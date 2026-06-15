@@ -1339,11 +1339,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return;
         }
         // §6.5 / §6.1 / §17.1: integer-operand operator type checks.
-        //   • Bitwise/shift (`& | ^ << >>`) carry no meaning on FLOATING-POINT
-        //     operands and previously produced garbage; reject them (§6.5). Bool
-        //     is NOT rejected here — §7.11 lifts `&`/`|`/`^` over nullable bool
-        //     (non-short-circuit logical, see lifted_operators_486); `char` is
-        //     left as-is (it yields a defined code-point result).
+        //   • Bitwise/shift (`& | ^ << >>`) are "not valid on `bool`, `char`, or
+        //     floating-point types" (§6.5) — they require integer operands, and
+        //     boolean operations use `and`/`or`/`not`. Reject all three operand
+        //     kinds (§7.11's lift list applies only where the base operator is
+        //     valid for `T`, so it does not extend bitwise to `bool?`/`char?`).
         //   • `mod` is defined on integer types and decimal, but NOT on float or
         //     double (§6.1).
         // (String/reference bitwise keeps its existing concatenation hint.)
@@ -1370,11 +1370,19 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
             if (isBitwise) {
                 for (TypeRef* o : {lt, rt0}) {
-                    if (isFloatPrim(primOf(o))) {
+                    PrimitiveType p = primOf(o);
+                    // §6.5: not valid on bool, char, or floating-point.
+                    const char* badKind =
+                        isFloatPrim(p)               ? "floating-point types"
+                        : (p == PrimitiveType::Bool) ? "`bool` (boolean operations "
+                                                       "use `and`/`or`/`not`)"
+                        : (p == PrimitiveType::Char)  ? "`char`"
+                                                      : nullptr;
+                    if (badKind) {
                         ctx_.diagnostics().report(Severity::Error, be.span.begin,
                             std::string("operator `") + std::string(op) +
-                            "` is not valid on floating-point types — bitwise "
-                            "operators require integer operands (§6.5)");
+                            "` is not valid on " + badKind + " — bitwise and "
+                            "shift operators require integer operands (§6.5)");
                         return;
                     }
                 }
@@ -1634,6 +1642,26 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     // access on a moved value (`var s := move r; s.M`) fails to resolve.
     if (op == "+" || op == "-" || op == "~" || op == "move") {
         TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
+        // §6.5: unary `~` (bitwise complement) is "not valid on bool, char, or
+        // floating-point types" — it requires an integer operand. (`not` is the
+        // boolean complement.) Primitive-only; a user type overloading `~` is
+        // resolved earlier via findUnaryOperator and never reaches here.
+        if (op == "~" && ot && ot->kind == TypeRef::Kind::Primitive) {
+            PrimitiveType p = ot->primitive;
+            const char* badKind =
+                (p == PrimitiveType::Float || p == PrimitiveType::Double)
+                    ? "floating-point types"
+                : (p == PrimitiveType::Bool)
+                    ? "`bool` (use `not` for boolean complement)"
+                : (p == PrimitiveType::Char) ? "`char`" : nullptr;
+            if (badKind) {
+                ctx_.diagnostics().report(Severity::Error, ue.span.begin,
+                    std::string("operator `~` is not valid on ") + badKind +
+                    " — the bitwise complement requires an integer operand "
+                    "(§6.5)");
+                return;
+            }
+        }
         if (ot) ctx_.setExprType(&ue, ot);
         return;
     }

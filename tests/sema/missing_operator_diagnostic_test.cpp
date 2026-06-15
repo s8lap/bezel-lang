@@ -288,13 +288,12 @@ BEZEL_TEST(sema_missing_op, mod_on_double_rejected_spec_6_1_738) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// #738 CONTROL: §7.11 lifts `&`/`|`/`^` over bool (non-short-circuit logical),
-// and integer `&` / integer `mod` / `decimal mod` stay valid — these must NOT
-// be rejected by the §6.5/§6.1 guard.
-BEZEL_TEST(sema_missing_op, bitwise_on_bool_and_int_mod_decimal_ok_738) {
+// CONTROL: integer `&`, integer `mod`, and `decimal mod` are valid and must NOT
+// be rejected by the §6.5 bitwise / §6.1 mod guard. (bool/char bitwise is now a
+// §6.5 error per the v0.143 §7.11 clarification — see lifted_operators_486.)
+BEZEL_TEST(sema_missing_op, integer_bitwise_and_mod_decimal_ok) {
     auto r = parseSema(
         "module M; class C public static method M(): int "
-        "  var ba: bool := true; var bb: bool := false; var bc := ba & bb; "
         "  var ia: int := 6; var ic := ia & 3; var im := ia mod 4; "
         "  var da: decimal := 5m; var dm := da mod 2m; "
         "  return 0; "

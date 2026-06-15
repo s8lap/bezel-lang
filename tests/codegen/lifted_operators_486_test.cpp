@@ -423,32 +423,14 @@ BEZEL_TEST(codegen_lifted_ops_486, long_lt_null_yields_false_spec_7_11) {
 
 
 // =========================================================================
-// §7.11 — bool? bitwise (& and |): treated as integer ops on i1
+// §6.5: bitwise `& | ^ ~ << >>` are NOT valid on `bool` or `char`.
 // =========================================================================
-
-// §7.11: bool? & bool? both true → true.
-BEZEL_TEST(codegen_lifted_ops_486, bool_bitand_both_present_true_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(
-        "var a: bool? := true; var b: bool? := true; "
-        "var r: bool? := a & b; "
-        "return int(r ?? false);"), 1);
-}
-
-// §7.11: bool? & bool? one false → false.
-BEZEL_TEST(codegen_lifted_ops_486, bool_bitand_one_false_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(
-        "var a: bool? := true; var b: bool? := false; "
-        "var r: bool? := a & b; "
-        "return int(r ?? true);"), 0);
-}
-
-// §7.11: bool? & null → null.
-BEZEL_TEST(codegen_lifted_ops_486, bool_bitand_null_yields_null_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(
-        "var a: bool? := true; var b: bool? := null; "
-        "var r: bool? := a & b; "
-        "return int(r = null);"), 1);
-}
+// §7.11's lift list applies only where the base operator is valid for `T`, so
+// it does not extend bitwise/shift to `bool?` / `char?`. The lifting machinery
+// previously treated `bool?` as an i1 integer and accepted `bool? & bool?`,
+// which drifted from §6.5 ("Boolean operations use `and`/`or`/`not`"); that is
+// now rejected at sema. The rejection (binary, unary `~`, and compound forms,
+// for both bool and char) is covered in lifted_operators_486_sema_test.cpp.
 
 
 // =========================================================================

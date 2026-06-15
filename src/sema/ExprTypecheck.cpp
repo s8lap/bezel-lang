@@ -1962,6 +1962,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         if (as->target) visitExpr(*as->target);
+        // §6.5: a compound bitwise/shift assignment (`&= |= ^= <<= >>=`) carries
+        // the same operand-type restriction as the binary bitwise operators — it
+        // is not valid on a `bool` / `char` / floating-point target. Compound
+        // assignments do NOT route through typeBinary, so guard here.
+        if (as->target &&
+            (as->op == "&=" || as->op == "|=" || as->op == "^=" ||
+             as->op == "<<=" || as->op == ">>=")) {
+            if (TypeRef* tt = ctx_.exprType(*as->target)) {
+                if (tt->kind == TypeRef::Kind::Primitive) {
+                    PrimitiveType p = tt->primitive;
+                    const char* badKind =
+                        (p == PrimitiveType::Float || p == PrimitiveType::Double)
+                            ? "floating-point types"
+                        : (p == PrimitiveType::Bool)
+                            ? "`bool` (boolean operations use `and`/`or`/`not`)"
+                        : (p == PrimitiveType::Char) ? "`char`" : nullptr;
+                    if (badKind)
+                        ctx_.diagnostics().report(Severity::Error, as->span.begin,
+                            std::string("operator `") + std::string(as->op) +
+                            "` is not valid on " + badKind + " — bitwise and "
+                            "shift operators require integer operands (§6.5)");
+                }
+            }
+        }
         // per §24.4: `event += handler` / `event -= handler` — type the
         // handler lambda's param as the event payload `T` (these forms desugar
         // to Add/Remove; they are not real compound assignments).

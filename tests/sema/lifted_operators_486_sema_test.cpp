@@ -305,3 +305,60 @@ BEZEL_TEST(sema_lifted_ops_486, int_add_result_needs_narrowing_spec_7_11) {
         "end M; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// =========================================================================
+// §6.5: bitwise/shift `& | ^ ~ << >>` are NOT valid on bool or char.
+// =========================================================================
+// Owner decision 2026-06-15: honor §6.5 ("Boolean operations use
+// `and`/`or`/`not`"); §7.11's lift list applies only where the base operator is
+// valid for T, so it does not extend bitwise/shift to `bool?` / `char?`.
+// (Previously the lifting machinery treated `bool?` as i1 and accepted
+// `bool? & bool?`.) Covers binary, nullable, char, unary `~`, and compound.
+
+namespace { bool any65(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("6.5") != std::string::npos ||
+            d.message.find("not valid on") != std::string::npos) return true;
+    return false;
+} }
+
+BEZEL_TEST(sema_lifted_ops_486, bool_bitand_is_error_6_5) {
+    auto r = parseSemaAll("module M; class C "
+        "public method M(a: bool, b: bool) _ := a & b; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(any65(r));
+}
+
+BEZEL_TEST(sema_lifted_ops_486, nullable_bool_bitor_is_error_6_5) {
+    auto r = parseSemaAll("module M; class C "
+        "public method M(a: bool?, b: bool?) _ := a | b; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_lifted_ops_486, char_bitand_is_error_6_5) {
+    auto r = parseSemaAll("module M; class C "
+        "public method M(a: char, b: char) _ := a & b; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(any65(r));
+}
+
+BEZEL_TEST(sema_lifted_ops_486, bitnot_bool_is_error_6_5) {
+    auto r = parseSemaAll("module M; class C "
+        "public method M(a: bool) _ := ~a; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(any65(r));
+}
+
+BEZEL_TEST(sema_lifted_ops_486, compound_bitand_bool_is_error_6_5) {
+    auto r = parseSemaAll("module M; class C "
+        "public method M() var a: bool := true; a &= false; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(any65(r));
+}
+
+// Control: integer bitwise is still valid.
+BEZEL_TEST(sema_lifted_ops_486, int_bitand_ok_6_5) {
+    auto r = parseSemaAll("module M; class C "
+        "public method M(a: int, b: int) _ := a & b; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
