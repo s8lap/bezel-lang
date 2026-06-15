@@ -7222,9 +7222,36 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
                    ? builder_.CreateFPExt(src, dstTy)
                    : builder_.CreateFPTrunc(src, dstTy);
     }
-    if (srcFP)  // float → int
+    if (srcFP) {  // float → int
+        // §5.2: "Floating-point to integer truncates toward zero; NaN,
+        // ±Infinity, and out-of-range values raise OverflowException." A bare
+        // fptosi/fptoui on such a source is LLVM undefined behaviour (poison;
+        // on x86 it silently yields the integer-indefinite value), so guard the
+        // conversion with an explicit in-range predicate first.
+        //
+        // The valid source interval is chosen so truncation-toward-zero lands
+        // in [MIN, MAX]. We use the exactly-representable power-of-two bounds
+        // (2^k is exact in both float and double for k ≤ 64): for a signed
+        // N-bit target the interval is [-2^(N-1), 2^(N-1)); for unsigned it is
+        // [0, 2^N). The upper bound is strict, so e.g. 2147483647.9 → int is
+        // accepted (truncates to int.MaxValue) while 2147483648.0 overflows.
+        // NaN fails both ordered comparisons and ±Infinity fails the matching
+        // side, so all three error cases of §5.2 are rejected.
+        auto pow2 = [](unsigned e) { double v = 1.0; for (unsigned i = 0; i < e; ++i) v *= 2.0; return v; };
+        unsigned nbits = dstTy->getIntegerBitWidth();
+        double maxBound = dstUns ? pow2(nbits) : pow2(nbits - 1);
+        double minBound = dstUns ? 0.0 : -pow2(nbits - 1);
+        llvm::Value* minC = llvm::ConstantFP::get(srcTy, minBound);
+        llvm::Value* maxC = llvm::ConstantFP::get(srcTy, maxBound);
+        // Ordered comparisons: both are false for NaN, so geMin∧ltMax excludes
+        // NaN and ±Infinity automatically as well as finite out-of-range values.
+        llvm::Value* geMin   = builder_.CreateFCmpOGE(src, minC, "f2i.gemin");
+        llvm::Value* ltMax   = builder_.CreateFCmpOLT(src, maxC, "f2i.ltmax");
+        llvm::Value* inRange = builder_.CreateAnd(geMin, ltMax, "f2i.inrange");
+        emitGuardThrow(builder_.CreateNot(inRange, "f2i.oor"), "OverflowException");
         return dstUns ? builder_.CreateFPToUI(src, dstTy)
                       : builder_.CreateFPToSI(src, dstTy);
+    }
     if (dstFP)  // int → float
         return srcUns ? builder_.CreateUIToFP(src, dstTy)
                       : builder_.CreateSIToFP(src, dstTy);

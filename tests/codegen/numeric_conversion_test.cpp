@@ -336,3 +336,89 @@ BEZEL_TEST(codegen_numeric_conv, negative_int_assigned_to_double_local_sitofp_42
         "var n: int := -7; var d := 0.0; d := n; "
         "return (1 if d < 0.0 else 0);"), 1);  // −7.0 < 0 → 1
 }
+
+// ---------------------------------------------------------------------------
+// §5.2 (issue #739, WR6/WR7/WR8): "Floating-point to integer truncates toward
+// zero; NaN, ±Infinity, and out-of-range values raise OverflowException." A
+// bare fptosi/fptoui used to be emitted with no guard, so these three cases
+// silently produced the integer-indefinite value (0x80000000 on x86) instead
+// of raising. The conversion now guards an in-range predicate and raises
+// OverflowException; valid sources still truncate toward zero. Each test
+// catches the exception and returns a sentinel so the int harness observes it.
+// ---------------------------------------------------------------------------
+
+// In-range truncation toward zero is unchanged: 3.7 → 3, −3.7 → −3.
+BEZEL_TEST(codegen_numeric_conv, float_to_int_truncates_toward_zero_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double := 3.7; var n: double := -3.7; "
+        "return int(a) * 10 + (0 - int(n));"), 33);  // 30 + 3
+}
+
+// NaN → int raises OverflowException (§5.2).
+BEZEL_TEST(codegen_numeric_conv, double_nan_to_int_overflows_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double := double.NaN; "
+        "try return int(a); catch OverflowException => return 7; end; return 1;"),
+        7);
+}
+
+// +Infinity → int raises OverflowException (§5.2).
+BEZEL_TEST(codegen_numeric_conv, double_pos_inf_to_int_overflows_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double := double.PositiveInfinity; "
+        "try return int(a); catch OverflowException => return 7; end; return 1;"),
+        7);
+}
+
+// −Infinity → int raises OverflowException (§5.2).
+BEZEL_TEST(codegen_numeric_conv, double_neg_inf_to_int_overflows_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double := double.NegativeInfinity; "
+        "try return int(a); catch OverflowException => return 7; end; return 1;"),
+        7);
+}
+
+// A finite value well past int.MaxValue raises OverflowException (§5.2).
+BEZEL_TEST(codegen_numeric_conv, double_too_large_to_int_overflows_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double := 1e20; "
+        "try return int(a); catch OverflowException => return 7; end; return 1;"),
+        7);
+}
+
+// The upper bound is strict at the truncation boundary: int.MaxValue exactly
+// (2147483647.0) is in range; int.MaxValue + 1 (2147483648.0) overflows.
+BEZEL_TEST(codegen_numeric_conv, double_int_max_boundary_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var ok: double := 2147483647.0; "
+        "var over: double := 2147483648.0; "
+        "var v := int(ok); "  // valid: int.MaxValue
+        "try var w := int(over); return 1; "
+        "catch OverflowException => return (1 if v = 2147483647 else 2); end;"),
+        1);
+}
+
+// byte (unsigned 8-bit): 200.0 fits, 300.0 overflows; negative also overflows.
+BEZEL_TEST(codegen_numeric_conv, double_to_byte_range_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var ok: double := 200.0; var v := byte(ok); "
+        "try var w := byte(300.0); return 1; "
+        "catch OverflowException => return int(v); end;"),  // 200
+        200);
+}
+
+// long (signed 64-bit): a value below long.MaxValue casts; 1e19 overflows.
+BEZEL_TEST(codegen_numeric_conv, double_to_long_range_739) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double := 9.0e18; var b: long := long(a); "
+        "var inrange := (1 if b > 8999999000000000000L else 0); "
+        "try var c: long := long(1.0e19); return 1; "
+        "catch OverflowException => return inrange; end;"),  // 1
+        1);
+}
+
+// NOTE: an UNCAUGHT NaN/Inf/out-of-range→int conversion propagates via the
+// runtime's unhandled-exception path (prints "Unhandled exception", exit 70).
+// That path calls exit() in-process, so it cannot be exercised under the JIT
+// harness without terminating the test runner; it is verified by AOT-compiling
+// and running a standalone binary instead (see the #739 lane notes).
