@@ -219,3 +219,38 @@ BEZEL_TEST(bug457_extension_method_ref_prim_thunk,
         "  end Main; "
         "end C;"), 42);
 }
+
+// #738 / §27.6: a method reference to a VIRTUAL method through a BASE-typed
+// receiver must dispatch dynamically through the receiver's runtime type — the
+// thunk previously called the static (base) method, so the override was missed.
+BEZEL_TEST(bug_457_458, method_ref_virtual_base_dispatch_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Base public virtual method Id(): int => 1; "
+        "  destructor end destructor; end Base; "
+        "class Sub: Base public override method Id(): int => 9; "
+        "  destructor end destructor; end Sub; "
+        "class C public static method Main(): int "
+        "  using var s := new Sub(); var b: Base := s; "
+        "  var fn: () -> int := b.Id; "  // method ref through base
+        "  return fn(); "  // 9 (Sub override), not 1 (Base)
+        "end Main; end C;"), 9);
+}
+
+// #738 / §27.6 / §13: a method reference to an INTERFACE method through an
+// interface-typed receiver must dispatch through the itable (previously the
+// thunk had no concrete function → SIGSEGV).
+BEZEL_TEST(bug_457_458, method_ref_interface_dispatch_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IFoo method Do(n: int): int; end IFoo; "
+        "class FooImpl: IFoo "
+        "  public constructor() end constructor; "
+        "  public method Do(n: int): int => n * 3; "
+        "  destructor end destructor; end FooImpl; "
+        "class C public static method Main(): int "
+        "  using var f := new FooImpl(); var p: IFoo := f; "
+        "  var fn: (int) -> int := p.Do; "  // method ref through interface
+        "  return fn(7); "  // 21
+        "end Main; end C;"), 21);
+}

@@ -1687,20 +1687,33 @@ void Emitter::collectCapturedSyms(
 
 llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                              llvm::Value* receiverVal) {
+    llvm::Function* origFn = nullptr;
     auto it = methodFns_.find(ms);
-    if (it == methodFns_.end()) return nullptr;
-    llvm::Function* origFn = it->second;
+    if (it != methodFns_.end()) origFn = it->second;
+    // §27.6 (#738): a method reference to a VIRTUAL or INTERFACE method dispatches
+    // DYNAMICALLY through the receiver's vtable/itable when invoked (not the
+    // statically-resolved origFn). An INTERFACE method has no concrete body /
+    // methodFns_ entry, so derive its LLVM signature from methodFnType.
+    bool instMethod = !isStaticMethod(ms);
+    auto ifaceIt = ifaceMethodIndex_.find(ms);
+    auto vtSlotIt = vtableSlot_.find(ms);
+    bool dynamicDispatch = instMethod &&
+        (ifaceIt != ifaceMethodIndex_.end() || vtSlotIt != vtableSlot_.end());
+    llvm::FunctionType* methTy =
+        origFn ? origFn->getFunctionType() : methodFnType(ms);
+    if (!methTy) return nullptr;
+    // A non-virtual, non-interface method ref must have a concrete origFn.
+    if (!origFn && !dynamicDispatch) return nullptr;
 
     // Build the thunk's parameter types: (ptr env, user_params...).
     std::vector<llvm::Type*> thunkParamTys;
     thunkParamTys.push_back(ptrTy());  // env_ptr
     // Skip the leading `this` arg for instance methods
     // (it comes from env instead).
-    bool instMethod = !isStaticMethod(ms);
     for (std::size_t i = (instMethod ? 1 : 0);
-         i < origFn->arg_size(); ++i)
-        thunkParamTys.push_back(origFn->getArg(i)->getType());
-    llvm::Type* retTy = origFn->getReturnType();
+         i < methTy->getNumParams(); ++i)
+        thunkParamTys.push_back(methTy->getParamType(i));
+    llvm::Type* retTy = methTy->getReturnType();
     auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
 
     // Create thunk function.
@@ -1756,7 +1769,44 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     for (; argIt != thunk->args().end(); ++argIt)
         callArgs.push_back(&*argIt);
 
-    llvm::Value* result = builder_.CreateCall(origFn, callArgs);
+    // §27.6 (#738): dispatch through the receiver's vtable/itable for a virtual
+    // or interface method (mirrors emitMethodCall's dynamic path); otherwise call
+    // the concrete origFn directly. callArgs[0] is the receiver.
+    llvm::Value* dynFnPtr = nullptr;
+    if (dynamicDispatch && !callArgs.empty() &&
+        callArgs[0]->getType()->isPointerTy()) {
+        llvm::Value* recv = callArgs[0];
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        if (ifaceIt != ifaceMethodIndex_.end()) {
+            // §13 itable: vptr[1] = itmap; bz_itable_lookup(itmap, td$I)[k].
+            auto descIt = descArray_.find(ms->parent);
+            if (descIt != descArray_.end()) {
+                llvm::Value* itmapPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+                auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* itab = builder_.CreateCall(
+                    lookupFn, {itmapPtr, descIt->second}, "thunk.itab");
+                dynFnPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(
+                        ptrTy(), itab,
+                        {builder_.getInt32(ifaceIt->second)}),
+                    "thunk.ifn");
+            }
+        } else {
+            // §8.6 vtable: virtuals base at slot 4 (vtableSlot_ is absolute).
+            dynFnPtr = builder_.CreateLoad(
+                ptrTy(),
+                builder_.CreateGEP(ptrTy(), vptr,
+                                   {builder_.getInt32(vtSlotIt->second)}),
+                "thunk.vfn");
+        }
+    }
+    llvm::Value* result =
+        dynFnPtr ? builder_.CreateCall(methTy, dynFnPtr, callArgs)
+                 : builder_.CreateCall(origFn, callArgs);
     if (retTy->isVoidTy()) builder_.CreateRetVoid();
     else builder_.CreateRet(result);
 
