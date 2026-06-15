@@ -247,3 +247,37 @@ BEZEL_TEST(codegen_nullable_record, regress_nonnull_record_multi_field) {
     BEZEL_EXPECT_EQ(runPair(
         "var p := new Pair(11, 22); return p.A * 100 + p.B;"), 1122);
 }
+
+// R40 / §9.5: a `with`-replacement of a NULLABLE VALUE-type field must store
+// the tagged {i8,T} struct, not the raw scalar. Previously `b with n := 9 end`
+// for `record Box(n: int?)` stored a raw i32 over the {i8,i32} field — the
+// hasValue byte was overwritten (so the null check passed by coincidence) but
+// the value half stayed stale, so `b2.n!` returned the OLD value.
+BEZEL_TEST(codegen_nullable_record, with_replaces_nullable_int_field_r40) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(1); var b2 := b with n := 9 end; "
+        "  return b2.n!; "  // 9, not the stale 1
+        "end Main; end C;"), 9);
+}
+
+// A `with` setting a nullable field to `null` produces a null field.
+BEZEL_TEST(codegen_nullable_record, with_sets_nullable_field_to_null_r40) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(5); var b2 := b with n := null end; "
+        "  return (42 if b2.n = null else 0); "
+        "end Main; end C;"), 42);
+}
+
+// A `with` on one nullable field leaves the other fields intact.
+BEZEL_TEST(codegen_nullable_record, with_one_nullable_field_preserves_others_r40) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?, m: int?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(1, 2); var b2 := b with n := 40 end; "
+        "  return b2.n! + b2.m!; "  // 40 + 2 = 42 (m preserved)
+        "end Main; end C;"), 42);
+}

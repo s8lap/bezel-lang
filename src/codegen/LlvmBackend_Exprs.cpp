@@ -5867,6 +5867,23 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
             emitStringRelease(oldVal);
             continue;
         }
+        // R40 / §9.5: a `with`-replacement of a nullable VALUE-type field must
+        // store the tagged {i8,T} struct, not the raw scalar — otherwise the
+        // scalar overwrites the hasValue byte and leaves the value half stale
+        // (wrong value, or coincidentally non-null). Wrap the replacement value
+        // exactly as the positional-constructor path does. (Narrow nullable
+        // fields like `byte?`, where the lowered value width differs from the
+        // element width, are a separate gap tracked in the R40 follow-up.)
+        if (const sema::TypeRef* fty = recordMemberTypeResolved(m)) {
+            if (isNullableValueTy(fty) && !v->getType()->isStructTy()) {
+                auto* expectedSt = nullableValueStructTy(fty);
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v))
+                    v = nullableValueNull(fty);
+                else if (v->getType() == expectedSt->getElementType(1))
+                    v = wrapNullableValue(fty, v);
+            }
+        }
         builder_.CreateStore(v, slot);
     }
     // Record: return the modified copy by value. Class: return the mutated
