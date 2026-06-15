@@ -5199,11 +5199,15 @@ extern "C" void* bz_lazy_to_set(void* lazy, int64_t esz, void* hashfn, void* eqf
 // The element T bytes are copied into a fresh heap block and stored as the value.
 extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                                  void* keyfn, void* closure,
-                                 void* hashfn, void* eqfn) {
+                                 void* hashfn, void* eqfn, int64_t val_inline) {
     auto* e = (bz_lazy_t*)lazy;
-    // The dict is keyed by TKey (key_esz bytes), value is a heap pointer to
-    // a T-value copy. This matches the Dictionary<TKey,T> runtime layout
-    // (string-key dicts store values inline; generic-key dicts store a void* val).
+    // The dict is keyed by TKey (key_esz bytes). #738: the VALUE must use the
+    // same generic-dict encoding the codegen Dictionary<TKey,T> read expects
+    // (encodeValue): a SCALAR value (val_inline != 0 — int/enum/char/class-ref,
+    // ≤ 8 bytes) is stored INLINE in the void* slot (the indexer read does
+    // ptrtoint, not a deref); a STRUCT value (record/decimal) is heap-boxed.
+    // Previously every value was heap-boxed, so an indexed read of a scalar
+    // value returned the pointer bits reinterpreted as the value — garbage.
     void* dict = bz_dict_alloc_generic(key_esz,
         (uint64_t(*)(const void*))hashfn,
         (bool(*)(const void*, const void*))eqfn);
@@ -5223,9 +5227,16 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
         // common single-int-key path — ToDictionary's key is a scalar TKey).
         int64_t k = ((kfn_t)keyfn)(closure, elem);
         memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
-        // Value: heap copy of the T element bytes.
-        void* val = malloc((size_t)val_esz);
-        memcpy(val, elem, (size_t)val_esz);
+        void* val;
+        if (val_inline) {
+            // Scalar: pack the value bytes directly into the void* slot.
+            val = nullptr;
+            memcpy(&val, elem, (size_t)(val_esz < 8 ? val_esz : 8));
+        } else {
+            // Struct (record/decimal): heap copy of the T element bytes.
+            val = malloc((size_t)val_esz);
+            memcpy(val, elem, (size_t)val_esz);
+        }
         bz_dict_set_gen(dict, key_buf, val);
     }
     bz_lazy_dispose(e);

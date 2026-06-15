@@ -392,6 +392,33 @@ BEZEL_TEST(linq_gaps, todict_from_lazy_spec_5) {
         "end Main; end C;"), 2);
 }
 
+// #738 / §5: a ToDictionary with a SCALAR value type (int) must read back the
+// VALUE correctly via the indexer. bz_lazy_to_dict heap-boxed every value, but
+// the Dictionary<int,int> indexer read decodes a scalar value INLINE (ptrtoint)
+// — so an indexed read returned the box pointer bits (garbage). Now stored
+// inline to match encodeValue.
+BEZEL_TEST(linq_gaps, todict_scalar_value_indexed_read_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a: Array<int> := [3, 5, 7]; "
+        "  using var d: Dictionary<int, int> := a.ToDictionary((x: int) => x); "
+        "  return d[3] + d[5] + d[7]; "  // 15
+        "end Main; end C;"), 15);
+}
+
+// #738 / §5: a ToDictionary with a STRUCT value type (record) keeps the boxed
+// encoding — the indexer read derefs the box. (Regression guard for the inline
+// change.)
+BEZEL_TEST(linq_gaps, todict_record_value_indexed_read_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  using var a: Array<Pt> := [new Pt(3, 4), new Pt(10, 20)]; "
+        "  using var d: Dictionary<int, Pt> := a.ToDictionary((p: Pt) => p.X); "
+        "  var got := d[10]; return got.X + got.Y; "  // 30
+        "end Main; end C;"), 30);
+}
+
 // ===========================================================================
 // BUG #459 / §5 / §22 — ToDictionary with a TYPE-INFERRED local (`var d :=`).
 // When the local's type is inferred from the initializer, the ToDictionary

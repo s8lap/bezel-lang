@@ -10743,11 +10743,16 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* hashTramp = buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
         llvm::Function* eqTramp   = buildLinqTrampoline(3, keyTy, nullptr, keyRec);
 
+        // #738: the value encoding must match the codegen Dictionary<K,V> read
+        // (encodeValue) — a SCALAR value (non-struct LLVM type) is stored inline
+        // in the void* slot; a STRUCT value (record/decimal) is heap-boxed.
+        bool valInline = elemTy2 && !elemTy2->isStructTy();
         auto* toDict = declareC("bz_lazy_to_dict", ptrTy(),
-            {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+            {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
         llvm::Value* result = builder_.CreateCall(toDict,
             {lazy, builder_.getInt64(valEsz), builder_.getInt64(keyEsz),
-             keyTramp, keyClosure, hashTramp, eqTramp}, "linq.todict");
+             keyTramp, keyClosure, hashTramp, eqTramp,
+             builder_.getInt64(valInline ? 1 : 0)}, "linq.todict");
         // Release the inline-lambda key closure if we own it (eager materialization
         // — the closure is fully consumed during bz_lazy_to_dict, same as eager
         // LINQ terminals like Count/Sum).
