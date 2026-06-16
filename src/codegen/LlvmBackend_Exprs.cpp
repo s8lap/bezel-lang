@@ -1476,6 +1476,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             case P::SByte:return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 127, true);
                             case P::Double:return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), std::numeric_limits<double>::max());
                             case P::Float: return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_), std::numeric_limits<float>::max());
+                            // stdlib §char: MaxValue = U+10FFFF (char is a 32-bit
+                            // code point, lowered to i32). #747 R42: was missing,
+                            // so the read hit an uninitialized alloca.
+                            case P::Char: return llvm::ConstantInt::get(i32(), 1114111, false);
                             default: break;
                         }
                     }
@@ -1485,7 +1489,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             case P::Long: return llvm::ConstantInt::get(i64(), int64_t(-9223372036854775808ll), true);
                             case P::Short:return llvm::ConstantInt::get(llvm::Type::getInt16Ty(llvm_), int16_t(-32768), true);
                             case P::SByte:return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), int8_t(-128), true);
-                            case P::UInt: case P::ULong: case P::UShort: case P::Byte:
+                            // stdlib §char: MinValue = U+0000 (0). #747 R42.
+                            case P::UInt: case P::ULong: case P::UShort: case P::Byte: case P::Char:
                                 return llvm::ConstantInt::get(lowerPrimitive(pt), 0, false);
                             case P::Double: return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), std::numeric_limits<double>::lowest());
                             case P::Float:  return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_), std::numeric_limits<float>::lowest());
