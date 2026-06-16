@@ -835,14 +835,31 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 }
 
 
+const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
+    if (!target) return nullptr;
+    if (auto* tt = ctx_.exprType(*target))
+        if (tt->kind == sema::TypeRef::Kind::Named && tt->declaration)
+            return tt->declaration;
+    // #747 R42: `this[i]` inside an instance method — `this` carries no sema
+    // exprType, so recover the owner TypeSymbol from the current method (mirrors
+    // lowerWith's reverse-lookup of currentFn_ in methodFns_).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        if ((id->name == "this" || id->name == "base") && currentFn_) {
+            for (const auto& [ms, fn] : methodFns_)
+                if (fn == currentFn_ && ms->parent) return ms->parent;
+            if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent)
+                return currentSpecMethodSymbol_->parent;
+        }
+    }
+    return nullptr;
+}
+
 llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
-    auto* targetTy = ctx_.exprType(*ix.target);
-    if (!targetTy || targetTy->kind != sema::TypeRef::Kind::Named ||
-        !targetTy->declaration)
-        return nullptr;
-    auto* ps = findIndexer(targetTy->declaration);
+    const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
+    if (!recvDecl) return nullptr;
+    auto* ps = findIndexer(recvDecl);
     if (!ps) return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
@@ -941,11 +958,9 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
 bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return false;
-    auto* targetTy = ctx_.exprType(*ix.target);
-    if (!targetTy || targetTy->kind != sema::TypeRef::Kind::Named ||
-        !targetTy->declaration)
-        return false;
-    auto* ps = findIndexer(targetTy->declaration);
+    const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
+    if (!recvDecl) return false;
+    auto* ps = findIndexer(recvDecl);
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;
@@ -1013,11 +1028,9 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         return false;
     // Check that this is a user-defined indexer (class/record with a property
     // [i]: T declaration). Built-in arrays fall through to lvalueAddr instead.
-    auto* targetTy = ctx_.exprType(*ix->target);
-    if (!targetTy || targetTy->kind != sema::TypeRef::Kind::Named ||
-        !targetTy->declaration)
-        return false;
-    auto* ps = findIndexer(targetTy->declaration);
+    const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix->target.get());
+    if (!recvDecl) return false;
+    auto* ps = findIndexer(recvDecl);
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;

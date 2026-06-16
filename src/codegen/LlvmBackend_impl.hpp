@@ -1988,6 +1988,14 @@ private:
     const sema::PropertySymbol* findIndexer(
         const sema::TypeSymbol* ts) const;
 
+    // §22.10/§23.4 (#747 R42): resolve the receiver TypeSymbol of an indexer
+    // access `target[i]`. Normally the target's sema exprType carries the
+    // declaration; but `this[i]` inside an instance method has no sema exprType
+    // (the member resolver uses the current type directly), so recover the owner
+    // TypeSymbol from the current method, mirroring lowerWith. Null when the
+    // receiver is not a user-defined type.
+    const sema::TypeSymbol* indexReceiverDecl(const ast::Expr* target);
+
     // §22.10: emit the getter of an indexer property via inline body.
     // Returns the loaded value, or null if no indexer applies.
     llvm::Value* lowerIndexerGet(const ast::IndexExpr& ix);

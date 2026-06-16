@@ -602,6 +602,8 @@ set(BEZEL_TEST_SOURCES
     # --- end #747 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp
+    # --- fix #747 (R42): this[i] user-indexer get/set/compound no-op (§22.10) ---
+    codegen/this_indexer_747_test.cpp
     # --- end #677 ---
     # --- fix #678: lambda void return type — inferred-param/untyped-var void body ---
     codegen/lambda_void_return_678_test.cpp
