@@ -137,6 +137,12 @@ private:
     // (use `yield break`); for an ASYNC iterator §21.7 does not catch it (it is
     // a VoidMethod ctx), so checkReturnForm consults this flag.
     bool inIteratorMethod_ = false;
+    // §29.9: true while visiting a lambda body. `yield` is a method-level
+    // construct only, so a `yield`/`yield break` inside a lambda is rejected
+    // (otherwise codegen builds a malformed iterator state machine for the
+    // lambda and the program SIGSEGVs at runtime — #747 R42). Saved/restored
+    // (not just set) so nested lambdas behave correctly.
+    bool inLambda_ = false;
 
     // per §24.3: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this

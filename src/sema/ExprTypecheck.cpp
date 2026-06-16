@@ -2542,6 +2542,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
         --finallyDepth_;
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        // §29.9: `yield` is a method-level construct only — `yield return` and
+        // `yield break` are both forbidden inside a lambda. Without this the
+        // compiler silently accepted the yield and codegen built a malformed
+        // iterator state machine for the lambda, SIGSEGV'ing at runtime
+        // (#747 R42). `inLambda_` is set only while visiting a lambda body.
+        if (inLambda_) {
+            ctx_.diagnostics().report(
+                Severity::Error, ys->span.begin,
+                "`yield` is not allowed in a lambda — it is a method-level "
+                "construct only (§29.9)");
+        }
         if (ys->value) visitExpr(*ys->value);
     } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (is->target) visitExpr(*is->target);

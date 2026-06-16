@@ -2034,6 +2034,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // iterator — `return;` in it is governed by the lambda's own rules.
         bool saveIter = inIteratorMethod_;
         inIteratorMethod_ = false;
+        // §29.9 (#747 R42): mark that we are inside a lambda body so a `yield`
+        // in it is rejected (yield is method-level only). Saved/restored for
+        // nested lambdas.
+        bool saveInLambda = inLambda_;
+        inLambda_ = true;
         currentScope_ = &lamScope;
         returnCtx_ = ReturnCtx::None;
         currentReturnType_ = nullptr;
@@ -2046,6 +2051,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentReturnType_ = saveRetTy;
         inAsyncContext_ = saveAsync;
         inIteratorMethod_ = saveIter;
+        inLambda_ = saveInLambda;
         loopDepth_ = saveLoop;
         catchDepth_ = saveCatch;
         // §A.7: set the lambda's exprType to a Function TypeRef so

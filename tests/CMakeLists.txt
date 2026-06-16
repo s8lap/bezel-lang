@@ -88,6 +88,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #746: generic-method class/value/notnull constraint at call site (§14.2) ---
     sema/generic_method_constraint_callsite_746_test.cpp
     # --- end #746 ---
+    # --- fix #747 (R42): `yield` in a lambda rejected (§29.9) ---
+    sema/yield_in_lambda_747_test.cpp
+    # --- end #747 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp
     sema/member_access_resolution_test.cpp
