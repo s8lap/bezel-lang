@@ -300,3 +300,45 @@ BEZEL_TEST(sema_missing_op, integer_bitwise_and_mod_decimal_ok) {
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// §25.2 (#746 R41-C): a relational operator on a record/class with no matching
+// overload is rejected cleanly (was a struct-level icmp → malformed IR).
+// ---------------------------------------------------------------------------
+
+// `<=` used on a record that declares only `<` and `>` — §25.2 error.
+BEZEL_TEST(sema_missing_op, record_relational_without_overload_25_2) {
+    auto r = parseSema(
+        "module P; record Val(N: int) "
+        "  public static method operator <(a: Val, b: Val): bool => a.N < b.N; "
+        "  public static method operator >(a: Val, b: Val): bool => a.N > b.N; "
+        "end Val; "
+        "class M public static method Main(): int "
+        "  var v1 := new Val(5); var v2 := new Val(10); "
+        "  if v1 <= v2 then return 1; else return 2; end; "
+        "end Main; end M;");
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "25.2"));
+}
+
+// CONTROL: a declared relational overload (`<`) IS usable — no error.
+BEZEL_TEST(sema_missing_op, record_declared_relational_ok_25_2) {
+    auto r = parseSema(
+        "module P; record Val(N: int) "
+        "  public static method operator <(a: Val, b: Val): bool => a.N < b.N; "
+        "end Val; "
+        "class M public static method Main(): int "
+        "  var v1 := new Val(5); var v2 := new Val(10); "
+        "  if v1 < v2 then return 0; else return 1; end; "
+        "end Main; end M;");
+    BEZEL_EXPECT_FALSE(anyMessageMentions(r, "25.2"));
+}
+
+// CONTROL: a primitive `<=` is the built-in relational — never rejected.
+BEZEL_TEST(sema_missing_op, primitive_relational_ok_25_2) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var a := 5; var b := 10; "
+        "  if a <= b then return 0; end; return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(anyMessageMentions(r, "25.2"));
+}

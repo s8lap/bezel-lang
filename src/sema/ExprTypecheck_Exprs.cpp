@@ -1243,6 +1243,33 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return;
         }
     }
+    // §25.2 (#746 R41-C): a relational operator (`<`, `>`, `<=`, `>=`) on a
+    // record/class operand requires a matching user-defined overload — none is
+    // auto-generated. A partial comparison group (e.g. only `<`/`>` declared,
+    // then `<=` used) otherwise fell through to the built-in result-type rule,
+    // and codegen emitted a struct-level `icmp` on the aggregate (malformed IR).
+    // Reject the undefined use cleanly. (Primitive operands have no
+    // memberTargetType and keep the built-in relational.)
+    if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+        for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
+            TypeSymbol* ts = memberTargetType(operand);
+            // Exclude the value-builtins (DateTime/TimeSpan/Guid/…): they carry
+            // a kind==Class TypeSymbol but support a built-in relational compare
+            // with no user overload (§2.5).
+            if (ts && !ts->isValueBuiltin &&
+                (ts->kind == ast::TypeDeclKind::Record ||
+                 ts->kind == ast::TypeDeclKind::Class)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) +
+                    "` is not defined for type `" + std::string(ts->name) +
+                    "` — comparison operators must be explicitly overloaded "
+                    "(§25.2)");
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
+        }
+    }
     // §9.2/§8.3: `=` / `<>` on a body record that is not auto-equality-bearing
     // and that declares no equality of its own is a compile error at the use
     // site. "A body record is **not** auto-equality-bearing — and `=` on it
