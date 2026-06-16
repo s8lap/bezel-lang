@@ -204,6 +204,7 @@ private:
     // A static constructor, static members, class-level consts (which
     // are implicitly static), and nested types are permitted.
     void checkStaticClassMembers();
+    void checkStaticIndexers();  // §23.5: static indexers are not supported
 
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 

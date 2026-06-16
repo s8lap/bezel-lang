@@ -92,6 +92,8 @@ set(BEZEL_TEST_SOURCES
     sema/yield_in_lambda_747_test.cpp
     # --- fix #747 (R42 FALSE_ACCEPT): assignment to a const member rejected (§10) ---
     sema/const_assignment_747_test.cpp
+    # --- fix #747 (R42): static indexers rejected (§23.5) ---
+    sema/static_indexer_747_test.cpp
     # --- end #747 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp

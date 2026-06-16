@@ -760,6 +760,25 @@ void Resolver::checkStaticClassMembers() {
     }
 }
 
+// §23.5 (#747 R42): static indexers are not supported — in ANY class or record,
+// not only static classes. A `static` indexer was silently accepted and then
+// miscompiled (the access lowered to garbage). Reject it at the declaration.
+void Resolver::checkStaticIndexers() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        for (Symbol* m : t->members) {
+            auto* ps = dynamic_cast<PropertySymbol*>(m);
+            if (ps && ps->isIndexer && hasMod(ps, "static")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "static indexers are not supported (§23.5)");
+            }
+        }
+    }
+}
+
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     auto reportInstance = [&](std::string_view kind,
                               std::string_view name) {
