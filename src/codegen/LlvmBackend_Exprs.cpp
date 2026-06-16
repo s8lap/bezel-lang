@@ -7638,11 +7638,42 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             // T field), not the struct — the bound name has type T. (The match
             // condition, hasValue, is computed in patternMatches.) An
             // unconstrained `var x` keeps the whole nullable value.
+            const sema::TypeRef* btyRef =
+                bp->type ? ctx_.resolvedType(*bp->type) : nullptr;
             if (bp->type && scrutTy && isNullableValueTy(scrutTy) &&
                 scrut->getType()->isStructTy()) {
                 llvm::Value* inner = nullablePrimValue(scrut);
                 llvm::AllocaInst* slot = entryAlloca(inner->getType());
                 builder_.CreateStore(inner, slot);
+                locals_[bp] = slot;
+            } else if (btyRef && isBoxableValueType(btyRef) &&
+                       scrut->getType()->isPointerTy()) {
+                // #746 / §19.3 / §8.6: a typed binding `var n: T` where T is a
+                // boxable VALUE type (int/bool/long/enum/record) over a BOXED
+                // reference scrutinee (`Object`/`Object?` — `scrut` is a box
+                // pointer) binds the UNBOXED value, not the raw box pointer.
+                // Without this, `n` was the box ptr, so arithmetic/branch/field
+                // access on it emitted ptr-vs-value IR (the IR_FAIL cluster) or
+                // GEP'd off the scrutinee slot (the record WRONG_VALUE case).
+                // The unbox is a payload deref (box + 2 words, like the `as`
+                // unbox); guard it on `pm` (the isa-check), which is true only
+                // when scrut is a non-null T — the binding store runs before the
+                // match branch, so an unguarded deref would fault on a null/
+                // mismatched scrutinee (a typed binding never matches null).
+                llvm::Type* valTy = lowerTypeRef(btyRef);
+                llvm::AllocaInst* slot = entryAlloca(valTy);
+                builder_.CreateStore(llvm::Constant::getNullValue(valTy), slot);
+                auto* ubBB = llvm::BasicBlock::Create(llvm_, "tb.unbox", currentFn_);
+                auto* ubContBB =
+                    llvm::BasicBlock::Create(llvm_, "tb.unbox.cont", currentFn_);
+                builder_.CreateCondBr(pm, ubBB, ubContBB);
+                builder_.SetInsertPoint(ubBB);
+                llvm::Value* payload = builder_.CreateGEP(
+                    ptrTy(), scrut, {builder_.getInt32(2)}, "tb.unbox.ptr");
+                builder_.CreateStore(
+                    builder_.CreateLoad(valTy, payload, "tb.unbox"), slot);
+                builder_.CreateBr(ubContBB);
+                builder_.SetInsertPoint(ubContBB);
                 locals_[bp] = slot;
             } else {
                 llvm::AllocaInst* slot = entryAlloca(scrut->getType());
@@ -8119,8 +8150,53 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // null (§19.5 holds trivially). The nullable VALUE-type
                 // scrutinee path is handled by the isNullableVal branch above
                 // and never reaches here.
-                if (rt->kind == sema::TypeRef::Kind::Primitive)
+                if (rt->kind == sema::TypeRef::Kind::Primitive) {
+                    bool scrutIsSamePrim =
+                        scrutTy &&
+                        scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                        scrutTy->primitive == rt->primitive && !scrutTy->nullable;
+                    // #746 / §19.3/§19.5: when the scrutinee is a BOXED reference
+                    // (`Object`/`Object?` — `scrut` is a box pointer, not the
+                    // primitive itself), the typed binding is a RUNTIME type-test
+                    // against the boxed primitive's descriptor, NOT an
+                    // unconditional match. Without this, `var n: int` matched ANY
+                    // boxed value (a string, a null) and the arm then unboxed
+                    // garbage / dereferenced null.
+                    if (!scrutIsSamePrim && scrut->getType()->isPointerTy())
+                        if (llvm::GlobalVariable* desc = boxDescriptorFor(rt)) {
+                            // A string in an Object is a vtable-less bz_string*;
+                            // emitIsA would fault walking it. A string is never a
+                            // boxed primitive, so short-circuit to false. (Guard
+                            // localized here, not in emitIsA: a cross-module class
+                            // mis-seen as a string by bz_obj_is_string still
+                            // yields the correct false for a primitive test — it
+                            // is not this primitive either way — so this does not
+                            // disturb exception/class dispatch that calls emitIsA
+                            // directly.)
+                            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+                            auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                                     {ptrTy(), ptrTy()});
+                            llvm::Value* isStr = builder_.CreateICmpNE(
+                                builder_.CreateCall(
+                                    isStrFn, {scrut, vtableTablePtr()}),
+                                builder_.getInt32(0));
+                            auto* doIsaBB = llvm::BasicBlock::Create(
+                                llvm_, "tb.isa", currentFn_);
+                            auto* joinBB = llvm::BasicBlock::Create(
+                                llvm_, "tb.isa.join", currentFn_);
+                            builder_.CreateCondBr(isStr, joinBB, doIsaBB);
+                            builder_.SetInsertPoint(doIsaBB);
+                            llvm::Value* isa = emitIsA(scrut, desc);
+                            llvm::BasicBlock* isaEnd = builder_.GetInsertBlock();
+                            builder_.CreateBr(joinBB);
+                            builder_.SetInsertPoint(joinBB);
+                            auto* phi = builder_.CreatePHI(i1(), 2);
+                            phi->addIncoming(builder_.getInt1(false), preBB);
+                            phi->addIncoming(isa, isaEnd);
+                            return phi;
+                        }
                     return builder_.getInt1(true);
+                }
             }
             return nullptr;  // type not found — deferred
         }
