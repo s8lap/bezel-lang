@@ -98,6 +98,8 @@ set(BEZEL_TEST_SOURCES
     sema/getter_only_property_747_test.cpp
     # --- fix #747 (R42): readonly field write via non-this receiver rejected (§22.8) ---
     sema/readonly_field_assignment_747_test.cpp
+    # --- fix #747 (R42): readonly auto-property assignable everywhere (§23.1) ---
+    sema/readonly_auto_property_747_test.cpp
     # --- end #747 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp

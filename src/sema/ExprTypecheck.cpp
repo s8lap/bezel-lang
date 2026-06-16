@@ -2149,10 +2149,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
             // §23.3 (#747 R42): assignment to a property with NO setter — an
             // expression-bodied property (`P: T => e;`) or a block-form property
-            // with only a getter — is rejected. Without this the write was
-            // silently accepted and dropped at runtime. (A plain AUTO property
-            // has an implicit setter; the readonly-AUTO-property case is a
-            // separate, churn-sensitive lane and is not handled here.)
+            // with only a getter — is rejected outright (no setter exists).
+            // §23.1 (#747 R42): a readonly AUTO-property has an implicit setter,
+            // but is assignable only in a field initializer or constructor (like
+            // a readonly field), so a write OUTSIDE a constructor is also
+            // rejected. Without these the write was silently accepted/dropped.
             if (as->target) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         as->target.get())) {
@@ -2170,12 +2171,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 for (const auto& acc : pd->accessors)
                                     if (acc.isSet) { hasSetter = true; break; }
                             }
+                            bool isReadonlyAuto = false;
+                            if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+                                for (auto mod : pd->modifiers)
+                                    if (mod == "readonly") {
+                                        isReadonlyAuto = true;
+                                        break;
+                                    }
                             if (!hasSetter) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
                                     "cannot assign to read-only property `" +
                                     std::string(ma->member) +
                                     "` — it has no setter (§23.3)");
+                            } else if (isReadonlyAuto && !inConstructor_) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, as->span.begin,
+                                    "cannot assign to readonly property `" +
+                                    std::string(ma->member) +
+                                    "` outside a field initializer or "
+                                    "constructor (§23.1)");
                             }
                         }
                     }
