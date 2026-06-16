@@ -4868,10 +4868,24 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
         }
         if (v->getType()->isFloatingPointTy())  // CG24: §6.3 IEEE negate
             return builder_.CreateFNeg(v);
-        // §6.1: unary negation overflows only at INT_MIN.
+        // §6.1: unary negation is checked for overflow.
         if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(1)) {
-            emitGuardThrow(builder_.CreateICmpEQ(v, minIntLike(v)),
-                           "OverflowException");
+            if (isUnsignedTargetExpr(*un.operand)) {
+                // #747 R42: on an UNSIGNED type the mathematical result of `-x`
+                // is negative, representable only when x == 0; any non-zero
+                // value overflows. (Previously this fell through to the signed
+                // INT_MIN check and silently wrapped, e.g. -uint(1) →
+                // uint.MaxValue instead of OverflowException.)
+                emitGuardThrow(
+                    builder_.CreateICmpNE(
+                        v, llvm::ConstantInt::get(v->getType(), 0)),
+                    "OverflowException");
+            } else {
+                // Signed: overflows only at INT_MIN (-INT_MIN is not
+                // representable).
+                emitGuardThrow(builder_.CreateICmpEQ(v, minIntLike(v)),
+                               "OverflowException");
+            }
         }
         return builder_.CreateNeg(v);
     }
