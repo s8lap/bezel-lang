@@ -468,31 +468,81 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // bound and the concrete arg resolve to a declaration — defer
                 // otherwise (built-in / generic-param / unresolved) to avoid
                 // false positives, mirroring Resolver::checkOneConstraint.
+                // #746 R41-C: classify a type-argument TypeRef as reference (1) /
+                // value (0) / unknown (-1) for the `class`/`value` kind
+                // constraints. Mirrors Resolver::categorize (so a class-kind
+                // value-builtin is treated as reference, consistent with the
+                // type-instantiation check). Function/inline-array/unit are
+                // value-ish per §14.2; an unresolved/Error arg is unknown (defer).
+                auto refKindOf = [&](const TypeRef* a) -> int {
+                    if (!a) return -1;
+                    switch (a->kind) {
+                        case TypeRef::Kind::Primitive:
+                            return (a->primitive == PrimitiveType::String ||
+                                    a->primitive == PrimitiveType::Object) ? 1 : 0;
+                        case TypeRef::Kind::Function: return 1;
+                        case TypeRef::Kind::InlineArray:
+                        case TypeRef::Kind::Unit: return 0;
+                        case TypeRef::Kind::Named:
+                            if (a->declaration) {
+                                auto k = a->declaration->kind;
+                                if (k == ast::TypeDeclKind::Class ||
+                                    k == ast::TypeDeclKind::Interface) return 1;
+                                if (k == ast::TypeDeclKind::Record ||
+                                    k == ast::TypeDeclKind::Enum) return 0;
+                            }
+                            return 1;  // built-in named (Array/IEnumerable/…) → ref
+                        default: return -1;  // Error/unresolved → defer
+                    }
+                };
+                auto argNameOf = [&](const TypeRef* a) -> std::string {
+                    if (a && a->declaration) return std::string(a->declaration->name);
+                    if (a && a->astNode && a->astNode->name &&
+                        !a->astNode->name->parts.empty())
+                        return std::string(a->astNode->name->parts.back());
+                    return "the type argument";
+                };
+                // §14.2 (#729 / #746 R41-C): enforce a generic METHOD's
+                // `where T: …` constraints at the CALL SITE. #729 covered only
+                // `type` (interface/class) bounds; the `class`/`value`/`notnull`
+                // KIND constraints were skipped (and a primitive arg, having no
+                // declaration, was dropped entirely) — `Clone<int>()` with
+                // `where T: class` was silently accepted (a soundness hole).
                 auto checkMethodGenericConstraints =
                     [&](const std::unordered_map<std::string_view,
                                                  TypeRef*>& subst) {
                         for (const auto& gc : md->genericConstraints) {
                             auto ai = subst.find(gc.typeParam);
-                            if (ai == subst.end() || !ai->second ||
-                                !ai->second->declaration)
-                                continue;
-                            TypeSymbol* argDecl = ai->second->declaration;
+                            if (ai == subst.end() || !ai->second) continue;
+                            TypeRef* argRef = ai->second;
+                            TypeSymbol* argDecl = argRef->declaration;  // may be null
+                            auto report = [&](const std::string& reason) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "type argument `" + argNameOf(argRef) +
+                                    "` does not satisfy the constraint `where " +
+                                    std::string(gc.typeParam) + ": " + reason +
+                                    "` (§14.2)");
+                            };
                             for (const auto& item : gc.items) {
-                                if (item.kind != "type" || !item.typeArg)
-                                    continue;
-                                TypeRef* bound =
-                                    ctx_.resolvedType(*item.typeArg);
-                                if (!bound || !bound->declaration) continue;
-                                if (!isSubtype(argDecl, bound->declaration)) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, ce.span.begin,
-                                        std::string("type argument `") +
-                                        std::string(argDecl->name) +
-                                        "` does not satisfy the constraint "
-                                        "`where " + std::string(gc.typeParam) +
-                                        ": " +
-                                        std::string(bound->declaration->name) +
-                                        "` (§14.2)");
+                                if (item.kind == "type" && item.typeArg) {
+                                    if (!argDecl) continue;  // defer: built-in/primitive bound match
+                                    TypeRef* bound =
+                                        ctx_.resolvedType(*item.typeArg);
+                                    if (!bound || !bound->declaration) continue;
+                                    if (!isSubtype(argDecl, bound->declaration))
+                                        report(std::string(
+                                            bound->declaration->name));
+                                } else if (item.kind == "class") {
+                                    // §14.2: non-nullable reference type only.
+                                    int r = refKindOf(argRef);
+                                    if (argRef->nullable || r == 0) report("class");
+                                } else if (item.kind == "value") {
+                                    // §14.2: non-nullable value type only.
+                                    int r = refKindOf(argRef);
+                                    if (argRef->nullable || r == 1) report("value");
+                                } else if (item.kind == "notnull") {
+                                    if (argRef->nullable) report("notnull");
                                 }
                             }
                         }

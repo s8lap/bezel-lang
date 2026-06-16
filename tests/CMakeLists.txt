@@ -85,6 +85,8 @@ set(BEZEL_TEST_SOURCES
     # --- end #743 ---
     # --- fix #746: R41 missing diagnostics (slice §15.6, try §31.2, interp §18.5) ---
     sema/r41_missing_diagnostics_746_test.cpp
+    # --- fix #746: generic-method class/value/notnull constraint at call site (§14.2) ---
+    sema/generic_method_constraint_callsite_746_test.cpp
     # --- end #746 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp
