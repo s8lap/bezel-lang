@@ -8014,9 +8014,26 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                         // the synthesized form, so (b1) misses it and the
                         // deserialized tree leaked under `using var` (found by
                         // the t2/t3 ASan round-trip probes, 2026-06-12).
+                        // §4.11 (#746 R41-F): OwnedStack.Pop() /
+                        // OwnedQueue.Dequeue() transfer the owned element to the
+                        // caller, exactly like PopLast/PopFirst. Gate on the
+                        // OWNING receiver — a borrowing Stack/Queue returns a
+                        // BORROW, and disposing that would double-free.
+                        bool ownedPopDequeue = false;
+                        if ((nm == "Pop" || nm == "Dequeue") && ma->target) {
+                            const sema::TypeRef* rt =
+                                ctx_.exprType(*ma->target);
+                            std::string_view rcn =
+                                (rt && rt->astNode && rt->astNode->name &&
+                                 !rt->astNode->name->parts.empty())
+                                    ? rt->astNode->name->parts[0]
+                                    : std::string_view{};
+                            ownedPopDequeue =
+                                rcn == "OwnedStack" || rcn == "OwnedQueue";
+                        }
                         if (nm == "PopLast" || nm == "PopFirst" ||
                             nm == "PopAt"   || nm == "PopValue" ||
-                            nm == "Deserialize") {
+                            nm == "Deserialize" || ownedPopDequeue) {
                             // Only register if the element class has a disposer
                             // (vtable slot 2 non-null).  Interface-typed results
                             // always dispatch dynamically and always have a vtable,
