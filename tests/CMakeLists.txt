@@ -94,6 +94,8 @@ set(BEZEL_TEST_SOURCES
     sema/const_assignment_747_test.cpp
     # --- fix #747 (R42): static indexers rejected (§23.5) ---
     sema/static_indexer_747_test.cpp
+    # --- fix #747 (R42): assignment to a setterless property rejected (§23.3) ---
+    sema/getter_only_property_747_test.cpp
     # --- end #747 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp

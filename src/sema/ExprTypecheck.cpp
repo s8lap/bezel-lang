@@ -2147,6 +2147,40 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // §23.3 (#747 R42): assignment to a property with NO setter — an
+            // expression-bodied property (`P: T => e;`) or a block-form property
+            // with only a getter — is rejected. Without this the write was
+            // silently accepted and dropped at runtime. (A plain AUTO property
+            // has an implicit setter; the readonly-AUTO-property case is a
+            // separate, churn-sensitive lane and is not handled here.)
+            if (as->target) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        as->target.get())) {
+                    if (auto* ps = dynamic_cast<PropertySymbol*>(
+                            ctx_.exprSymbol(*as->target))) {
+                        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                                ps->decl)) {
+                            bool hasSetter = true;
+                            if (pd->bodyKind ==
+                                ast::PropertyBodyKind::Expression) {
+                                hasSetter = false;
+                            } else if (pd->bodyKind ==
+                                       ast::PropertyBodyKind::Block) {
+                                hasSetter = false;
+                                for (const auto& acc : pd->accessors)
+                                    if (acc.isSet) { hasSetter = true; break; }
+                            }
+                            if (!hasSetter) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, as->span.begin,
+                                    "cannot assign to read-only property `" +
+                                    std::string(ma->member) +
+                                    "` — it has no setter (§23.3)");
+                            }
+                        }
+                    }
+                }
+            }
             // Slice S7: readonly field assignment outside a ctor.
             checkReadonlyAssignment(*as);
             // Slice T2: plain `:=` assignment must be primitive-
