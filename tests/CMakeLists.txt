@@ -562,6 +562,8 @@ set(BEZEL_TEST_SOURCES
     # --- end #743 ---
     # --- fix #746: case typed-binding unbox over Object? (R41 A, §19.3/§8.6) ---
     codegen/case_typed_binding_unbox_746_test.cpp
+    # --- fix #746: implicit numeric conversions (R41 H/I, §5.1) ---
+    codegen/implicit_numeric_conv_746_test.cpp
     # --- end #746 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp

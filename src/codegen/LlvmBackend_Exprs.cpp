@@ -7076,6 +7076,29 @@ llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
         srcTy->getIntegerBitWidth() < targetTy->getIntegerBitWidth())
         return srcUnsigned ? builder_.CreateZExt(v, targetTy)
                            : builder_.CreateSExt(v, targetTy);
+    // int → decimal (§5.1, #746 R41-I): an IMPLICIT integer-to-decimal widening
+    // (`var m: decimal := i;`) must use the same runtime conversion the explicit
+    // `decimal(i)` cast does (emitIntToDecimal), not a raw store of the integer
+    // bits into the 16-byte decimal struct (which produced a misrepresented
+    // value that failed equality with a decimal literal).
+    if (srcTy->isIntegerTy() && !srcTy->isIntegerTy(1) &&
+        targetTy == decimalStructType()) {
+        using P = sema::PrimitiveType;
+        llvm::Value* iv = v;
+        P sp;
+        unsigned bw = srcTy->getIntegerBitWidth();
+        if (bw <= 32) {
+            if (bw < 32)
+                iv = srcUnsigned ? builder_.CreateZExt(v, i32())
+                                 : builder_.CreateSExt(v, i32());
+            sp = srcUnsigned ? P::UInt : P::Int;
+        } else {
+            sp = srcUnsigned ? P::ULong : P::Long;
+        }
+        llvm::AllocaInst* out = entryAlloca(decimalStructType());
+        emitIntToDecimal(iv, sp, out);
+        return builder_.CreateLoad(decimalStructType(), out);
+    }
     return v;  // no §5.1 numeric widening applies — leave the value as is.
 }
 

@@ -868,6 +868,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     ctx_.resolvedType(*currentReturnTypeNode_))
                 v = coerceReturnToNullableValue(v, declRet);
         }
+        // §5.1 (#746 R41-H): a numeric return value narrower than the declared
+        // return type is implicitly widened (e.g. `return arr[0]` where
+        // arr: Array<byte> in an int-returning method, or `return aByte`).
+        // Without this the bare i8/i16 was `ret`'d into a wider integer function
+        // (IR-verify failure). coerceNumericToType is a no-op for ptr/struct
+        // returns and for an already-matching width.
+        if (v && rs->value && currentFn_ &&
+            !currentFn_->getReturnType()->isVoidTy())
+            v = coerceNumericToType(v, currentFn_->getReturnType(),
+                                    isUnsignedTargetExpr(*rs->value));
         // §28.3 ownership transfer: if the return expression is a bare
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before
