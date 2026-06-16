@@ -574,6 +574,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #746: AsSpan(Range) endpoint (R41 J, §4.14) ---
     codegen/asspan_range_746_test.cpp
     # --- end #746 ---
+    # --- fix #747 (R42 #0): static field via instance receiver crashed codegen (§22.12) ---
+    codegen/static_field_via_instance_747_test.cpp
+    # --- end #747 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp
     # --- end #677 ---

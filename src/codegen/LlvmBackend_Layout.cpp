@@ -2224,6 +2224,20 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         classStruct(ms->parent);
         idxIt = fieldIndex_.find(ms);
     }
+    if (idxIt == fieldIndex_.end()) {
+        // §22.12 / #213 / #747: a STATIC field (or static auto-property) has no
+        // slot in the instance struct, so its FieldSymbol is absent from
+        // fieldIndex_ even after classStruct() repopulates it. Return nullptr so
+        // the caller falls through to staticFieldGlobal(), which reads/writes the
+        // program-lifetime backing global — exactly the path a qualified
+        // `Type._x` access already takes (the read in LlvmBackend_Exprs.cpp and
+        // the write in lvalueAddr both have that fallback). Without this guard
+        // the `idxIt->second` dereferences below run off end() and SIGSEGV the
+        // compiler on an instance-receiver static access (e.g. `c._x` where
+        // `_x: int` is `public static`).
+        genericSubst_ = std::move(savedSubst);
+        return nullptr;
+    }
     llvm::StructType* st = classStruct(ms->parent);
     genericSubst_ = std::move(savedSubst);
     // CG29: a record is a first-class struct value, not a pointer. To take
