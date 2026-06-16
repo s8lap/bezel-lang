@@ -1083,14 +1083,14 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
         return;
     }
     if (inConstructor_) return;
-    if (!as.target) return;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as.target.get());
-    if (!ma) return;
-    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!tid || tid->name != "this") return;
-    if (!currentType_) return;
-    Symbol* m = lookupMember(currentType_, ma->member);
-    auto* fs = dynamic_cast<FieldSymbol*>(m);
+    // §22.8 (#747 R42): a readonly field may be assigned only in a field
+    // initializer or a constructor body; assignment anywhere else is a compile
+    // error. Resolve the target's field symbol directly so EVERY receiver shape
+    // is covered — `this.f`, `c.f`, `Type.f`, and a bare `f`. The previous check
+    // matched only `this.f`, so an instance- or type-qualified readonly write
+    // (e.g. `Config.MaxSize := 50` in a normal method) slipped through and was
+    // silently dropped at runtime.
+    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*as.target));
     if (!fs) return;
     // Check the readonly modifier on the field's MemberSymbol.
     for (auto mod : fs->modifiers) {
