@@ -83,6 +83,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #743: §21.9 owned-value discard-as-statement is an error ---
     sema/owned_discard_stmt_743_test.cpp
     # --- end #743 ---
+    # --- fix #746: R41 missing diagnostics (slice §15.6, try §31.2, interp §18.5) ---
+    sema/r41_missing_diagnostics_746_test.cpp
+    # --- end #746 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp
     sema/member_access_resolution_test.cpp

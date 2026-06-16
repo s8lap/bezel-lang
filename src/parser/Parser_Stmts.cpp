@@ -330,6 +330,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     // TryStmt (A.6). Slice 22 covers the binding catch arm only —
     // `catch var Identifier : Type => Statement` — plus optional finally.
     if (isKeyword("try")) {
+        auto tryLoc = current_.location;  // for the §31.2 diagnostic below
         advance(); // past `try`
         auto stmt = std::make_unique<ast::TryStmt>();
         while (!isKeyword("catch") && !isKeyword("finally") &&
@@ -548,6 +549,13 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         if (!consumeKeyword("end")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'try' statement");
+        }
+        // §31.2 (#746 R41-G): "At least one of catch or finally must be
+        // present." A bare `try ... end;` with neither was silently accepted.
+        if (stmt->catches.empty() && !stmt->hasFinally) {
+            diagnostics_.report(Severity::Error, tryLoc,
+                                "a `try` statement must have at least one "
+                                "`catch` arm or a `finally` block (§31.2)");
         }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,

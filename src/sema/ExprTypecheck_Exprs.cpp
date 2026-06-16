@@ -556,8 +556,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) {
             if (auto* tt = ctx_.exprType(*ix->target)) {
-                if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement)
+                if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement) {
+                    // §15.6 (#746 R41-E): "Slicing is not supported on inline
+                    // arrays in this version." A range index on an inline array
+                    // otherwise reached codegen and emitted a `%bz.range` struct
+                    // as a GEP index (malformed IR); reject it cleanly here.
+                    if (!ix->indices.empty() && ix->indices[0].value &&
+                        dynamic_cast<const ast::RangeExpr*>(
+                            ix->indices[0].value.get()))
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin,
+                            "range slicing `[a..b]` is not supported on inline "
+                            "array types `[N]T` (§15.6)");
                     ctx_.setExprType(&e, tt->arrayElement);
+                }
                 else if (tt->kind == TypeRef::Kind::Primitive &&
                          tt->primitive == PrimitiveType::String) {
                     // §3.4 / §4.6 / issue #474: a string indexer distinguishes
@@ -637,6 +649,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             !ix->indices.empty() && ix->indices[0].value &&
                             dynamic_cast<const ast::RangeExpr*>(
                                 ix->indices[0].value.get()) != nullptr;
+                        // §15.6 (#746 R41-E): range slicing produces a NEW Array<T>
+                        // of copied references; it is admitted only on Array<T>.
+                        // "Slicing is not admitted on OwnedArray<T>" — the
+                        // copy-returning semantics would manufacture a second
+                        // owner for each owned element. Reject it instead of
+                        // silently typing the (miscompiled) result as the element.
+                        if (isRangeIdx && cn == "OwnedArray")
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "range slicing `[a..b]` is not admitted on "
+                                "`OwnedArray<T>` — it would manufacture a second "
+                                "owner for each owned element (§15.6)");
                         if (isRangeIdx && cn == "Array")
                             ctx_.setExprType(&e, tt);
                         else

@@ -143,6 +143,23 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                     }
                 }
             }
+            // §18.5 (#746 R41-G): `{expression}` requires an expression; an
+            // empty hole `{}` (or whitespace-only / `{:FORMAT}` with no
+            // expression) was silently accepted as an empty contribution,
+            // masking a missing-expression typo. Reject it.
+            {
+                bool blank = true;
+                for (char bc : actualExpr)
+                    if (!std::isspace(static_cast<unsigned char>(bc))) {
+                        blank = false;
+                        break;
+                    }
+                if (blank)
+                    diagnostics_.report(
+                        Severity::Error, e.span.begin,
+                        "empty interpolation hole — `{...}` requires an "
+                        "expression (§18.5)");
+            }
             if (!actualExpr.empty()) {
                 // Heap-allocate the source string so string_views inside the
                 // sub-parsed expression AST remain valid through vector moves
