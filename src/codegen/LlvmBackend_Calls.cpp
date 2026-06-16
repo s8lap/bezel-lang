@@ -6583,10 +6583,59 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return ok;
     }
 
+    // int.Parse(s, radix): base-N integer parse (§5.2). The two-argument form
+    // reaches this primitive handler via the lowercase keyword receiver; without
+    // it the call was dropped and the result read an uninitialized slot
+    // (#747 R42). strtol with the given base, narrowed to the target width.
+    if (m == "Parse" && call.args.size() == 2 && call.args[0].value &&
+        call.args[1].value) {
+        auto* argTy = ctx_.exprType(*call.args[0].value);
+        if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+            argTy->primitive == P::String &&
+            (pt == P::Int || pt == P::UInt || pt == P::Short ||
+             pt == P::UShort || pt == P::Byte || pt == P::SByte ||
+             pt == P::Long || pt == P::ULong)) {
+            llvm::Value* sArg = lowerExpr(*call.args[0].value);
+            llvm::Value* radix = lowerExpr(*call.args[1].value);
+            if (!sArg || !radix) return nullptr;
+            llvm::Value* data = loadStringData(sArg);
+            // radix is `int` (i32) — strtol's `base` parameter.
+            if (!radix->getType()->isIntegerTy(32))
+                radix = builder_.CreateTrunc(radix, i32());
+            auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
+            llvm::Value* r = builder_.CreateCall(
+                strtolFn,
+                {data, llvm::ConstantPointerNull::get(ptrTy()), radix});
+            llvm::Type* tt = lowerPrimitive(pt);
+            return tt->isIntegerTy(64) ? r : builder_.CreateTrunc(r, tt);
+        }
+    }
+
     // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
     if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
+        // #747 R42: `decimal.Parse(s)` reaches this primitive handler via the
+        // lowercase keyword receiver (pt==Decimal). Route it to bz_decimal_parse
+        // exactly like `Decimal.Parse` (§6.4 / fix #521); without this it fell
+        // through to `return arg`, handing back the string pointer as a decimal
+        // struct and crashing codegen with an IntegerType cast assertion.
+        if (pt == P::Decimal) {
+            llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+            auto vt = [&](const char* n) -> llvm::Value* {
+                auto it = builtinVtable_.find(n);
+                if (it == builtinVtable_.end())
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                return it->second;
+            };
+            auto* fn = declareC("bz_decimal_parse",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(
+                fn, {arg, slot, vt("OverflowException"), vt("FormatException")});
+            emitPendingCheck();
+            return builder_.CreateLoad(decimalStructType(), slot, "dec.parsed");
+        }
         // If the argument is a string, use atoi/atoll/atof.
         auto* argTy = ctx_.exprType(*call.args[0].value);
         if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&

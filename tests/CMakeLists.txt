@@ -585,6 +585,8 @@ set(BEZEL_TEST_SOURCES
     codegen/char_minmax_747_test.cpp
     # --- fix #747 (R42 WRONG_VALUE): unary negation of unsigned must overflow (§6.1) ---
     codegen/unsigned_negate_747_test.cpp
+    # --- fix #747 (R42): int.Parse(s,radix) dropped + decimal.Parse keyword crash ---
+    codegen/parse_overloads_747_test.cpp
     # --- end #747 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp
