@@ -2191,6 +2191,49 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     std::string(ma->member) +
                                     "` outside a field initializer or "
                                     "constructor (§23.1)");
+                            } else if (hasSetter) {
+                                // §13.6 (#747 R42): a property write must respect
+                                // the SETTER accessor's visibility, which may be
+                                // more restrictive than the property's (e.g.
+                                // `private set`). Compute the setter's effective
+                                // visibility and apply the §13.1 access rules;
+                                // without this a `private set` was writable from
+                                // any class.
+                                ast::Visibility sv = pd->visibility;
+                                if (pd->bodyKind ==
+                                    ast::PropertyBodyKind::Block) {
+                                    for (const auto& acc : pd->accessors)
+                                        if (acc.isSet &&
+                                            acc.visibility !=
+                                                ast::Visibility::None) {
+                                            sv = acc.visibility;
+                                            break;
+                                        }
+                                } else if (pd->bodyKind ==
+                                               ast::PropertyBodyKind::Auto &&
+                                           pd->hasAutoAccessorVis &&
+                                           pd->autoAccessorIsSet) {
+                                    sv = pd->autoAccessorVis;
+                                }
+                                TypeSymbol* declaring = ps->parent;
+                                bool bad = false;
+                                if (sv == ast::Visibility::Private)
+                                    bad = (currentType_ != declaring);
+                                else if (sv == ast::Visibility::Protected)
+                                    bad = !(currentType_ == declaring ||
+                                            (currentType_ &&
+                                             isSubtype(currentType_,
+                                                       declaring)));
+                                else if (sv == ast::Visibility::Internal)
+                                    bad = ctx_.isImported(ps);
+                                if (bad) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, as->span.begin,
+                                        "cannot assign to property `" +
+                                        std::string(ma->member) +
+                                        "` — its setter is not accessible "
+                                        "here (§13.6)");
+                                }
                             }
                         }
                     }

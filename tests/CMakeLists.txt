@@ -100,6 +100,8 @@ set(BEZEL_TEST_SOURCES
     sema/readonly_field_assignment_747_test.cpp
     # --- fix #747 (R42): readonly auto-property assignable everywhere (§23.1) ---
     sema/readonly_auto_property_747_test.cpp
+    # --- fix #747 (R42): private setter not enforced at use site (§13.6) ---
+    sema/private_setter_747_test.cpp
     # --- end #747 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp
