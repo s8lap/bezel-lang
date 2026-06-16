@@ -32,6 +32,15 @@ bool hasGroupError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// §25.1: a forbidden-operator overload (e.g. `not`) diagnostic.
+bool hasForbiddenError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("may not be overloaded") != std::string::npos &&
+            d.message.find("25.1") != std::string::npos)
+            return true;
+    return false;
+}
+
 const char* kRec = "module M; record V(n: int) ";
 
 }  // namespace
@@ -89,4 +98,24 @@ BEZEL_TEST(operator_groups_746, additive_operator_alone_ok) {
         "end V; class F public static method Main(): int return 0; end Main; "
         "end F;");
     BEZEL_EXPECT_FALSE(hasGroupError(r));
+}
+
+// §25.1: `operator not` may not be overloaded — rejected.
+BEZEL_TEST(operator_groups_746, operator_not_forbidden) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator not(a: V): bool => a.n = 0; "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasForbiddenError(r));
+}
+
+// §25.1: `operator ~` (bitwise complement) IS overloadable — no error.
+BEZEL_TEST(operator_groups_746, operator_complement_allowed) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator ~(a: V): V => new V(0 - a.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasForbiddenError(r));
 }

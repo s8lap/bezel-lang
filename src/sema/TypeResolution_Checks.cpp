@@ -797,6 +797,18 @@ void Resolver::checkOperatorGroups() {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms || !ms->isOperator) continue;
             std::string_view tok = ms->operatorToken;
+            // §25.1 (#746 R41): operators excluded from the overload set. `not`
+            // is boolean negation (use a named `.Negate()` or overload `~`); the
+            // null-aware / type-test / range operators have language-fixed
+            // semantics. These were silently accepted as overload declarations.
+            if (tok == "not" || tok == "!" || tok == "??" || tok == "is" ||
+                tok == "as" || tok == ".." || tok == "..<") {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "operator `" + std::string(tok) +
+                    "` may not be overloaded (§25.1)");
+                continue;
+            }
             if (tok == "<" || tok == ">" || tok == "<=" || tok == ">=") {
                 if (!cmpFirst) cmpFirst = m;
                 if (tok == "<") lt = true;
