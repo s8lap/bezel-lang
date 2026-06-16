@@ -646,3 +646,15 @@ target_link_options(bezel_tests PRIVATE
     -Wl,--export-dynamic)
 
 add_test(NAME bezel_tests COMMAND bezel_tests)
+
+# Fast full-suite run: the single bezel_tests binary honours
+# BEZEL_SHARD_COUNT / BEZEL_SHARD_INDEX (test_main.cpp) to run a disjoint subset,
+# so run_parallel.sh launches one process per core and runs the whole suite in a
+# fraction of the serial wall-clock (≈186s serial → ≈25s on 16 shards) while
+# still executing every test. This is the blessed way to run the full suite for
+# a merge gate:  cmake --build build --target check
+add_custom_target(check
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel.sh
+    DEPENDS bezel_tests
+    USES_TERMINAL
+    COMMENT "Running full test suite in parallel shards (run_parallel.sh)")

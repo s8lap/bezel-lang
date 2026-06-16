@@ -52,6 +52,9 @@ endif()
 #    (shared ~/.ccache), so a fresh worktree's "clean" build is mostly cache
 #    hits — the single biggest win for parallel lanes. Install with
 #    `sudo dnf install ccache`; CMake picks it up automatically on reconfigure.
+#    NOTE: LLVM-heavy objects are large, so the default 5G cache thrashes (it
+#    evicts faster than it reuses). Raise it once with `ccache -M 40G` — this is
+#    machine-local config (~/.config/ccache/ccache.conf), not tracked here.
 #  * lld: a much faster linker than the default bfd/gold for the 60M test
 #    binary, which is relinked on every change.
 find_program(BEZEL_CCACHE ccache)
@@ -64,6 +67,18 @@ find_program(BEZEL_LLD ld.lld)
 if(BEZEL_LLD)
     add_link_options(-fuse-ld=lld)
     message(STATUS "Bezel: using lld linker")
+endif()
+#  * split DWARF: the RelWithDebInfo build carries full `-g` debug info, and
+#    everything links statically into one 300M+ test binary that is relinked on
+#    every change. With -gsplit-dwarf the debug info goes into separate .dwo
+#    files the linker does NOT touch, so links are far faster and the binary far
+#    smaller, with no loss of debuggability (gdb reads the .dwo in place). Gated
+#    on a debug-info build type and clang/gcc support, like the accelerators
+#    above; a plain Release build is unaffected.
+if(CMAKE_BUILD_TYPE MATCHES "Deb" AND
+   (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
+    add_compile_options(-gsplit-dwarf)
+    message(STATUS "Bezel: using split DWARF (-gsplit-dwarf)")
 endif()
 
 # --- LLVM (codegen backend) -------------------------------------------------
