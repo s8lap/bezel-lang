@@ -128,6 +128,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkConstTypes();
     // Slice S32: enum member restrictions (§10.5).
     checkEnumRestrictions();
+    // §14.2 (#746): contradictory generic constraints (e.g. class + value).
+    checkGenericConstraintConsistency();
     // Slice S33: method body-presence rules (§12.5 / §11.2).
     checkMethodBodies();
     // Slice S34: static members may not be virtual (§12.1).

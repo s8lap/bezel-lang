@@ -119,6 +119,11 @@ private:
     // fields and static methods are permitted (§10.4).
     void checkEnumRestrictions();
 
+    // §14.2 (#746): a type parameter may not carry contradictory constraints
+    // (e.g. both `class` and `value`). Checked once per generic declaration
+    // (type + method `where` clauses), independent of instantiation.
+    void checkGenericConstraintConsistency();
+
     // Slice S30 (§22.12): a `const` declaration requires a primitive
     // value type or `string`. Object, named types, arrays, functions,
     // and unit are rejected. Only the explicit-ascription case is

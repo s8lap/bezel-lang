@@ -96,3 +96,45 @@ BEZEL_TEST(method_constraint_callsite_746, int_satisfies_value) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
+
+// ---------------------------------------------------------------------------
+// §14.2 (#746): contradictory constraint combinations (`class` + `value`) are
+// compile errors — checked at the DECLARATION, independent of instantiation.
+// ---------------------------------------------------------------------------
+
+namespace {
+bool hasContradictionError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("contradictory constraints") != std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// §14.2: a generic TYPE with `where T: class, value` is rejected (even though
+// it is never instantiated).
+BEZEL_TEST(method_constraint_callsite_746, contradictory_type_constraint) {
+    auto r = parseSemaAll(
+        "module M; class Foo<T> where T: class, value end Foo; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasContradictionError(r));
+}
+
+// §14.2: a generic METHOD with `where T: class, value` is rejected.
+BEZEL_TEST(method_constraint_callsite_746, contradictory_method_constraint) {
+    auto r = parseSemaAll(
+        "module M; static class F "
+        "  public static method Do<T>(v: T): int where T: class, value "
+        "    return 0; end Do; "
+        "end F; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasContradictionError(r));
+}
+
+// §14.2: a single (non-contradictory) constraint is accepted.
+BEZEL_TEST(method_constraint_callsite_746, single_constraint_ok) {
+    auto r = parseSemaAll(
+        "module M; class Foo<T> where T: class end Foo; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasContradictionError(r));
+}

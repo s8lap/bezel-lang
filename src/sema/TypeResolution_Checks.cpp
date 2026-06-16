@@ -336,6 +336,41 @@ void Resolver::checkEnumRestrictions() {
     }
 }
 
+void Resolver::checkGenericConstraintConsistency() {
+    if (!ctx_.module()) return;
+    // §14.2: "Contradictory constraint combinations (e.g. class, value) are
+    // compile errors." Check each generic declaration's `where` clauses once,
+    // independent of instantiation (an un-instantiated generic was never
+    // checked by the per-instantiation checkGenericConstraints).
+    auto checkList =
+        [&](const std::vector<ast::GenericConstraint>& gcs, SourceLocation loc) {
+            // Per type-parameter: does it require both `class` and `value`?
+            std::unordered_map<std::string_view, std::pair<bool, bool>> kinds;
+            for (const auto& gc : gcs)
+                for (const auto& item : gc.items) {
+                    if (item.kind == "class") kinds[gc.typeParam].first = true;
+                    else if (item.kind == "value") kinds[gc.typeParam].second = true;
+                }
+            for (const auto& kv : kinds)
+                if (kv.second.first && kv.second.second)
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "contradictory constraints on type parameter `" +
+                        std::string(kv.first) +
+                        "`: `class` and `value` cannot both be required (§14.2)");
+        };
+    for (Symbol* child : ctx_.module()->children) {
+        auto* ts = dynamic_cast<TypeSymbol*>(child);
+        if (!ts || !ts->decl) continue;
+        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+        if (!td) continue;
+        checkList(td->genericConstraints, td->span.begin);
+        for (const auto& m : td->members)
+            if (auto* mdl = dynamic_cast<const ast::MethodDecl*>(m.get()))
+                checkList(mdl->genericConstraints, mdl->span.begin);
+    }
+}
+
 void Resolver::checkConstTypes() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
