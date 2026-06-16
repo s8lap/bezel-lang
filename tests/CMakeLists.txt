@@ -576,6 +576,8 @@ set(BEZEL_TEST_SOURCES
     # --- end #746 ---
     # --- fix #747 (R42 #0): static field via instance receiver crashed codegen (§22.12) ---
     codegen/static_field_via_instance_747_test.cpp
+    # --- fix #747 (R42 IR_FAIL): `return` in a sync iterator → §29.5 diagnostic ---
+    codegen/iterator_return_747_test.cpp
     # --- end #747 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp

@@ -602,6 +602,23 @@ void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
 // The "every exit path returns" coverage rule needs flow analysis
 // and is left to a definite-return slice.
 void ExprTC::checkReturnForm(const ast::ReturnStmt& rs) {
+    // §29.5 (#721, #747): a method that uses `yield` is an iterator and may not
+    // use plain `return` AT ALL — neither `return;` nor `return expr;`. Use
+    // `yield break;` to end iteration. Checked up front because the per-context
+    // §21.7 rules below otherwise (a) misreport a sync iterator's `return;` as
+    // "must provide a value", and (b) MISS a sync iterator's `return expr;`
+    // entirely — a sync iterator returns IEnumerable<T> (a ValueMethod ctx that
+    // accepts a value), so the value-carrying return slipped through to codegen
+    // and emitted malformed IR (#747 R42). inIteratorMethod_ is cleared inside
+    // nested lambda bodies (ExprTypecheck_Exprs.cpp), so a lambda's own `return`
+    // here is unaffected.
+    if (inIteratorMethod_) {
+        ctx_.diagnostics().report(
+            Severity::Error, rs.span.begin,
+            "an iterator method cannot use `return` — use `yield break;` to "
+            "end iteration (§29.5)");
+        return;
+    }
     switch (returnCtx_) {
         case ReturnCtx::None:
             return;
@@ -622,18 +639,9 @@ void ExprTC::checkReturnForm(const ast::ReturnStmt& rs) {
             }
             return;
         case ReturnCtx::VoidMethod:
-            // §29.5 (#721): an iterator method cannot use plain `return;` — use
-            // `yield break`. A sync iterator returns IEnumerable<T> (a
-            // ValueMethod ctx) so §21.7 already rejects a bare return; an ASYNC
-            // iterator returns IAsyncEnumerable<T> (this VoidMethod ctx), so
-            // without this the plain return slipped through and HUNG at runtime.
-            if (inIteratorMethod_ && !rs.value) {
-                ctx_.diagnostics().report(
-                    Severity::Error, rs.span.begin,
-                    "an iterator method cannot use plain `return;` — use "
-                    "`yield break;` to end iteration (§29.5)");
-                return;
-            }
+            // Iterator returns are rejected up front (§29.5); here only the
+            // §21.7 "no return type — `return` may not carry a value" rule
+            // remains for ordinary void methods.
             if (rs.value) {
                 ctx_.diagnostics().report(
                     Severity::Error, rs.span.begin,
