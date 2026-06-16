@@ -779,6 +779,51 @@ void Resolver::checkStaticIndexers() {
     }
 }
 
+// §25.2 (#746 R41): comparison operators must be overloaded as a complete group
+// — `<`, `>`, `<=`, `>=` together; `=` and `<>` together. A partial group was
+// silently accepted, and then using a missing member (`v1 <= v2` with only
+// `<`/`>` declared) fell through to a struct-level `icmp` → malformed IR. Reject
+// the incomplete group at the declaration so the downstream IR_FAIL can't arise.
+void Resolver::checkOperatorGroups() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        bool lt = false, gt = false, le = false, ge = false;
+        bool eq = false, ne = false;
+        Symbol* cmpFirst = nullptr;
+        Symbol* eqFirst = nullptr;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || !ms->isOperator) continue;
+            std::string_view tok = ms->operatorToken;
+            if (tok == "<" || tok == ">" || tok == "<=" || tok == ">=") {
+                if (!cmpFirst) cmpFirst = m;
+                if (tok == "<") lt = true;
+                else if (tok == ">") gt = true;
+                else if (tok == "<=") le = true;
+                else ge = true;
+            } else if (tok == "=" || tok == "<>") {
+                if (!eqFirst) eqFirst = m;
+                if (tok == "=") eq = true;
+                else ne = true;
+            }
+        }
+        if (cmpFirst && !(lt && gt && le && ge)) {
+            ctx_.diagnostics().report(
+                Severity::Error, cmpFirst->declLoc,
+                "comparison operators must be overloaded as a complete group: "
+                "`<`, `>`, `<=`, `>=` together (§25.2)");
+        }
+        if (eqFirst && !(eq && ne)) {
+            ctx_.diagnostics().report(
+                Severity::Error, eqFirst->declLoc,
+                "the equality operators `=` and `<>` must be overloaded together "
+                "(§25.2)");
+        }
+    }
+}
+
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     auto reportInstance = [&](std::string_view kind,
                               std::string_view name) {

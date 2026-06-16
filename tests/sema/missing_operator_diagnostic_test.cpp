@@ -183,9 +183,13 @@ BEZEL_TEST(sema_missing_op, class_owns_operator_plus_no_error_spec_25) {
 BEZEL_TEST(sema_missing_op, class_owns_operator_lt_no_error_spec_25) {
     auto r = parseSema(
         "module M; "
+        // §25.2: comparison operators are declared as a complete group.
         "class V "
         "  public X: int := 0; "
         "  public static method operator <(a: V, b: V): bool => a.X < b.X; "
+        "  public static method operator >(a: V, b: V): bool => a.X > b.X; "
+        "  public static method operator <=(a: V, b: V): bool => a.X <= b.X; "
+        "  public static method operator >=(a: V, b: V): bool => a.X >= b.X; "
         "end V; "
         "class C public static method M(a: V, b: V): bool "
         "  return a < b; "
@@ -323,8 +327,12 @@ BEZEL_TEST(sema_missing_op, record_relational_without_overload_25_2) {
 // CONTROL: a declared relational overload (`<`) IS usable — no error.
 BEZEL_TEST(sema_missing_op, record_declared_relational_ok_25_2) {
     auto r = parseSema(
+        // §25.2: comparison operators are declared as a complete group.
         "module P; record Val(N: int) "
         "  public static method operator <(a: Val, b: Val): bool => a.N < b.N; "
+        "  public static method operator >(a: Val, b: Val): bool => a.N > b.N; "
+        "  public static method operator <=(a: Val, b: Val): bool => a.N <= b.N; "
+        "  public static method operator >=(a: Val, b: Val): bool => a.N >= b.N; "
         "end Val; "
         "class M public static method Main(): int "
         "  var v1 := new Val(5); var v2 := new Val(10); "

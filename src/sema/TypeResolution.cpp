@@ -112,6 +112,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticClassMembers();
     // §23.5 (#747): static indexers are not supported (any type).
     checkStaticIndexers();
+    // §25.2 (#746): comparison/equality operators must form a complete group.
+    checkOperatorGroups();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
     // Slice S19: overloads must differ in signature.

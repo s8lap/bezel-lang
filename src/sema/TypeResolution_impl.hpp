@@ -205,6 +205,7 @@ private:
     // are implicitly static), and nested types are permitted.
     void checkStaticClassMembers();
     void checkStaticIndexers();  // §23.5: static indexers are not supported
+    void checkOperatorGroups();  // §25.2: comparison/equality operator groups
 
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 

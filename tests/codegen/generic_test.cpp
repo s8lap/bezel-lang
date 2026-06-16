@@ -424,6 +424,10 @@ BEZEL_TEST(codegen_generic, user_defined_operator_eq_class) {
         "  public static method operator =(a: V, b: V): bool "
         "    return a.X = b.X and a.Y = b.Y; "
         "  end operator =; "
+        // §25.2: `=` and `<>` must be declared together.
+        "  public static method operator <>(a: V, b: V): bool "
+        "    return a.X <> b.X or a.Y <> b.Y; "
+        "  end operator <>; "
         "  destructor end destructor; "
         "end V; "
         "class Program "

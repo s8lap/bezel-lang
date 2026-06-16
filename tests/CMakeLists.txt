@@ -87,6 +87,8 @@ set(BEZEL_TEST_SOURCES
     sema/r41_missing_diagnostics_746_test.cpp
     # --- fix #746: generic-method class/value/notnull constraint at call site (§14.2) ---
     sema/generic_method_constraint_callsite_746_test.cpp
+    # --- fix #746 (R41 C): operator-overload group completeness (§25.2) ---
+    sema/operator_groups_746_test.cpp
     # --- end #746 ---
     # --- fix #747 (R42): `yield` in a lambda rejected (§29.9) ---
     sema/yield_in_lambda_747_test.cpp

@@ -42,9 +42,13 @@ BEZEL_TEST(codegen_cg48, operator_times) {
 
 BEZEL_TEST(codegen_cg48, operator_comparison) {
     BEZEL_EXPECT_EQ(run(
+        // §25.2: comparison operators must be declared as a complete group.
         "module M; class V "
         "  public X: int := 0; "
         "  public static method operator <(a: V, b: V): bool => a.X < b.X; "
+        "  public static method operator >(a: V, b: V): bool => a.X > b.X; "
+        "  public static method operator <=(a: V, b: V): bool => a.X <= b.X; "
+        "  public static method operator >=(a: V, b: V): bool => a.X >= b.X; "
         "end V; "
         "class C public static method Main(): int "
         "  var a := new V(); a.X := 3; var b := new V(); b.X := 5; "
