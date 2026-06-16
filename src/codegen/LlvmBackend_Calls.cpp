@@ -11623,6 +11623,37 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         if (call.args.empty()) {
             return buildArraySpan(arr, builder_.getInt32(0), count);
         }
+        // §4.14 (#746 R41-J): AsSpan(r: Range<int>) — Start = r.Start, Length =
+        // the range's element count (End - Start + 1 inclusive, End - Start
+        // half-open). Previously the Range fell into the (start) form below,
+        // which read only its low bound and set Length = Count - Start, ignoring
+        // the End entirely (and never bounds-checking it).
+        if (call.args.size() == 1 && call.args[0].value &&
+            isRangeType(ctx_.exprType(*call.args[0].value))) {
+            llvm::Value* rv = lowerExpr(*call.args[0].value);
+            if (!rv || !rv->getType()->isStructTy()) return nullptr;
+            llvm::Value* lo = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {0u}), i32(), "sp.r.lo");
+            llvm::Value* hi = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {1u}), i32(), "sp.r.hi");
+            llvm::Value* incl = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {3u}), i1(), "sp.r.incl");
+            llvm::Value* span0 = builder_.CreateSub(hi, lo, "sp.r.span");
+            llvm::Value* len = builder_.CreateSelect(
+                incl, builder_.CreateAdd(span0, builder_.getInt32(1)), span0,
+                "sp.r.len");
+            // bounds: Start ∈ [0, Count], len ≥ 0, Start+len ∈ [0, Count].
+            llvm::Value* startNeg =
+                builder_.CreateICmpSLT(lo, builder_.getInt32(0));
+            llvm::Value* lenNeg =
+                builder_.CreateICmpSLT(len, builder_.getInt32(0));
+            llvm::Value* endOOB =
+                builder_.CreateICmpSGT(builder_.CreateAdd(lo, len), count);
+            emitGuardThrow(
+                builder_.CreateOr(builder_.CreateOr(startNeg, lenNeg), endOOB),
+                "IndexOutOfRangeException");
+            return buildArraySpan(arr, lo, len);
+        }
         // (start) form: [start, Count)
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* start = lowerExpr(*call.args[0].value);

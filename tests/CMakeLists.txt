@@ -569,6 +569,8 @@ set(BEZEL_TEST_SOURCES
     codegen/implicit_numeric_conv_746_test.cpp
     # --- fix #746: OwnedStack/Queue Pop/Dequeue disposal (R41 F, §4.11) ---
     codegen/owned_collection_pop_dispose_746_test.cpp
+    # --- fix #746: AsSpan(Range) endpoint (R41 J, §4.14) ---
+    codegen/asspan_range_746_test.cpp
     # --- end #746 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp
