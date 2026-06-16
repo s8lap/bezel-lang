@@ -1062,6 +1062,26 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
 // target shape; `other.f := X` would need cross-object readonly
 // tracking that we don't have yet (and rarely matters in practice).
 void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
+    if (!as.target) return;
+    // §10 (#747 R42): a `const` member is a compile-time constant and is never
+    // assignable — in any method OR constructor, through any receiver
+    // (`this.K`, `c.K`, `Type.K`, or a bare `K`). Resolve the target's member
+    // symbol directly so every receiver shape is covered. Without this the
+    // assignment was silently accepted and dropped at runtime.
+    if (dynamic_cast<const ConstMemberSymbol*>(ctx_.exprSymbol(*as.target))) {
+        std::string nm;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                as.target.get()))
+            nm = std::string(ma->member);
+        else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                     as.target.get()))
+            nm = std::string(id->name);
+        ctx_.diagnostics().report(
+            Severity::Error, as.span.begin,
+            "cannot assign to const member `" + nm +
+            "` — a const is a compile-time constant");
+        return;
+    }
     if (inConstructor_) return;
     if (!as.target) return;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as.target.get());
