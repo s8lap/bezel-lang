@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.143 — June 2026**
+**Version 0.144 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -31,7 +31,7 @@ If this is your first encounter with Bezel, the rationale's opening section is a
 16. [Range Expressions](#16-range-expressions)
 17. [Expressions and Operators](#17-expressions-and-operators)
 18. [Literals and Strings](#18-literals-and-strings)
-19. [The `case` Construct](#19-the-case-construct)
+19. [The `case` and `when` Constructs](#19-the-case-and-when-constructs)
 20. [The `if` Expression](#20-the-if-expression)
 21. [Statements](#21-statements)
 22. [Methods and Constructors](#22-methods-and-constructors)
@@ -300,7 +300,7 @@ New rules added to this specification that need a structural classification of t
 <a id="sec-bool"></a>
 ### 4.1 `bool`
 
-Two values: `true` and `false`. No implicit conversion to or from any other type. Conditions of `if`, `while`, and `case` (in scrutinee-less form) require `bool`.
+Two values: `true` and `false`. No implicit conversion to or from any other type. Conditions of `if`, `while`, and the `when` construct ([§19.1](#sec-forms)), as well as a `case`/`catch` arm's `when` guard, require `bool`.
 
 <a id="sec-integer-types"></a>
 ### 4.2 Integer types
@@ -943,12 +943,12 @@ A record cannot derive from another record or from a class. A record may impleme
 ```bezel
 record Point(X: int, Y: int): IComparable<Point>
   public method CompareTo(other: Point): int =>
-    case
-      X <> other.X => case
+    when
+      X <> other.X => when
         X < other.X => -1,
         _ => 1
       end,
-      Y <> other.Y => case
+      Y <> other.Y => when
         Y < other.Y => -1,
         _ => 1
       end,
@@ -1197,7 +1197,7 @@ enum Priority: IComparable<Priority>
   Low, Medium, High;
 
   public method CompareTo(other: Priority): int =>
-    case
+    when
       int(this) < int(other) => -1,
       int(this) > int(other) => 1,
       _ => 0
@@ -2967,14 +2967,14 @@ Surrogate escapes (U+D800–U+DFFF) are compile errors.
 ---
 
 <a id="sec-the-case-construct"></a>
-## 19. The `case` Construct
+## 19. The `case` and `when` Constructs
 
-`case` is multi-way pattern matching. It is a single construct that produces a value; in statement position, the value is discarded.
+`case` is multi-way pattern matching against a scrutinee. Its sibling `when` is multi-way **condition** dispatch with no scrutinee — each arm is a boolean test, and the first true arm wins. Both are single constructs that produce a value; in statement position, the value is discarded. They share the same arm bodies ([§19.2](#sec-arms)) and the same `end` terminator, and either may appear in expression or statement position.
 
 <a id="sec-forms"></a>
 ### 19.1 Forms
 
-**Scrutinee form** — `case expression` followed by arms. The scrutinee is evaluated once and matched against each pattern in order.
+**`case` (scrutinee form)** — `case expression` followed by arms. The scrutinee is evaluated once and matched against each pattern in order. `case` **always** takes a scrutinee; a `case` written with no scrutinee expression is a syntax error — use `when` for condition dispatch.
 
 ```bezel
 var grade := case score
@@ -2985,16 +2985,28 @@ var grade := case score
 end;
 ```
 
-**Scrutinee-less form** — `case` with no expression, followed by arms whose patterns are full boolean expressions. The first arm whose expression is `true` is selected.
+**`when` (condition dispatch)** — `when` followed by arms whose patterns are full boolean expressions. The arms are evaluated in textual order; the first whose expression is `true` is selected. This subsumes the `if`/`elif` chain. `when` takes no scrutinee.
 
 ```bezel
-var grade := case
+var grade := when
   score >= 90 => "A",
   score >= 80 => "B",
   score >= 70 => "C",
   _ => "F"
 end;
 ```
+
+`when` exists in both expression position (above) and statement position:
+
+```bezel
+when
+  score >= 90 => Console.WriteLine("A"),
+  score >= 70 => Console.WriteLine("C"),
+  _          => Console.WriteLine("F")
+end;
+```
+
+A `when` arm's expression must have type `bool` ([§4.1](#sec-bool)). The `_` catch-all is permitted as the last arm and behaves as an always-true condition. Because `when` has no scrutinee, it is never statically exhaustive: in expression position, supply a `_` arm or the compiler warns that an unmatched dispatch raises `MatchFailureException` ([§19.6](#sec-exhaustiveness)).
 
 <a id="sec-arms"></a>
 ### 19.2 Arms
@@ -3069,6 +3081,8 @@ end;
 
 Arms are evaluated in textual order. The first arm whose pattern matches *and* whose guard is true is selected.
 
+The guard keyword `when` (after a pattern, within an arm) is distinct from the `when` *construct* keyword ([§19.1](#sec-forms), at the start of an expression or statement); position disambiguates the two, so no parsing conflict arises.
+
 <a id="sec-type-pattern-matching-never-matches-null"></a>
 ### 19.5 Type-pattern matching never matches `null`
 
@@ -3080,6 +3094,8 @@ A bare type pattern `T` matches only non-null values. A typed binding pattern `v
 If `_` appears, it must be the last arm; placing it earlier is a compile error.
 
 A `case` with no `_` arm is permitted. In statement position, an unmatched value falls through with no action. In expression position, an unmatched value raises `MatchFailureException` at runtime; the compiler warns when it cannot prove exhaustiveness statically.
+
+A `when` construct is governed by the same no-match rule, but having no scrutinee it is never statically exhaustive: the static-proof cases below all reason about a scrutinee's type. A `when` with no `_` arm in expression position therefore always draws the non-exhaustiveness warning; supply a `_` arm to make the dispatch total.
 
 The compiler proves exhaustiveness statically in the following cases:
 
@@ -7767,6 +7783,7 @@ The grammar shown here is informal: it lists the alternatives at each precedence
 Expression      ::= ConditionalExpr
 ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
                   | CaseExpr
+                  | WhenExpr
                   | ThrowExpr
 ThrowExpr       ::= "throw" Expression?
                               /* Bare "throw" (no operand) is valid only inside a
@@ -7869,6 +7886,7 @@ PrimaryAtom     ::= Literal
                   | MoveExpr
                   | LambdaExpr
                   | CaseExpr
+                  | WhenExpr
                   | "this" | "base"
                   | NameOfExpr | TypeOfExpr | DefaultExpr
                   | CollectionLiteral
@@ -7904,8 +7922,26 @@ LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
-CaseExpr        ::= "case" Expression? CaseArm ("," CaseArm)* ","? "end"
+CaseExpr        ::= "case" Expression CaseArm ("," CaseArm)* ","? "end"
+                              /* The scrutinee Expression is mandatory (#744).
+                                 The scrutinee-less condition-dispatch form is
+                                 the separate WhenExpr below. A parser parses the
+                                 scrutinee above the range precedence level so a
+                                 following relational, range, or open-ended range
+                                 token begins the first arm's Pattern rather than
+                                 being absorbed into the scrutinee (§19.3). */
 CaseArm         ::= Pattern ("when" Expression)? "=>" ArmBody
+WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end"
+                              /* Scrutinee-less condition dispatch (§19.1). Arms
+                                 are tried in textual order; the first whose
+                                 condition is `true` is selected. Valid in both
+                                 expression and statement position. The construct
+                                 keyword `when` is distinct from the guard `when`
+                                 of a CaseArm/CatchArm — position disambiguates. */
+WhenArm         ::= (Expression | "_") "=>" ArmBody
+                              /* The Expression is a `bool` condition. `_` is the
+                                 always-true catch-all and, if present, must be the
+                                 last arm. ArmBody follows the same rules as CaseArm. */
 ArmBody         ::= Expression
                   | Statement                  /* valid only in statement-position case
                                                   or in a catch arm; reads as a single

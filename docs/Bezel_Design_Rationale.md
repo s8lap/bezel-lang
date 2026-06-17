@@ -801,12 +801,12 @@ Bezel's intended implementation specializes for value-type substitutions (where 
 `case` is the multi-way conditional. Most of its design follows ML/Scala/F# precedent. Two Bezel-specific points:
 
 <a id="sec-the-scrutinee-less-form"></a>
-### 11.1 The scrutinee-less form
+### 11.1 The `when` form (scrutinee-less condition dispatch)
 
-A common need is "test totally different conditions." Forcing those into a scrutinee-having `case` would require gymnastics. Bezel's `case` permits omitting the scrutinee, with each arm being a full boolean test:
+A common need is "test totally different conditions." Forcing those into a scrutinee-having `case` would require gymnastics. Bezel provides `when` — a scrutinee-less sibling of `case` whose every arm is a full boolean test:
 
 ```bezel
-var grade := case
+var grade := when
   score >= 90 => "A",
   score >= 80 => "B",
   score >= 70 => "C",
@@ -815,6 +815,8 @@ end;
 ```
 
 This subsumes most `if-else-if` chains.
+
+Through v0.143 this was spelled `case` with the scrutinee omitted — the same keyword carried two readings, and the parser told them apart by source layout (whether the first arm began on the line after `case`, or whether an `or`/`and`/`=` appeared before the first `=>`). That made a `case`'s meaning depend on where line breaks fell, and it left a real ambiguity unresolved: a leading-open range pattern (`case x ..<0 => …`, §19.3) could not be distinguished from a `scrutinee..hi` range, so the spec listed `..<0` as a legal pattern that the parser had to reject. v0.144 (#744) gives condition dispatch its own keyword. `case` now *always* carries a scrutinee and `when` *never* does, so neither relies on layout; and because `case` is unconditionally scrutinee-bearing, its scrutinee can be parsed above the range precedence level, which makes the leading-open range pattern unambiguous and finally legal. The keyword `when` was already reserved (it introduces a `case`/`catch` arm guard); the construct use and the guard use never collide, because the construct `when` stands at the head of an expression or statement while the guard `when` follows a pattern inside an arm.
 
 <a id="sec-naked-binding-inside-positional-patterns"></a>
 ### 11.2 Naked binding inside positional patterns
@@ -927,7 +929,7 @@ end;
 
 The unification is structural, not total. Exception dispatch and value dispatch differ in two ways the syntax doesn't try to hide.
 
-The first is the source of the value being matched. `case` matches an explicit scrutinee (or evaluates boolean conditions in scrutinee-less form). `catch` matches the implicit "currently-thrown exception" — there is no scrutinee to name, and the arms can only test types. A non-type `catch` arm pattern (a literal, a range, a record-destructuring) makes no sense and is a syntax error.
+The first is the source of the value being matched. `case` matches an explicit scrutinee (its sibling `when` evaluates boolean conditions with no scrutinee). `catch` matches the implicit "currently-thrown exception" — there is no scrutinee to name, and the arms can only test types. A non-type `catch` arm pattern (a literal, a range, a record-destructuring) makes no sense and is a syntax error.
 
 The second is the behavior on no match. `case` in expression position raises `MatchFailureException` on no match; `case` in statement position falls through silently. `catch` does neither — unmatched exceptions propagate to the enclosing handler. This is the right behavior for exception dispatch, and it is documented as a third position in [§19.6](Bezel_Language_Spec.md#sec-exhaustiveness) (alongside expression-position and statement-position `case`).
 
@@ -6892,6 +6894,26 @@ Spec §7.11 (one sentence). No grammar or stdlib change. Compiler: bitwise/shift
 
 #### Migration
 A program that applied a bitwise or shift operator to a `bool` or `char` operand (including the lifted `bool? & bool?`) no longer compiles; rewrite boolean combinations with `and`/`or`/`not`. No program that was already §6.5-conformant is affected.
+
+---
+
+### v0.144 changelog (v0.143 → v0.144)
+
+**`when` is now a keyword for scrutinee-less condition dispatch; `case` always takes a scrutinee (§19, Appendix A).** Through v0.143 a `case` could be written two ways: with a scrutinee (`case x ...`) or without one, in which case each arm was a full boolean condition. The two readings shared the keyword `case`, and the parser told them apart by *source layout* — whether the first arm started on a line after `case`, or whether an `or`/`and`/`=` appeared before the first `=>`. That made a `case`'s meaning depend on where line breaks fell, and it left a genuine ambiguity unresolved: §19.3 has always listed the leading-open range pattern `..<0` as legal, but in `case x ..<0 => …` the scrutinee parser could not tell `x ..<0` (a range scrutinee) from `x` followed by the pattern `..<0`, so the compiler rejected the very pattern the spec admitted. Issue #744; owner-directed 2026-06-17.
+
+The fix gives condition dispatch its own keyword. **`when`** (already a reserved word — it introduces a `case`/`catch` arm guard) is now also the scrutinee-less construct: `when Arm ("," Arm)* end`, each arm a boolean condition, first-true wins, valid in both expression and statement position. The construct use and the guard use never collide — the construct `when` heads an expression or statement, the guard `when` follows a pattern inside an arm. With condition dispatch peeled off, **`case` always carries a scrutinee**; a `case` with no scrutinee is now a syntax error. Because the scrutinee is unconditional, the parser parses it above the range precedence level, which makes the leading-open range pattern (`..<0`, `..5`) unambiguous and finally legal.
+
+#### What changed
+- §19 retitled "The `case` and `when` Constructs"; §19.1 documents the `case` (scrutinee) form and the `when` (condition-dispatch) form, the latter in both expression and statement position, and states that `case` always requires a scrutinee.
+- §19.4 gains a sentence distinguishing the guard `when` from the construct `when` (position disambiguates). §19.6 notes a `when` is never statically exhaustive (no scrutinee to reason about) and needs a `_` arm in expression position. §4.1's `bool`-condition list now names `when`.
+- Appendix A: `CaseExpr`'s scrutinee `Expression?` becomes mandatory `Expression`; a new `WhenExpr`/`WhenArm` pair is added and wired into `ConditionalExpr` and `PrimaryAtom` alongside `CaseExpr`. The `RangeExpr` note already documented `..<0` as a pattern; it now actually parses.
+- Rationale §11.1 retitled and rewritten around `when`; this changelog.
+
+#### Touched
+Spec §4.1 (one clause), §19 (title, §19.1 forms, §19.4 guard note, §19.6 exhaustiveness note, two scrutinee-less `case` examples in §9.6/§10.5 migrated to `when`), Appendix A (CaseExpr mandatory scrutinee + new WhenExpr/WhenArm + two alternative-list wirings), Contents entry. Rationale §11.1 and §11.3 (one clause). No stdlib change. Compiler: the parser drops the layout heuristic (`case` unconditionally scrutinee'd), adds `when` in expression and statement position, raises the `case` scrutinee precedence cap above the range level, and removes the leading-open-range-pattern rejection — landed across #744 stages 1–5.
+
+#### Migration
+A scrutinee-less `case` (e.g. `case\n  x >= 90 => …\nend`) no longer parses; replace the keyword with `when`. A `case` with a scrutinee is unaffected. An unparenthesised bitwise (`& ^ |`) or range scrutinee — never shown in any example and not previously idiomatic — must now be parenthesised (`case (flags & MASK) …`). Leading-open range patterns that were previously rejected now compile. The conformance corpus and the project's own test/example sources were migrated with this revision.
 
 ---
 
