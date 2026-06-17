@@ -953,6 +953,33 @@ void Resolver::checkTypeDuplicates(TypeSymbol* t) {
     }
 }
 
+void Resolver::checkDuplicateTopLevelTypes() {
+    if (!ctx_.module()) return;
+    // §11.3 / §13.2 (#747 R42): a module may not declare two top-level types
+    // with the same name. §11.3 states the clash rule for members and NESTED
+    // types; the module is the top-level namespace and the same well-formedness
+    // requirement applies — two same-named top-level types are unresolvable, and
+    // silently letting the second declaration shadow the first is a soundness
+    // hazard (e.g. `Foo.Val` reads the wrong type's static). The spec states the
+    // member/nested case explicitly; this top-level extension is the obvious
+    // reading (a candidate for a future spec clarification). Local decls only —
+    // imported types live in a separate symbol list.
+    std::unordered_map<std::string_view, Symbol*> seen;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->name.empty()) continue;
+        auto it = seen.find(t->name);
+        if (it == seen.end()) { seen[t->name] = t; continue; }
+        SourceLocation loc = t->declLoc;
+        if (t->decl) loc = t->decl->span.begin;  // point at the 2nd declaration
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("a top-level type named `") + std::string(t->name) +
+            "` is already declared in this module — top-level type names must be "
+            "unique (§11.3 well-formedness)");
+    }
+}
+
 bool Resolver::checkInheritanceCycles() {
     if (!ctx_.module()) return false;
     std::unordered_set<TypeSymbol*> reported;

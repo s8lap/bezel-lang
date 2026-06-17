@@ -95,6 +95,8 @@ set(BEZEL_TEST_SOURCES
     sema/yield_in_lambda_747_test.cpp
     # --- fix #747 (R42 FALSE_ACCEPT): assignment to a const member rejected (§10) ---
     sema/const_assignment_747_test.cpp
+    # --- fix #747 (R42 FALSE_ACCEPT): duplicate top-level type names rejected (§11.3) ---
+    sema/duplicate_top_level_type_747_test.cpp
     # --- fix #747 (R42): static indexers rejected (§23.5) ---
     sema/static_indexer_747_test.cpp
     # --- fix #747 (R42): assignment to a setterless property rejected (§23.3) ---

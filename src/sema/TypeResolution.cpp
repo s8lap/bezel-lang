@@ -108,6 +108,8 @@ void Resolver::run(const ast::SourceFile& src) {
     // Slice S14: duplicate non-overloadable member names within a
     // single type.
     checkDuplicateMembers();
+    // §11.3 / §13.2 (#747 R42): two top-level types may not share a name.
+    checkDuplicateTopLevelTypes();
     // Slice S16: a static class may contain only static members.
     checkStaticClassMembers();
     // §23.5 (#747): static indexers are not supported (any type).

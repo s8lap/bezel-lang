@@ -217,6 +217,10 @@ private:
     // of the same name is an error.
     void checkDuplicateMembers();
 
+    // §11.3 / §13.2 (#747 R42): two top-level types in one module may not share
+    // a name (the member/nested clash rule extended to the module namespace).
+    void checkDuplicateTopLevelTypes();
+
     // #594 (§28.2): user code may not declare a method named `Dispose()` on
     // a class or record. The compiler synthesises `Dispose()` from the
     // `destructor` (§28.4); a user-declared `Dispose()` is never called by
