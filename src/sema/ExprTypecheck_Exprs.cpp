@@ -710,6 +710,44 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // resolved member symbol and field/property type.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         resolveMemberAccess(*ma);
+        // §22.12 (cf. C# CS0176): a static member must be accessed through the
+        // type name (`C._x`), not through an instance (`c._x`). The latter was
+        // silently accepted (and previously crashed codegen, #747). Reject it.
+        if (ma->target) {
+            sema::Symbol* mem = ctx_.exprSymbol(e);
+            auto isStaticMod = [](const sema::MemberSymbol* m) {
+                for (auto md : m->modifiers)
+                    if (md == "static") return true;
+                return false;
+            };
+            bool memStatic = false;
+            if (auto* fs = dynamic_cast<sema::FieldSymbol*>(mem))
+                memStatic = isStaticMod(fs);
+            else if (auto* ms = dynamic_cast<sema::MethodSymbol*>(mem))
+                memStatic = isStaticMod(ms) && !ms->isOperator &&
+                            ms->extensionDecl == nullptr;
+            else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(mem))
+                memStatic = isStaticMod(ps);
+            if (memStatic) {
+                // A type-name receiver (`C._x`) or primitive-keyword receiver
+                // (`int.MaxValue`) is fine; an instance value receiver is not.
+                sema::Symbol* recv = ctx_.exprSymbol(*ma->target);
+                bool recvIsType =
+                    dynamic_cast<sema::TypeSymbol*>(recv) != nullptr;
+                bool recvIsPrim = false;
+                if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get()))
+                    recvIsPrim =
+                        primitiveFromName(rid->name) != PrimitiveType::None;
+                if (!recvIsType && !recvIsPrim && ctx_.exprType(*ma->target)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma->span.begin,
+                        "static member `" + std::string(ma->member) +
+                        "` must be accessed through the type name, not an "
+                        "instance (§22.12)");
+                }
+            }
+        }
     }
     // §17.5 null-conditional member access `x?.M`.
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {

@@ -1,88 +1,94 @@
-// Spec-derived regression tests for fix #747 (R42 finding #0) — accessing a
-// STATIC field through an INSTANCE receiver (`c._x` where `_x` is `public
-// static`) crashed the COMPILER with a SIGSEGV during codegen.
+// Spec-derived tests for #747 R42 #0 + the §22.12 ruling — accessing a STATIC
+// member through an INSTANCE receiver (`c._x` where `_x` is `public static`).
 //
-// Authority: §22.12 (static state). Root cause: a static field has no slot in
-// the instance struct, so its FieldSymbol is absent from `fieldIndex_`.
-// `Emitter::fieldAddr` looked the symbol up, found `end()`, and then
-// dereferenced that end iterator (`idxIt->second`) to index the struct layout —
-// running off the end and segfaulting the compiler. The fix returns `nullptr`
-// from `fieldAddr` when the member is not in the instance layout, so the read
-// path (LlvmBackend_Exprs.cpp) and the write path (lvalueAddr) both fall through
-// to `staticFieldGlobal()` — the same program-lifetime backing global a
-// type-qualified `C._x` access already reads. Instance and type access therefore
-// reach the SAME static storage.
+// History: this originally SIGSEGV'd the compiler (fieldAddr dereferenced an
+// end iterator). The crash was fixed (fieldAddr returns nullptr for a member not
+// in the instance layout, routing to staticFieldGlobal). The owner then ruled
+// (cf. C# CS0176) that an instance-receiver static access should be a SEMA
+// diagnostic — static members are accessed through the type name only (§22.12).
 //
-// NOTE (open design question, flagged on #747): the spec frames static-member
-// access as being on the type name in receiver position (§22.12); whether an
-// instance-receiver static access like `c._x` should instead be REJECTED with a
-// sema diagnostic (cf. C# CS0176) is a separate design call. These tests pin the
-// crash-freedom + shared-storage semantics that hold *while* the access is
-// accepted; if it is later made a diagnostic, they move to the sema suite.
+// So the access is now rejected at sema (before codegen), which both enforces
+// §22.12 and makes the original crash path unreachable. These tests assert the
+// rejection; a type-qualified `C._x` access is unaffected.
 
-#include "support/codegen_support.hpp"
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+#include "driver/Driver.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
-
 namespace {
-int run(const std::string& src) {
-    auto r = runJit(src);
-    return r.ran ? r.exitCode : -999;
+namespace fs = std::filesystem;
+
+// True when `source` FAILS to compile (a diagnostic is raised — NOT a crash).
+bool compileFails(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_747sfi_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    { std::ofstream out(src); out << source; }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return !r.success;
 }
 }  // namespace
 
-// §22.12: the headline — reading a static field through an instance receiver
-// must not crash the compiler and must read the static value (7).
-BEZEL_TEST(static_field_via_instance_747, read_through_instance) {
-    BEZEL_EXPECT_EQ(run(
+// §22.12: reading a static field through an instance receiver is rejected.
+BEZEL_TEST(static_field_via_instance_747, read_through_instance_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
         "module M; class C "
         "  public static _x: int := 7; "
         "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    return c._x; "  // instance-receiver read of a static field
+        "    using var c := new C(); return c._x; "
         "  end Main; "
-        "end C;"), 7);
+        "end C;"));
 }
 
-// §22.12: a write through an instance receiver reaches the same static storage,
-// observable through a type-qualified read (`C._x`).
-BEZEL_TEST(static_field_via_instance_747, write_through_instance_shared_storage) {
-    BEZEL_EXPECT_EQ(run(
+// §22.12: writing a static field through an instance receiver is rejected.
+BEZEL_TEST(static_field_via_instance_747, write_through_instance_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
         "module M; class C "
         "  public static _x: int := 7; "
         "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    c._x := 9; "        // instance-receiver write...
-        "    return C._x; "      // ...observed through the type → 9
+        "    using var c := new C(); c._x := 9; return 0; "
         "  end Main; "
-        "end C;"), 9);
+        "end C;"));
 }
 
-// §22.12: the converse — a type-qualified write is observed through an
-// instance-receiver read; both name the one backing global.
-BEZEL_TEST(static_field_via_instance_747, type_write_instance_read) {
-    BEZEL_EXPECT_EQ(run(
+// §22.12: calling a static method through an instance receiver is rejected.
+BEZEL_TEST(static_field_via_instance_747, static_method_through_instance_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
         "module M; class C "
-        "  public static _x: int := 0; "
+        "  public static method Get(): int => 9; "
         "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    C._x := 42; "       // type-qualified write...
-        "    return c._x; "      // ...observed through the instance → 42
+        "    using var c := new C(); return c.Get(); "
         "  end Main; "
-        "end C;"), 42);
+        "end C;"));
 }
 
-// §22.12: a non-int static field (string length) read through an instance —
-// the layout-miss guard is type-agnostic, so a wider/other-typed static field
-// is equally safe.
-BEZEL_TEST(static_field_via_instance_747, read_through_instance_long) {
-    BEZEL_EXPECT_EQ(run(
+// §22.12: a type-qualified static access `C._x` is fine — must compile.
+BEZEL_TEST(static_field_via_instance_747, type_qualified_ok) {
+    BEZEL_EXPECT_FALSE(compileFails(
         "module M; class C "
-        "  public static _n: long := 5000000000L; "  // > 2^32, needs i64 storage
+        "  public static _x: int := 7; "
         "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    return int(c._n - 4999999993L); "  // 5000000000 - 4999999993 = 7
+        "    C._x := 9; return C._x; "  // type-name receiver, read + write
         "  end Main; "
-        "end C;"), 7);
+        "end C;"));
+}
+
+// §22.12: an ordinary instance member through an instance receiver is fine.
+BEZEL_TEST(static_field_via_instance_747, instance_member_ok) {
+    BEZEL_EXPECT_FALSE(compileFails(
+        "module M; class C "
+        "  public n: int := 5; "
+        "  public static method Main(): int "
+        "    using var c := new C(); return c.n; "
+        "  end Main; "
+        "end C;"));
 }
