@@ -325,11 +325,13 @@ bool isAutoPropertySymbol(const Symbol* m) {
 // and per the §9.2 "Authors who want explicit equality … declare `=` and `<>`"
 // clause a user `=`/`<>` overload opts out).
 //
-// The §9.2 "side-effecting computed property" and "non-trivial constructor
-// body" disqualifiers are not statically decided at this stage; computed
-// (expression-bodied / block) properties and constructors are treated as
-// non-disqualifying (the spec's stated default for the trivial forms). See the
-// PR note for that scoping.
+// The §9.2 "non-trivial constructor body" disqualifier IS now decided here
+// (#770): a constructor whose body does work beyond property initialization
+// (control flow, locals, throws, non-property-target assignments) opts the
+// record out of auto-equality. The "side-effecting computed property"
+// disqualifier remains out of scope; computed (expression-bodied / block)
+// properties are treated as non-disqualifying (the spec's stated default for
+// the trivial forms).
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
     if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
     // §9.3: a record with positional fields is positional / combined form; it
@@ -360,8 +362,39 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
                 return false;
             continue;  // ordinary methods do not disqualify (§9.2)
         }
-        // Constructors do not disqualify (§9.2).
-        if (dynamic_cast<const ConstructorSymbol*>(m)) continue;
+        // §9.2 (#770): a constructor disqualifies auto-equality when its body
+        // "performs work other than property initialization." A TRIVIAL body is
+        // one whose every statement is a property-initialization assignment
+        // (`P := e` / `this.P := e`, op `:=`, target a bare name or `this.`
+        // member). Any other statement form — control flow (`if`/`while`/`for`/
+        // `case`/`try`), a `throw`, a local declaration, a compound or non-
+        // property-target assignment — is "other work" and opts the record out
+        // of auto-equality (the author must then declare explicit `=`/`<>`). A
+        // constructor-chain ExpressionStmt is conservatively treated as trivial
+        // (a residual leniency for a side-effecting bare call — far narrower
+        // than the prior blanket acceptance of every constructor body).
+        if (auto* cs = dynamic_cast<const ConstructorSymbol*>(m)) {
+            if (auto* cd =
+                    dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                for (const auto& st : cd->body) {
+                    if (!st) continue;
+                    if (auto* as =
+                            dynamic_cast<const ast::AssignmentStmt*>(st.get())) {
+                        if (as->op == ":=" && as->target &&
+                            (dynamic_cast<const ast::IdentifierExpr*>(
+                                 as->target.get()) ||
+                             dynamic_cast<const ast::MemberAccessExpr*>(
+                                 as->target.get())))
+                            continue;  // property-initialization — trivial
+                        return false;  // compound / other-target — non-trivial
+                    }
+                    if (dynamic_cast<const ast::ExpressionStmt*>(st.get()))
+                        continue;  // constructor-chain call — conservatively ok
+                    return false;  // any other statement kind — non-trivial
+                }
+            }
+            continue;
+        }
         // Const members and nested types carry no instance storage and do not
         // participate in equality; they are benign.
         if (dynamic_cast<const ConstMemberSymbol*>(m)) continue;

@@ -193,3 +193,63 @@ BEZEL_TEST(sema_record_equality, ineligible_user_operator_eq_accepted_spec_8_4) 
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ─── #770: a NON-TRIVIAL constructor body disqualifies auto-equality ────────
+
+// §9.2: "A body record is not auto-equality-bearing … when it contains: A
+// non-trivial constructor body that performs work other than property
+// initialization." A constructor with control flow (`if … then … end`) is
+// non-trivial — `=` on the record is a compile error.
+BEZEL_TEST(sema_record_equality, nontrivial_ctor_eq_diagnosed_770) {
+    auto r = parseSema(
+        "module M; "
+        "record Clamped "
+        "  public property V: int; "
+        "  public constructor(v: int) "
+        "    V := v; "
+        "    if V > 100 then V := 100; end; "
+        "  end constructor; "
+        "end Clamped; "
+        "class C public method M() "
+        "  var a := new Clamped(5); var b := new Clamped(5); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.2 / §8.3: `.Equals(...)` on the same non-trivial-ctor record is likewise a
+// compile error.
+BEZEL_TEST(sema_record_equality, nontrivial_ctor_equals_call_diagnosed_770) {
+    auto r = parseSema(
+        "module M; "
+        "record Clamped "
+        "  public property V: int; "
+        "  public constructor(v: int) "
+        "    V := v; "
+        "    if V > 100 then V := 100; end; "
+        "  end constructor; "
+        "end Clamped; "
+        "class C public method M() "
+        "  var a := new Clamped(5); var b := new Clamped(5); "
+        "  _ := a.Equals(b); "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.2 (#770 regression guard): a TRIVIAL constructor — only property-
+// initialization assignments (`X := x;` / `this.Y := y;`) — does NOT disqualify
+// auto-equality; `=` remains available. (Must not over-reject the common form.)
+BEZEL_TEST(sema_record_equality, trivial_ctor_eq_accepted_770) {
+    auto r = parseSema(
+        "module M; "
+        "record Pt2 "
+        "  public property X: int; "
+        "  public property Y: int; "
+        "  public constructor(x: int, y: int) X := x; this.Y := y; end constructor; "
+        "end Pt2; "
+        "class C public method M() "
+        "  var a := new Pt2(1, 2); var b := new Pt2(1, 2); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
