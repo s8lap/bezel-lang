@@ -733,11 +733,16 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
     // (they overload as a single name-less family).
     std::unordered_map<std::string_view, std::vector<Overload>> methods;
     std::vector<Overload> ctors;
+    // §23.4 (#774): indexers overload as a single name-less family (like
+    // constructors), distinguished by their parameter type lists.
+    std::vector<Overload> indexers;
     for (Symbol* m : t->members) {
         if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
             methods[ms->name].push_back({&ms->params, m});
         } else if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
             if (!cs->isStatic) ctors.push_back({&cs->params, m});
+        } else if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+            if (ps->isIndexer) indexers.push_back({&ps->indexerParams, m});
         }
     }
     auto checkGroup = [&](std::vector<Overload>& overloads,
@@ -761,6 +766,7 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
         checkGroup(overloads, std::string("`") + std::string(name) + "`");
     }
     checkGroup(ctors, "constructor");
+    checkGroup(indexers, "indexer");  // §23.4 (#774)
 }
 
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
@@ -979,8 +985,15 @@ void Resolver::checkDuplicateMembers() {
 }
 
 bool Resolver::isOverloadable(Symbol* m) {
-    return dynamic_cast<MethodSymbol*>(m) != nullptr ||
-           dynamic_cast<ConstructorSymbol*>(m) != nullptr;
+    if (dynamic_cast<MethodSymbol*>(m) != nullptr ||
+        dynamic_cast<ConstructorSymbol*>(m) != nullptr)
+        return true;
+    // §23.4 (#774): "Indexers may be overloaded by parameter type list." An
+    // indexer is a PropertySymbol with isIndexer set; two indexers sharing the
+    // synthetic `.this` name are a legal overload pair (distinguished by their
+    // parameter types in checkTypeOverloads), not a duplicate member.
+    if (auto* ps = dynamic_cast<PropertySymbol*>(m)) return ps->isIndexer;
+    return false;
 }
 
 void Resolver::checkTypeDuplicates(TypeSymbol* t) {

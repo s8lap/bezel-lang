@@ -729,18 +729,52 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // a borrow, so returning it from an owned `using var` local is
                 // not a borrow escape (a CLASS/borrow-typed result still is).
                 else if (tt->kind == TypeRef::Kind::Named && tt->declaration) {
-                    if (auto* ps = dynamic_cast<PropertySymbol*>(
-                            lookupMember(tt->declaration, ".this"))) {
-                        if (ps->isIndexer) {
-                            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                                    ps->decl)) {
-                                if (pd->type) {
-                                    if (auto* rt = ctx_.resolvedType(*pd->type))
-                                        ctx_.setExprType(
-                                            &e, substituteMemberType(
-                                                    rt, ix->target.get(),
-                                                    ps->parent));
-                                }
+                    // §23.4 (#774): with overloaded indexers the result type
+                    // depends on WHICH overload the argument selects. Among this
+                    // type's own indexers, pick the one whose first parameter
+                    // type matches the index argument's type; fall back to the
+                    // transitive `.this` lookup (the first indexer, incl.
+                    // inherited) when the arg type is unknown or no own overload
+                    // matches exactly — preserving the prior single-indexer path.
+                    const TypeRef* argTy =
+                        (!ix->indices.empty() && ix->indices[0].value)
+                            ? ctx_.exprType(*ix->indices[0].value)
+                            : nullptr;
+                    PropertySymbol* ps = nullptr;
+                    if (argTy) {
+                        for (Symbol* m : tt->declaration->members) {
+                            auto* cand = dynamic_cast<PropertySymbol*>(m);
+                            if (!cand || !cand->isIndexer) continue;
+                            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
+                                cand->decl);
+                            if (!cpd || cpd->indexerParams.empty() ||
+                                !cpd->indexerParams[0].type)
+                                continue;
+                            const TypeRef* pty = ctx_.resolvedType(
+                                *cpd->indexerParams[0].type);
+                            if (pty && pty->kind == argTy->kind &&
+                                (pty->kind == TypeRef::Kind::Primitive
+                                     ? pty->primitive == argTy->primitive
+                                     : pty->kind == TypeRef::Kind::Named
+                                         ? pty->declaration == argTy->declaration
+                                         : false)) {
+                                ps = cand;
+                                break;
+                            }
+                        }
+                    }
+                    if (!ps)
+                        ps = dynamic_cast<PropertySymbol*>(
+                            lookupMember(tt->declaration, ".this"));
+                    if (ps && ps->isIndexer) {
+                        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                                ps->decl)) {
+                            if (pd->type) {
+                                if (auto* rt = ctx_.resolvedType(*pd->type))
+                                    ctx_.setExprType(
+                                        &e, substituteMemberType(
+                                                rt, ix->target.get(),
+                                                ps->parent));
                             }
                         }
                     }

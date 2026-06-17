@@ -2,13 +2,39 @@
 
 namespace bezel::codegen {
 
+namespace {
+// §23.4 (#774): exact structural match between an indexer's first parameter
+// type and the index argument's type — by primitive for value/string types and
+// by declaration for named types. Used to pick the right overload; the
+// checkTypeOverloads distinctness check (sema) guarantees at most one indexer
+// matches any concrete argument type exactly.
+bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
+    if (!p || !a || p->kind != a->kind) return false;
+    if (p->kind == sema::TypeRef::Kind::Primitive)
+        return p->primitive == a->primitive;
+    if (p->kind == sema::TypeRef::Kind::Named)
+        return p->declaration == a->declaration;
+    return false;
+}
+}  // namespace
+
 const sema::PropertySymbol* Emitter::findIndexer(
-    const sema::TypeSymbol* ts) const {
+    const sema::TypeSymbol* ts, const sema::TypeRef* argTy) const {
+    const sema::PropertySymbol* first = nullptr;
     for (const sema::Symbol* m : ts->members) {
-        if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m))
-            if (ps->isIndexer) return ps;
+        auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+        if (!ps || !ps->isIndexer) continue;
+        if (!first) first = ps;
+        if (!argTy) continue;  // no argument type → first indexer (legacy)
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->indexerParams.empty() || !pd->indexerParams[0].type)
+            continue;
+        if (indexerArgMatches(ctx_.resolvedType(*pd->indexerParams[0].type),
+                              argTy))
+            return ps;  // §23.4: the overload whose param type matches the arg
     }
-    return nullptr;
+    return first;  // single indexer, or an argument matching no overload
+                   // exactly (e.g. a widening index) → the first indexer
 }
 
 
@@ -877,7 +903,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         return nullptr;
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
     if (!recvDecl) return nullptr;
-    auto* ps = findIndexer(recvDecl);
+    auto* ps = findIndexer(recvDecl, ctx_.exprType(*ix.indices[0].value));
     if (!ps) return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
@@ -978,7 +1004,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         return false;
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
     if (!recvDecl) return false;
-    auto* ps = findIndexer(recvDecl);
+    auto* ps = findIndexer(recvDecl, ctx_.exprType(*ix.indices[0].value));
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;
@@ -1048,7 +1074,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     // [i]: T declaration). Built-in arrays fall through to lvalueAddr instead.
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix->target.get());
     if (!recvDecl) return false;
-    auto* ps = findIndexer(recvDecl);
+    auto* ps = findIndexer(recvDecl, ctx_.exprType(*ix->indices[0].value));
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;

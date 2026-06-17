@@ -2000,9 +2000,14 @@ private:
     llvm::Value* coerceReturnToNullableValue(llvm::Value* v,
                                              const sema::TypeRef* declRet);
 
-    // §22.10: find the indexer PropertySymbol on a TypeSymbol, if any.
+    // §22.10 / §23.4: find the indexer PropertySymbol on a TypeSymbol, if any.
+    // When `argTy` is non-null, select the OVERLOAD (#774) whose first
+    // parameter type matches the index argument's type, falling back to the
+    // first indexer found (single-indexer types, and index types that match no
+    // overload exactly, keep their existing behavior).
     const sema::PropertySymbol* findIndexer(
-        const sema::TypeSymbol* ts) const;
+        const sema::TypeSymbol* ts,
+        const sema::TypeRef* argTy = nullptr) const;
 
     // §22.10/§23.4 (#747 R42): resolve the receiver TypeSymbol of an indexer
     // access `target[i]`. Normally the target's sema exprType carries the
