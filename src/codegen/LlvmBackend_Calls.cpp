@@ -6250,6 +6250,41 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return emitPrimitiveToString(arg, P::Char);
     }
 
+    // §9.6 (#747 R43): string.From(buffer: Array<char>, start, count): string —
+    // build a string from the char array's code points at slots [start,
+    // start+count). The 3-arg overload had NO codegen handler, so the call
+    // produced a garbage string pointer that SIGSEGV'd on first use. Lowers to
+    // bz_str_from_char_array (the inverse of ToCharArray). Out-of-range start /
+    // count raise IndexOutOfRangeException (the §4.6 / stdlib bounds convention),
+    // checked here against the array's Count before the runtime call.
+    if (pt == P::String && m == "From" && call.args.size() == 3 &&
+        call.args[0].value && call.args[1].value && call.args[2].value) {
+        llvm::Value* arr   = lowerExpr(*call.args[0].value);
+        llvm::Value* start = lowerExpr(*call.args[1].value);
+        llvm::Value* count = lowerExpr(*call.args[2].value);
+        if (!arr || !start || !count) return nullptr;
+        llvm::Value* start64 = builder_.CreateSExt(start, i64(), "from.start");
+        llvm::Value* count64 = builder_.CreateSExt(count, i64(), "from.count");
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* n = builder_.CreateCall(lenFn, {arr}, "from.n");
+        // start in [0, n]; count >= 0; start + count <= n.
+        llvm::Value* end = builder_.CreateAdd(start64, count64, "from.end");
+        llvm::Value* oor = builder_.CreateOr(
+            builder_.CreateICmpSLT(start64, builder_.getInt64(0), "from.sneg"),
+            builder_.CreateOr(
+                builder_.CreateICmpSGT(start64, n, "from.sbig"),
+                builder_.CreateOr(
+                    builder_.CreateICmpSLT(count64, builder_.getInt64(0),
+                                           "from.cneg"),
+                    builder_.CreateICmpSGT(end, n, "from.ebig"), "from.c"),
+                "from.b"),
+            "from.oor");
+        emitGuardThrow(oor, "IndexOutOfRangeException");
+        auto* fn = declareC("bz_str_from_char_array", ptrTy(),
+                            {ptrTy(), i64(), i64()});
+        return builder_.CreateCall(fn, {arr, start64, count64}, "str.from");
+    }
+
     // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
     if (pt == P::String && m == "IsNullOrEmpty" &&
         call.args.size() == 1 && call.args[0].value) {

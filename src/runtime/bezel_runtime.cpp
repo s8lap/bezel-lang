@@ -6066,6 +6066,54 @@ extern "C" void* bz_str_to_char_array(const void* self_p) {
     return arr;
 }
 
+// §9.6 (#747 R43): string.From(buffer: Array<char>, start, count): string.
+// Inverse of ToCharArray — builds a fresh +1 string from the i32 code points at
+// the char array's slots [start, start+count). The char array stores one i32
+// code point per slot (elem_size=4, matching bz_str_to_char_array). The result
+// uses the narrowest §4.6 adaptive width that fits all code points. Bounds are
+// validated in codegen (IndexOutOfRangeException); the clamps here are a
+// defensive backstop so a stray call can never read out of the array buffer.
+extern "C" void* bz_str_from_char_array(const void* arr_p,
+                                        int64_t start, int64_t count) {
+    const auto* arr = (const bz_array_t*)arr_p;
+    int64_t n = arr ? arr->count : 0;
+    if (start < 0) start = 0;
+    if (start > n) start = n;
+    if (count < 0) count = 0;
+    if (start + count > n) count = n - start;
+    const int32_t* src = arr ? (const int32_t*)arr->data : nullptr;
+    int64_t olen = count;
+    uint32_t maxCp = 0;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(olen > 0 ? olen : 1) * sizeof(uint32_t));
+    for (int64_t k = 0; k < olen; ++k) {
+        uint32_t cp = (uint32_t)src[start + k];
+        if (cp > maxCp) maxCp = cp;
+        out[k] = cp;
+    }
+    // Pack into the narrowest width (§4.6), mirroring bz_str_replace's repack.
+    int8_t w = (maxCp <= 0xFF) ? 1 : (maxCp <= 0xFFFF ? 2 : 4);
+    void* data =
+        calloc((size_t)(olen > 0 ? olen : 1) * (size_t)w + (size_t)w, 1);
+    if (w == 1) {
+        uint8_t* d = (uint8_t*)data;
+        for (int64_t k = 0; k < olen; ++k) d[k] = (uint8_t)out[k];
+    } else if (w == 2) {
+        uint16_t* d = (uint16_t*)data;
+        for (int64_t k = 0; k < olen; ++k) d[k] = (uint16_t)out[k];
+    } else {
+        uint32_t* d = (uint32_t*)data;
+        for (int64_t k = 0; k < olen; ++k) d[k] = out[k];
+    }
+    free(out);
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    memcpy(strObj + 8, &olen, sizeof(int64_t));
+    strObj[16] = (uint8_t)w;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    return strObj;
+}
+
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {

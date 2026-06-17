@@ -257,3 +257,61 @@ BEZEL_TEST(codegen_654_tochararray_asan_no_leak, using_var_disposes_array) {
         "var n := a.Count; "
         "return n; ")), 16);
 }
+
+// fix #747 R43 / §9.6: string.From(buffer: Array<char>, start, count): string —
+// the inverse of ToCharArray. The 3-arg overload had no codegen handler, so the
+// call produced a garbage string pointer that SIGSEGV'd on first use (equality,
+// indexing, Length-traversal). Now builds the string from the array's code
+// points at [start, start+count). All exceptions are caught.
+
+// Empty array + (0, 0) → empty string (the minimal repro that SIGSEGV'd).
+BEZEL_TEST(codegen_string_from_747, empty_array_zero_count_equals_empty) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var chars := new Array<char>(); "
+        "  var s := string.From(chars, 0, 0); "
+        "  return 0 if s = \"\" else 1; "  // 0
+        "end Main; end C;"), 0);
+}
+
+// Content is populated correctly: From(['H','i','!'], 0, 2) == "Hi", Length 2.
+BEZEL_TEST(codegen_string_from_747, builds_substring_content) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var chars := new Array<char>(); "
+        "  chars.Add('H'); chars.Add('i'); chars.Add('!'); "
+        "  var s := string.From(chars, 0, 2); "
+        "  return s.Length if s = \"Hi\" else 99; "  // 2
+        "end Main; end C;"), 2);
+}
+
+// Round-trips with ToCharArray: "World".ToCharArray() then From(arr, 1, 3) == "orl".
+BEZEL_TEST(codegen_string_from_747, roundtrips_with_to_char_array) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var arr := \"World\".ToCharArray(); "
+        "  var s := string.From(arr, 1, 3); "
+        "  return 0 if s = \"orl\" else s.Length; "  // 0
+        "end Main; end C;"), 0);
+}
+
+// Non-ASCII code points round-trip (adaptive width selected): "café".
+BEZEL_TEST(codegen_string_from_747, non_ascii_roundtrip_width) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var arr := \"caf\xC3\xA9\".ToCharArray(); "
+        "  var s := string.From(arr, 0, 4); "
+        "  return s.Length if s = \"caf\xC3\xA9\" else 99; "  // 4
+        "end Main; end C;"), 4);
+}
+
+// Out-of-range count raises IndexOutOfRangeException (§4.6 bounds convention).
+BEZEL_TEST(codegen_string_from_747, out_of_range_count_throws) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var chars := new Array<char>(); "
+        "  chars.Add('A'); chars.Add('B'); "
+        "  try var s := string.From(chars, 0, 10); return 1; "
+        "  catch IndexOutOfRangeException => return 0; end; "  // 0
+        "end Main; end C;"), 0);
+}
