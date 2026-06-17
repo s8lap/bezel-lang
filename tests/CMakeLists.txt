@@ -604,6 +604,8 @@ set(BEZEL_TEST_SOURCES
     codegen/parse_overloads_747_test.cpp
     # --- end #747 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
+    # --- #744 stage 1: dedicated `when` condition-dispatch expression (§19) ---
+    codegen/when_expr_744_test.cpp
     codegen/record_method_case_expr_677_test.cpp
     # --- fix #747 (R42): this[i] user-indexer get/set/compound no-op (§22.10) ---
     codegen/this_indexer_747_test.cpp

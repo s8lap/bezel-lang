@@ -500,6 +500,10 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
     if (isKeyword("case")) {
         return parseCaseExpr();
     }
+    // #744 / §19: `when` opens the condition-dispatch (scrutinee-less) form.
+    if (isKeyword("when")) {
+        return parseWhenExpr();
+    }
 
     // §A.5 NewExpr — `new Type "(" ArgList? ")"` or shorthand `new "(" … ")"`.
     if (isKeyword("new")) {
@@ -1048,6 +1052,29 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     if (!consumeKeyword("end")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close case expression");
+    }
+    return std::unique_ptr<ast::Expr>(ce.release());
+}
+
+// #744 / §19: `when Arm ("," Arm)* ","? end` — the dedicated scrutinee-less
+// condition-dispatch form. Each arm's "pattern" is a full boolean expression;
+// the first whose condition is true is taken. It produces the same
+// null-scrutinee CaseExpr the bare-`case` form does today (sema/codegen's
+// scrutinee-less path is reused), but with NO layout-significant disambiguation
+// — `when` is unambiguous. (Migrating bare `case` → `when` and deleting the
+// heuristic is a later stage.)
+std::unique_ptr<ast::Expr> Parser::parseWhenExpr() {
+    advance();  // past `when`
+    auto ce = std::make_unique<ast::CaseExpr>();
+    // Scrutinee stays null: `when` is always the condition-dispatch form.
+    ce->arms.push_back(parseCaseArm(/*bareForm=*/true));
+    while (consumePunctuator(",")) {
+        if (isKeyword("end")) break;  // trailing `,?`
+        ce->arms.push_back(parseCaseArm(/*bareForm=*/true));
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close `when` expression");
     }
     return std::unique_ptr<ast::Expr>(ce.release());
 }

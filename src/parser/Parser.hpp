@@ -124,6 +124,10 @@ private:
     // consumed `case` keyword.
     bool isScruntineeLessCase(uint32_t caseKeyLine) const;
     std::unique_ptr<ast::Expr> parseCaseExpr();
+    // #744 / §19: `when` is the dedicated scrutinee-less condition-dispatch
+    // construct (arms are boolean conditions; the first true wins). It reuses
+    // the null-scrutinee CaseExpr representation.
+    std::unique_ptr<ast::Expr> parseWhenExpr();
     // The positional sub-pattern of `Name(p1, p2)` destructuring. Mostly
     // delegates to parsePattern, but also admits naked-binding Identifier
     // per A.7.
