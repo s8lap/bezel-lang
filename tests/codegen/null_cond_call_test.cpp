@@ -171,3 +171,39 @@ BEZEL_TEST(null_cond_call, function_value_reference_return_738) {
         "  return r!.Length; "  // 'v'.Length = 1
         "end Main; end C;"), 1);
 }
+
+// fix #747 R43 / §27.7: a null-conditional call on a VOID-returning nullable
+// function (`((int) -> ())?`) is a no-op when null. This aborted the compiler
+// with a PHI type-mismatch assertion: the lowering built a `{i8, void}`
+// nullable struct + PHI for a result that does not exist. The spec example
+// `maybeHandler?(42)` (§27.7) must compile and run.
+
+// Null handler → the call is skipped, no crash, program returns 0.
+BEZEL_TEST(null_cond_call, void_function_value_null_is_noop_747) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var maybeHandler: ((int) -> ())? := null; "
+        "  maybeHandler?(42); "  // no-op, §27.7
+        "  return 0; "
+        "end Main; end C;"), 0);
+}
+
+// Non-null void handler → the call runs (and observably mutates state); a null
+// handler in the same program is skipped. total = 5 + 7 = 12.
+BEZEL_TEST(null_cond_call, void_function_value_present_runs_747) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "class Box "
+        "  public total: int := 0; "
+        "  public method Add(n: int) this.total := this.total + n; end Add; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box(); "
+        "  var h: ((int) -> ())? := (n) => b.Add(n); "
+        "  h?(5); "
+        "  h?(7); "
+        "  var none: ((int) -> ())? := null; "
+        "  none?(99); "  // skipped
+        "  return b.total; "  // 12
+        "end Main; end C;"), 12);
+}

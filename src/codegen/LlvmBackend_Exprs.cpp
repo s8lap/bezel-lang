@@ -1235,6 +1235,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         if (!closurePtr || !closurePtr->getType()->isPointerTy()) return nullptr;
         llvm::Type* rTy = lowerTypeRef(fnRt->funcReturn);  // R
         bool refResult = rTy->isPointerTy();
+        // fix #747 R43 / §27.7: a null-conditional call on a VOID-returning
+        // function (`((int) -> ())?`) is a statement-position no-op when null
+        // and discards the result otherwise — there is no "nullable void" value
+        // to materialize. The general path below built a `{i8, void}` nullable
+        // struct and a PHI over it, which is malformed and aborted the compiler
+        // (PHINode type-mismatch assertion). Emit the guarded call with no
+        // result PHI and return no value (Unit), like an ordinary void call.
+        bool voidResult = rTy->isVoidTy();
         // Result type R?: ptr for a reference R, tagged {i8 hasValue; R} struct
         // for a value R (matches lowerTypeRef of the sema-set R? result).
         llvm::Type* resTy = refResult
@@ -1265,14 +1273,21 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         std::vector<llvm::Type*> argTys;
         for (auto* v : args) argTys.push_back(v->getType());
         auto* fnTy = llvm::FunctionType::get(rTy, argTys, false);
-        llvm::Value* callRes =
-            builder_.CreateCall(fnTy, fnPtr, args, "nccall.ret");
+        // A void call must not carry a value name (LLVM forbids naming a void
+        // instruction); only name the result when it is a real value.
+        llvm::Value* callRes = builder_.CreateCall(
+            fnTy, fnPtr, args, voidResult ? "" : "nccall.ret");
+        // Wrap the non-void result into R? in THIS (call) block so it dominates
+        // its PHI edge; the void case has no result to wrap.
         llvm::Value* wrapped =
-            refResult ? callRes : wrapNullableValue(fnRt->funcReturn, callRes);
+            voidResult ? nullptr
+            : (refResult ? callRes
+                         : wrapNullableValue(fnRt->funcReturn, callRes));
         auto* callEndBB = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
+        if (voidResult) return nullptr;  // Unit result — no PHI.
         auto* phi = builder_.CreatePHI(resTy, 2);
         llvm::Value* nullVal = refResult
             ? static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptrTy()))
