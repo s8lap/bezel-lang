@@ -355,6 +355,40 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     bool nullableUncovered =
         scrutTy && scrutTy->nullable && !armsCoverNull(ce);
 
+    // §19.5 / §19.6 (#784): an unguarded typed-binding arm `var n: T` matches
+    // ALL non-null values (§19.5 — "a typed binding pattern `var n: T` matches
+    // only non-null values"). When the scrutinee is assignable to T (T is the
+    // scrutinee's own static type or a supertype of it), such an arm covers
+    // every non-null value of the scrutinee, so the case is exhaustive once
+    // null is also covered: a NON-nullable scrutinee is fully covered by the
+    // binding alone; a nullable scrutinee additionally needs a `null` arm.
+    // Without this, `case x null => 0, var n: int => n end` (x: int?) drew a
+    // spurious non-exhaustiveness warning even though it covers every value
+    // (sibling of the bool? exhaustiveness fix, daa83f4).
+    if (scrutTy) {
+        for (const auto& arm : ce.arms) {
+            if (arm.guard) continue;
+            auto* bp =
+                dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
+            if (!bp || !bp->type) continue;
+            const TypeRef* bt = ctx_.resolvedType(*bp->type);
+            if (!bt || bt->kind != scrutTy->kind) continue;
+            bool coversNonNull = false;
+            if (bt->kind == TypeRef::Kind::Primitive)
+                coversNonNull = bt->primitive == scrutTy->primitive;
+            else if (bt->kind == TypeRef::Kind::Named && bt->declaration &&
+                     scrutTy->declaration)
+                coversNonNull = bt->declaration == scrutTy->declaration ||
+                                isSubtype(scrutTy->declaration, bt->declaration);
+            if (!coversNonNull) continue;
+            if (!scrutTy->nullable || armsCoverNull(ce)) return;  // exhaustive
+            // Non-null fully covered, but null is not (§19.6 nullable rule).
+            warn("the nullable scrutinee's non-null values are covered by a "
+                 "typed binding, but `null` is not");
+            return;
+        }
+    }
+
     // --- Bool scrutinee (§19.6): both `true` and `false` must be covered. A
     // nullable `bool?` is exhaustive when, per the nullable rule (§19.6:
     // "the rules above plus an explicit `null` pattern"), `true`, `false`, AND

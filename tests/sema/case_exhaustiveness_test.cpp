@@ -495,3 +495,56 @@ BEZEL_TEST(sema_case_exhaust, statement_case_no_warning_spec_19_6) {
     BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// fix #784 / §19.5 / §19.6: an unguarded typed-binding `var n: T` arm matches
+// all non-null values; with a `null` arm it makes a `T?` scrutinee exhaustive
+// (sibling of the bool? fix). The checker wrongly warned because it treated
+// only `_`/untyped `var x` as a catch-all.
+
+// `null` + `var n: int` over int? → exhaustive, no warning.
+BEZEL_TEST(sema_case_exhaust, nullable_typed_binding_plus_null_ok_spec_19_5) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int?): int "
+        "    return case x null => 0, var n: int => n end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A typed binding `var n: int` over a NON-nullable int covers everything.
+BEZEL_TEST(sema_case_exhaust, nonnullable_typed_binding_is_exhaustive_spec_19_5) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x var n: int => n end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+}
+
+// A typed binding over int? WITHOUT a `null` arm is still non-exhaustive.
+BEZEL_TEST(sema_case_exhaust, nullable_typed_binding_no_null_arm_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int?): int "
+        "    return case x var n: int => n end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+}
+
+// A NARROWER typed binding (`var d: Dog` over `Animal`) does NOT cover all —
+// still non-exhaustive without a catch-all (must not over-broaden).
+BEZEL_TEST(sema_case_exhaust, narrower_typed_binding_still_warns_spec_19_5) {
+    auto r = parseSemaAll(
+        "module M; "
+        "abstract class Animal end Animal; "
+        "class Dog: Animal end Dog; "
+        "class Cat: Animal end Cat; "
+        "class C public static method M(a: Animal): int "
+        "  return case a var d: Dog => 1 end; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+}
