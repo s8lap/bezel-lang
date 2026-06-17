@@ -639,6 +639,20 @@ private:
     // expression's type, so member access chains (`a?.b?.c`) resolve.
     void resolveNullCondMember(const ast::NullCondMemberExpr& nm);
 
+    // §7.5 / #751: result type of a builtin (string/primitive) RECEIVER's
+    // property-like value member (e.g. `string.Length`, `string.IsAscii`) for
+    // the null-conditional `x?.M` path. resolveMemberAccess types these via a
+    // large inlined intrinsic block keyed on the MemberAccessExpr node, which
+    // resolveNullCondMember cannot run — so `x?.Length` was left untyped and a
+    // following `??` (lowerCoalesce) silently read 0. Returns the member's
+    // NON-nullable result type, or null when unrecognized; the caller lifts it
+    // to the nullable form. Only the property-like value members reachable as a
+    // bare `?.` access are covered — the numeric-primitive intrinsics
+    // (CompareTo, Abs, …) are all METHODS, reached through `?(`
+    // (NullCondCallExpr), not this path.
+    TypeRef* builtinValueMemberType(const TypeRef* recvTy,
+                                    std::string_view member);
+
     // §17.1 result-type table for binary operators. Slice 3c covers the
     // common cases with no operator-overload resolution: equality and
     // relational ops produce bool; arithmetic / shift / bitwise produce

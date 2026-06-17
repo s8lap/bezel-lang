@@ -172,3 +172,28 @@ BEZEL_TEST(codegen_cg41, already_nullable_field_present_value) {
         "  var x: int? := bb?.m; return x!; "
         "end Main; end C;"), 13);
 }
+
+// §7.5 / #751 — an INFERRED local from `?.` on a string built-in member
+// (`var n := s?.Length`, no annotation) must carry the `int?` type so a
+// following `??` yields the length, not 0. resolveNullCondMember previously
+// left the result untyped (string built-in members have no Symbol and were not
+// run through the intrinsic-typing block), so lowerCoalesce silently produced 0.
+BEZEL_TEST(codegen_cg41, inferred_string_length_feeds_coalesce_751) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := \"ab\"; "
+        "  var n := s?.Length; "   // inferred int? — was untyped pre-#751
+        "  return n ?? 99; "       // 2, not 0
+        "end Main; end C;"), 2);
+}
+
+// §7.5 / #751 — the null-receiver case still short-circuits: `s` is null, so
+// `s?.Length` is a null `int?` and `?? 99` supplies the default.
+BEZEL_TEST(codegen_cg41, inferred_string_length_null_receiver_coalesce_751) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := null; "
+        "  var n := s?.Length; "
+        "  return n ?? 99; "       // 99
+        "end Main; end C;"), 99);
+}

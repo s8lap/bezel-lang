@@ -5899,6 +5899,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     }
 }
 
+// §7.5 / #751: result type of a builtin string/primitive RECEIVER's
+// property-like value member, for the null-conditional `x?.M` path. See the
+// declaration comment in ExprTypecheck_impl.hpp for why resolveNullCondMember
+// needs this (the authoritative listing is the inlined intrinsic block in
+// resolveMemberAccess; only the bare-access value members are mirrored here).
+TypeRef* ExprTC::builtinValueMemberType(const TypeRef* recvTy,
+                                        std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive) return nullptr;
+    if (recvTy->primitive == PrimitiveType::String) {
+        // stdlib §9.6: Length: int. (ToString and the rest are methods —
+        // reached as `?(`, not a bare `?.` member access. `IsAscii` is also a
+        // bare-access bool member and types correctly here, but its value path
+        // needs a runtime scan helper that is the same gap regardless of `?.`;
+        // it is left to a dedicated follow-up rather than half-enabled.)
+        if (member == "Length")
+            return ctx_.primitiveTypeRef(PrimitiveType::Int);
+    }
+    return nullptr;
+}
+
 // §7.5 null-conditional member access `x?.M`. Resolves the member on
 // the target's (non-nullable) type exactly like `.`, but the result
 // type is ALWAYS nullable (the access yields null when the target is
@@ -5920,6 +5940,21 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
         if (recvTy) {
             member = lookupExtensionMember(recvTy, nm.member);
+        }
+        // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has
+        // no Symbol — resolveMemberAccess types these via a large inlined
+        // intrinsic block this function does not run, so `s?.Length` was left
+        // untyped. An inferred local copies that absent type, and `n ?? d`
+        // (lowerCoalesce, gated on isNullableValueTy) then silently produced 0.
+        // Type the value member here (nullable result per §7.5) so the inferred
+        // local and `??` see a usable `int?`. The value codegen already handled
+        // `s?.Length` (only the type was missing).
+        if (!member && recvTy) {
+            if (TypeRef* bt = builtinValueMemberType(recvTy, nm.member)) {
+                ctx_.setExprType(
+                    &nm, ctx_.primitiveTypeRef(bt->primitive, /*nullable=*/true));
+                return;
+            }
         }
     }
     if (!member) return;
