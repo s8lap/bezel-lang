@@ -320,6 +320,24 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
     auto* recvTy = ctx_.exprType(*ix.target);
+    // §15.3 / §28.11 (#747): `move a[i]` on a move-only OWNING inline array
+    // ([N owned]T? / [N owned]T). Read the owned element out of the slot and
+    // leave the slot NULL (moved-from), so the array's scope-end slot disposal
+    // (Disposal.inlineOwnedArray) skips it — the new owner now owns the element.
+    // Without this null the dangling slot pointer would be double-freed at scope
+    // end (the inline array stays disposal-eligible — a slot-move is a borrow of
+    // the array as a whole). lvalueAddr computes the bounds-checked slot address,
+    // evaluating the index exactly once.
+    if (recvTy && recvTy->kind == sema::TypeRef::Kind::InlineArray &&
+        recvTy->arrayOwned) {
+        llvm::Type* slotElemTy = nullptr;
+        llvm::Value* slotAddr = lvalueAddr(ix, slotElemTy);
+        if (!slotAddr || !slotElemTy) return nullptr;
+        llvm::Value* moved = builder_.CreateLoad(slotElemTy, slotAddr, "ioa.mv");
+        builder_.CreateStore(
+            llvm::Constant::getNullValue(slotElemTy), slotAddr);
+        return moved;
+    }
     bool isArr  = isCollectionTypeName(recvTy);
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return nullptr;

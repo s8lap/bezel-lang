@@ -6,6 +6,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
         if (diverged_) return true;  // CG40: diverging initializer
+        // §15.3 (#747): a move-only owning inline-array local auto-disposes its
+        // slots at scope end, independent of `using var` (§28.10 line 2025).
+        // When handled, bypass the using/task/unwind chain (none applies to a
+        // move-only value-typed local).
+        if (registerInlineOwnedArrayDisposal(ld)) return false;
         if (ld->isUsing) registerUsingDisposal(ld);
         // #445 / §30.5: a plain `var` task-typed local is freed at scope end via
         // bz_task_fire_and_forget — the same disposal a `using var` task gets.

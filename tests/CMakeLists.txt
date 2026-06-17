@@ -365,6 +365,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_string_equality_test.cpp
     codegen/inline_array_test.cpp
     codegen/inline_array_equality_test.cpp
+    codegen/inline_owned_array_disposal_747_test.cpp
     codegen/string_test.cpp
     codegen/string_length_codepoints_528_test.cpp
     codegen/string_methods_codepoints_535_test.cpp

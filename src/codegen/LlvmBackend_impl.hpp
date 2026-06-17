@@ -725,6 +725,22 @@ private:
         //       free(null) is a no-op per POSIX.
         // Fires on BOTH normal and unwind paths (symmetric with closureRelease).
         bool boxedCellFree = false;
+        // §15.3 / §15.1.1 (#747): a move-only OWNING inline-array local
+        // ([N owned]T? / [N owned]T) whose ownership is NOT transferred out of
+        // the local anywhere in the body (per the inlineOwnedArrayTransferred_
+        // pre-scan). At scope end — on BOTH the normal and the unwind exit (the
+        // array's scope ends either way; a given exit goes one way only → exactly
+        // once per exit, §15.3 line 2021 + §28.10 line 2025) — each non-null slot
+        // is disposed-and-reclaimed via the slot object's own vtable (dynamic
+        // dispatch, mirroring emitOwnedFieldDisposals' class-field path), then
+        // nulled so a re-entrant pass is a no-op. `slot` is the array alloca
+        // ([N x ptr]); `inlineSlotCount` is N. Registration is restricted to
+        // never-transferred locals so this is the SOLE disposal site (a
+        // transferred-out array is skipped — the receiving local / callee owns it
+        // — so no double-free; a conservatively-misjudged transfer at worst
+        // leaks, never double-frees).
+        bool inlineOwnedArray = false;
+        unsigned inlineSlotCount = 0;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -4064,6 +4080,30 @@ private:
     // double-dispose. Such a lambda local simply leaks on its unwind path
     // (a bounded leak, never a double-free).
     llvm::Function* unwindIneligibleFn_ = nullptr;
+
+    // §15.3 (#747): the set of move-only owning inline-array ([N owned]T?/
+    // [N owned]T) LocalDecl nodes whose ownership is TRANSFERRED out of the local
+    // somewhere in the body (init-RHS, assignment-RHS, owned-arg, `return arr`,
+    // field-store, throw, `move arr`, or any other non-borrow use). Computed once
+    // per body by collectMoveOnlyArrayTransferred via a DEFAULT-TRANSFER walk:
+    // only borrow positions (index/member receiver, for-in iterable) keep a local
+    // OUT of the set. A local NOT in the set gets scope-end slot disposal
+    // registered; a local IN the set is skipped (the receiving local / callee
+    // owns the slots — so the array's slots are disposed exactly once, never
+    // double-freed). A conservatively-misjudged transfer at worst LEAKS.
+    std::unordered_set<const void*> moveOnlyArrayTransferred_;
+    // The function for which moveOnlyArrayTransferred_ was computed (mirrors
+    // unwindIneligibleFn_): registration only fires when currentFn_ matches, so a
+    // lambda/thunk body lowered mid-function does not consult a stale set.
+    llvm::Function* moveOnlyArrayTransferredFn_ = nullptr;
+    void collectMoveOnlyArrayTransferred(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // §15.3 (#747): if `ld` is a move-only owning inline-array local, register
+    // (or, when transferred-out / outside the analyzed body, deliberately skip)
+    // its scope-end slot disposal and return true (so the caller bypasses the
+    // using/task/unwind registration chain, which does not apply to a move-only
+    // value-typed local). Returns false for any non-(inline-owned-array) local.
+    bool registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld);
 
     // #422 / §4.6 / §28.9: the set of `var` string LocalDecl nodes PROVABLY
     // eligible for scope-end bz_string_release — initialized once by a

@@ -1,0 +1,164 @@
+// Codegen — move-only owning inline-array slot disposal (§15.3 / §15.1.1, #747).
+//
+// Spec §15.3 line 2021: "a move-only local's owned slots are auto-disposed at
+// scope end by the compiler." §15.1.1 line 1957: "When an owning inline array's
+// lifetime ends, the array's auto-dispose pass disposes each non-null slot."
+// Before this fix, a `[N owned]T?` / `[N owned]T` local registered NO disposal
+// at all, so its slots' class instances leaked on every exit (normal and
+// unwind).
+//
+// SOUNDNESS: a move-only array whose ownership is TRANSFERRED out of the local
+// (whole-array move `var b := a`, owned-arg, `return arr`, …) must NOT be
+// disposed at the source's scope end (the receiver / callee owns it) — else a
+// double-free. The fix gates disposal on a conservative default-transfer
+// pre-pass and nulls a slot at `move a[i]`. All "disposed" assertions use a
+// static counter that a double-free would drive negative or corrupt.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Cell: a disposable class with a static live-instance counter. ctor +1,
+// destructor -1. After all owners are disposed the counter is 0; a leak leaves
+// it positive; a double-free drives it negative (or aborts).
+const char* kCell =
+    "module M; "
+    "class Cell "
+    "  public static n: int := 0; "
+    "  public V: int := 0; "
+    "  public constructor(v: int) Cell.n := Cell.n + 1; V := v; end constructor; "
+    "  destructor Cell.n := Cell.n - 1; end destructor; "
+    "end Cell; ";
+
+std::string prog(const std::string& body) {
+    return std::string(kCell) +
+        "class C public static method Main(): int " + body + " end Main; end C;";
+}
+}  // namespace
+
+// §15.3: a `[N owned]Cell?` literal-initialized local disposes BOTH slots at
+// scope end → counter back to 0.
+BEZEL_TEST(codegen_inline_owned_747, nullable_literal_disposed_at_scope_end) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "do var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; end; "
+        "return Cell.n;")), 0);
+}
+
+// §15.3: the NON-nullable `[N owned]Cell` form likewise disposes its slots.
+BEZEL_TEST(codegen_inline_owned_747, non_nullable_literal_disposed_at_scope_end) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "do var a: [2 owned]Cell := [new Cell(1), new Cell(2)]; end; "
+        "return Cell.n;")), 0);
+}
+
+// SOUNDNESS — whole-array move-only transfer `var b := a`: b's slots ALIAS a's
+// pointers (aggregate copy). a is transferred → its disposal is SKIPPED; b (the
+// receiver) disposes each cell exactly once → counter 0 (NOT -2 from a
+// double-free, NOT a crash).
+BEZEL_TEST(codegen_inline_owned_747, whole_array_move_no_double_free) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "  var b: [2 owned]Cell? := a; "
+        "end; "
+        "return Cell.n;")), 0);
+}
+
+// SOUNDNESS — `move a[i]` nulls the slot, so the scope-end disposal skips it and
+// the moved value is disposed exactly once by its new owner. Slot 0 → `t`; slot
+// 1 → the scope-end pass. Counter 0.
+BEZEL_TEST(codegen_inline_owned_747, slot_move_then_null_restore_no_double_free) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "  using var t: Cell? := move a[0]; "
+        "  a[0] := null; "
+        "end; "
+        "return Cell.n;")), 0);
+}
+
+// BORROW position — an index read keeps the array disposal-eligible: the value
+// is read (borrow), then both slots are disposed at scope end. Returns the read
+// value (5) with counter 0 (encoded n*100+read).
+BEZEL_TEST(codegen_inline_owned_747, index_read_borrow_stays_eligible) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var read: int := 0; "
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(5), new Cell(7)]; "
+        "  read := a[0]!.V; "
+        "end; "
+        "return Cell.n * 100 + read;")), 5);
+}
+
+// BORROW position — a for-in iterable keeps the array eligible: iterate (borrow
+// each slot), accumulate, then dispose both slots. sum=12, counter 0.
+BEZEL_TEST(codegen_inline_owned_747, for_in_borrow_stays_eligible) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var sum: int := 0; "
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(5), new Cell(7)]; "
+        "  for var c in a do sum := sum + c!.V; end; "
+        "end; "
+        "return Cell.n * 100 + sum;")), 12);
+}
+
+// SOUNDNESS (adversarial verify, LENS 2) — a slot store `a[i] := a[j]` lowers to
+// a plain pointer copy that ALIASES one object into two slots; disposing both
+// would double-free / UAF (was SIGSEGV). The transfer walker marks the array
+// ineligible on any owned-slot store whose RHS is not new/move/null, so the
+// array is SKIPPED — a conservative LEAK (counter stays 2), NEVER a double-free.
+// (A precise fix — reject/move-convert `a[i] := <borrow>` per §28.11 — is a
+// follow-up; this lane guarantees no crash.)
+BEZEL_TEST(codegen_inline_owned_747, slot_alias_assignment_no_double_free) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "a[0] := a[1]; "        // aliases Cell(2) into both slots
+        "return Cell.n;")), 2);  // safe leak, NOT a negative count / crash
+}
+
+// SOUNDNESS (adversarial verify, LENS 1) — a move-only array captured by a
+// closure is capture-boxed (its [N x ptr] alloca becomes a ptr-sized cell), so
+// the slot-disposal GEP would read out of bounds (was SIGSEGV). The walker marks
+// any array referenced in a lambda body ineligible, so it is SKIPPED — a
+// conservative leak (counter 2), no crash. The capture itself still works.
+BEZEL_TEST(codegen_inline_owned_747, closure_capture_no_crash) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var got: int := 0; "
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "  var f := () => a[0]!.V; "  // captures a (capture-boxed)
+        "  got := f(); "
+        "end; "
+        "return Cell.n;")), 2);  // got==1 read OK; both cells leaked, no crash
+}
+
+// EXCEPTION path (§15.3 line 2022 / §28.3 implicit try/finally): both slots are
+// disposed when an exception unwinds out of the array's scope. Mirrors the
+// exception_dispose_test.cpp convention exactly (resource in a `do…end` inside
+// the try, an UP-counting destructor, a case-arm catch reading the count) so the
+// unwind-ordering is the established one — `Dn` increments once per slot
+// disposed, so the catch sees 2.
+BEZEL_TEST(codegen_inline_owned_747, exception_unwind_disposes_both_slots) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class Dn "
+        "  public static n: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Dn.n := Dn.n + 1; end destructor; "
+        "end Dn; "
+        "class C public static method Main(): int "
+        "  try "
+        "    do var a: [2 owned]Dn? := [new Dn(), new Dn()]; "
+        "       throw new AppError(); end; "
+        "  catch AppError => return Dn.n; end; "
+        "  return -1; "
+        "end Main; end C;"), 2);
+}

@@ -3160,6 +3160,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // unwind, and no dispose scope for owned params (a documented gap).
     unwindIneligible_.clear();
     unwindIneligibleFn_ = fn;
+    // §15.3 (#747): which move-only owning inline-array locals are TRANSFERRED
+    // out (so the rest stay eligible for scope-end slot disposal).
+    moveOnlyArrayTransferred_.clear();
+    moveOnlyArrayTransferredFn_ = fn;
     currentReturnTypeNode_ = ci.returnType;  // §8.6: for return-value boxing
     // #422 / §4.6 / §28.9: which `var` string locals may be released at scope
     // end (mirrors collectUnwindIneligible; consulted in lowerLocalDecl).
@@ -3179,6 +3183,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     cellFreeEligibleFn_ = fn;
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
+        collectMoveOnlyArrayTransferred(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
@@ -3548,6 +3553,9 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     unwindIneligible_.clear();
     unwindIneligibleFn_ = fn;
     collectUnwindIneligible(cd->body);
+    moveOnlyArrayTransferred_.clear();
+    moveOnlyArrayTransferredFn_ = fn;
+    collectMoveOnlyArrayTransferred(cd->body);  // §15.3 (#747)
     bindParameters(fn, /*hasThis=*/true, &cs->params);
 
     // CG16 (§12.8): a leading `base(...)`/`this(...)` chain call runs
@@ -5464,6 +5472,40 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
 }
 
 
+bool Emitter::registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld) {
+    // §15.3 / §15.1.1 (#747): a move-only OWNING inline-array local
+    // ([N owned]T? / [N owned]T) auto-disposes its non-null slots at scope end.
+    const sema::TypeRef* rt =
+        ld->type ? ctx_.resolvedType(*ld->type)
+                 : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray || !rt->arrayOwned)
+        return false;  // not a move-only owning inline array — caller continues.
+    // From here it IS a move-only owning inline array: handle it (return true)
+    // so the using/task/unwind chain is bypassed (§28.10 line 2025: `using var`
+    // has no disposal effect on a move-only array; the auto-dispose below runs
+    // regardless). Whether we actually register disposal depends on transfer.
+    if (emittingDisposerBody_) return true;
+    // Only register when the transfer analysis covers the current body; a
+    // lambda/thunk body lowered mid-function inherits a stale set, so skip
+    // (a safe leak, never a double-free).
+    if (currentFn_ != moveOnlyArrayTransferredFn_) return true;
+    // Transferred out of the local somewhere → the receiver / callee owns the
+    // slots; disposing here would double-free. Skip (the conservative default).
+    if (moveOnlyArrayTransferred_.count(static_cast<const void*>(ld))) return true;
+    if (disposeStack_.empty()) return true;
+    auto it = locals_.find(ld);
+    if (it == locals_.end() || !it->second) return true;
+    llvm::AllocaInst* slot = it->second;
+    auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(slot->getAllocatedType());
+    if (!arrTy) return true;  // defensive: a non-aggregate alloca → skip.
+    Disposal d{slot, nullptr};
+    d.inlineOwnedArray = true;
+    d.inlineSlotCount = static_cast<unsigned>(arrTy->getNumElements());
+    disposeStack_.back().push_back(d);
+    return true;
+}
+
+
 void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
     // §28.3 (line 4910): a plain `var` owned local is auto-disposed when an
     // exception unwinds out of its scope (an `unwindOnly` Disposal — normal exit
@@ -5755,6 +5797,277 @@ void Emitter::collectUnwindIneligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     unwindIneligible_.clear();
     UnwindIneligibleWalker w{ctx_, unwindIneligible_};
+    for (auto& s : body) w.stmt(s.get());
+}
+
+
+namespace {
+// §15.3 (#747): a DEFAULT-TRANSFER walk that records every local whose ownership
+// LEAVES the local — used to decide which move-only owning inline-array locals
+// are eligible for scope-end slot disposal. The bias is the inverse of
+// UnwindIneligibleWalker: there, an unrecognized use is a BORROW (eligible);
+// here, an unrecognized use is a TRANSFER (ineligible → skip disposal → at worst
+// a leak, NEVER a double-free). The ONLY positions that keep a local eligible
+// (borrow=true, identifier NOT recorded) are: an index receiver (`a[i]`,
+// `a[i] := x`, `move a[i]`), a member-access receiver (`a.Length`), and a for-in
+// iterable. Crucially, unlike UnwindIneligibleWalker, `return arr` is a TRANSFER
+// (a move-only array returned hands ownership to the caller — disposing it at the
+// callee's scope end would double-free). A lambda body is walked as transfer
+// (conservative): an inline-owned-array captured by a closure is left ineligible
+// (a safe leak) rather than risk disposing it while an escaping closure still
+// references it. `markIdent` records the local by its LocalDecl node.
+struct MoveOnlyArrayTransferWalker {
+    const sema::SemaContext& ctx;
+    std::unordered_set<const void*>& out;
+    // #747 verify (LENS 1): inside a lambda body EVERY referenced local is
+    // treated as transferred — a captured move-only inline array is capture-boxed
+    // (its [N x ptr] alloca is rewritten to a ptr-sized cell holder, §27.5), so
+    // the slot-disposal GEP would read out of bounds and crash. Marking captured
+    // arrays ineligible (a safe leak) avoids that entirely.
+    bool inLambda = false;
+
+    // #747 verify (LENS 2): a store into an owned slot `a[i] := rhs` whose rhs is
+    // NOT a fresh-owned value (`new`), a `move`, or `null` may ALIAS another owner
+    // into the slot (e.g. `a[i] := a[j]` copies a slot pointer), and the scope-end
+    // disposal would then double-free the shared object. Such a store marks the
+    // array ineligible (skip disposal = leak, never a double-free). new/move/null
+    // stores never alias, so they keep the array eligible.
+    static bool isSafeOwnedSlotRhs(const ast::Expr* rhs) {
+        if (!rhs) return true;
+        if (dynamic_cast<const ast::NewExpr*>(rhs)) return true;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(rhs)) return true;
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(rhs))
+            if (u->op == "move") return true;
+        return false;
+    }
+
+    void markIdent(const ast::Expr* e) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id)))
+                if (loc->decl) out.insert(static_cast<const void*>(loc->decl));
+            return;
+        }
+        expr(e, /*borrow=*/false);
+    }
+
+    // borrow=true: this position only BORROWS its operand — an inline-array
+    // identifier appearing here does NOT transfer ownership and stays eligible.
+    void expr(const ast::Expr* e, bool borrow) {
+        if (!e) return;
+        if (dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (!borrow || inLambda) markIdent(e);  // capture ⇒ transfer (LENS 1)
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), /*borrow=*/true);   // a[i] borrows a
+            for (auto& a : ix->indices) expr(a.value.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get(), /*borrow=*/true);     // a.Length borrows a
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get(), /*borrow=*/true);
+            return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get(), borrow);
+            return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            // `move a` transfers the whole array; `move a[i]` is a slot-move whose
+            // receiver `a` is a borrow (the IndexExpr branch handles it, and the
+            // slot is nulled at lowering so the array stays disposal-eligible).
+            if (u->op == "move") {
+                if (dynamic_cast<const ast::IndexExpr*>(u->operand.get()))
+                    expr(u->operand.get(), /*borrow=*/false);  // walks a[i]: a borrow
+                else
+                    markIdent(u->operand.get());               // move a → transfer
+            } else {
+                expr(u->operand.get(), /*borrow=*/false);
+            }
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get()))
+                expr(ma->target.get(), /*borrow=*/true);  // a.M(...) borrows a
+            else
+                expr(c->callee.get(), /*borrow=*/false);
+            for (auto& a : c->args) expr(a.value.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get()))
+                expr(ma->target.get(), /*borrow=*/true);
+            else
+                expr(c->callee.get(), /*borrow=*/false);
+            for (auto& a : c->args) expr(a.value.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get(), /*borrow=*/false);
+            expr(b->right.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get(), /*borrow=*/false);
+            expr(c->thenValue.get(), borrow);
+            expr(c->elseValue.get(), borrow);
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get(), /*borrow=*/true);  // `is`/`as` borrows
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get(), /*borrow=*/false);
+            for (auto& a : w->assigns) expr(a.value.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get(), /*borrow=*/false);
+            for (auto& k : cl->keys) expr(k.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // Every local referenced in a lambda body is treated as transferred
+            // (captured ⇒ ineligible) — the `inLambda` flag forces marking even at
+            // borrow positions, so a captured capture-boxed array is never the
+            // target of the slot-disposal GEP (LENS 1: that GEP would crash).
+            bool saved = inLambda;
+            inLambda = true;
+            if (lam->exprBody) expr(lam->exprBody.get(), /*borrow=*/false);
+            for (auto& s : lam->stmts) stmt(s.get());
+            inLambda = saved;
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get(), /*borrow=*/true);
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get(), /*borrow=*/false);
+                expr(arm.exprBody.get(), borrow);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+        // Any other expression: recurse conservatively as transfer.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get(), /*borrow=*/false);   // `var b := a` xfers a
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), /*borrow=*/false); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            // KEY: `return arr` TRANSFERS the move-only array to the caller.
+            expr(r->value.get(), /*borrow=*/false); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get(), /*borrow=*/false); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get(), /*borrow=*/false); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // The target is a WRITE (not a transfer of the target's old value);
+            // `a[i] := x` borrows a, `a := x` overwrites a (its final value is
+            // still disposed at scope end). The RHS, if an array identifier, is a
+            // transfer.
+            // LENS 2: a slot store `a[i] := rhs` whose rhs is NOT new/move/null may
+            // alias another owner into the slot (`a[i] := a[j]`), which the
+            // scope-end disposal would then double-free — mark the array (the index
+            // receiver) ineligible so it is skipped (leak, never a double-free).
+            if (auto* ixt = dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
+                if (!isSafeOwnedSlotRhs(as->value.get()))
+                    markIdent(ixt->target.get());
+            }
+            expr(as->target.get(), /*borrow=*/true);
+            expr(as->value.get(), /*borrow=*/false);
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get(), /*borrow=*/true); return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            // `_ := arr` is a §17.13 compile error for a move-only array, so this
+            // never carries a real transfer; walk conservatively anyway.
+            expr(ds->value.get(), /*borrow=*/false); return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get(), /*borrow=*/false); return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), /*borrow=*/false);
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), /*borrow=*/false);
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), /*borrow=*/false);
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get(), /*borrow=*/true);   // `for x in a` borrows a
+            expr(fs->withExpr.get(), /*borrow=*/false);
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), /*borrow=*/false);
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), /*borrow=*/true);
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get(), /*borrow=*/false);
+                expr(arm.exprBody.get(), /*borrow=*/false);
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return;
+        }
+        // BreakStmt / ContinueStmt: no sub-expressions.
+    }
+};
+}  // namespace
+
+
+void Emitter::collectMoveOnlyArrayTransferred(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    moveOnlyArrayTransferred_.clear();
+    MoveOnlyArrayTransferWalker w{ctx_, moveOnlyArrayTransferred_};
     for (auto& s : body) w.stmt(s.get());
 }
 
@@ -8771,6 +9084,38 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // freed exactly here on a normal handled exit (a re-raise skips it
             // via the isUnwind branch above).
             emitDisposeAndReclaim(obj);
+            continue;
+        }
+        // §15.3 / §15.1.1 (#747): a move-only owning inline-array local. Dispose
+        // each non-null slot of the [N x ptr] alloca via the slot object's own
+        // vtable (dynamic dispatch), then null the slot. Runs on BOTH normal and
+        // unwind exit — the array as a whole carries no class Dispose (it is a
+        // value type, not IDisposable), so unlike a plain owned class local
+        // (unwindOnly below) it auto-disposes on normal exit too (§15.3 line 2021:
+        // "a move-only local's owned slots are auto-disposed at scope end").
+        // Only registered for locals proven never transferred out, so this is the
+        // single disposal of each slot's object (no double-free).
+        if (it->inlineOwnedArray) {
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), it->inlineSlotCount);
+            for (unsigned i = 0; i < it->inlineSlotCount; ++i) {
+                llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
+                    arrTy, it->slot,
+                    {builder_.getInt32(0), builder_.getInt32(i)}, "ioa.slot");
+                llvm::Value* obj = builder_.CreateLoad(ptrTy(), slotAddr, "ioa.val");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()));
+                auto* dispBB = llvm::BasicBlock::Create(llvm_, "ioa.dispose",
+                                                        currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(llvm_, "ioa.cont",
+                                                        currentFn_);
+                builder_.CreateCondBr(isNull, contBB, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(obj);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), slotAddr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
             continue;
         }
         // §28.3 (line 4910): a plain `var` owned local / `owned` parameter. It is
