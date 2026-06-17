@@ -5268,6 +5268,19 @@ private:
     // the caller continues normal dispatch.
     std::optional<llvm::Value*> tryLowerEventCall(const ast::CallExpr& call);
 
+    // §24.3 (#747): lower an event handler argument (a lambda / method ref) to a
+    // closure {fn, env}, informing lowerLambda of the expected `(payload) -> ()`
+    // type so an untyped `(e) => …` param resolves the payload and a block-bodied
+    // handler resolves its return to void (not the i32 default). Shared by the
+    // direct-event `.Subscribe`/`.Add`/`.Remove` path and the stored-IEvent<T>
+    // `.Subscribe` path. Returns null on failure.
+    llvm::Value* lowerEventHandlerClosure(const ast::Expr* handlerExpr,
+                                          const sema::TypeRef* payload);
+    // §24.3 (#747): is `rt` the builtin IEvent<T> / IAsyncEvent<T> interface
+    // (a Named TypeRef with a null user declaration whose first name part is
+    // "IEvent"/"IAsyncEvent")? Mirrors isSubscriptionType.
+    static bool isIEventTypeName(const sema::TypeRef* rt);
+
     // per §24.4: `<event> += h` / `<event> -= h` inside the declaring class —
     // a fixed desugaring to Add/Remove. Returns true when handled.
     bool tryLowerEventCompound(const ast::AssignmentStmt& as);

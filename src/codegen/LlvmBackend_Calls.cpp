@@ -7045,13 +7045,73 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     builder_.SetInsertPoint(endBB);
 }
 
+bool Emitter::isIEventTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    const auto& n = rt->astNode->name->parts[0];
+    return n == "IEvent" || n == "IAsyncEvent";
+}
+
+llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
+                                               const sema::TypeRef* payload) {
+    if (!handlerExpr) return nullptr;
+    const sema::TypeRef* saved = expectedFunctionType_;
+    sema::TypeRef handlerTy;  // synthesized (payload) -> ()
+    handlerTy.kind = sema::TypeRef::Kind::Function;
+    if (payload) {
+        sema::TypeRef::FuncParam p;
+        p.type = const_cast<sema::TypeRef*>(payload);
+        handlerTy.funcParams.push_back(p);
+    }
+    // §24.3: a handler returns unit. Set funcReturn so lowerLambda resolves a
+    // block-bodied handler's return type to void — without this it defaulted to
+    // i32, defining the handler as i32(...) while the Raise loop calls it through
+    // a void(...) function pointer (an indirect-call type mismatch).
+    auto* unitRet = ctx_.makeTypeRef();
+    unitRet->kind = sema::TypeRef::Kind::Unit;
+    handlerTy.funcReturn = unitRet;
+    expectedFunctionType_ = &handlerTy;
+    llvm::Value* closure = lowerExpr(*handlerExpr);
+    expectedFunctionType_ = saved;
+    return closure;
+}
+
 std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return std::nullopt;
     // The target of `.Subscribe`/`.Raise`/`.Add`/`.Remove` must itself be an
     // event access.
     const sema::EventSymbol* es = eventSymbolOf(*ma->target);
-    if (!es) return std::nullopt;
+    if (!es) {
+        // §24.3 (#747): `.Subscribe` on a STORED IEvent<T>/IAsyncEvent<T> value
+        // (`var ev := s.Happened; ev.Subscribe(h)`), not a direct event access.
+        // IEvent<T> has no itable, but its runtime value IS the
+        // bz_event_source_t* (via the event-as-value read), so dispatch directly
+        // to bz_event_subscribe. The payload is the receiver type's genericArgs[0]
+        // (the upcast type, variance-safe per §12.9). Add/Remove/Raise are NOT on
+        // the IEvent<T> interface (§24.3) and are deferred to ordinary dispatch.
+        if (ma->member == "Subscribe" && call.args.size() == 1 &&
+            call.args[0].value) {
+            const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+            if (isIEventTypeName(recvTy)) {
+                llvm::Value* src = lowerExpr(*ma->target);
+                if (!src) return std::optional<llvm::Value*>(nullptr);
+                const sema::TypeRef* payload =
+                    (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                   : nullptr;
+                llvm::Value* closure =
+                    lowerEventHandlerClosure(call.args[0].value.get(), payload);
+                if (!closure) return std::optional<llvm::Value*>(nullptr);
+                auto* subFn =
+                    declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
+                return std::optional<llvm::Value*>(
+                    builder_.CreateCall(subFn, {src, closure}, "subscription"));
+            }
+        }
+        return std::nullopt;
+    }
     const auto& method = ma->member;
     const bool isSubscribe = method == "Subscribe" && call.args.size() == 1;
     const bool isAdd       = method == "Add"       && call.args.size() == 1;
@@ -7065,28 +7125,10 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
 
     if (isSubscribe || isAdd || isRemove) {
         // per §24.3 / stdlib §6.5: the handler argument is a function value
-        // (lambda or method reference) lowered to a closure { fn, env }.
-        // Inform lowerLambda of the expected handler type so an untyped lambda
-        // param `(e) => …` resolves the payload type.
-        const sema::TypeRef* saved = expectedFunctionType_;
-        sema::TypeRef handlerTy;  // synthesized (payload) -> ()
-        handlerTy.kind = sema::TypeRef::Kind::Function;
-        if (const sema::TypeRef* pt = eventPayloadType(es)) {
-            sema::TypeRef::FuncParam p;
-            p.type = const_cast<sema::TypeRef*>(pt);
-            handlerTy.funcParams.push_back(p);
-        }
-        // §24.3: a handler returns unit. Set funcReturn so lowerLambda resolves
-        // a block-bodied handler's return type to void — without this it
-        // defaulted to i32, defining the handler as i32(...) while the Raise
-        // loop calls it through a void(...) function pointer (an indirect-call
-        // type mismatch / malformed IR: `ret void` in an i32 function).
-        auto* unitRet = ctx_.makeTypeRef();
-        unitRet->kind = sema::TypeRef::Kind::Unit;
-        handlerTy.funcReturn = unitRet;
-        expectedFunctionType_ = &handlerTy;
-        llvm::Value* closure = lowerExpr(*call.args[0].value);
-        expectedFunctionType_ = saved;
+        // (lambda or method reference) lowered to a closure { fn, env } with the
+        // synthesized `(payload) -> ()` expected type (shared helper).
+        llvm::Value* closure = lowerEventHandlerClosure(
+            call.args[0].value.get(), eventPayloadType(es));
         if (!closure) return std::optional<llvm::Value*>(nullptr);
         if (isSubscribe) {
             auto* subFn =
@@ -7158,7 +7200,10 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
         if (!ma || ma->member != "Subscribe" || !ma->target ||
             ce->args.size() != 1)
             return false;
-        return eventSymbolOf(*ma->target) != nullptr;
+        // A direct event access OR a stored IEvent<T>/IAsyncEvent<T> value
+        // (#747): both produce an owned Subscription that must be disposed.
+        return eventSymbolOf(*ma->target) != nullptr ||
+               isIEventTypeName(ctx_.exprType(*ma->target));
     };
     if (isSubscribeCall(e)) return true;
     if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {

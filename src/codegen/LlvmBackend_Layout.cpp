@@ -443,6 +443,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known
                     // pointer (bz_grouping_t*) produced by GroupBy(...).ToArray().
                     n == "IGrouping" ||
+                    // §24.3 (#747): IEvent<T>/IAsyncEvent<T> value = the bare
+                    // bz_event_source_t* (a borrow of the declaring instance).
+                    n == "IEvent" || n == "IAsyncEvent" ||
                     // §6.2 / #647: Mutex (bz_mutex_t*) and Lock (bz_lock_t*) are
                     // compiler-known heap-pointer builtins. Without these entries
                     // lowerTypeRef fell through to the i32 default →
@@ -529,6 +532,10 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Channel" || n == "ChannelSender" ||
                     // stdlib §5 (#651): imported IGrouping<TKey, T>.
                     n == "IGrouping" ||
+                    // §24.3 (#747): an IEvent<T>/IAsyncEvent<T> value is the
+                    // bare bz_event_source_t* (a borrow of the declaring
+                    // instance's backing source).
+                    n == "IEvent" || n == "IAsyncEvent" ||
                     // §6.2 / #647: imported Mutex (bz_mutex_t*) and Lock (bz_lock_t*).
                     n == "Mutex" || n == "Lock" ||
                     // §6.3 / #647: imported Semaphore / SemaphoreToken.

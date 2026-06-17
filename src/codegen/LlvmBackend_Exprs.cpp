@@ -3012,6 +3012,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     }
     // CG8: field read `obj.f`.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // §24.3 (#747): an event read in VALUE position (`var ev := b.Clicked;`,
+        // `return Clicked;` — not immediately `.Subscribe`'d) yields the bare
+        // bz_event_source_t* (a BORROW of the declaring instance's backing
+        // source — the same pointer the direct `.Subscribe` path uses). Without
+        // this, fieldAddr's storageMemberOf returns null for an EventSymbol and
+        // the IEvent<T> local was loaded with garbage, so its Subscribe never
+        // fired. The IEvent<T> value is non-owning (the class disposes the
+        // source), so this read takes no ownership.
+        if (eventSymbolOf(e))
+            if (llvm::Value* src = eventSourcePtr(e))
+                return src;
         // #548 / stdlib §4.8 v0.135: `entry.Key` / `entry.Value` on a
         // DictionaryEntry<K,V> loop variable. The entry alloca is a
         // {K, V} struct (laid down by lowerDictEntryFor); field 0 is Key,
@@ -3076,6 +3087,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        // §24.3 (#747): a BARE event identifier read in VALUE position (e.g.
+        // `return Clicked;` returning the event as an IEvent<T>) yields the
+        // bz_event_source_t* — the same borrow the `b.Clicked` member-access form
+        // produces. Without this, a bare event in a value position lowered as a
+        // field load of garbage (IR_FAIL on the method-returned IEvent<T> form).
+        if (eventSymbolOf(e))
+            if (llvm::Value* src = eventSourcePtr(e))
+                return src;
         // Inject lambda-param type hints so type-gated branches below
         // (string subscript, member access) see the correct type.
         if (!ctx_.exprType(e)) {
