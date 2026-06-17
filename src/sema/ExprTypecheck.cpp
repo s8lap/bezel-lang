@@ -2873,6 +2873,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
+        // §10.6 (#772): bare enum member names may be used throughout a `case`
+        // over an enum scrutinee, including arm bodies. Inject the scrutinee
+        // enum's constants for the arm bodies (the statement-position analogue
+        // of the CaseExpr handler). // per §10.6
+        Scope armEnumScope;
+        Scope* preArmEnumScope = currentScope_;
+        bool savedEnumArms = inEnumScrutineeCaseArms_;
+        if (scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+            scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Enum &&
+            currentScope_) {
+            armEnumScope.parent = currentScope_;
+            for (Symbol* m : scrutTy->declaration->members)
+                if (dynamic_cast<EnumConstantSymbol*>(m))
+                    armEnumScope.names[m->name] = m;
+            currentScope_ = &armEnumScope;
+            inEnumScrutineeCaseArms_ = true;
+        }
         for (const auto& arm : cs->arms) {
             // §19 / §A (#727): scrutinee-less arm — typecheck the bool CONDITION
             // expression(s) the ConstantPattern holds.
@@ -3069,6 +3087,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
             }
         }
+        currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
+        inEnumScrutineeCaseArms_ = savedEnumArms;
     }
     // Break, Continue have no expressions.
 }

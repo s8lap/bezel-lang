@@ -170,6 +170,25 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         Symbol* sym = lookupName(id->name);
         if (sym) {
             ctx_.setExprSymbol(&e, sym);
+            // §10.6 (#772): a bare enum constant `Green` resolved via the
+            // case-scrutinee enum scope injection carries the enum's type, so an
+            // arm body that yields it has a determinable common arm type (§20).
+            // GATED on `inEnumScrutineeCaseArms_` so it applies ONLY inside such
+            // a case's arms — NOT in an enum-constant initializer like
+            // `C := A + 100`, where a bare sibling `A` is its integer value for
+            // arithmetic (typing it as the enum there breaks the fold). The
+            // qualified `Color.Green` form gets its type via MemberAccess.
+            // // per §10.6
+            if (inEnumScrutineeCaseArms_) {
+                if (auto* ec = dynamic_cast<EnumConstantSymbol*>(sym)) {
+                    if (ec->parent) {
+                        auto* et = ctx_.makeTypeRef();
+                        et->kind = TypeRef::Kind::Named;
+                        et->declaration = ec->parent;
+                        ctx_.setExprType(&e, et);
+                    }
+                }
+            }
             // Slice S29 (§22.8): a field initializer may not observe
             // an instance member (implicit-`this` reference).
             if (inFieldInitializer_) checkNotInstanceMember(*id, sym);
@@ -2196,6 +2215,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         validateCaseArms(ce->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
+        // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
+        // prefix may be omitted." This holds throughout the construct, INCLUDING
+        // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee
+        // enum's constants into a scope that parents the arm bodies so a bare
+        // `Green` resolves; the per-arm binding/destructuring scopes set
+        // `parent = currentScope_`, so they inherit it too. Restored after the
+        // loop. (The qualified `Color.Green` form already worked.) // per §10.6
+        Scope armEnumScope;
+        Scope* preArmEnumScope = currentScope_;
+        bool savedEnumArms = inEnumScrutineeCaseArms_;
+        if (scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+            scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Enum &&
+            currentScope_) {
+            armEnumScope.parent = currentScope_;
+            for (Symbol* m : scrutTy->declaration->members)
+                if (dynamic_cast<EnumConstantSymbol*>(m))
+                    armEnumScope.names[m->name] = m;
+            currentScope_ = &armEnumScope;
+            inEnumScrutineeCaseArms_ = true;
+        }
         for (const auto& arm : ce->arms) {
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
             // boolean CONDITION expression (a ConstantPattern) — typecheck its
@@ -2390,6 +2430,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
             }
         }
+        currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
+        inEnumScrutineeCaseArms_ = savedEnumArms;
         // §19.6: an expression-position `case` whose value cannot be proven
         // to be covered by some arm raises MatchFailureException at runtime;
         // the compiler emits a non-exhaustiveness warning here. Statement-

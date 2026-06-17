@@ -124,6 +124,11 @@ private:
     // for the §22.8 rule that initializers may not observe instance
     // state (`this`, `base`, instance members).
     bool inFieldInitializer_ = false;
+    // §10.6 (#772): true while typechecking the arm guards/bodies of a `case`
+    // whose scrutinee is an enum (the scope into which that enum's constants are
+    // injected). Gates the bare-enum-constant exprType attachment so it applies
+    // only there — never in an enum-constant initializer's sibling arithmetic.
+    bool inEnumScrutineeCaseArms_ = false;
     // async-readiness 3b (§30.2 / Appendix C.6): true while walking the body
     // of an `async` method or `async` lambda — the contexts where `await` is
     // valid. Reset to false across every lambda boundary (a non-async lambda
