@@ -321,3 +321,43 @@ BEZEL_TEST(enum_underlying_749, ulong_auto_increment_above_2p63) {
         "  return (0 if ulong(U.B) = 9223372036854775809UL else 1); "
         "end Main; end C;"), 0);
 }
+
+// §5 (#749 follow-up): an explicitly-suffixed literal whose magnitude overflows
+// 64 bits is unrepresentable in any integer type and must be rejected. The
+// unsuffixed path always did (via the `int` branch); the suffixed path did not,
+// so `…UL` beyond ulong.MaxValue was silently accepted and miscompiled to 0.
+BEZEL_TEST(enum_underlying_749, ulong_literal_over_64bit_rejected) {
+    // per §5 — 1e23 (≫ 2^64-1) carries an explicit `UL` yet is unrepresentable.
+    auto r = runJit(
+        "module M; "
+        "enum U: ulong A := 99999999999999999999999UL; end U; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §5 (#749 follow-up): the boundary value ulong.MaxValue (2^64-1) is in range
+// and must still be accepted — the rejection above triggers only on a true
+// 64-bit overflow, not on the maximum representable value.
+BEZEL_TEST(enum_underlying_749, ulong_max_value_accepted) {
+    // per §5 / §10.2 — 18446744073709551615 == 2^64-1 == ulong.MaxValue.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum U: ulong Max := 18446744073709551615UL; end U; "
+        "class C public static method Main(): int "
+        "  return (0 if ulong(U.Max) = 18446744073709551615UL else 1); "
+        "end Main; end C;"), 0);
+}
+
+// §5 (#749 follow-up) regression guard: long.MinValue (-2^63) must NOT be
+// rejected. Its inner literal magnitude is 2^63 (a leading `-` is a UnaryExpr),
+// which is exactly the value the over-64-bit check must continue to admit — the
+// reject fires only when strtoull itself overflows (value > 2^64-1).
+BEZEL_TEST(enum_underlying_749, long_min_value_literal_accepted) {
+    // per §5 — -9223372036854775808 == -(2^63) == long.MinValue.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x: long := -9223372036854775808L; "
+        "  return (0 if x = -9223372036854775808L else 1); "
+        "end Main; end C;"), 0);
+}

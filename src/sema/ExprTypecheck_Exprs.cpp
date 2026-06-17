@@ -420,6 +420,24 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "(§5)");
                 }
             }
+        } else {
+            // §5 (#749 follow-up): an explicitly L/U/UL-suffixed literal whose
+            // magnitude overflows 64 bits is unrepresentable in any integer
+            // type. The unsuffixed path above rejects such a value (via the
+            // `int` branch), but the suffixed path did not — so a value like
+            // `99999999999999999999999UL` was silently accepted and later
+            // miscompiled (an enum member materialized to 0, #749). Reject it.
+            // (A value that fits 64 bits but exceeds the *named* suffix's range
+            // — e.g. an `L` literal in (2^63, 2^64) — is left to the broader
+            // literal-typing work: that boundary entangles with the
+            // `-9223372036854775808L` long.MinValue magnitude, 2^63.)
+            unsigned long long mag = 0;
+            if (intLiteralMagnitude(il->text, mag) && errno == ERANGE) {
+                ctx_.diagnostics().report(
+                    Severity::Error, il->span.begin,
+                    "integer literal is too large to represent (exceeds the "
+                    "64-bit range of any integer type) (§5)");
+            }
         }
         ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
         return;
