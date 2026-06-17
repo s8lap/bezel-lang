@@ -106,21 +106,17 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
 }
 
 std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
-    const uint32_t caseKeyLine = current_.location.line;
     advance(); // past `case`
     auto cs = std::make_unique<ast::CaseStmt>();
-    // §19.1 / §A.7 `Expression?`: detect scrutinee-less form.
-    const bool bareForm = isScruntineeLessCase(caseKeyLine);
-    if (!bareForm) {
-        // Scrutinee form: same restriction as parseCaseExpr (precedence ≥ 8
-        // stops before relational ops so relop patterns are parsed as arms).
-        SourceLocation start = current_.location;
-        cs->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
-    }
-    cs->arms.push_back(parseCaseStmtArm(bareForm));
+    // #744 / §19: `case` ALWAYS takes a scrutinee (scrutinee-less dispatch is
+    // now `when`, parseWhenStmt). Scrutinee parsed at precedence ≥ 8 so relop
+    // patterns are recognised as arms.
+    SourceLocation start = current_.location;
+    cs->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
+    cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/false));
     while (consumePunctuator(",")) {
         if (isKeyword("end")) break;
-        cs->arms.push_back(parseCaseStmtArm(bareForm));
+        cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/false));
     }
     if (!consumeKeyword("end")) {
         diagnostics_.report(Severity::Error, current_.location,

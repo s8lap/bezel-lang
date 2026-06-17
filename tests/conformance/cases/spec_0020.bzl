@@ -1,11 +1,11 @@
 record Point(X: int, Y: int): IComparable<Point>
   public method CompareTo(other: Point): int =>
-    case
-      X <> other.X => case
+    when
+      X <> other.X => when
         X < other.X => -1,
         _ => 1
       end,
-      Y <> other.Y => case
+      Y <> other.Y => when
         Y < other.Y => -1,
         _ => 1
       end,

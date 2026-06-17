@@ -28,7 +28,7 @@ int run(const std::string& src) {
 BEZEL_TEST(scrutineeless_case_727, case_expr_literal_condition) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var r := case\n"
+        "  var r := when\n"
         "    true => 42,\n"
         "    _ => 0\n"
         "  end; "
@@ -41,7 +41,7 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_variable_condition_chain) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 7; "
-        "  var r := case\n"
+        "  var r := when\n"
         "    x > 10 => 1,\n"
         "    x > 5 => 2,\n"
         "    _ => 3\n"
@@ -55,7 +55,7 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_first_match_wins) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 100; "
-        "  var r := case\n"
+        "  var r := when\n"
         "    x > 5 => 1,\n"
         "    x > 50 => 2,\n"
         "    _ => 3\n"
@@ -69,7 +69,7 @@ BEZEL_TEST(scrutineeless_case_727, case_stmt_variable_condition) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 3; var r := 0; "
-        "  case\n"
+        "  when\n"
         "    x = 1 => do r := 10; end,\n"
         "    x = 3 => do r := 30; end,\n"
         "    _ => do r := 99; end,\n"

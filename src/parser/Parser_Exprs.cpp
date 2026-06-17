@@ -986,68 +986,31 @@ ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
     return arm;
 }
 
-// §19.1 / §A.7 `Expression?`: detect the scrutinee-less bare-`case` form.
-// Returns true when either:
-//   (a) the first arm's first token is on a different (later) source line
-//       than the `case` keyword — the canonical written style for bare case;
-//   (b) a bounded forward scan to the first `=>` at depth 0 finds an
-//       operator that cannot appear in a Pattern (equality `=`/`<>`, logical
-//       `or`/`and`) — an unambiguous signal that the arms are full boolean
-//       expressions rather than patterns.
-// Called immediately after advance() past `case`; `caseKeyLine` is the
-// source line of the consumed `case` token.
-bool Parser::isScruntineeLessCase(uint32_t caseKeyLine) const {
-    // Heuristic (a): `case` keyword on a different line than first arm token.
-    if (current_.location.line != caseKeyLine) return true;
-    // Heuristic (b): scan for non-pattern operators before first `=>`.
-    // Track nesting depth for `(`, `)`, `[`, `]`; bail at `end`/EOF.
-    int depth = 0;
-    for (std::size_t i = 0; ; ++i) {
-        const Token& t = const_cast<Parser*>(this)->peekAt(i);
-        if (t.kind == TokenKind::EndOfFile) break;
-        if (t.kind == TokenKind::Punctuator) {
-            if (t.text == "(" || t.text == "[") { depth++; continue; }
-            if (t.text == ")" || t.text == "]") { depth--; continue; }
-            if (depth == 0) {
-                if (t.text == "=>") break;  // end of first arm's pattern region
-            }
-        }
-        if (t.kind == TokenKind::Keyword && depth == 0) {
-            if (t.text == "end") break;  // empty or malformed case
-            // `or` / `and` — logical operators, not in Pattern
-            if (t.text == "or" || t.text == "and") return true;
-        }
-    }
-    return false;
-}
+// #744 / §19: the scrutinee-less bare-`case` detection (isScruntineeLessCase)
+// has been deleted — the scrutinee-less condition-dispatch form is now spelled
+// `when` (parseWhenExpr / parseWhenStmt), so `case` is unconditionally
+// scrutinee'd and the parser no longer consults source line numbers anywhere.
 
 std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
-    const uint32_t caseKeyLine = current_.location.line;
     advance(); // past `case`
     auto ce = std::make_unique<ast::CaseExpr>();
 
-    // §19.1 / §A.7 `Expression?`: detect scrutinee-less form. In the bare
-    // form (no scrutinee), each arm's pattern is a full boolean expression
-    // and no scrutinee value exists.
-    //
-    // §19: in scrutinee form, the scrutinee is limited to operators above
-    // the relational level (precedence ≥ 8) so that relop patterns
-    // (`>=90`, `<0`, etc.) are recognised as arm patterns rather than
-    // consumed as part of a boolean scrutinee. Users needing a full boolean
-    // expression as scrutinee can wrap it in parentheses.
-    const bool bareForm = isScruntineeLessCase(caseKeyLine);
-    if (!bareForm) {
-        SourceLocation start = current_.location;
-        ce->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
-    }
-    // ce->scrutinee remains null for bare form (grammar: Expression?).
+    // #744 / §19: `case` ALWAYS takes a scrutinee; the scrutinee-less
+    // condition-dispatch form is now spelled `when` (parseWhenExpr), so the
+    // newline-significant `isScruntineeLessCase` heuristic is gone. The
+    // scrutinee is parsed above relational precedence (≥ 8) so relop patterns
+    // (`>=90`, `<0`, etc.) are recognised as arm patterns rather than consumed
+    // as part of a boolean scrutinee. A full boolean scrutinee can be
+    // parenthesised.
+    SourceLocation start = current_.location;
+    ce->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
 
-    ce->arms.push_back(parseCaseArm(bareForm));
+    ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     while (consumePunctuator(",")) {
         // Trailing `","?` per the grammar — `,` followed immediately by
         // `end` terminates the list.
         if (isKeyword("end")) break;
-        ce->arms.push_back(parseCaseArm(bareForm));
+        ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     }
     if (!consumeKeyword("end")) {
         diagnostics_.report(Severity::Error, current_.location,

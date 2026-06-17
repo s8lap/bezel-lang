@@ -115,14 +115,8 @@ private:
     // the result in a ConstantPattern so the arm's pattern field is always
     // non-null. Issue #657 / spec_0026, spec_0020, spec_0100.
     ast::CaseArm parseCaseArm(bool scrutineeLess = false);
-    // Scrutinee-less `case` form detection (§19.1 / §A.7 `Expression?`):
-    // returns true when `case` is on a different source line than the first
-    // arm's first token (the common written style for bare-case), OR when a
-    // bounded forward scan to the first `=>` at depth 0 finds an operator
-    // that cannot appear in a Pattern (`=`, `<>`, `or`, `and`).
-    // Called after advance() past `case`; `caseKeyLine` is the line of the
-    // consumed `case` keyword.
-    bool isScruntineeLessCase(uint32_t caseKeyLine) const;
+    // #744 / §19: `case` always takes a scrutinee (the scrutinee-less form is
+    // now `when`); no source-line heuristic is consulted.
     std::unique_ptr<ast::Expr> parseCaseExpr();
     // #744 / §19: `when` is the dedicated scrutinee-less condition-dispatch
     // construct (arms are boolean conditions; the first true wins). It reuses

@@ -70,7 +70,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Using \n to separate `case` from its first arm.
     auto r = parseAll(
         "module M; class C public method M(score: int) _ := "
-        "case\n"
+        "when\n"
         "  score >= 90 => \"A\",\n"
         "  score >= 80 => \"B\",\n"
         "  _ => \"F\"\n"
@@ -112,7 +112,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     auto r = parseAll(
         "module M; class C "
         "  public method CompareTo(x: int, y: int): int =>\n"
-        "    case\n"
+        "    when\n"
         "      int(x) < int(y) => -1,\n"
         "      int(x) > int(y) => 1,\n"
         "      _ => 0\n"
@@ -131,7 +131,7 @@ BEZEL_TEST(parser_case_scrutineeless,
         "module M; "
         "record Point(X: int, Y: int) "
         "  public method CompareTo(other: Point): int =>\n"
-        "    case\n"
+        "    when\n"
         "      X <> other.X => 1,\n"
         "      _ => 0\n"
         "    end; "
@@ -148,7 +148,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     auto r = parseAll(
         "module M; class C public method M(x: int): int\n"
         "_ :=\n"
-        "case\n"
+        "when\n"
         "  x = 1 or x = 2 => 10,\n"
         "  _ => 0\n"
         "end"
@@ -169,7 +169,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Block-body method so extractExpr (stmts[0]) works correctly.
     auto r = parseAll(
         "module M; class C public method M(x: int): int "
-        "_ := case x = 1 or x = 2 => 10, _ => 0 end"
+        "_ := when x = 1 or x = 2 => 10, _ => 0 end"
         "; end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* e = extractExpr(r);
