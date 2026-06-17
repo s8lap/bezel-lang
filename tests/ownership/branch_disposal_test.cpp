@@ -187,3 +187,45 @@ BEZEL_TEST(own_branch_disposal, in_loop_dispose_both_branches_clean_28_3) {
         "end;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---- §28.3 / #747 R42: dispose + EARLY RETURN in a branch ----------------
+//
+// When the `then` branch BOTH disposes `x` AND returns, the then-block flows
+// straight to the function exit (it has no fall-through to the merge). The
+// implicit fall-through (`else`) edge leaves `x` Owned and reaches method exit
+// undischarged → leak. This was silently accepted: the CFG builder's runInto()
+// (used for branch bodies) returned a spurious empty dead-code block for the
+// returning branch, which visitBranch wired as an extra orphan→merge edge.
+// That orphan carried no locals, so the non-union if-merge meet dropped the
+// `x = Owned` that arrived on the real fall-through edge, masking the leak.
+// (The control case where the then branch only disposes — no return —
+// `dispose_then_only_leaks_else_path_28_6` above — was always caught, because
+// the then-block then DOES fall through to the merge carrying `x = Disposed`.)
+BEZEL_TEST(own_branch_disposal, dispose_then_early_return_leaks_fallthrough_747) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x := new Stream(); "
+        "if cond then x.Dispose(); return; end;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Companion clean case: the `then` branch disposes + returns, and the
+// fall-through path ALSO disposes. Every normal-exit edge discharges `x` →
+// clean (no leak, no false double-dispose). Pins that the runInto fix does not
+// over-reject the dispose-on-all-paths early-return shape.
+BEZEL_TEST(own_branch_disposal, dispose_then_early_return_else_dispose_clean_747) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x := new Stream(); "
+        "if cond then x.Dispose(); return; end; "
+        "x.Dispose();"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The `then` branch transfers ownership out (MovedFrom) then returns; the
+// fall-through leaves `x` Owned → leak. Exercises the orphan-edge fix for a
+// move-discharge (not just Dispose) early-return branch.
+BEZEL_TEST(own_branch_disposal, move_then_early_return_leaks_fallthrough_747) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x := new Stream(); "
+        "if cond then sink.Take(owned x); return; end;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}

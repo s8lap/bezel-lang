@@ -571,6 +571,24 @@ private:
                 current = cfg_.makeBlock(CFGBlock::Kind::Linear);
             }
         }
+        // Mirror build() (#747 R42): when the body ends in a terminator
+        // (return / throw / unbounded break), the loop above left `current`
+        // pointing at a fresh dead-code block — one created to absorb any
+        // statements after the terminator, with no predecessors and (usually)
+        // no statements. It is NOT a live exit of the body. Returning it would
+        // let a caller wire a spurious orphan→merge / orphan→header edge
+        // (visitBranch / visitIfBranches' else / the loop visitors all do
+        // `if (end) addEdge(end, target)`). That orphan, carrying no locals,
+        // then dilutes the §28.3 ownership meet at the merge: an owned local
+        // present only on the real fall-through edge is silently dropped by the
+        // non-union if-merge join, masking a leak (a `var c := new T()` whose
+        // `if` branch does `c.Dispose(); return;` left the fall-through leak
+        // undiagnosed). Returning null here — exactly as build() does — keeps
+        // the returning branch from contributing a fall-through edge.
+        if (current->preds.empty() && current->stmts.empty() &&
+            current != cfg_.entry()) {
+            return nullptr;
+        }
         return current;
     }
 };
