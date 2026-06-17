@@ -41,6 +41,16 @@ bool hasForbiddenError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// §25.2: `=`/`<>` overloaded on a class diagnostic.
+bool hasClassEqError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("may not be overloaded on a class") !=
+                std::string::npos &&
+            d.message.find("25.2") != std::string::npos)
+            return true;
+    return false;
+}
+
 const char* kRec = "module M; record V(n: int) ";
 
 }  // namespace
@@ -118,4 +128,27 @@ BEZEL_TEST(operator_groups_746, operator_complement_allowed) {
         "end V; class F public static method Main(): int return 0; end Main; "
         "end F;");
     BEZEL_EXPECT_FALSE(hasForbiddenError(r));
+}
+
+// §25.2: a CLASS may not overload `=`/`<>` (it customizes via Equals).
+BEZEL_TEST(operator_groups_746, class_equality_overload_rejected) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public n: int := 0; "
+        "  public static method operator =(a: C, b: C): bool => a.n = b.n; "
+        "  public static method operator <>(a: C, b: C): bool => a.n <> b.n; "
+        "end C; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasClassEqError(r));
+}
+
+// §25.2: a RECORD may overload `=`/`<>` — no class restriction.
+BEZEL_TEST(operator_groups_746, record_equality_overload_ok) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator =(a: V, b: V): bool => a.n = b.n; "
+        "  public static method operator <>(a: V, b: V): bool => a.n <> b.n; "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasClassEqError(r));
 }

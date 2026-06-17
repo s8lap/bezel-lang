@@ -816,6 +816,17 @@ void Resolver::checkOperatorGroups() {
                 else if (tok == "<=") le = true;
                 else ge = true;
             } else if (tok == "=" || tok == "<>") {
+                // §25.2: `=` and `<>` may not be overloaded on a CLASS — classes
+                // customize equality by overriding `Equals`. Only records and
+                // enums may overload them. (Was silently accepted.)
+                if (t->kind == ast::TypeDeclKind::Class) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        "`" + std::string(tok) +
+                        "` may not be overloaded on a class — classes customize "
+                        "equality by overriding `Equals` (§25.2)");
+                    continue;
+                }
                 if (!eqFirst) eqFirst = m;
                 if (tok == "=") eq = true;
                 else ne = true;

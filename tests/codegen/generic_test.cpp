@@ -415,26 +415,24 @@ BEZEL_TEST(codegen_generic, closure_captures_this_field) {
 }
 
 // Test: user-defined operator= on class types — §25
-BEZEL_TEST(codegen_generic, user_defined_operator_eq_class) {
+BEZEL_TEST(codegen_generic, user_defined_operator_eq_record) {
+    // §25.2: `=`/`<>` may be overloaded on records (not classes — classes use
+    // `Equals`). A user `operator =` is dispatched for `a = b`.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class V "
-        "  public X: int; public Y: int; "
-        "  public constructor(x: int, y: int) X := x; Y := y; end constructor; "
+        "record V(X: int, Y: int) "
         "  public static method operator =(a: V, b: V): bool "
         "    return a.X = b.X and a.Y = b.Y; "
         "  end operator =; "
-        // §25.2: `=` and `<>` must be declared together.
         "  public static method operator <>(a: V, b: V): bool "
         "    return a.X <> b.X or a.Y <> b.Y; "
         "  end operator <>; "
-        "  destructor end destructor; "
         "end V; "
         "class Program "
         "  public static method Main(): int "
-        "    using var a := new V(3, 4); "
-        "    using var b := new V(3, 4); "
-        "    using var c := new V(1, 2); "
+        "    var a := new V(3, 4); "
+        "    var b := new V(3, 4); "
+        "    var c := new V(1, 2); "
         "    if a = b and not (a = c) then return 1; end; "
         "    return 0; "
         "  end Main; "
