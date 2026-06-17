@@ -355,8 +355,13 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     bool nullableUncovered =
         scrutTy && scrutTy->nullable && !armsCoverNull(ce);
 
-    // --- Bool scrutinee (§19.6): both `true` and `false` must be covered.
-    if (scrutTy && !scrutTy->nullable &&
+    // --- Bool scrutinee (§19.6): both `true` and `false` must be covered. A
+    // nullable `bool?` is exhaustive when, per the nullable rule (§19.6:
+    // "the rules above plus an explicit `null` pattern"), `true`, `false`, AND
+    // `null` are all covered. fix #747 R43: the nullable case was previously
+    // excluded here (`!scrutTy->nullable`), so a fully-covered `bool?` fell
+    // through to the generic "cannot prove" path and drew a spurious warning.
+    if (scrutTy &&
         scrutTy->kind == TypeRef::Kind::Primitive &&
         scrutTy->primitive == PrimitiveType::Bool) {
         bool t = false, f = false;
@@ -373,6 +378,8 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         }
         if (!(t && f))
             warn("bool scrutinee does not cover both `true` and `false`");
+        else if (nullableUncovered)
+            warn("nullable `bool?` scrutinee has no `null` arm");
         return;
     }
 

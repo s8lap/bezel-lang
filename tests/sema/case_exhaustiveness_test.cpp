@@ -248,6 +248,64 @@ BEZEL_TEST(sema_case_exhaust, bool_one_missing_warns_spec_19_6) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- Nullable bool scrutinee (§19.6: bool rule + nullable-`null`-arm rule) ---
+// fix #747 R43: a `bool?` covered by `null`, `true`, AND `false` is statically
+// exhaustive; the checker previously skipped the bool branch for nullable
+// scrutinees and drew a spurious non-exhaustiveness warning.
+
+BEZEL_TEST(sema_case_exhaust, nullable_bool_null_true_false_ok_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method M(b: bool?): int "
+        "    var n := case b "
+        "      null => 2, "
+        "      true => 1, "
+        "      false => 0 "
+        "    end; "
+        "    return n; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A `bool?` covering `true`+`false` but NOT `null` is non-exhaustive (§19.6:
+// the nullable rule requires an explicit `null` pattern).
+BEZEL_TEST(sema_case_exhaust, nullable_bool_no_null_arm_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method M(b: bool?): int "
+        "    var n := case b "
+        "      true => 1, "
+        "      false => 0 "
+        "    end; "
+        "    return n; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A `bool?` with `null`+`true` but NOT `false` is non-exhaustive (the bool rule
+// still requires both `true` and `false`).
+BEZEL_TEST(sema_case_exhaust, nullable_bool_missing_false_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method M(b: bool?): int "
+        "    var n := case b "
+        "      null => 2, "
+        "      true => 1 "
+        "    end; "
+        "    return n; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Sealed-abstract closed hierarchy (§11.7 / §19.6 example) ---------------
 
 // The §19.6 spec example, adapted to integer fields (stdlib Math.Pi is real
