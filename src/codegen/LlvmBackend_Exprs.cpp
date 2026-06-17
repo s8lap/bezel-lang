@@ -5100,6 +5100,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     }
                 }
             }
+            // fix #747 R43 / §27.1: a `ref`/`out` lambda parameter is passed by
+            // POINTER — the argument is the caller's storage address, exactly as
+            // a named method's `ref n` parameter (§22.3). Without this the lambda
+            // received the value by copy, so a mutation in the body never reached
+            // the caller's variable (the write-back was silently lost). The body
+            // binding below registers it in refParams_ so reads/writes route
+            // through the incoming pointer.
+            if (par && isByRefMod(par->modifier)) ty = ptrTy();
             userParamTys.push_back(ty);
             ++pi;
         }
@@ -5536,9 +5544,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         for (auto it = std::next(fn->args().begin()); it != fn->args().end();
              ++it, ++idx) {
             if (idx >= paramSyms->size()) break;
+            sema::Symbol* psym = (*paramSyms)[idx];
+            auto* par = dynamic_cast<sema::ParameterSymbol*>(psym);
+            // fix #747 R43 / §27.1: a `ref`/`out` lambda parameter receives the
+            // caller's storage ADDRESS (a pointer, per the param-type override
+            // above). Register it in refParams_ so body reads/writes route
+            // through that pointer (lvalueAddr → refParamAddr), mirroring the
+            // named-method ref ABI — this is what writes the mutation back.
+            if (par && isByRefMod(par->modifier)) {
+                llvm::Type* elemTy =
+                    par->declType ? lowerType(par->declType) : i32();
+                refParams_[psym] = {&*it, elemTy};
+                continue;
+            }
             auto* slot = entryAlloca(it->getType());
             builder_.CreateStore(&*it, slot);
-            paramSlots_[(*paramSyms)[idx]] = slot;
+            paramSlots_[psym] = slot;
         }
     }
 

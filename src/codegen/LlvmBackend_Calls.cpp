@@ -7581,8 +7581,25 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // Build call args first so we can reconcile types.
         std::vector<llvm::Value*> args;
         args.push_back(envPtr);  // env_ptr first
-        for (const auto& a : call.args) {
+        for (std::size_t pi = 0; pi < call.args.size(); ++pi) {
+            const auto& a = call.args[pi];
             if (!a.value) return nullptr;
+            // fix #747 R43 / §27.1: a `ref`/`out` argument to a function value
+            // passes the caller's storage ADDRESS, not its value — the lambda's
+            // matching parameter is by-pointer (see lowerLambda). Use the
+            // call-site `ref`/`out` modifier (the formal funcParams modifier may
+            // be absent on an inferred function type). Without this the closure
+            // received the value by copy and the callee's mutation was lost.
+            bool byRef = isByRefMod(a.modifier) ||
+                         (pi < rt->funcParams.size() &&
+                          isByRefMod(rt->funcParams[pi].modifier));
+            if (byRef) {
+                llvm::Type* elemTy = nullptr;
+                llvm::Value* addr = lvalueAddr(*a.value, elemTy);
+                if (!addr) return nullptr;
+                args.push_back(addr);
+                continue;
+            }
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
             args.push_back(v);
@@ -7644,6 +7661,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         for (std::size_t pi = 0; pi < rt->funcParams.size(); ++pi) {
+            // fix #747 R43 / §27.1: a `ref`/`out` parameter of the function type
+            // is passed by pointer (its argument is an address), matching the
+            // lambda's by-pointer parameter.
+            if (isByRefMod(rt->funcParams[pi].modifier) ||
+                (pi < call.args.size() && isByRefMod(call.args[pi].modifier))) {
+                allArgTys.push_back(ptrTy());
+                continue;
+            }
             llvm::Type* declared =
                 rt->funcParams[pi].type ? lowerTypeRef(rt->funcParams[pi].type) : i32();
             // CG-generic: if declared resolved to i32 (unresolved generic T):
