@@ -133,6 +133,29 @@ std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
     return std::unique_ptr<ast::Stmt>(cs.release());
 }
 
+// #744 / §19: statement-position `when … end;` — the scrutinee-less
+// condition-dispatch form. Produces a null-scrutinee CaseStmt (sema/codegen
+// reuse the existing scrutinee-less path); no layout-significant disambiguation.
+std::unique_ptr<ast::Stmt> Parser::parseWhenStmt() {
+    advance();  // past `when`
+    auto cs = std::make_unique<ast::CaseStmt>();
+    // Scrutinee stays null: `when` is always the condition-dispatch form.
+    cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/true));
+    while (consumePunctuator(",")) {
+        if (isKeyword("end")) break;  // trailing `,?`
+        cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/true));
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close `when` statement");
+    }
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after 'end' of `when` statement");
+    }
+    return std::unique_ptr<ast::Stmt>(cs.release());
+}
+
 std::unique_ptr<ast::Stmt> Parser::parseStatement() {
     SourceLocation start = current_.location;
     return stampSpan(parseStatementImpl(), start, current_.location);
@@ -234,6 +257,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     // the richer body forms work correctly.
     if (isKeyword("case")) {
         return parseCaseStmt();
+    }
+    // #744 / §19: statement-position `when` (scrutinee-less condition dispatch).
+    if (isKeyword("when")) {
+        return parseWhenStmt();
     }
 
     // IfStmt (A.6).

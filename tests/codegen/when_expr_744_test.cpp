@@ -54,3 +54,16 @@ BEZEL_TEST(when_expr_744, multiline_layout_independent) {
         "  end; "
         "  return r; end Main; end F;"), 20);
 }
+
+// #744 (stage 2): statement-position `when` with `do … end` arm bodies.
+BEZEL_TEST(when_expr_744, statement_form) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var n := 7; var result := 0; "
+        "  when "
+        "    n > 100 => do result := 1; end, "
+        "    n > 5 => do result := 2; end, "
+        "    _ => do result := 3; end "
+        "  end; "
+        "  return result; end Main; end F;"), 2);
+}

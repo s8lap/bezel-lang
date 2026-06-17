@@ -145,6 +145,8 @@ private:
     // Slice 39: statement-position `case` (A.6). Sibling of parseCaseExpr;
     // arms have Expression-form, Statement-form, or `do … end` bodies.
     std::unique_ptr<ast::Stmt> parseCaseStmt();
+    // #744 / §19: statement-position `when` (scrutinee-less condition dispatch).
+    std::unique_ptr<ast::Stmt> parseWhenStmt();
     ast::CaseArm parseCaseStmtArm(bool scrutineeLess = false);
     // Slice 41: parse `serialized ( "skip" | StringLiteral? "optional"? )`
     // (A.4 SerializedClause). The caller checks `isSerializedClauseStart()`
