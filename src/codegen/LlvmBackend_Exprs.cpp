@@ -8278,8 +8278,23 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // §19.5's "matches only non-null values" holds trivially. (A nullable
     // VALUE-type scrutinee is handled by the isNullableVal branch above,
     // which never falls through to here.)
-    if (dynamic_cast<const ast::TypePattern*>(pat))
+    if (dynamic_cast<const ast::TypePattern*>(pat)) {
+        // §19.5 (#760): "A bare type pattern T matches only non-null values."
+        // A nullable runtime-managed-reference scrutinee (`string?`, a function
+        // type, a boxed value) is a *pointer*, not the tagged struct the
+        // isNullableVal branch handles — `isNullableValueTy` is false for it, so
+        // it falls through here. Its runtime value may be a null pointer, which
+        // the bare type pattern must NOT match (only `null` / `_` / untyped
+        // `var x` do). Emit the non-null requirement; a non-nullable scrutinee
+        // is statically never null and stays an unconditional match.
+        if (scrutTy && scrutTy->nullable && scrut->getType()->isPointerTy())
+            return builder_.CreateICmpNE(
+                scrut,
+                llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(scrut->getType())),
+                "typepat.nonnull");
         return builder_.getInt1(true);
+    }
     if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
         llvm::Value* any = builder_.getInt1(false);
         for (const auto& c : cp->constants) {
