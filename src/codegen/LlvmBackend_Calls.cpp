@@ -10747,7 +10747,8 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
 // selector `(T) -> Array<U>` (returns a collection pointer) and wraps that
 // collection as a lazy enumerator the runtime then drains. innerEsz is U's size.
 llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
-                                                   int64_t innerEsz) {
+                                                   int64_t innerEsz,
+                                                   bool innerIsLazy) {
     auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$linq$flatsel", module_.get());
@@ -10764,10 +10765,21 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
     llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "fs.env");
     auto* clTy = llvm::FunctionType::get(ptrTy(), {ptrTy(), elemTy}, false);
     llvm::Value* coll = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "fs.coll");
-    // Wrap the returned Array<U> as a lazy enumerator (the runtime drains it).
-    auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
-    llvm::Value* inner = builder_.CreateCall(wrapFn,
-        {coll, builder_.getInt64(innerEsz)}, "fs.inner");
+    llvm::Value* inner;
+    if (innerIsLazy) {
+        // stdlib §5 (#758): the selector returns a LAZY enumerable directly — a
+        // LINQ chain such as `(n) => arr.Where(...)`, whose result is already a
+        // `bz_lazy_t*` enumerator. Hand it back unchanged for the runtime to
+        // drain. Wrapping it via `bz_lazy_from_array` (the concrete-collection
+        // path below) would mis-read the enumerator struct as an array header
+        // and yield only a garbage prefix (the WRONG_VALUE behind the IR_FAIL).
+        inner = coll;
+    } else {
+        // Wrap the returned Array<U> as a lazy enumerator (the runtime drains it).
+        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        inner = builder_.CreateCall(wrapFn,
+            {coll, builder_.getInt64(innerEsz)}, "fs.inner");
+    }
     builder_.CreateRet(inner);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -11333,7 +11345,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
         if (!closure) return nullptr;
         int64_t innerEsz = lazyElemSize(innerElemTy, module_->getDataLayout());
-        llvm::Function* tramp = buildSelectManyTrampoline(elemTy, innerEsz);
+        // #758: when the selector returns a lazy LINQ chain (not a concrete
+        // collection), its result is already a `bz_lazy_t*` enumerator — the
+        // trampoline returns it directly instead of wrapping it as an array.
+        bool innerIsLazy = isLazyEnumerableType(retSemaType);
+        llvm::Function* tramp =
+            buildSelectManyTrampoline(elemTy, innerEsz, innerIsLazy);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(smFn,

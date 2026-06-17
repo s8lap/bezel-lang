@@ -5185,7 +5185,8 @@ private:
     // returned collection as a lazy enumerator (bz_lazy_from_array) the runtime
     // drains. `elemTy` is the upstream element type; `innerEsz` the inner U size.
     llvm::Function* buildSelectManyTrampoline(llvm::Type* elemTy,
-                                              int64_t innerEsz);
+                                              int64_t innerEsz,
+                                              bool innerIsLazy = false);
 
     // stdlib §5 Zip: a combine trampoline `void(closure, a, b, out)`. Loads the
     // left element (`aTy`) and right element (`bTy`), calls the closure

@@ -311,6 +311,7 @@ set(BEZEL_TEST_SOURCES
     codegen/case_untyped_binding_nullable_747_test.cpp
     codegen/case_type_pattern_null_760_test.cpp
     codegen/destructor_field_move_runtime_763_test.cpp
+    codegen/selectmany_lazy_inner_758_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp

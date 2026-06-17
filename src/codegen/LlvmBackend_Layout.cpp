@@ -643,6 +643,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             if (rt->declaration &&
                 rt->declaration->kind == ast::TypeDeclKind::Enum)
                 return enumLlvmType(rt->declaration);
+            // stdlib §5 (#758): a lazy-LINQ enumerable sentinel TypeRef (Named
+            // kind, null declaration/astNode, empty importedName, non-empty
+            // genericArgs) is a heap `bz_lazy_t*`, not a value type — it falls
+            // through every guard above to this value-kind fallback and would
+            // wrongly lower to i32, declaring a SelectMany-style selector lambda
+            // `(n) => arr.Where(...)` with an i32 return while its body returns
+            // a `ptr` (the IR_FAIL "return type does not match operand type").
+            // Lower it to a pointer. // per stdlib §5
+            if (isLazyEnumerableType(rt)) return ptrTy();
             return i32();  // other value-kind named — int
         case sema::TypeRef::Kind::InlineArray: {
             // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
