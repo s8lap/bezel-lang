@@ -66,3 +66,41 @@ BEZEL_TEST(sema_enum, instance_method_ok) {
         "end E;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §10.3 (#740): a member value that exceeds the declared underlying type's
+// range is a compile error (it previously wrapped silently at codegen).
+BEZEL_TEST(sema_enum, byte_member_over_255_rejected) {
+    auto r = parseSemaAll("module M; enum E: byte A := 256; end E;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §10.3: an unsigned underlying type rejects a negative value.
+BEZEL_TEST(sema_enum, byte_member_negative_rejected) {
+    auto r = parseSemaAll("module M; enum E: byte A := -1; end E;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §10.3: a value that overflows a `short` (but fits `int`) is rejected.
+BEZEL_TEST(sema_enum, short_member_over_range_rejected) {
+    auto r = parseSemaAll("module M; enum E: short A := 40000; end E;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §10.3 regression guard: in-range values, an unsigned boundary, a signed
+// minimum, and AUTO-INCREMENT continuation are all accepted.
+BEZEL_TEST(sema_enum, in_range_and_auto_increment_ok) {
+    auto r = parseSemaAll(
+        "module M; "
+        "enum B: byte Lo := 0, Mid := 200, Hi := 255; end B; "
+        "enum S: short A := -32768, Z := 32767; end S; "
+        "enum Inc: byte X := 253, Y, Z; end Inc;");  // 253, 254, 255 — all fit
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §10.3: auto-increment that overflows the underlying type is rejected
+// (`byte X := 255, Y;` → Y is 256, out of range).
+BEZEL_TEST(sema_enum, auto_increment_overflow_rejected) {
+    auto r = parseSemaAll(
+        "module M; enum E: byte X := 255, Y; end E;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}

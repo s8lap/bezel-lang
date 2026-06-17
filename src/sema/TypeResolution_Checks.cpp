@@ -1,5 +1,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include "sema/ConstFold.hpp"
+
 #include "sema/TypeResolution.hpp"
 
 #include <cctype>
@@ -331,6 +333,71 @@ void Resolver::checkEnumRestrictions() {
                         "` may not be virtual, abstract, or override "
                         "— enums dispatch statically (§10.5)");
                 }
+            }
+        }
+        // §10.3 (#740): every declared enum member value must fit the
+        // underlying type's range. The underlying type is explicit
+        // (enumUnderlyingType) or the default `int`. A value that fits `int`
+        // but exceeds a smaller declared underlying type (`enum E: byte A :=
+        // 256;`) previously wrapped silently at codegen.
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+            using P = PrimitiveType;
+            P up = P::Int;
+            if (t->enumUnderlyingType &&
+                t->enumUnderlyingType->kind == TypeRef::Kind::Primitive)
+                up = t->enumUnderlyingType->primitive;
+            auto fits = [](long long v, P p) -> bool {
+                switch (p) {
+                    case P::Byte:   return v >= 0 && v <= 255;
+                    case P::SByte:  return v >= -128 && v <= 127;
+                    case P::Short:  return v >= -32768 && v <= 32767;
+                    case P::UShort: return v >= 0 && v <= 65535;
+                    case P::Int:    return v >= -2147483648LL && v <= 2147483647LL;
+                    case P::UInt:   return v >= 0 && v <= 4294967295LL;
+                    // long / ulong: any 64-bit pattern is in range (the literal
+                    // type-check already rejects values that exceed 64 bits).
+                    default:        return true;
+                }
+            };
+            auto spell = [](P p) -> const char* {
+                switch (p) {
+                    case P::Byte: return "byte"; case P::SByte: return "sbyte";
+                    case P::Short: return "short"; case P::UShort: return "ushort";
+                    case P::Int: return "int"; case P::UInt: return "uint";
+                    case P::Long: return "long"; case P::ULong: return "ulong";
+                    default: return "the underlying type";
+                }
+            };
+            std::unordered_map<std::string_view, long long> siblings;
+            long long running = 0;
+            for (const auto& ec : td->enumConstants) {
+                long long val = running;
+                bool haveVal = true;
+                if (ec.value) {
+                    auto resolve = [&](std::string_view name, int)
+                        -> std::optional<long long> {
+                        auto it = siblings.find(name);
+                        if (it != siblings.end()) return it->second;
+                        return std::nullopt;
+                    };
+                    if (auto folded = foldIntConst(*ec.value, resolve))
+                        val = *folded;
+                    else
+                        haveVal = false;  // non-constant — a separate concern
+                }
+                if (haveVal) {
+                    siblings[ec.name] = val;
+                    if (!fits(val, up))
+                        ctx_.diagnostics().report(
+                            Severity::Error,
+                            ec.value ? ec.value->span.begin : t->declLoc,
+                            std::string("enum member `") + std::string(ec.name) +
+                            "` value " + std::to_string(val) +
+                            " does not fit the underlying type `" + spell(up) +
+                            "` (§10.3 — all declared values must fit the "
+                            "underlying type's range)");
+                }
+                running = val + 1;
             }
         }
     }
