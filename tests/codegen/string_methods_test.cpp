@@ -121,6 +121,51 @@ BEZEL_TEST(codegen_cg27f, substring_length) {
         "end Main; end C;"), 5);
 }
 
+// fix #747 R43 / §9.6 / language spec §4.6: an out-of-range Substring index or
+// length raises IndexOutOfRangeException (the runtime previously silently
+// clamped). All exceptions are caught so the JIT runner never aborts.
+
+// start past the end, a negative start, and a too-long (start, length) each
+// throw — three caught OOB cases leave the counter at 0.
+BEZEL_TEST(codegen_cg27f, substring_out_of_range_throws_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; var fails := 0; "
+        "  try var a := s.Substring(6); fails := fails + 1; "
+        "  catch IndexOutOfRangeException => fails := fails + 0; end; "
+        "  try var b := s.Substring(-1); fails := fails + 1; "
+        "  catch IndexOutOfRangeException => fails := fails + 0; end; "
+        "  try var c := s.Substring(3, 3); fails := fails + 1; "
+        "  catch IndexOutOfRangeException => fails := fails + 0; end; "
+        "  return fails; "  // 0 — every OOB call threw
+        "end Main; end C;"), 0);
+}
+
+// Boundary cases that are VALID must NOT throw: start == len (empty tail),
+// length 0, and an exact (0, len) slice. 1+2+4+8+16 = 31.
+BEZEL_TEST(codegen_cg27f, substring_valid_boundaries_no_throw_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; var ok := 0; "
+        "  if s.Substring(5).Length = 0 then ok := ok + 1; end; "
+        "  if s.Substring(5, 0).Length = 0 then ok := ok + 2; end; "
+        "  if s.Substring(0, 0).Length = 0 then ok := ok + 4; end; "
+        "  if s.Substring(2).Length = 3 then ok := ok + 8; end; "
+        "  if s.Substring(0, 5).Length = 5 then ok := ok + 16; end; "
+        "  return ok; "  // 31
+        "end Main; end C;"), 31);
+}
+
+// Bounds are in CODE POINTS (#535): a code-point-OOB start throws.
+BEZEL_TEST(codegen_cg27f, substring_codepoint_out_of_range_throws_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello \xE6\x97\xA5\xE6\x9C\xAC World\"; "  // 14 code points
+        "  try var x := s.Substring(99); return 1; "
+        "  catch IndexOutOfRangeException => return 0; end; "  // 0 — threw
+        "end Main; end C;"), 0);
+}
+
 // -------------------------------------------------------------------------
 // §9.6 Split(separator: char): owned Array<string> — split on a single code
 // point. The char overload routes through bz_string_split_anychar with a

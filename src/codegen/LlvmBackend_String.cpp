@@ -1270,10 +1270,34 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         llvm::Value* startV = getIntArg(0);
         if (!startV) return nullptr;
         llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "sub.start");
+        bool hasLen = call.args.size() >= 2 && call.args[1].value;
         // If length arg absent, pass -1 to signal "rest of string" to runtime.
-        llvm::Value* count64 = (call.args.size() >= 2 && call.args[1].value)
+        llvm::Value* count64 = hasLen
             ? builder_.CreateSExt(lowerExpr(*call.args[1].value), i64(), "sub.count")
             : builder_.getInt64(-1);
+        // fix #747 R43 / §9.6 / language spec §4.6: an out-of-range start or
+        // length raises IndexOutOfRangeException — the same convention every
+        // string/span/array bounds operation follows (the runtime previously
+        // silently CLAMPED, the only clamping bounds op in the stdlib). `start`
+        // is valid in [0, len] (start == len is the empty tail); for the
+        // two-arg form `length` must be >= 0 and `start + length <= len`. The
+        // single-arg form keeps the runtime's -1 "rest of string" sentinel.
+        // Bounds are in CODE POINTS (loadStringLen), matching #535's code-point
+        // Substring and the slicing path in emitStringSliceBytes.
+        llvm::Value* len = loadStringLen(self);  // i64 code-point count
+        llvm::Value* oor = builder_.CreateOr(
+            builder_.CreateICmpSLT(start64, builder_.getInt64(0), "sub.sneg"),
+            builder_.CreateICmpSGT(start64, len, "sub.sbig"), "sub.soor");
+        if (hasLen) {
+            llvm::Value* lenNeg =
+                builder_.CreateICmpSLT(count64, builder_.getInt64(0), "sub.lneg");
+            llvm::Value* end = builder_.CreateAdd(start64, count64, "sub.end");
+            llvm::Value* endBig =
+                builder_.CreateICmpSGT(end, len, "sub.ebig");
+            oor = builder_.CreateOr(
+                oor, builder_.CreateOr(lenNeg, endBig, "sub.loor"), "sub.oor");
+        }
+        emitGuardThrow(oor, "IndexOutOfRangeException");
         auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
         return builder_.CreateCall(fn, {self, start64, count64}, "sub.result");
     }
