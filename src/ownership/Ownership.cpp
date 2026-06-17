@@ -1021,6 +1021,30 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // is sema's; here we just satisfy the discharge requirement
     // pessimistically.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        // §28.3 / §28.10 (#762): a `using var` is owned but scope-bound — per
+        // §28.3 "it cannot be moved out of, only borrowed from." Returning it by
+        // bare identifier transfers it out of its scope: for an `owned` return
+        // type it is a move-on-read into the owned return slot, and for a borrow
+        // return type it is a borrow that escapes the scope that disposes the
+        // value — either way the value would be disposed both by the caller (or
+        // the dangling borrow's reader) and by the using-var's scope-bound
+        // discharge, a double-free / use-after-free. The bare-identifier
+        // fast-path here ran before both the owned-move-out and borrow-escape
+        // checks and silently marked the local discharged; reject instead,
+        // mirroring the `markMovedByName` scope-bound guard. // per §28.3, §28.10
+        if (auto* st = lookupState(id->name)) {
+            if (st->implicitDischarge) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("cannot return `using var` `") +
+                    std::string(id->name) +
+                    "`; a `using var` is scope-bound — it cannot be moved out of "
+                    "(only borrowed from, and a borrow of it may not escape its "
+                    "scope) (§28.3 / §28.10)");
+                st->state = OwnershipState::Poisoned;
+                return;
+            }
+        }
         markDisposedByName(id->name, id->span.begin);
         return;
     }
