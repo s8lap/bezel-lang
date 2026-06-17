@@ -2199,6 +2199,57 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         builder_.SetInsertPoint(contBB);
     }
 
+    // §15.1.1 line 1957 / §15.3 (#747): a move-only OWNING inline-array FIELD
+    // ([N owned]T? / [N owned]T) — "for class fields, the enclosing class's
+    // destructor invokes the disposal." Each non-null slot's object is disposed
+    // via its own vtable, then nulled (the #396 slot-null precedent guards a
+    // re-entrant pass). A slot left moved-from via `move this.field[i]` was
+    // nulled at the move (lowerMoveFromCollectionSlot), so the null-guard skips
+    // it — no double-free. Unlike the owned-reference fields above there is no
+    // single object to dispatch on; the field is a [N x ptr] sub-aggregate.
+    {
+        llvm::StructType* st = classStruct(ts);
+        for (const sema::Symbol* m : ts->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
+            const sema::TypeRef* ft = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                if (fd->type) ft = ctx_.resolvedType(*fd->type);
+            }
+            if (!ft || ft->kind != sema::TypeRef::Kind::InlineArray ||
+                !ft->arrayOwned)
+                continue;
+            unsigned n = ft->arraySizeValue >= 0
+                ? (unsigned)ft->arraySizeValue : 0;
+            if (n == 0) continue;
+            unsigned idx = fieldIndex_[fs];
+            llvm::Value* fieldAddr =
+                builder_.CreateStructGEP(st, currentThis_, idx, "ioaf.addr");
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), n);
+            for (unsigned i = 0; i < n; ++i) {
+                llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
+                    arrTy, fieldAddr,
+                    {builder_.getInt32(0), builder_.getInt32(i)}, "ioaf.slot");
+                llvm::Value* obj =
+                    builder_.CreateLoad(ptrTy(), slotAddr, "ioaf.val");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()));
+                auto* dispBB = llvm::BasicBlock::Create(llvm_, "ioaf.dispose",
+                                                        currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(llvm_, "ioaf.cont",
+                                                        currentFn_);
+                builder_.CreateCondBr(isNull, contBB, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(obj);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), slotAddr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
+        }
+    }
+
     // #429 / §4.6 / §28.9: release every STRING field / auto-property of THIS
     // class (own members only; an inherited slot is released by the base CORE
     // disposer via emitBaseDisposeChain — so visiting only ts->members avoids a

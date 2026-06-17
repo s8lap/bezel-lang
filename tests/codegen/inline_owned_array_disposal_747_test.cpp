@@ -43,6 +43,44 @@ std::string prog(const std::string& body) {
 }
 }  // namespace
 
+// §15.1.1 line 1957: an owning inline-array FIELD is disposed by the enclosing
+// class's destructor. A Holder with a `[2 owned]Cell?` field → both slots
+// disposed when the Holder is disposed (counter 0; was 2, a leak).
+BEZEL_TEST(codegen_inline_owned_747, field_disposed_by_host_destructor) {
+    BEZEL_EXPECT_EQ(run(std::string(kCell) +
+        "class Holder public slots: [2 owned]Cell? := "
+        "  [new Cell(1), new Cell(2)]; end Holder; "
+        "class C public static method Main(): int "
+        "  do using var h := new Holder(); end; return Cell.n; "
+        "end Main; end C;"), 0);
+}
+
+// The non-nullable owning inline-array field likewise.
+BEZEL_TEST(codegen_inline_owned_747, non_nullable_field_disposed_by_host) {
+    BEZEL_EXPECT_EQ(run(std::string(kCell) +
+        "class Holder public slots: [2 owned]Cell := "
+        "  [new Cell(1), new Cell(2)]; end Holder; "
+        "class C public static method Main(): int "
+        "  do using var h := new Holder(); end; return Cell.n; "
+        "end Main; end C;"), 0);
+}
+
+// A field slot moved out (`move this.slots[0]`) is nulled, so the host
+// destructor skips it — the moved value is disposed once by its new owner and
+// the remaining slot once by the host. No double-free.
+BEZEL_TEST(codegen_inline_owned_747, field_slot_move_then_null_no_double_free) {
+    BEZEL_EXPECT_EQ(run(std::string(kCell) +
+        "class Holder public slots: [2 owned]Cell? := "
+        "  [new Cell(1), new Cell(2)]; "
+        "  public method DropFirst() "
+        "    using var t: Cell? := move slots[0]; slots[0] := null; "
+        "  end DropFirst; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  do using var h := new Holder(); h.DropFirst(); end; return Cell.n; "
+        "end Main; end C;"), 0);
+}
+
 // §15.3: a `[N owned]Cell?` literal-initialized local disposes BOTH slots at
 // scope end → counter back to 0.
 BEZEL_TEST(codegen_inline_owned_747, nullable_literal_disposed_at_scope_end) {
