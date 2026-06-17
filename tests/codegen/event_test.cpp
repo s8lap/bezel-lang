@@ -389,3 +389,40 @@ BEZEL_TEST(codegen_events, unit_static_event_raise_no_arg_737) {
         "  return App.count; "  // 2
         "end Main; end C;"), 2);
 }
+
+// §24.5 (#747 R42): a handler that throws stops the dispatch — subsequent
+// handlers are NOT invoked and the exception propagates (here caught by the
+// caller's try). The Raise loop now tests the global exception slot after each
+// handler; pre-fix it ran every handler regardless, so `second` became 1.
+BEZEL_TEST(codegen_events, throwing_handler_aborts_dispatch_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Ev(N: int); "
+        "class Src public event Changed: Ev; "
+        "  public method Fire(n: int) Changed.Raise(new Ev(n)); end Fire; end Src; "
+        "class C "
+        "  public static second: int := 0; "
+        "  public static method Main(): int "
+        "    using var s := new Src(); "
+        "    using var s1 := s.Changed.Subscribe((e) => do throw new Exception(\"x\"); end); "
+        "    using var s2 := s.Changed.Subscribe((e) => do second := 1; end); "
+        "    try s.Fire(1); catch var ex: Exception => second := second + 0; end; "
+        "    return second; "  // 0 — the second handler never ran
+        "  end Main; end C;"), 0);
+}
+
+// §24.5 regression guard: with no throw, every handler runs in subscription
+// order (the pending-check breaks the loop only on an actual exception).
+BEZEL_TEST(codegen_events, all_handlers_run_when_no_throw_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Ev(N: int); "
+        "class Src public event Changed: Ev; "
+        "  public method Fire(n: int) Changed.Raise(new Ev(n)); end Fire; end Src; "
+        "class C "
+        "  public static total: int := 0; "
+        "  public static method Main(): int "
+        "    using var s := new Src(); "
+        "    using var s1 := s.Changed.Subscribe((e) => do total := total + e.N; end); "
+        "    using var s2 := s.Changed.Subscribe((e) => do total := total + 10; end); "
+        "    s.Fire(5); return total; "  // 15
+        "  end Main; end C;"), 15);
+}

@@ -6984,12 +6984,13 @@ const sema::TypeRef* Emitter::eventPayloadType(const sema::EventSymbol* es) {
 // (env_ptr, payload?) -> void. Handlers run in subscription order; with zero
 // subscribers this is a no-op (no null check at the call site, per §24.5).
 //
-// NOTE (§24.5, deferred): "if a handler throws, subsequent handlers are not
-// invoked and the exception propagates" — handler exception propagation is not
-// wired here (handlers are plain closure calls without an unwind edge). With
-// the current synchronous closure-call path a throwing handler would still
-// abort the loop via the process-level unwind, but the spec's precise
-// stop-and-propagate semantics are not yet enforced. Reported as deferred.
+// §24.5 (#747 R42): "if a handler throws, subsequent handlers are not invoked
+// and the exception propagates." Bezel propagates exceptions through the global
+// exception slot (emitExcSlot), not LLVM unwind edges, so a plain closure call
+// does not stop the loop on its own — the slot must be tested after each
+// handler. After invoking a handler, if the slot is non-null the loop breaks to
+// `endBB` (no further handlers) and the still-pending exception propagates to
+// Raise's caller via the normal post-call pending check.
 void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
                              llvm::Type* payloadTy) {
     if (!srcPtr) return;
@@ -7029,6 +7030,15 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     callArgs.push_back(envPtr);
     if (payloadLL) callArgs.push_back(payloadLL);
     builder_.CreateCall(handlerFnTy, fnPtr, callArgs);
+    // §24.5: stop on a throwing handler — break the loop if the handler set the
+    // global exception slot; the exception stays pending and propagates.
+    llvm::Value* pend =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "raise.exc");
+    llvm::Value* threw = builder_.CreateICmpNE(
+        pend, llvm::ConstantPointerNull::get(ptrTy()), "raise.threw");
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "raise.cont", fn);
+    builder_.CreateCondBr(threw, endBB, contBB);
+    builder_.SetInsertPoint(contBB);
     builder_.CreateStore(builder_.CreateAdd(iv, builder_.getInt64(1)), iSlot);
     builder_.CreateBr(loopBB);
 
