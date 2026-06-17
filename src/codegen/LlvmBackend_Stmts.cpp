@@ -1913,12 +1913,14 @@ bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
 void Emitter::registerForLoopSpillSlots(
         const ast::ForStmt& fs,
         std::initializer_list<llvm::AllocaInst*> slots) {
-    // §29.3 / §30.7 (#747 R42) — see the declaration comment. Only an async
-    // suspend point (Await / AsyncYield) uses the side spill area + the
-    // fixupSuspendDominance pass that consumes asyncHandlerSpillSlots_; a sync
-    // iterator (Yield) has no such mechanism, so it is handled separately.
+    // §29.3 / §30.7 (#747 R42) — see the declaration comment. All three suspend
+    // kinds now use the side spill area + the fixupSuspendDominance pass that
+    // consumes asyncHandlerSpillSlots_: Await / AsyncYield (async resume) and
+    // Yield (sync MoveNext — emitIteratorMethod sets asyncSpillPtrField_ and runs
+    // the fixup when any slot is registered).
     if (!smStateStruct_) return;
-    if (smKind_ != SuspendKind::Await && smKind_ != SuspendKind::AsyncYield)
+    if (smKind_ != SuspendKind::Await && smKind_ != SuspendKind::AsyncYield &&
+        smKind_ != SuspendKind::Yield)
         return;
     if (!containsYield(fs.body) && !containsAwait(fs.body)) return;
     for (llvm::AllocaInst* s : slots)

@@ -338,16 +338,22 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             elemTy = lowerTypeRef(retRef->genericArgs[0]);
     }
 
-    // Build the kind-agnostic frame; the yield driver's one extra trailing
-    // field is the `current_val` of element type T.
-    // Layout: { ptr vtable, i32 state, captures..., locals..., T current_val }
+    // Build the kind-agnostic frame; the yield driver's extra trailing fields are
+    // the `current_val` of element type T, then (#747) a spill-area pointer for a
+    // suspending for-loop's implicit locals — promoteDemotedSlotsToFrame heap-
+    // spills the loop index/array-ptr/enumerator into it when MoveNext crosses a
+    // yield, just like the async resume path. calloc-zeroed, so it starts null
+    // and stays null (and free(null) is a no-op) for iterators that never spill.
+    // Layout: { ptr vtable, i32 state, captures..., locals..., T current_val,
+    //           ptr spill }
     StateMachineFrame frame = buildStateMachineFrame(
-        ms, *ci.stmts, {elemTy},
+        ms, *ci.stmts, {elemTy, ptrTy()},
         std::string("iter.") + std::string(ms->name));
     auto* stateStructTy = frame.structTy;
     const unsigned VTABLE_FIELD = frame.vtableField;
     const unsigned STATE_FIELD = frame.stateField;
     const unsigned CURRENT_VAL_FIELD = frame.currentValField;
+    const unsigned SPILL_PTR_FIELD = CURRENT_VAL_FIELD + 1;  // #747
 
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$iter$") + std::string(ms->name) + "$";
@@ -472,6 +478,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // Yield-specific live state for the YieldStmt handler in lowerStmt.
         iterCurrentValField_ = CURRENT_VAL_FIELD;
         iterElemTy_ = elemTy;
+        // #747: enable for-loop frame-spill for THIS MoveNext, reusing the async
+        // spill-area mechanism. registerForLoopSpillSlots records a suspending
+        // for-loop's implicit allocas (index / array-ptr / enumerator) into
+        // asyncHandlerSpillSlots_ during the body lowering below; fixupSuspend-
+        // Dominance then heap-spills them (and any SSA temporary whose def no
+        // longer dominates a use across a yield) into the frame's spill field.
+        asyncSpillPtrField_ = SPILL_PTR_FIELD;
+        asyncHandlerSpillSlots_.clear();
 
         // Emit MoveNext body starting from state 0.
         // The body is emitted linearly; YieldStmt handlers interrupt it to
@@ -485,6 +499,17 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRet(builder_.getFalse());
         }
+
+        // #747: if a suspending for-loop registered implicit allocas (or an SSA
+        // temporary fails to dominate a use across a yield), promote them into the
+        // frame's spill area so they survive the resume — fixing the sync-iterator
+        // "Instruction does not dominate all uses" IR_FAIL. Scoped to MoveNexts
+        // that actually registered slots, so a sync iterator with no problematic
+        // for-loop is byte-for-byte unchanged.
+        if (!asyncHandlerSpillSlots_.empty())
+            fixupSuspendDominance(moveNextFn);
+        asyncHandlerSpillSlots_.clear();
+        asyncSpillPtrField_ = 0;
 
         // Clear state-machine state.
         smStateStruct_ = nullptr;
@@ -511,6 +536,11 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         builder_.SetInsertPoint(entry);
 
         llvm::Value* self = &*disposeFn->arg_begin();
+        // #747: emitFreeSpillArea reads the frame's spill-ptr field; set the
+        // frame context it needs. free(null) is a no-op for an iterator that
+        // never spilled, so this is safe for every sync iterator.
+        smStateStruct_ = stateStructTy;
+        asyncSpillPtrField_ = SPILL_PTR_FIELD;
 
         // Restore captures so finally bodies can access `this` / params.
         emitFrameCaptureRestores(frame, self);
@@ -537,6 +567,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
         } else {
@@ -568,6 +599,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
 
             builder_.SetInsertPoint(doneBB);
+            emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
         }

@@ -1974,8 +1974,12 @@ void Emitter::promoteDemotedSlotsToFrame(
         llvm_, spillFields, fn->getName().str() + ".spill");
 
     // (2) Resume entry setup, inserted before the dispatch switch (the entry
-    // block's terminator). The frame pointer is the resume function's 2nd arg.
-    llvm::Value* self = fn->getArg(1);
+    // block's terminator). The frame pointer is smSelf_ — the resume function's
+    // 2nd arg for an async coroutine (getArg(1)), but the sync iterator MoveNext's
+    // ONLY arg (getArg(0)); #747 reuses this pass for the sync MoveNext, so read
+    // the frame ptr from smSelf_ (set identically by both setups) rather than a
+    // hardcoded arg index.
+    llvm::Value* self = smSelf_;
     llvm::BasicBlock& entryBB = fn->getEntryBlock();
     llvm::Instruction* term = entryBB.getTerminator();
     // The resume entry always ends in the dispatch switch (emitResumeDispatch);

@@ -368,6 +368,7 @@ set(BEZEL_TEST_SOURCES
     codegen/inline_owned_array_disposal_747_test.cpp
     codegen/generic_base_this_base_call_747_test.cpp
     codegen/async_iter_frame_spill_747_test.cpp
+    codegen/sync_iter_frame_spill_747_test.cpp
     codegen/event_ievent_var_747_test.cpp
     codegen/string_test.cpp
     codegen/string_length_codepoints_528_test.cpp
