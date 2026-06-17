@@ -3029,7 +3029,7 @@ end;
 
 private static method Classify(score: int): string
   Log("low score: " + score.ToString());
-  return if score < 0 then "invalid" else "failing";
+  return "invalid" if score < 0 else "failing";
 end Classify;
 ```
 

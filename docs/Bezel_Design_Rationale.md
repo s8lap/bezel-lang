@@ -6915,6 +6915,8 @@ Spec §4.1 (one clause), §19 (title, §19.1 forms, §19.4 guard note, §19.6 ex
 #### Migration
 A scrutinee-less `case` (e.g. `case\n  x >= 90 => …\nend`) no longer parses; replace the keyword with `when`. A `case` with a scrutinee is unaffected. An unparenthesised bitwise (`& ^ |`) or range scrutinee — never shown in any example and not previously idiomatic — must now be parenthesised (`case (flags & MASK) …`). Leading-open range patterns that were previously rejected now compile. The conformance corpus and the project's own test/example sources were migrated with this revision.
 
+**Erratum (same revision) — §19.2 `Classify` example (#748).** The `Classify` helper example used statement-if syntax (`return if score < 0 then "invalid" else "failing";`) in expression position. Bezel's if-*expression* is the postfix form `trueValue if condition else falseValue` (§20); `if … then … end` is the *statement* form (§21). The compiler correctly rejected the example; it now reads `return "invalid" if score < 0 else "failing";`. Documentation-only; isolated (a doc-wide scan found no other expression-position `if … then … else`).
+
 ---
 
 ## 20. Closing
