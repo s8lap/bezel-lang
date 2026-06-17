@@ -7798,13 +7798,22 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // a declared type (from the FieldDecl); if it's a Function TypeRef,
     // lower the field access as a closure pointer and dispatch.
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(calleeSym)) {
-        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-        if (fd && fd->type) {
-            sema::TypeRef* rt = ctx_.resolvedType(*fd->type);
-            if (rt && rt->kind == sema::TypeRef::Kind::Function) {
-                llvm::Value* closurePtr = lowerExpr(*call.callee);
-                return emitClosureCall(closurePtr, rt);
-            }
+        // The field's declared type is on the body FieldDecl, or — for a
+        // POSITIONAL record field (§9.1) — on posParam (fs->decl is then the
+        // owning TypeDecl, so the FieldDecl cast fails). #747 R43: without the
+        // positional branch, `box.fn()` on a record whose `fn` field is a
+        // positional function-typed parameter skipped the closure-call path and
+        // fell through to a no-method/garbage result; the same call worked only
+        // after extracting `b.fn` to a local first.
+        sema::TypeRef* rt = nullptr;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+            if (fd->type) rt = ctx_.resolvedType(*fd->type);
+        } else if (fs->posParam && fs->posParam->type) {
+            rt = ctx_.resolvedType(*fs->posParam->type);
+        }
+        if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+            llvm::Value* closurePtr = lowerExpr(*call.callee);
+            return emitClosureCall(closurePtr, rt);
         }
     }
     // fix #507 / §27.3: IIFE — the callee is a LambdaExpr invoked directly at

@@ -342,6 +342,44 @@ BEZEL_TEST(codegen_cg60, function_typed_field_call) {
         "end Main; end C;"), 25);
 }
 
+// fix #747 R43 / §9.1: calling a function value directly through a POSITIONAL
+// record field — `box.fn()` where `record Box(fn: () -> int)`. The field's type
+// is on its positional param, not a FieldDecl, so the closure-call path was
+// skipped and the combined load+call returned garbage (extracting `b.fn` to a
+// local first was the only working form). Now dispatches through emitClosureCall.
+BEZEL_TEST(codegen_cg60, positional_record_fn_field_call_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Box(fn: () -> int); "
+        "class C public static method Main(): int "
+        "  var b := new Box(() => 42); "
+        "  return b.fn(); "
+        "end Main; end C;"), 42);
+}
+
+// §9.1: the positional function field takes arguments.
+BEZEL_TEST(codegen_cg60, positional_record_fn_field_with_args_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Box(fn: (int) -> int); "
+        "class C public static method Main(): int "
+        "  var b := new Box((x: int) => x * 7); "
+        "  return b.fn(6); "  // 42
+        "end Main; end C;"), 42);
+}
+
+// §9.1: the function field is NOT the first positional field — the field offset
+// must be correct, not assumed to be slot 0.
+BEZEL_TEST(codegen_cg60, positional_record_fn_field_second_slot_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pair(n: int, fn: (int) -> int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(10, (x: int) => x + 5); "
+        "  return p.fn(p.n); "  // 15
+        "end Main; end C;"), 15);
+}
+
 // ── Function-typed array elements — return type propagation ───────────────
 BEZEL_TEST(codegen_cg60, array_element_string_return) {
     // Verify that calling a `(int)->string` through an array element correctly
