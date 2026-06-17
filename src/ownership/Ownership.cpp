@@ -795,6 +795,22 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // Find the LocalSymbol that ExprTypecheck created for this decl.
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
+    // §28.3 (#747 R42): an initializer that READS a moved-from / disposed /
+    // uninitialized local is a use-after-move/dispose. The initializer was
+    // never run through checkRead, so `move b; var x := b._val;` (a member
+    // access on a moved-from local) slipped through. Run checkRead here — but
+    // NOT when the initializer is itself a top-level CONSUMING form (`move y` /
+    // `await y`): those are handled by the existing, more specific
+    // move/await-consume checks below, which emit the precise error; running a
+    // broad read-check first would steal that diagnostic (and weaken it to a
+    // use-after-dispose warning).
+    if (ld.initializer) {
+        bool topLevelConsume = false;
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(ld.initializer.get()))
+            topLevelConsume = (ue->op == "move" || ue->op == "await");
+        if (!topLevelConsume)
+            checkRead(*ld.initializer, /*selfTarget=*/false);
+    }
     LocalOwnership lo;
     lo.obligationOrigin = &ld;
     if (ld.isUsing) {

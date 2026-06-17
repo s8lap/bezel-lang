@@ -100,3 +100,31 @@ BEZEL_TEST(own_read, return_after_move_uses_moved_local_diagnosed) {
         "var x := new T(); _ := move x; return x;", "Make(): T"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §28.3 (#747 R42): reading a FIELD of a moved-from local in a LocalDecl
+// initializer (`move b; var x := b._val;`) is a use-after-move. Pre-fix the
+// initializer was never run through the read-check, so this slipped past.
+BEZEL_TEST(own_read, member_access_on_moved_local_in_initializer_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Box public _val: int; public constructor(v: int) _val := v; "
+        "  end constructor; end Box; "
+        "class C public method Bad() "
+        "  var b := new Box(42); move b; var x := b._val; "
+        "end Bad; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.3 regression guard: a `move` into a new owner followed by reading the NEW
+// owner's field is valid and must NOT be flagged (the skip-the-consuming-form
+// rule keeps `var e := move b` from stealing/false-firing).
+BEZEL_TEST(own_read, move_into_local_then_read_new_owner_ok) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Box public _val: int; public constructor(v: int) _val := v; "
+        "  end constructor; end Box; "
+        "class C public method Good() "
+        "  var b := new Box(9); var e := move b; var r := e._val; e.Dispose(); "
+        "end Good; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
