@@ -822,22 +822,16 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
         rop->expr = parseExpression();
         return std::unique_ptr<ast::Pattern>(rop.release());
     }
-    // §16.2 / §19.3 (#726): a TRAILING-open range pattern (`31..`) is handled by
-    // the catch-all below (the leading expression is parsed, then `..` makes it a
-    // RangeExpr with an absent upper bound; codegen now matches the open bound).
-    // A LEADING-open range pattern (`..<EXPR`) cannot be parsed unambiguously
-    // here: in the scrutinee form `case x ..<10` the scrutinee parser greedily
-    // consumes `x ..< 10` as a range expression. Use the equivalent relational
-    // pattern (`< EXPR` / `<= EXPR`), which is supported, instead.
-    if (isPunctuator("..") || isPunctuator("..<")) {
-        diagnostics_.report(
-            Severity::Error, current_.location,
-            "leading-open range pattern (`..<x` / `..x`) is not supported as a "
-            "case pattern (it is ambiguous with a `scrutinee..hi` range); use "
-            "the equivalent relational pattern `< x` / `<= x` (§19.3)");
-        advance();
-        return nullptr;
-    }
+    // §16.2 / §19.3 (#726, #744): both open-ended range-pattern forms are
+    // supported. A TRAILING-open pattern (`31..`) is handled by the catch-all
+    // below (the leading expression is parsed, then `..` makes it a RangeExpr
+    // with an absent upper bound). A LEADING-open pattern (`..<EXPR` / `..EXPR`)
+    // is now unambiguous: with the scrutinee-less form spelled `when` (#744),
+    // `case` always carries a scrutinee parsed above the range level (≥ 12), so
+    // the scrutinee never swallows a following `..`/`..<`. A leading `..`/`..<`
+    // therefore begins this arm's pattern — fall through to the catch-all,
+    // where parsePrimaryExpression parses it as a high-only RangeExpr (§A.7)
+    // that wraps into a RangePattern.
     // Primitive-type-led TypePattern. Other types (named) fall through to
     // the Identifier branch as NamedPattern — sema disambiguates Constant
     // vs Type by name resolution per the §A.7 note.
@@ -998,12 +992,13 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     // #744 / §19: `case` ALWAYS takes a scrutinee; the scrutinee-less
     // condition-dispatch form is now spelled `when` (parseWhenExpr), so the
     // newline-significant `isScruntineeLessCase` heuristic is gone. The
-    // scrutinee is parsed above relational precedence (≥ 8) so relop patterns
-    // (`>=90`, `<0`, etc.) are recognised as arm patterns rather than consumed
-    // as part of a boolean scrutinee. A full boolean scrutinee can be
-    // parenthesised.
+    // scrutinee is parsed above the range level (precedence ≥ 12) so that
+    // relational patterns (`>= 90`, `< 0`), range patterns (`90..100`), and
+    // the §19.3 leading-open range patterns (`..<0`, `..5`) are recognised as
+    // arm patterns rather than consumed into the scrutinee. A scrutinee that
+    // is itself a bitwise/range/relational expression must be parenthesised.
     SourceLocation start = current_.location;
-    ce->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
+    ce->scrutinee = stampSpan(parseBinaryExpression(12), start, current_.location);
 
     ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     while (consumePunctuator(",")) {

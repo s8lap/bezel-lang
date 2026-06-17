@@ -109,10 +109,11 @@ std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
     advance(); // past `case`
     auto cs = std::make_unique<ast::CaseStmt>();
     // #744 / §19: `case` ALWAYS takes a scrutinee (scrutinee-less dispatch is
-    // now `when`, parseWhenStmt). Scrutinee parsed at precedence ≥ 8 so relop
-    // patterns are recognised as arms.
+    // now `when`, parseWhenStmt). Scrutinee parsed above the range level
+    // (precedence ≥ 12) so relational/range/leading-open-range patterns are
+    // recognised as arms rather than swallowed (mirrors parseCaseExpr).
     SourceLocation start = current_.location;
-    cs->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
+    cs->scrutinee = stampSpan(parseBinaryExpression(12), start, current_.location);
     cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/false));
     while (consumePunctuator(",")) {
         if (isKeyword("end")) break;

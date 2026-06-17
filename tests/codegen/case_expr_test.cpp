@@ -786,8 +786,7 @@ BEZEL_TEST(codegen_cg28, relational_pattern_ge_lt_variable_726) {
 
 // #726 / §16.2 / §19.3: a TRAILING-open range pattern (`31..` matches values at
 // or above 31). Previously IR-failed — codegen's range-pattern handler required
-// both bounds; it now matches an absent upper (or lower) bound. (Leading-open
-// `..<x` is ambiguous with a `scrutinee..hi` range; use the relational `< x`.)
+// both bounds; it now matches an absent upper (or lower) bound.
 BEZEL_TEST(codegen_cg28, trailing_open_range_pattern_726) {
     BEZEL_EXPECT_EQ(run(
         "var x := 80; "
@@ -807,6 +806,58 @@ BEZEL_TEST(codegen_cg28, trailing_open_range_boundary_726) {
         "    _ => 0 "
         "  end; "
         "return r;"), 9);
+}
+
+// #744 / §19.3: a LEADING-open range pattern (`..<0` matches values below 0).
+// This was previously rejected at parse time as ambiguous with a
+// `scrutinee..hi` range; with the scrutinee-less form now spelled `when`, the
+// `case` scrutinee parses above the range level so a leading `..`/`..<` opens
+// the arm pattern, not a scrutinee range. The upper bound is EXCLUSIVE.
+BEZEL_TEST(codegen_cg28, leading_open_exclusive_range_pattern_744) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -3; "
+        "var r := case x "
+        "    ..<0 => 1, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 1);  // -3 < 0
+}
+
+// #744 / §19.3: `..<0` is exclusive of 0 — the value 0 falls through.
+BEZEL_TEST(codegen_cg28, leading_open_exclusive_boundary_744) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 0; "
+        "var r := case x "
+        "    ..<0 => 1, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 0);  // 0 is not < 0
+}
+
+// #744 / §19.3: an INCLUSIVE leading-open range (`..5`) matches up to and
+// including 5; the boundary 5 matches.
+BEZEL_TEST(codegen_cg28, leading_open_inclusive_boundary_744) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "var r := case x "
+        "    ..5 => 7, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 7);  // 5 <= 5
+}
+
+// #744 / §19.3: a leading-open pattern as the FIRST arm must NOT be swallowed
+// into the scrutinee. `case x ..<10 => 1, 10.. => 2` with x = 3 selects arm 1,
+// proving `x` (not `x..<10`) is the scrutinee.
+BEZEL_TEST(codegen_cg28, leading_open_first_arm_not_swallowed_744) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 3; "
+        "var r := case x "
+        "    ..<10 => 1, "
+        "    10.. => 2, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 1);  // 3 < 10
 }
 
 // #738 / §16.4: `step` is not legal in a `case` range pattern (a pattern tests
