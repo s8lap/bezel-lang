@@ -3936,6 +3936,24 @@ bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || md->genericParams.empty() || !md->returnType) return false;
 
+    // fix #747 R43 / §14.1: EXPLICIT call-site type arguments (`Swap<int,int>(p)`)
+    // fully determine the method's type parameters — there is nothing to infer,
+    // so no target type is required. Without this short-circuit a call whose
+    // type parameter appears only in the return type (or is bound through a
+    // generic-typed parameter the argument-inference loop doesn't solve) was
+    // wrongly rejected as "cannot infer ... target type required" even though
+    // the type arguments were spelled out, so `var q := C.Swap<int,int>(p);`
+    // failed while `var q: Pair<int,int> := C.Swap<int,int>(p);` compiled.
+    const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs = nullptr;
+    if (auto* callMa =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        callTypeArgs = &callMa->typeArgs;
+    else if (auto* callId =
+                 dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
+        callTypeArgs = &callId->typeArgs;
+    if (callTypeArgs && callTypeArgs->size() >= md->genericParams.size())
+        return false;
+
     // Determine which type parameters are already bound by an argument: a
     // value parameter whose declared type is exactly the bare parameter name
     // (mirrors codegen's argument-inference loop and §14.1). These never need

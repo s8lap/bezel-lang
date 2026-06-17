@@ -138,3 +138,65 @@ BEZEL_TEST(generic_return_inference_391, argument_inferred_unaffected) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
+
+// fix #747 R43 / §14.1: EXPLICIT call-site type arguments fully determine a
+// generic method's type parameters, so NO target type is required — the
+// "cannot infer ... target type required" diagnostic must not fire. Previously
+// `var q := C.Swap<int,int>(p);` was rejected (it appeared to need a target)
+// even though the type arguments were spelled out, while the equivalent typed
+// local compiled.
+
+// A return-position-only T solved by explicit type args, bound to an UNTYPED
+// local — must compile and run.
+BEZEL_TEST(generic_return_inference_391, explicit_type_args_no_target_needed_747) {
+    auto r = runJit(
+        "module M; "
+        "class C "
+        "  public static method Make<T>(): T return default(T); end Make; "
+        "  public static method Main(): int "
+        "    var x := C.Make<int>(); "  // explicit <int> → no target needed
+        "    return x; "  // default(int) = 0
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// Explicit type args on a method whose params are bound through a generic-typed
+// parameter and whose return swaps them — `Swap<int,int>(p)` into an untyped
+// local. Returns the swapped first field.
+BEZEL_TEST(generic_return_inference_391, explicit_type_args_generic_param_swap_747) {
+    auto r = runJit(
+        "module M; "
+        "record Pair<A, B>(a: A, b: B); "
+        "class C "
+        "  public static method Swap<A, B>(p: Pair<A, B>): Pair<B, A> "
+        "    return new Pair<B, A>(p.b, p.a); "
+        "  end Swap; "
+        "  public static method Main(): int "
+        "    var p := new Pair<int, int>(3, 7); "
+        "    var q := C.Swap<int, int>(p); "  // untyped local, explicit args
+        "    return q.a; "  // swapped → 7
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// CONTROL: WITHOUT explicit type args, a return-only T into an untyped local is
+// still rejected (the diagnostic must remain for genuine inference-needs-target).
+BEZEL_TEST(generic_return_inference_391, no_explicit_args_still_rejected_747) {
+    auto r = runJit(
+        "module M; "
+        "class C "
+        "  public static method Make<T>(): T return default(T); end Make; "
+        "  public static method Main(): int "
+        "    var x := C.Make(); "  // no type args, no target → rejected
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
