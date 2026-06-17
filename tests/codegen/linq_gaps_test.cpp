@@ -406,6 +406,43 @@ BEZEL_TEST(linq_gaps, todict_scalar_value_indexed_read_738) {
         "end Main; end C;"), 15);
 }
 
+// fix #747 R43 / §5: the TWO-selector ToDictionary(key, value) must APPLY the
+// value selector to each element. Previously the second lambda was accepted but
+// never called — the element was stored as the value (a silent miscompile).
+BEZEL_TEST(linq_gaps, todict_two_selector_applies_value_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a: Array<int> := [5, 7]; "
+        "  using var d: Dictionary<int, int> := "
+        "    a.ToDictionary((x: int) => x, (x: int) => x * 10); "
+        "  return d[5] + d[7]; "  // 50 + 70 = 120
+        "end Main; end C;"), 120);
+}
+
+// §5: the two-selector value lambda is applied over a LAZY source too.
+BEZEL_TEST(linq_gaps, todict_two_selector_lazy_source_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a: Array<int> := [5, 6, 7]; "
+        "  using var d: Dictionary<int, int> := "
+        "    a.Where((x: int) => x > 5).ToDictionary((x: int) => x, "
+        "                                             (x: int) => x * 10); "
+        "  return d[6] + d[7]; "  // 60 + 70 = 130
+        "end Main; end C;"), 130);
+}
+
+// §5: a key DISTINCT from the value — key = x, value = x + 100 — proves the
+// value selector is independent of the key selector (not just echoing the key).
+BEZEL_TEST(linq_gaps, todict_two_selector_distinct_key_value_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a: Array<int> := [1, 2]; "
+        "  using var d: Dictionary<int, int> := "
+        "    a.ToDictionary((x: int) => x, (x: int) => x + 100); "
+        "  return d[1] + d[2]; "  // 101 + 102 = 203
+        "end Main; end C;"), 203);
+}
+
 // #738 / §5 / §14.1: an UN-ANNOTATED ToDictionary key selector `(x) => x` must
 // infer its param type from the source element T (it is a `(T) -> TKey` lambda).
 // Without seeding, the inferred Dictionary<K,V> result got a wrong key type and

@@ -10950,17 +10950,17 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             {lazy, builder_.getInt64(esz), hashTramp, eqTramp}, "linq.toset");
     }
 
-    // ----- ToDictionary: materialize into an owned Dictionary<TKey, T> -------
-    // stdlib §5: ToDictionary<TKey>(key: (T)->TKey): owned Dictionary<TKey, T>.
-    // The one-arg overload uses the element itself as the value; the two-arg form
-    // (key, value: (T)->TValue) is not modeled in this JIT milestone (the second
-    // arg would require a value-selector lambda).
+    // ----- ToDictionary: materialize into an owned Dictionary<TKey, TValue> --
+    // stdlib §5: ToDictionary<TKey>(key: (T)->TKey): owned Dictionary<TKey, T>,
+    // and the two-selector ToDictionary<TKey,TValue>(key, value: (T)->TValue):
+    // owned Dictionary<TKey, TValue> (#747 R43 — was silently ignoring the value
+    // selector and storing the element). The value selector is applied per
+    // element when supplied.
     if (m == "ToDictionary" && call.args.size() >= 1 && call.args[0].value) {
         sema::TypeRef* elemRef = nullptr;
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
         llvm::Type* elemTy2 = elemLlvmOf(elemRef);
-        int64_t valEsz = lazyElemSize(elemTy2, module_->getDataLayout());
 
         // Key type: the lambda (T)->TKey; TKey is its return type.
         sema::TypeRef* keyRefSema = nullptr;
@@ -10972,6 +10972,31 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             }
         int64_t keyEsz = lazyElemSize(keyTy, module_->getDataLayout());
 
+        // Value type/encoding: with a value selector (two-arg form) the value is
+        // the selector's TValue return; otherwise it is the element T.
+        bool hasValueSel = call.args.size() >= 2 && call.args[1].value;
+        llvm::Type* valTy = elemTy2;
+        if (hasValueSel) {
+            if (auto* lamTy = ctx_.exprType(*call.args[1].value))
+                if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                    lamTy->funcReturn)
+                    if (auto* t = lowerTypeRef(lamTy->funcReturn)) valTy = t;
+            // The value trampoline (kind 2) carries the selector result through
+            // an i32→i64 closure call, so only an i32-lowered scalar TValue
+            // (int/enum/char) round-trips correctly. Reject wider/struct value
+            // types with a clean diagnostic rather than silently miscompiling.
+            if (valTy != i32()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "two-selector `ToDictionary(key, value)` currently supports "
+                    "only an `int`-typed value selector in codegen; a value "
+                    "selector returning another type is not yet implemented "
+                    "(stdlib \xC2\xA7""5, #747)");
+                return llvm::PoisonValue::get(ptrTy());
+            }
+        }
+        int64_t valEsz = lazyElemSize(valTy, module_->getDataLayout());
+
         // Key closure + trampoline (kind 2 = key: i64(closure, elem_ptr)).
         // Note: lowerLinqLambda is not in scope here (defined later in the isOp
         // section). For ToDictionary the user always annotates the lambda key
@@ -10980,6 +11005,17 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         if (!keyClosure) return nullptr;
         llvm::Function* keyTramp = buildLinqTrampoline(2, elemTy2, nullptr);
 
+        // Value closure + trampoline (kind 2 over the element type: applies the
+        // value selector to each element). Null when there is no value selector.
+        llvm::Value* valClosure =
+            llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* valTramp = llvm::ConstantPointerNull::get(ptrTy());
+        if (hasValueSel) {
+            valClosure = lowerExpr(*call.args[1].value);
+            if (!valClosure) return nullptr;
+            valTramp = buildLinqTrampoline(2, elemTy2, nullptr);
+        }
+
         // Key hash + equality trampolines for the dict backing.
         const sema::TypeSymbol* keyRec = recordTypeOfRef(keyRefSema);
         llvm::Function* hashTramp = buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
@@ -10987,20 +11023,26 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
 
         // #738: the value encoding must match the codegen Dictionary<K,V> read
         // (encodeValue) — a SCALAR value (non-struct LLVM type) is stored inline
-        // in the void* slot; a STRUCT value (record/decimal) is heap-boxed.
-        bool valInline = elemTy2 && !elemTy2->isStructTy();
+        // in the void* slot; a STRUCT value (record/decimal) is heap-boxed. A
+        // value selector always yields a scalar TValue (gated to i32 above).
+        bool valInline = hasValueSel || (valTy && !valTy->isStructTy());
         auto* toDict = declareC("bz_lazy_to_dict", ptrTy(),
-            {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64()});
+            {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64(),
+             ptrTy(), ptrTy()});
         llvm::Value* result = builder_.CreateCall(toDict,
             {lazy, builder_.getInt64(valEsz), builder_.getInt64(keyEsz),
              keyTramp, keyClosure, hashTramp, eqTramp,
-             builder_.getInt64(valInline ? 1 : 0)}, "linq.todict");
-        // Release the inline-lambda key closure if we own it (eager materialization
-        // — the closure is fully consumed during bz_lazy_to_dict, same as eager
-        // LINQ terminals like Count/Sum).
-        bool inlineLambda = !call.args.empty() && call.args[0].value &&
-            dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()) != nullptr;
-        if (inlineLambda) emitClosureRelease(keyClosure);
+             builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure},
+            "linq.todict");
+        // Release the inline-lambda key/value closures if we own them (eager
+        // materialization — the closures are fully consumed during
+        // bz_lazy_to_dict, same as eager LINQ terminals like Count/Sum).
+        if (call.args[0].value &&
+            dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+            emitClosureRelease(keyClosure);
+        if (hasValueSel &&
+            dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get()))
+            emitClosureRelease(valClosure);
         return result;
     }
 

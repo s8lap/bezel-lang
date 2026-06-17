@@ -5211,7 +5211,8 @@ extern "C" void* bz_lazy_to_set(void* lazy, int64_t esz, void* hashfn, void* eqf
 // The element T bytes are copied into a fresh heap block and stored as the value.
 extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                                  void* keyfn, void* closure,
-                                 void* hashfn, void* eqfn, int64_t val_inline) {
+                                 void* hashfn, void* eqfn, int64_t val_inline,
+                                 void* valfn, void* valclosure) {
     auto* e = (bz_lazy_t*)lazy;
     // The dict is keyed by TKey (key_esz bytes). #738: the VALUE must use the
     // same generic-dict encoding the codegen Dictionary<TKey,T> read expects
@@ -5240,7 +5241,16 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
         int64_t k = ((kfn_t)keyfn)(closure, elem);
         memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
         void* val;
-        if (val_inline) {
+        if (valfn) {
+            // Two-selector ToDictionary(key, value): apply the value selector to
+            // the element. The value trampoline (kind 2) returns the scalar
+            // TValue widened to i64; pack its low val_esz bytes inline (a value
+            // selector always produces a scalar value in this milestone, so
+            // val_inline is 1). (§5 / #747 R43)
+            int64_t vv = ((kfn_t)valfn)(valclosure, elem);
+            val = nullptr;
+            memcpy(&val, &vv, (size_t)(val_esz < 8 ? val_esz : 8));
+        } else if (val_inline) {
             // Scalar: pack the value bytes directly into the void* slot.
             val = nullptr;
             memcpy(&val, elem, (size_t)(val_esz < 8 ? val_esz : 8));
