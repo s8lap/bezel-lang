@@ -3599,7 +3599,14 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     // here; iterator state machines and Array<T> go through other paths.
     if (!isLazyEnumerableType(iterTy)) return false;
 
-    llvm::Value* lazy = lowerExpr(*fs.iterable);
+    // #752: route through lowerToLazyEnumerator (not lowerExpr) so a bare
+    // `GroupBy(...)` iterable — which lowerExpr cannot lower to a usable
+    // enumerator — is materialized into a lazy ARRAY source over its
+    // IGrouping elements, exactly as the Count()/Any()/Sum() consumers do.
+    // For an ordinary lazy pipeline (Where/Select/…) lowerToLazyEnumerator
+    // returns lowerExpr(iterable) unchanged, so this is behaviour-preserving.
+    sema::TypeRef* lazyElemRef = nullptr;
+    llvm::Value* lazy = lowerToLazyEnumerator(*fs.iterable, lazyElemRef);
     if (!lazy) return false;
     llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
     if (!elemTy) elemTy = i32();

@@ -10623,9 +10623,98 @@ llvm::Function* Emitter::buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
     return fn;
 }
 
+// stdlib §5 (#651/#752): is `e` a `GroupBy(keySelector)` call — a CallExpr whose
+// callee is a MemberAccessExpr with member "GroupBy" and exactly one argument?
+static bool isGroupByCall(const ast::Expr* e) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee || call->args.size() != 1 || !call->args[0].value)
+        return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    return ma && ma->member == "GroupBy" && ma->target;
+}
+
+llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
+    // The caller guarantees isGroupByCall(&srcCall).
+    auto* srcMa = dynamic_cast<const ast::MemberAccessExpr*>(srcCall.callee.get());
+    if (!srcMa || !srcMa->target) return nullptr;
+    // srcMa->target is the source collection/lazy.
+    auto* srcRecvTy = ctx_.exprType(*srcMa->target);
+    sema::TypeRef* valElemRef =
+        (srcRecvTy && !srcRecvTy->genericArgs.empty())
+        ? srcRecvTy->genericArgs[0] : nullptr;
+    llvm::Type* valElemTy = valElemRef ? lowerTypeRef(valElemRef) : i32();
+    int64_t val_esz = lazyElemSize(valElemTy, module_->getDataLayout());
+    // Determine key element type from the key lambda's return.
+    sema::TypeRef* keyElemRef = valElemRef; // default: identity
+    auto* callTy = ctx_.exprType(srcCall);
+    // callTy = IEnumerable<IGrouping<TKey,T>>; IGrouping genericArgs[0]=TKey.
+    if (callTy && !callTy->genericArgs.empty() &&
+        callTy->genericArgs[0] &&
+        callTy->genericArgs[0]->astNode &&
+        callTy->genericArgs[0]->astNode->name &&
+        !callTy->genericArgs[0]->astNode->name->parts.empty() &&
+        callTy->genericArgs[0]->astNode->name->parts[0] == "IGrouping" &&
+        callTy->genericArgs[0]->genericArgs.size() >= 1) {
+        keyElemRef = callTy->genericArgs[0]->genericArgs[0];
+    }
+    llvm::Type* keyElemTy = keyElemRef ? lowerTypeRef(keyElemRef) : i32();
+    int64_t key_esz = lazyElemSize(keyElemTy, module_->getDataLayout());
+    // Lower the source to a lazy enumerator.
+    sema::TypeRef* dummyElem = nullptr;
+    llvm::Value* srcLazy = lowerToLazyEnumerator(*srcMa->target, dummyElem);
+    if (!srcLazy) return nullptr;
+    // Lower the key lambda to a closure. Use selector trampoline (kind 1):
+    // void(cl, elem, out) so the key is written as bytes into the output slot.
+    const bool relCl =
+        srcCall.args[0].value &&
+        dynamic_cast<const ast::LambdaExpr*>(srcCall.args[0].value.get()) != nullptr;
+    llvm::Value* closure = nullptr;
+    {
+        auto* funcRef = ctx_.makeTypeRef();
+        funcRef->kind = sema::TypeRef::Kind::Function;
+        funcRef->funcReturn = keyElemRef;
+        if (valElemRef) {
+            sema::TypeRef::FuncParam fp;
+            fp.type = valElemRef;
+            funcRef->funcParams.push_back(std::move(fp));
+        }
+        const sema::TypeRef* saved = expectedFunctionType_;
+        expectedFunctionType_ = funcRef;
+        closure = lowerExpr(*srcCall.args[0].value);
+        expectedFunctionType_ = saved;
+    }
+    if (!closure) return nullptr;
+    llvm::Function* keyTramp = buildLinqTrampoline(1, valElemTy, keyElemTy);
+    auto* gbFn = declareC("bz_groupby_to_array", ptrTy(),
+        {ptrTy(), i64(), i64(), ptrTy(), ptrTy()});
+    llvm::Value* groups = builder_.CreateCall(gbFn,
+        {srcLazy, builder_.getInt64(val_esz), builder_.getInt64(key_esz),
+         closure, keyTramp}, "linq.groupby");
+    if (relCl && closure) emitClosureRelease(closure);
+    return groups;
+}
+
 llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                             sema::TypeRef*& elemRef) {
     auto* recvTy = ctx_.exprType(recvExpr);
+    // stdlib §5 (#752): a bare `GroupBy(...)` is IEnumerable<IGrouping<TKey,T>>
+    // (so isLazyEnumerableType below is true), but lowerExpr cannot lower it to
+    // a usable enumerator — only the `.ToArray()` interception handled GroupBy,
+    // so Count()/Any()/Sum()/for-in over a bare GroupBy enumerated garbage.
+    // Materialize the groups into an owned Array<IGrouping> and wrap it as a
+    // lazy ARRAY source: each element is a bz_grouping_t* pointer, so the lazy
+    // element size is one pointer. Now every lazy consumer composes uniformly.
+    if (isGroupByCall(&recvExpr)) {
+        llvm::Value* groups =
+            lowerGroupByMaterialize(*static_cast<const ast::CallExpr*>(&recvExpr));
+        if (!groups) return nullptr;
+        elemRef = (recvTy && !recvTy->genericArgs.empty())
+                  ? recvTy->genericArgs[0] : nullptr;
+        int64_t esz = lazyElemSize(ptrTy(), module_->getDataLayout());
+        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(wrapFn, {groups, builder_.getInt64(esz)},
+                                   "lazy.groupby");
+    }
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
     if (isLazyEnumerableType(recvTy)) {
@@ -10699,88 +10788,13 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // ----- ToArray: materialize the (lazy) pipeline into an owned Array<T> ---
     if (m == "ToArray" && call.args.empty()) {
         // stdlib §5 (#651): GroupBy(...).ToArray() — intercept before the
-        // generic lazy-materialization path.  The GroupBy source is itself a
-        // call expression; detect by checking if it's a CallExpr whose callee
-        // is a MemberAccessExpr with member "GroupBy".
+        // generic lazy-materialization path and return the materialized groups
+        // array directly (avoids a redundant array→lazy→array round-trip). The
+        // GroupBy source is itself a call expression.
         if (auto* srcCall = dynamic_cast<const ast::CallExpr*>(ma->target.get())) {
-            if (srcCall->callee) {
-                if (auto* srcMa = dynamic_cast<const ast::MemberAccessExpr*>(
-                        srcCall->callee.get())) {
-                    if (srcMa->member == "GroupBy" && srcMa->target &&
-                        srcCall->args.size() == 1 && srcCall->args[0].value) {
-                        // srcMa->target is the source collection/lazy.
-                        auto* srcRecvTy = ctx_.exprType(*srcMa->target);
-                        sema::TypeRef* valElemRef =
-                            (srcRecvTy && !srcRecvTy->genericArgs.empty())
-                            ? srcRecvTy->genericArgs[0] : nullptr;
-                        llvm::Type* valElemTy = valElemRef
-                            ? lowerTypeRef(valElemRef) : i32();
-                        int64_t val_esz = lazyElemSize(valElemTy,
-                            module_->getDataLayout());
-                        // Determine key element type from the key lambda's return.
-                        sema::TypeRef* keyElemRef = valElemRef; // default: identity
-                        auto* callTy = ctx_.exprType(*srcCall);
-                        // callTy = IEnumerable<IGrouping<TKey,T>>;
-                        // IGrouping genericArgs[0]=TKey.
-                        if (callTy && !callTy->genericArgs.empty() &&
-                            callTy->genericArgs[0] &&
-                            callTy->genericArgs[0]->astNode &&
-                            callTy->genericArgs[0]->astNode->name &&
-                            !callTy->genericArgs[0]->astNode->name->parts.empty() &&
-                            callTy->genericArgs[0]->astNode->name->parts[0] == "IGrouping" &&
-                            callTy->genericArgs[0]->genericArgs.size() >= 1) {
-                            keyElemRef = callTy->genericArgs[0]->genericArgs[0];
-                        }
-                        llvm::Type* keyElemTy = keyElemRef
-                            ? lowerTypeRef(keyElemRef) : i32();
-                        int64_t key_esz = lazyElemSize(keyElemTy,
-                            module_->getDataLayout());
-                        // Lower the source to a lazy enumerator.
-                        sema::TypeRef* dummyElem = nullptr;
-                        llvm::Value* srcLazy = lowerToLazyEnumerator(
-                            *srcMa->target, dummyElem);
-                        if (!srcLazy) return nullptr;
-                        // Lower the key lambda to a closure.
-                        // Use selector trampoline (kind 1): void(cl, elem, out)
-                        // so the key is written as bytes into the output slot.
-                        const bool relCl =
-                            srcCall->args[0].value &&
-                            dynamic_cast<const ast::LambdaExpr*>(
-                                srcCall->args[0].value.get()) != nullptr;
-                        // lowerLinqLambda is defined AFTER the ToArray block;
-                        // inline its logic: set expectedFunctionType_ to a
-                        // function (valElemRef)->keyElemRef and lowerExpr.
-                        llvm::Value* closure = nullptr;
-                        {
-                            auto* funcRef = ctx_.makeTypeRef();
-                            funcRef->kind = sema::TypeRef::Kind::Function;
-                            funcRef->funcReturn = keyElemRef;
-                            if (valElemRef) {
-                                sema::TypeRef::FuncParam fp;
-                                fp.type = valElemRef;
-                                funcRef->funcParams.push_back(std::move(fp));
-                            }
-                            const sema::TypeRef* saved = expectedFunctionType_;
-                            expectedFunctionType_ = funcRef;
-                            closure = lowerExpr(*srcCall->args[0].value);
-                            expectedFunctionType_ = saved;
-                        }
-                        if (!closure) return nullptr;
-                        llvm::Function* keyTramp = buildLinqTrampoline(
-                            1, valElemTy, keyElemTy);
-                        auto* gbFn = declareC("bz_groupby_to_array", ptrTy(),
-                            {ptrTy(), i64(), i64(), ptrTy(), ptrTy()});
-                        llvm::Value* groups = builder_.CreateCall(gbFn,
-                            {srcLazy,
-                             builder_.getInt64(val_esz),
-                             builder_.getInt64(key_esz),
-                             closure,
-                             keyTramp},
-                            "linq.groupby");
-                        if (relCl && closure) emitClosureRelease(closure);
-                        return groups;
-                    }
-                }
+            if (isGroupByCall(srcCall)) {
+                if (llvm::Value* groups = lowerGroupByMaterialize(*srcCall))
+                    return groups;
             }
         }
 

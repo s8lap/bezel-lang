@@ -301,6 +301,51 @@ BEZEL_TEST(codegen_stdlib_651_groupby_oftype, groupby_key_property_correct) {
         "return groups[0].Key; ")), 5);
 }
 
+// #752 — a BARE GroupBy(...) (no .ToArray()) must compose with the generic lazy
+// operators and for-in, not only the special-cased .ToArray() path. Before the
+// fix, GroupBy lowered to garbage for every consumer except ToArray (Count → 0
+// /garbage, Any → false, for-in → "not yet implemented"). lowerToLazyEnumerator
+// now materializes GroupBy into a lazy ARRAY source over its IGrouping elements.
+BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_count_composes) {
+    // {1,2,3,4} grouped by mod 2 → 2 groups (keys 1, 0).
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "return a.GroupBy((x: int) => x mod 2).Count(); ")), 2);
+}
+BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_any_composes) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(1); a.Add(2); "
+        "if a.GroupBy((x: int) => x mod 2).Any() then return 1; else return 0; end; ")),
+        1);
+}
+BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_any_empty_is_false) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "if a.GroupBy((x: int) => x mod 2).Any() then return 1; else return 0; end; ")),
+        0);
+}
+BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_for_in_sums_group_counts) {
+    // {1..6} grouped by mod 3 → 3 groups, each with 2 elements → sum of counts 6.
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); a.Add(6); "
+        "var total := 0; "
+        "for var g in a.GroupBy((x: int) => x mod 3) do total := total + g.Count(); end; "
+        "return total; ")), 6);
+}
+BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_for_in_keys_correct) {
+    // {1..6} grouped by mod 3 → keys {1,2,0} → sum 3 (proves Key per group is right
+    // when iterated through the lazy enumerator, not just the .ToArray() path).
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); a.Add(6); "
+        "var keysum := 0; "
+        "for var g in a.GroupBy((x: int) => x mod 3) do keysum := keysum + g.Key; end; "
+        "return keysum; ")), 3);
+}
+
 
 // ===========================================================================
 // #653 — Shared<T>/Weak<T> with nullable receiver and TryUpgrade — §28.13

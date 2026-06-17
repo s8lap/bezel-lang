@@ -5102,6 +5102,16 @@ private:
     llvm::Value* lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                        sema::TypeRef*& elemRef);
 
+    // stdlib §5 (#651/#752): materialize a `GroupBy(keySelector)` call into an
+    // owned `Array<IGrouping<TKey, T>>` (a bz_array_t* of bz_grouping_t*
+    // pointers) via bz_groupby_to_array. `srcCall` is the GroupBy CallExpr
+    // (callee a MemberAccessExpr with member "GroupBy", one argument). Returns
+    // the groups array pointer, or null on failure. Shared by the
+    // `GroupBy(...).ToArray()` interception and by lowerToLazyEnumerator (a bare
+    // `GroupBy(...)` lowers to a lazy enumerator over this array so it composes
+    // with Count/Any/Sum/for-in like any other lazy source).
+    llvm::Value* lowerGroupByMaterialize(const ast::CallExpr& srcCall);
+
     // stdlib §5: build a trampoline LLVM function the runtime can call to
     // invoke a Bezel closure on a type-erased element. `kind`:
     //   0 = predicate  i32(closure, elem_ptr)        (loads elemTy, calls, ext)
