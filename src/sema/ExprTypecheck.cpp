@@ -844,6 +844,16 @@ TypeRef* ExprTC::commonTypeOf(TypeRef* a, TypeRef* b) {
     if (isObject(b)) return b;
     // `from` widens/subtypes into `to` — so `to` is a candidate common type.
     auto convertsInto = [&](TypeRef* from, TypeRef* to) -> bool {
+        // §7 / §20 (#747 R42): nullability is part of the conversion. A
+        // non-nullable `T` widens into `T?`, but a nullable `T?` does NOT
+        // implicitly convert into non-nullable `T` (that would silently drop the
+        // null possibility). Without this guard `commonTypeOf(int, int?)`
+        // returned the NON-nullable `int` (because `convertsInto(int?, int)`
+        // ignored the flag), so a `case` whose untyped `var n` arm binds the
+        // whole `int?` value (§19.5) was mis-typed `int`; codegen then built a
+        // PHI mixing the `{i8,T}` nullable struct with a bare `T` and aborted
+        // the compiler. The correct common type is `int?`.
+        if (from->nullable && !to->nullable) return false;
         if (from->kind != to->kind) return false;
         if (from->kind == TypeRef::Kind::Primitive) {
             if (from->primitive == to->primitive) return true;

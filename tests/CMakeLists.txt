@@ -122,6 +122,7 @@ set(BEZEL_TEST_SOURCES
     sema/private_visibility_test.cpp
     sema/sealed_class_test.cpp
     sema/case_exhaustiveness_test.cpp
+    sema/case_common_type_nullable_747_test.cpp
     sema/multi_base_test.cpp
     sema/abstract_instantiation_test.cpp
     sema/inheritance_cycle_test.cpp
@@ -306,6 +307,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_pattern_constants_615_test.cpp
     codegen/var_destructure_577_test.cpp
     codegen/case_expr_nullable_result_573_test.cpp
+    codegen/case_untyped_binding_nullable_747_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp
     codegen/short_circuit_test.cpp
