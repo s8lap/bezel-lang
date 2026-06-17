@@ -214,3 +214,70 @@ BEZEL_TEST(enum_underlying_740, default_int_enum_unchanged) {
         "  return case d Dir.North => 10, Dir.East => 0, _ => 9 end; "
         "end Main; end C;"), 0);
 }
+
+// §10.2/§10.3 (#740): an enum member value is "a compile-time constant of the
+// underlying type", so an unsuffixed integer literal that exceeds `int` must
+// widen to the enum's `long`/`ulong`/`uint` underlying type — the same target-
+// typing a typed local initializer gets (`var x: long := 5000000000;`, issue
+// #184). Pre-fix, the literal was typed as `int` first and rejected ("does not
+// fit in `int`; add a suffix"), forcing every long-enum member to carry an `L`.
+BEZEL_TEST(enum_underlying_740, long_member_bare_literal_no_suffix) {
+    // per §10.2 — `5000000000` (no `L`) is accepted and round-trips at i64.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum Big: long A := 5000000000, B := 6000000000; end Big; "
+        "class C public static method Main(): int "
+        "  var x: Big := Big.B; "
+        "  return (0 if long(x) = 6000000000L else 1); "
+        "end Main; end C;"), 0);
+}
+
+// §10.2/§10.3 (#740): a `uint` member literal above int.MaxValue, no suffix.
+BEZEL_TEST(enum_underlying_740, uint_member_bare_literal_no_suffix) {
+    // per §10.2 — `4000000000` (> 2^31, no `U`) is accepted under a `: uint` enum.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum UI: uint A := 4000000000; end UI; "
+        "class C public static method Main(): int "
+        "  return (0 if long(UI.A) = 4000000000L else 1); "
+        "end Main; end C;"), 0);
+}
+
+// §10.2/§10.3 (#740): a `ulong` member literal above int.MaxValue, no suffix —
+// exercises the ULong widening hint and round-trips. (A `ulong` value above
+// long.MaxValue — 2^63 — does not round-trip even with an explicit `UL` suffix;
+// that is a separate pre-existing value-materialization bug, filed apart from
+// this literal-widening fix, so this test stays below 2^63.)
+BEZEL_TEST(enum_underlying_740, ulong_member_bare_literal_no_suffix) {
+    // per §10.2 — `5000000000` (> 2^31, < 2^63, no `UL`) accepted under `: ulong`.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum U: ulong A := 5000000000; end U; "
+        "class C public static method Main(): int "
+        "  return (0 if ulong(U.A) = 5000000000UL else 1); "
+        "end Main; end C;"), 0);
+}
+
+// §10.3 (#740): the widening is bounded by the underlying type — an `int`-backed
+// enum (default) still rejects an over-`int` member literal (no widening hint).
+BEZEL_TEST(enum_underlying_740, int_member_over_int_still_rejected) {
+    // per §10.3 — default underlying type is `int`; 5e9 does not fit.
+    auto r = runJit(
+        "module M; "
+        "enum E: int A := 5000000000; end E; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §10.3 (#740): a value beyond the underlying type's own range is still rejected
+// even with the widening hint (a `: long` member exceeding long.MaxValue).
+BEZEL_TEST(enum_underlying_740, long_member_over_long_still_rejected) {
+    // per §10.3 — "all declared values must fit in the underlying type's range".
+    auto r = runJit(
+        "module M; "
+        "enum Big: long A := 99999999999999999999999; end Big; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}

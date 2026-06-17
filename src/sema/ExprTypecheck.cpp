@@ -1434,9 +1434,29 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
         }
         TypeSymbol* save = currentType_;
         currentType_ = tsym;
+        // §10.2/§10.3 (#740): an enum member value is a "compile-time constant
+        // of the underlying type", so an unsuffixed integer literal that
+        // exceeds `int` must widen to the enum's underlying type (long/ulong/
+        // uint) — exactly as a typed local initializer does (issue #184) —
+        // rather than being rejected for want of an `L`/`U` suffix. The smaller
+        // underlying types (byte/short/…) already fit in `int`, so they need no
+        // hint; their range is checked separately.
+        PrimitiveType savedEnumHint = currentLiteralWideningHint_;
+        if (tsym && tsym->enumUnderlyingType &&
+            tsym->enumUnderlyingType->kind == TypeRef::Kind::Primitive) {
+            using P = PrimitiveType;
+            switch (tsym->enumUnderlyingType->primitive) {
+                case P::Long: case P::ULong: case P::UInt:
+                    currentLiteralWideningHint_ =
+                        tsym->enumUnderlyingType->primitive;
+                    break;
+                default: break;
+            }
+        }
         for (const auto& ec : td->enumConstants) {
             if (ec.value) visitExpr(*ec.value);
         }
+        currentLiteralWideningHint_ = savedEnumHint;
         for (const auto& m : td->members) {
             if (m) visitMember(*m);
         }
