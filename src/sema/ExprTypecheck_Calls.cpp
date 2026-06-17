@@ -3726,8 +3726,21 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     // resolves `T` to the concrete arg. Mirrors the codegen base-substitution in
     // LlvmBackend_Layout.cpp:738-765. A single inheritance level (the reported
     // case) is handled; deeper args-through-args chains can extend this later.
-    if (recvTy && recvTy->declaration && recvTy->declaration != parent) {
-        TypeSymbol* derived = recvTy->declaration;
+    // #747 R42: a `this`/`base` keyword receiver carries no exprType, so recvTy
+    // is null and the local/parameter fallbacks above did not match. An INHERITED
+    // generic-base method called via `this`/`base` (e.g. `this.GetVal()` /
+    // `base.GetVal()` on `Derived: Base<int>` where GetVal(): T comes from Base)
+    // must still substitute the base's type params. Seed the base-chain walk from
+    // the ENCLOSING type (currentType_) in that case; otherwise from the derived
+    // receiver's declaration (the #722 path).
+    TypeSymbol* derived = (recvTy && recvTy->declaration) ? recvTy->declaration
+                                                          : nullptr;
+    if (!derived) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target))
+            if ((id->name == "this" || id->name == "base") && currentType_)
+                derived = currentType_;
+    }
+    if (derived && derived != parent) {
         for (std::size_t bi = 0; bi < derived->baseTypes.size(); ++bi) {
             if (derived->baseTypes[bi] == parent &&
                 bi < derived->baseTypeRefs.size() &&

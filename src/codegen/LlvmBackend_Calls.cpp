@@ -8915,6 +8915,36 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     genericSubst_ = std::move(ancSubst);
                     genericSubstSemaTy_ = std::move(ancSema);
                 }
+            } else if (!recvTy && !ms->parent->genericParams.empty()) {
+                // §12 / §14 (#747 R42): an INHERITED method declared on a generic
+                // BASE, called via a `this`/`base` KEYWORD receiver. `this`/`base`
+                // carry no exprType (recvTy null), so neither branch above fired
+                // and the inherited body ran as the T→i32 template (IR_FAIL on a
+                // ptr/struct return, silent wrong value). Recover the enclosing
+                // class (indexReceiverDecl's reverse-lookup of currentFn_) and bind
+                // the base's generic params from the derived→base<…> chain, exactly
+                // as the #585 local-receiver branch above.
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recvExpr)) {
+                    if (id->name == "this" || id->name == "base") {
+                        const sema::TypeSymbol* enclosingCls =
+                            indexReceiverDecl(recvExpr);
+                        if (enclosingCls && enclosingCls != ms->parent) {
+                            sema::TypeRef synth;
+                            synth.kind = sema::TypeRef::Kind::Named;
+                            synth.declaration =
+                                const_cast<sema::TypeSymbol*>(enclosingCls);
+                            std::unordered_map<std::string_view, llvm::Type*>
+                                ancSubst;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*> ancSema;
+                            if (computeAncestorGenericSubst(&synth, ms->parent,
+                                                            ancSubst, ancSema)) {
+                                genericSubst_ = std::move(ancSubst);
+                                genericSubstSemaTy_ = std::move(ancSema);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
