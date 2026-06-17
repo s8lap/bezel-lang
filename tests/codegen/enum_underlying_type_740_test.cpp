@@ -244,10 +244,8 @@ BEZEL_TEST(enum_underlying_740, uint_member_bare_literal_no_suffix) {
 }
 
 // §10.2/§10.3 (#740): a `ulong` member literal above int.MaxValue, no suffix —
-// exercises the ULong widening hint and round-trips. (A `ulong` value above
-// long.MaxValue — 2^63 — does not round-trip even with an explicit `UL` suffix;
-// that is a separate pre-existing value-materialization bug, filed apart from
-// this literal-widening fix, so this test stays below 2^63.)
+// exercises the ULong widening hint and round-trips. (The high `ulong` range,
+// ≥ 2^63, is covered by the #749 tests below.)
 BEZEL_TEST(enum_underlying_740, ulong_member_bare_literal_no_suffix) {
     // per §10.2 — `5000000000` (> 2^31, < 2^63, no `UL`) accepted under `: ulong`.
     BEZEL_EXPECT_EQ(run(
@@ -280,4 +278,46 @@ BEZEL_TEST(enum_underlying_740, long_member_over_long_still_rejected) {
         "class C public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §10.2/§10.3 (#749): a `ulong` member value in [2^63, 2^64) round-trips. The
+// member-value fold (sema::foldIntConst) parsed literals with signed `stoll`,
+// which threw for any value above long.MaxValue (2^63); the enum value then
+// silently fell back to the auto-increment running counter (0 for the first
+// member). The fold now parses the high half via `stoull` and preserves the
+// bit pattern, which the i64 materialization reads back as the right unsigned
+// value. Plain `ulong` locals were always fine — the defect was enum-specific.
+BEZEL_TEST(enum_underlying_749, ulong_member_above_long_max_round_trips) {
+    // per §10.2 — 1.8e19 (> 2^63, < 2^64) survives, was 0.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum U: ulong A := 18000000000000000000UL; end U; "
+        "class C public static method Main(): int "
+        "  return (0 if ulong(U.A) = 18000000000000000000UL else 1); "
+        "end Main; end C;"), 0);
+}
+
+// §10.2/§10.3 (#749): the exact 2^63 boundary (the first value `stoll` rejects)
+// round-trips, both with and without an explicit `UL` suffix.
+BEZEL_TEST(enum_underlying_749, ulong_member_at_2p63_round_trips) {
+    // per §10.2 — 9223372036854775808 == 2^63.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum U: ulong A := 9223372036854775808, B := 9223372036854775808UL; end U; "
+        "class C public static method Main(): int "
+        "  if ulong(U.A) <> 9223372036854775808UL then return 1; end; "
+        "  return (0 if ulong(U.B) = 9223372036854775808UL else 2); "
+        "end Main; end C;"), 0);
+}
+
+// §10.2 (#749): auto-increment continues correctly from a >2^63 explicit value
+// (the running counter advances on the preserved bit pattern: B == A + 1).
+BEZEL_TEST(enum_underlying_749, ulong_auto_increment_above_2p63) {
+    // per §10.2 — B := A + 1 where A == 2^63.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum U: ulong A := 9223372036854775808UL, B; end U; "
+        "class C public static method Main(): int "
+        "  return (0 if ulong(U.B) = 9223372036854775809UL else 1); "
+        "end Main; end C;"), 0);
 }

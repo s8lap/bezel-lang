@@ -1,5 +1,6 @@
 #include "sema/ConstFold.hpp"
 
+#include <stdexcept>
 #include <string>
 
 namespace bezel::sema {
@@ -13,10 +14,24 @@ std::optional<long long> foldIntConst(
 
     // Integer literal — the leaf case.
     if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
+        const std::string text(il->text);
         try {
-            return std::stoll(std::string(il->text));
+            return std::stoll(text);
+        } catch (const std::out_of_range&) {
+            // §10 (#749): a `ulong` constant in [2^63, 2^64) overflows signed
+            // `long long` but fits `unsigned long long`. Preserve its bit
+            // pattern as the (negative) signed value — the i64 materialization
+            // (LlvmBackend::enumConstant casts back through uint64_t) then reads
+            // the correct unsigned value instead of falling back to 0. A leaf
+            // literal is always non-negative (a leading `-` is a UnaryExpr),
+            // so `stoull` never sees a sign and never silently wraps.
+            try {
+                return static_cast<long long>(std::stoull(text));
+            } catch (...) {
+                return std::nullopt;  // genuinely beyond the 64-bit range
+            }
         } catch (...) {
-            return std::nullopt;  // out of `long long` range
+            return std::nullopt;  // not a valid integer literal
         }
     }
 
