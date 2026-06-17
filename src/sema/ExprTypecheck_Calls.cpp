@@ -496,11 +496,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 };
                 auto argNameOf = [&](const TypeRef* a) -> std::string {
-                    if (a && a->declaration) return std::string(a->declaration->name);
-                    if (a && a->astNode && a->astNode->name &&
-                        !a->astNode->name->parts.empty())
-                        return std::string(a->astNode->name->parts.back());
-                    return "the type argument";
+                    std::string base;
+                    if (a && a->declaration) base = std::string(a->declaration->name);
+                    else if (a && a->astNode && a->astNode->name &&
+                             !a->astNode->name->parts.empty())
+                        base = std::string(a->astNode->name->parts.back());
+                    else return "the type argument";
+                    // §7.1 (#741/f13): a nullable type argument displays with its
+                    // `?` so the diagnostic names the actual offending type
+                    // (`int?` does not satisfy `value`, not `int`).
+                    if (a->nullable) base += "?";
+                    return base;
                 };
                 // §14.2 (#729 / #746 R41-C): enforce a generic METHOD's
                 // `where T: …` constraints at the CALL SITE. #729 covered only

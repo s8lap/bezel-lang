@@ -138,3 +138,23 @@ BEZEL_TEST(method_constraint_callsite_746, single_constraint_ok) {
         "class C public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_FALSE(hasContradictionError(r));
 }
+
+// §7.1 / §14.2 (#741 f13): a nullable type argument that violates a `value`
+// constraint must be NAMED with its `?` in the diagnostic. The constraint was
+// always correctly enforced; only the displayed name was wrong (`int` for the
+// `int?` argument), because argNameOf dropped the nullable flag.
+BEZEL_TEST(method_constraint_callsite_746, nullable_arg_name_shows_question_mark) {
+    auto r = parseSemaAll(
+        "module M; class F "
+        "  public static method ValueOnly<T>(x: T): T where T: value "
+        "    return x; end ValueOnly; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  var v: int? := 5; var r := F.ValueOnly<int?>(v!); return r!; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`int?`") != std::string::npos) named = true;
+    BEZEL_EXPECT_TRUE(named);
+}
