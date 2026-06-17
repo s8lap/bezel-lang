@@ -4468,8 +4468,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             !declTR->astNode->name->parts.empty() &&
             declTR->astNode->name->parts[0] == "IEnumerable") {
             const sema::TypeRef* initTR = ctx_.exprType(*init);
-            if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
-                initTR->declaration) {
+            // fix #747 R43 / §29.2: an Array<T> initializer assigned to an
+            // IEnumerable<T> local must ALSO be wrapped in a vtable-backed
+            // enumerator — only the user-class case was handled here, so
+            // `var seq: IEnumerable<int> := someArray; for var x in seq do`
+            // left `seq` holding the raw bz_array_t* and the for-loop's
+            // IEnumerable vtable dispatch (lowerIEnumerableBuiltinFor) read the
+            // array layout as a vtable → SIGSEGV. Mirrors the call-site wrapping
+            // in buildOrderedArgs. Richer interfaces (IList/IReadOnlyList) keep
+            // the array-backed protocol and are not wrapped.
+            bool initIsArray = initTR &&
+                initTR->kind == sema::TypeRef::Kind::Named &&
+                initTR->astNode && initTR->astNode->name &&
+                !initTR->astNode->name->parts.empty() &&
+                initTR->astNode->name->parts[0] == "Array";
+            if (initIsArray) {
+                v = wrapArrayAsIEnumerable(v, declTR);
+            } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
+                       initTR->declaration) {
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR);
             }
         }

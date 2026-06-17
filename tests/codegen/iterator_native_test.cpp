@@ -130,6 +130,60 @@ BEZEL_TEST(iter_native_b1, string_array_as_ienumerable) {
         "  end Main; end C;"), 3);
 }
 
+// fix #747 R43 / §29.2: an Array<T> assigned to an IEnumerable<T> LOCAL must be
+// wrapped in a vtable-backed enumerator, exactly as an Array<T> argument passed
+// to an IEnumerable<T> PARAMETER is (iter_native_b1 above). Previously only the
+// parameter and the user-class-local cases were wrapped, so iterating an
+// `IEnumerable<T>` local backed by an array dereferenced the bz_array_t layout
+// as a vtable → SIGSEGV. The richer interfaces (IList/IReadOnlyList) keep the
+// array-backed protocol and are not wrapped.
+BEZEL_TEST(iter_native_b1, array_in_ienumerable_local) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); "
+        "  var seq: IEnumerable<int> := a; "
+        "  var sum := 0; for var x in seq do sum := sum + x; end; "
+        "  return sum; "  // 30
+        "end Main; end C;"), 30);
+}
+
+// String element type through an IEnumerable<string> local.
+BEZEL_TEST(iter_native_b1, string_array_in_ienumerable_local) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); "
+        "  a.Add(\"ab\"); a.Add(\"cde\"); "
+        "  var seq: IEnumerable<string> := a; "
+        "  var total := 0; for var s in seq do total := total + s.Length; end; "
+        "  return total; "  // 2 + 3 = 5
+        "end Main; end C;"), 5);
+}
+
+// An empty array through an IEnumerable<int> local iterates zero times.
+BEZEL_TEST(iter_native_b1, empty_array_in_ienumerable_local) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  var seq: IEnumerable<int> := a; "
+        "  var sum := 0; for var x in seq do sum := sum + x; end; "
+        "  return sum + 7; "  // 7
+        "end Main; end C;"), 7);
+}
+
+// CONTROL §29.2: an IList<int> local keeps the array-backed protocol (it is
+// NOT wrapped) and still iterates correctly — the fix must not change it.
+BEZEL_TEST(iter_native_b1, ilist_local_unwrapped_control) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); "
+        "  var seq: IList<int> := a; "
+        "  var sum := 0; for var x in seq do sum := sum + x; end; "
+        "  return sum; "  // 30
+        "end Main; end C;"), 30);
+}
+
 // ---------------------------------------------------------------------------
 // §29.3 Part C: yield return / iterator methods (state-machine codegen).
 // ---------------------------------------------------------------------------
