@@ -322,6 +322,20 @@ BEZEL_TEST(enum_underlying_749, ulong_auto_increment_above_2p63) {
         "end Main; end C;"), 0);
 }
 
+// §10.2 (#749 codegen counterpart): a `: long` enum member holding long.MinValue
+// round-trips and compares equal to the long.MinValue literal. The enum fold
+// (foldIntConst, stoull) was already correct, but the literal lowered through
+// strtoll-saturation to INT64_MIN+1 — so `long(L.N) = -9223372036854775808L`
+// was false even though the enum value's bits were right. Both sides now agree.
+BEZEL_TEST(enum_underlying_749, long_min_value_enum_member_round_trips) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum L: long N := -9223372036854775808L; end L; "
+        "class C public static method Main(): int "
+        "  return (0 if long(L.N) = -9223372036854775808L else 1); "
+        "end Main; end C;"), 0);
+}
+
 // §5 (#749 follow-up): an explicitly-suffixed literal whose magnitude overflows
 // 64 bits is unrepresentable in any integer type and must be rejected. The
 // unsuffixed path always did (via the `int` branch); the suffixed path did not,

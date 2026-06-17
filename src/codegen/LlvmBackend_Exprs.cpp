@@ -4798,6 +4798,33 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     if (un.op == "await")
         return lowerAwait(un);
 
+    // §6.1 / §4.2: a negative integer LITERAL (`-123`, `-9223372036854775808L`)
+    // is a single compile-time constant, not a runtime negation of a positive
+    // one. Fold it directly so (a) it bypasses the checked-negate overflow trap
+    // — `-9223372036854775808L` is long.MinValue, not an overflow of +2^63 —
+    // and (b) the magnitude 2^63 (not a representable positive long) never has
+    // to exist as a runtime value. This mirrors the compile-time fold the
+    // enum/const path already performs via sema::foldIntConst. Only a plain
+    // int literal operand is folded; `-x` on a variable still runs the checked
+    // negate (and still traps on int.MinValue per §6.1).
+    if (un.op == "-") {
+        if (auto* lit =
+                dynamic_cast<const ast::IntLiteralExpr*>(un.operand.get())) {
+            llvm::Type* ty = i32();
+            const sema::TypeRef* rt = ctx_.exprType(un);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Primitive)
+                rt = ctx_.exprType(*un.operand);
+            if (rt && rt->kind == sema::TypeRef::Kind::Primitive)
+                ty = lowerPrimitive(rt->primitive);
+            std::uint64_t mag =
+                static_cast<std::uint64_t>(parseIntLiteral(lit->text));
+            // Two's-complement negation in unsigned arithmetic (well-defined,
+            // wraps for the 2^63 / 2^31 boundary instead of overflowing).
+            return llvm::ConstantInt::get(
+                ty, static_cast<std::uint64_t>(0) - mag, /*isSigned=*/true);
+        }
+    }
+
     llvm::Value* v = lowerExpr(*un.operand);
     if (!v) return nullptr;
     const auto& op = un.op;

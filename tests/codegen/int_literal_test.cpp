@@ -70,3 +70,31 @@ BEZEL_TEST(codegen_cg1, int_min_value) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
+
+// §4.2 (#749 codegen counterpart): the `long.MinValue` literal
+// `-9223372036854775808L` must carry the exact bit pattern 0x8000000000000000.
+// parseIntLiteral parsed non-`U` literals with signed strtoll, which SATURATES
+// at long.MaxValue for the magnitude 2^63 — so the literal lowered to
+// long.MaxValue and `-` made it -(2^63-1) == INT64_MIN+1 (off by one). The
+// magnitude is now parsed with strtoull and the negation is constant-folded.
+BEZEL_TEST(codegen_cg1, long_min_value_literal_exact_bits) {
+    // ulong reinterpretation of long.MinValue is exactly 2^63.
+    auto r = runJit(
+        "module M; class C public static method Main(): int "
+        "  var m := -9223372036854775808L; "
+        "  return (0 if ulong(m) = 9223372036854775808UL else 1); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §4.2: long.MinValue is the smallest long — strictly less than long.MinValue+1
+// (a fold to INT64_MIN+1 would have made this comparison false).
+BEZEL_TEST(codegen_cg1, long_min_value_literal_is_smallest) {
+    auto r = runJit(
+        "module M; class C public static method Main(): int "
+        "  return (0 if -9223372036854775808L < -9223372036854775807L else 1); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

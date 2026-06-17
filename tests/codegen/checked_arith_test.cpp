@@ -91,3 +91,14 @@ BEZEL_TEST(codegen_cg22, overflow_propagates_uncaught_to_outer) {
         "  catch DivideByZeroException => return 1; end; "
         "catch OverflowException => return 9; end;"), 9);
 }
+
+// §6.1: negating a runtime VARIABLE holding long.MinValue overflows (there is
+// no +2^63), so the checked negate raises OverflowException — even though the
+// literal `-9223372036854775808L` itself is a constant (folded, no trap). This
+// pins that the literal-negation fold did not weaken the checked-negate path.
+BEZEL_TEST(codegen_cg22, negate_long_min_variable_overflows) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -9223372036854775808L; "      // long.MinValue (constant, no trap)
+        "try var y := -x; return int(y); "       // -x at runtime overflows
+        "catch OverflowException => return 8; end;"), 8);
+}

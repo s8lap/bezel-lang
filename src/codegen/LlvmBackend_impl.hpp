@@ -70,21 +70,21 @@ inline std::int64_t parseIntLiteral(std::string_view text) {
         digits.push_back(c);
     }
     if (digits.empty()) return 0;
-    // §4.2 / A.1: the trailing IntSuffix (`U`, `UL`, `LU`, case-insensitive)
-    // marks an unsigned literal. A `ulong` value above long.MaxValue (e.g.
-    // 18000000000000000000uL) overflows signed strtoll, which saturates to
-    // long.MaxValue and loses the value. Parse such literals with the unsigned
-    // strtoull so the full 64-bit value is preserved; the caller stores the
-    // returned bit pattern into an i64 LLVM constant (issue #421).
-    bool isUnsigned = false;
-    for (std::size_t s = i; s < text.size(); ++s) {
-        char c = text[s];
-        if (c == 'u' || c == 'U') { isUnsigned = true; break; }
-    }
-    if (isUnsigned)
-        return static_cast<std::int64_t>(
-            std::strtoull(digits.c_str(), nullptr, base));
-    return static_cast<std::int64_t>(std::strtoll(digits.c_str(), nullptr, base));
+    // §4.2 / A.1: parse the magnitude with the UNSIGNED strtoull regardless of
+    // the trailing IntSuffix. The caller always stores the result as a 64-bit
+    // pattern (int64 -> uint64 -> i64 LLVM constant), and `digits` is the bare
+    // magnitude — the sign of a negative literal is a separate UnaryExpr — so
+    // the full [0, 2^64) range is meaningful. Signed strtoll SATURATES at
+    // long.MaxValue (and sets ERANGE) for any magnitude in [2^63, 2^64):
+    //   - a `ulong` value above long.MaxValue (e.g. 18000000000000000000UL)
+    //     lost its value (issue #421 — already handled for the `U` case), and
+    //   - the 2^63 magnitude of `-9223372036854775808L` (long.MinValue)
+    //     saturated to 2^63-1, so the literal lowered to INT64_MIN+1 instead of
+    //     INT64_MIN (the codegen counterpart of the #749 fold bug).
+    // strtoull preserves the bit pattern across the whole range; the
+    // out-of-range guard lives in sema (the literal type-check, §5).
+    return static_cast<std::int64_t>(
+        std::strtoull(digits.c_str(), nullptr, base));
 }
 
 // CG32 / #527: decode a char literal lexeme (`'A'`, `'\n'`, `'A'`, …)
