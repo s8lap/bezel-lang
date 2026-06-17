@@ -6846,7 +6846,50 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         return nullptr;
 
     auto* recvTy = ctx_.exprType(*ma->target);
-    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+    if (!recvTy) return nullptr;
+    // fix #747 R43 / stdlib §9.1–§9.5: a PRIMITIVE value type (int/long/bool/
+    // char/double/…) implements IEquatable<T> with an auto-generated
+    // `Equals(other): bool` and a `GetHashCode(): int`. Codegen had no handler,
+    // so `a.Equals(b)` fell through and returned the receiver's raw value — the
+    // result was always-false when branched and produced a `br i32` (non-i1)
+    // IR-verification failure when stored to a `var`. Emit the value comparison /
+    // hash directly. ToString on a primitive is handled by the dedicated
+    // primitive-ToString path, so it is left to fall through.
+    if (recvTy->kind == sema::TypeRef::Kind::Primitive &&
+        recvTy->primitive != sema::PrimitiveType::String &&
+        recvTy->primitive != sema::PrimitiveType::Object &&
+        (isEquals || isGetHashCode)) {
+        llvm::Value* recv = lowerExpr(*ma->target);
+        if (!recv) return nullptr;
+        if (isGetHashCode) {
+            // §8.3-style: the value itself as an i32 hash (bit-pattern for FP).
+            if (recv->getType()->isDoubleTy())
+                recv = builder_.CreateBitCast(recv, i64());
+            else if (recv->getType()->isFloatingPointTy())
+                recv = builder_.CreateBitCast(recv, i32());
+            if (recv->getType()->isIntegerTy())
+                return builder_.CreateZExtOrTrunc(recv, i32(), "prim.hash");
+            return nullptr;
+        }
+        // isEquals: value equality, returning i1 (Bool).
+        if (!call.args[0].value) return nullptr;
+        llvm::Value* other = lowerExpr(*call.args[0].value);
+        if (!other) return nullptr;
+        if (recv->getType()->isFloatingPointTy()) {
+            if (other->getType() != recv->getType())
+                other = recv->getType()->isDoubleTy()
+                    ? builder_.CreateFPExt(other, recv->getType())
+                    : builder_.CreateFPTrunc(other, recv->getType());
+            return builder_.CreateFCmpOEQ(recv, other, "prim.eq");
+        }
+        if (recv->getType()->isIntegerTy()) {
+            if (other->getType() != recv->getType())
+                other = builder_.CreateSExtOrTrunc(other, recv->getType());
+            return builder_.CreateICmpEQ(recv, other, "prim.eq");
+        }
+        return nullptr;
+    }
+    if (recvTy->kind != sema::TypeRef::Kind::Named ||
         !recvTy->declaration)
         return nullptr;
     const sema::TypeSymbol* ts = recvTy->declaration;

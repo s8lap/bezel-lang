@@ -178,3 +178,60 @@ BEZEL_TEST(codegen_586, string_compareto_regression_equal) {
 }
 
 }  // namespace
+
+// fix #747 R43 / stdlib §9.1–§9.5: primitive types implement IEquatable<T> with
+// an auto-generated Equals(other): bool and GetHashCode(): int. The bug:
+// `a.Equals(b)` on a primitive receiver fell through codegen and returned the
+// receiver's raw value — always-false when branched, and a `br i32` (non-i1)
+// IR-verification failure when stored to a `var`.
+
+// int.Equals — equal returns true, unequal returns false.
+BEZEL_TEST(codegen_586, int_equals_true_and_false_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: int := 5; var b: int := 5; var c: int := 7; "
+        "  var ok := 0; "
+        "  if a.Equals(b) then ok := ok + 1; end; "
+        "  if not a.Equals(c) then ok := ok + 2; end; "
+        "  return ok; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// Storing the result to a `var` and branching on it must compile (i1 result,
+// not i32) and behave correctly — the IR_FAIL repro.
+BEZEL_TEST(codegen_586, int_equals_stored_to_var_branches_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: int := 5; var b: int := 7; "
+        "  var r := a.Equals(b); "
+        "  if r then return 1; else return 0; end; "  // 0 — a != b
+        "end Main; end C;"), 0);
+}
+
+// bool / char / long / double all compare by value through Equals.
+BEZEL_TEST(codegen_586, equals_across_primitive_types_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var ok := 0; "
+        "  var b1: bool := true; var b2: bool := true; "
+        "  if b1.Equals(b2) then ok := ok + 1; end; "
+        "  var c1: char := 'x'; var c2: char := 'y'; "
+        "  if not c1.Equals(c2) then ok := ok + 2; end; "
+        "  var l1: long := 100L; var l2: long := 100L; "
+        "  if l1.Equals(l2) then ok := ok + 4; end; "
+        "  var d1: double := 3.5; var d2: double := 3.5; "
+        "  if d1.Equals(d2) then ok := ok + 8; end; "
+        "  var d3: double := 3.5; var d4: double := 9.0; "
+        "  if not d3.Equals(d4) then ok := ok + 16; end; "
+        "  return ok; "  // 31
+        "end Main; end C;"), 31);
+}
+
+// GetHashCode on an int is the value itself (a valid IEquatable hash).
+BEZEL_TEST(codegen_586, int_gethashcode_is_value_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: int := 42; "
+        "  return 0 if a.GetHashCode() = 42 else 1; "  // 0
+        "end Main; end C;"), 0);
+}
