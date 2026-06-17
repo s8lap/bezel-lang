@@ -407,32 +407,39 @@ BEZEL_TEST(dict_insertion_order_622, indexer_read_write_unaffected) {
 // OwnedDictionary: basic ops regression guard (§4.9 — order not promised)
 // ---------------------------------------------------------------------------
 
-// #622 regression guard / stdlib §4.9: OwnedDictionary<string,string> basic
-// ops (Set/Remove/Count) still work after the runtime changes. The order
-// tracking array is maintained but §4.9 makes no iteration-order promise.
-// Insert 3 keys, remove 1, Count == 2.
+// #622 regression guard / stdlib §4.9: OwnedDictionary<string, V> basic ops
+// (Set/Remove/Count) still work after the runtime changes. The order tracking
+// array is maintained but §4.9 makes no iteration-order promise. Insert 3 keys,
+// remove 1, Count == 2. (The VALUE is a class — per §14.4 an owning dictionary
+// owns its values and rejects a runtime-managed `string` value; the key is
+// value-like and may be `string`.)
 BEZEL_TEST(dict_insertion_order_622, owned_dict_basic_ops_regression) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, string>(); "
-        "  od.Set(\"k1\", \"hello\"); "
-        "  od.Set(\"k2\", \"world\"); "
-        "  od.Set(\"k3\", \"bezel\"); "
+        "module M; class V public n: int := 0; end V; "
+        "class C public static method Main(): int "
+        "  using var od := new OwnedDictionary<string, V>(); "
+        "  od.Set(\"k1\", new V()); "
+        "  od.Set(\"k2\", new V()); "
+        "  od.Set(\"k3\", new V()); "
         "  od.Remove(\"k2\"); "
         "  return od.Count; "
         "end Main; end C;"), 2);
 }
 
 // #622 regression guard / stdlib §4.9: OwnedDictionary.Clear() disposes values
-// and does not leak. After Clear(), Count == 0; a new value can be added.
+// and does not leak. After Clear(), Count == 0; a new value can be added. (The
+// VALUE is a class with a real disposal obligation — §14.4 requires a class
+// value for an owning dictionary, which also makes the "disposes values"
+// guarantee meaningful.)
 BEZEL_TEST(dict_insertion_order_622, owned_dict_clear_then_reuse) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, string>(); "
-        "  od.Set(\"a\", \"hello\"); "
-        "  od.Set(\"b\", \"world\"); "
+        "module M; class V public n: int := 0; end V; "
+        "class C public static method Main(): int "
+        "  using var od := new OwnedDictionary<string, V>(); "
+        "  od.Set(\"a\", new V()); "
+        "  od.Set(\"b\", new V()); "
         "  od.Clear(); "
-        "  od.Set(\"c\", \"new\"); "
+        "  od.Set(\"c\", new V()); "
         "  return od.Count; "
         "end Main; end C;"), 1);
 }

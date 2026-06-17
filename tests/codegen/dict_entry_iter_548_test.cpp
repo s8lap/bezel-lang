@@ -221,9 +221,12 @@ BEZEL_TEST(dict_entry_iter_548, spec_21_verbatim_entry_accessible) {
 // the §4.9 diagnostic.  Verify: the program does NOT produce a meaningful
 // result (compile error → r.ran == false, or r.exitCode != 42).
 BEZEL_TEST(dict_entry_iter_548, owned_dict_still_rejected) {
+    // Value is a class (§14.4: an owning dictionary rejects a `string` value),
+    // so the ONLY rejection here is the §4.9 for-in one this test targets.
     auto r = runJit(
-        "module M; class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, string>(); "
+        "module M; class V public n: int := 0; end V; "
+        "class C public static method Main(): int "
+        "  using var od := new OwnedDictionary<string, V>(); "
         "  var n := 0; "
         "  for var e in od do n := n + 1; end; "
         "  return n; "

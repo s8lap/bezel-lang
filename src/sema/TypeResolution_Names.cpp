@@ -687,6 +687,51 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     if (!ga) continue;
                     ref.genericArgs.push_back(resolveType(*ga, scope));
                 }
+                // §14.4 (#761): the standard-library owning collection types are
+                // compiler-enforced to reject the runtime-managed reference
+                // element types (`string`, function values). Those are runtime-
+                // managed (§28.9) and carry no disposal obligation, so owning
+                // them is degenerate; the `where T: class` constraint in their
+                // declarations is the imprecise admission (§14.2 admits `string`
+                // and function types under `class`) that §14.4 narrows. Per §3.6
+                // this is a per-instantiation check AT THE INSTANTIATION SITE, so
+                // it fires for every spelling — a typed local / field / parameter
+                // / return as well as `new` — not only `new`. Interfaces and
+                // class types (including nullable, whose underlying type is what
+                // matters) remain admitted; only `string` / function elements are
+                // rejected. The owned slot is the element `T` for the list / set
+                // / stack / queue families and the VALUE `V` for
+                // `OwnedDictionary<K, V>` (its keys are value-like, §28.11).
+                std::size_t ownedSlot = static_cast<std::size_t>(-1);
+                if (first == "OwnedArray" || first == "OwnedSet" ||
+                    first == "OwnedStack" || first == "OwnedQueue" ||
+                    first == "OwnedLinkedList")
+                    ownedSlot = 0;
+                else if (first == "OwnedDictionary")
+                    ownedSlot = 1;
+                if (ownedSlot != static_cast<std::size_t>(-1) &&
+                    ownedSlot < ref.genericArgs.size()) {
+                    const TypeRef* el = ref.genericArgs[ownedSlot];
+                    const char* badKind = nullptr;
+                    if (el && el->kind == TypeRef::Kind::Primitive &&
+                        el->primitive == PrimitiveType::String)
+                        badKind = "`string`";
+                    else if (el && el->kind == TypeRef::Kind::Function)
+                        badKind = "a function value";
+                    if (badKind) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`") + std::string(first) +
+                            "` may not be instantiated with " + badKind +
+                            " \xE2\x80\x94 owning collection types reject "
+                            "runtime-managed reference element types (`string`, "
+                            "function values); they have no disposal obligation, "
+                            "so owning them is degenerate (\xC2\xA7""14.4 / "
+                            "\xC2\xA7""28.9). Use the borrowing collection `" +
+                            std::string(first.substr(5)) + "<\xE2\x80\xA6>` "
+                            "instead.");
+                    }
+                }
                 return;
             }
         }
