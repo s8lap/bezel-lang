@@ -1910,6 +1910,21 @@ bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
     return true;
 }
 
+void Emitter::registerForLoopSpillSlots(
+        const ast::ForStmt& fs,
+        std::initializer_list<llvm::AllocaInst*> slots) {
+    // §29.3 / §30.7 (#747 R42) — see the declaration comment. Only an async
+    // suspend point (Await / AsyncYield) uses the side spill area + the
+    // fixupSuspendDominance pass that consumes asyncHandlerSpillSlots_; a sync
+    // iterator (Yield) has no such mechanism, so it is handled separately.
+    if (!smStateStruct_) return;
+    if (smKind_ != SuspendKind::Await && smKind_ != SuspendKind::AsyncYield)
+        return;
+    if (!containsYield(fs.body) && !containsAwait(fs.body)) return;
+    for (llvm::AllocaInst* s : slots)
+        if (s) asyncHandlerSpillSlots_.push_back(s);
+}
+
 bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     // Handle collection literal `for var x in [e1, e2, ...] do`:
@@ -2041,6 +2056,9 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             builder_.CreateStore(builder_.getInt64(0), idxSlotR);
             auto* varSlotR = entryAlloca(elemTy);
             locals_[&fs] = varSlotR;
+            // #747 R42: spill the index + loop-var into the async frame so they
+            // survive a yield/await suspend in the body (else garbage on resume).
+            registerForLoopSpillSlots(fs, {idxSlotR, varSlotR});
             auto* condBBR = llvm::BasicBlock::Create(llvm_, "rt.cond", currentFn_);
             auto* bodyBBR = llvm::BasicBlock::Create(llvm_, "rt.body", currentFn_);
             auto* incBBR  = llvm::BasicBlock::Create(llvm_, "rt.inc",  currentFn_);
@@ -3211,6 +3229,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         builder_.CreateStore(builder_.getInt64(0), idxSlot);
         auto* varSlot = entryAlloca(elemTy);
         locals_[&fs] = varSlot;
+        registerForLoopSpillSlots(fs, {idxSlot, varSlot});  // #747 R42
         auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
         auto* incBB  = llvm::BasicBlock::Create(llvm_, "ib.inc",  currentFn_);
@@ -3261,6 +3280,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
 
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
+    registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
@@ -3423,6 +3443,7 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
+    registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ien.body", currentFn_);

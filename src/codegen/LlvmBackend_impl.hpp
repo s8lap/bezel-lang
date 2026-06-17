@@ -3522,6 +3522,20 @@ private:
     // §29.3: Detect if a block of statements contains any yield return / yield break.
     static bool containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
+    // §29.3 / §30.7 (#747 R42): a for-loop inside a SUSPENDING async iterator /
+    // async body creates implicit locals (index counter, loop variable,
+    // enumerator) as plain stack allocas whose live range crosses the
+    // yield/await suspend. fixupSuspendDominance only demotes REGISTERS (an
+    // alloca's pointer trivially dominates, so it is skipped), so on a
+    // cross-thread Resume these allocas read fresh-stack garbage → wrong value
+    // (index) / segfault (enumerator). Register them into asyncHandlerSpillSlots_
+    // so promoteDemotedSlotsToFrame heap-spills them into the persistent
+    // state-machine frame. Gated on the loop body actually suspending (else the
+    // cheap stack allocas are correct and promotion would only waste a field).
+    void registerForLoopSpillSlots(
+        const ast::ForStmt& fs,
+        std::initializer_list<llvm::AllocaInst*> slots);
+
     // §29.3: Collect all YieldStmt pointers in order from a statement list.
     static void collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                                std::vector<const ast::YieldStmt*>& out);
