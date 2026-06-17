@@ -89,6 +89,7 @@ set(BEZEL_TEST_SOURCES
     sema/generic_method_constraint_callsite_746_test.cpp
     # --- fix #746 (R41 C): operator-overload group completeness (§25.2) ---
     sema/operator_groups_746_test.cpp
+    sema/string_concat_746_test.cpp
     # --- end #746 ---
     # --- fix #747 (R42): `yield` in a lambda rejected (§29.9) ---
     sema/yield_in_lambda_747_test.cpp

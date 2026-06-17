@@ -1386,6 +1386,30 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         op == "mod" || op == "&" || op == "|" || op == "^" ||
         op == "<<" || op == ">>") {
         TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        // §4.6 (spec ruling): `s + t` concatenates two STRINGS. The compiler does
+        // not implicitly convert other types to `string` — `"x=" + 7` was
+        // silently converted, `"v=" + 1.5` IR-failed (`sitofp ptr`), and
+        // `42 + " h"` returned garbage. Require both operands to be string; reject
+        // a mixed `string + <non-string>` (or reverse) and point at the remedies.
+        if (op == "+") {
+            TypeRef* rt0 = be.right ? ctx_.exprType(*be.right) : nullptr;
+            auto isStr = [](const TypeRef* t) {
+                return t && t->kind == TypeRef::Kind::Primitive &&
+                       t->primitive == PrimitiveType::String;
+            };
+            if (isStr(lt) != isStr(rt0)) {  // exactly one operand is string
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "`+` requires both operands to be `string` — the compiler "
+                    "does not implicitly convert other types to `string`; use "
+                    "interpolation (`$\"...{x}...\"`) or `.ToString()` (§4.6)");
+                auto* sTy = ctx_.makeTypeRef();
+                sTy->kind = TypeRef::Kind::Primitive;
+                sTy->primitive = PrimitiveType::String;
+                ctx_.setExprType(&be, sTy);
+                return;
+            }
+        }
         // §2.5 (stdlib L264–265): TimeSpan + TimeSpan → TimeSpan and
         // TimeSpan - TimeSpan → TimeSpan are compiler-intrinsic operators
         // (TimeSpan is a builtin value type backed by a scalar i64 tick count;
