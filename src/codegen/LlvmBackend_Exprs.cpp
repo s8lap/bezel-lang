@@ -5965,6 +5965,28 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                               : src;
         builder_.CreateStore(srcVal, base);
     }
+    // fix #747 R43 / §22.11 / §28.3: during a CLASS object-initializer block's
+    // setter sequence, the freshly-`new`'d instance is an UNATTACHED OWNED
+    // value. If a setter (or a setter's value expression) throws, §22.11
+    // requires the partially-initialized instance to be disposed by the implicit
+    // try/finally before the exception propagates — exactly as a plain owned
+    // `new T(...)` dropped on an exception path (§28.3). Register an unwindOnly
+    // disposal (dynamic dispatch through the object's vtable) that is active
+    // ONLY across the setter loop: it fires if a setter unwinds, and is removed
+    // once the loop completes (the result is returned and ownership transfers to
+    // the binding/caller, whose own discharge takes over — keeping it would
+    // double-dispose on a LATER throw). Records are value types with no disposal
+    // obligation, so this is the class form only.
+    llvm::AllocaInst* initGuardSlot = nullptr;
+    std::size_t initGuardIdx = static_cast<std::size_t>(-1);
+    if (!isRecord && !disposeStack_.empty()) {
+        initGuardSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(base, initGuardSlot);
+        Disposal g{initGuardSlot, nullptr};
+        g.unwindOnly = true;
+        initGuardIdx = disposeStack_.back().size();
+        disposeStack_.back().push_back(g);
+    }
     std::vector<const sema::Symbol*> storage;
     collectInstanceStorage(t, storage);
     for (const auto& a : we.assigns) {
@@ -6012,6 +6034,18 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
             }
         }
         builder_.CreateStore(v, slot);
+    }
+    // §22.11: the setter sequence completed without throwing — ownership of the
+    // instance transfers to the with-expression's result, so remove the implicit
+    // try/finally guard (the binding/caller now owns the discharge). Guarded so a
+    // value-expression that perturbed the dispose scope cannot erase the wrong
+    // entry: only remove it if our exact unwindOnly guard is still at its index.
+    if (initGuardIdx != static_cast<std::size_t>(-1) && !disposeStack_.empty() &&
+        initGuardIdx < disposeStack_.back().size() &&
+        disposeStack_.back()[initGuardIdx].slot == initGuardSlot &&
+        disposeStack_.back()[initGuardIdx].unwindOnly) {
+        disposeStack_.back().erase(disposeStack_.back().begin() +
+                                   static_cast<std::ptrdiff_t>(initGuardIdx));
     }
     // Record: return the modified copy by value. Class: return the mutated
     // instance pointer.
