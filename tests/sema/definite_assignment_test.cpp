@@ -105,3 +105,54 @@ BEZEL_TEST(sema_da, self_referential_init_reads_undeclared_diagnoses) {
     auto r = parseAndCheckDA(wrap("var x := x + 1; _ := x;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// fix #747 R43 / §22.3: a pre-declared local passed as `out x` is an OUTPUT
+// location — "the variable need not be initialized before the call", and the
+// callee assigns it on every exit path — so it is definitely assigned after the
+// call. The DA pass previously treated every call argument as a read, so a
+// `var v: int; M(out v); _ := v;` drew a false "read of unassigned" both at the
+// argument and at the post-call read.
+BEZEL_TEST(sema_da, out_arg_predeclared_local_is_assigned_spec_22_3) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method GetIt(out v: int): bool v := 42; return true; end GetIt; "
+        "  public static method Main(): int "
+        "    var v: int; "
+        "    var ok := GetIt(out v); "
+        "    return v; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL §22.3: a genuinely unassigned local read (no `out` write) still
+// diagnoses — the out-arg relaxation must not mask a real unassigned read.
+BEZEL_TEST(sema_da, plain_unassigned_read_still_diagnoses_after_out_fix) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var v: int; "
+        "    return v; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: a `ref` argument is read-write — the variable must be assigned
+// BEFORE the call, so an unassigned `ref v` still diagnoses (only `out` is a
+// pure write).
+BEZEL_TEST(sema_da, ref_arg_unassigned_still_diagnoses_spec_22_3) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Inc(ref v: int) v := v + 1; end Inc; "
+        "  public static method Main(): int "
+        "    var v: int; "
+        "    Inc(ref v); "
+        "    return v; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}

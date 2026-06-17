@@ -245,20 +245,14 @@ private:
         if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
             if (ce->callee) visitExpr(*ce->callee);
             for (const auto& a : ce->args) {
-                // `out var x` introduces x as a new local at this call
-                // site — slice DA1 doesn't model out-binding yet, so
-                // we conservatively treat it as a read of the named
-                // identifier (which will pass when the local already
-                // exists in declared_ but not assigned_). Future slice
-                // wires it as an assignment.
-                if (a.value) visitExpr(*a.value);
+                visitCallArg(a);
             }
             return;
         }
         if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
             if (nc->callee) visitExpr(*nc->callee);
             for (const auto& a : nc->args) {
-                if (a.value) visitExpr(*a.value);
+                visitCallArg(a);
             }
             return;
         }
@@ -317,6 +311,31 @@ private:
             return;
         }
         // Literals, This/Base/TypeOf/NameOf/Default — no child to walk.
+    }
+
+    // §22.3 (#747 R43): an `out` argument is an OUTPUT location, not a read —
+    // "the variable need not be initialized before the call", and the callee
+    // assigns it on every exit path, so a bare local passed as `out x` is
+    // DEFINITELY ASSIGNED after the call. Mark it assigned and do not treat it
+    // as a read. (Previously every call argument was visited as a read, so a
+    // pre-declared `var x: int; M(out x)` drew a false "read of unassigned"
+    // both at the argument position and at every post-call read. The inline
+    // `out var x` form was unaffected only because its name is not tracked in
+    // declared_.) A `ref` argument, by contrast, IS a read (the variable must
+    // be assigned before the call) and is visited normally. An `out` target
+    // that is a member/index location (`out obj.f`, `out arr[i]`) still reads
+    // its sub-expressions (the receiver and index), so only a bare identifier
+    // target is treated as a pure write.
+    void visitCallArg(const ast::CallArgument& a) {
+        if (!a.value) return;
+        if (a.modifier.rfind("out", 0) == 0) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                assigned_.insert(id->name);
+                return;  // pure write — not a read
+            }
+        }
+        visitExpr(*a.value);
     }
 
     void checkRead(const ast::IdentifierExpr& id) {
