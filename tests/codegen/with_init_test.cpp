@@ -152,3 +152,76 @@ BEZEL_TEST(codegen_cg34, object_init_success_then_later_throw_disposes_once_747)
         "  end Main; "
         "end C;"), 1);
 }
+
+// fix #747 R43 / §22.11: a class object initializer "assigns through the named
+// properties' setters". A property with a CUSTOM (block) setter must run its
+// setter body — previously the with-block only handled fields + auto-properties
+// (via backing storage), so a custom-setter target was silently dropped and any
+// exception the setter throws was swallowed. All exits are caught.
+
+// The setter body runs and transforms the value (doubles it): with V := 5 → 10.
+BEZEL_TEST(codegen_cg34, object_init_runs_custom_setter_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W "
+        "  private _v: int := 0; "
+        "  public property V: int get => _v; set => do _v := value * 2; end; end; "
+        "end W; "
+        "class C public static method Main(): int "
+        "  using var w := new W() with V := 5 end; "
+        "  return w.V; "  // 10 — the setter ran
+        "end Main; end C;"), 10);
+}
+
+// A setter that throws propagates out of the object initializer (was swallowed).
+BEZEL_TEST(codegen_cg34, object_init_setter_throw_propagates_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W "
+        "  private _v: int := 0; "
+        "  public property V: int get => _v; set => do "
+        "    if value >= 5 then throw new InvalidOperationException(\"big\"); end; "
+        "    _v := value; "
+        "  end; end; "
+        "end W; "
+        "class C public static method Main(): int "
+        "  try "
+        "    using var w := new W() with V := 5 end; "
+        "    return 0; "
+        "  catch InvalidOperationException => return 1; end; "  // 1
+        "end Main; end C;"), 1);
+}
+
+// §22.11 + §28.3: when the setter throws, the instance is also disposed by the
+// implicit try/finally (the [13] guard) before the exception propagates.
+BEZEL_TEST(codegen_cg34, object_init_setter_throw_disposes_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W "
+        "  private _v: int := 0; "
+        "  public static disposed: int := 0; "
+        "  public property V: int get => _v; set => do "
+        "    if value >= 5 then throw new InvalidOperationException(\"big\"); end; "
+        "    _v := value; "
+        "  end; end; "
+        "  destructor W.disposed := W.disposed + 1; end destructor; "
+        "end W; "
+        "class C public static method Main(): int "
+        "  try "
+        "    using var w := new W() with V := 5 end; "
+        "    return 99; "
+        "  catch InvalidOperationException => return W.disposed; end; "  // 1
+        "end Main; end C;"), 1);
+}
+
+// CONTROL: an auto-property target still works (its setter is a plain field
+// store via backing storage; the custom-setter path must not change it).
+BEZEL_TEST(codegen_cg34, object_init_auto_property_unregressed_747) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W public property P: int; end W; "
+        "class C public static method Main(): int "
+        "  using var w := new W() with P := 42 end; "
+        "  return w.P; "  // 42
+        "end Main; end C;"), 42);
+}

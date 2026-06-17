@@ -5987,10 +5987,84 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         initGuardIdx = disposeStack_.back().size();
         disposeStack_.back().push_back(g);
     }
+    // fix #747 R43 / §22.11: a class object initializer "assigns through the
+    // named properties' setters". An auto-property's setter is a plain field
+    // store (its backing field is in `storage` below), but a property with a
+    // CUSTOM (block) setter must RUN that setter's body — a direct field store
+    // would bypass its logic and any exception it throws. Custom-setter
+    // properties are not in `storage` (collectInstanceStorage only records
+    // fields + auto-properties), so the assignment was previously dropped
+    // silently. Resolve a custom-setter property by name on the class chain.
+    auto customSetterPd =
+        [&](std::string_view name) -> const ast::PropertyDecl* {
+        for (const sema::TypeSymbol* cur = t; cur;) {
+            for (const sema::Symbol* mm : cur->members) {
+                auto* ps = dynamic_cast<const sema::PropertySymbol*>(mm);
+                if (!ps || ps->name != name || ps->isIndexer ||
+                    isAutoProperty(ps))
+                    continue;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd || pd->bodyKind != ast::PropertyBodyKind::Block)
+                    return nullptr;
+                for (const auto& acc : pd->accessors)
+                    if (acc.isSet &&
+                        acc.bodyKind != ast::PropertyAccessorBodyKind::Abstract)
+                        return pd;
+                return nullptr;
+            }
+            const sema::TypeSymbol* nextBase = nullptr;
+            for (const sema::TypeSymbol* b : cur->baseTypes)
+                if (b && b->kind == ast::TypeDeclKind::Class) {
+                    nextBase = b;
+                    break;
+                }
+            cur = nextBase;
+        }
+        return nullptr;
+    };
     std::vector<const sema::Symbol*> storage;
     collectInstanceStorage(t, storage);
     for (const auto& a : we.assigns) {
         if (!a.value) continue;
+        // §22.11: a custom-setter property target runs its setter body (with
+        // `this` = the new instance and `value` = the supplied value) — mirrors
+        // lowerPropertySetValue's non-static inlining. If the setter throws, the
+        // unwindOnly guard registered above disposes the instance before the
+        // exception propagates.
+        if (!isRecord) {
+            if (const ast::PropertyDecl* pd = customSetterPd(a.name)) {
+                const ast::PropertyAccessor* setter = nullptr;
+                for (const auto& acc : pd->accessors)
+                    if (acc.isSet && acc.bodyKind !=
+                            ast::PropertyAccessorBodyKind::Abstract) {
+                        setter = &acc;
+                        break;
+                    }
+                llvm::Value* v = lowerExpr(*a.value);
+                if (!v || !setter) continue;
+                llvm::AllocaInst* vslot = entryAlloca(v->getType());
+                builder_.CreateStore(v, vslot);
+                locals_[pd] = vslot;  // `value` param anchored on the PropertyDecl
+                llvm::Value* savedThis = currentThis_;
+                currentThis_ = base;
+                llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
+                auto* accEndBB =
+                    llvm::BasicBlock::Create(llvm_, "with.setter.end", currentFn_);
+                inlinedAccessorEnd_ = accEndBB;
+                bool term = false;
+                if (setter->bodyKind ==
+                        ast::PropertyAccessorBodyKind::Expression &&
+                    setter->exprBody)
+                    lowerExpr(*setter->exprBody);
+                else
+                    term = lowerScopedBlock(setter->stmts);
+                inlinedAccessorEnd_ = savedAccEnd;
+                if (!term) builder_.CreateBr(accEndBB);
+                builder_.SetInsertPoint(accEndBB);
+                currentThis_ = savedThis;
+                continue;
+            }
+        }
         const sema::Symbol* m = nullptr;
         for (const sema::Symbol* s : storage)
             if (s->name == a.name) { m = s; break; }
