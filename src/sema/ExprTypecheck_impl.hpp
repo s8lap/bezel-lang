@@ -413,6 +413,13 @@ private:
 
     void visitMember(const ast::Member& m);
 
+    // §22.12 (#747 R42): true iff `e` is a compile-time-constant expression
+    // admissible as a `const` member initializer — a literal (not an
+    // interpolated string), a unary/binary/conditional expression over
+    // constants, or a reference to another const / enum constant. Must be
+    // called AFTER the initializer is type-checked (it reads exprSymbol).
+    bool isConstInitExpr(const ast::Expr& e);
+
     void visitStmt(const ast::Stmt& s);
 
     void visitExpr(const ast::Expr& e);

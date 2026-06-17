@@ -1768,7 +1768,22 @@ void ExprTC::visitMember(const ast::Member& m) {
                 runMethodBody(pdParams, &a.stmts, nullptr, idxSymsPtr);
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
-        if (cd->value) visitExpr(*cd->value);
+        if (cd->value) {
+            visitExpr(*cd->value);
+            // §22.12 (#747 R42): a `const` member's initializer must be a
+            // compile-time-constant expression. Without this check an
+            // initializer that read a (non-const) static field or called a
+            // method was silently accepted and treated like a static-field
+            // initializer (`const K := _runtime * 2;` compiled and ran).
+            if (!isConstInitExpr(*cd->value)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cd->value->span.begin,
+                    std::string("const `") + std::string(cd->name) +
+                    "` must be initialized with a compile-time-constant "
+                    "expression — a literal, an operation on constants, or a "
+                    "reference to another const or enum constant (§22.12)");
+            }
+        }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
             TypeSymbol* nested = nullptr;
@@ -1791,6 +1806,48 @@ void ExprTC::visitMember(const ast::Member& m) {
             currentType_ = save;
         }
     }
+}
+
+bool ExprTC::isConstInitExpr(const ast::Expr& e) {
+    // §22.12 / §A.8: literals are constants — except interpolated strings,
+    // which are not compile-time constants in general.
+    if (dynamic_cast<const ast::IntLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::FloatLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::StringLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::CharLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::BoolLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::NullLiteralExpr*>(&e))
+        return true;
+    if (dynamic_cast<const ast::InterpolatedStringExpr*>(&e))
+        return false;
+    // Operations over constants are constant.
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return u->operand && isConstInitExpr(*u->operand);
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e))
+        return b->left && b->right && isConstInitExpr(*b->left) &&
+               isConstInitExpr(*b->right);
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e))
+        return c->condition && c->thenValue && c->elseValue &&
+               isConstInitExpr(*c->condition) && isConstInitExpr(*c->thenValue) &&
+               isConstInitExpr(*c->elseValue);
+    // A named reference is constant iff it resolves to another const member or
+    // an enum constant. A (non-const) field, property, or method reference is
+    // not — that is the runtime-dependent case this check rejects.
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        Symbol* sym = ctx_.exprSymbol(e);
+        return dynamic_cast<ConstMemberSymbol*>(sym) != nullptr ||
+               dynamic_cast<EnumConstantSymbol*>(sym) != nullptr;
+    }
+    // A `nameof(...)` expression is a compile-time-constant string.
+    if (dynamic_cast<const ast::NameOfExpr*>(&e)) return true;
+    // Conservative: anything else — a method call, `new`, indexing, a primitive
+    // conversion (`int(x)`), or a reference to a non-const field/property — is
+    // treated as not constant. This matches §A.8's `Constant` form (literals +
+    // named const/enum references) plus operations over constants; admitting
+    // constant-folded conversions in a `const` initializer is a possible future
+    // widening, but rejecting them never accepts a non-constant value.
+    return false;
 }
 
 void ExprTC::visitStmt(const ast::Stmt& s) {

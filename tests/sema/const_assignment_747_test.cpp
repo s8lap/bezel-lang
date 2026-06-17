@@ -87,3 +87,52 @@ BEZEL_TEST(const_assignment_747, reading_const_ok) {
         "end C;");
     BEZEL_EXPECT_FALSE(hasConstAssignError(r));
 }
+
+namespace {
+bool hasConstInitError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("must be initialized with a compile-time-constant") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// §22.12 (#747 R42): a const initialized from a (non-const) static field is
+// NOT a compile-time constant — rejected. Pre-fix it was silently accepted and
+// treated like a static-field initializer.
+BEZEL_TEST(const_assignment_747, nonconst_static_field_initializer_rejected) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static _runtime: int := 5; "
+        "  public const K: int := _runtime * 2; "
+        "  public static method Main(): int return K; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasConstInitError(r));
+}
+
+// §22.12: a const initialized by a method call is not constant — rejected.
+BEZEL_TEST(const_assignment_747, method_call_initializer_rejected) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Compute(): int return 7; end Compute; "
+        "  public const K: int := Compute(); "
+        "  public static method Main(): int return K; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasConstInitError(r));
+}
+
+// §22.12 regression guard: literals, operations over constants, references to
+// other consts, and conditionals over constants are all admitted.
+BEZEL_TEST(const_assignment_747, constant_expressions_accepted) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public const A: int := 40; "
+        "  public const B: int := A * 2 + 1; "
+        "  public const S: string := \"hi\"; "
+        "  public const F: bool := true; "
+        "  public const G: int := A if F else B; "
+        "  public static method Main(): int return A + B; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasConstInitError(r));
+}
