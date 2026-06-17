@@ -7958,6 +7958,37 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
+    // fix #747 R43 / §27.2 / §14.1: a user method call `x.M(...)` where `x` is
+    // an unannotated lambda parameter whose type sema left unresolved (so
+    // `calleeSym` is null) — but codegen injected a concrete class/record type
+    // via `lambdaParamTypeHint_` (the same hint that already lets `x.field` and
+    // `x.ToString()` resolve; see fieldAddr at LlvmBackend_Layout.cpp and the
+    // ToString paths above). Resolve the MethodSymbol by name from the hinted
+    // type's members so the ordinary instance-dispatch path below (ms != null)
+    // handles the call. Without this, the unresolved call returned null and the
+    // enclosing expression-body lambda emitted `ret void` into a non-void
+    // function → IR verification failure.
+    if (!calleeSym) {
+        if (auto* hma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (auto* hid = dynamic_cast<const ast::IdentifierExpr*>(
+                    hma->target.get())) {
+                sema::Symbol* hSym = ctx_.exprSymbol(*hid);
+                auto hit = lambdaParamTypeHint_.find(hSym);
+                if (hit != lambdaParamTypeHint_.end() && hit->second &&
+                    hit->second->kind == sema::TypeRef::Kind::Named &&
+                    hit->second->declaration) {
+                    for (sema::Symbol* m : hit->second->declaration->members) {
+                        if (m && m->name == hma->member &&
+                            dynamic_cast<sema::MethodSymbol*>(m)) {
+                            calleeSym = m;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
     if (!ms) {
         // §8.5 / §8.6 (#417): `o.ToString()` where o: Object / interface (the

@@ -308,6 +308,7 @@ set(BEZEL_TEST_SOURCES
     codegen/var_destructure_577_test.cpp
     codegen/case_expr_nullable_result_573_test.cpp
     codegen/case_untyped_binding_nullable_747_test.cpp
+    codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp
     codegen/short_circuit_test.cpp
