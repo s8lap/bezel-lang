@@ -123,3 +123,50 @@ BEZEL_TEST(sema_field_init, enum_instance_field_still_diagnoses) {
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+namespace {
+bool hasForwardRefError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("forward reference between static readonly") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// §22.13 (#747 R42): a static readonly field that reads a LATER-declared static
+// readonly field of the same type is a compile error.
+BEZEL_TEST(sema_field_init, static_readonly_forward_ref_rejected) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static readonly A: int := B + 1; "
+        "  public static readonly B: int := 5; "
+        "  public static method Main(): int return A; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasForwardRefError(r));
+}
+
+// §22.13: a BACKWARD reference (the read field is declared earlier) is fine.
+BEZEL_TEST(sema_field_init, static_readonly_backward_ref_ok) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static readonly B: int := 5; "
+        "  public static readonly A: int := B + 1; "
+        "  public static method Main(): int return A; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasForwardRefError(r));
+}
+
+// §22.13: the rule is per-type — reading a DIFFERENT type's static readonly
+// field is not a same-type forward reference (cross-type ordering is governed
+// by the cycle rule, not this one).
+BEZEL_TEST(sema_field_init, static_readonly_cross_type_ref_ok) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class D public static readonly Q: int := 10; end D; "
+        "class C "
+        "  public static readonly X: int := D.Q + 1; "
+        "  public static method Main(): int return X; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasForwardRefError(r));
+}

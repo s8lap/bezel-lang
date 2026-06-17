@@ -1580,6 +1580,9 @@ void ExprTC::visitMember(const ast::Member& m) {
             visitExpr(*fd->initializer);
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
+            // §22.13: a static readonly field may not forward-reference a later
+            // static readonly field of the same type.
+            checkStaticReadonlyForwardRef(fd);
         }
     } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
@@ -1848,6 +1851,75 @@ bool ExprTC::isConstInitExpr(const ast::Expr& e) {
     // constant-folded conversions in a `const` initializer is a possible future
     // widening, but rejecting them never accepts a non-constant value.
     return false;
+}
+
+void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
+    if (!fd || !fd->initializer || !currentType_) return;
+    auto hasMod = [](const std::vector<std::string_view>& mods,
+                     std::string_view m) {
+        for (auto x : mods) if (x == m) return true;
+        return false;
+    };
+    if (!hasMod(fd->modifiers, "static") || !hasMod(fd->modifiers, "readonly"))
+        return;
+    // Declaration-order index of a symbol in the current type, or -1.
+    auto indexOf = [&](const Symbol* s) -> int {
+        int i = 0;
+        for (const Symbol* m : currentType_->members) {
+            if (m == s) return i;
+            ++i;
+        }
+        return -1;
+    };
+    int iF = -1;
+    for (std::size_t i = 0; i < currentType_->members.size(); ++i)
+        if (auto* fs = dynamic_cast<const FieldSymbol*>(currentType_->members[i]))
+            if (fs->decl == fd) { iF = static_cast<int>(i); break; }
+    if (iF < 0) return;
+    // A reference is offending iff it resolves to a static-readonly field of the
+    // same type declared after F.
+    auto laterSR = [&](Symbol* g) -> const FieldSymbol* {
+        auto* fs = dynamic_cast<FieldSymbol*>(g);
+        if (!fs) return nullptr;
+        if (!hasMod(fs->modifiers, "static") ||
+            !hasMod(fs->modifiers, "readonly"))
+            return nullptr;
+        return indexOf(fs) > iF ? fs : nullptr;
+    };
+    std::function<void(const ast::Expr*)> walk = [&](const ast::Expr* e) {
+        if (!e) return;
+        if (dynamic_cast<const ast::IdentifierExpr*>(e) ||
+            dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            if (auto* g = laterSR(ctx_.exprSymbol(*e)))
+                ctx_.diagnostics().report(
+                    Severity::Error, e->span.begin,
+                    std::string("static readonly `") + std::string(fd->name) +
+                    "` reads static readonly `" + std::string(g->name) +
+                    "`, which is declared later in the same type — a forward "
+                    "reference between static readonly fields is not allowed; "
+                    "reorder the declarations or use a static constructor "
+                    "(§22.13)");
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            walk(b->left.get()); walk(b->right.get());
+        } else if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            walk(u->operand.get());
+        } else if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            walk(c->condition.get()); walk(c->thenValue.get());
+            walk(c->elseValue.get());
+        } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            walk(ma->target.get());
+        } else if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+            walk(call->callee.get());
+            for (const auto& a : call->args) walk(a.value.get());
+        } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            walk(ix->target.get());
+            for (const auto& a : ix->indices) walk(a.value.get());
+        } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (const auto& a : ne->args) walk(a.value.get());
+        }
+    };
+    walk(fd->initializer.get());
 }
 
 void ExprTC::visitStmt(const ast::Stmt& s) {

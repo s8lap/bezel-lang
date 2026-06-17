@@ -420,6 +420,11 @@ private:
     // called AFTER the initializer is type-checked (it reads exprSymbol).
     bool isConstInitExpr(const ast::Expr& e);
 
+    // §22.13 (#747 R42): reject a `static readonly` field whose initializer
+    // reads a `static readonly` field of the same type declared LATER. Called
+    // with the FieldDecl after its initializer is type-checked.
+    void checkStaticReadonlyForwardRef(const ast::FieldDecl* fd);
+
     void visitStmt(const ast::Stmt& s);
 
     void visitExpr(const ast::Expr& e);
