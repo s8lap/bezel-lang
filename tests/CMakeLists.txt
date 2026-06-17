@@ -663,6 +663,7 @@ set(BEZEL_TEST_SOURCES
     ownership/owned_sink_test.cpp
     ownership/owned_field_sink_test.cpp
     ownership/owned_sink_sources_test.cpp
+    ownership/inline_owned_array_slot_sink_780_test.cpp
     ownership/owned_field_assign_test.cpp
     ownership/catch_owned_sink_test.cpp
     ownership/throw_owned_arg_test.cpp

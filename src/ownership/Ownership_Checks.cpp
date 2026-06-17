@@ -2130,10 +2130,21 @@ bool MethodOwnership::targetIsOwnedField(const ast::Expr& target) const {
     return exprIsOwnedFieldRead(target);
 }
 
+// §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
+// the contract.
+bool MethodOwnership::targetIsOwningInlineArraySlot(
+    const ast::Expr& target) const {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(&target);
+    if (!ix || !ix->target) return false;
+    const sema::TypeRef* tt = ctx_.exprType(*ix->target);
+    return tt && tt->kind == sema::TypeRef::Kind::InlineArray && tt->arrayOwned;
+}
+
 // §28.3 / §28.5 / §28.8 (issue #402): an owned-field assignment. See the header
 // for the full contract.
 void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
-                                                 bool borrowAlreadyFlagged) {
+                                                 bool borrowAlreadyFlagged,
+                                                 bool intoOwningArraySlot) {
     if (!as.value) return;
     // The RHS must be an OWNED value (§28.3 producers). `ownedArgSourceIsBorrow`
     // is the same borrow classifier the owned-parameter / owned-sink checks
@@ -2148,12 +2159,19 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
         if (!borrowAlreadyFlagged) {
             report(
                 Severity::Error, as.value->span.begin,
-                "a borrow cannot be stored into an `owned` field: the field's "
-                "owner disposes the value when the object is disposed, but a "
-                "borrow is owned elsewhere and its real owner disposes it too — "
-                "a double-free (§28.3 / §28.5 / §28.8 — store an owned value "
-                "with `new`, `move`, an owned-returning call, or a consumed "
-                "`owned` parameter)");
+                intoOwningArraySlot
+                    ? "a borrow cannot be stored into an owning array slot: the "
+                      "array disposes each owned element when the array is "
+                      "disposed, but a borrow is owned elsewhere and its real "
+                      "owner disposes it too — a double-free (§28.11 / §28.3 — "
+                      "store an owned value with `new`, `move`, an owned-"
+                      "returning call, or a consumed `owned` parameter)"
+                    : "a borrow cannot be stored into an `owned` field: the "
+                      "field's owner disposes the value when the object is "
+                      "disposed, but a borrow is owned elsewhere and its real "
+                      "owner disposes it too — a double-free (§28.3 / §28.5 / "
+                      "§28.8 — store an owned value with `new`, `move`, an "
+                      "owned-returning call, or a consumed `owned` parameter)");
         }
         return;
     }

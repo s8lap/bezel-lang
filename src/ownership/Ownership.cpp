@@ -916,6 +916,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // and §31.1 catch-borrow diagnoses are not duplicated. // per §28.3, §28.5
     if (targetIsOwnedField(*as.target)) {
         handleOwnedFieldAssignment(as, flagged386);
+    } else if (targetIsOwningInlineArraySlot(*as.target)) {
+        // §28.11 (#780): an owning inline-array slot `a[i]` (a `[N owned]T?` /
+        // `[N owned]T` slot) is an owned sink with the SAME discipline as an
+        // `owned` field — its indexer-set "takes owned" (§28.11 slot policy).
+        // A borrow RHS is the double-free hazard; a bare owned-LOCAL read is a
+        // move INTO the slot (so a `using var` source is correctly rejected as
+        // scope-bound, §28.3, and a plain owned local is recorded moved-from
+        // rather than spuriously flagged as dropped-without-disposal). This is
+        // the index-target analogue of the owned-field path above and of the
+        // owning-collection indexer check below. `checkBorrowStoreEscape`
+        // returns early for an index target, so `flagged386` is false here and
+        // no diagnostic is duplicated. // per §28.11, §28.3
+        handleOwnedFieldAssignment(as, flagged386,
+                                   /*intoOwningArraySlot=*/true);
     }
     // §28.11 (#395): an owning-collection `set(owned)` indexer assignment
     // `coll[i] := value` requires `value` to be owned — "Indexer set

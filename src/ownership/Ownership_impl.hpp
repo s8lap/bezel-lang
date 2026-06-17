@@ -261,6 +261,16 @@ private:
     // of a consumed owned parameter). // per §28.3, §28.5, §28.8
     bool targetIsOwnedField(const ast::Expr& target) const;
 
+    // §28.11 (issue #780): true when `target` is an owning inline-array slot
+    // `a[i]` — an index into a `[N owned]T?` / `[N owned]T` value. Such a slot
+    // is an owned storage location with the SAME discipline as an `owned` field:
+    // its indexer-set "takes owned" (§28.11 element slot policy), so a borrow
+    // RHS is the double-free hazard and a bare owned-local read is a move INTO
+    // the slot. Used by handleAssignment to route the slot write through
+    // handleOwnedFieldAssignment (with the owning-array-slot diagnostic
+    // wording). // per §28.11, §28.3
+    bool targetIsOwningInlineArraySlot(const ast::Expr& target) const;
+
     // §28.3 / §28.5 / §28.8 (issue #402): handle an assignment whose LHS is an
     // `owned` field. An owned field may only receive an OWNED value (§28.3
     // producers: `new`, `move`, an owned-returning call, a consumed `owned`
@@ -275,9 +285,14 @@ private:
     // `move` / `new` / call RHS side-effects are already recorded by the
     // preceding recordMovesIn, so this records only the bare-identifier case.
     // `borrowAlreadyFlagged` is the #386 result, so a borrow source already
-    // diagnosed there is not re-reported. // per §28.3, §28.5, §28.8
+    // diagnosed there is not re-reported. `intoOwningArraySlot` (issue #780)
+    // selects the owning inline-array-slot diagnostic wording (§28.11) instead
+    // of the owned-field wording; the ownership semantics are identical, so the
+    // borrow-reject and the move-/discharge-recording paths are shared.
+    // // per §28.3, §28.5, §28.8, §28.11
     void handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
-                                    bool borrowAlreadyFlagged);
+                                    bool borrowAlreadyFlagged,
+                                    bool intoOwningArraySlot = false);
 
     // Like the owned-source half of borrowSourceForExpr but restricted to an
     // owned scope-bound *local* (a `using var` or `var x := <owned producer>`),
