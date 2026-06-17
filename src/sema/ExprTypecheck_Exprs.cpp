@@ -646,6 +646,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     }
                     bool isArrLike =
                         cn == "Array" || cn == "OwnedArray" ||
+                        // §4.14 (#743/f11): OwnedBuffer<T>[i] is element-indexed
+                        // exactly like OwnedArray<T> — its result type is the
+                        // element T = genericArgs[0]. Without this it fell to the
+                        // untyped path, where the ownership checker assumed a
+                        // borrow and falsely rejected `return buf[0]` for a
+                        // value-type T (§28.3 borrow-lifetime).
+                        cn == "OwnedBuffer" ||
                         // issue #401: list interfaces are array-backed; their
                         // indexer result type is the element T = genericArgs[0].
                         cn == "IReadOnlyList" || cn == "IList" ||

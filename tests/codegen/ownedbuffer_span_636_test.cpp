@@ -235,3 +235,30 @@ BEZEL_TEST(ownedbuffer_span_636, asreadonly_int_buffer_ir_verifies_spec_4_14_iss
         "end Main; end C;");
     BEZEL_EXPECT_EQ(r.verifies, true);
 }
+
+// §4.14 / §28.3 (#743 f11): OwnedBuffer<T>[i] is element-indexed (result type T),
+// so returning a VALUE-type element is a copy, not a borrow — it must NOT trip
+// the borrow-lifetime rule. Pre-fix OwnedBuffer was absent from the indexer's
+// isArrLike set, so `buf[i]` was untyped and the ownership checker assumed a
+// borrow, falsely rejecting `return buf[0]`.
+BEZEL_TEST(ownedbuffer_span_636, value_element_index_return_not_a_borrow_743_f11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(1); "
+        "  buf[0] := 77; "
+        "  return buf[0]; "
+        "end Main; end C;"), 77);
+}
+
+// §4.14 (#743 f11) regression guard: a class-typed element still works (the
+// indexer reads a borrow of the owned element, accessed in-scope).
+BEZEL_TEST(ownedbuffer_span_636, class_element_index_still_works_743_f11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Obj public V: int; public constructor(v: int) V := v; end constructor; end Obj; "
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Obj>(1); "
+        "  buf[0] := new Obj(5); "
+        "  return buf[0].V; "
+        "end Main; end C;"), 5);
+}
