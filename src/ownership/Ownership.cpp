@@ -21,8 +21,10 @@ namespace bezel::ownership {
 // checkOwnership entry point and its supporting free functions.
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
-         const std::vector<sema::Symbol*>* paramSyms, bool isAsync) {
+         const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
+         bool isDestructor) {
     isAsync_ = isAsync;
+    isDestructor_ = isDestructor;
     // Issue #392 / §31.1: collect this method's catch-bound exception
     // variables before the dataflow runs. Each is a borrow of the in-flight
     // exception whose lifetime is its arm body; the escape machinery consults
@@ -98,16 +100,25 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // even when the method exits via a throw, the destructor on `this`
     // would observe the field moved-from during unwinding, so the check
     // fires unconditionally (path-insensitively) here.
-    for (const auto& [name, moved] : fieldMovedFrom_) {
-        if (moved) {
-            ctx_.diagnostics().report(
-                Severity::Error,
-                fieldMoveLoc_.count(name)
-                    ? fieldMoveLoc_[name]
-                    : SourceLocation{},
-                std::string("field `") + std::string(name) +
-                "` left in moved-from state at method exit "
-                "(§28.8.1 — reassign the field before exiting)");
+    // §28.8.1 (#763): the field-restoration rule does NOT apply inside a
+    // destructor — "the object is being torn down and no future read of the
+    // field will occur," so a `move this.f` whose taken value is otherwise
+    // discharged (checked by the ordinary owned-local discharge above) leaves
+    // the field validly moved-from at destructor exit. Skip the check there;
+    // for every other method/constructor body it still fires unconditionally
+    // (path-insensitively — exception paths are not exempt).
+    if (!isDestructor_) {
+        for (const auto& [name, moved] : fieldMovedFrom_) {
+            if (moved) {
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    fieldMoveLoc_.count(name)
+                        ? fieldMoveLoc_[name]
+                        : SourceLocation{},
+                    std::string("field `") + std::string(name) +
+                    "` left in moved-from state at method exit "
+                    "(§28.8.1 — reassign the field before exiting)");
+            }
         }
     }
     // Async-readiness 3c (§30.5 Consumer-side; Appendix C.6): the at-await-site
@@ -1100,7 +1111,11 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
         mo.run(cd->body, paramSymsOf(m, ctx));
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
-        mo.run(dd->body);
+        // §28.8.1 (#763): analyse the destructor body with isDestructor=true so
+        // the field-restoration check is suppressed (a torn-down object's owned
+        // fields may be left moved-from after a discharged `move this.f`).
+        mo.run(dd->body, /*paramSyms=*/nullptr, /*isAsync=*/false,
+               /*isDestructor=*/true);
     } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);

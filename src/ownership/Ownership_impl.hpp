@@ -66,7 +66,7 @@ public:
     // byte-for-byte unchanged. // per §30.5, §30.1
     void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
              const std::vector<sema::Symbol*>* paramSyms = nullptr,
-             bool isAsync = false);
+             bool isAsync = false, bool isDestructor = false);
 
 private:
     sema::SemaContext& ctx_;
@@ -75,6 +75,14 @@ private:
     // Gates the at-await-site Pattern A/B checks and the SuspendLocal
     // annotation so they never affect a synchronous body. // per §30.5
     bool isAsync_ = false;
+    // §28.8.1 (#763): true while analysing a DESTRUCTOR body. Inside a
+    // destructor the field-restoration rule does NOT require reassigning a
+    // moved-from owned field — the object is being torn down and no future read
+    // of the field occurs ("the field-restoration rule does not require
+    // reassignment inside a destructor"). Gates the field-moved-from-at-exit
+    // check so a `move this.f` whose taken value is otherwise discharged is not
+    // spuriously rejected. // per §28.8.1
+    bool isDestructor_ = false;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed

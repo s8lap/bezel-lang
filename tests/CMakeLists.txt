@@ -310,6 +310,7 @@ set(BEZEL_TEST_SOURCES
     codegen/case_expr_nullable_result_573_test.cpp
     codegen/case_untyped_binding_nullable_747_test.cpp
     codegen/case_type_pattern_null_760_test.cpp
+    codegen/destructor_field_move_runtime_763_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp
@@ -667,6 +668,7 @@ set(BEZEL_TEST_SOURCES
     ownership/owned_sink_sources_test.cpp
     ownership/inline_owned_array_slot_sink_780_test.cpp
     ownership/using_var_return_762_test.cpp
+    ownership/destructor_field_move_763_test.cpp
     ownership/owned_field_assign_test.cpp
     ownership/catch_owned_sink_test.cpp
     ownership/throw_owned_arg_test.cpp
