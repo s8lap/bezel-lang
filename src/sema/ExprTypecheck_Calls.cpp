@@ -3596,8 +3596,13 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     // A collection (Array/Set/… — Named with astNode, no declaration) or a lazy
     // IEnumerable sentinel (Named with neither). Either carries the element
     // type as genericArgs[0]. A user class/interface (has declaration) is not
-    // a LINQ source and is excluded.
-    if (recvTy->declaration) return nullptr;
+    // a LINQ source and is excluded — EXCEPT a `Range<T>` (issue #775), which is
+    // IEnumerable<T> but carries the builtin Range class decl; its element is
+    // genericArgs[0]. Without this seeding, a Range LINQ lambda's untyped param
+    // (`(1L..n).Select((x) => x * 2L)`) was left untyped → codegen compiled the
+    // selector with an i32 param while the body produced i64 → an IR mismatch.
+    if (recvTy->declaration && recvTy->declaration->name != "Range")
+        return nullptr;
     return recvTy->genericArgs[0];
 }
 

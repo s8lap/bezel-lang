@@ -90,6 +90,19 @@ BEZEL_TEST(selectmany_range_selector_775, step_and_descending) {
         "end Main; end C;"), 10);
 }
 
+// §16.3 / stdlib §5: a LINQ lambda over a non-int Range element (Range<long>)
+// must seed its untyped param with the element type. `(1L..3L).Select((x)=>x*2L)`
+// previously left `x` untyped so codegen compiled the selector with an i32 param
+// while the body produced i64 — an IR mismatch ("ret i64 … declared i32"). The
+// fix seeds the Range element type into the LINQ lambda param (linqLambdaElementType).
+BEZEL_TEST(selectmany_range_selector_775, typed_element_select_lambda) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C public static method Main(): int "
+        "  return (0 if (1L..3L).Select((x) => x * 2L).Sum() = 12L else 1); "  // 2+4+6=12
+        "end Main; end C;"), 0);
+}
+
 // §16.3: GetEnumerator on an open-ended range raises InvalidOperationException.
 BEZEL_TEST(selectmany_range_selector_775, open_ended_raises) {
     BEZEL_EXPECT_EQ(runFull(
