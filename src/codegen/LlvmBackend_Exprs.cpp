@@ -7586,7 +7586,6 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     }
     llvm::Type* dstTy = lowerPrimitive(target);
     llvm::Type* srcTy = src->getType();
-    if (srcTy == dstTy) return src;
     bool dstFP = dstTy->isFloatingPointTy();
     bool srcFP = srcTy->isFloatingPointTy();
     bool dstUns = isUnsignedPrim(target);
@@ -7598,6 +7597,23 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         if (st->kind == sema::TypeRef::Kind::Named && st->declaration &&
             st->declaration->kind == ast::TypeDeclKind::Enum)
             srcUns = enumIsUnsigned(st->declaration);
+    if (srcTy == dstTy) {
+        // §5.2 (#753): a same-width signed↔unsigned integer cast is a CHECKED
+        // value conversion — it raises OverflowException when the value is not
+        // representable under the destination's signedness. At equal LLVM
+        // integer width the only out-of-range values are those with the top bit
+        // set: read as signed they are negative (cannot fit an unsigned
+        // destination); read as unsigned they exceed the signed maximum (cannot
+        // fit a signed destination). Either way ICmpSLT(src, 0) on the shared
+        // bit pattern detects them. Bit reinterpretation WITHOUT this check is
+        // BitConverter.Reinterpret<T> (stdlib §2.12).
+        if (srcTy->isIntegerTy() && srcUns != dstUns) {
+            llvm::Value* bad = builder_.CreateICmpSLT(
+                src, llvm::ConstantInt::get(srcTy, 0), "swflip.oor");
+            emitGuardThrow(bad, "OverflowException");
+        }
+        return src;
+    }
     if (srcFP && dstFP) {
         return srcTy->getPrimitiveSizeInBits() <
                        dstTy->getPrimitiveSizeInBits()
@@ -7660,7 +7676,10 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         return srcUns ? builder_.CreateZExt(src, dstTy)
                       : builder_.CreateSExt(src, dstTy);
     }
-    return src;  // same width, differing signedness (e.g. int ↔ uint)
+    // Defensive fallthrough. Same-width casts (incl. int↔uint signedness flips,
+    // now CHECKED per §5.2/#753) return from the `srcTy == dstTy` branch above;
+    // all genuine width changes are handled by the FP/int branches. Unreached.
+    return src;
 }
 
 

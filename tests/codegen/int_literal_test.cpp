@@ -78,11 +78,14 @@ BEZEL_TEST(codegen_cg1, int_min_value) {
 // long.MaxValue and `-` made it -(2^63-1) == INT64_MIN+1 (off by one). The
 // magnitude is now parsed with strtoull and the negation is constant-folded.
 BEZEL_TEST(codegen_cg1, long_min_value_literal_exact_bits) {
-    // ulong reinterpretation of long.MinValue is exactly 2^63.
+    // §5.2 / #753: `ulong(m)` of long.MinValue is now a CHECKED same-width cast
+    // and would throw OverflowException (the value is negative). Observe the
+    // literal's exact bit pattern via the unchecked reinterpret surface instead:
+    // BitConverter.Reinterpret<ulong> of long.MinValue is exactly 2^63.
     auto r = runJit(
         "module M; class C public static method Main(): int "
         "  var m := -9223372036854775808L; "
-        "  return (0 if ulong(m) = 9223372036854775808UL else 1); "
+        "  return (0 if BitConverter.Reinterpret<ulong>(m) = 9223372036854775808UL else 1); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

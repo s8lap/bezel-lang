@@ -383,6 +383,54 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
 // resolved MethodSymbol.
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
+    // stdlib §2.12 (#753): BitConverter.Reinterpret<TTo>(value) well-formedness.
+    // The target type (explicit type arg) and the source value must be primitive
+    // numeric types of EQUAL bit width; a width mismatch — or a non-numeric type
+    // on either side — is a compile error. The result type (the target) is set
+    // by resolveMemberAccess; this is only the validation, and args are already
+    // typed here (post-order), so the source type is available.
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if (rma->member == "Reinterpret" && rma->target) {
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(rma->target.get())) {
+                if (tid->name == "BitConverter") {
+                    auto rw = [](PrimitiveType p) -> int {
+                        switch (p) {
+                            case PrimitiveType::Byte:
+                            case PrimitiveType::SByte:  return 8;
+                            case PrimitiveType::Short:
+                            case PrimitiveType::UShort: return 16;
+                            case PrimitiveType::Int:
+                            case PrimitiveType::UInt:
+                            case PrimitiveType::Float:  return 32;
+                            case PrimitiveType::Long:
+                            case PrimitiveType::ULong:
+                            case PrimitiveType::Double: return 64;
+                            default: return 0;  // not reinterpret-eligible
+                        }
+                    };
+                    PrimitiveType tgt = PrimitiveType::None;
+                    if (!rma->typeArgs.empty() && rma->typeArgs[0] &&
+                        rma->typeArgs[0]->name &&
+                        !rma->typeArgs[0]->name->parts.empty())
+                        tgt = primitiveFromName(
+                            rma->typeArgs[0]->name->parts.front());
+                    PrimitiveType srcP = PrimitiveType::None;
+                    if (ce.args.size() == 1 && ce.args[0].value)
+                        if (auto* st = ctx_.exprType(*ce.args[0].value))
+                            if (st->kind == TypeRef::Kind::Primitive)
+                                srcP = st->primitive;
+                    int tw = rw(tgt), sw = rw(srcP);
+                    if (tw == 0 || sw == 0 || tw != sw)
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "BitConverter.Reinterpret requires the target type and "
+                            "the source value to be primitive numeric types of equal "
+                            "bit width (stdlib §2.12)");
+                }
+            }
+        }
+    }
     // §5.2: an explicit conversion `int(x)` — the callee is a primitive
     // type name with no symbol. The call's type is that primitive type.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
@@ -5504,6 +5552,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
                 } else if (m == "Int64BitsToDouble") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
+                } else if (m == "Reinterpret") {
+                    // stdlib §2.12 (#753): generic same-width bit reinterpretation.
+                    // The result type is the single explicit type argument (the
+                    // target); the source is inferred from the call argument. The
+                    // same-bit-width requirement is validated in typeCall, where
+                    // the argument's type is available.
+                    if (!ma.typeArgs.empty() && ma.typeArgs[0] &&
+                        ma.typeArgs[0]->name &&
+                        !ma.typeArgs[0]->name->parts.empty()) {
+                        PrimitiveType tgt = primitiveFromName(
+                            ma.typeArgs[0]->name->parts.front());
+                        if (tgt != PrimitiveType::None)
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(tgt));
+                    }
                 }
             }
             // stdlib §9.3 / fix #521: Decimal static member types.

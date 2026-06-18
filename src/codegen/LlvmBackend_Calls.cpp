@@ -5196,6 +5196,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     arg = builder_.CreateSExt(arg, i64(), "bc.i64");
                 return builder_.CreateBitCast(arg, llvm::Type::getDoubleTy(llvm_), "bc.l2d");
             }
+            if (m == "Reinterpret") {
+                // stdlib §2.12 (#753): generic same-width bit reinterpretation.
+                // The target type is the call's resolved type (the explicit type
+                // argument). Same LLVM type (e.g. int↔uint, both iN) is a no-op;
+                // a same-width differently-shaped pair (e.g. float↔int) is a real
+                // bitcast. Width mismatches are rejected in sema (typeCall).
+                const sema::TypeRef* rt = ctx_.exprType(call);
+                if ((!rt || rt->kind != sema::TypeRef::Kind::Primitive) && call.callee)
+                    rt = ctx_.exprType(*call.callee);
+                if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) return nullptr;
+                llvm::Type* dstTy = lowerPrimitive(rt->primitive);
+                if (arg->getType() == dstTy) return arg;  // identical repr → no-op
+                if (arg->getType()->getPrimitiveSizeInBits() ==
+                    dstTy->getPrimitiveSizeInBits())
+                    return builder_.CreateBitCast(arg, dstTy, "bc.reinterpret");
+                return nullptr;  // width mismatch (sema rejects; defensive)
+            }
         }
         return nullptr;
     }
