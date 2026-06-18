@@ -328,6 +328,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_forgotten_await_777_test.cpp
     codegen/selectmany_range_selector_775_test.cpp
     codegen/checked_cast_reinterpret_753_test.cpp
+    codegen/linq_last_single_predicate_789_test.cpp
     codegen/async_nested_task_return_776_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp

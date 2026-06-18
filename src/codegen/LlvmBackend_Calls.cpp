@@ -1706,6 +1706,181 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return fstv;
         }
+        // per §5 LINQ (#789): .Last(pred: (T)->bool): T — the LAST element
+        // satisfying the predicate; throws InvalidOperationException if none does.
+        // Identical scan to First(pred) except the match branch does NOT break: it
+        // keeps scanning so the final survivor in resultSlot is the last match.
+        if (m == "Last" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* resultSlot = entryAlloca(elemTy);
+            auto* foundSlot = entryAlloca(i1());
+            builder_.CreateStore(builder_.getFalse(), foundSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "lstp.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "lstp.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "lstp.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "lstp.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "lstp.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateStore(builder_.getTrue(), foundSlot);
+            builder_.CreateBr(nextBB);  // keep scanning — last match wins
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);
+            llvm::Value* notFound = builder_.CreateNot(builder_.CreateLoad(i1(), foundSlot));
+            emitGuardThrow(notFound, "InvalidOperationException");
+            llvm::Value* lstv = builder_.CreateLoad(elemTy, resultSlot, "lstp.r");
+            freeLazyTemp();
+            return lstv;
+        }
+        // per §5 LINQ (#789): .Single(pred): T — the sole element satisfying the
+        // predicate; throws InvalidOperationException if zero or more than one
+        // match. Scan-and-count like SingleOrNull(pred) but throws (not null) and
+        // returns plain T.
+        if (m == "Single" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* resultSlot = entryAlloca(elemTy);
+            auto* matchCountSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), matchCountSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "sgl.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "sgl.b", currentFn_);
+            auto* matchBB = llvm::BasicBlock::Create(llvm_, "sgl.m", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "sgl.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "sgl.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, matchBB, nextBB);
+            builder_.SetInsertPoint(matchBB);
+            llvm::Value* curCnt = builder_.CreateLoad(i32(), matchCountSlot);
+            llvm::Value* isFirst = builder_.CreateICmpEQ(curCnt, builder_.getInt32(0));
+            auto* storeMatchBB = llvm::BasicBlock::Create(llvm_, "sgl.sm", currentFn_);
+            auto* afterStoreBB = llvm::BasicBlock::Create(llvm_, "sgl.as", currentFn_);
+            builder_.CreateCondBr(isFirst, storeMatchBB, afterStoreBB);
+            builder_.SetInsertPoint(storeMatchBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateBr(afterStoreBB);
+            builder_.SetInsertPoint(afterStoreBB);
+            llvm::Value* newCnt = builder_.CreateAdd(curCnt, builder_.getInt32(1));
+            llvm::Value* saturated = builder_.CreateSelect(
+                builder_.CreateICmpSGT(newCnt, builder_.getInt32(2)),
+                builder_.getInt32(2), newCnt);
+            builder_.CreateStore(saturated, matchCountSlot);
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);
+            llvm::Value* finalCnt = builder_.CreateLoad(i32(), matchCountSlot);
+            llvm::Value* notOne = builder_.CreateICmpNE(finalCnt, builder_.getInt32(1));
+            emitGuardThrow(notOne, "InvalidOperationException");
+            llvm::Value* sglv = builder_.CreateLoad(elemTy, resultSlot, "sgl.r");
+            freeLazyTemp();
+            return sglv;
+        }
+        // per §5 LINQ (#789): .LastOrNull(pred): T? — the LAST element satisfying
+        // the predicate, or null if none. Scan-keep-last like Last(pred) but
+        // returns T? (mirrors FirstOrNull(pred)).
+        if (m == "LastOrNull" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* resultSlot = entryAlloca(elemTy);
+            auto* foundSlot = entryAlloca(i1());
+            builder_.CreateStore(builder_.getFalse(), foundSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "lon.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "lon.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "lon.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "lon.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "lon.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateStore(builder_.getTrue(), foundSlot);
+            builder_.CreateBr(nextBB);  // keep scanning — last match wins
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);
+            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            sema::TypeRef nullRT;
+            if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
+            bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
+            llvm::Value* found = builder_.CreateLoad(i1(), foundSlot);
+            llvm::Value* notFound = builder_.CreateNot(found);
+            llvm::Value* loadedV = builder_.CreateLoad(elemTy, resultSlot, "lon.v");
+            llvm::Value* resultV = nullptr;
+            if (isValTy) {
+                auto* nst = nullableValueStructTy(&nullRT);
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst),
+                    builder_.CreateSelect(notFound,
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1)),
+                    {0u});
+                resultV = builder_.CreateInsertValue(res,
+                    builder_.CreateSelect(notFound,
+                        llvm::Constant::getNullValue(elemTy), loadedV),
+                    {1u});
+            } else {
+                resultV = builder_.CreateSelect(notFound,
+                    llvm::Constant::getNullValue(elemTy), loadedV, "lon.ptr");
+            }
+            freeLazyTemp();
+            return resultV;
+        }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
         // return the first element; Last() returns the last; ElementAt(i)
         // returns the element at index i (stdlib §5 — each `: T`).

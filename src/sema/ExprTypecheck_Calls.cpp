@@ -1139,9 +1139,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         return true;
                     }
-                    // stdlib §5 (#650/#661): FirstOrNull(pred)/SingleOrNull(pred)
-                    // on lazy receiver → T?.
-                    if ((m == "FirstOrNull" || m == "SingleOrNull") &&
+                    // stdlib §5 (#650/#661/#789): FirstOrNull(pred) /
+                    // LastOrNull(pred) / SingleOrNull(pred) on lazy receiver → T?.
+                    if ((m == "FirstOrNull" || m == "LastOrNull" ||
+                         m == "SingleOrNull") &&
                         ce.args.size() == 1) {
                         if (srcElem) {
                             auto* nullTy = ctx_.makeTypeRef();
@@ -1643,10 +1644,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             nullTy->nullable = true;
                             ctx_.setExprType(&ce, nullTy);
                         }
-                        // stdlib §5 (#650/#661): FirstOrNull(predicate) /
-                        // SingleOrNull(predicate) — returns T? for the predicate
-                        // form (the no-predicate form is above).
-                        else if ((m == "FirstOrNull" || m == "SingleOrNull") &&
+                        // stdlib §5 (#650/#661/#789): FirstOrNull(predicate) /
+                        // LastOrNull(predicate) / SingleOrNull(predicate) — returns
+                        // T? for the predicate form (the no-predicate form is above).
+                        else if ((m == "FirstOrNull" || m == "LastOrNull" ||
+                                  m == "SingleOrNull") &&
                                  ce.args.size() == 1 &&
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0]) {
