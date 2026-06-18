@@ -626,8 +626,17 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                          gi < rtd->genericParams.size(); ++gi) {
                         newSubst[rtd->genericParams[gi].name] =
                             lowerTypeRef(rt->genericArgs[gi]);
+                        // §14.1 (#766): resolve a generic ARGUMENT that is itself
+                        // a bare type parameter of an enclosing scope (the `T` in
+                        // `new R<T>()` inside `Make<T>()`) through the active
+                        // outer substitution, so the inner record's sema-type map
+                        // holds the CONCRETE type (`int`), not the unresolved
+                        // `T`. Otherwise the field layout uses the i32 placeholder
+                        // while the value is the 8-byte nullable struct → an
+                        // 8-into-4 stack write (SIGSEGV). A concrete arg is
+                        // returned unchanged.
                         newSema[rtd->genericParams[gi].name] =
-                            rt->genericArgs[gi];
+                            resolveTypeParamRef(rt->genericArgs[gi]);
                     }
                     genericSubst_ = std::move(newSubst);
                     genericSubstSemaTy_ = std::move(newSema);
@@ -934,7 +943,8 @@ Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt
         for (std::size_t gi = 0; gi < rtd->genericParams.size(); ++gi) {
             newSubst[rtd->genericParams[gi].name] =
                 e->lowerTypeRef(rt->genericArgs[gi]);
-            newSema[rtd->genericParams[gi].name] = rt->genericArgs[gi];
+            // §14.1 (#766): resolve a bare-param arg through the outer subst.
+            newSema[rtd->genericParams[gi].name] = e->resolveTypeParamRef(rt->genericArgs[gi]);
         }
         e->genericSubst_ = std::move(newSubst);
         e->genericSubstSemaTy_ = std::move(newSema);
@@ -952,7 +962,8 @@ Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt
         for (std::size_t gi = 0; gi < rt->declaration->genericParams.size(); ++gi) {
             std::string_view pname = rt->declaration->genericParams[gi]->name;
             newSubst[pname] = e->lowerTypeRef(rt->genericArgs[gi]);
-            newSema[pname] = rt->genericArgs[gi];
+            // §14.1 (#766): resolve a bare-param arg through the outer subst.
+            newSema[pname] = e->resolveTypeParamRef(rt->genericArgs[gi]);
         }
         e->genericSubst_ = std::move(newSubst);
         e->genericSubstSemaTy_ = std::move(newSema);

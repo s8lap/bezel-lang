@@ -6895,7 +6895,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     newSubst[pname] = concrTy;
                     // Record the sema TypeRef for the concrete arg so the
                     // binary `=` handler can distinguish string vs. class ptr.
-                    newSema[pname] = rt->genericArgs[gi];
+                    // §14.1 (#766): resolve a bare-param arg through the outer subst.
+                    newSema[pname] = resolveTypeParamRef(rt->genericArgs[gi]);
                 }
                 genericSubst_ = std::move(newSubst);
                 genericSubstSemaTy_ = std::move(newSema);
@@ -6917,7 +6918,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
             std::string_view pname = t->genericParams[gi]->name;
             newSubst[pname] = concrTy;
-            newSema[pname] = rt->genericArgs[gi];
+            // §14.1 (#766): resolve a bare-param arg through the outer subst.
+            newSema[pname] = resolveTypeParamRef(rt->genericArgs[gi]);
         }
         genericSubst_ = std::move(newSubst);
         genericSubstSemaTy_ = std::move(newSema);
