@@ -3624,10 +3624,11 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // below — see the function comment on why it must NOT be a stack slot).
     llvm::Value* enumPtr = lowerExpr(*fs.iterable);
     if (!enumPtr) return false;
-    // §30.8 (#765): evaluate the optional `with` cancellation token for its
-    // side-effects/ownership, then discard it (cancellation honoring deferred).
-    if (fs.withExpr)
-        (void)lowerExpr(*fs.withExpr);
+    // §30.8 (#765/#790): evaluate the optional `with` cancellation token. Its
+    // value is a pointer to the source's cancellation-state cell (null for
+    // CancellationToken.None). It is observed at each iteration's suspend point
+    // (condBB below): a cancelled token raises OperationCanceledException.
+    llvm::Value* tokenVal = fs.withExpr ? lowerExpr(*fs.withExpr) : nullptr;
 
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);
@@ -3654,6 +3655,42 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
 
     // cond: task = MoveNextAsync(enum); hasValue = await task.
     builder_.SetInsertPoint(condBB);
+    // §30.8 (#790): cooperative cancellation — before advancing the iterator,
+    // observe the `with` token. When it is cancelled, dispose the enumerator
+    // frame and raise OperationCanceledException; the consuming method observes
+    // cancellation at this suspend point (§30.8). CancellationToken.None (a null
+    // state cell) never cancels.
+    if (tokenVal) {
+        auto* isCancFn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
+        llvm::Value* cancelled = builder_.CreateICmpNE(
+            builder_.CreateCall(isCancFn, {tokenVal}, "afor.canc"),
+            builder_.getInt32(0));
+        auto* cancelBB =
+            llvm::BasicBlock::Create(llvm_, "afor.cancel", currentFn_);
+        auto* proceedBB =
+            llvm::BasicBlock::Create(llvm_, "afor.proceed", currentFn_);
+        builder_.CreateCondBr(cancelled, cancelBB, proceedBB);
+        // cancelBB: dispose the iterator frame (vtable slot 1), then throw a
+        // catchable OperationCanceledException (mirrors ThrowIfCancellation
+        // Requested). emitThrowValue terminates the block (branch to unwind).
+        builder_.SetInsertPoint(cancelBB);
+        llvm::Value* cvt = builder_.CreateLoad(ptrTy(), enumPtr);
+        llvm::Value* cdisp = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), cvt, {builder_.getInt32(1)}));
+        builder_.CreateCall(disposeTy, cdisp, {enumPtr});
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end()) {
+            llvm::Value* oce = builder_.CreateCall(
+                callocFn(),
+                {builder_.getInt64(1), builder_.getInt64(16)}, "afor.oce");
+            builder_.CreateStore(vit->second, oce);
+            emitThrowValue(oce);
+        } else {
+            builder_.CreateBr(proceedBB);  // no OCE vtable available — fall back
+        }
+        builder_.SetInsertPoint(proceedBB);
+    }
     llvm::Value* vt = builder_.CreateLoad(ptrTy(), enumPtr);
     llvm::Value* mnSlotPtr =
         builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(2)});

@@ -334,6 +334,7 @@ set(BEZEL_TEST_SOURCES
     codegen/await_for_with_token_765_test.cpp
     codegen/null_guard_dispose_764_test.cpp
     codegen/property_ref_function_value_756_test.cpp
+    codegen/await_for_cancellation_790_test.cpp
     codegen/async_nested_task_return_776_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
