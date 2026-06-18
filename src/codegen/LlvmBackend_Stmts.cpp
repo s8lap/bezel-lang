@@ -819,6 +819,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // the unwrapped result value. (await-in-try / return-through-finally in
         // async bodies is deferred; finallyStack_ is empty for the minimal cut.)
         if (smKind_ == SuspendKind::Await && smStateStruct_) {
+            // #776 / §30.5: when the async result is a bare local `Task`/`Task<T>`
+            // being TRANSFERRED out (e.g. `return t;` in a `Task<Task<T>>` method),
+            // null its slot before scope-end disposal. `v` already holds the task
+            // pointer; without nulling, emitAllDisposals fire-and-forgets the very
+            // task being returned, so the caller's `await` on the returned task
+            // hangs (its completion was consumed by the scope-end fire-and-forget).
+            if (v && rs->value) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        rs->value.get())) {
+                    const sema::TypeRef* vt = ctx_.exprType(*id);
+                    bool isTaskLocal =
+                        vt && vt->kind == sema::TypeRef::Kind::Named &&
+                        !vt->nullable && vt->astNode && vt->astNode->name &&
+                        !vt->astNode->name->parts.empty() &&
+                        (vt->astNode->name->parts[0] == "Task" ||
+                         vt->astNode->name->parts[0] == "OwnedTask");
+                    if (isTaskLocal) {
+                        llvm::Type* sty = nullptr;
+                        if (llvm::Value* slot = lvalueAddr(*id, sty))
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), slot);
+                    }
+                }
+            }
             emitAllDisposals();
             // #721 C1 / §30.9: a `return` exiting a try-with-finally must run the
             // finally first. Stash the unwrapped result and route through the
