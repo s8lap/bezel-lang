@@ -1764,6 +1764,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // Dispose() → unit; no type needed.
                     }
+                    // issue #759 / §29.3 / §30.7 / stdlib §4.13: builtin
+                    // IAsyncEnumerator<T> / OwnedAsyncEnumerator<T> manual
+                    // protocol. MoveNextAsync(): Task<bool> — advances the async
+                    // iterator (vtable slot 2). The `await` typer then peels
+                    // Task<bool> → bool. (Current is a readonly property typed in
+                    // resolveMemberAccess below.) makeTaskTypeRef is defined later
+                    // in this function (out of scope here), so build Task<bool>
+                    // inline — a Named "Task" ast::Type with genericArgs=[Bool].
+                    if (colName == "IAsyncEnumerator" ||
+                        colName == "OwnedAsyncEnumerator") {
+                        if (m == "MoveNextAsync" && ce.args.empty()) {
+                            auto* taskBool = ctx_.makeTypeRef();
+                            taskBool->kind = TypeRef::Kind::Named;
+                            taskBool->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("Task");
+                            ann->name.reset(nm);
+                            taskBool->astNode = ann;
+                            taskBool->genericArgs.push_back(
+                                ctx_.primitiveTypeRef(P::Bool));
+                            ctx_.setExprType(&ce, taskBool);
+                        }
+                        // DisposeAsync()/Dispose() → Task/unit; no type needed.
+                    }
                     // Dictionary methods
                     if (colName == "Dictionary" || colName == "OwnedDictionary") {
                         if (m == "Count")
@@ -4636,8 +4662,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
+                    // issue #759: the async enumerators expose Current: T too.
                     (tt->astNode->name->parts[0] == "IEnumerator" ||
-                     tt->astNode->name->parts[0] == "OwnedEnumerator");
+                     tt->astNode->name->parts[0] == "OwnedEnumerator" ||
+                     tt->astNode->name->parts[0] == "IAsyncEnumerator" ||
+                     tt->astNode->name->parts[0] == "OwnedAsyncEnumerator");
                 if (isBuiltinEnumerator && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                     ctx_.setExprType(&ma, tt->genericArgs[0]);

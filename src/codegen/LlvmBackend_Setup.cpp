@@ -4767,6 +4767,31 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // method is not in methodFns_ yet, leave disposeAsyncFn null — emitDisposals
     // will use the sync fallback.
     if (ld->isAwaitUsing) {
+        // issue #759 (UNMASK): an async-iterator enumerator frame
+        // (IAsyncEnumerator<T> / OwnedAsyncEnumerator<T>) has the iterator vtable
+        // layout [0]=td,[1]=Dispose,[2]=MoveNextAsync,[3]=Current. The generic
+        // asyncDispose path below reclaims via emitDynamicDispose → vtable SLOT 2,
+        // which for THIS frame is MoveNextAsync (not Dispose) — calling it then
+        // freeing the frame corrupts the heap. Route scope-end disposal through
+        // the iterator-format slot-1 Dispose (iterEnumDispose), exactly as the
+        // sync `for` / `await for` loops do (§29.7); it runs the state machine's
+        // pending finally blocks (state → -1) then frees the frame.
+        if (ld->initializer) {
+            if (const sema::TypeRef* lt = ctx_.exprType(*ld->initializer)) {
+                bool isAsyncIterEnum =
+                    lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
+                    lt->astNode && lt->astNode->name &&
+                    !lt->astNode->name->parts.empty() &&
+                    (lt->astNode->name->parts[0] == "IAsyncEnumerator" ||
+                     lt->astNode->name->parts[0] == "OwnedAsyncEnumerator");
+                if (isAsyncIterEnum) {
+                    Disposal d{it->second, nullptr};
+                    d.iterEnumDispose = true;
+                    disposeStack_.back().push_back(d);
+                    return;
+                }
+            }
+        }
         Disposal d{it->second, nullptr};
         d.asyncDispose = true;
         // Attempt to resolve the direct DisposeAsync function pointer.

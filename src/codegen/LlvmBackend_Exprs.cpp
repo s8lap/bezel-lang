@@ -2827,8 +2827,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 !recvTy->declaration &&
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
+                // issue #759: async enumerators share the slot-3 Current layout.
                 (recvTy->astNode->name->parts[0] == "IEnumerator" ||
-                 recvTy->astNode->name->parts[0] == "OwnedEnumerator");
+                 recvTy->astNode->name->parts[0] == "OwnedEnumerator" ||
+                 recvTy->astNode->name->parts[0] == "IAsyncEnumerator" ||
+                 recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerator");
             if (isBuiltinEnumerator) {
                 llvm::Value* recv = lowerExpr(*ma->target);
                 if (recv && recv->getType()->isPointerTy()) {
