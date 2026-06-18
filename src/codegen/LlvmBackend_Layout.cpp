@@ -992,16 +992,33 @@ const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
     if (!declared || genericSubstSemaTy_.empty()) return declared;
     if (declared->kind != sema::TypeRef::Kind::Named || declared->declaration)
         return declared;
+    // §9.1 / §14.1 (#769): substitute the type param, PRESERVING the declared
+    // field's nullable flag. The substitution map holds the bare type argument
+    // (a non-nullable `int`), so a nullable field `V: T?` must resolve to
+    // `int?` — not `int`. Without this the `?` was dropped, so a nullable
+    // VALUE-type field lost its tagged `{i8 hasValue; T value}` treatment (wrong
+    // struct layout / missing nullable wrap → the field read back wrong).
+    auto withNullability = [&](const sema::TypeRef* sub) -> const sema::TypeRef* {
+        if (declared->nullable && sub && !sub->nullable) {
+            auto* nn = ctx_.makeTypeRef();
+            *nn = *sub;
+            nn->nullable = true;
+            return nn;
+        }
+        return sub;
+    };
     // Local generic record: type-param name is in astNode.
     if (declared->astNode && declared->astNode->name &&
         declared->astNode->name->parts.size() == 1) {
         auto it = genericSubstSemaTy_.find(declared->astNode->name->parts[0]);
-        if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+        if (it != genericSubstSemaTy_.end() && it->second)
+            return withNullability(it->second);
     }
     // #428: imported generic record — type-param name is in importedName.
     if (!declared->importedName.empty()) {
         auto it = genericSubstSemaTy_.find(declared->importedName);
-        if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+        if (it != genericSubstSemaTy_.end() && it->second)
+            return withNullability(it->second);
     }
     return declared;
 }

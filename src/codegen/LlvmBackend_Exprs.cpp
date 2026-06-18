@@ -7746,7 +7746,13 @@ llvm::Value* Emitter::buildRecordValue(
                 // mirroring buildOrderedArgs — without this the bare T would be
                 // stored into the wider struct slot, leaving the value half
                 // uninitialized. per §9.1
-                const sema::TypeRef* fty = recordMemberType(fields[i]);
+                // §9.1 / §14.1 (#769): resolve the field's type through the
+                // active record generic substitution — for `Box<int>` with a
+                // field `V: T?`, the declared `T?` must resolve to `int?` so the
+                // nullable-value wrap below fires and the value is stored as the
+                // tagged `{i8 hasValue; int value}` struct (the unresolved `T?`
+                // was mis-judged, leaving the field wrong).
+                const sema::TypeRef* fty = recordMemberTypeResolved(fields[i]);
                 if (isNullableValueTy(fty)) {
                     auto* expectedSt = nullableValueStructTy(fty);
                     llvm::Type* valTy = expectedSt->getElementType(1);

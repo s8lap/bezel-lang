@@ -318,6 +318,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_extension_773_test.cpp
     codegen/inline_owned_array_return_781_test.cpp
     codegen/generic_arg_inference_785_test.cpp
+    codegen/generic_record_nullable_field_769_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp
