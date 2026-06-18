@@ -605,10 +605,17 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                         if (!arg) { allUnbound = false; break; }
                         // An unbound type param: Named kind, no declaration,
                         // single-part name, NOT bound in the current outer subst.
+                        // issue #787: a builtin collection (`Array<int>`) is also
+                        // Named/declaration-less/single-part ("Array"); it carries
+                        // its own generic args, so it is a concrete type, NOT an
+                        // unbound parameter (a bare `T` has no generic args). Kept
+                        // in sync with the mirror check in LlvmBackend_Exprs.cpp
+                        // (lowerNew record construction).
                         if (arg->kind != sema::TypeRef::Kind::Named ||
                             arg->declaration ||
                             !arg->astNode || !arg->astNode->name ||
                             arg->astNode->name->parts.size() != 1 ||
+                            !arg->genericArgs.empty() ||
                             genericSubst_.count(arg->astNode->name->parts[0])) {
                             allUnbound = false;
                             break;

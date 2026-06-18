@@ -6890,9 +6890,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // Mirrors the allUnbound test in LlvmBackend_Layout.cpp:594-609.
             bool allUnbound = true;
             for (const auto& arg : rt->genericArgs) {
+                // issue #787: a bare type parameter (`T`) has NO generic args of
+                // its own; a builtin collection like `Array<int>` is ALSO a
+                // Named/declaration-less/single-part name ("Array") not in the
+                // subst, so it was misclassified as unbound — `new Box<Array<int>>`
+                // then SKIPPED the substitution, built the UNSPECIALIZED {i32}
+                // struct, and truncated the 8-byte Array pointer into a 4-byte
+                // field (SIGSEGV on field access via the specialized {ptr} view).
+                // A type carrying its own generic args is concrete, not unbound.
                 if (!arg || arg->kind != sema::TypeRef::Kind::Named ||
                     arg->declaration || !arg->astNode || !arg->astNode->name ||
                     arg->astNode->name->parts.size() != 1 ||
+                    !arg->genericArgs.empty() ||
                     genericSubst_.count(arg->astNode->name->parts[0])) {
                     allUnbound = false;
                     break;
