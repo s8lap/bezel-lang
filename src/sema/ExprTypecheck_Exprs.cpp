@@ -2058,14 +2058,36 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // param as the event payload T (handler) or the LINQ source
                 // element T, so its body resolves member access on the param.
                 TypeRef* savedPending = pendingLambdaParamType_;
+                TypeRef* savedLamRet = pendingLambdaReturnType_;
                 if (auto* lam =
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
                     else if (linqElem)    pendingLambdaParamType_ = linqElem;
+                    // issue #777 / §30.6: when an async lambda is bound to a
+                    // function-typed parameter `(…) -> Task<T>` / `OwnedTask<T>`,
+                    // thread the peeled element T so the lambda visitor rejects a
+                    // forgotten `await` in its body (same as the typed-local
+                    // path). Positional binding via calleeMd2/pos2 mirrors the
+                    // out-var inference above; the common positional call gets
+                    // the hint, named/overloaded forms simply do not.
+                    if (lam->isAsync && calleeMd2 &&
+                        pos2 < calleeMd2->params.size() &&
+                        calleeMd2->params[pos2].type) {
+                        if (auto* pt = ctx_.resolvedType(
+                                *calleeMd2->params[pos2].type)) {
+                            if (pt->kind == TypeRef::Kind::Function &&
+                                pt->funcReturn &&
+                                isTaskShapedRef(pt->funcReturn) &&
+                                !pt->funcReturn->genericArgs.empty())
+                                pendingLambdaReturnType_ =
+                                    pt->funcReturn->genericArgs.front();
+                        }
+                    }
                     (void)lam;
                 }
                 visitExpr(*a.value);
                 pendingLambdaParamType_ = savedPending;
+                pendingLambdaReturnType_ = savedLamRet;
             }
             ++pos2;
         }

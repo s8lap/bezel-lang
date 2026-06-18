@@ -105,6 +105,38 @@ BEZEL_TEST(async_forgotten_await_777, method_with_await_accepted) {
         "end C;"), 7);
 }
 
+// §30.6 REJECT: an async lambda passed as a call ARGUMENT to a function-typed
+// parameter `(…) -> Task<int>`, with a forgotten await. Threaded via the
+// callee's positional parameter type. Was SIGSEGV; now a compile error.
+BEZEL_TEST(async_forgotten_await_777, call_argument_forgotten_await_rejected) {
+    BEZEL_EXPECT_EQ(rejects(
+        "module M; "
+        "class C "
+        "  public static method GetSeven(): Task<int> "
+        "    return Task.FromResult<int>(7); end GetSeven; "
+        "  public static async method Run(f: () -> Task<int>): Task<int> "
+        "    return await f(); end Run; "
+        "  public static async method Main(): Task<int> "
+        "    return await Run(async () => GetSeven()); "          // forgot await
+        "  end Main; "
+        "end C;"), true);
+}
+
+// §30.6 ACCEPT: the corrected call-argument form — must compile and run.
+BEZEL_TEST(async_forgotten_await_777, call_argument_with_await_accepted) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C "
+        "  public static method GetSeven(): Task<int> "
+        "    return Task.FromResult<int>(7); end GetSeven; "
+        "  public static async method Run(f: () -> Task<int>): Task<int> "
+        "    return await f(); end Run; "
+        "  public static async method Main(): Task<int> "
+        "    return await Run(async () => await GetSeven()); "
+        "  end Main; "
+        "end C;"), 7);
+}
+
 // §30.6 ACCEPT (the exemption): a genuine `Task<Task<int>>` result — the element
 // type IS itself Task-shaped, so `return GetSeven()` (a Task<int> value) is
 // correct, not a forgotten await. Must compile and run.
