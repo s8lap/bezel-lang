@@ -2901,6 +2901,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // CG-generic: set up genericSubst_ for the receiver's type so
             // that fields accessed inside the getter use the right struct.
             auto savedSubst = genericSubst_;
+            auto savedSemaTy = genericSubstSemaTy_;
             if (auto* sym = ctx_.exprSymbol(*ma)) {
                 if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
                     if (ps->parent && ps->parent->decl) {
@@ -2911,9 +2912,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             auto* td = dynamic_cast<const ast::TypeDecl*>(ps->parent->decl);
                             if (td && td->genericParams.size() == recvTy->genericArgs.size()) {
                                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                                // §14.1 (#768): build the SEMA-type substitution
+                                // too — the getter body resolves the member type
+                                // (e.g. `_v: T?`) through genericSubstSemaTy_, so
+                                // without it a generic nullable field read with
+                                // the wrong type (wrong value / mismatched ICmp).
+                                std::unordered_map<std::string_view,
+                                                   const sema::TypeRef*> newSema;
                                 for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
                                     llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
                                     newSubst[td->genericParams[gi].name] = concrTy;
+                                    newSema[td->genericParams[gi].name] =
+                                        resolveTypeParamRef(recvTy->genericArgs[gi]);
                                 }
                                 // Check unresolved (i32 fallback) → use localGenericSubst_
                                 bool hasUnresolved = false;
@@ -2931,6 +2941,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                     }
                                 }
                                 genericSubst_ = std::move(newSubst);
+                                genericSubstSemaTy_ = std::move(newSema);
                             }
                         }
                     }
@@ -2972,6 +2983,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
             return v;
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
