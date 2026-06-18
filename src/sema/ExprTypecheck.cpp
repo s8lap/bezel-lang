@@ -613,6 +613,18 @@ bool ExprTC::returnsValue(const ast::Type* rt) {
 // return-type diagnostic (§30.1, in TypeResolution) already names a non-async
 // return type, and an async-iterator method is exempt from the value-return
 // check via the `isIteratorMethod` path.
+// issue #777 / §30.6: a Named `Task<…>` / `OwnedTask<…>` shape — the async task
+// wrapper. An async lambda/method body must produce the unwrapped element T, not
+// a Task value; a Task-shaped body where T is NOT itself Task-shaped is a
+// forgotten `await`.
+bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
+    return t && t->kind == TypeRef::Kind::Named && !t->nullable &&
+           t->astNode && t->astNode->name &&
+           t->astNode->name->parts.size() == 1 &&
+           (t->astNode->name->parts.front() == "Task" ||
+            t->astNode->name->parts.front() == "OwnedTask");
+}
+
 void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
                                    TypeRef*& outType) {
     outCtx = ReturnCtx::VoidMethod;
@@ -2071,7 +2083,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // issue #777 / §30.6: when a typed local's declared type is a function
+        // type `(…) -> Task<T>` / `(…) -> OwnedTask<T>` and the initializer is an
+        // `async` lambda, thread the peeled element T to the lambda visitor so it
+        // can reject a forgotten `await` in the body. Restored after the visit.
+        TypeRef* savedLamRet = pendingLambdaReturnType_;
+        if (ld->type && ld->initializer) {
+            if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
+                if (auto* dt = ctx_.resolvedType(*ld->type)) {
+                    if (dt->kind == TypeRef::Kind::Function && dt->funcReturn &&
+                        isTaskShapedRef(dt->funcReturn) &&
+                        !dt->funcReturn->genericArgs.empty())
+                        pendingLambdaReturnType_ =
+                            dt->funcReturn->genericArgs.front();
+                }
+            }
+        }
         if (ld->initializer) visitExpr(*ld->initializer);
+        pendingLambdaReturnType_ = savedLamRet;
         currentLiteralWideningHint_ = savedHint;
         if (currentScope_ && !ld->name.empty()) {
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
@@ -2239,6 +2268,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             checkAssignable(
                 ctx_.exprType(*rs->value), currentReturnType_,
                 rs->value->span.begin, "returned value");
+        }
+        // issue #777 / §30.6: forgotten `await` in an async METHOD body. For an
+        // async method `(): Task<T>`, currentReturnType_ is the peeled element T
+        // and inAsyncContext_ is set. `return <Task<U>>` (a bare un-awaited
+        // producer call) is silently accepted by checkAssignable (Task has no
+        // declaration, so the §5.1 path falls through) and then codegen stores
+        // the 8-byte task pointer into the element-sized result slot → memory
+        // corruption / SIGSEGV. Reject it with a clear diagnostic, unless the
+        // element T is itself Task-shaped (a legitimate `Task<Task<U>>` result).
+        if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
+            inAsyncContext_ && currentReturnType_ &&
+            !isTaskShapedRef(currentReturnType_) &&
+            isTaskShapedRef(ctx_.exprType(*rs->value))) {
+            ctx_.diagnostics().report(
+                Severity::Error, rs->value->span.begin,
+                "an `async` method's `return` must produce the element type of "
+                "its `Task<T>`/`OwnedTask<T>` return, not a `Task` value; add "
+                "`await` (e.g. `return await Producer();`) (§30.6)");
         }
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) visitExpr(*es->expr);

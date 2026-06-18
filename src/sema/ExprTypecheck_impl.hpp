@@ -157,6 +157,17 @@ private:
     // cleared) by visitExpr(LambdaExpr).
     TypeRef* pendingLambdaParamType_ = nullptr;
 
+    // issue #777 / §30.6: when about to visit an `async` lambda whose expected
+    // function type is `(…) -> Task<T>` / `(…) -> OwnedTask<T>`, this holds the
+    // peeled element type T so the lambda visitor can reject a forgotten `await`
+    // (an expression body that produces a `Task` value where T is expected).
+    // Null otherwise. Consumed (and cleared) by visitExpr(LambdaExpr).
+    TypeRef* pendingLambdaReturnType_ = nullptr;
+
+    // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwnedTask<…>`
+    // (the async task wrapper). Used to detect a forgotten `await`.
+    bool isTaskShapedRef(const TypeRef* t) const;
+
     // per §24.3: the payload type of an event-handler call's callee, or null
     // when `callee` is not `<event>.Subscribe/.Add/.Remove`. Used to set
     // pendingLambdaParamType_ before visiting the handler argument.

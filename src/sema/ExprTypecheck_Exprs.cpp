@@ -2144,6 +2144,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // don't inherit it.
         TypeRef* eventParamType = pendingLambdaParamType_;
         pendingLambdaParamType_ = nullptr;
+        // issue #777 / §30.6: the expected async element type T (peeled from a
+        // `(…) -> Task<T>` context), threaded in to detect a forgotten `await`.
+        // Consumed once so nested lambdas don't inherit it.
+        TypeRef* lamRetHint = pendingLambdaReturnType_;
+        pendingLambdaReturnType_ = nullptr;
         Scope lamScope;
         lamScope.parent = currentScope_;
         std::vector<sema::Symbol*> lamParamSyms;
@@ -2186,6 +2191,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         catchDepth_ = 0;
         if (lam->exprBody) visitExpr(*lam->exprBody);
         for (const auto& s : lam->stmts) if (s) visitStmt(*s);
+        // issue #777 / §30.6: forgotten `await` in an expression-bodied async
+        // lambda. The body must produce the element type T threaded in as
+        // lamRetHint, not a `Task` value. A Task-shaped body where T is not
+        // itself Task-shaped is a forgotten await — codegen would store the
+        // task pointer into the element-sized async result slot (corruption /
+        // SIGSEGV). The legitimate `(…) -> Task<Task<U>>` case is exempt because
+        // lamRetHint (= Task<U>) is itself Task-shaped.
+        if (lam->isAsync && lam->exprBody && lamRetHint &&
+            !isTaskShapedRef(lamRetHint) &&
+            isTaskShapedRef(ctx_.exprType(*lam->exprBody))) {
+            ctx_.diagnostics().report(
+                Severity::Error, lam->exprBody->span.begin,
+                "an expression-bodied `async` lambda's body must produce the "
+                "element type of its `Task<T>`/`OwnedTask<T>` return, not a "
+                "`Task` value; add `await` (e.g. `async () => await Producer()`)"
+                " (§30.6)");
+        }
         currentScope_ = saveScope;
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
