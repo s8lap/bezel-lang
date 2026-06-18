@@ -663,6 +663,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // operators must enumerate it via bz_lazy_from_llist + bz_lazy_to_array, the
     // same materialize-and-run path that lazy receivers use.
     bool isLinkedList = isLinkedListTypeName(recvTy);
+    // issue #775 / §16.3: a `Range<T>` is IEnumerable<T>; route its aggregate
+    // terminals (Count/Sum/Any/…) through the materialize-then-run path, the
+    // same as a lazy/LinkedList receiver. lowerToLazyEnumerator wraps the range
+    // via bz_lazy_from_range. (Recognized by name — in receiver position the
+    // Range TypeSymbol carries the builtin class decl, so isRangeType is false,
+    // but the value is the %bz.range struct.) `Contains` keeps its own §17.5
+    // range-membership lowering and is intentionally not range-materialized here.
+    bool isRangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                       recvTy->declaration &&
+                       recvTy->declaration->name == "Range" && m != "Contains";
     bool isArrTerminal =
         m == "Count" || m == "Sum" || m == "Aggregate" || m == "Average" ||
         m == "Min" || m == "Max" || m == "First" || m == "Single" ||
@@ -670,7 +680,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "ForEach" || m == "Contains" || m == "IndexOf" ||
         // stdlib §5 *OrNull variants (lazy source → materialize, then check):
         m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
-    bool lazyTerminal = (lazyRecv || isLinkedList) && isArrTerminal;
+    bool lazyTerminal =
+        (lazyRecv || isLinkedList || isRangeRecv) && isArrTerminal;
 
     if (!isArr && !isDict && !isStrBld && !lazyTerminal) return nullptr;
 
@@ -10807,7 +10818,8 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
 // collection as a lazy enumerator the runtime then drains. innerEsz is U's size.
 llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
                                                    int64_t innerEsz,
-                                                   bool innerIsLazy) {
+                                                   bool innerIsLazy,
+                                                   bool rangeInner) {
     auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$linq$flatsel", module_.get());
@@ -10822,9 +10834,33 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
     llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "fs.fn");
     llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
     llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "fs.env");
+    llvm::Value* inner;
+    if (rangeInner) {
+        // issue #775 / §16.3: the selector returns a `Range<T>` VALUE — a 32-byte
+        // { i64 start, i64 end, i64 step, i8 flags } struct, NOT a collection
+        // pointer. Call it via the struct-return ABI (LLVM lowers the sret
+        // automatically), extract the fields, and wrap them as a lazy range
+        // enumerator the runtime drains. (Open-ended selector ranges yield empty
+        // via bz_lazy_from_range — the per-element trampoline has no unwind
+        // context to raise InvalidOperationException; the receiver path does.)
+        auto* rty = rangeStructType();
+        auto* clTy = llvm::FunctionType::get(rty, {ptrTy(), elemTy}, false);
+        llvm::Value* rv = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "fs.rng");
+        llvm::Value* start = builder_.CreateExtractValue(rv, {0u}, "fs.rs");
+        llvm::Value* end   = builder_.CreateExtractValue(rv, {1u}, "fs.re");
+        llvm::Value* step  = builder_.CreateExtractValue(rv, {2u}, "fs.rp");
+        llvm::Value* flags = builder_.CreateExtractValue(rv, {3u}, "fs.rf");
+        auto* frFn = declareC("bz_lazy_from_range", ptrTy(),
+            {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
+        inner = builder_.CreateCall(frFn,
+            {start, end, step, flags, builder_.getInt64(innerEsz)}, "fs.inner.rng");
+        builder_.CreateRet(inner);
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
     auto* clTy = llvm::FunctionType::get(ptrTy(), {ptrTy(), elemTy}, false);
     llvm::Value* coll = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "fs.coll");
-    llvm::Value* inner;
     if (innerIsLazy) {
         // stdlib §5 (#758): the selector returns a LAZY enumerable directly — a
         // LINQ chain such as `(n) => arr.Where(...)`, whose result is already a
@@ -11006,6 +11042,36 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     }
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
+    // issue #775 / §16.3: a `Range<T>` is IEnumerable<T>. Wrap its value struct
+    // { i64 start, i64 end, i64 step, i8 flags } as a lazy range source so the
+    // receiver-position operators (Count/Where/Select/Sum/…) enumerate it. An
+    // open-ended range (flags bit1/bit2) raises InvalidOperationException per
+    // §16.3 (GetEnumerator on an open-ended range).
+    // A Range-typed receiver is recognized by name: in receiver position its
+    // TypeSymbol carries the builtin Range class decl (so isRangeType's
+    // `!declaration->decl` guard is false), but the lowered value is still the
+    // `%bz.range` { i64 start, i64 end, i64 step, i8 flags } struct.
+    bool isRangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                       recvTy->declaration &&
+                       recvTy->declaration->name == "Range";
+    if (isRangeRecv) {
+        elemRef = (recvTy && !recvTy->genericArgs.empty())
+                      ? recvTy->genericArgs[0] : nullptr;
+        llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
+        int64_t esz = lazyElemSize(et, module_->getDataLayout());
+        llvm::Value* start = builder_.CreateExtractValue(recv, {0u}, "rng.start");
+        llvm::Value* end   = builder_.CreateExtractValue(recv, {1u}, "rng.end");
+        llvm::Value* step  = builder_.CreateExtractValue(recv, {2u}, "rng.step");
+        llvm::Value* flags = builder_.CreateExtractValue(recv, {3u}, "rng.flags");
+        llvm::Value* isOpen = builder_.CreateICmpNE(
+            builder_.CreateAnd(flags, builder_.getInt8(6)),
+            builder_.getInt8(0), "rng.open");
+        emitGuardThrow(isOpen, "InvalidOperationException");
+        auto* fn = declareC("bz_lazy_from_range", ptrTy(),
+            {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
+        return builder_.CreateCall(fn,
+            {start, end, step, flags, builder_.getInt64(esz)}, "lazy.range");
+    }
     if (isLazyEnumerableType(recvTy)) {
         // Already a lazy enumerator (chained LINQ): use it directly.
         elemRef = recvTy->genericArgs[0];
@@ -11066,7 +11132,14 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // LinkedList), so Where/Select/ToArray/etc. silently fell through and returned
     // 0 or crashed.  Include it so the lazy operators wrap it correctly.
     bool llRecv = isLinkedListTypeName(recvTy);
-    if (!collRecv && !lazyRecv && !llRecv) return nullptr;
+    // issue #775 / §16.3: a `Range<T>` is IEnumerable<T> but is neither a
+    // bz_array_t*-backed collection nor a lazy enumerator — without this it fell
+    // through and Count()/Where()/Sum()/… over a range returned 0. lowerToLazy-
+    // Enumerator wraps it via bz_lazy_from_range, so admit it here too.
+    bool rangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                     recvTy->declaration &&
+                     recvTy->declaration->name == "Range";
+    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv) return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
     auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {
@@ -11408,8 +11481,16 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // collection), its result is already a `bz_lazy_t*` enumerator — the
         // trampoline returns it directly instead of wrapping it as an array.
         bool innerIsLazy = isLazyEnumerableType(retSemaType);
+        // issue #775 / §16.3: the selector returns a `Range<T>` value (a 32-byte
+        // struct, not a collection pointer) — the trampoline must call it via the
+        // struct-return ABI and wrap it via bz_lazy_from_range. Recognized by
+        // name (its TypeSymbol carries the builtin Range class decl).
+        bool rangeInner = retSemaType &&
+                          retSemaType->kind == sema::TypeRef::Kind::Named &&
+                          retSemaType->declaration &&
+                          retSemaType->declaration->name == "Range";
         llvm::Function* tramp =
-            buildSelectManyTrampoline(elemTy, innerEsz, innerIsLazy);
+            buildSelectManyTrampoline(elemTy, innerEsz, innerIsLazy, rangeInner);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(smFn,

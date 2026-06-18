@@ -1,17 +1,16 @@
-// fix #775 / §16.3: a `Range<T>` selector in `SelectMany` (the per-element
-// inner sequence is a range) is rejected with a clean diagnostic instead of
-// crashing.
+// fix #775 / §16.3: a `Range<T>` works as an IEnumerable<T> in the lazy LINQ
+// pipeline — both as a `SelectMany` selector return (flatten) and in receiver
+// position (Count/Sum/Where/Select/…). Previously a SelectMany Range selector
+// SIGSEGV'd (the 32-byte Range struct return was called via a pointer-return
+// trampoline ABI) and a Range receiver silently returned 0.
 //
-// `arr.SelectMany((n) => (1..n+1))` compiled clean but SIGSEGV'd at runtime: the
-// selector lowers to a 32-byte `Range` struct return, while the flatten
-// trampoline (`bz$linq$flatsel`) calls it via a pointer-return prototype — the
-// struct bits are reinterpreted as a pointer and fed to `bz_lazy_from_array`.
-// Per §16.3 a `Range<T>` implements `IEnumerable<T>`, so SelectMany SHOULD
-// support it, but the lazy range source is not yet implemented. Until then the
-// front end rejects it with a clear §16.3 diagnostic rather than miscompiling.
-// The legitimate paths (Select returning a sequence of ranges, an ordinary
-// non-range SelectMany selector, for-in over a range, range slicing) are
-// untouched.
+// The runtime gained a BZ_LAZY_RANGE source (bz_lazy_from_range) whose movenext
+// mirrors the for-in counted-loop semantics: inclusive (a..b) / half-open
+// (a..<b) per the flags byte, direction by the step sign. Codegen wraps a Range
+// receiver/selector via bz_lazy_from_range (the SelectMany trampoline calls the
+// selector through the struct-return ABI). Open-ended ranges raise
+// InvalidOperationException (§16.3). Ranges are INCLUSIVE by default, so the
+// flatten of [1,3] via (n)=>1..(n+1) is {1,2} ∪ {1,2,3,4} = 6 elements.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -23,65 +22,84 @@ int runFull(const std::string& program) {
     auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
-bool rejects(const std::string& program) {
-    return runJit(program).diagnostics.hasErrors();
-}
 }  // namespace
 
-// §16.3 REJECT: the #775 repro — a Range selector in SelectMany. Was SIGSEGV;
-// now a clean compile error.
-BEZEL_TEST(selectmany_range_selector_775, range_selector_rejected) {
-    BEZEL_EXPECT_EQ(rejects(
-        "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var arr: Array<int> := new Array<int>(2); "
-        "    arr.Add(1); arr.Add(3); "
-        "    var total: int := arr.SelectMany((n) => (1..n + 1)).Count(); "
-        "    return total mod 100; "
-        "  end Main; "
-        "end C;"), true);
-}
-
-// §16.3 ACCEPT: `Select` returning a Range yields a sequence OF ranges (no
-// flatten/iteration of the inner range) — does not hit the trampoline, must
-// still compile and run. arr=[1,3] → 2 range values.
-BEZEL_TEST(selectmany_range_selector_775, select_returning_range_ok) {
+// §16.3: the #775 repro — flatten an inclusive range per source element. Was
+// SIGSEGV; now returns the correct inclusive count (6, NOT the issue's "7").
+BEZEL_TEST(selectmany_range_selector_775, flatten_inclusive_count) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var arr: Array<int> := new Array<int>(2); "
-        "    arr.Add(1); arr.Add(3); "
-        "    return arr.Select((x) => (1..x)).Count(); "  // 2
-        "  end Main; "
-        "end C;"), 2);
+        "class C public static method Main(): int "
+        "  using var arr: Array<int> := new Array<int>(2); "
+        "  arr.Add(1); arr.Add(3); "
+        "  var total: int := arr.SelectMany((n) => (1..n + 1)).Count(); "
+        "  return total mod 100; "  // {1,2} ∪ {1,2,3,4} = 6
+        "end Main; end C;"), 6);
 }
 
-// §16.3 ACCEPT: an ordinary non-range SelectMany selector (Array inner) is
-// unaffected by the gate. arr=[1,2], selector returns arr → 2*2 = 4.
-BEZEL_TEST(selectmany_range_selector_775, array_selector_unaffected) {
+// §16.3: the flattened VALUES flow through (not just the count). For [1,3] with
+// (n)=>1..n: 1..1={1}(=1) ∪ 1..3={1,2,3}(=6); sum = 7.
+BEZEL_TEST(selectmany_range_selector_775, flatten_value_flow_sum) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var arr: Array<int> := new Array<int>(2); "
-        "    arr.Add(1); arr.Add(2); "
-        "    return arr.SelectMany((x) => arr).Count(); "  // 4
-        "  end Main; "
-        "end C;"), 4);
+        "class C public static method Main(): int "
+        "  using var arr: Array<int> := new Array<int>(2); "
+        "  arr.Add(1); arr.Add(3); "
+        "  return arr.SelectMany((n) => (1..n)).Sum(); "  // 1 + 6 = 7
+        "end Main; end C;"), 7);
 }
 
-// §16.3 ACCEPT: for-in over a range is a different (counted-loop) path — the
-// gate must not touch it. 1..4 is inclusive ⇒ 4 iterations.
-BEZEL_TEST(selectmany_range_selector_775, for_in_range_unaffected) {
+// §16.3: a half-open selector range `1..<n`. [2,3] → 1..<2={1}(1) ∪ 1..<3={1,2}(2)
+// = 3 elements.
+BEZEL_TEST(selectmany_range_selector_775, flatten_half_open) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    var k: int := 0; "
-        "    for var i in 1..4 do k := k + 1; end; "  // 4 (inclusive)
-        "    return k; "
-        "  end Main; "
-        "end C;"), 4);
+        "class C public static method Main(): int "
+        "  using var arr: Array<int> := new Array<int>(2); "
+        "  arr.Add(2); arr.Add(3); "
+        "  return arr.SelectMany((n) => (1..<n)).Count(); "  // 3
+        "end Main; end C;"), 3);
+}
+
+// §16.3: receiver-position aggregates — Count (inclusive) and Sum.
+BEZEL_TEST(selectmany_range_selector_775, receiver_count_and_sum) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C public static method Main(): int "
+        "  return (1..5).Count() + (1..5).Sum(); "  // 5 + 15 = 20
+        "end Main; end C;"), 20);
+}
+
+// §16.3: a receiver-position lazy chain over a range (Where → Select → Sum).
+// 1..10 evens = {2,4,6,8,10}; *1; sum = 30.
+BEZEL_TEST(selectmany_range_selector_775, receiver_where_select_sum) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C public static method Main(): int "
+        "  return (1..10).Where((x) => x mod 2 = 0).Select((x) => x).Sum(); "
+        "end Main; end C;"), 30);
+}
+
+// §16.4: descending (step -1) and positive step counted correctly via the range
+// source. 5..1 step -1 = {5,4,3,2,1} = 5; 1..10 step 2 = {1,3,5,7,9} = 5.
+BEZEL_TEST(selectmany_range_selector_775, step_and_descending) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C public static method Main(): int "
+        "  return (5..1 step -1).Count() + (1..10 step 2).Count(); "  // 10
+        "end Main; end C;"), 10);
+}
+
+// §16.3: GetEnumerator on an open-ended range raises InvalidOperationException.
+BEZEL_TEST(selectmany_range_selector_775, open_ended_raises) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var lo: int := 1; "
+        "  try "
+        "    return (lo..).Count(); "
+        "  catch "
+        "    var ex: InvalidOperationException => do return 5; end "
+        "  end; "
+        "end Main; end C;"), 5);
 }

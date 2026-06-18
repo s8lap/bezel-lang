@@ -755,6 +755,10 @@ void* bz_lazy_from_array(void* arr, int64_t elem_size);
 // lazy source so LINQ aggregate/terminal operators can enumerate it. Walks nodes
 // head-to-tail; does not own the list (caller still responsible for disposal).
 void* bz_lazy_from_llist(void* llist, int64_t elem_size);
+// issue #775 / §16.3: wrap a Range<T> (start/end/step/flags) as a lazy
+// IEnumerable<T> source. flags bit0=inclusive, bit1=startOpen, bit2=endOpen.
+void* bz_lazy_from_range(int64_t start, int64_t end, int64_t step,
+                         int8_t flags, int64_t elem_size);
 void* bz_lazy_where(void* up, void* closure, void* pred);            // pred: i32(closure, elem)
 void* bz_lazy_select(void* up, int64_t out_elem_size,
                      void* closure, void* sel);                      // sel: void(closure, elem, out)

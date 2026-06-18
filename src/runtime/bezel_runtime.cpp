@@ -4351,6 +4351,9 @@ enum bz_lazy_kind {
     BZ_LAZY_REVERSE,   // §5 Ordering: materialize then yield backwards
     // per §4.6/§4.7 + §5 fix #450:
     BZ_LAZY_LLIST,     // source = bz_llist_t*, walk nodes head-to-tail
+    // issue #775 / §16.3: a `Range<T>` source — a counted sequence from
+    // idx(start)→n(end) by up_esz(step), inclusive/exclusive per phase bit0.
+    BZ_LAZY_RANGE,
 };
 
 struct bz_lazy_t {
@@ -4535,6 +4538,26 @@ extern "C" void* bz_lazy_from_llist(void* llist, int64_t esz) {
     e->arr = llist;     // bz_llist_t*
     e->inner = nullptr; // current node, null = not yet started
     e->materialized = 0;// 0 = not yet advanced to head
+    return e;
+}
+
+// issue #775 / §16.3: wrap a `Range<T>` value (the codegen { i64 start, i64 end,
+// i64 step, i8 flags } struct) as a lazy IEnumerable<T> source so SelectMany and
+// the receiver-position LINQ operators (Count/Where/Select/…) can enumerate it.
+// `esz` is T's byte width; the i64 working value is truncated to its low esz
+// bytes on store (little-endian), matching the for-in counted-loop semantics.
+// flags bit0 = IsEndInclusive, bit1 = startOpen, bit2 = endOpen (§16.3 layout).
+// Open-ended ranges have no bounded enumeration: the receiver lowering raises
+// InvalidOperationException before calling this, and as a safe fallback for any
+// other path the enumerator is marked empty (movenext yields nothing).
+extern "C" void* bz_lazy_from_range(int64_t start, int64_t end, int64_t step,
+                                    int8_t flags, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_RANGE, esz);
+    e->idx = start;       // current working value
+    e->n = end;           // end bound
+    e->up_esz = step;     // signed stride (§16.4; sign decides direction)
+    e->phase = (int32_t)(uint8_t)flags;
+    if (((uint8_t)flags & 0x6u) != 0) e->stopped = 1;  // open-ended → empty
     return e;
 }
 
@@ -4892,6 +4915,22 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
         if (e->idx >= bz_array_len(e->arr)) return 0;
         memcpy(e->cur, bz_array_ptr_at(e->arr, e->idx, e->esz), (size_t)e->esz);
         e->idx++;
+        return 1;
+    }
+    // issue #775 / §16.3: counted iteration of a Range<T>. The direction is the
+    // sign of the step; inclusive/exclusive of the upper bound is phase bit0.
+    // This mirrors the for-in counted-loop semantics (a zero step yields nothing
+    // rather than looping forever; open-ended ranges were marked e->stopped).
+    case BZ_LAZY_RANGE: {
+        if (e->stopped) return 0;
+        int64_t cur = e->idx, end = e->n, step = e->up_esz;
+        if (step == 0) return 0;
+        bool incl = (e->phase & 1) != 0;
+        bool inRange = (step < 0) ? (incl ? cur >= end : cur > end)
+                                  : (incl ? cur <= end : cur < end);
+        if (!inRange) return 0;
+        memcpy(e->cur, &cur, (size_t)e->esz);  // low esz bytes = truncation to T
+        e->idx = cur + step;
         return 1;
     }
     case BZ_LAZY_WHERE: {

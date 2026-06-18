@@ -1044,36 +1044,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // (a collection or lazy enumerable carrying U at genericArgs[0]).
                     if (m == "SelectMany" && !ce.args.empty() && ce.args[0].value) {
                         TypeRef* outElem = srcElem;
+                        // issue #775 / §16.3: the selector may return a `Range<T>`
+                        // (a range as the inner sequence) — its element type is
+                        // genericArgs[0], exactly like a collection/lazy inner.
                         if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
                             if (lamTy->kind == TypeRef::Kind::Function &&
-                                lamTy->funcReturn) {
-                                // issue #775 / §16.3: a `Range<T>` selector — the
-                                // per-element inner sequence is a range — is not
-                                // yet supported by the lazy SelectMany pipeline.
-                                // The selector lowers to a 32-byte `Range` struct
-                                // return, but the flatten trampoline calls it via
-                                // a pointer-return prototype (ABI mismatch) and
-                                // reinterprets the struct bits as a pointer →
-                                // SIGSEGV at runtime. Reject with a clean
-                                // diagnostic until the lazy range source is
-                                // implemented, rather than miscompiling.
-                                if (lamTy->funcReturn->kind ==
-                                        TypeRef::Kind::Named &&
-                                    lamTy->funcReturn->declaration ==
-                                        builtinClassSym("Range")) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error,
-                                        ce.args[0].value->span.begin,
-                                        "flattening a `Range<T>` selector with "
-                                        "`SelectMany` is not yet supported "
-                                        "(§16.3); materialize the range into an "
-                                        "`Array<T>` first");
-                                    return true;
-                                }
-                                if (!lamTy->funcReturn->genericArgs.empty() &&
-                                    lamTy->funcReturn->genericArgs[0])
-                                    outElem = lamTy->funcReturn->genericArgs[0];
-                            }
+                                lamTy->funcReturn &&
+                                !lamTy->funcReturn->genericArgs.empty() &&
+                                lamTy->funcReturn->genericArgs[0])
+                                outElem = lamTy->funcReturn->genericArgs[0];
                         ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         return true;
                     }
@@ -1174,7 +1153,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 bool isLazyRecv = recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     !recvTy->declaration && !recvTy->astNode &&
                     !recvTy->genericArgs.empty();
-                if (isLazyRecv) {
+                // issue #775 / §16.3: a `Range<T>` is IEnumerable<T>. It carries
+                // the builtin Range class declaration (so it is not the lazy
+                // sentinel above), but exposes the same LINQ operators/terminals
+                // with element type genericArgs[0]. Type them through the same
+                // block so a chained `(1..n).Where(…).Count()` is typed (its
+                // result was otherwise left null → the downstream operator saw an
+                // untyped receiver). Range's own members (Contains/GetEnumerator)
+                // resolve through their dedicated handlers and are unaffected.
+                bool isRangeLinqRecv =
+                    recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    recvTy->declaration && recvTy->declaration->name == "Range" &&
+                    !recvTy->genericArgs.empty();
+                if (isLazyRecv || isRangeLinqRecv) {
                     TypeRef* srcElem = recvTy->genericArgs[0];
                     if (m == "Any" || m == "All")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
