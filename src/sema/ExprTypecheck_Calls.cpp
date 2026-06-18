@@ -1046,10 +1046,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         TypeRef* outElem = srcElem;
                         if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
                             if (lamTy->kind == TypeRef::Kind::Function &&
-                                lamTy->funcReturn &&
-                                !lamTy->funcReturn->genericArgs.empty() &&
-                                lamTy->funcReturn->genericArgs[0])
-                                outElem = lamTy->funcReturn->genericArgs[0];
+                                lamTy->funcReturn) {
+                                // issue #775 / §16.3: a `Range<T>` selector — the
+                                // per-element inner sequence is a range — is not
+                                // yet supported by the lazy SelectMany pipeline.
+                                // The selector lowers to a 32-byte `Range` struct
+                                // return, but the flatten trampoline calls it via
+                                // a pointer-return prototype (ABI mismatch) and
+                                // reinterprets the struct bits as a pointer →
+                                // SIGSEGV at runtime. Reject with a clean
+                                // diagnostic until the lazy range source is
+                                // implemented, rather than miscompiling.
+                                if (lamTy->funcReturn->kind ==
+                                        TypeRef::Kind::Named &&
+                                    lamTy->funcReturn->declaration ==
+                                        builtinClassSym("Range")) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        ce.args[0].value->span.begin,
+                                        "flattening a `Range<T>` selector with "
+                                        "`SelectMany` is not yet supported "
+                                        "(§16.3); materialize the range into an "
+                                        "`Array<T>` first");
+                                    return true;
+                                }
+                                if (!lamTy->funcReturn->genericArgs.empty() &&
+                                    lamTy->funcReturn->genericArgs[0])
+                                    outElem = lamTy->funcReturn->genericArgs[0];
+                            }
                         ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         return true;
                     }
