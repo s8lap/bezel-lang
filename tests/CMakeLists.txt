@@ -314,6 +314,7 @@ set(BEZEL_TEST_SOURCES
     codegen/selectmany_lazy_inner_758_test.cpp
     codegen/case_enum_prefix_body_772_test.cpp
     codegen/indexer_overload_774_test.cpp
+    codegen/owned_buffer_init_778_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp

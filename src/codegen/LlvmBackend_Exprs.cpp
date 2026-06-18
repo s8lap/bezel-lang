@@ -6241,8 +6241,78 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // (All slots are zero-initialized by calloc inside the runtime.)
                     auto* fn = declareC("bz_array_alloc_count_n", ptrTy(),
                                        {i64(), i64()});
-                    return builder_.CreateCall(fn,
+                    llvm::Value* buf = builder_.CreateCall(fn,
                         {builder_.getInt64(elemSize), nArg}, "ob.arr");
+                    // §4.14 (#778): the two-argument constructor
+                    // `OwnedBuffer<T>(length, init: (int) -> T)` calls `init(i)`
+                    // for each i in 0..<length and stores the result into slot i
+                    // (copying for value-typed T, taking ownership for class-typed
+                    // T — the buffer's destructor then disposes the owned slots).
+                    // Previously the init lambda was ignored and every slot stayed
+                    // zero / null.
+                    if (ne.args.size() >= 2 && ne.args[1].value) {
+                        llvm::Type* elemTy = i32();
+                        if (!rt->genericArgs.empty() && rt->genericArgs[0])
+                            if (auto* et = lowerTypeRef(rt->genericArgs[0]))
+                                elemTy = et;
+                        // Lower the init lambda as `(int) -> T` so its param and
+                        // return types match (mirrors the LINQ lambda lowering).
+                        auto* funcRef = ctx_.makeTypeRef();
+                        funcRef->kind = sema::TypeRef::Kind::Function;
+                        if (!rt->genericArgs.empty())
+                            funcRef->funcReturn = rt->genericArgs[0];
+                        sema::TypeRef::FuncParam fp;
+                        fp.type = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+                        funcRef->funcParams.push_back(fp);
+                        const sema::TypeRef* savedExpected = expectedFunctionType_;
+                        expectedFunctionType_ = funcRef;
+                        llvm::Value* initClosure = lowerExpr(*ne.args[1].value);
+                        expectedFunctionType_ = savedExpected;
+                        if (initClosure) {
+                            // for i in 0..<length: slot[i] := init(i)
+                            llvm::AllocaInst* iSlot = entryAlloca(i64());
+                            builder_.CreateStore(builder_.getInt64(0), iSlot);
+                            auto* hdr = llvm::BasicBlock::Create(
+                                llvm_, "ob.init.hdr", currentFn_);
+                            auto* bodyBB = llvm::BasicBlock::Create(
+                                llvm_, "ob.init.body", currentFn_);
+                            auto* doneBB = llvm::BasicBlock::Create(
+                                llvm_, "ob.init.done", currentFn_);
+                            builder_.CreateBr(hdr);
+                            builder_.SetInsertPoint(hdr);
+                            llvm::Value* iv =
+                                builder_.CreateLoad(i64(), iSlot, "ob.i");
+                            builder_.CreateCondBr(
+                                builder_.CreateICmpSLT(iv, nArg), bodyBB, doneBB);
+                            builder_.SetInsertPoint(bodyBB);
+                            // call init(i) via the closure ABI {fn_ptr, env_ptr}.
+                            llvm::Value* iArg = builder_.CreateTrunc(iv, i32());
+                            llvm::Value* clFn =
+                                builder_.CreateLoad(ptrTy(), initClosure, "ob.fn");
+                            llvm::Value* clEnvSlot = builder_.CreateGEP(
+                                ptrTy(), initClosure, {builder_.getInt32(1)});
+                            llvm::Value* clEnv =
+                                builder_.CreateLoad(ptrTy(), clEnvSlot, "ob.env");
+                            auto* clTy = llvm::FunctionType::get(
+                                elemTy, {ptrTy(), i32()}, false);
+                            llvm::Value* val = builder_.CreateCall(
+                                clTy, clFn, {clEnv, iArg}, "ob.v");
+                            // store the produced value into slot i.
+                            llvm::AllocaInst* vslot = entryAlloca(elemTy);
+                            builder_.CreateStore(val, vslot);
+                            auto* setFn = declareC(
+                                "bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), ptrTy(), i64()});
+                            builder_.CreateCall(setFn,
+                                {buf, iv, vslot, builder_.getInt64(elemSize)});
+                            builder_.CreateStore(
+                                builder_.CreateAdd(iv, builder_.getInt64(1)),
+                                iSlot);
+                            builder_.CreateBr(hdr);
+                            builder_.SetInsertPoint(doneBB);
+                        }
+                    }
+                    return buf;
                 }
                 // stdlib §4.4/§4.5 (#741): the `constructor(capacity: int)` arg
                 // reserves backing slots WITHOUT setting count (an empty array
