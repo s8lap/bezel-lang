@@ -9764,7 +9764,27 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     llvm::Type* retTy = llvm::Type::getVoidTy(llvm_);
     if (ci.returnType) {
         sema::TypeRef* rt = ctx_.resolvedType(*ci.returnType);
-        if (rt) retTy = lowerTypeRef(rt);
+        if (rt) {
+            retTy = lowerTypeRef(rt);
+            // §14.1 (#767): when the declared return type is a BARE, NON-NULLABLE
+            // type parameter `T` bound to a record, lowerTypeRef yields the
+            // cached UNSPECIALIZED struct from genericSubst_, but the body lowers
+            // `new T()` to the per-instantiation SPECIALIZED struct (recordStruct
+            // under the active substitution) — a return-type mismatch (IR_FAIL).
+            // Re-derive the return type exactly as the body does. Restricted to a
+            // bare non-nullable param: a nullable `T?` return goes through the
+            // tagged `{i8; T}` struct (lowerTypeRef is already correct, #568), and
+            // a direct record return (rt has a declaration) is already specialized
+            // by lowerTypeRef.
+            if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+                !rt->nullable) {
+                const sema::TypeRef* resolved = resolveTypeParamRef(rt);
+                if (resolved && resolved->kind == sema::TypeRef::Kind::Named &&
+                    resolved->declaration &&
+                    resolved->declaration->kind == ast::TypeDeclKind::Record)
+                    retTy = recordStruct(resolved->declaration);
+            }
+        }
     }
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
 
