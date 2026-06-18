@@ -2183,6 +2183,14 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     // bd: Box<double>), set up the substitution from the target's exprType
     // so classStruct uses the correct concrete field types.
     auto savedSubst = genericSubst_;
+    // §14.1 (#786): also save/build the SEMA-type substitution. The LLVM-type
+    // map (genericSubst_) alone is insufficient for a nullable VALUE field
+    // `V: T?` — its layout (`{i8, value}`) is driven by genericSubstSemaTy_ in
+    // lowerTypeRef's nullable bare-param branch, which falls to the `{i8, i32}`
+    // placeholder when that map is empty. So a `Box<bool>` field force-unwrap
+    // read `b.V!` GEP'd an i32 value and `br i32 %nv.val` failed IR verification
+    // (i32 is not i1). Mirror RecordSubstGuard/#766/#768: install both maps.
+    auto savedSemaTy = genericSubstSemaTy_;
     if (sema::TypeRef* targetTy = ctx_.exprType(*ma.target)) {
         if (targetTy->kind == sema::TypeRef::Kind::Named &&
             targetTy->declaration == ms->parent &&
@@ -2192,10 +2200,16 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             if (td && td->genericParams.size() ==
                       targetTy->genericArgs.size()) {
                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    newSema;
                 for (std::size_t gi = 0;
                      gi < td->genericParams.size(); ++gi) {
                     newSubst[td->genericParams[gi].name] =
                         lowerTypeRef(targetTy->genericArgs[gi]);
+                    // §14.1 (#786): resolve a bare-param arg through the outer
+                    // subst (built BEFORE genericSubstSemaTy_ is replaced).
+                    newSema[td->genericParams[gi].name] =
+                        resolveTypeParamRef(targetTy->genericArgs[gi]);
                 }
                 // If any resolved type is i32 (unresolved generic fallback),
                 // try looking up the local's stored concrete substitution.
@@ -2228,6 +2242,7 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                     }
                 }
                 genericSubst_ = std::move(newSubst);
+                genericSubstSemaTy_ = std::move(newSema);
             } else if (!td &&
                        ms->parent->genericParams.size() ==
                        targetTy->genericArgs.size()) {
@@ -2236,12 +2251,18 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                 // same layout substitution so recordStruct (and classStruct)
                 // produce the correct specialized struct for field-index mapping.
                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    newSema;
                 for (std::size_t gi = 0;
                      gi < ms->parent->genericParams.size(); ++gi) {
                     newSubst[ms->parent->genericParams[gi]->name] =
                         lowerTypeRef(targetTy->genericArgs[gi]);
+                    // §14.1 (#786): build the parallel sema-type map (#766).
+                    newSema[ms->parent->genericParams[gi]->name] =
+                        resolveTypeParamRef(targetTy->genericArgs[gi]);
                 }
                 genericSubst_ = std::move(newSubst);
+                genericSubstSemaTy_ = std::move(newSema);
             }
         } else if (targetTy->kind == sema::TypeRef::Kind::Named &&
                    targetTy->declaration &&
@@ -2259,8 +2280,12 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             std::unordered_map<std::string_view, llvm::Type*> ancSubst;
             std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
             if (computeAncestorGenericSubst(targetTy, ms->parent, ancSubst,
-                                            ancSema))
+                                            ancSema)) {
                 genericSubst_ = std::move(ancSubst);
+                // §14.1 (#786): install the parallel sema-type map so an
+                // inherited generic-base nullable field also resolves.
+                genericSubstSemaTy_ = std::move(ancSema);
+            }
         }
     }
     if (idxIt == fieldIndex_.end()) {
@@ -2280,10 +2305,12 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         // compiler on an instance-receiver static access (e.g. `c._x` where
         // `_x: int` is `public static`).
         genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
         return nullptr;
     }
     llvm::StructType* st = classStruct(ms->parent);
     genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
     // CG29: a record is a first-class struct value, not a pointer. To take
     // the address of one of its fields, GEP the record's storage:
     //  - an addressable target (a record local/parameter) → GEP its slot
