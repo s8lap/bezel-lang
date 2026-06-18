@@ -1732,6 +1732,136 @@ struct CaptureWalker {
         // BreakStmt / ContinueStmt: no sub-expressions.
     }
 };
+
+// §27.5 / #754: collect the OUTERMOST LambdaExpr nodes appearing in a statement
+// list, WITHOUT descending into the lambdas themselves. The caller runs
+// collectCapturedSyms on each (which DOES descend into nested lambdas), so a
+// for-var captured only by a nested lambda is still detected. Mirrors
+// CaptureWalker's traversal of the AST, but records lambdas instead of symbols.
+struct LambdaCollector {
+    std::vector<const ast::LambdaExpr*>& out;
+
+    void expr(const ast::Expr* e) {
+        if (!e) return;
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            out.push_back(lam); return;  // outermost only — do not descend
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return; }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            for (auto& a : ix->indices) expr(a.value.get());
+            return; }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get()); expr(b->right.get()); return; }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get()); return; }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get()); return; }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get()); expr(c->thenValue.get());
+            expr(c->elseValue.get()); return; }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get());
+            return; }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get());
+            return; }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get());
+            for (auto& a : w->assigns) expr(a.value.get());
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get());
+            for (auto& k : cl->keys) expr(k.get());
+            return; }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get());
+            return; }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get());
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return; }
+        // Literals and other leaf expressions: nothing to do.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get()); return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get()); return; }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get()); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get()); return; }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get()); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            expr(as->target.get()); expr(as->value.get()); return; }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get()); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get()); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get()); return; }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get());
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            for (auto& b : ws->body) stmt(b.get());
+            return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get()); expr(fs->withExpr.get());
+            for (auto& b : fs->body) stmt(b.get());
+            return; }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return; }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get());
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get());
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return; }
+        // BreakStmt / ContinueStmt: no sub-expressions.
+    }
+};
 }  // namespace
 
 
@@ -1741,6 +1871,24 @@ void Emitter::collectCapturedSyms(
     CaptureWalker w{ctx_, out};
     if (lam.exprBody) w.expr(lam.exprBody.get());
     for (auto& s : lam.stmts) w.stmt(s.get());
+}
+
+
+// §27.5 / #754: does any closure in `fs.body` capture the for-loop variable?
+bool Emitter::forVarCapturedInBody(const ast::ForStmt& fs) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    LambdaCollector lc{lambdas};
+    for (auto& s : fs.body) lc.stmt(s.get());
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::unordered_set<const sema::Symbol*> caps;
+        collectCapturedSyms(*lam, caps);
+        for (const sema::Symbol* s : caps) {
+            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                if (loc->decl == &fs) return true;
+            }
+        }
+    }
+    return false;
 }
 
 

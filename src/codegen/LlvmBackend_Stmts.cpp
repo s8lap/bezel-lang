@@ -1734,6 +1734,46 @@ bool Emitter::lowerWhile(const ast::WhileStmt& ws) {
 }
 
 
+// §27.5 / #754: lower a for-loop body, pre-boxing the loop variable into a
+// fresh per-iteration cell at body entry IF a closure in the body captures it.
+//
+// Background: `boxLocalSlot(forLoopVar=true)` allocates a fresh cell each
+// iteration so a `()=>i` closure captures that iteration's value (§16.5 fresh
+// binding). Previously this boxing was emitted lazily, at the capturing lambda
+// site, and `lowerLambda` then rebound `locals_[&fs]` to the cell — so every
+// later read of the loop variable in the body routes through the cell. When the
+// lambda sits inside a conditionally-executed branch (a nested `if`), an
+// iteration that skips that branch never allocates a fresh cell, so the
+// cell-holder still points at a stale earlier iteration's cell; reads of the
+// loop variable later in the body then observe the wrong value and loop control
+// flow miscompiles (#754: a counted loop returned 1 instead of 21).
+//
+// Pre-boxing here, unconditionally at body entry, refreshes the cell on EVERY
+// iteration regardless of branch outcomes. The capturing lambda's own
+// `boxLocalSlot` call then finds the slot already boxed and reuses the
+// body-entry cell (no double-box). The loop COUNTER stays on the original slot
+// (the cond/inc blocks read and advance it), and body entry reads that slot to
+// fill the fresh cell — so reassigning the loop variable in the body writes
+// through the cell without disturbing iteration (capture-by-reference, §27.5).
+//
+// Iterator (state-machine) methods map the loop variable to a frame field and
+// have their own resume/spill handling, so we never rebox there.
+bool Emitter::lowerForBody(const ast::ForStmt& fs) {
+    if (!smStateStruct_) {
+        auto it = locals_.find(&fs);
+        if (it != locals_.end()) {
+            llvm::AllocaInst* slot = it->second;
+            if (slot && !cellVars_.count(slot) && forVarCapturedInBody(fs)) {
+                llvm::AllocaInst* nb = nullptr;
+                boxLocalSlot(slot, nb, /*forLoopVar=*/true);
+                locals_[&fs] = nb;
+            }
+        }
+    }
+    return lowerScopedBlock(fs.body);
+}
+
+
 bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     auto* range = dynamic_cast<const ast::RangeExpr*>(fs.iterable.get());
 
@@ -1801,7 +1841,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
 
         builder_.SetInsertPoint(bodyBB);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-        bool term = lowerScopedBlock(fs.body);
+        bool term = lowerForBody(fs);
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
 
@@ -1872,7 +1912,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         builder_.CreateCondBr(cond, bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-        bool term = lowerScopedBlock(fs.body);
+        bool term = lowerForBody(fs);
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
         builder_.SetInsertPoint(incBB);
@@ -1910,7 +1950,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // body: `continue` targets incBB, `break` targets endBB.
     builder_.SetInsertPoint(bodyBB);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -1964,7 +2004,7 @@ bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
     llvm::Value* vp = builder_.CreateCall(valFn, {nodeB});
     builder_.CreateStore(builder_.CreateLoad(elemTy, vp), varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
     builder_.SetInsertPoint(incBB);
@@ -2035,7 +2075,7 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 builder_.CreateGEP(at, tmp,
                     {builder_.getInt32(0), idx2}));
             builder_.CreateStore(elem2, varSlot2);
-            lowerScopedBlock(fs.body);
+            lowerForBody(fs);
             llvm::Value* inc2 = builder_.CreateAdd(
                 builder_.CreateLoad(i32(), idxSlot2), builder_.getInt32(1));
             builder_.CreateStore(inc2, idxSlot2);
@@ -2091,7 +2131,7 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
             builder_.CreateStore(elem, varSlot);
             loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-            bool termSp = lowerScopedBlock(fs.body);
+            bool termSp = lowerForBody(fs);
             loopStack_.pop_back();
             if (!termSp) builder_.CreateBr(incBB);
             builder_.SetInsertPoint(incBB);
@@ -2147,7 +2187,7 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             // block — emitting the increment in bodyBBR left incBBR without a
             // terminator (malformed IR), mirroring the far.inc path below.
             loopStack_.push_back({incBBR, endBBR, disposeStack_.size()});
-            bool termR = lowerScopedBlock(fs.body);
+            bool termR = lowerForBody(fs);
             loopStack_.pop_back();
             if (!termR) builder_.CreateBr(incBBR);
             builder_.SetInsertPoint(incBBR);
@@ -2213,7 +2253,7 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     builder_.CreateStore(elem, varSlot);
 
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -2275,7 +2315,7 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
     llvm::Value* keyVal    = builder_.CreateLoad(elemTy, keyPtr);
     builder_.CreateStore(keyVal, varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -2398,7 +2438,7 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     initStringRc(strObj);  // #422: producer's reference, rc := 1
     builder_.CreateStore(strObj, varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -2545,7 +2585,7 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     builder_.CreateStore(decoded, varSlot);
 
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -2760,7 +2800,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     }
 
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -2828,7 +2868,7 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateStore(loadCodePoint(strPtr, idxB), varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    lowerScopedBlock(fs.body);
+    lowerForBody(fs);
     loopStack_.pop_back();
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(incBB);
@@ -2969,7 +3009,7 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     }
 
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -3172,7 +3212,7 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     }
 
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
@@ -3311,7 +3351,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
         builder_.CreateStore(elem, varSlot);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
-        lowerScopedBlock(fs.body);
+        lowerForBody(fs);
         loopStack_.pop_back();
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(incBB);
@@ -3383,7 +3423,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // so that emitLoopDisposals on `break` disposes both the body scope AND
     // the enumerator scope (calls Dispose on the iterator frame).
     loopStack_.push_back({condBB, endBB, outerDepth});
-    lowerScopedBlock(fs.body);
+    lowerForBody(fs);
     loopStack_.pop_back();
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(condBB);
@@ -3574,7 +3614,7 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     }
 
     loopStack_.push_back({condBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
 
@@ -3715,7 +3755,7 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     builder_.CreateStore(curVal, varSlot);
 
     loopStack_.push_back({condBB, endBB, disposeStack_.size()});
-    bool term = lowerScopedBlock(fs.body);
+    bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
 
@@ -3787,7 +3827,7 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     builder_.CreateStore(curVal, varSlot);
 
     loopStack_.push_back({condBB, endBB, disposeStack_.size()});
-    lowerScopedBlock(fs.body);
+    lowerForBody(fs);
     loopStack_.pop_back();
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(condBB);

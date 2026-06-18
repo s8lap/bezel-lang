@@ -4512,6 +4512,15 @@ private:
     bool lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                           std::size_t startIdx = 0);
 
+    // §27.5 / #754: lower a for-loop body. If the loop variable is captured by a
+    // closure anywhere in the body, first pre-box it into a fresh per-iteration
+    // cell AT BODY ENTRY (rather than lazily at the capturing lambda site) so the
+    // cell is refreshed on EVERY iteration — including iterations where the
+    // capturing lambda sits inside a conditionally-executed branch (a nested
+    // `if`). Then delegate to lowerScopedBlock. Used by every for-handler in
+    // place of a bare `lowerScopedBlock(fs.body)`.
+    bool lowerForBody(const ast::ForStmt& fs);
+
     // CG13: emit Dispose calls for one scope's `using var`s, in reverse
     // declaration order (§28.4 ordering). #383 / §31.1: when `isUnwind` is true
     // (the exception-propagation path), a `caughtException` entry is SKIPPED —
@@ -4715,6 +4724,12 @@ private:
     // their captures too. Identifier resolution uses sema's exprSymbol map.
     void collectCapturedSyms(const ast::LambdaExpr& lam,
                              std::unordered_set<const sema::Symbol*>& out);
+
+    // §27.5 / #754: does any closure in `fs.body` capture the for-loop variable?
+    // Finds the outermost LambdaExprs in the body and runs collectCapturedSyms on
+    // each (which descends into nested lambdas), returning true iff some captured
+    // symbol is the for-var's LocalSymbol (its `decl == &fs`).
+    bool forVarCapturedInBody(const ast::ForStmt& fs);
 
     // Lower an expression to an LLVM value.
     //   CG1: integer literals.
