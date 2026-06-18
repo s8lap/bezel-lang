@@ -11314,8 +11314,13 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  m == "Union" || m == "Intersect" || m == "Except" ||
                  // stdlib §5 Ordering secondary key:
                  m == "ThenBy" || m == "ThenByDescending" ||
-                 // stdlib §5 lazy Reverse — only on a lazy receiver (not Array):
-                 (m == "Reverse" && lazyRecv) ||
+                 // stdlib §5 lazy Reverse — on a lazy receiver (not Array, which
+                 // has an in-place Array.Reverse()). issue #775: a Range<T> also
+                 // has no in-place Reverse, so `(1..n).Reverse()` is the lazy
+                 // materialize-then-yield-backwards form — without rangeRecv it
+                 // fell through to the Array in-place handler (Count/Sum = 0;
+                 // ToArray SIGABRT on the bz.range struct read as an array).
+                 (m == "Reverse" && (lazyRecv || rangeRecv)) ||
                  // stdlib §5 (#651): OfType<U>() — lazy identity/type-filter.
                  m == "OfType");
     if (!isOp) return nullptr;

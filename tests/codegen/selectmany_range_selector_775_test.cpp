@@ -103,6 +103,20 @@ BEZEL_TEST(selectmany_range_selector_775, typed_element_select_lambda) {
         "end Main; end C;"), 0);
 }
 
+// §16.3 / stdlib §5: `Reverse()` on a Range source. The lazy `Reverse` operator
+// was gated on a lazy receiver only (to avoid intercepting `Array.Reverse()`'s
+// in-place form); a Range — which has no in-place Reverse — fell through to the
+// Array in-place handler, so `(1..n).Reverse().Count()/.Sum()` returned 0 and
+// `.ToArray()` SIGABRT'd (the bz.range struct was read as an array). The fix
+// admits a Range receiver into the lazy Reverse path.
+BEZEL_TEST(selectmany_range_selector_775, reverse_over_range) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class C public static method Main(): int "
+        "  return (1..5).Reverse().First() + (1..5).Reverse().Count(); "  // 5 + 5 = 10
+        "end Main; end C;"), 10);
+}
+
 // §16.3: GetEnumerator on an open-ended range raises InvalidOperationException.
 BEZEL_TEST(selectmany_range_selector_775, open_ended_raises) {
     BEZEL_EXPECT_EQ(runFull(
