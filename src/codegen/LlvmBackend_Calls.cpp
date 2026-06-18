@@ -9208,24 +9208,24 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 genericSubst_;
             std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
                 genericSubstSemaTy_;
-            for (const auto& gp : md->genericParams) {
-                if (newSubst.count(gp.name)) continue;  // already bound
-                // Find a value parameter whose declared type is exactly this
-                // type parameter, and read the matching call argument's type.
-                for (std::size_t pi = 0; pi < md->params.size() &&
-                     pi < call.args.size(); ++pi) {
-                    const ast::Type* pt = md->params[pi].type.get();
-                    if (!pt || pt->kind != ast::TypeKind::Named || !pt->name ||
-                        pt->name->parts.size() != 1 ||
-                        pt->name->parts[0] != gp.name)
-                        continue;
-                    if (!call.args[pi].value) continue;
-                    sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
-                    if (!at) continue;
-                    newSubst[gp.name] = lowerTypeRef(at);
-                    newSema[gp.name] = at;
-                    break;
-                }
+            // §14.1 (#785): bind each method type parameter by STRUCTURALLY
+            // unifying every value parameter's declared type against the call
+            // argument's type — so a generic-typed parameter `p: Pair<A, B>`
+            // binds A and B from a `Pair<int, string>` argument, not only a
+            // top-level bare `p: T`. Reuses the same recursive unification the
+            // return-type inference uses (unifyMethodReturnTypeArg); the helper
+            // skips any param already bound (genericSubst_ from the receiver, or
+            // an earlier parameter).
+            for (std::size_t pi = 0; pi < md->params.size() &&
+                 pi < call.args.size(); ++pi) {
+                if (!md->params[pi].type || !call.args[pi].value) continue;
+                const sema::TypeRef* declPt =
+                    ctx_.resolvedType(*md->params[pi].type);
+                sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
+                if (!declPt || !at) continue;
+                bool added = false;
+                unifyMethodReturnTypeArg(declPt, at, md->genericParams,
+                                         newSubst, newSema, added);
             }
             // per §14.1 (issues #515/#516/#561): a generic method whose type
             // param appears ONLY in lambda param/return positions (not in any

@@ -197,6 +197,34 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 }
 
 namespace {
+// §14.1 (#785): structurally unify a value parameter's declared type (`pt`,
+// AST) against the call argument's resolved type (`argTy`), binding each method
+// type parameter named in `paramNames` to the matching component of the
+// argument's type. A bare `p: T` binds T; a generic-typed `p: Pair<A, B>`
+// recurses pairwise into the generic args (binding A and B from a
+// `Pair<int, string>` argument). The first binding for a name wins (a later or
+// already-receiver-bound occurrence is left). Mirrors codegen's
+// unifyMethodReturnTypeArg. // per §14.1
+void unifyArgSubst(
+    const ast::Type* pt, TypeRef* argTy,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_map<std::string_view, TypeRef*>& argSubst) {
+    if (!pt || !argTy) return;
+    if (pt->kind == ast::TypeKind::Named && pt->name &&
+        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
+        std::string_view nm = pt->name->parts[0];
+        if (!argSubst.count(nm)) argSubst[nm] = argTy;
+        return;
+    }
+    if (!pt->genericArgs.empty() &&
+        argTy->kind == TypeRef::Kind::Named &&
+        argTy->genericArgs.size() == pt->genericArgs.size()) {
+        for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
+            unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
+                          paramNames, argSubst);
+    }
+}
+
 // A printable signature for a method candidate, e.g. "F(int, long)".
 std::string methodSignatureString(std::string_view name,
                                   const std::vector<ast::Param>& params) {
@@ -621,25 +649,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // path only runs when typeArgs is empty — i.e., type inference
                 // from arguments is needed.)
                 if (!md->genericParams.empty()) {
-                    // Build the argument-inferred substitution map: for each
-                    // method generic param, find the first value parameter whose
-                    // declared type is exactly that bare param name, and map
-                    // the param to the corresponding call argument's sema type.
+                    // §14.1 (#785): build the argument-inferred substitution map
+                    // by STRUCTURALLY unifying each value parameter's declared
+                    // type against the call argument's type — so a generic-typed
+                    // parameter `p: Pair<A, B>` binds A and B (not only a bare
+                    // `p: T`). Without this the return type `A` was left as the
+                    // unresolvable bare param (`q := First(p)` typed `?`).
+                    std::unordered_set<std::string_view> paramNames;
+                    for (const auto& gp : md->genericParams)
+                        paramNames.insert(gp.name);
                     std::unordered_map<std::string_view, TypeRef*> argSubst;
-                    for (const auto& gp : md->genericParams) {
-                        for (std::size_t pi = 0;
-                             pi < md->params.size() &&
-                             pi < ce.args.size(); ++pi) {
-                            const ast::Type* pt = md->params[pi].type.get();
-                            if (!pt || pt->kind != ast::TypeKind::Named ||
-                                !pt->name ||
-                                pt->name->parts.size() != 1 ||
-                                pt->name->parts[0] != gp.name)
-                                continue;
-                            if (!ce.args[pi].value) continue;
-                            TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
-                            if (argTy) { argSubst[gp.name] = argTy; break; }
-                        }
+                    for (std::size_t pi = 0;
+                         pi < md->params.size() && pi < ce.args.size(); ++pi) {
+                        if (!md->params[pi].type || !ce.args[pi].value) continue;
+                        TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                        unifyArgSubst(md->params[pi].type.get(), argTy,
+                                      paramNames, argSubst);
                     }
                     // #729: enforce the method's where-constraints on the
                     // argument-inferred type args (only when no explicit type
@@ -3924,6 +3949,27 @@ TypeRef* ExprTC::substituteReturnType(
     return declared;
 }
 
+// §14.1 (#785): collect the method type-parameter names that a value
+// parameter's declared type BINDS — recursively, so a generic-typed parameter
+// like `p: Pair<A, B>` discovers both A and B (a bare `p: T` discovers T), not
+// only a top-level bare parameter name. Mirrors codegen's structural
+// argument-inference (unifyMethodReturnTypeArg). // per §14.1
+static void collectBoundParamNames(
+    const ast::Type* pt,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_set<std::string_view>& boundByArg) {
+    if (!pt) return;
+    if (pt->kind == ast::TypeKind::Named && pt->name &&
+        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0]))
+        boundByArg.insert(pt->name->parts[0]);
+    for (const auto& ga : pt->genericArgs)
+        collectBoundParamNames(ga.get(), paramNames, boundByArg);
+    collectBoundParamNames(pt->arrayElement.get(), paramNames, boundByArg);
+    collectBoundParamNames(pt->funcReturn.get(), paramNames, boundByArg);
+    for (const auto& fp : pt->funcParams)
+        collectBoundParamNames(fp.type.get(), paramNames, boundByArg);
+}
+
 // per §14.1/§14.2 + §A.7 (issue #391) — see the header comment. Solve a
 // generic method's return-only type parameters from the call's target type.
 bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
@@ -3961,12 +4007,8 @@ bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
     std::unordered_set<std::string_view> paramNames;
     for (const auto& gp : md->genericParams) paramNames.insert(gp.name);
     std::unordered_set<std::string_view> boundByArg;
-    for (const auto& p : md->params) {
-        const ast::Type* pt = p.type.get();
-        if (pt && pt->kind == ast::TypeKind::Named && pt->name &&
-            pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0]))
-            boundByArg.insert(pt->name->parts[0]);
-    }
+    for (const auto& p : md->params)
+        collectBoundParamNames(p.type.get(), paramNames, boundByArg);
 
     // The unbound parameters are those a target must solve. If every parameter
     // is bound by an argument, this is the ordinary argument-inferred case and
