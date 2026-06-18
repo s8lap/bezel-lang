@@ -421,6 +421,36 @@ BlockState MethodOwnership::runDataflow(
             return flow::CFG::isExceptionEdge(p, b) ||
                    flow::CFG::isCompletionEdge(p, b);
         };
+        // §28.3/§28.7 (#764): the name of the local that is PROVABLY NULL on the
+        // CFG edge p→b, when p is an if/elif condition `x <> null` / `x = null`
+        // on a local and b is the null successor (succs[0]=true, succs[1]=false).
+        // Empty otherwise (loop headers, non-Branch preds, non-null-check
+        // conditions). Condition-sensitive: fires only for a real null check.
+        auto nullEdgeName = [](const flow::CFGBlock* p,
+                               const flow::CFGBlock* b) -> std::string_view {
+            if (!p || p->kind != flow::CFGBlock::Kind::Branch ||
+                p->isLoopHeader || p->succs.size() < 2 || !p->condition)
+                return {};
+            const auto* be = dynamic_cast<const ast::BinaryExpr*>(p->condition);
+            if (!be || (be->op != "<>" && be->op != "=")) return {};
+            const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(be->left.get());
+            bool nullOther =
+                dynamic_cast<const ast::NullLiteralExpr*>(be->right.get())
+                    != nullptr;
+            if (!id) {  // accept the reversed `null <> x`
+                id = dynamic_cast<const ast::IdentifierExpr*>(be->right.get());
+                nullOther =
+                    dynamic_cast<const ast::NullLiteralExpr*>(be->left.get())
+                        != nullptr;
+            }
+            if (!id || !nullOther) return {};
+            // `x <> null`: x is null on the FALSE edge (succs[1]).
+            // `x = null` : x is null on the TRUE  edge (succs[0]).
+            const flow::CFGBlock* nullSucc =
+                (be->op == "<>") ? p->succs[1] : p->succs[0];
+            return (b == nullSucc) ? id->name : std::string_view{};
+        };
         auto foldPred = [&](const flow::CFGBlock* p, bool dischargeEdge) {
             if (!evaluated.count(p)) return;
             const bool loopEdge =
@@ -430,7 +460,24 @@ BlockState MethodOwnership::runDataflow(
             if (dischargeEdge)
                 peDischarged =
                     dischargeOnExceptionEdge(peRaw, unwoundDeclsFor(b));
-            const BlockState& pe = dischargeEdge ? peDischarged : peRaw;
+            const BlockState& peBase = dischargeEdge ? peDischarged : peRaw;
+            // §28.3/§28.7 (#764): on the edge where x is provably null, x carries
+            // no disposal obligation ("disposal of null is a no-op"). Feed x as
+            // Disposed into THIS edge's contribution only — the other (non-null)
+            // edge keeps x Owned, so a genuine leak there (e.g. a then-branch
+            // that never disposes, or a null branch that re-acquires ownership)
+            // still surfaces at the merge join.
+            BlockState peGuard;
+            const BlockState* pePtr = &peBase;
+            if (std::string_view nn = nullEdgeName(p, b); !nn.empty()) {
+                peGuard = peBase;
+                for (auto& [sym, lo] : peGuard)
+                    if (sym && sym->name == nn &&
+                        lo.state == OwnershipState::Owned)
+                        lo.state = OwnershipState::Disposed;
+                pePtr = &peGuard;
+            }
+            const BlockState& pe = *pePtr;
             if (!haveIn) {
                 in = pe;
                 haveIn = true;

@@ -383,6 +383,9 @@ private:
         // but adding successor edges. To keep the contract clean, we
         // promote `from` to Branch kind.
         from->kind = CFGBlock::Kind::Branch;
+        // #764: record the (el)if condition so the ownership pass can
+        // null-discriminate the branch successors (succs[0]=true, succs[1]=false).
+        from->condition = b.condition.get();
         // Async-readiness 3a: the (el)if condition is evaluated in this
         // branch block; record any `await` in it as a suspend site here.
         recordAwaitsInExpr(cfg_, from, b.condition.get());

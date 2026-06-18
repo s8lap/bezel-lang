@@ -102,6 +102,13 @@ struct CFGBlock {
     // separate dominator computation.
     bool isLoopHeader = false;
 
+    // #764: for an if/elif condition Branch block, the condition expression —
+    // so a forward analysis can null-discriminate the successors (`x <> null`
+    // makes x non-null on succs[0] and null on succs[1]; `x = null` the reverse).
+    // Null for loop-header Branches and non-Branch blocks. Additive; populated by
+    // the CFG builder's visitBranch.
+    const ast::Expr* condition = nullptr;
+
     // F2 / O11-real: successor targets reached only along an *exception*
     // (stack-unwinding) edge from this block — an explicit `throw`, or the
     // over-approximated "a throwable call inside the try body" edge from a
