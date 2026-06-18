@@ -1334,9 +1334,12 @@ void Emitter::declareVtables() {
         // each holding a per-class accessor function (getter, then setter if the
         // interface property declares one). Indices continue from the running
         // count so method/event positions are unchanged.
+        // #730 / §23.4: interface INDEXERS (`property [i: T]: U;`) participate
+        // too, interleaved with named properties in declaration order. The fill
+        // in Pass D walks the same member order, so positions stay consistent.
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
-            if (!ps || ps->isIndexer) continue;
+            if (!ps) continue;
             ifacePropertyGetIndex_[ps] = idx++;
             if (propertyHasSetter(ps)) ifacePropertySetIndex_[ps] = idx++;
         }
@@ -1554,10 +1557,11 @@ void Emitter::declareVtables() {
             }
             // #481 / §13 / §23: collect iface's properties in declaration order
             // (after the events, matching ifacePropertyGetIndex_'s numbering).
+            // #730 / §23.4: include indexers — same member order as Pass 0.
             std::vector<sema::PropertySymbol*> ifaceProps;
             for (sema::Symbol* m : iface->members) {
                 auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
-                if (ps && !ps->isIndexer) ifaceProps.push_back(ps);
+                if (ps) ifaceProps.push_back(ps);
             }
             // Skip a wholly empty interface (no methods, events, or properties).
             if (ifaceMethods.empty() && ifaceEvents.empty() &&
@@ -1594,6 +1598,30 @@ void Emitter::declareVtables() {
             // vtable. Interface-typed property access dispatches here to reach
             // the implementing class's get/set body.
             for (sema::PropertySymbol* ip : ifaceProps) {
+                // #730 / §23.4: an interface INDEXER's slot holds the class's
+                // concrete indexer accessor (`T get(ptr this, idx...)` /
+                // `void set(ptr this, idx..., value)`), matched by index-param
+                // type rather than name (all indexers are anonymous ".this").
+                if (ip->isIndexer) {
+                    const sema::PropertySymbol* iimpl =
+                        classIndexerImplementing(ts, ip);
+                    llvm::Constant* getFp =
+                        llvm::ConstantPointerNull::get(ptrTy());
+                    if (iimpl)
+                        if (llvm::Function* acc = ensureIndexerGetterFn(ts, iimpl))
+                            getFp = llvm::cast<llvm::Constant>(acc);
+                    itabElems.push_back(getFp);
+                    if (propertyHasSetter(ip)) {
+                        llvm::Constant* setFp =
+                            llvm::ConstantPointerNull::get(ptrTy());
+                        if (iimpl)
+                            if (llvm::Function* acc =
+                                    ensureIndexerSetterFn(ts, iimpl))
+                                setFp = llvm::cast<llvm::Constant>(acc);
+                        itabElems.push_back(setFp);
+                    }
+                    continue;
+                }
                 sema::PropertySymbol* impl =
                     classPropertyByName(ts, ip->name);
                 llvm::Constant* getFp =
@@ -9973,10 +10001,13 @@ void Emitter::setupBoxDescriptors() {
             // This was the root cause of the block-form-getter SIGSEGV: Pass C
             // only handled methods, so property slots were absent from the
             // record's box itable and bz_itable_lookup + GEP reached null.
+            // #730 / §23.4: include indexers — same member order as Pass 0, so
+            // record-box itable slot offsets stay consistent with the class
+            // path's ifacePropertyGetIndex_ numbering.
             std::vector<sema::PropertySymbol*> ifaceProps;
             for (sema::Symbol* m : iface->members) {
                 auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
-                if (ps && !ps->isIndexer) ifaceProps.push_back(ps);
+                if (ps) ifaceProps.push_back(ps);
             }
             // Skip a wholly empty interface (no methods, events, or properties).
             if (ifaceMethods.empty() && ifaceEvents.empty() &&
@@ -10123,6 +10154,34 @@ void Emitter::setupBoxDescriptors() {
             // classStruct routes to recordStruct for records (§9.4).
             classStruct(ts);
             for (sema::PropertySymbol* ip : ifaceProps) {
+                // #730 / §23.4: a record's interface-indexer slot holds a box
+                // thunk over the record's concrete indexer accessor (the thunk
+                // GEPs past the box header to the record bytes, then forwards
+                // the index params / value).
+                if (ip->isIndexer) {
+                    const sema::PropertySymbol* iimpl =
+                        classIndexerImplementing(ts, ip);
+                    llvm::Constant* getFp =
+                        llvm::ConstantPointerNull::get(ptrTy());
+                    if (iimpl)
+                        if (llvm::Function* acc = ensureIndexerGetterFn(ts, iimpl))
+                            getFp = makeBoxThunk(acc,
+                                "bz$boxidxget$" + std::string(ts->name) + "$" +
+                                std::string(iface->name));
+                    itabElems.push_back(getFp);
+                    if (propertyHasSetter(ip)) {
+                        llvm::Constant* setFp =
+                            llvm::ConstantPointerNull::get(ptrTy());
+                        if (iimpl)
+                            if (llvm::Function* acc =
+                                    ensureIndexerSetterFn(ts, iimpl))
+                                setFp = makeBoxThunk(acc,
+                                    "bz$boxidxset$" + std::string(ts->name) +
+                                    "$" + std::string(iface->name));
+                        itabElems.push_back(setFp);
+                    }
+                    continue;
+                }
                 sema::PropertySymbol* impl =
                     classPropertyByName(ts, ip->name);
                 llvm::Constant* getFp =

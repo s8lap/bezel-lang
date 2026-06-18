@@ -907,6 +907,54 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ps) return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
+    // #730 / §13 / §23.4: an indexer accessed through an INTERFACE-typed receiver
+    // (`(arr: IFoo)[i]`) dispatches dynamically through the itable — the static
+    // body resolution below would find the (bodiless) interface indexer and bail
+    // to 0. Load the implementing class's getter from itab[get-index] and call it
+    // as `T get(ptr this, idx...)`.
+    if (recvDecl->kind == ast::TypeDeclKind::Interface) {
+        auto ifIt = ifacePropertyGetIndex_.find(ps);
+        auto descIt = descArray_.find(recvDecl);
+        if (ifIt == ifacePropertyGetIndex_.end() || descIt == descArray_.end())
+            return nullptr;
+        llvm::Type* retTy = lowerType(pd->type.get());
+        if (!retTy) retTy = i32();
+        std::vector<llvm::Type*> paramTys;
+        paramTys.push_back(ptrTy());
+        for (const auto& p : pd->indexerParams) {
+            llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+            paramTys.push_back(pt ? pt : i32());
+        }
+        auto* gFnTy = llvm::FunctionType::get(retTy, paramTys, false);
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+        auto* lookupFn =
+            declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
+        llvm::Value* itmapPtr = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+        llvm::Value* itab = builder_.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmapPtr, descIt->second}, "itab");
+        llvm::Value* fnPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab,
+                               {builder_.getInt32(ifIt->second)}),
+            "idxget");
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < pd->indexerParams.size() &&
+             k < ix.indices.size(); ++k) {
+            if (!ix.indices[k].value) return nullptr;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return nullptr;
+            callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
+                                                   false));
+        }
+        llvm::Value* r = builder_.CreateCall(gFnTy, fnPtr, callArgs);
+        emitPendingCheck();
+        return r;
+    }
     // Find a getter accessor body. The getter is either an expression body
     // (`property [i]: T => expr;` or `get => expr;`) or a BLOCK body
     // (`get => do … end;`, §23.4). A block body may contain a `return`, so it
@@ -1008,6 +1056,56 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;
+    // #730 / §13 / §23.4: `(arr: IFoo)[i] := v` through an INTERFACE-typed
+    // receiver dispatches the setter dynamically through the itable — load the
+    // implementing class's setter from itab[set-index] and call it as
+    // `void set(ptr this, idx..., value)`.
+    if (recvDecl->kind == ast::TypeDeclKind::Interface) {
+        auto ifIt = ifacePropertySetIndex_.find(ps);
+        auto descIt = descArray_.find(recvDecl);
+        if (ifIt == ifacePropertySetIndex_.end() || descIt == descArray_.end())
+            return false;
+        llvm::Type* valTy = lowerType(pd->type.get());
+        if (!valTy) valTy = i32();
+        std::vector<llvm::Type*> paramTys;
+        paramTys.push_back(ptrTy());
+        for (const auto& p : pd->indexerParams) {
+            llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+            paramTys.push_back(pt ? pt : i32());
+        }
+        paramTys.push_back(valTy);
+        auto* sFnTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), paramTys, false);
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj || !obj->getType()->isPointerTy()) return false;
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+        auto* lookupFn =
+            declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
+        llvm::Value* itmapPtr = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+        llvm::Value* itab = builder_.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmapPtr, descIt->second}, "itab");
+        llvm::Value* fnPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab,
+                               {builder_.getInt32(ifIt->second)}),
+            "idxset");
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < pd->indexerParams.size() &&
+             k < ix.indices.size(); ++k) {
+            if (!ix.indices[k].value) return false;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return false;
+            callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
+                                                   false));
+        }
+        callArgs.push_back(coerceNumericToType(val, valTy, false));
+        builder_.CreateCall(sFnTy, fnPtr, callArgs);
+        emitPendingCheck();
+        return true;
+    }
     // Find a setter accessor body.
     const ast::Expr* setterExpr = nullptr;
     const std::vector<std::unique_ptr<ast::Stmt>>* setterStmts = nullptr;
@@ -1939,6 +2037,257 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     genericSubst_       = std::move(savedGSubst);
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
+    return fn;
+}
+
+
+// #730 / §13 / §23.4: the class `cls`'s concrete indexer implementing the
+// interface indexer `ifaceIdx`. Indexers are anonymous (all named ".this"), so
+// classPropertyByName can't be used; match by the first index-parameter type
+// via findIndexer (which falls back to the sole indexer when there is one).
+const sema::PropertySymbol* Emitter::classIndexerImplementing(
+    const sema::TypeSymbol* cls, const sema::PropertySymbol* ifaceIdx) {
+    if (!cls || !ifaceIdx) return nullptr;
+    const sema::TypeRef* firstParamTy = nullptr;
+    if (auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ifaceIdx->decl))
+        if (!ipd->indexerParams.empty() && ipd->indexerParams[0].type)
+            firstParamTy = ctx_.resolvedType(*ipd->indexerParams[0].type);
+    return findIndexer(cls, firstParamTy);
+}
+
+
+// #730 / §23.4 / §13: emit a standalone `T get(ptr this, idx...)` for a class's
+// concrete indexer getter, used to fill the itable slot for interface-typed
+// indexer dispatch. Block-bodied getters reuse ensureIndexerBlockGetter (same
+// signature); expression-bodied getters are emitted here. Cached per indexer
+// PropertySymbol.
+llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
+                                               const sema::PropertySymbol* ps) {
+    (void)cls;
+    auto cached = indexerGetterFns_.find(ps);
+    if (cached != indexerGetterFns_.end()) return cached->second;
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return nullptr;
+
+    // Select the getter body form (mirrors lowerIndexerGet).
+    const ast::Expr* getterExpr = nullptr;
+    const ast::PropertyAccessor* getterBlock = nullptr;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody)
+        getterExpr = pd->exprBody.get();
+    for (const auto& a : pd->accessors) {
+        if (!a.isSet) {
+            if (a.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                getterBlock = &a;
+            else if (a.exprBody)
+                getterExpr = a.exprBody.get();
+            break;
+        }
+    }
+    // Block-bodied: reuse the existing standalone-function emitter (identical
+    // `T get(ptr this, idx...)` signature) — no duplicate emission.
+    if (getterBlock) {
+        llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
+        indexerGetterFns_[ps] = fn;
+        return fn;
+    }
+    if (!getterExpr) return nullptr;
+
+    llvm::Type* retTy = lowerType(pd->type.get());
+    if (!retTy) retTy = i32();
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());                     // `this`
+    for (const auto& p : pd->indexerParams) {
+        llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+        paramTys.push_back(pt ? pt : i32());
+    }
+    auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$get", *module_);
+    indexerGetterFns_[ps] = fn;
+
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    // Save + reset the full per-function emitter state (mirrors
+    // ensureIndexerBlockGetter): the body may emit checks/throws that branch to
+    // the unwind/propagate blocks, which must be this function's, not the
+    // caller's (else IR references a block in another function).
+    auto* savedFn       = currentFn_;
+    auto  savedBB       = builder_.GetInsertBlock();
+    auto  savedBBOffset = savedBB ? builder_.GetInsertPoint()
+                                  : decltype(savedBB->begin()){};
+    auto* savedThis     = currentThis_;
+    auto  savedLocals   = locals_;
+    auto  savedParams   = paramSlots_;
+    auto  savedRef      = refParams_;
+    auto  savedDispose  = disposeStack_;
+    auto  savedLoop     = loopStack_;
+    auto  savedFinally  = finallyStack_;
+    auto* savedUnwind   = unwindTarget_;
+    auto* savedProp     = propagateBB_;
+    auto* savedCaught   = currentCaughtExc_;
+    auto  savedUD       = unwindScopeDepth_;
+    auto  savedDiv      = diverged_;
+    auto  savedGSubst   = genericSubst_;
+
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entryBB);
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear();
+    finallyStack_.clear();
+    unwindTarget_     = nullptr;
+    propagateBB_      = nullptr;
+    currentCaughtExc_ = nullptr;
+    unwindScopeDepth_ = 0;
+    diverged_         = false;
+
+    auto argIt = fn->args().begin();
+    currentThis_ = &*argIt;
+    ++argIt;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         argIt != fn->args().end(); ++k, ++argIt) {
+        llvm::Argument& a = *argIt;
+        llvm::AllocaInst* slot = entryAlloca(a.getType());
+        builder_.CreateStore(&a, slot);
+        paramSlots_[ps->indexerParams[k]] = slot;
+    }
+    llvm::Value* result = lowerExpr(*getterExpr);
+    if (!result) result = llvm::Constant::getNullValue(retTy);
+    result = coerceNumericToType(result, retTy, false);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateRet(result);
+
+    currentFn_        = savedFn;
+    currentThis_      = savedThis;
+    locals_           = std::move(savedLocals);
+    paramSlots_       = std::move(savedParams);
+    refParams_        = std::move(savedRef);
+    disposeStack_     = std::move(savedDispose);
+    loopStack_        = std::move(savedLoop);
+    finallyStack_     = std::move(savedFinally);
+    unwindTarget_     = savedUnwind;
+    propagateBB_      = savedProp;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUD;
+    diverged_         = savedDiv;
+    genericSubst_     = std::move(savedGSubst);
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
+    return fn;
+}
+
+
+// #730 / §23.4 / §13: emit a standalone `void set(ptr this, idx..., value)` for
+// a class's concrete indexer setter, used to fill the itable slot for
+// interface-typed indexer assignment. Handles expression- and block-bodied
+// setters. Cached per indexer PropertySymbol. Returns null if the indexer has
+// no setter.
+llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
+                                               const sema::PropertySymbol* ps) {
+    (void)cls;
+    auto cached = indexerSetterFns_.find(ps);
+    if (cached != indexerSetterFns_.end()) return cached->second;
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return nullptr;
+
+    const ast::Expr* setterExpr = nullptr;
+    const std::vector<std::unique_ptr<ast::Stmt>>* setterStmts = nullptr;
+    for (const auto& a : pd->accessors) {
+        if (a.isSet) {
+            if (a.exprBody) setterExpr = a.exprBody.get();
+            else if (!a.stmts.empty()) setterStmts = &a.stmts;
+            break;
+        }
+    }
+    if (!setterExpr && !setterStmts) return nullptr;
+
+    llvm::Type* valTy = lowerType(pd->type.get());
+    if (!valTy) valTy = i32();
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());                     // `this`
+    for (const auto& p : pd->indexerParams) {
+        llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+        paramTys.push_back(pt ? pt : i32());
+    }
+    paramTys.push_back(valTy);                        // implicit `value`
+    auto* fnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), paramTys, false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$set", *module_);
+    indexerSetterFns_[ps] = fn;
+
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    // Save + reset the full per-function emitter state (see ensureIndexerGetterFn).
+    auto* savedFn       = currentFn_;
+    auto  savedBB       = builder_.GetInsertBlock();
+    auto  savedBBOffset = savedBB ? builder_.GetInsertPoint()
+                                  : decltype(savedBB->begin()){};
+    auto* savedThis     = currentThis_;
+    auto  savedLocals   = locals_;
+    auto  savedParams   = paramSlots_;
+    auto  savedRef      = refParams_;
+    auto  savedDispose  = disposeStack_;
+    auto  savedLoop     = loopStack_;
+    auto  savedFinally  = finallyStack_;
+    auto* savedUnwind   = unwindTarget_;
+    auto* savedProp     = propagateBB_;
+    auto* savedCaught   = currentCaughtExc_;
+    auto  savedUD       = unwindScopeDepth_;
+    auto  savedDiv      = diverged_;
+    auto  savedGSubst   = genericSubst_;
+
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entryBB);
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear();
+    finallyStack_.clear();
+    unwindTarget_     = nullptr;
+    propagateBB_      = nullptr;
+    currentCaughtExc_ = nullptr;
+    unwindScopeDepth_ = 0;
+    diverged_         = false;
+
+    auto argIt = fn->args().begin();
+    currentThis_ = &*argIt;
+    ++argIt;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         argIt != fn->args().end(); ++k, ++argIt) {
+        llvm::Argument& a = *argIt;
+        llvm::AllocaInst* slot = entryAlloca(a.getType());
+        builder_.CreateStore(&a, slot);
+        paramSlots_[ps->indexerParams[k]] = slot;
+    }
+    // The implicit `value` param is the last argument; the setter body reads it
+    // via locals_[pd] (the same anchor lowerIndexerSet uses).
+    if (argIt != fn->args().end()) {
+        llvm::Argument& a = *argIt;
+        llvm::AllocaInst* slot = entryAlloca(a.getType());
+        builder_.CreateStore(&a, slot);
+        locals_[pd] = slot;
+    }
+    if (setterExpr) lowerExpr(*setterExpr);
+    else if (setterStmts) lowerScopedBlock(*setterStmts);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateRetVoid();
+
+    currentFn_        = savedFn;
+    currentThis_      = savedThis;
+    locals_           = std::move(savedLocals);
+    paramSlots_       = std::move(savedParams);
+    refParams_        = std::move(savedRef);
+    disposeStack_     = std::move(savedDispose);
+    loopStack_        = std::move(savedLoop);
+    finallyStack_     = std::move(savedFinally);
+    unwindTarget_     = savedUnwind;
+    propagateBB_      = savedProp;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUD;
+    diverged_         = savedDiv;
+    genericSubst_     = std::move(savedGSubst);
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
     return fn;
 }
 
