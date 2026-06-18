@@ -8476,6 +8476,32 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // issue #757 / §30.7: a direct `src.GetAsyncEnumerator(token)` on a builtin
+        // IAsyncEnumerable<T>. For a compiler-generated async iterator the source
+        // value (the frame `Gen()` returns) IS the enumerator — the same identity
+        // the `await for` desugaring relies on (LlvmBackend_Stmts.cpp "the value IS
+        // the enumerator"). Return the receiver unchanged; the token argument is
+        // evaluated for side-effects/ownership then discarded (§30.8 cancellation
+        // deferred, consistent with the `await for` path).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "GetAsyncEnumerator" && ma->target) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                bool isAsyncEnumerable =
+                    recvTy &&
+                    recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->declaration &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    (recvTy->astNode->name->parts[0] == "IAsyncEnumerable" ||
+                     recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerable");
+                if (isAsyncEnumerable) {
+                    if (!call.args.empty() && call.args[0].value)
+                        (void)lowerExpr(*call.args[0].value);
+                    return lowerExpr(*ma->target);
+                }
+            }
+        }
         // CG13/CG18: explicit `obj.Dispose()` call where Dispose is a
         // compiler-generated method (no MethodSymbol in sema). Emit a
         // dynamic vtable dispatch to the object's Dispose function (slot 1).

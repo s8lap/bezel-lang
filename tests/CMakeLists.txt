@@ -330,6 +330,7 @@ set(BEZEL_TEST_SOURCES
     codegen/checked_cast_reinterpret_753_test.cpp
     codegen/linq_last_single_predicate_789_test.cpp
     codegen/accessor_grammar_691_test.cpp
+    codegen/async_get_async_enumerator_757_test.cpp
     codegen/async_nested_task_return_776_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp

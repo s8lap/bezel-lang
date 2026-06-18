@@ -1855,6 +1855,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // DisposeAsync()/Dispose() → Task/unit; no type needed.
                     }
+                    // issue #757 / §30.7: a direct GetAsyncEnumerator(token) on a
+                    // builtin IAsyncEnumerable<T> returns IAsyncEnumerator<T> — the
+                    // async-iterator frame, the same value `await for` iterates.
+                    // Without typing the call the `await using` slot is sized i32
+                    // (not ptr) and scope-exit disposal loads a garbage pointer →
+                    // SIGSEGV. Build the result type inline (Named "IAsyncEnumerator"
+                    // carrying the source's element type T) exactly like MoveNextAsync
+                    // builds Task<bool> above.
+                    if (colName == "IAsyncEnumerable" ||
+                        colName == "OwnedAsyncEnumerable") {
+                        if (m == "GetAsyncEnumerator") {
+                            auto* enumTy = ctx_.makeTypeRef();
+                            enumTy->kind = TypeRef::Kind::Named;
+                            enumTy->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("IAsyncEnumerator");
+                            ann->name.reset(nm);
+                            enumTy->astNode = ann;
+                            if (recvTy && !recvTy->genericArgs.empty() &&
+                                recvTy->genericArgs[0])
+                                enumTy->genericArgs.push_back(
+                                    recvTy->genericArgs[0]);
+                            ctx_.setExprType(&ce, enumTy);
+                        }
+                    }
                     // Dictionary methods
                     if (colName == "Dictionary" || colName == "OwnedDictionary") {
                         if (m == "Count")
