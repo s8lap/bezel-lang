@@ -3598,10 +3598,14 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
 // exactly the mechanism the embedded-await pre-suspend operands already rely on.
 bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     if (!fs.isAwait || !fs.iterable) return false;
-    // §30.8 cancellation (`await for ... with token`) is deferred — the token
-    // would be passed to GetAsyncEnumerator(token); our minimal cut iterates an
-    // async-iterator-method result directly. Fall through to the diagnostic.
-    if (fs.withExpr) return false;
+    // §30.7/§30.8 (#765): an optional `with token` clause is now lowered. For a
+    // compiler-generated async iterator the source value IS the enumerator (the
+    // enumPtr below is the source directly — there is no separate
+    // GetAsyncEnumerator(token) call), so the token is evaluated for its
+    // side-effects/ownership and then discarded; the rest of the loop is
+    // identical to the no-`with` form. Honoring the token for cancellation
+    // (§30.8) remains deferred, exactly as on a direct GetAsyncEnumerator path.
+    // The token expression is lowered after the source is evaluated, below.
     // The consuming context must be an async state machine (the await suspend
     // lives in its Resume function). sema rejects `await for` outside async; this
     // is a defensive guard so a stray case produces a diagnostic, not bad IR.
@@ -3620,6 +3624,10 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // below — see the function comment on why it must NOT be a stack slot).
     llvm::Value* enumPtr = lowerExpr(*fs.iterable);
     if (!enumPtr) return false;
+    // §30.8 (#765): evaluate the optional `with` cancellation token for its
+    // side-effects/ownership, then discard it (cancellation honoring deferred).
+    if (fs.withExpr)
+        (void)lowerExpr(*fs.withExpr);
 
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);

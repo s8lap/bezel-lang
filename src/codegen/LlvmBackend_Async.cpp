@@ -184,11 +184,11 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             // §30.7: `await for` desugars to a loop whose head awaits the
             // enumerator's MoveNextAsync() each iteration — one suspend point
             // (the loop re-enters the same await.resume block). Count it so the
-            // consuming method's resume switch has a state block for it. Skip the
-            // deferred `await for ... with token` form (§30.8): it is not lowered
-            // (a diagnostic fails the compile), so reserving a state block for it
-            // would leave an unterminated orphan block.
-            if (fs->isAwait && !fs->withExpr) n += 1;
+            // consuming method's resume switch has a state block for it. This
+            // includes the `await for ... with token` form (#765): the `with`
+            // clause is lowered the same way (the token is evaluated and then
+            // discarded), so it carries the same single suspend point.
+            if (fs->isAwait) n += 1;
             n += countAwaits(fs->body);
         }
         else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {

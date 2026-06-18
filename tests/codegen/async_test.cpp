@@ -1401,12 +1401,12 @@ BEZEL_TEST(async_30_7, async_iterator_parameterized_stress) {
         55);
 }
 
-// §30.8 / §30.7 (#440): `await for ... with token` (cancellation) is DEFERRED —
-// the token would be passed to GetAsyncEnumerator(token); the minimal cut
-// iterates the async-iterator result directly. Pin the boundary with a clean
-// diagnostic (compile FAILS) rather than emitting wrong code.
-BEZEL_TEST(async_30_8, await_for_with_cancellation_token_deferred) {
-    BEZEL_EXPECT_EQ(compileFails(
+// §30.8 / §30.7 (#765): `await for ... with token` (cancellation) is now LOWERED
+// (was deferred per #440). For a compiler-generated async iterator the source IS
+// the enumerator, so the token is evaluated then discarded (honoring it for
+// cancellation, §30.8, remains deferred). Compiles and iterates correctly.
+BEZEL_TEST(async_30_8, await_for_with_cancellation_token_lowered) {
+    BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Gen(): IAsyncEnumerable<int> "
         "    yield return 1; "
@@ -1419,7 +1419,7 @@ BEZEL_TEST(async_30_8, await_for_with_cancellation_token_deferred) {
         "    end; "
         "    return sum; "
         "  end Main; end C;"),
-        true);
+        1);
 }
 
 // §30.7 (#440) DEFERRED: a `yield` inside a try region in an async iterator —
