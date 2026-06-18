@@ -1184,26 +1184,76 @@ Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) {
 // interface, and generic-extension matching (§26.5 step 2/3) are deferred
 // (#433): a non-empty genericArgs list on either side disqualifies the match
 // here so an `extension Box<int>` is never mis-applied to a `Box<string>`.
-static bool extensionTargetMatchesReceiver(const TypeRef* target,
-                                           const TypeRef* recv) {
+static bool extensionTargetMatchesReceiver(
+    const TypeRef* target, const TypeRef* recv,
+    const std::unordered_set<std::string_view>& freeVars) {
     if (!target || !recv) return false;
     if (target->kind != recv->kind) return false;
     switch (target->kind) {
         case TypeRef::Kind::Primitive:
             return target->primitive == recv->primitive;
         case TypeRef::Kind::Named:
-            // Exact user type: same declaration, no generic args on either
-            // side (generic extensions deferred).
             if (target->declaration == nullptr ||
                 recv->declaration == nullptr)
                 return false;
             if (target->declaration != recv->declaration) return false;
-            if (!target->genericArgs.empty() || !recv->genericArgs.empty())
+            // §26.5 (#773): generic-extension matching. The declarations agree
+            // (same generic type); now match each type argument. A target arg
+            // that is one of the extension's FREE TYPE VARIABLES (the `T` in
+            // `extension Bag<T> where T: class`, resolved to a Named ref with no
+            // declaration whose name is in `freeVars`) unifies with the
+            // receiver's corresponding arg — so `extension Bag<T>` applies to
+            // any `Bag<X>`. A CONCRETE target arg must match the receiver's arg
+            // exactly (recursively), so `extension Box<int>` is never applied to
+            // a `Box<string>` (the former-deferral safety is preserved).
+            if (target->genericArgs.size() != recv->genericArgs.size())
                 return false;
+            for (std::size_t i = 0; i < target->genericArgs.size(); ++i) {
+                const TypeRef* ta = target->genericArgs[i];
+                const TypeRef* ra = recv->genericArgs[i];
+                if (!ta || !ra) return false;
+                bool taFree =
+                    ta->kind == TypeRef::Kind::Named &&
+                    ta->declaration == nullptr && ta->astNode &&
+                    ta->astNode->name && !ta->astNode->name->parts.empty() &&
+                    freeVars.count(ta->astNode->name->parts.back());
+                if (taFree) continue;  // free var unifies with the receiver arg
+                if (!extensionTargetMatchesReceiver(ta, ra, freeVars))
+                    return false;  // concrete arg must match exactly
+            }
             return true;
         default:
             return false;  // function/array/unit types are not extensible
     }
+}
+
+// §26.5 (#773): does an ast::Type name (transitively through generic args /
+// array element / function signature) reference one of `freeVars`?
+static bool typeNamesFreeVar(
+    const ast::Type* t, const std::unordered_set<std::string_view>& freeVars) {
+    if (!t) return false;
+    if (t->name && !t->name->parts.empty() &&
+        freeVars.count(t->name->parts.back()))
+        return true;
+    for (const auto& ga : t->genericArgs)
+        if (typeNamesFreeVar(ga.get(), freeVars)) return true;
+    if (typeNamesFreeVar(t->arrayElement.get(), freeVars)) return true;
+    if (typeNamesFreeVar(t->funcReturn.get(), freeVars)) return true;
+    for (const auto& p : t->funcParams)
+        if (typeNamesFreeVar(p.type.get(), freeVars)) return true;
+    return false;
+}
+
+// §26.5 (#773): true when an extension method's parameter or return types
+// reference a free type variable of the extension — the case whose codegen
+// substitution is deferred (see lookupExtensionMember).
+static bool extSignatureUsesFreeVar(
+    const ast::MethodDecl* md,
+    const std::unordered_set<std::string_view>& freeVars) {
+    if (typeNamesFreeVar(md->returnType.get(), freeVars)) return true;
+    for (const auto& p : md->params)
+        if (typeNamesFreeVar(p.type.get(), freeVars)) return true;
+    return false;
 }
 
 Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
@@ -1215,9 +1265,36 @@ Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
         const TypeRef* target = ctx_.resolvedType(*decl->targetType);
-        if (!extensionTargetMatchesReceiver(target, receiver)) continue;
+        // §26.5 (#773): the extension's free type variables — the `T` in
+        // `extension Bag<T> where T: class` — come from its `where`-constraint
+        // type-params; a target arg named by one of them unifies with any
+        // receiver arg of that position.
+        std::unordered_set<std::string_view> freeVars;
+        for (const auto& gc : decl->genericConstraints)
+            freeVars.insert(gc.typeParam);
+        if (!extensionTargetMatchesReceiver(target, receiver, freeVars))
+            continue;
         for (Symbol* m : ext->members) {
-            if (m && m->name == name) return m;
+            if (!m || m->name != name) continue;
+            // §26.5 (#773): a generic-extension method whose SIGNATURE
+            // references a free type variable (`FirstOr(x: T): T`) needs the
+            // free var substituted by the receiver's concrete arg in codegen
+            // — not yet implemented; matching it would emit a type-mismatched
+            // call (IR_FAIL). Skip such a method so the lookup falls through to
+            // a clean "no member" diagnostic instead of malformed IR. A method
+            // that does NOT use the free var in its signature (`IsEmpty(): bool`
+            // — it uses T only via the receiver's own members) is fully
+            // supported. This scopes #773 to the sound subset; the
+            // free-var-in-signature case is a deferred follow-up.
+            if (!freeVars.empty()) {
+                if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                    if (auto* md =
+                            dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                        if (extSignatureUsesFreeVar(md, freeVars)) continue;
+                    }
+                }
+            }
+            return m;
         }
     }
     return nullptr;
