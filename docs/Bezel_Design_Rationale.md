@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.143 — June 2026**
+**Companion to the Bezel Language Specification, v0.145 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6916,6 +6916,36 @@ Spec §4.1 (one clause), §19 (title, §19.1 forms, §19.4 guard note, §19.6 ex
 A scrutinee-less `case` (e.g. `case\n  x >= 90 => …\nend`) no longer parses; replace the keyword with `when`. A `case` with a scrutinee is unaffected. An unparenthesised bitwise (`& ^ |`) or range scrutinee — never shown in any example and not previously idiomatic — must now be parenthesised (`case (flags & MASK) …`). Leading-open range patterns that were previously rejected now compile. The conformance corpus and the project's own test/example sources were migrated with this revision.
 
 **Erratum (same revision) — §19.2 `Classify` example (#748).** The `Classify` helper example used statement-if syntax (`return if score < 0 then "invalid" else "failing";`) in expression position. Bezel's if-*expression* is the postfix form `trueValue if condition else falseValue` (§20); `if … then … end` is the *statement* form (§21). The compiler correctly rejected the example; it now reads `return "invalid" if score < 0 else "failing";`. Documentation-only; isolated (a doc-wide scan found no other expression-position `if … then … else`).
+
+### v0.145 changelog (v0.144 → v0.145)
+
+v0.145 folds three decided amendments: a cast-semantics clarification paired with a new bit-reinterpretation intrinsic, a LINQ standard-library completion, and a grammar-appendix catch-up. All three are additive or clarifying; none changes the meaning of an existing conforming program except where one previously relied on undefined-by-the-spec behaviour. Owner-directed 2026-06-19.
+
+#### Amendment 1 — same-width signed↔unsigned casts are checked; `BitConverter.Reinterpret<T>` added (spec §5.2, stdlib §2.12; #753)
+
+Spec §5.2's "integer narrowing raises `OverflowException` if the value does not fit" left unresolved whether a *same-width* signed↔unsigned cast (`int(uintValue)`, `ulong(longValue)`) is a checked value conversion or a bit reinterpretation — and an existing codegen test had quietly committed to the latter. The ruling: such a cast is a **checked value conversion** — it raises `OverflowException` when the value is outside the destination type's range (a negative cast to unsigned, or an unsigned value above the destination's signed maximum). This is Reading A; it matches the rationale's standing position that `BitConverter` is the only general bit-reinterpretation surface and that narrowing casts are checked.
+
+To keep a zero-cost bit reinterpretation available — the legitimate "view this `uint` as the `int` with the same bits" need — stdlib §2.12 gains a generic `BitConverter.Reinterpret<TTo>(value): TTo` (target type explicit, source inferred from the argument, same bit width required) that lowers to a register-level reinterpretation. The existing `FloatToInt32Bits`/`Int32BitsToFloat`/`DoubleToInt64Bits`/`Int64BitsToDouble` family are its float/double special cases. The net rule reads cleanly: **a cast converts a value (checked); `BitConverter.Reinterpret` reinterprets bits (always succeeds)** — no new syntax, intent greppable at the call site, consistent with the no-implicit-conversions discipline.
+
+#### Amendment 2 — `Last`/`Single` predicate overloads (stdlib §5; #789)
+
+Through v0.144 the LINQ element-access surface offered a predicate overload only on `First`/`FirstOrNull`; `Last`, `Single`, `LastOrNull`, and `SingleOrNull` had none, so a predicate argument on those was silently accepted and mis-evaluated. The asymmetry was an oversight. v0.145 adds the predicate overload to each — `Last(predicate)`, `Single(predicate)`, `LastOrNull(predicate)`, `SingleOrNull(predicate)` — each defined as the no-argument method applied after `Where(predicate)`, inheriting its missing-element and (for `Single`) more-than-one-match behaviour.
+
+#### Amendment 3 — Appendix A accessor grammar catch-up (spec Appendix A; #691)
+
+The grammar lagged prose the compiler already implements. `AccessorBody` gains the single-statement form `set => _x := value;` (an `AssignmentStmt`, per §13.6) — previously the appendix admitted only `=> Expression` (assignment is a statement, not an expression) or a `do … end` block. `IfaceProperty`/`IfaceIndexer` gain the accessor-block declaration form (`get; set(owned); end;`, per §23.3) alongside the `;`-terminated auto form. No compiler change — the appendix now matches the implemented prose.
+
+#### Touched
+
+Spec §5.2 (one paragraph), Appendix A (`AccessorBody`, `IfaceProperty`, `IfaceIndexer`). Stdlib §2.12 (`Reinterpret` signature + prose; revised the "no unsigned forms" sentence), §5 (four LINQ overloads + one prose paragraph). Rationale: this changelog. Version headers bumped to v0.145 across the language spec, standard library, and design rationale. Compiler (separate lanes, #753/#789): the §5.2 checked-cast guard and the `Reinterpret` intrinsic; the `Last`/`Single` predicate-overload typing and lowering; #691 is doc-only (a conformance test pins the already-accepted forms).
+
+#### Migration
+
+No existing conforming program changes meaning. Amendment 1 is observable only for code that *relied on* a same-width signed↔unsigned cast silently bit-reinterpreting an out-of-range value — that cast now raises `OverflowException`; rewrite it as `BitConverter.Reinterpret<T>(...)` to retain the reinterpreting behaviour. Amendments 2 and 3 are purely additive (new overloads; grammar forms the compiler already accepts).
+
+#### Editorial note
+
+Amendment 1's compiler change overturns one pre-existing codegen test (`long_min_value_literal_exact_bits`) that documented the bit-reinterpret reading; that test is rewritten to observe the literal's bits via `BitConverter.Reinterpret` rather than `ulong(longMin)`, per the CLAUDE.md rule that a test misrepresenting the (now-ruled) spec is fixed.
 
 ---
 

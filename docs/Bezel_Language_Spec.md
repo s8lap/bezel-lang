@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.144 — June 2026**
+**Version 0.145 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -445,6 +445,8 @@ var f: double := double(m);       // decimal to double
 ```
 
 Integer narrowing raises `OverflowException` if the value does not fit. Floating-point to integer truncates toward zero; `NaN`, `±Infinity`, and out-of-range values raise `OverflowException`. Integer to floating-point never overflows; precision may be lost.
+
+A conversion between a signed and an unsigned integer type of the *same width* (`int` ↔ `uint`, `long` ↔ `ulong`, `short` ↔ `ushort`, `byte` ↔ `sbyte`) is likewise a checked narrowing: it raises `OverflowException` when the value is not representable in the destination type — a negative value cast to an unsigned type, or an unsigned value greater than the destination type's signed maximum. Such a cast is a *value* conversion, not a reinterpretation of bits: it preserves the numeric value or fails. To view the bit pattern of a same-width integer under the other signedness *without* a range check — reading a `uint` as the `int` with the identical representation — use [`BitConverter.Reinterpret<T>`](Bezel_Standard_Library.md#sec-bitconverter), the standard library's bit-reinterpretation surface ([stdlib §2.12](Bezel_Standard_Library.md#sec-bitconverter)).
 
 Casting an integer to `char` requires the integer to fall in U+0000–U+10FFFF excluding the surrogate range; otherwise `OverflowException`.
 
@@ -7509,8 +7511,15 @@ IfaceMethod     ::= "method" Identifier GenericParams?
                                  an `owned` return requires implementations to
                                  declare an `owned` return (§11.2's exact-match
                                  rule). */
-IfaceProperty   ::= "readonly"? "property" Identifier ":" Type ";"
-IfaceIndexer    ::= "readonly"? "property" "[" ParamList "]" ":" Type ";"
+IfaceProperty   ::= "readonly"? "property" Identifier ":" Type
+                    ( ";" | Accessor* "end" Identifier? ";" )
+IfaceIndexer    ::= "readonly"? "property" "[" ParamList "]" ":" Type
+                    ( ";" | Accessor* "end" ";" )
+                              /* The accessor-block form declares explicit get/set
+                                 accessors (e.g. `get; set(owned);`) on an interface
+                                 property or indexer; in interface context each
+                                 Accessor uses the `;`-terminated AccessorBody (no
+                                 implementation), enforced semantically. See §23.3. */
 IfaceEvent      ::= "async"? "event" Identifier (":" Type)? ";"
 
 FieldDecl       ::= Visibility "static"? "owned"? "readonly"?
@@ -7562,8 +7571,13 @@ SetterParamSpec ::= "(" ParamMod? Identifier? ")"
                                  (borrow-taking per §14.4 Rule 2 after
                                  substitution). */
 ParamMod        ::= "owned" | "ref" | "out" | "out" "owned"
-AccessorBody    ::= "=>" (Expression | "do" Statement* "end") ";"
+AccessorBody    ::= "=>" (Expression | AssignmentStmt | "do" Statement* "end") ";"
                   | ";"                                  /* abstract / interface body */
+                              /* The single-statement form `set => _x := value;`
+                                 (an AssignmentStmt) parallels the §13.6 prose; it
+                                 is distinct from the expression form (assignment is
+                                 a statement, not an expression) and the do-block
+                                 form. */
 
 IndexerDecl     ::= Visibility "static"? VirtualKind?
                     "readonly"? "property" "[" ParamList "]" ":" Type

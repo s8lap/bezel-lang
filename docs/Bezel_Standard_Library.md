@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.142 — June 2026**
+**Companion to the Bezel Language Specification, v0.145 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -385,6 +385,11 @@ public static class BitConverter
   // double (64-bit) ↔ long bit pattern
   public static method DoubleToInt64Bits(value: double): long;
   public static method Int64BitsToDouble(value: long): double;
+
+  // Same-width bit reinterpretation (compiler intrinsic). The single type
+  // argument names the TARGET type; the source type is inferred from `value`.
+  // The source and target must be primitive numeric types of equal bit width.
+  public static method Reinterpret<TTo>(value: TFrom): TTo;
 end BitConverter;
 ```
 
@@ -392,7 +397,9 @@ end BitConverter;
 
 These are pure bit-reinterpretation operations: the bit patterns are preserved exactly. For `NaN` values, the specific bit pattern (signaling vs quiet, payload bits) is preserved, which is what bit-level tools (serialization, hashing, exact comparison) need.
 
-The method names use the sized record-type names (`Int32`, `Int64`) consistently with the byte-buffer accessors of [§4.14](#sec-owned-buffers-and-spans). The `Float`/`Double` portion uses the primitive keyword names (Bezel has no separate `Single` record type; `float` is the only 32-bit floating-point type). No unsigned forms (e.g. `FloatToUInt32Bits`) are provided — the bit-pattern integer is treated as opaque by callers most of the time, and the signed form interoperates with the standard bitwise operators identically.
+The method names use the sized record-type names (`Int32`, `Int64`) consistently with the byte-buffer accessors of [§4.14](#sec-owned-buffers-and-spans). The `Float`/`Double` portion uses the primitive keyword names (Bezel has no separate `Single` record type; `float` is the only 32-bit floating-point type). No unsigned *named* forms (e.g. `FloatToUInt32Bits`) are provided — the bit-pattern integer is treated as opaque by callers most of the time, and the signed form interoperates with the standard bitwise operators identically; when a same-width signedness view is genuinely needed, the generic `Reinterpret<TTo>` below supplies it.
+
+`Reinterpret<TTo>(value)` (v0.145) is the general same-width bit-reinterpretation operation. The single type argument names the *target* type; the source type is inferred from the argument, so the call site writes only the target — `BitConverter.Reinterpret<int>(someUint)`. The source and target must be primitive numeric types of equal bit width (the 8-, 16-, 32-, and 64-bit groups — e.g. `int`, `uint`, and `float` are mutually reinterpretable at 32 bits; `long`, `ulong`, and `double` at 64 bits); a target of a different width is a compile error. `Reinterpret` copies the value's bits unchanged — it never raises and never alters the bit pattern. The four named `…Bits…` methods above are the float/double special cases of `Reinterpret`, retained for readability and continuity. `Reinterpret` is the bit-level counterpart to the *checked* same-width signed↔unsigned cast of language spec [§5.2](Bezel_Language_Spec.md#sec-explicit-conversions): the cast performs a *value* conversion that raises `OverflowException` if the value does not fit, while `Reinterpret` performs a *bit* reinterpretation that always succeeds. Convert a value with the cast; view the same bits under a different type with `Reinterpret`.
 
 <a id="sec-the-type-class"></a>
 ### 2.13 The `Type` class
@@ -2567,9 +2574,13 @@ public extension IEnumerable<T>
   public method FirstOrNull(): T?;
   public method FirstOrNull(predicate: (T) -> bool): T?;
   public method Last(): T;
+  public method Last(predicate: (T) -> bool): T;
   public method LastOrNull(): T?;
+  public method LastOrNull(predicate: (T) -> bool): T?;
   public method Single(): T;                                         // throws if not exactly one
+  public method Single(predicate: (T) -> bool): T;                   // throws unless exactly one matches
   public method SingleOrNull(): T?;
+  public method SingleOrNull(predicate: (T) -> bool): T?;            // null if none; throws if more than one
   public method ElementAt(index: int): T;
 
   // Aggregation
@@ -2633,6 +2644,8 @@ end;
 ```
 
 `First`/`Last`/`Single`/`ElementAt` throw `InvalidOperationException` (or `IndexOutOfRangeException` for `ElementAt`) on missing-element; the `*OrNull` variants return `null` instead.
+
+The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` forms) restrict to the elements satisfying the predicate: `First(pred)` and `Last(pred)` yield the first and last matching element, and `Single(pred)` the sole matching element. Each is equivalent to the corresponding no-argument method applied after `Where(pred)` — `xs.First(pred)` is `xs.Where(pred).First()` — and inherits its missing-element behaviour: `First(pred)`/`Last(pred)`/`Single(pred)` throw `InvalidOperationException` when no element matches (and `Single(pred)` also when more than one matches), while `FirstOrNull(pred)`/`LastOrNull(pred)`/`SingleOrNull(pred)` return `null` when none matches (`SingleOrNull(pred)` still throws when more than one matches).
 
 `ToArray()` returns a fresh `Array<T>` containing the materialized sequence. The return is `owned` — the caller is responsible for disposing it. There is no `ToList()` because Bezel does not have a dynamic-array type named `List<T>` (`Array<T>` is the resizable form; `LinkedList<T>` is the linked form; use `new LinkedList<T>(source)` if a linked list is wanted).
 
