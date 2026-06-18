@@ -759,7 +759,48 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (currentReturnTypeNode_) {
                     if (const sema::TypeRef* rrt =
                             ctx_.resolvedType(*currentReturnTypeNode_)) {
-                        if (!cl->isDict)
+                        // §15.3 (#781): a `return [e1, …]` whose declared return
+                        // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
+                        // the `[N x elem]` aggregate and returns it BY VALUE.
+                        // lowerExpr returns null for a CollectionLiteralExpr, and
+                        // materializeHeapCollectionLiteral only makes a heap
+                        // bz_array_t* (a `ptr`, the wrong type for an inline
+                        // return) — so without this the method returned an
+                        // undef/zero array and the caller's `var a := Make()`
+                        // materialized as all-null. Mirrors the inline-array
+                        // local-decl build (lowerLocalDecl).
+                        if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
+                            !cl->isDict) {
+                            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                    lowerTypeRef(rrt))) {
+                                llvm::Type* elemTy = aty->getElementType();
+                                llvm::AllocaInst* tmp = entryAlloca(aty);
+                                for (std::size_t i = 0; i < cl->elements.size();
+                                     ++i) {
+                                    if (!cl->elements[i]) continue;
+                                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                                    if (!ev) continue;
+                                    if (ev->getType() != elemTy &&
+                                        ev->getType()->isIntegerTy() &&
+                                        elemTy->isIntegerTy()) {
+                                        unsigned eb =
+                                            ev->getType()->getIntegerBitWidth();
+                                        unsigned db =
+                                            elemTy->getIntegerBitWidth();
+                                        ev = db > eb
+                                                 ? builder_.CreateSExt(ev, elemTy)
+                                                 : builder_.CreateTrunc(ev,
+                                                                        elemTy);
+                                    }
+                                    llvm::Value* gep = builder_.CreateGEP(
+                                        aty, tmp,
+                                        {builder_.getInt32(0),
+                                         builder_.getInt32((int)i)});
+                                    builder_.CreateStore(ev, gep);
+                                }
+                                v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
+                            }
+                        } else if (!cl->isDict)
                             v = materializeHeapCollectionLiteral(cl, rrt);
                         else if (!cl->keys.empty())
                             v = materializeHeapDictLiteral(cl, rrt);
