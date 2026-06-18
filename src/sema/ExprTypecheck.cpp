@@ -772,7 +772,8 @@ bool ExprTC::isSubtype(TypeSymbol* from, TypeSymbol* to) {
 //   - named → named (non-generic): identity or subclass/interface.
 // A non-nullable target accepting a nullable source is rejected.
 void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
-                             SourceLocation loc, const std::string& what) {
+                             SourceLocation loc, const std::string& what,
+                             const ast::Expr* fromExpr) {
     if (!from || !to) return;
     // `Object` (the root) accepts anything — never flag.
     if (to->kind == TypeRef::Kind::Primitive &&
@@ -812,6 +813,32 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         if (isSubtype(from->declaration, to->declaration)) return;
         reportNotConvertible();
         return;
+    }
+    // §27.6 (#756): a target-typed PROPERTY REFERENCE. `var f: () -> T := b.P`
+    // where P is a property whose getter returns T — a property read is a value
+    // by default, but when the target is a zero-arg function returning the
+    // property's type, re-type the source expression to that function type so it
+    // is the getter-as-function value (≡ `() => b.P`) and codegen emits a
+    // property thunk. (Methods are already unconditionally function-typed; a
+    // property read needs this target-directed promotion.)
+    if (to->kind == TypeRef::Kind::Function &&
+        from->kind != TypeRef::Kind::Function && fromExpr &&
+        to->funcParams.empty() && to->funcReturn) {
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*fromExpr))) {
+            auto sameRetTy = [](const TypeRef* a, const TypeRef* b) {
+                if (!a || !b || a->kind != b->kind || a->nullable != b->nullable)
+                    return false;
+                if (a->kind == TypeRef::Kind::Primitive)
+                    return a->primitive == b->primitive;
+                if (a->kind == TypeRef::Kind::Named)
+                    return a->declaration == b->declaration;
+                return false;
+            };
+            if (!ps->isIndexer && sameRetTy(to->funcReturn, from)) {
+                ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
+                return;  // accepted as a property getter reference
+            }
+        }
     }
     // §27.6 / §5.1 (issue #436): a bare method reference has a Function type.
     // A Function value is not implicitly convertible to a non-Function type
@@ -2173,7 +2200,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         fromTy,
                         lsym->declType, ld->initializer->span.begin,
                         std::string("initializer for `") +
-                        std::string(ld->name) + "`");
+                        std::string(ld->name) + "`",
+                        ld->initializer.get());  // §27.6 #756 property-ref
                 }
             } else if (ld->initializer) {
                 // per §15.4: a collection literal has no standalone type; a
@@ -2267,7 +2295,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
             checkAssignable(
                 ctx_.exprType(*rs->value), currentReturnType_,
-                rs->value->span.begin, "returned value");
+                rs->value->span.begin, "returned value",
+                rs->value.get());  // §27.6 #756 property-ref
         }
         // issue #777 / §30.6: forgotten `await` in an async METHOD body. For an
         // async method `(): Task<T>`, currentReturnType_ is the peeled element T
@@ -2605,7 +2634,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 checkAssignable(
                     fromTy,
                     toTy,
-                    as->value->span.begin, "assigned value");
+                    as->value->span.begin, "assigned value",
+                    as->value.get());  // §27.6 #756 property-ref
             }
         }
         // §7.4 (issue #418): a plain `:=` of a non-null value to a simple

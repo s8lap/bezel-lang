@@ -1920,6 +1920,183 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
 }
 
 
+// §27.6 (#756): a PROPERTY reference used in function-value position
+// (`var f: () -> int := b.Count`) produces the getter as a function value —
+// equivalent to `() => b.Count`. Build a closure { thunk_ptr, env } whose thunk
+// loads the captured receiver from env and computes the property getter (the
+// same getter the normal `b.Count` read would, dispatched virtually when the
+// property is virtual/interface). Mirrors makeMethodThunk; the getter takes no
+// user parameters. `recv` is a BORROW of the receiver (the cell does not own it).
+llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
+                                        llvm::Value* receiverVal,
+                                        const ast::MemberAccessExpr* ma) {
+    if (!ps) return nullptr;
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    // Result type = the property's value type.
+    llvm::Type* retTy = nullptr;
+    if (pd && pd->type) retTy = lowerType(pd->type.get());
+    else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) retTy = lowerTypeRef(tr);
+    if (!retTy) retTy = i32();
+
+    // Thunk fn type: retTy thunk(ptr env). A getter takes no user params.
+    auto* thunkFnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+    static std::atomic<unsigned> pthunkCtr{0};
+    std::string thunkName = "pthunk$" + std::to_string(pthunkCtr.fetch_add(1));
+    auto* thunk = llvm::Function::Create(
+        thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
+
+    // Save emitter state (mirror makeMethodThunk).
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+
+    currentFn_ = thunk;
+    currentThis_ = nullptr;
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    unwindTarget_ = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
+
+    // Load the captured receiver from env; bind as `this`.
+    llvm::Value* thisVal = builder_.CreateLoad(ptrTy(), thunk->getArg(0));
+    currentThis_ = thisVal;
+
+    // §14.1: for a generic class receiver, set up the generic substitution so a
+    // getter body that reads a `T`-typed field uses the right struct layout.
+    // (Mirror the computed-getter read path in LlvmBackend_Exprs.cpp.)
+    if (ma && ma->target && ps->parent && ps->parent->decl) {
+        if (sema::TypeRef* recvTy = ctx_.exprType(*ma->target)) {
+            if (recvTy->kind == sema::TypeRef::Kind::Named &&
+                recvTy->declaration == ps->parent && !recvTy->genericArgs.empty()) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(ps->parent->decl);
+                if (td && td->genericParams.size() == recvTy->genericArgs.size()) {
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+                    for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                        newSubst[td->genericParams[gi].name] =
+                            lowerTypeRef(recvTy->genericArgs[gi]);
+                        newSema[td->genericParams[gi].name] =
+                            resolveTypeParamRef(recvTy->genericArgs[gi]);
+                    }
+                    genericSubst_ = std::move(newSubst);
+                    genericSubstSemaTy_ = std::move(newSema);
+                }
+            }
+        }
+    }
+
+    // Compute the getter result. Virtual/interface properties dispatch through
+    // the receiver's vtable/itable; otherwise evaluate the concrete getter.
+    llvm::Value* result = nullptr;
+    bool isIfaceProp = ps->parent &&
+                       ps->parent->kind == ast::TypeDeclKind::Interface;
+    auto getIt = propGetSlot_.find(ps);
+    auto ifGetIt = ifacePropertyGetIndex_.find(ps);
+    bool dynamicGet = thisVal->getType()->isPointerTy() &&
+        (getIt != propGetSlot_.end() || ifGetIt != ifacePropertyGetIndex_.end());
+    if (dynamicGet) {
+        auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), thisVal);
+        llvm::Value* fnPtr = nullptr;
+        if (isIfaceProp && ifGetIt != ifacePropertyGetIndex_.end()) {
+            auto descIt = descArray_.find(ps->parent);
+            if (descIt != descArray_.end()) {
+                llvm::Value* itmapPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+                auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* itab = builder_.CreateCall(
+                    lookupFn, {itmapPtr, descIt->second}, "pthunk.itab");
+                fnPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), itab,
+                                       {builder_.getInt32(ifGetIt->second)}),
+                    "pthunk.ifn");
+            }
+        } else if (getIt != propGetSlot_.end()) {
+            fnPtr = builder_.CreateLoad(
+                ptrTy(),
+                builder_.CreateGEP(ptrTy(), vptr,
+                                   {builder_.getInt32(getIt->second)}),
+                "pthunk.vfn");
+        }
+        if (fnPtr) {
+            result = builder_.CreateCall(fnTy, fnPtr, {thisVal}, "pthunk.r");
+            emitPendingCheck();
+        }
+    }
+    if (!result) {
+        if (const ast::Expr* getter = computedGetterOf(ps)) {
+            result = lowerExpr(*getter);
+        } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
+            if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {
+                result = builder_.CreateCall(fn->getFunctionType(), fn, {thisVal});
+                emitPendingCheck();
+            }
+        } else if (isAutoProperty(ps)) {
+            auto idxIt = fieldIndex_.find(ps);
+            if (idxIt != fieldIndex_.end()) {
+                llvm::StructType* st = classStruct(ps->parent);
+                llvm::Type* fty = st->getElementType(idxIt->second);
+                result = builder_.CreateLoad(
+                    fty, builder_.CreateStructGEP(st, thisVal, idxIt->second));
+            }
+        }
+    }
+    if (!result) result = llvm::Constant::getNullValue(retTy);
+    builder_.CreateRet(result);
+
+    // Restore emitter state.
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+    currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+
+    // Build the closure cell { thunk_ptr, env_ptr, rc, envdtor } at the call
+    // site. The env holds the receiver as a BORROW (§28.3); bz_closure_release
+    // frees the cell + env, never the receiver.
+    uint64_t cellSz =
+        module_->getDataLayout().getTypeAllocSize(closureCellType());
+    llvm::Value* closureObj = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)cellSz)});
+    builder_.CreateStore(thunk, closureObj);
+    llvm::Value* envObj = llvm::ConstantPointerNull::get(ptrTy());
+    if (receiverVal && receiverVal->getType()->isPointerTy()) {
+        envObj = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+        builder_.CreateStore(receiverVal, envObj);
+    }
+    builder_.CreateStore(
+        envObj,
+        builder_.CreateGEP(ptrTy(), closureObj, {builder_.getInt32(1)}));
+    initClosureRc(closureObj);
+    initClosureEnvdtor(closureObj);
+    return closureObj;
+}
+
+
 sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) return fs;
     if (isAutoProperty(sym))

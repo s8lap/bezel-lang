@@ -261,7 +261,8 @@ private:
     //   - named → named (non-generic): identity or subclass/interface.
     // A non-nullable target accepting a nullable source is rejected.
     void checkAssignable(TypeRef* from, TypeRef* to,
-                         SourceLocation loc, const std::string& what);
+                         SourceLocation loc, const std::string& what,
+                         const ast::Expr* fromExpr = nullptr);
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved

@@ -4729,6 +4729,12 @@ private:
     llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
                                  llvm::Value* receiverVal);
 
+    // §27.6 (#756): a property reference in function-value position →
+    // a closure whose thunk computes the getter on the captured receiver.
+    llvm::Value* makePropertyThunk(sema::PropertySymbol* ps,
+                                   llvm::Value* receiverVal,
+                                   const ast::MemberAccessExpr* ma);
+
     // CG9: address of an implicitly-`this`-qualified instance field
     // referenced bare inside an instance method (`_x` rather than
     // `this._x`). Returns the GEP and sets `elemTy`; null if `e` is not

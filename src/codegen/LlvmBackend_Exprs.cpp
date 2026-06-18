@@ -2852,6 +2852,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // §27.6 (#756): a property reference in FUNCTION-VALUE position. sema's
+    // target-typed promotion (checkAssignable) typed `b.Count` as `() -> T` when
+    // it is bound to a function-typed slot; produce the getter as a closure
+    // (≡ `() => b.Count`) instead of evaluating the getter here (which would
+    // store the int into a function-pointer slot and SIGSEGV at the call). Gate
+    // strictly on exprType == Function so ordinary value-position reads (typed as
+    // the property value) are unaffected and fall through to the read paths below.
+    if (const sema::TypeRef* et = ctx_.exprType(e)) {
+        if (et->kind == sema::TypeRef::Kind::Function) {
+            if (auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e))) {
+                if (!ps->isIndexer) {
+                    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
+                    llvm::Value* recv =
+                        (ma && ma->target) ? lowerExpr(*ma->target) : currentThis_;
+                    if (llvm::Value* th = makePropertyThunk(ps, recv, ma))
+                        return th;
+                }
+            }
+        }
+    }
     // #481 / §12.1 / §12.5 / §13 / §23: a VIRTUAL or INTERFACE property read
     // through a (potentially) polymorphic receiver dispatches dynamically — load
     // the accessor function from the receiver's vtable/itable and call it. This
