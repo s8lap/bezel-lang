@@ -97,7 +97,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Type* elemTy2 = nullptr;
                     llvm::Value* addr2 = lvalueAddr(*as->target, elemTy2);
                     if (!addr2) return false;
-                    builder_.CreateStore(rhsOnce, addr2);
+                    // #813 / §15.1: an inline `[N]T?` element slot is a nullable-
+                    // value struct `{i8, T}`; wrap the bare inner value so the
+                    // hasValue byte is set (this fast path bypasses the general
+                    // CG-nullable wrapping below).
+                    builder_.CreateStore(
+                        coerceToNullableSlot(elemTy2, rhsOnce), addr2);
                     return false;
                 }
             } else {
@@ -185,7 +190,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                         aty, aaddr,
                                         {builder_.getInt32(0),
                                          builder_.getInt32((unsigned)i)});
-                                    builder_.CreateStore(ev, gep);
+                                    // #813 / §15.1: wrap into the nullable-value
+                                    // slot struct for an `[N]T?` literal assign.
+                                    builder_.CreateStore(
+                                        coerceToNullableSlot(et, ev), gep);
                                 }
                                 return false;  // handled
                             }

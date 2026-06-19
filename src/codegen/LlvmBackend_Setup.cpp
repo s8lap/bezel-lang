@@ -4756,7 +4756,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 }
                 llvm::Value* gep = builder_.CreateGEP(
                     arrTy, slot, {builder_.getInt32(0), builder_.getInt32(i)});
-                builder_.CreateStore(ev, gep);
+                // #813 / §15.1: wrap into the nullable-value slot struct
+                // `{i8, T}` for an `[N]T?` literal initializer.
+                builder_.CreateStore(coerceToNullableSlot(elemTy, ev), gep);
             }
             return;
         }

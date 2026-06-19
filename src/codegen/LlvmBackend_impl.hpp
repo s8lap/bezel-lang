@@ -1985,6 +1985,33 @@ private:
             declareC("bz_decimal_from_int32", voidTy, {i32(), ptrTy()}),
             {v32, outSlot});
     }
+    // #813 / §15.1: wrap a bare inner value (or a null literal) into a
+    // nullable-value slot struct `{i8 hasValue, T value}` when the destination
+    // LLVM slot type IS such a struct and `v` is not already that struct. This
+    // mirrors the general assignment path (LlvmBackend_Stmts.cpp, the
+    // "CG-nullable" block) so the fast paths that bypass it — inline `[N]T?`
+    // element assignment (`a[i] := v`), inline-array literal assignment, and the
+    // inline-array literal initializer — store a properly-tagged value rather
+    // than the raw inner bytes (which clobber the hasValue byte). Returns `v`
+    // unchanged when the slot is not a nullable-value struct or `v` is already it.
+    llvm::Value* coerceToNullableSlot(llvm::Type* elemTy, llvm::Value* v) {
+        auto* st = elemTy ? llvm::dyn_cast<llvm::StructType>(elemTy) : nullptr;
+        if (!st || st->getNumElements() != 2 ||
+            st->getElementType(0) != nullablePrimHasValTy() || !v ||
+            v->getType() == elemTy)
+            return v;
+        if (v->getType()->isPointerTy() &&
+            llvm::isa<llvm::ConstantPointerNull>(v))
+            return llvm::ConstantAggregateZero::get(elemTy);
+        if (v->getType() == st->getElementType(1)) {
+            llvm::Value* res = builder_.CreateInsertValue(
+                llvm::UndefValue::get(elemTy),
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+            return builder_.CreateInsertValue(res, v, {1u});
+        }
+        return v;
+    }
+
     llvm::Value* wrapNullableValue(const sema::TypeRef* rt, llvm::Value* val) {
         auto* st = nullableValueStructTy(rt);
         // fix #569 / §14.1 / #460: inside a monomorphized body the value slot may
