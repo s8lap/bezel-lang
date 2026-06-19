@@ -625,6 +625,25 @@ bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
             t->astNode->name->parts.front() == "OwnedTask");
 }
 
+// stdlib §5 (#755): a BARE lazy GroupBy result — `IEnumerable<IGrouping<TKey,T>>`
+// is modelled by sema's makeLazyEnumerable(IGrouping<…>): a Named TypeRef with NO
+// astNode whose sole generic argument is the synthetic "IGrouping" element. The
+// lazy IGrouping enumerator dangles once stored in a variable (the #755 [8]
+// crash). A MATERIALIZED result (`.ToArray()` → `Array<IGrouping>`, astNode
+// "Array") or a terminal scalar (`.Count()`/`.Any()`) is a different, working
+// type and is deliberately NOT matched, so existing GroupBy chaining keeps
+// compiling. The element-position IGrouping itself (a for-var binding `g`) is the
+// inner element, not this outer lazy enumerable, so it is not matched either.
+static bool isBareLazyGroupingType(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->astNode != nullptr ||
+        t->genericArgs.empty())
+        return false;
+    const TypeRef* elem = t->genericArgs[0];
+    return elem && elem->astNode && elem->astNode->name &&
+           !elem->astNode->name->parts.empty() &&
+           elem->astNode->name->parts.front() == "IGrouping";
+}
+
 void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
                                    TypeRef*& outType) {
     outCtx = ReturnCtx::VoidMethod;
@@ -2129,6 +2148,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ld->initializer) visitExpr(*ld->initializer);
         pendingLambdaReturnType_ = savedLamRet;
         currentLiteralWideningHint_ = savedHint;
+        // stdlib §5 (#755): reject STORING a bare lazy GroupBy result in a local —
+        // the lazy IGrouping<TKey,T> enumerator dangles after the store and
+        // SIGSEGVs on iteration (#755 [8]). The IGrouping value model is not yet
+        // implemented, so a GroupBy(...) result may currently only be consumed
+        // INLINE (a direct `for var g in <seq>.GroupBy(...)`, or a terminal
+        // `.ToArray()/.Count()/.Any()`), never bound to a variable. This converts
+        // a clean-compile-then-crash into a clean diagnostic (decline-with-reasons
+        // until the value model lands).
+        if (ld->initializer) {
+            if (const TypeRef* it = ctx_.exprType(*ld->initializer))
+                if (isBareLazyGroupingType(it))
+                    ctx_.diagnostics().report(
+                        Severity::Error, ld->initializer->span.begin,
+                        "a GroupBy(...) result cannot be stored in a variable yet: "
+                        "the IGrouping<TKey, T> value model is not implemented "
+                        "(#755). Consume it inline — iterate "
+                        "`for var g in <seq>.GroupBy(...)`, or use a terminal "
+                        "operator such as `.ToArray()`, `.Count()`, or `.Any()`");
+        }
         if (currentScope_ && !ld->name.empty()) {
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = ld->name;
