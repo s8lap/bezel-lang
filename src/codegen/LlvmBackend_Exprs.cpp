@@ -3360,6 +3360,25 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                     }
                 }
             }
+            // #815 / §9.1: the implementation may be a POSITIONAL record field
+            // (which generates a read-only property but is a FieldSymbol, not a
+            // PropertySymbol). Spill the record and load the field directly.
+            if (sema::FieldSymbol* pfs = classPositionalFieldProperty(
+                    concrete->declaration, ps->name)) {
+                llvm::Value* obj = recv;
+                if (!obj->getType()->isPointerTy()) {
+                    llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                    builder_.CreateStore(obj, tmp);
+                    obj = tmp;
+                }
+                llvm::StructType* rst = classStruct(concrete->declaration);
+                auto idxIt = fieldIndex_.find(pfs);
+                if (rst && idxIt != fieldIndex_.end()) {
+                    llvm::Value* slot = builder_.CreateStructGEP(
+                        rst, obj, idxIt->second);
+                    return builder_.CreateLoad(valTy, slot);
+                }
+            }
         }
     }
     if (!recv) return nullptr;

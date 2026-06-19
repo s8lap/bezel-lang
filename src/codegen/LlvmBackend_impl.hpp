@@ -968,6 +968,48 @@ private:
     std::unordered_map<const ast::PropertyDecl*, llvm::Function*>
         propBlockGetterFns_;
 
+    // #815 / §9.1: standalone getter functions for a positional record field
+    // used as the implementation of an interface property (the itable slot).
+    // `T get(ptr this)` — GEP the field in the record struct and load. Keyed by
+    // the FieldSymbol so it is reused across interfaces/access sites.
+    std::unordered_map<const sema::FieldSymbol*, llvm::Function*>
+        posFieldGetterFns_;
+
+    // Build (or return the cached) getter function for a positional record field
+    // backing an interface property. Returns null if the field has no struct
+    // slot. Mirrors ensurePropertyBlockGetter's function-creation boilerplate.
+    llvm::Function* ensurePositionalFieldGetterFn(const sema::TypeSymbol* cls,
+                                                  const sema::FieldSymbol* fs) {
+        if (auto it = posFieldGetterFns_.find(fs);
+            it != posFieldGetterFns_.end())
+            return it->second;
+        llvm::StructType* rst = classStruct(cls);
+        auto idxIt = fieldIndex_.find(const_cast<sema::FieldSymbol*>(fs));
+        if (!rst || idxIt == fieldIndex_.end()) return nullptr;
+        llvm::Type* retTy = rst->getElementType(idxIt->second);
+        auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::GlobalValue::InternalLinkage,
+            "bz$posfield$" + std::string(cls->name) + "$" +
+                std::string(fs->name) + "$get",
+            *module_);
+        posFieldGetterFns_[fs] = fn;
+        auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        auto* savedFn = currentFn_;
+        auto savedBB = builder_.GetInsertBlock();
+        auto savedIP = savedBB ? builder_.GetInsertPoint()
+                               : decltype(savedBB->begin()){};
+        currentFn_ = fn;
+        builder_.SetInsertPoint(entryBB);
+        llvm::Value* thisPtr = &*fn->args().begin();
+        llvm::Value* slot =
+            builder_.CreateStructGEP(rst, thisPtr, idxIt->second);
+        builder_.CreateRet(builder_.CreateLoad(retTy, slot));
+        currentFn_ = savedFn;
+        if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+        return fn;
+    }
+
     // #730 / §23.4 / §13: standalone indexer accessor functions used for
     // INTERFACE-typed indexer dispatch (`(arr: IFoo)[i]`). The getter has the
     // signature `T get(ptr this, idx...)` and the setter `void set(ptr this,
@@ -2591,6 +2633,28 @@ private:
                 for (auto mod : ps->modifiers)
                     if (mod == "static") { isStatic = true; break; }
                 if (!isStatic) return ps;
+            }
+            t = baseClassOf(t);
+        }
+        return nullptr;
+    }
+
+    // #815 / §9.1: a positional record field generates a public read-only
+    // property of the same name, but it is represented as a FieldSymbol (with a
+    // non-null `posParam`), not a PropertySymbol — so classPropertyByName misses
+    // it. When a positional record implements an interface property (or is used
+    // through a `where T: IFace` constraint), the same-named positional field is
+    // the implementation. Return it so the caller can emit a struct-GEP+load.
+    sema::FieldSymbol* classPositionalFieldProperty(const sema::TypeSymbol* cls,
+                                                    std::string_view name) {
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+                if (!fs || fs->posParam == nullptr || fs->name != name) continue;
+                bool isStatic = false;
+                for (auto mod : fs->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (!isStatic) return fs;
             }
             t = baseClassOf(t);
         }

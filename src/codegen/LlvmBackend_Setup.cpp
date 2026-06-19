@@ -10744,6 +10744,19 @@ void Emitter::setupBoxDescriptors() {
                             std::string(ip->name);
                         getFp = makeBoxThunk(acc, thunkName);
                     }
+                } else if (sema::FieldSymbol* pfs =
+                               classPositionalFieldProperty(ts, ip->name)) {
+                    // #815 / §9.1: a POSITIONAL record field backs the interface
+                    // property (it generates a public read-only property but is a
+                    // FieldSymbol, not a PropertySymbol). Emit a struct-GEP+load
+                    // getter and box-thunk it so interface dispatch reaches the
+                    // field value instead of a null itable slot (which SIGSEGV'd).
+                    if (llvm::Function* acc =
+                            ensurePositionalFieldGetterFn(ts, pfs)) {
+                        getFp = makeBoxThunk(
+                            acc, "bz$boxposfieldget$" + std::string(ts->name) +
+                                     "$" + std::string(ip->name));
+                    }
                 }
                 itabElems.push_back(getFp);
                 if (propertyHasSetter(ip)) {
