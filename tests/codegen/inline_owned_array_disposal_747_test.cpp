@@ -218,12 +218,17 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_escaping_not_disposed_782) {
         "return Cell.n;")), 2);  // leaked (escaping), no double-free
 }
 
-// #782 (conservative residual): the array is declared inside a LOOP body — its
-// guarded cell could be reused across iterations, so it stays excluded (loopStack
-// non-empty). The elements leak (counter 4 = 2 iters x 2 cells) but there is no
-// crash / double-free. (Tracked: per-iteration disposal of in-loop captured
-// owned arrays is the harder follow-up — same family as #793/#694.)
-BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_conservative_leak_782) {
+// #806 (fixed): the array is declared inside a LOOP body and captured by a
+// non-escaping closure. A field-by-field (per-slot GEP) initialiser means
+// boxLocalSlot's whole-slot freshness heuristic misses it, so it would use
+// GUARDED boxing (one cell reused across iterations) — which previously had to
+// exclude the in-loop case (reusing then re-disposing the same cell would
+// UAF/double-free), leaving the elements to leak (counter 4 = 2 iters x 2
+// cells). #806 forces FRESH boxing for an in-loop inline-owned-array capture, so
+// each iteration owns its own cell and the #782 element-dispose-through-cell
+// fires per iteration. All 4 cells are now disposed (counter 0); a double-free
+// across iterations would drive the live counter negative.
+BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_disposed_806) {
     BEZEL_EXPECT_EQ(run(prog(
         "for var i in 1 .. 2 do "
         "  do "
@@ -231,7 +236,23 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_conservative_leak_78
         "    var f := () => a.Length; var n := f(); "
         "  end; "
         "end; "
-        "return Cell.n;")), 4);  // leaked (in-loop), no crash
+        "return Cell.n;")), 0);  // #806: per-iteration fresh cell → all disposed
+}
+
+// #806: an in-loop captured inline-owned-array whose elements are READ through
+// the closure each iteration. The fresh per-iteration cell holds that
+// iteration's elements; reading a[0] returns the live value, and both cells are
+// disposed at the iteration's scope end (counter 0 across both iterations).
+BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_read_disposed_806) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var acc: int := 0; "
+        "for var i in 1 .. 3 do "
+        "  do "
+        "    var a: [2 owned]Cell? := [new Cell(i), new Cell(i)]; "
+        "    var f := () => a[0]!.V; acc := acc + f(); "
+        "  end; "
+        "end; "
+        "return Cell.n;")), 0);  // each iteration's pair disposed; nothing leaks
 }
 
 // EXCEPTION path (§15.3 line 2022 / §28.3 implicit try/finally): both slots are

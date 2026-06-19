@@ -5435,8 +5435,35 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // subsequent iterations, so the accumulated value is never overwritten by
         // a re-initialisation from the (potentially stale) original slot.
         bool isForVar = dynamic_cast<const ast::ForStmt*>(decl) != nullptr;
+        // #806 / #782: a captured move-only OWNING inline-array
+        // ([N owned]T? / [N owned]T) is initialised field-by-field (a per-slot
+        // GEP store), so boxLocalSlot's whole-slot-store freshness heuristic does
+        // not fire and it would use GUARDED boxing — one cell allocated on the
+        // first pass and reused on every loop iteration. That is why an in-loop
+        // capture leaks today: the #782 element-dispose-through-cell + cell-free
+        // at the lambda scope is only sound for a FRESH per-iteration cell (a
+        // reused guarded cell would be disposed+freed on iteration 1 then
+        // dereferenced on iteration 2 → UAF), so the in-loop case is excluded
+        // (loopStack non-empty, see guardedOk below) and the elements never get
+        // disposed. Force FRESH boxing for an inline owned array captured inside a
+        // loop so each iteration owns its own cell — the element-dispose then
+        // fires per iteration with no cross-iteration corruption. The non-loop
+        // case keeps the proven guarded path (loopStack empty ⇒ allocated once),
+        // and non-array captured aggregates keep the guarded default entirely.
+        bool isInlineOwnedArray = false;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(decl)) {
+            const sema::TypeRef* rt =
+                ld->type ? ctx_.resolvedType(*ld->type)
+                         : (ld->initializer ? ctx_.exprType(*ld->initializer)
+                                            : nullptr);
+            if (rt && rt->kind == sema::TypeRef::Kind::InlineArray &&
+                rt->arrayOwned)
+                isInlineOwnedArray = true;
+        }
+        bool forceFresh = isForVar ||
+                          (isInlineOwnedArray && !loopStack_.empty());
         bool wasGuardedLocal = false;
-        ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/isForVar,
+        ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/forceFresh,
                                    &wasGuardedLocal);
         locals_[decl] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
