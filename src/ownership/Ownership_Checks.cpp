@@ -681,6 +681,45 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
 // "value-typed returns") is a copy and can never outlive its source, so
 // it is never a borrow escape and is reported here as may-borrow = false.
 bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
+    // #791 / §28.9 / §27.6: a method/property REFERENCE `recv.M` (a member access
+    // resolving to a method or property, used as a function value) captures `recv`
+    // as a BORROW in its closure cell — `recv.GetN` ≡ `() => recv.GetN()`. It is
+    // therefore a borrow of the receiver, NOT a value copy, even though its type
+    // is a function. (isBorrowableType is false for a function type, treating a
+    // bare function pointer as a value — correct for a non-capturing lambda / free
+    // function, but a member reference always captures its receiver.) So if the
+    // borrow's source (the receiver root) is a scope-bound local, returning or
+    // storing the reference lets the borrow outlive its source (a UAF at the
+    // deferred call), which the escape checks must catch.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        (void)ma;
+        if (const sema::TypeRef* t = ctx_.exprType(e)) {
+            if (t->kind == sema::TypeRef::Kind::Function) {
+                sema::Symbol* sym = ctx_.exprSymbol(e);
+                // A METHOD reference always captures the receiver.
+                if (dynamic_cast<const sema::MethodSymbol*>(sym))
+                    return true;
+                // A PROPERTY reference captures the receiver too, but only the
+                // PROMOTED form (a non-function property used as a function value,
+                // §27.6) — distinguish it from reading a property whose VALUE type
+                // is itself a function (a value read, not a capturing ref) by
+                // checking the property's declared type is not a function.
+                if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym)) {
+                    if (ps->isIndexer) return true;  // conservative
+                    bool declIsFunction = false;
+                    if (auto* pd =
+                            dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                        if (pd->type) {
+                            const sema::TypeRef* dt = ctx_.resolvedType(*pd->type);
+                            declIsFunction =
+                                dt && dt->kind == sema::TypeRef::Kind::Function;
+                        }
+                    }
+                    if (!declIsFunction) return true;
+                }
+            }
+        }
+    }
     // Prefer sema's resolved type for the returned expression: user-type
     // field/property/method-call results are typed here (e.g. `r.V`/`r.Size()`
     // returning int → value type → not a borrow). isBorrowableType is
