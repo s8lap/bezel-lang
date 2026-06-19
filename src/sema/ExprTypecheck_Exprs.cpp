@@ -712,6 +712,69 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     } else if (isDict && tt->genericArgs.size() > 1 &&
                              tt->genericArgs[1])
                         ctx_.setExprType(&e, tt->genericArgs[1]);
+                    // #794 / §14.2 + §23.4: `x[i]` where `x` has the type of a
+                    // bare generic parameter `T` constrained `where T: IIndexable`
+                    // and the constraint interface declares an indexer. The stdlib
+                    // branches above don't match (cn names a type parameter, not a
+                    // collection), so the IndexExpr was left untyped → the
+                    // ownership pass assumed a borrow and the result fell to 0.
+                    // Type it as the constraint interface's indexer return type
+                    // (codegen then devirtualizes through genericSubstSemaTy_).
+                    // Mirrors the #484 method-via-constraint resolver
+                    // (ExprTypecheck_Calls.cpp): walk the type parameter's
+                    // where-constraints on the enclosing method, then the class.
+                    if (!ctx_.exprType(e)) {
+                        auto tryIndexerConstraint =
+                            [&](const std::vector<ast::GenericParam>& gps,
+                                const std::vector<ast::GenericConstraint>& gcs)
+                            -> bool {
+                            bool isParam = false;
+                            for (const auto& gp : gps)
+                                if (gp.name == cn) { isParam = true; break; }
+                            if (!isParam) return false;
+                            for (const auto& gc : gcs) {
+                                if (gc.typeParam != cn) continue;
+                                for (const auto& item : gc.items) {
+                                    if (item.kind != "type" || !item.typeArg)
+                                        continue;
+                                    TypeRef* ctr =
+                                        ctx_.resolvedType(*item.typeArg);
+                                    if (!ctr ||
+                                        ctr->kind != TypeRef::Kind::Named ||
+                                        !ctr->declaration)
+                                        continue;
+                                    auto* ps = dynamic_cast<PropertySymbol*>(
+                                        lookupMember(ctr->declaration, ".this"));
+                                    if (!ps || !ps->isIndexer) continue;
+                                    auto* pd =
+                                        dynamic_cast<const ast::PropertyDecl*>(
+                                            ps->decl);
+                                    if (!pd || !pd->type) continue;
+                                    if (auto* rt = ctx_.resolvedType(*pd->type)) {
+                                        ctx_.setExprType(
+                                            &e, substituteMemberType(
+                                                    rt, ix->target.get(),
+                                                    ps->parent));
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        };
+                        bool done = false;
+                        if (currentMethodDecl_ &&
+                            !currentMethodDecl_->genericParams.empty())
+                            done = tryIndexerConstraint(
+                                currentMethodDecl_->genericParams,
+                                currentMethodDecl_->genericConstraints);
+                        if (!done && currentType_ && currentType_->decl)
+                            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                    currentType_->decl))
+                                if (!td->genericParams.empty())
+                                    tryIndexerConstraint(
+                                        td->genericParams,
+                                        td->genericConstraints);
+                    }
                 }
                 // §23.4: USER-DEFINED indexer `obj[i]` on a class/record/
                 // interface type. The result type is the indexer property's

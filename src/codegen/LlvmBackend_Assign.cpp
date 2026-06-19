@@ -881,9 +881,27 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
 const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
     if (!target) return nullptr;
-    if (auto* tt = ctx_.exprType(*target))
+    if (auto* tt = ctx_.exprType(*target)) {
         if (tt->kind == sema::TypeRef::Kind::Named && tt->declaration)
             return tt->declaration;
+        // #794 / §14.2: a bare generic-parameter receiver (`x: T`, no
+        // declaration) constrained `where T: IIndexable`. Resolve T through the
+        // active monomorphization to its concrete class/record declaration so the
+        // indexer access devirtualizes to the substituted type's own indexer —
+        // exactly mirroring the method-call constraint devirt in
+        // LlvmBackend_Calls.cpp (~9095). In an unspecialized template body there
+        // is no substitution, so this falls through and the access stays gated
+        // (returns 0) rather than miscompiling.
+        if (tt->kind == sema::TypeRef::Kind::Named && !tt->declaration &&
+            tt->astNode && tt->astNode->name &&
+            tt->astNode->name->parts.size() == 1) {
+            auto sit = genericSubstSemaTy_.find(tt->astNode->name->parts[0]);
+            if (sit != genericSubstSemaTy_.end() && sit->second &&
+                sit->second->kind == sema::TypeRef::Kind::Named &&
+                sit->second->declaration)
+                return sit->second->declaration;
+        }
+    }
     // #747 R42: `this[i]` inside an instance method — `this` carries no sema
     // exprType, so recover the owner TypeSymbol from the current method (mirrors
     // lowerWith's reverse-lookup of currentFn_ in methodFns_).
@@ -1015,6 +1033,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // Bind `this` to the target object and indexer params to the args.
     llvm::Value* obj = lowerExpr(*ix.target);
     if (!obj) return nullptr;
+    // #794: lower the index ARGUMENTS in the CALLER's scope — BEFORE clearing
+    // locals_/paramSlots_ for the inline getter body. An index expression may
+    // reference the enclosing method's locals or parameters (e.g. `x[i]` where
+    // `i` is an outer parameter). Lowering it after the clear (as the prior code
+    // did) resolved the outer name to 0. This surfaced for an indexer reached
+    // through a generic constraint (`At<T>(x: T, i: int) where T: IIndexable`
+    // → `x[i]`, where the index `i` is the method parameter), but it was a latent
+    // hazard for any expression-bodied user indexer whose index references a
+    // caller local/param.
+    std::vector<llvm::Value*> argVals;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         k < ix.indices.size(); ++k) {
+        if (!ix.indices[k].value) { argVals.push_back(nullptr); continue; }
+        llvm::Value* av = lowerExpr(*ix.indices[k].value);
+        if (!av) return nullptr;
+        argVals.push_back(av);
+    }
     llvm::Value* savedThis = currentThis_;
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
@@ -1025,17 +1060,26 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // value type), not its i32 erasure (which would truncate the multi-field
     // record to one word).
     auto savedSubst = setupReceiverGenericSubst(ix.target.get(), ps->parent);
+    // §9.2 / #794: a RECORD receiver is a by-value struct; the getter body reads
+    // its fields through `this` as a pointer, so spill the value to a stack slot
+    // and bind the address. (A class receiver is already a pointer — skip.) This
+    // matters for an indexer reached through a generic constraint where T = a
+    // record: `lowerExpr(x)` yields the record value, and a field GEP on a
+    // non-pointer would emit malformed IR. Mirrors the block-form getter spill.
+    if (!obj->getType()->isPointerTy()) {
+        llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+        builder_.CreateStore(obj, tmp);
+        obj = tmp;
+    }
     currentThis_ = obj;
     locals_.clear();
     paramSlots_.clear();
-    // Bind each indexer parameter to its argument.
-    for (std::size_t k = 0; k < ps->indexerParams.size() &&
-         k < ix.indices.size(); ++k) {
-        if (!ix.indices[k].value) continue;
-        llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
-        if (!argVal) continue;
-        auto* slot = entryAlloca(argVal->getType());
-        builder_.CreateStore(argVal, slot);
+    // Bind each indexer parameter to its pre-lowered argument value.
+    for (std::size_t k = 0; k < ps->indexerParams.size() && k < argVals.size();
+         ++k) {
+        if (!argVals[k]) continue;
+        auto* slot = entryAlloca(argVals[k]->getType());
+        builder_.CreateStore(argVals[k], slot);
         paramSlots_[ps->indexerParams[k]] = slot;
     }
     llvm::Value* result = lowerExpr(*getterExpr);
@@ -1120,20 +1164,39 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     // Bind `this`, indexer params, and implicit `value` param.
     llvm::Value* obj = lowerExpr(*ix.target);
     if (!obj) return false;
+    // #794: lower index ARGUMENTS in the CALLER's scope, BEFORE clearing
+    // locals_/paramSlots_ (they may reference the enclosing method's
+    // locals/params — the same hazard fixed in lowerIndexerGet).
+    std::vector<llvm::Value*> argVals;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         k < ix.indices.size(); ++k) {
+        if (!ix.indices[k].value) { argVals.push_back(nullptr); continue; }
+        llvm::Value* av = lowerExpr(*ix.indices[k].value);
+        if (!av) return false;
+        argVals.push_back(av);
+    }
     llvm::Value* savedThis = currentThis_;
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
+    // §14.1 / #794: install the receiver's generic substitution (mirrors the
+    // getter path) so a `T`-typed field read/write inside the setter body uses
+    // the concrete layout, not the i32 erasure.
+    auto savedSubst = setupReceiverGenericSubst(ix.target.get(), ps->parent);
+    // §9.2 / #794: spill a by-value RECORD receiver to a pointer for `this`.
+    if (!obj->getType()->isPointerTy()) {
+        llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+        builder_.CreateStore(obj, tmp);
+        obj = tmp;
+    }
     currentThis_ = obj;
     locals_.clear();
     paramSlots_.clear();
-    // Indexer params.
-    for (std::size_t k = 0; k < ps->indexerParams.size() &&
-         k < ix.indices.size(); ++k) {
-        if (!ix.indices[k].value) continue;
-        llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
-        if (!argVal) continue;
-        auto* slot = entryAlloca(argVal->getType());
-        builder_.CreateStore(argVal, slot);
+    // Indexer params (pre-lowered above).
+    for (std::size_t k = 0; k < ps->indexerParams.size() && k < argVals.size();
+         ++k) {
+        if (!argVals[k]) continue;
+        auto* slot = entryAlloca(argVals[k]->getType());
+        builder_.CreateStore(argVals[k], slot);
         paramSlots_[ps->indexerParams[k]] = slot;
     }
     // `value` param: look for the LocalSymbol anchored on pd.
@@ -1148,6 +1211,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
+    genericSubst_ = std::move(savedSubst);
     return true;
 }
 
