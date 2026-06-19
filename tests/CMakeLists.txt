@@ -341,6 +341,7 @@ set(BEZEL_TEST_SOURCES
     codegen/interface_indexer_dispatch_730_test.cpp
     codegen/indexer_via_constraint_794_test.cpp
     codegen/inline_array_nullable_store_813_test.cpp
+    codegen/heap_collection_literal_assign_820_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp
     codegen/for_var_capture_leak_793_test.cpp

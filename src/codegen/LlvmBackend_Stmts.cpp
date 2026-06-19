@@ -197,6 +197,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 }
                                 return false;  // handled
                             }
+                        } else if (aaddr) {
+                            // #820 / §15.4: a HEAP-collection target (`Array<T>`,
+                            // `OwnedArray<T>`, etc.) lowers to a bare `ptr` slot,
+                            // not an inline ArrayType — the inline path above
+                            // missed it, so `field := [1,2,3]` lowered the
+                            // CollectionLiteralExpr (which yields null as a general
+                            // value) and the store was silently dropped, leaving
+                            // the slot null → crash on first use. Materialize a
+                            // real heap collection and store the pointer, mirroring
+                            // the field-initializer path (Setup.cpp ~4117).
+                            const sema::TypeRef* tRt =
+                                ctx_.exprType(*as->target);
+                            if (tRt && isCollectionTypeName(tRt)) {
+                                if (llvm::Value* arr =
+                                        materializeHeapCollectionLiteral(cl,
+                                                                         tRt)) {
+                                    builder_.CreateStore(arr, aaddr);
+                                    return false;  // handled
+                                }
+                            }
                         }
                     }
                 }
