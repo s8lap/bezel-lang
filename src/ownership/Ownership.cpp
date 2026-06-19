@@ -845,6 +845,28 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             }
         }
     }
+    // #724 F1 / §28.8.1 / §17.x: `move x` TRANSFERS ownership of x to the binding,
+    // so `var s := move x` makes `s` an OWNED local (subject to the standard §28.3
+    // discharge rules), exactly as `var s := x` would have made `x`'s obligation
+    // s's. Without this the move expression fell through to Borrowed, so `s`
+    // carried no disposal obligation: it was neither disposed at scope end nor
+    // diagnosed as an undischarged owned local — a silent leak. Owned only when the
+    // moved value is a disposable reference type (class/interface); a `move` of a
+    // value type (record/enum/value-builtin) is a copy with no obligation and
+    // stays Borrowed, mirroring the `new T` classification above.
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->op == "move" && ue->operand) {
+            if (const sema::TypeRef* opTy = ctx_.exprType(*ue->operand)) {
+                if (opTy->kind == sema::TypeRef::Kind::Named &&
+                    opTy->declaration &&
+                    (opTy->declaration->kind == ast::TypeDeclKind::Class ||
+                     opTy->declaration->kind == ast::TypeDeclKind::Interface) &&
+                    !opTy->declaration->isValueBuiltin) {
+                    return OwnershipState::Owned;
+                }
+            }
+        }
+    }
     // Default: Borrowed.
     return OwnershipState::Borrowed;
 }

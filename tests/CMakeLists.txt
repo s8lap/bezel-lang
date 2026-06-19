@@ -340,6 +340,7 @@ set(BEZEL_TEST_SOURCES
     codegen/lazy_static_init_720_test.cpp
     codegen/await_for_frame_dispose_792_test.cpp
     codegen/escaping_member_ref_borrow_791_test.cpp
+    codegen/move_result_owned_724_test.cpp
     codegen/async_nested_task_return_776_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp

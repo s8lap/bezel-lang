@@ -1,0 +1,122 @@
+// fix #724 F1 / §28.8.1 / §28.3 / §17.x: `var s := move x` (x an owned class)
+// transfers ownership of x to `s`, so `s` is an OWNED local subject to the
+// standard §28.3 discharge rules. Previously the ownership pass classified the
+// move expression's result as Borrowed (producerState fell through to the
+// default), so `s` carried no disposal obligation — it was neither disposed at
+// scope end nor diagnosed as an undischarged owned local (a silent leak).
+//
+// This file pins F1 (the remaining defect) and includes regression pins for the
+// sibling cluster members F2 (§17.13 discard) and F3 (use-after-move), which were
+// already fixed on main. Accept/reject ownership tests drive the real Driver
+// (runJit does not run the ownership pass).
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "driver/Driver.hpp"
+#include "test_harness.hpp"
+
+namespace {
+namespace fs = std::filesystem;
+
+int compileAndRun(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_724_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    { std::ofstream out(src); out << source; }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
+}
+
+bool compileFails(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_724_neg_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    { std::ofstream out(src); out << source; }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return !r.success;
+}
+
+// A class with a destructor that bumps a static counter, so disposal is
+// observable through the program's exit code.
+const char* rclass =
+    "class R public static n: int := 0; "
+    "  destructor R.n := R.n + 1; end destructor; end R; ";
+}  // namespace
+
+// #724 F1: `var s := move x` with `s` never discharged is now an owned local —
+// rejected as an undischarged owned value (§28.3), not silently leaked.
+BEZEL_TEST(move_result_owned_724, undischarged_move_result_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module M; ") + rclass +
+        "class C public static method Main(): int "
+        "  var x := new R(); "
+        "  var s := move x; "          // s is owned, never discharged → error
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// #724 F1: the move result is owned, so discharging it by RETURN is accepted.
+BEZEL_TEST(move_result_owned_724, move_result_returned_accepted) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M; ") + rclass +
+        "class C "
+        "  public static method Make(): R "
+        "    var x := new R(); var s := move x; return s; "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    using var r := Make(); return 0; "  // disposed by the caller
+        "  end Main; end C;"), 0);
+}
+
+// #724 F1: `using var s := move x` is accepted and DISPOSES s at scope end — the
+// destructor runs (R.n becomes 1), proving the move result carries the obligation.
+BEZEL_TEST(move_result_owned_724, using_var_move_result_disposed) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M; ") + rclass +
+        "class C public static method Main(): int "
+        "  var x := new R(); "
+        "  do using var s := move x; end; "  // s disposed here → R.n = 1
+        "  return R.n; "
+        "end Main; end C;"), 1);
+}
+
+// #724 F2 (regression pin, already fixed): discarding a freshly-constructed owned
+// value with a destructor is rejected (§17.13).
+BEZEL_TEST(move_result_owned_724, discard_disposable_new_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class R destructor end destructor; end R; "
+        "class C public static method Main(): int "
+        "  _ := new R(); return 0; "    // §17.13 — cannot discard a disposable
+        "end Main; end C;"));
+}
+
+// #724 F3 (regression pin, already fixed): a use after `_ := move x` via a `var`
+// binding is caught as a use-after-move.
+BEZEL_TEST(move_result_owned_724, use_after_move_var_binding_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class R destructor end destructor; end R; "
+        "class C public static method Main(): int "
+        "  var x := new R(); _ := move x; "
+        "  var t := x; _ := move t; "    // x already moved out → error
+        "  return 0; "
+        "end Main; end C;"));
+}
