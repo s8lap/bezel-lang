@@ -396,6 +396,14 @@ private:
     // through the cell (see `boxedStorage`). The set is part of the saved/
     // restored emitter state across nested-function emission.
     std::unordered_map<llvm::AllocaInst*, llvm::Type*> cellVars_;
+
+    // #823 / §27.5: slots of locals DECLARED INSIDE a loop body. Such a local is
+    // re-initialised every iteration, so a closure capturing it must get a FRESH
+    // cell per iteration. boxLocalSlot consults this when its current-BB store
+    // heuristic would otherwise miss the init store (nested control flow puts it
+    // in an earlier basic block) and wrongly reuse one stale cell. Keyed by the
+    // AllocaInst (module-lifetime, unique across the compilation — no clearing).
+    std::unordered_set<llvm::AllocaInst*> loopBodyDeclaredSlots_;
     // §27.5 / #673: for guarded-boxed (non-for-var) locals, maps each
     // cell-holder alloca (newSlot) to the ORIGINAL pre-boxing alloca
     // (the variable's original storage slot).  After boxing, the original

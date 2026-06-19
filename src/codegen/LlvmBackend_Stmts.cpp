@@ -5,6 +5,17 @@ namespace bezel::codegen {
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
+        // #823 / §27.5: a local declared INSIDE a loop body is re-initialised
+        // every iteration, so a closure capturing it needs a fresh cell per
+        // iteration. Record its slot so boxLocalSlot chooses fresh-each-iteration
+        // boxing even when nested control flow (an inner loop / if) puts the init
+        // store in a different basic block than the capture site (the current-BB
+        // store heuristic would otherwise miss it → a stale first-iteration cell).
+        if (!loopStack_.empty()) {
+            auto lit = locals_.find(ld);
+            if (lit != locals_.end())
+                loopBodyDeclaredSlots_.insert(lit->second);
+        }
         if (diverged_) return true;  // CG40: diverging initializer
         // §15.3 (#747): a move-only owning inline-array local auto-disposes its
         // slots at scope end, independent of `using var` (§28.10 line 2025).
@@ -42,6 +53,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         lowerLocalDecl(lc, lc->value.get(), lc->type.get());
+        // #823 / §27.5: same loop-body fresh-capture handling as LocalDecl.
+        if (!loopStack_.empty()) {
+            auto lit = locals_.find(lc);
+            if (lit != locals_.end())
+                loopBodyDeclaredSlots_.insert(lit->second);
+        }
         return diverged_;  // CG40
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {

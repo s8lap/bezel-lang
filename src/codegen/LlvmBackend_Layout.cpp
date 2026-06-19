@@ -1517,6 +1517,13 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     //       r_slot each iteration; using the null-guard would preserve the
     //       first iteration's (disposed) pointer in the cell.
     bool freshEachIteration = forLoopVar;
+    // #823 / §27.5: a local declared inside a loop body is re-initialised each
+    // iteration → fresh cell each pass. This is robust to nested control flow
+    // (an inner loop / if-then) that puts the init store in a different basic
+    // block than the capture site, which the current-BB store heuristic below
+    // misses (it would then reuse one stale first-iteration cell).
+    if (!freshEachIteration && loopBodyDeclaredSlots_.count(slot))
+        freshEachIteration = true;
     if (!freshEachIteration) {
         llvm::BasicBlock* cur = builder_.GetInsertBlock();
         for (llvm::Use& u : slot->uses()) {
