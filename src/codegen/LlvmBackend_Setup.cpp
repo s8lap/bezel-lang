@@ -8216,12 +8216,36 @@ void Emitter::collectBoxCaptureLocals(
 void Emitter::collectDefinitelyEscapingLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     definitelyEscapingLambdas_.clear();
+    // One pass collects: (a) a DIRECT `return () => …` lambda → escapes; (b) the
+    // set of locals that are REASSIGNED anywhere; (c) `return <ident>` candidates.
+    // After the pass, a candidate `return f` adds f's INITIALIZER lambda iff f is
+    // never reassigned (#694 extend) — otherwise f's value at the return is not
+    // its init lambda, so freeing the init lambda's cell (dropped at the
+    // reassignment) could UAF a later read of the captured local.
+    std::unordered_set<const void*> reassigned;
+    std::vector<const ast::LocalDecl*> returnedVars;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                if (auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                    if (loc->decl)
+                        reassigned.insert(static_cast<const void*>(loc->decl));
+            return;
+        }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
             if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(r->value.get()))
                 definitelyEscapingLambdas_.insert(
                     static_cast<const void*>(lam));
+            else if (auto* id =
+                         dynamic_cast<const ast::IdentifierExpr*>(r->value.get()))
+                if (auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                    if (auto* ld =
+                            dynamic_cast<const ast::LocalDecl*>(loc->decl))
+                        returnedVars.push_back(ld);
             return;
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -8245,6 +8269,12 @@ void Emitter::collectDefinitelyEscapingLambdas(
         }
     };
     for (auto& s : body) scan(s.get());
+    for (const ast::LocalDecl* ld : returnedVars) {
+        if (reassigned.count(static_cast<const void*>(ld))) continue;
+        if (auto* lam =
+                dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
+            definitelyEscapingLambdas_.insert(static_cast<const void*>(lam));
+    }
 }
 
 

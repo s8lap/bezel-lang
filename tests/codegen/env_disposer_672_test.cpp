@@ -605,3 +605,46 @@ const char* kNonEscapingSingleNotEnvdtorFreed =
 BEZEL_TEST(codegen_env_disposer_672, non_escaping_single_not_envdtor_freed_lsan_clean_694) {
     expectValueAndLeakFree(kNonEscapingSingleNotEnvdtorFreed, 7);
 }
+
+// #694 extend: a closure RETURNED VIA A VARIABLE (`var f := () => x; return f`)
+// also definitely escapes — collectDefinitelyEscapingLambdas traces the returned
+// identifier to the lambda its (never-reassigned) var was initialized from. Its
+// envdtor frees the sole capture cell. LSan-CLEAN; returns 7.
+const char* kEscapingReturnedViaVarCell =
+    "module M; class C "
+    "  public static method Make(): () -> int "
+    "    var x: int := 7; "
+    "    var f: () -> int := () => x; "
+    "    return f; "
+    "  end Make; "
+    "  public static method Main(): int "
+    "    var g: () -> int := Make(); "
+    "    return g(); "   // 7
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_returned_via_var_cell_freed_lsan_clean_694) {
+    expectValueAndLeakFree(kEscapingReturnedViaVarCell, 7);
+}
+
+// #694 extend (soundness boundary): when the returned var is REASSIGNED, its init
+// lambda is dropped mid-scope, so freeing that lambda's cell could UAF a later
+// read of the captured local (`var z := x`). The reassignment guard excludes it —
+// the cell leaks (safe), with NO use-after-free / double-free. Returns g() where
+// g is the reassigned `() => y` (y = 5).
+const char* kEscapingReassignedVarNotFreed =
+    "module M; class C "
+    "  public static method Make(): () -> int "
+    "    var x: int := 3; var y: int := 5; "
+    "    var f: () -> int := () => x; "
+    "    f := () => y; "
+    "    var z: int := x; "
+    "    return f; "
+    "  end Make; "
+    "  public static method Main(): int "
+    "    var g: () -> int := Make(); "
+    "    return g(); "   // 5
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_reassigned_var_no_corruption_694) {
+    expectValueAndNoCorruption(kEscapingReassignedVarNotFreed, 5);
+}
