@@ -854,6 +854,18 @@ private:
         std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>>
         smIterFinallyAtState_;
 
+    // #821 / §29.7: per-yield-state → the `using var` (owned-resource) disposals
+    // active at that yield, recorded as (decl-node, Disposal). The local is
+    // spilled to the frame and restored in Dispose; the recorded decl-node lets
+    // Dispose rebind the Disposal's slot to the restored alloca and run it. This
+    // is the using-var analogue of smIterFinallyAtState_ — §29 says `using var`
+    // compiles to try/finally, but the codegen tracks it via disposeStack_, so
+    // the iterator Dispose needs this parallel record to honour §29.7's "Dispose
+    // every using var active at the point of suspension."
+    std::unordered_map<unsigned,
+        std::vector<std::pair<const ast::Node*, Disposal>>>
+        smIterDisposalsAtState_;
+
     // CG20: exception handling (explicit-unwinding model). A module-level
     // global holds the in-flight exception (null when none). A `throw` and
     // any call that leaves the global non-null branch to the current

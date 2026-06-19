@@ -1025,4 +1025,76 @@ BEZEL_TEST(codegen_excdisp_818, guide_detachlog_idiom_leak_free) {
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// --------------------------------------------------------------------------
+// [821] §29.7 — a `using var` inside an iterator body must be disposed both on
+// NORMAL completion (the body runs off its end) and on EARLY abandonment (the
+// consumer stops iterating and Disposes the enumerator while it is suspended at
+// a yield). Before the fix the iterator's generated Dispose only re-ran explicit
+// try/finally chains, and MoveNext's normal-completion path freed the frame
+// without disposing active using-vars → leak.
+// --------------------------------------------------------------------------
+
+// Full iteration to completion: the using-var r is disposed once (R.count = 1).
+const char* kIterUsingVarFullIteration =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C "
+    "  public static method Gen(): IEnumerable<int> "
+    "    using var r := new R(); "
+    "    yield return 1; "
+    "  end Gen; "
+    "  public static method Main(): int "
+    "    for var x in Gen() do end; "
+    "    return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_821, iterator_using_var_full_iteration_disposed) {
+    expectExitAndLeakFree(kIterUsingVarFullIteration, 1);
+}
+
+// Early break: the consumer stops after the first yield; Dispose disposes the
+// still-active using-var (R.count = 1).
+const char* kIterUsingVarEarlyBreak =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C "
+    "  public static method Gen(): IEnumerable<int> "
+    "    using var r := new R(); "
+    "    yield return 1; "
+    "    yield return 2; "
+    "  end Gen; "
+    "  public static method Main(): int "
+    "    for var x in Gen() do break; end; "
+    "    return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_821, iterator_using_var_early_break_disposed) {
+    expectExitAndLeakFree(kIterUsingVarEarlyBreak, 1);
+}
+
+// Two using-vars in the iterator body: both disposed (R.count = 2).
+const char* kIterTwoUsingVars =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C "
+    "  public static method Gen(): IEnumerable<int> "
+    "    using var a := new R(); "
+    "    using var b := new R(); "
+    "    yield return 1; "
+    "  end Gen; "
+    "  public static method Main(): int "
+    "    for var x in Gen() do end; "
+    "    return R.count; "                 // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_821, iterator_two_using_vars_disposed) {
+    expectExitAndLeakFree(kIterTwoUsingVars, 2);
+}
+
 }  // namespace

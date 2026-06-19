@@ -1238,6 +1238,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>(
                         finallyBodyStack_.begin(), finallyBodyStack_.end());
             }
+            // #821 / §29.7: snapshot the `using var` (owned-resource) disposals
+            // active at this yield so Dispose can run them when the iterator is
+            // disposed while suspended here. Each using-var local is spilled to
+            // the frame and restored in Dispose; record its decl node (reverse-
+            // mapped from the Disposal's slot) so Dispose can rebind the slot.
+            // Skip non-using-var entries: caught-exception borrows (never live
+            // across a yield) and unwind-only plain-`var` owned locals (§29.7
+            // disposes using-var only). Outermost-first; Dispose runs in reverse.
+            {
+                std::vector<std::pair<const ast::Node*, Disposal>> active;
+                for (const auto& level : disposeStack_) {
+                    for (const Disposal& d : level) {
+                        if (d.caughtException || d.unwindOnly) continue;
+                        const ast::Node* node = nullptr;
+                        for (const auto& [n, s] : locals_)
+                            if (s == d.slot) { node = n; break; }
+                        if (node) active.emplace_back(node, d);
+                    }
+                }
+                if (!active.empty())
+                    smIterDisposalsAtState_[nextState] = std::move(active);
+            }
             builder_.CreateStore(builder_.getInt32((int)nextState), smStateGEP_);
             if (isAsyncYield) {
                 emitAsyncIterComplete(/*hasValue=*/true);
