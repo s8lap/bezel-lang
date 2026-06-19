@@ -8526,6 +8526,26 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // if the scrutinee is-a T and (§19.5) is non-null.
             if (auto* rt = ctx_.resolvedType(*bp->type)) {
                 if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
+                    // §9.6 / §10: a RECORD or ENUM is a sealed VALUE type with no
+                    // subtyping, so a typed binding `var q: R` over an UNBOXED
+                    // such scrutinee is a STATIC test — the scrutinee's static
+                    // type either IS R or is not. An unboxed record scrutinee is a
+                    // struct VALUE and an enum is an i32 (neither a pointer), so
+                    // the runtime is-a path (emitIsA, which walks a vtable
+                    // pointer) emitted an ICmp on mismatched operand types and
+                    // crashed the backend (#801: discovery probe). Decide
+                    // statically. A BOXED record/enum (scrutinee `Object`/
+                    // interface — a pointer) is genuinely a runtime type test and
+                    // falls through to emitIsA / the box-descriptor path below
+                    // (the §19.5 unbox case, #746).
+                    auto declKind = rt->declaration->kind;
+                    if ((declKind == ast::TypeDeclKind::Record ||
+                         declKind == ast::TypeDeclKind::Enum) &&
+                        !scrut->getType()->isPointerTy()) {
+                        bool sameType =
+                            scrutTy && scrutTy->declaration == rt->declaration;
+                        return builder_.getInt1(sameType);
+                    }
                     auto dit = descArray_.find(rt->declaration);
                     if (dit != descArray_.end())
                         return emitIsA(scrut, dit->second);
