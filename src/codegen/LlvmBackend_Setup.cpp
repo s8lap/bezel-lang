@@ -1830,9 +1830,18 @@ void Emitter::setupBuiltinExceptions() {
             chain.push_back(c);
         chainOf[name] = chain;
         auto* arrTy = llvm::ArrayType::get(ptrTy(), chain.size() + 1);
+        // #805 / §2.5 / §31: the built-in exception type descriptor is emitted
+        // with LinkOnceODR (not Internal) linkage so all modules share ONE
+        // descriptor symbol per built-in exception type. emitIsA matches by
+        // descriptor-POINTER equality; with per-module (internal) descriptors a
+        // `catch Exception` in an importer could never match an exception thrown
+        // by an imported module (distinct addresses). The built-in exception
+        // hierarchy is fixed, so every module's `btd$<name>` is the same chain —
+        // ODR-mergeable. The address stays significant (no unnamed_addr): isA
+        // depends on a single canonical address per type.
         builtinDesc_[name] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage, nullptr,
+            llvm::GlobalValue::LinkOnceODRLinkage, nullptr,
             std::string("btd$") + name);
     }
     // Pass 2: fill descriptors [self..Exception, null].

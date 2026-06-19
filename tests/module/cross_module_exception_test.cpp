@@ -238,4 +238,68 @@ BEZEL_TEST(cross_module_exception, cross_module_throw_with_field_readable_spec_3
     BEZEL_EXPECT_EQ(code, 33);
 }
 
+// ── (f) fix #805: cross-module throw caught by a BUILT-IN exception type ───────
+// §31.2 / §2.5: an exception thrown by an imported module and caught in the
+// importer by a BUILT-IN exception type (`catch Exception`) is now matched. The
+// catch lowers emitIsA against the built-in type descriptor `btd$Exception`;
+// before this fix that descriptor was per-module (InternalLinkage), so the
+// importer's `btd$Exception` address never equalled the address embedded in the
+// imported exception object's vtable → the catch never fired (uncaught, exit 70).
+// LinkOnceODR linkage merges the descriptor to one symbol so the pointer match
+// succeeds. (The existing user-type-catch tests above already worked — user
+// class descriptors are shared via the import mechanism; built-in descriptors
+// were the gap.)
+BEZEL_TEST(cross_module_exception, cross_module_throw_caught_by_builtin_Exception_805) {
+    int code = buildAndRun(
+        "module ELib; "
+        "public class Thrower "
+        "  public static method Go(): int => throw new Exception(\"x\"); "
+        "end Thrower;",
+        "module Main; "
+        "import ELib; "
+        "class C public static method Main(): int "
+        "  try return Thrower.Go(); catch Exception => return 55; end; "
+        "end Main; end C;",
+        "builtin_base");
+    BEZEL_EXPECT_EQ(code, 55);
+}
+
+// §31.2 / §12: a DERIVED built-in exception (ArgumentException) thrown
+// cross-module is caught as its base `Exception` — the descriptor chain
+// (btd$ArgumentException -> btd$Exception, all shared) is walked cross-module.
+BEZEL_TEST(cross_module_exception, cross_module_derived_builtin_caught_as_base_805) {
+    int code = buildAndRun(
+        "module ELib; "
+        "public class T "
+        "  public static method ThrowArg(): int => "
+        "    throw new ArgumentException(\"a\"); "
+        "end T;",
+        "module Main; "
+        "import ELib; "
+        "class C public static method Main(): int "
+        "  try return T.ThrowArg(); catch Exception => return 11; end; "
+        "end Main; end C;",
+        "builtin_derived");
+    BEZEL_EXPECT_EQ(code, 11);
+}
+
+// §31.2 (no false catch): a built-in exception thrown cross-module is NOT caught
+// by a non-matching built-in catch type — it propagates uncaught (exit 70). Pins
+// that the shared-descriptor change did not make isA over-match.
+BEZEL_TEST(cross_module_exception, cross_module_builtin_non_matching_not_caught_805) {
+    int code = buildAndRun(
+        "module ELib; "
+        "public class T "
+        "  public static method ThrowInvalid(): int => "
+        "    throw new InvalidOperationException(\"i\"); "
+        "end T;",
+        "module Main; "
+        "import ELib; "
+        "class C public static method Main(): int "
+        "  try return T.ThrowInvalid(); catch ArgumentException => return 33; end; "
+        "end Main; end C;",
+        "builtin_nonmatch");
+    BEZEL_EXPECT_EQ(code, kUnhandledExit);
+}
+
 }  // namespace bezel::module
