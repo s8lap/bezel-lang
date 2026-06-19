@@ -5446,11 +5446,42 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // inner-scope (lambda-declaration) exit would corrupt subsequent
         // iterations.  Such cells continue to be freed at the outer scope exit
         // through the variable's own disposal entry (future work).
-        if (!alreadyBoxed && !isForVar && !wasGuardedLocal &&
+        if (!alreadyBoxed && !isForVar &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(decl))) {
-            lastLambdaCapturedCells_.push_back({newSlot,
-                                                static_cast<const void*>(decl)});
+            // #782: if the captured local is a move-only OWNING inline-array
+            // ([N owned]T? / [N owned]T), record N so lowerLocalDecl registers an
+            // element-dispose-through-cell next to the boxedCellFree — otherwise
+            // the owned elements (boxed into the cell) leak. ce.valTy is the
+            // pre-boxing [N x ptr] alloca type (this branch requires !alreadyBoxed,
+            // so it was set from slot->getAllocatedType()).
+            unsigned inlineN = 0;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(decl)) {
+                const sema::TypeRef* rt =
+                    ld->type ? ctx_.resolvedType(*ld->type)
+                             : (ld->initializer ? ctx_.exprType(*ld->initializer)
+                                                : nullptr);
+                if (rt && rt->kind == sema::TypeRef::Kind::InlineArray &&
+                    rt->arrayOwned)
+                    if (auto* at = llvm::dyn_cast<llvm::ArrayType>(ce.valTy))
+                        inlineN = static_cast<unsigned>(at->getNumElements());
+            }
+            // #429 / #782: guarded-boxing cells are normally excluded — a local
+            // declared in an outer scope and captured by an inner-LOOP lambda
+            // reuses one cell across iterations, so freeing it at the lambda
+            // scope would corrupt later iterations. A move-only inline-owned-array
+            // uses guarded boxing too (its per-slot init is not a whole-array
+            // store, so boxLocalSlot's freshEachIteration heuristic is false), but
+            // when the capture is NOT lexically inside any loop (loopStack_ empty)
+            // the guarded cell is allocated exactly once — so disposing + freeing
+            // it at scope end is sound. Non-array guarded cells keep the
+            // conservative exclusion (a safe leak).
+            bool guardedOk = !wasGuardedLocal ||
+                             (inlineN > 0 && loopStack_.empty());
+            if (guardedOk)
+                lastLambdaCapturedCells_.push_back({newSlot,
+                                                    static_cast<const void*>(decl),
+                                                    inlineN});
         }
         // #429/#672: resolve sema type for retain/release classification.
         for (const sema::Symbol* s : capturedSyms) {

@@ -5048,6 +5048,21 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             Disposal dc{ce.newSlot, nullptr};
             dc.boxedCellFree = true;
             disposeStack_.back().push_back(dc);
+            // #782: a captured move-only OWNING inline-array's elements live in the
+            // boxed cell. Dispose each non-null element THROUGH the cell, then null
+            // the slot — pushed AFTER boxedCellFree so it fires BEFORE it (reverse
+            // iteration): dispose elements, then free the cell. The original
+            // [N x ptr] alloca disposal is skipped (the array is marked
+            // "transferred" by the capture), so each element is disposed exactly
+            // once. Non-escaping-gated via lastLambdaCapturedCells_ (only cells of
+            // cellFreeEligible_ locals are recorded), so the escaped-closure UAF
+            // case never reaches here.
+            if (ce.inlineArrayN > 0) {
+                Disposal da{ce.newSlot, nullptr};
+                da.inlineOwnedArrayCell = true;
+                da.inlineSlotCount = ce.inlineArrayN;
+                disposeStack_.back().push_back(da);
+            }
         }
         Disposal d{slot, nullptr};
         d.closureRelease = true;
@@ -9610,6 +9625,47 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
             }
+            continue;
+        }
+        // §15.3 / §27.5 (#782): a CAPTURED move-only owning inline-array — its
+        // [N x ptr] value lives in the boxed cell (boxLocalSlot copied it there).
+        // `slot` is the cell-HOLDER ptr-alloca; load the cell pointer, then dispose
+        // each non-null element by GEPing the [N x ptr] over the CELL (heap), and
+        // null the slot. The cell itself is freed separately by the boxedCellFree
+        // that fires AFTER this. Non-escaping-gated at registration so the cell is
+        // alive here and no escaping closure still references the elements.
+        if (it->inlineOwnedArrayCell) {
+            llvm::Value* cell =
+                builder_.CreateLoad(ptrTy(), it->slot, "ioac.cell");
+            auto* cellNull = builder_.CreateICmpEQ(
+                cell, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* liveBB = llvm::BasicBlock::Create(llvm_, "ioac.live", currentFn_);
+            auto* afterBB = llvm::BasicBlock::Create(llvm_, "ioac.after", currentFn_);
+            builder_.CreateCondBr(cellNull, afterBB, liveBB);
+            builder_.SetInsertPoint(liveBB);
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), it->inlineSlotCount);
+            for (unsigned i = 0; i < it->inlineSlotCount; ++i) {
+                llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
+                    arrTy, cell,
+                    {builder_.getInt32(0), builder_.getInt32(i)}, "ioac.slot");
+                llvm::Value* obj =
+                    builder_.CreateLoad(ptrTy(), slotAddr, "ioac.val");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()));
+                auto* dispBB = llvm::BasicBlock::Create(llvm_, "ioac.dispose",
+                                                        currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(llvm_, "ioac.cont",
+                                                        currentFn_);
+                builder_.CreateCondBr(isNull, contBB, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(obj);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), slotAddr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
+            builder_.CreateBr(afterBB);
+            builder_.SetInsertPoint(afterBB);
             continue;
         }
         // §28.3 (line 4910): a plain `var` owned local / `owned` parameter. It is

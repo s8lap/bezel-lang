@@ -161,12 +161,13 @@ BEZEL_TEST(codegen_inline_owned_747, slot_alias_assignment_no_double_free) {
         "return Cell.n;")), 2);  // safe leak, NOT a negative count / crash
 }
 
-// SOUNDNESS (adversarial verify, LENS 1) — a move-only array captured by a
-// closure is capture-boxed (its [N x ptr] alloca becomes a ptr-sized cell), so
-// the slot-disposal GEP would read out of bounds (was SIGSEGV). The walker marks
-// any array referenced in a lambda body ineligible, so it is SKIPPED — a
-// conservative leak (counter 2), no crash. The capture itself still works.
-BEZEL_TEST(codegen_inline_owned_747, closure_capture_no_crash) {
+// §15.3 / §27.5 (#782, was #747 LENS 1) — a move-only array captured by a
+// NON-escaping closure is capture-boxed (its [N x ptr] value moves into a heap
+// cell). The plain [N x ptr]-alloca disposal is skipped (the boxed slot is now a
+// ptr-holder), but the elements are now disposed THROUGH the cell at scope end
+// (after the closure release), so both cells are reclaimed: counter 0 (was a leak
+// of 2). The capture still works (got == 1). No crash, no double-free.
+BEZEL_TEST(codegen_inline_owned_747, closure_capture_disposes_via_cell_782) {
     BEZEL_EXPECT_EQ(run(prog(
         "var got: int := 0; "
         "do "
@@ -174,7 +175,63 @@ BEZEL_TEST(codegen_inline_owned_747, closure_capture_no_crash) {
         "  var f := () => a[0]!.V; "  // captures a (capture-boxed)
         "  got := f(); "
         "end; "
-        "return Cell.n;")), 2);  // got==1 read OK; both cells leaked, no crash
+        "return Cell.n;")), 0);  // got==1 read OK; both cells disposed via cell
+}
+
+// #782: TWO non-escaping closures capture the same array — they share ONE boxed
+// cell, so the element-dispose-through-cell fires exactly once. Both cells
+// reclaimed (counter 0); a double-free would drive the live counter negative.
+BEZEL_TEST(codegen_inline_owned_747, captured_array_multi_closure_disposes_once_782) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "  var f := () => a[0]!.V; var g := () => a[1]!.V; "
+        "  var s := f() + g(); "
+        "end; "
+        "return Cell.n;")), 0);  // both disposed exactly once
+}
+
+// #782: a null slot is skipped — only the non-null element is disposed. One Cell
+// created, one disposed → counter 0.
+BEZEL_TEST(codegen_inline_owned_747, captured_array_null_slot_skipped_782) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(1), null]; "
+        "  var f := () => a.Length; var n := f(); "
+        "end; "
+        "return Cell.n;")), 0);  // the one Cell disposed; null slot a no-op
+}
+
+// #782 (soundness boundary): an ESCAPING closure captures the array (stored in an
+// outer var that outlives the do-block). The array is NOT in cellFreeEligible_,
+// so it is NOT disposed at scope end (the escaped closure still references it) —
+// a conservative leak (counter 2), NEVER a use-after-free / double-free (which
+// would drive the live counter negative). The escaped closure reads valid memory.
+BEZEL_TEST(codegen_inline_owned_747, captured_array_escaping_not_disposed_782) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var captured: () -> int := () => 0; "
+        "do "
+        "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "  captured := () => a.Length; "
+        "end; "
+        "var n := captured(); "
+        "return Cell.n;")), 2);  // leaked (escaping), no double-free
+}
+
+// #782 (conservative residual): the array is declared inside a LOOP body — its
+// guarded cell could be reused across iterations, so it stays excluded (loopStack
+// non-empty). The elements leak (counter 4 = 2 iters x 2 cells) but there is no
+// crash / double-free. (Tracked: per-iteration disposal of in-loop captured
+// owned arrays is the harder follow-up — same family as #793/#694.)
+BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_conservative_leak_782) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "for var i in 1 .. 2 do "
+        "  do "
+        "    var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
+        "    var f := () => a.Length; var n := f(); "
+        "  end; "
+        "end; "
+        "return Cell.n;")), 4);  // leaked (in-loop), no crash
 }
 
 // EXCEPTION path (§15.3 line 2022 / §28.3 implicit try/finally): both slots are

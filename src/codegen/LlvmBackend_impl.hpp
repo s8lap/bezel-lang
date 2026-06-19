@@ -416,6 +416,10 @@ private:
     struct LastCellEntry {
         llvm::AllocaInst* newSlot;
         const void* key;   // LocalDecl* (ast::Node*) or Symbol* for params
+        // #782: N>0 when `key` is a move-only OWNING inline-array local captured
+        // by this (non-escaping) lambda — drives an element-dispose-through-cell
+        // disposal next to the boxedCellFree. 0 otherwise.
+        unsigned inlineArrayN = 0;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // CG6: emitted LLVM function for each static method symbol.
@@ -757,6 +761,20 @@ private:
         // leaks, never double-frees).
         bool inlineOwnedArray = false;
         unsigned inlineSlotCount = 0;
+        // §15.3 / §27.5 (#782): a move-only OWNING inline-array local that is
+        // CAPTURED by a non-escaping closure. Capture boxes the [N x ptr] value
+        // into a heap cell (boxLocalSlot, §27.5) and marks the local "transferred"
+        // so its plain inlineOwnedArray slot disposal is skipped (the boxed slot is
+        // now a ptr-holder, so the alloca GEP would be out of bounds). Without a
+        // replacement the owned elements leak (#782). This disposal disposes each
+        // non-null element THROUGH the cell: `slot` is the cell-holder ptr-alloca
+        // (newSlot), `inlineSlotCount` is N. Registered next to the captured cell's
+        // boxedCellFree (so it is non-escaping-gated via lastLambdaCapturedCells_)
+        // and BEFORE it in firing order (dispose elements, then free the cell). The
+        // original [N x ptr] alloca disposal stays skipped, so each element is
+        // disposed exactly once (no double-free). bz_box-style no GEP on the
+        // ptr-holder: the cell pointer is loaded first.
+        bool inlineOwnedArrayCell = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
