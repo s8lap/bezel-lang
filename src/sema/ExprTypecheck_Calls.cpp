@@ -5834,8 +5834,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // When the receiver was flow-narrowed (§12.7, issue #413), `targetType`
         // is already the narrowed type, so a member declared only on the narrowed
         // type resolves and is not rejected.
+        // #795 / §2.5 / §2.6: an IMPORTED user type is also known-complete — its
+        // metadata carries its full member set (and base chain, which lookupMember
+        // walks), so a member that resolves to nothing genuinely does not exist.
+        // An imported type has a null `decl` (no local AST), so it would otherwise
+        // miss the `decl != nullptr` gate below and an unknown-member call would
+        // miscompile silently (garbage result) instead of failing the build.
+        // Restricted to NON-GENERIC imported types: imported generic-class member
+        // completeness is not yet guaranteed (the #428 family — #783/#710/#711),
+        // so imported generics stay permissive to avoid a false rejection.
+        // Builtin types (Console, Math, …) are NOT imported, so they keep their
+        // null-decl permissive path; imported INTERFACES have kind Interface and
+        // are excluded by the kind check (their member resolution is incomplete).
+        bool importedKnownCompleteUserType =
+            ctx_.isImported(targetType) && targetType->genericParams.empty();
         bool knownCompleteUserType =
-            targetType->decl != nullptr &&
+            (targetType->decl != nullptr || importedKnownCompleteUserType) &&
             (targetType->kind == ast::TypeDeclKind::Class ||
              targetType->kind == ast::TypeDeclKind::Record ||
              targetType->kind == ast::TypeDeclKind::Enum);

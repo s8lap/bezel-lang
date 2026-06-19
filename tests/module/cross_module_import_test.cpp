@@ -174,6 +174,61 @@ BEZEL_TEST(cross_module_import, wrong_arg_type_rejected_spec_5_1) {
     BEZEL_EXPECT_TRUE(r->hadErrors);
 }
 
+// fix #795 / §2.5 / §11.3 / §12.1: a call to a member that does NOT exist on an
+// imported type is rejected with a "no member" diagnostic. Before the fix the
+// importer silently accepted it (the imported type has a null local `decl`, so
+// the issue-#414 known-complete-user-type gate missed it) and codegen lowered a
+// null callee → a garbage/zero result. Member-existence is a basic soundness
+// check; for imported types it must be enforced too.
+BEZEL_TEST(cross_module_import, unknown_member_on_imported_type_rejected_795) {
+    ModuleMetadata dep = buildMetaFor(
+        "module ExtLib; "
+        "public class Widget "
+        "  public _val: int; "
+        "  public constructor(v: int) _val := v; end constructor; "
+        "end Widget;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import ExtLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w := new Widget(21); "
+        "    return w.Nonexistent(); "   // no such member on Widget
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// fix #795 (false-rejection guard) / §2.5 / §12: legitimate imported members —
+// an instance method, a public field, AND a member INHERITED from an imported
+// base (lookupMember walks the reconstructed base chain) — all resolve and
+// type-check clean; the new unknown-member diagnostic must not over-reject.
+BEZEL_TEST(cross_module_import, imported_real_and_inherited_members_resolve_795) {
+    ModuleMetadata dep = buildMetaFor(
+        "module ExtLib; "
+        "public class Base "
+        "  public _b: int; "
+        "  public constructor(b: int) _b := b; end constructor; "
+        "  public method BaseVal(): int => _b; "
+        "end Base; "
+        "public class Derived: Base "
+        "  public constructor(b: int) base(b); end constructor; "
+        "  public method DerivedVal(): int => _b + 1; "
+        "end Derived;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import ExtLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var d := new Derived(10); "
+        "    return d.BaseVal() + d.DerivedVal() + d._b; "  // inherited + own + field
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
 // §2.5 by-name resolution within the loaded module set: a method whose return
 // type is a SIBLING exported type of the same module reconstructs with that
 // sibling's TypeSymbol as its return type's declaration (named-type-by-name).
