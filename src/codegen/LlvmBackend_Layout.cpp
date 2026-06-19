@@ -39,6 +39,20 @@ bool Emitter::isUnsignedPrim(sema::PrimitiveType p) {
 }
 
 
+// #814 / §6.2 / §5.1: the signedness of a binary integer OPERATION (the
+// comparison predicate, the overflow/div/rem intrinsic) is the signedness of the
+// COMMON (promoted) type, not "either operand is unsigned". §6.2 promotes the
+// narrower operand to the larger type; the common type is unsigned ONLY when
+// BOTH operands are unsigned — if either is signed, the unsigned operand widens
+// to a signed type (byte→int, uint→long per the §5.1 table; `ulong + long` has
+// no common integer type and is a §6.2 compile error), so the operation is
+// signed. (Earlier this OR'd the operands, so `byte < int(-3)` used ICmpULT and
+// `byte + int(-3)` used uadd_with_overflow — treating the negative value as a
+// huge unsigned → wrong boolean / spurious OverflowException.)
+//
+// NOTE: per-operand WIDENING (zext vs sext of the narrower operand) and the
+// fill of a right-SHIFT use a *different* signedness — each operand's own (and,
+// for shift, the LEFT operand's). Those sites use isUnsignedTargetExpr directly.
 bool Emitter::isUnsignedBinOperand(const ast::BinaryExpr& bin) {
     auto unsignedExpr = [&](const ast::Expr* e) {
         if (!e) return false;
@@ -46,7 +60,7 @@ bool Emitter::isUnsignedBinOperand(const ast::BinaryExpr& bin) {
         return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                isUnsignedPrim(rt->primitive);
     };
-    return unsignedExpr(bin.left.get()) || unsignedExpr(bin.right.get());
+    return unsignedExpr(bin.left.get()) && unsignedExpr(bin.right.get());
 }
 
 

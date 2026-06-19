@@ -3907,8 +3907,15 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                         lp->getType() != rp->getType()) {
                         unsigned lb = lp->getType()->getIntegerBitWidth();
                         unsigned rb = rp->getType()->getIntegerBitWidth();
-                        if (lb < rb) lp = builder_.CreateSExt(lp, rp->getType());
-                        else         rp = builder_.CreateSExt(rp, lp->getType());
+                        // #814: widen each narrower payload by ITS OWN signedness.
+                        bool lU = bin.left && isUnsignedTargetExpr(*bin.left);
+                        bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
+                        if (lb < rb)
+                            lp = lU ? builder_.CreateZExt(lp, rp->getType())
+                                    : builder_.CreateSExt(lp, rp->getType());
+                        else
+                            rp = rU ? builder_.CreateZExt(rp, lp->getType())
+                                    : builder_.CreateSExt(rp, lp->getType());
                     }
                     bool uns = isUnsignedBinOperand(bin);
                     if      (op == "<")  cmp = uns ? builder_.CreateICmpULT(lp, rp, "lift.cmp")
@@ -3952,14 +3959,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (!lFP && !rFP && lp->getType()->isIntegerTy() &&
                 rp->getType()->isIntegerTy() &&
                 lp->getType() != rp->getType()) {
-                bool uns = isUnsignedBinOperand(bin);
                 unsigned lb = lp->getType()->getIntegerBitWidth();
                 unsigned rb = rp->getType()->getIntegerBitWidth();
                 llvm::Type* wide = lb >= rb ? lp->getType() : rp->getType();
-                if (lb < rb) lp = uns ? builder_.CreateZExt(lp, wide)
-                                      : builder_.CreateSExt(lp, wide);
-                if (rb < lb) rp = uns ? builder_.CreateZExt(rp, wide)
-                                      : builder_.CreateSExt(rp, wide);
+                // #814: widen each narrower payload by ITS OWN signedness.
+                bool lU = bin.left && isUnsignedTargetExpr(*bin.left);
+                bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
+                if (lb < rb) lp = lU ? builder_.CreateZExt(lp, wide)
+                                     : builder_.CreateSExt(lp, wide);
+                if (rb < lb) rp = rU ? builder_.CreateZExt(rp, wide)
+                                     : builder_.CreateSExt(rp, wide);
             }
             // Promote integer payload to FP when the other side is FP.
             if (lFP || rFP) {
@@ -4326,10 +4335,15 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         unsigned lw = l->getType()->getIntegerBitWidth();
         unsigned rw = r->getType()->getIntegerBitWidth();
         llvm::Type* wide = lw >= rw ? l->getType() : r->getType();
-        if (lw < rw) l = uns ? builder_.CreateZExt(l, wide)
-                             : builder_.CreateSExt(l, wide);
-        if (rw < lw) r = uns ? builder_.CreateZExt(r, wide)
-                             : builder_.CreateSExt(r, wide);
+        // #814: widen each narrower operand by ITS OWN signedness (an unsigned
+        // operand zero-extends, a signed operand sign-extends), independent of
+        // the operation's common-type signedness (`uns`).
+        bool lU = bin.left && isUnsignedTargetExpr(*bin.left);
+        bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
+        if (lw < rw) l = lU ? builder_.CreateZExt(l, wide)
+                            : builder_.CreateSExt(l, wide);
+        if (rw < lw) r = rU ? builder_.CreateZExt(r, wide)
+                            : builder_.CreateSExt(r, wide);
     }
     // CG27a (§4.6): string binary operations — intercept before the
     // integer arithmetic path (string variables are ptr-typed, not int).
@@ -4631,8 +4645,12 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             llvm::Value* mask = llvm::ConstantInt::get(r->getType(), bits - 1);
             llvm::Value* cnt = builder_.CreateAnd(r, mask, "shcnt");
             if (op == "<<")  return builder_.CreateShl(l, cnt);
-            return uns ? builder_.CreateLShr(l, cnt)
-                       : builder_.CreateAShr(l, cnt);
+            // #814 / §6.5: `>>` fill is logical (LShr) iff the SHIFTED value (the
+            // LEFT operand) is unsigned; arithmetic (AShr) for a signed value.
+            // The shift count's signedness is irrelevant.
+            bool lShiftUns = bin.left && isUnsignedTargetExpr(*bin.left);
+            return lShiftUns ? builder_.CreateLShr(l, cnt)
+                             : builder_.CreateAShr(l, cnt);
         }
     }
     // §8.3 (equality table) / §15.1.2: inline arrays `[N]T` compare
