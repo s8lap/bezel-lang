@@ -3660,10 +3660,17 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     if (!iterTy->genericArgs.empty() && iterTy->genericArgs[0])
         elemTy = lowerTypeRef(iterTy->genericArgs[0]);
 
-    // Evaluate the source to the enumerator pointer (an SSA value, used directly
-    // below — see the function comment on why it must NOT be a stack slot).
+    // Evaluate the source to the enumerator pointer and store it in a slot.
+    // #792 / §29.7/§30.7: the slot is frame-backed (asyncHandlerSpillSlots_) so it
+    // survives the loop's own per-iteration await suspends AND is reachable on the
+    // unwind path — mirroring the synchronous iterator-for (lowerIEnumerableBuiltinFor).
+    // This replaces the prior SSA-promoted enumerator: holding it in a frame slot
+    // lets the disposal scope below dispose the frame on EVERY exit edge.
     llvm::Value* enumPtr = lowerExpr(*fs.iterable);
     if (!enumPtr) return false;
+    auto* enumSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(enumPtr, enumSlot);
+    asyncHandlerSpillSlots_.push_back(enumSlot);  // survive the condBB await suspend
     // §30.8 (#765/#790): evaluate the optional `with` cancellation token. Its
     // value is a pointer to the source's cancellation-state cell (null for
     // CancellationToken.None). It is observed at each iteration's suspend point
@@ -3681,12 +3688,23 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     }
     locals_[&fs] = varSlot;
 
-    // Vtable-dispatched MoveNextAsync (slot 2) / Current (slot 3) / Dispose
-    // (slot 1) on the enumerator frame.
+    // #792 / §29.7 (#623): register the enumerator frame for disposal on ALL exit
+    // paths (break / return / exception-unwind / normal exhaustion) via a dedicated
+    // scope around the loop — the iterator frame's Dispose is at vtable slot 1, so
+    // use iterEnumDispose. Previously the frame was disposed only at endBB (normal
+    // completion), leaking it when the body threw / returned / broke out.
+    std::size_t outerDepth = disposeStack_.size();
+    disposeStack_.emplace_back();
+    {
+        Disposal d{enumSlot, nullptr};
+        d.iterEnumDispose = true;
+        disposeStack_.back().push_back(d);
+    }
+
+    // Vtable-dispatched MoveNextAsync (slot 2) / Current (slot 3); Dispose
+    // (slot 1) is handled by the disposal scope above (iterEnumDispose).
     auto* moveNextTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
     auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
-    auto* disposeTy =
-        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "afor.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "afor.body", currentFn_);
@@ -3710,15 +3728,11 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
         auto* proceedBB =
             llvm::BasicBlock::Create(llvm_, "afor.proceed", currentFn_);
         builder_.CreateCondBr(cancelled, cancelBB, proceedBB);
-        // cancelBB: dispose the iterator frame (vtable slot 1), then throw a
-        // catchable OperationCanceledException (mirrors ThrowIfCancellation
-        // Requested). emitThrowValue terminates the block (branch to unwind).
+        // cancelBB: throw a catchable OperationCanceledException. The iterator
+        // frame is disposed by the disposal scope on the resulting unwind (#792 —
+        // no longer an explicit per-cancel-path dispose). emitThrowValue
+        // terminates the block (branch to unwind).
         builder_.SetInsertPoint(cancelBB);
-        llvm::Value* cvt = builder_.CreateLoad(ptrTy(), enumPtr);
-        llvm::Value* cdisp = builder_.CreateLoad(
-            ptrTy(),
-            builder_.CreateGEP(ptrTy(), cvt, {builder_.getInt32(1)}));
-        builder_.CreateCall(disposeTy, cdisp, {enumPtr});
         auto vit = builtinVtable_.find("OperationCanceledException");
         if (vit != builtinVtable_.end()) {
             llvm::Value* oce = builder_.CreateCall(
@@ -3731,12 +3745,13 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
         }
         builder_.SetInsertPoint(proceedBB);
     }
-    llvm::Value* vt = builder_.CreateLoad(ptrTy(), enumPtr);
+    llvm::Value* enumObj = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vt = builder_.CreateLoad(ptrTy(), enumObj);
     llvm::Value* mnSlotPtr =
         builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(2)});
     llvm::Value* mnFnPtr = builder_.CreateLoad(ptrTy(), mnSlotPtr);
     llvm::Value* task =
-        builder_.CreateCall(moveNextTy, mnFnPtr, {enumPtr}, "afor.task");
+        builder_.CreateCall(moveNextTy, mnFnPtr, {enumObj}, "afor.task");
     // §30.7: await the per-advance task (a single-use producer task — free it
     // after its bool is read). This is a suspend point in the consuming method.
     llvm::Value* hasValue =
@@ -3746,26 +3761,29 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
 
     // body: x := Current(enum); run the user body.
     builder_.SetInsertPoint(bodyBB);
-    llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), enumPtr);
+    llvm::Value* enumObj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), enumObj2);
     llvm::Value* curSlotPtr =
         builder_.CreateGEP(ptrTy(), vt2, {builder_.getInt32(3)});
     llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
     llvm::Value* curVal =
-        builder_.CreateCall(currentTy, curFnPtr, {enumPtr}, "afor.cur");
+        builder_.CreateCall(currentTy, curFnPtr, {enumObj2}, "afor.cur");
     builder_.CreateStore(curVal, varSlot);
 
-    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    // #792 / §29.7: loopScopeDepth = outerDepth (BEFORE the enumerator scope) so
+    // `break`/`return` out of the loop disposes the iterator frame too.
+    loopStack_.push_back({condBB, endBB, outerDepth});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
 
-    // end: dispose the enumerator (vtable slot 1) — frees the iterator frame.
+    // end: normal exhaustion. Dispose the enumerator frame (vtable slot 1, via the
+    // scope's iterEnumDispose — runs any pending finally + frees the frame), then
+    // pop the scope. #792: this single scope now covers normal exit AND the
+    // break/return/unwind paths (previously only this normal-exit dispose existed).
     builder_.SetInsertPoint(endBB);
-    llvm::Value* vt3 = builder_.CreateLoad(ptrTy(), enumPtr);
-    llvm::Value* dispSlotPtr =
-        builder_.CreateGEP(ptrTy(), vt3, {builder_.getInt32(1)});
-    llvm::Value* dispFnPtr = builder_.CreateLoad(ptrTy(), dispSlotPtr);
-    builder_.CreateCall(disposeTy, dispFnPtr, {enumPtr});
+    emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
     return true;
 }
 

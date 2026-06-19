@@ -338,6 +338,7 @@ set(BEZEL_TEST_SOURCES
     codegen/loop_var_capture_nested_if_754_test.cpp
     codegen/interface_indexer_dispatch_730_test.cpp
     codegen/lazy_static_init_720_test.cpp
+    codegen/await_for_frame_dispose_792_test.cpp
     codegen/async_nested_task_return_776_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp
