@@ -2294,14 +2294,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // operand"); an explicit `f: () -> Task<T>` annotation supplied the
             // wrapping but inference did not.
             //
-            // SCOPE: BLOCK-bodied async lambdas only. An EXPRESSION-bodied async
-            // lambda with an inferred (synthetic) Task<T> type miscompiles at
-            // codegen (a SIGSEGV — the inferred Task type is not equivalent to a
-            // resolved annotated one at the closure-call/local-decl site, the
-            // async-lambda analogue of #799); wrapping it here would turn a clean
-            // compile error into a crash. That expression-body case is tracked in
-            // #800 (full fix) and remains a clear compile error (sound) for now.
-            if (lam->isAsync && !lam->exprBody && inferredReturn) {
+            // Applies to BOTH block- and expression-bodied async lambdas (#800
+            // Layer-2). The codegen reads this wrapped funcReturn (Task<T>) for an
+            // expression-bodied async lambda too (LlvmBackend_Exprs.cpp lowerLambda
+            // derives the closure's async result type from the lambda's exprType
+            // funcReturn when it is async), so the body's value is wrapped into the
+            // outer Task instead of returned raw.
+            if (lam->isAsync && inferredReturn) {
                 bool ownedResult =
                     inferredReturn->kind == TypeRef::Kind::Named &&
                     inferredReturn->declaration &&

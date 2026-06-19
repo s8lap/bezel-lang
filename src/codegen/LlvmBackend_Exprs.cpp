@@ -5157,7 +5157,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // nullable-value promotion in the expr-body emit path — fix #541 / §7).
     llvm::Type* retTy = i32();
     const sema::TypeRef* retSemaTy = nullptr;
-    if (lam.exprBody) {
+    // #800 Layer-2 / §30.6: an ASYNC expression-bodied lambda's function type is
+    // `() -> Task<T>` (sema wraps the inferred return), and the async state machine
+    // wraps the body's natural value T into that outer Task. Derive retTy/retSemaTy
+    // from the wrapped funcReturn (Task<T>), exactly as the block-body path below
+    // does — NOT from the raw body element type. Using the raw element type left
+    // the async result-element typing inconsistent with the block case (the
+    // no-annotation fallback's `retTy != i32()` gate then dropped an int element →
+    // null result slot → SIGSEGV).
+    if (lam.exprBody && lam.isAsync) {
+        if (sema::TypeRef* lamTy = ctx_.exprType(lam)) {
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retTy = lowerTypeRef(lamTy->funcReturn);
+                retSemaTy = lamTy->funcReturn;
+            }
+        }
+    } else if (lam.exprBody) {
         if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
             retTy = lowerTypeRef(rt);
             retSemaTy = rt;
