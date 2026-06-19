@@ -735,8 +735,54 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // ast::MethodDecl; its resolved return type was stashed by the
             // loader keyed on the symbol. Use it so the call expression types
             // correctly against the imported signature.
-            if (TypeRef* rt = ctx_.importedReturnType(ms))
+            if (TypeRef* rt = ctx_.importedReturnType(ms)) {
                 ctx_.setExprType(&ce, rt);
+                // #783 / §14.1 (decline-with-reasons): an IMPORTED generic class's
+                // method whose return type references a class type parameter is NOT
+                // monomorphized importer-side — its body was compiled in the
+                // defining module against the placeholder (i32) layout, so calling
+                // it on a REFERENCE-typed instantiation (the parameter lowers to
+                // `ptr`, not i32) returns the field at the wrong offset → a silently
+                // wrong value (e.g. `Box<string>.Get()` → 0). Direct field access,
+                // ctors, and owned-field disposal ARE specialized importer-side and
+                // keep working; an `int` instantiation matches the placeholder and
+                // works; a method whose return type does NOT use the parameter is
+                // not substituted (sub == rt) and is left alone. Reject ONLY the
+                // proven-miscompiling shape with a clean diagnostic (importer-side
+                // method monomorphization is the full fix — #783, #428 family) so a
+                // clean compile never returns garbage.
+                if (ms->parent && ctx_.isImported(ms->parent) &&
+                    !ms->parent->genericParams.empty()) {
+                    if (auto* gma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce.callee.get())) {
+                        if (gma->target) {
+                            TypeRef* sub = substituteMemberType(
+                                rt, gma->target.get(), ms->parent);
+                            bool refLike = sub && sub != rt &&
+                                ((sub->kind == TypeRef::Kind::Primitive &&
+                                  sub->primitive == PrimitiveType::String) ||
+                                 (sub->kind == TypeRef::Kind::Named &&
+                                  sub->declaration &&
+                                  (sub->declaration->kind ==
+                                       ast::TypeDeclKind::Class ||
+                                   sub->declaration->kind ==
+                                       ast::TypeDeclKind::Interface)));
+                            if (refLike)
+                                ctx_.diagnostics().report(
+                                    Severity::Error, gma->span.begin,
+                                    "calling `" + std::string(ms->name) +
+                                    "` on an imported generic class instantiated "
+                                    "with a reference type argument is not yet "
+                                    "monomorphized (\xC2\xA7""14.1 / #783): the "
+                                    "method's body uses the type parameter against "
+                                    "the placeholder layout and would return a "
+                                    "wrong value. Access the field directly, or use "
+                                    "an `int` instantiation, until importer-side "
+                                    "method monomorphization lands");
+                        }
+                    }
+                }
+            }
         }
     } else if (auto* xd = dynamic_cast<ExternDeclSymbol*>(calleeSym)) {
         // §32: a call to an extern method takes its declared return type.

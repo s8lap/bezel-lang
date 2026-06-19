@@ -3555,4 +3555,84 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 6);
 }
 
+// partial #783 / §14.1: calling a method whose RETURN TYPE references the class's
+// generic parameter, on an imported generic class instantiated with a REFERENCE
+// type argument, is not yet monomorphized importer-side — the body runs against
+// the placeholder layout and returns a silently wrong value. Sema now rejects it
+// with a clean diagnostic instead of miscompiling.
+BEZEL_TEST(cross_module_import, imported_generic_T_method_reftype_rejected_783) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib2; "
+        "public class Box<T> "
+        "  public v: T; "
+        "  public method Get(): T return this.v; end Get; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; import Lib2; "
+        "public class C public static method Main(): int "
+        "  using var b := new Box<string>(); b.v := \"hello\"; "
+        "  return b.Get().Length; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);  // #783: T-returning method on Box<string>
+}
+
+// #783 (no false positive): the SAME method on an `int` instantiation matches the
+// placeholder layout and works — it is NOT rejected.
+BEZEL_TEST(cross_module_import, imported_generic_T_method_int_accepted_783) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib2; "
+        "public class Box<T> "
+        "  public v: T; "
+        "  public method Get(): T return this.v; end Get; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; import Lib2; "
+        "public class C public static method Main(): int "
+        "  using var b := new Box<int>(); b.v := 7; "
+        "  return b.Get(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);  // int matches the placeholder → works
+}
+
+// #783 (no false positive): a method whose return type does NOT use the type
+// parameter (`Hello(): int`) is unaffected by the placeholder layout and is NOT
+// rejected, even on a reference-type instantiation.
+BEZEL_TEST(cross_module_import, imported_generic_nonT_method_accepted_783) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib2; "
+        "public class Box<T> "
+        "  public v: T; "
+        "  public method Hello(): int return 42; end Hello; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; import Lib2; "
+        "public class C public static method Main(): int "
+        "  using var b := new Box<string>(); "
+        "  return b.Hello(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);  // Hello() doesn't use T → works
+}
+
+// #783 (no false positive): DIRECT field access on a reference-type instantiation
+// IS specialized importer-side and works — only the METHOD path is gated.
+BEZEL_TEST(cross_module_import, imported_generic_direct_field_accepted_783) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib2; "
+        "public class Box<T> "
+        "  public v: T; "
+        "  public method Get(): T return this.v; end Get; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; import Lib2; "
+        "public class C public static method Main(): int "
+        "  using var b := new Box<string>(); b.v := \"hello\"; "
+        "  return b.v.Length; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);  // direct field read is specialized
+}
+
 }  // namespace bezel::module
