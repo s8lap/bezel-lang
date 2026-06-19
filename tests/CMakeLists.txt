@@ -342,6 +342,7 @@ set(BEZEL_TEST_SOURCES
     codegen/escaping_member_ref_borrow_791_test.cpp
     codegen/move_result_owned_724_test.cpp
     codegen/expr_bodied_async_799_test.cpp
+    codegen/async_lambda_infer_block_800_test.cpp
     codegen/async_nested_task_return_776_test.cpp
     codegen/lambda_method_call_on_param_747_test.cpp
     codegen/finally_test.cpp

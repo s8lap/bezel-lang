@@ -2285,6 +2285,39 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 if (!inferredReturn)
                     inferredReturn = ctx_.primitiveTypeRef(PrimitiveType::Int);
             }
+            // §30.6 (#800, partial): the function type of an ASYNC lambda has a
+            // `Task<T>` (or `OwnedTask<T>` for a class-typed, ownership-
+            // transferring result) return — the body's natural result T is
+            // wrapped, exactly as for an async method (§30.1). Without this the
+            // INFERRED type of `var f := async () => do return 1; end` was
+            // `() -> T`, so `await f()` was rejected ("await requires a Task
+            // operand"); an explicit `f: () -> Task<T>` annotation supplied the
+            // wrapping but inference did not.
+            //
+            // SCOPE: BLOCK-bodied async lambdas only. An EXPRESSION-bodied async
+            // lambda with an inferred (synthetic) Task<T> type miscompiles at
+            // codegen (a SIGSEGV — the inferred Task type is not equivalent to a
+            // resolved annotated one at the closure-call/local-decl site, the
+            // async-lambda analogue of #799); wrapping it here would turn a clean
+            // compile error into a crash. That expression-body case is tracked in
+            // #800 (full fix) and remains a clear compile error (sound) for now.
+            if (lam->isAsync && !lam->exprBody && inferredReturn) {
+                bool ownedResult =
+                    inferredReturn->kind == TypeRef::Kind::Named &&
+                    inferredReturn->declaration &&
+                    inferredReturn->declaration->kind == ast::TypeDeclKind::Class;
+                auto* taskTy = ctx_.makeTypeRef();
+                taskTy->kind = TypeRef::Kind::Named;
+                taskTy->nullable = false;
+                auto* ann = new ast::Type();
+                ann->kind = ast::TypeKind::Named;
+                auto* nm = new ast::QualifiedName();
+                nm->parts.push_back(ownedResult ? "OwnedTask" : "Task");
+                ann->name.reset(nm);
+                taskTy->astNode = ann;
+                taskTy->genericArgs.push_back(inferredReturn);
+                inferredReturn = taskTy;
+            }
             lamTy->funcReturn = inferredReturn;
             ctx_.setExprType(lam, lamTy);
         }
