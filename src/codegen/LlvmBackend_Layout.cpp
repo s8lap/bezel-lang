@@ -1745,11 +1745,20 @@ struct CaptureWalker {
 // CaptureWalker's traversal of the AST, but records lambdas instead of symbols.
 struct LambdaCollector {
     std::vector<const ast::LambdaExpr*>& out;
+    // §27.5 / #672: when true, also descend INTO each recorded lambda's body so
+    // every nested LambdaExpr is collected (one entry per closure env). When
+    // false (the #754 default), only the outermost lambdas are recorded.
+    bool descend = false;
 
     void expr(const ast::Expr* e) {
         if (!e) return;
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
-            out.push_back(lam); return;  // outermost only — do not descend
+            out.push_back(lam);
+            if (descend) {
+                if (lam->exprBody) expr(lam->exprBody.get());
+                for (auto& s : lam->stmts) stmt(s.get());
+            }
+            return;  // outermost only unless descend is set
         }
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             expr(m->target.get()); return; }
@@ -1876,6 +1885,16 @@ void Emitter::collectCapturedSyms(
     CaptureWalker w{ctx_, out};
     if (lam.exprBody) w.expr(lam.exprBody.get());
     for (auto& s : lam.stmts) w.stmt(s.get());
+}
+
+
+// §27.5 / #672: collect EVERY LambdaExpr in the body (full descent into nested
+// lambda bodies). Each distinct node is one closure env.
+void Emitter::collectAllLambdas(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<const ast::LambdaExpr*>& out) {
+    LambdaCollector lc{out, /*descend=*/true};
+    for (auto& s : body) lc.stmt(s.get());
 }
 
 

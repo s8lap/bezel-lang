@@ -4364,6 +4364,29 @@ private:
     void collectBoxReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // §27.5 / §28.9 / #672: the set of +1-box-producer LOCAL DECL NODES
+    // (ast::Node*) that are captured by EXACTLY ONE lambda env in the function
+    // body. A captured boxed-value local has its scope-end bz_box_release
+    // SUPPRESSED by BoxEscapeWalker (the capture marks it escaped); the owning
+    // lambda's per-lambda envdtor must perform that deferred release instead
+    // (mirroring the string/closure capture handling). The transfer model —
+    // one suppressed release, performed by the single envdtor — is sound ONLY
+    // when exactly one env holds the box; two capturing lambdas (two envdtors)
+    // would each perform the single suppressed release → double-free. So this
+    // set admits a box-producer local only when its whole-body capture count is
+    // exactly 1. Multi-captured boxes keep leaking (the safe direction, PRIME
+    // DIRECTIVE) — tracked separately for the general rc-retain solution.
+    // Computed once per body by collectBoxSingleCaptureLocals; consulted at the
+    // lambda capture site in lowerLambda to arm the envdtor box release.
+    std::unordered_set<const void*> boxSingleCaptureLocals_;
+    // The function for which boxSingleCaptureLocals_ was computed (mirrors
+    // boxReleaseEligibleFn_): a lambda/thunk body lowered mid-function inherits
+    // no eligibility, so its captured boxes just leak (never double-freed).
+    llvm::Function* boxSingleCaptureLocalsFn_ = nullptr;
+    // Compute boxSingleCaptureLocals_ for a block body (see the .cpp).
+    void collectBoxSingleCaptureLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // #429 / §27.5: the set of LOCAL DECL NODES (ast::Node*) and PARAMETER
     // SYMBOLS (sema::Symbol*) whose boxed capture cell can be safely freed at
     // outer-scope exit.  A captured local/param qualifies iff EVERY lambda in
@@ -4787,6 +4810,14 @@ private:
     // their captures too. Identifier resolution uses sema's exprSymbol map.
     void collectCapturedSyms(const ast::LambdaExpr& lam,
                              std::unordered_set<const sema::Symbol*>& out);
+
+    // §27.5 / #672: collect EVERY LambdaExpr in a statement list, descending
+    // into nested lambda bodies (unlike LambdaCollector, which stops at the
+    // outermost). Each distinct lambda node corresponds to one closure env, so
+    // the caller can count how many envs capture a given local.
+    void collectAllLambdas(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<const ast::LambdaExpr*>& out);
 
     // §27.5 / #754: does any closure in `fs.body` capture the for-loop variable?
     // Finds the outermost LambdaExprs in the body and runs collectCapturedSyms on

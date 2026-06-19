@@ -305,6 +305,107 @@ const char* kCellSizeSmoke =
     "  end Main; "
     "end C;";
 
+// §8.6 / §28.9 / #672 BOX-CAPTURE RELEASE (the fix): a boxed VALUE local
+// (`var o: Object := 42` — a +1 box producer) captured by exactly ONE
+// non-escaping lambda.  BoxEscapeWalker marks the local escaped (captured), so
+// its scope-end bz_box_release is SUPPRESSED; the owning lambda's envdtor now
+// performs that deferred release.  Before this lane the 24-byte box wrapper
+// leaked.  LSan-CLEAN.  Returns 1 (the `o is int` capture fires).
+const char* kBoxSingleCaptureNonEscaping =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var hit: int := 0; "
+    "    do "
+    "      var o: Object := 42; "
+    "      var f: () -> bool := () => o is int; "
+    "      if f() then hit := 1; end; "
+    "    end; "
+    "    return hit; "   // 1
+    "  end Main; "
+    "end C;";
+
+// §8.6 / §27.5 / #672: a FRESH boxed value captured by a fresh non-escaping
+// lambda each loop iteration.  Each iteration's box is released by THAT
+// iteration's closure envdtor (the in-loop local uses fresh — not guarded —
+// boxing, so one box + one closure per iteration, count==1).  No per-iteration
+// leak, no double-free.  LSan-CLEAN.  Returns 1 (all 1000 iterations match).
+const char* kBoxLoopFreshCapture =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var i: int := 0; var acc: int := 0; "
+    "    while i < 1000 do "
+    "      var o: Object := i; "
+    "      var f: () -> bool := () => o is int; "
+    "      if f() then acc := acc + 1; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    if acc = 1000 then return 1; end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// §8.6 / §28.9 / #672: an ESCAPING capturing lambda — the closure (holding the
+// boxed `o`) is RETURNED from Make and invoked in Main, then released at Main's
+// scope end.  The box's release is correctly deferred to the envdtor that runs
+// at the escaped closure's last-drop (AFTER Make returns), so the box is read
+// during f() while still live (no UAF) and freed exactly once (no double-free).
+// The 8-byte boxed CELL still leaks (the pre-existing #429 escaping-cell leak,
+// orthogonal to the box-value release) — tolerated here.  Returns 1.
+const char* kBoxEscapingCapture =
+    "module M; class C "
+    "  public static method Make(): () -> bool "
+    "    var o: Object := 42; "
+    "    return () => o is int; "
+    "  end Make; "
+    "  public static method Main(): int "
+    "    var f: () -> bool := Make(); "
+    "    if f() then return 1; end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// §8.6 / §28.9 / #672 MULTI-CAPTURE (deferred, leak-tolerated): the SAME boxed
+// `o` captured by TWO lambdas — two envs hold the one box.  The single
+// suppressed scope-end release cannot be performed by BOTH envdtors without a
+// double-free, so this case is deliberately EXCLUDED from box release (capture
+// count 2 ≠ 1) and the box leaks (the safe PRIME-DIRECTIVE direction).  This
+// test pins that there is NO double-free / UAF — only a tolerated leak.
+// Returns 1.
+const char* kBoxMultiCaptureNoDoubleFree =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var hit: int := 0; "
+    "    do "
+    "      var o: Object := 42; "
+    "      var f: () -> bool := () => o is int; "
+    "      var g: () -> bool := () => o is int; "
+    "      if f() then if g() then hit := 1; end; end; "
+    "    end; "
+    "    return hit; "   // 1
+    "  end Main; "
+    "end C;";
+
+// §8.6 / §27.5 / #672 GUARDED (deferred, leak-tolerated): a box producer
+// declared OUTSIDE a loop, captured by a lambda INSIDE the loop.  Guarded
+// boxing reuses ONE box/cell across all iterations, so N closures share one box
+// — releasing it in each envdtor would double-free.  The `wasGuardedLocal` gate
+// EXCLUDES this from box release (the box leaks, safe direction).  Pins NO
+// double-free across 100 iterations.  Returns 1.
+const char* kBoxGuardedOuterCaptureNoDoubleFree =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var o: Object := 42; "
+    "    var i: int := 0; var acc: int := 0; "
+    "    while i < 100 do "
+    "      var f: () -> bool := () => o is int; "
+    "      if f() then acc := acc + 1; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    if acc = 100 then return 1; end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -345,4 +446,43 @@ BEZEL_TEST(codegen_env_disposer_672, null_envdtor_loop_no_double_dispose_28_9) {
 // initClosureEnvdtor store (off 24) if the cell were only 24 bytes.
 BEZEL_TEST(codegen_env_disposer_672, cell_size_smoke_27_5) {
     expectValueAndNoCorruption(kCellSizeSmoke, 12);
+}
+
+// §8.6 / §28.9 / #672 (THE FIX): a boxed value captured by exactly one
+// non-escaping lambda — the envdtor performs the deferred box release that
+// BoxEscapeWalker suppressed.  Previously the 24-byte box wrapper leaked.
+// LSan-CLEAN; returns 1.
+BEZEL_TEST(codegen_env_disposer_672, box_single_capture_release_lsan_clean_8_6) {
+    expectValueAndLeakFree(kBoxSingleCaptureNonEscaping, 1);
+}
+
+// §8.6 / §27.5 / #672: fresh box + fresh closure each loop iteration; each box
+// released by its own envdtor (count==1, non-guarded).  No accumulating leak,
+// no double-free.  LSan-CLEAN; returns 1.
+BEZEL_TEST(codegen_env_disposer_672, box_loop_fresh_capture_lsan_clean_27_5) {
+    expectValueAndLeakFree(kBoxLoopFreshCapture, 1);
+}
+
+// §8.6 / §28.9 / #672: an escaping closure holding a boxed value — the box is
+// read while live (no UAF) and released exactly once at the closure's last-drop
+// (no double-free).  The pre-existing 8-byte escaping-cell leak is tolerated.
+// Value + no-corruption; returns 1.
+BEZEL_TEST(codegen_env_disposer_672, box_escaping_capture_no_corruption_28_9) {
+    expectValueAndNoCorruption(kBoxEscapingCapture, 1);
+}
+
+// §8.6 / §28.9 / #672: the same box captured by two lambdas is deliberately
+// EXCLUDED from envdtor release (count 2 ≠ 1) — it leaks rather than risk a
+// double-free.  Pins NO double-free / UAF (the leak itself is tolerated and
+// tracked for the general rc-retain solution).  Returns 1.
+BEZEL_TEST(codegen_env_disposer_672, box_multi_capture_no_double_free_28_9) {
+    expectValueAndNoCorruption(kBoxMultiCaptureNoDoubleFree, 1);
+}
+
+// §8.6 / §27.5 / #672: a guarded-boxing capture (box producer outside the loop,
+// lambda inside) reuses one box across iterations; EXCLUDED from envdtor release
+// via the wasGuardedLocal gate so N closures do not double-free the shared box.
+// Pins NO double-free across iterations (leak tolerated).  Returns 1.
+BEZEL_TEST(codegen_env_disposer_672, box_guarded_capture_no_double_free_27_5) {
+    expectValueAndNoCorruption(kBoxGuardedOuterCaptureNoDoubleFree, 1);
 }

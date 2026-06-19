@@ -3293,6 +3293,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // VALUE may be released at scope end (mirrors stringReleaseEligible_).
     boxReleaseEligible_.clear();
     boxReleaseEligibleFn_ = fn;
+    // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
+    // one lambda env, so the owning lambda's envdtor may perform the deferred
+    // (escape-suppressed) scope-end box release.
+    boxSingleCaptureLocals_.clear();
+    boxSingleCaptureLocalsFn_ = fn;
     // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
     // and may have their boxed cells freed at outer-scope exit.
     cellFreeEligible_.clear();
@@ -3303,6 +3308,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectStringReleaseEligible(*ci.stmts);
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
+        collectBoxSingleCaptureLocals(*ci.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses the result).
         collectCellFreeEligible(*ci.stmts);
     }
@@ -8017,6 +8023,76 @@ void Emitter::collectBoxReleaseEligible(
         if (!w.escaped)
             boxReleaseEligible_.insert(static_cast<const void*>(ld));
     }
+}
+
+
+// §27.5 / §28.9 / #672: compute boxSingleCaptureLocals_ for the function body.
+//
+// A +1-box-producer local that is CAPTURED by a lambda has its scope-end
+// bz_box_release suppressed by BoxEscapeWalker (the capture is an escape, so the
+// local is NOT in boxReleaseEligible_). The owning lambda's per-lambda envdtor
+// must perform that deferred release instead — but ONLY when exactly one closure
+// env holds the box. If two lambdas capture it, each env holds the same box
+// pointer and each envdtor would perform the single suppressed release → a
+// double-free of the box wrapper. So a box-producer local qualifies here iff its
+// whole-body capture count across ALL lambdas is exactly 1. Multi-captured boxes
+// are excluded and keep leaking (the safe direction, PRIME DIRECTIVE).
+//
+// Counting uses FULL-DESCENT lambda collection (collectAllLambdas) + per-lambda
+// collectCapturedSyms (which itself descends): a box captured by a nested lambda
+// is counted at BOTH the enclosing and the nested lambda (each env holds it), so
+// any multi-env case yields count >= 2 and is conservatively excluded.
+void Emitter::collectBoxSingleCaptureLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    boxSingleCaptureLocals_.clear();
+
+    // Candidate box-producer locals (same predicate as collectBoxReleaseEligible).
+    std::unordered_set<const void*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && isPlusOneBoxProducer(ld))
+                candidates.insert(static_cast<const void*>(ld));
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+    if (candidates.empty()) return;
+
+    // Tally how many distinct lambda envs capture each candidate.
+    std::vector<const ast::LambdaExpr*> lambdas;
+    collectAllLambdas(body, lambdas);
+    std::unordered_map<const void*, int> captureCount;
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::unordered_set<const sema::Symbol*> caps;
+        collectCapturedSyms(*lam, caps);
+        for (const sema::Symbol* s : caps) {
+            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                const void* d = static_cast<const void*>(loc->decl);
+                if (candidates.count(d)) captureCount[d]++;
+            }
+        }
+    }
+    for (const auto& [d, n] : captureCount)
+        if (n == 1) boxSingleCaptureLocals_.insert(d);
 }
 
 
