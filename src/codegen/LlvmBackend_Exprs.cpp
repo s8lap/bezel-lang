@@ -5041,7 +5041,8 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     // and plain-var locals are not registered for scope-end disposal.
     if (op == "move") {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un.operand.get())) {
-            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
                 if (loc->isUsing) {
                     if (llvm::AllocaInst* slotAI = localSlot(*un.operand)) {
                         llvm::Type* ety = nullptr;
@@ -5052,6 +5053,27 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                             builder_.CreateStore(
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
                         }
+                    }
+                }
+            } else if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) {
+                // #818 / §28.8.1: `move _field` (an UNQUALIFIED owned-field move —
+                // the §6/Guide-1 detach idiom, e.g. `return move _log`) transfers
+                // the field's object out. Null the field slot so the owner's
+                // destructor — whose owned-field disposal is null-guarded
+                // (emitOwnedFieldDisposals) — skips it instead of disposing the
+                // already-transferred object again (a double-free → SIGSEGV).
+                // Mirrors the local using-var null above and the collection-slot
+                // move (lowerMoveFromCollectionSlot). Only pointer-typed
+                // (class/interface) owned fields carry a disposal obligation.
+                // NOTE: the qualified `move this._field` form is handled (and
+                // currently rejected) by the ownership pass before codegen, so it
+                // never reaches here; this only makes the unqualified form sound.
+                if (isOwnedReferenceField(fs)) {
+                    llvm::Type* fty = nullptr;
+                    if (llvm::Value* addr = implicitFieldAddr(*un.operand, fty)) {
+                        if (fty && fty->isPointerTy())
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), addr);
                     }
                 }
             }

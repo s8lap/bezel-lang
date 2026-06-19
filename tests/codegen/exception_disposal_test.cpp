@@ -960,4 +960,69 @@ BEZEL_TEST(codegen_excdisp_822, inner_match_outer_local_disposed_once) {
     expectExitAndLeakFree(kNestedTryInnerMatches, 1);
 }
 
+// --------------------------------------------------------------------------
+// [818] §28.8.1 / Guide 1 §6 — the UNQUALIFIED owned-field detach idiom
+// `return move _field` transfers the field's object out; the field slot must be
+// nulled so the owner's destructor (null-guarded owned-field disposal) skips it
+// instead of disposing the already-transferred object again. Before the fix the
+// move codegen nulled only LOCAL using-var slots, not fields, so the owner's
+// destructor double-freed the moved-out object → SIGSEGV.
+// --------------------------------------------------------------------------
+
+// Detach a Cell out of a Box via `move _v`, take ownership, dispose both. The
+// Cell's destructor runs exactly ONCE (Cell.n returns to 0); no double-free.
+const char* kDetachOwnedFieldMove =
+    "module M; "
+    "class Cell public static n: int := 0; "
+    "  public constructor() Cell.n := Cell.n + 1; end constructor; "
+    "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+    "class Box "
+    "  private owned _v: Cell; "
+    "  public constructor(owned x: Cell) _v := x; end constructor; "
+    "  destructor end destructor; "
+    "  public method Take(): owned Cell return move _v; end Take; "
+    "end Box; "
+    "class C public static method Main(): int "
+    "  do "
+    "    var c := new Cell(); "
+    "    using var b := new Box(move c); "
+    "    using var taken := b.Take(); "
+    "  end; "
+    "  return Cell.n; "                 // 0 — disposed once, owner field skipped
+    "end Main; end C;";
+
+BEZEL_TEST(codegen_excdisp_818, detached_field_disposed_once_no_double_free) {
+    expectExitAndLeakFree(kDetachOwnedFieldMove, 0);
+}
+
+// The Guide 1 §6 `DetachLog` idiom: `return move _log` with no restoration. The
+// returned value carries the right field (id=5); the owner's destructor does not
+// double-free the moved-out object.
+const char* kDetachLogIdiom =
+    "module M; "
+    "class Logfile public id: int; "
+    "  public constructor(i: int) id := i; end constructor; "
+    "  destructor end destructor; end Logfile; "
+    "class Logger "
+    "  private owned _log: Logfile; "
+    "  public constructor(owned l: Logfile) _log := l; end constructor; "
+    "  destructor end destructor; "
+    "  public method DetachLog(): owned Logfile return move _log; end DetachLog; "
+    "end Logger; "
+    "class C public static method Main(): int "
+    "  using var lg := new Logger(new Logfile(5)); "
+    "  using var d := lg.DetachLog(); "
+    "  return d.id; "                   // 5
+    "end Main; end C;";
+
+BEZEL_TEST(codegen_excdisp_818, guide_detachlog_idiom_value) {
+    BEZEL_EXPECT_EQ(run(kDetachLogIdiom), 5);
+}
+
+BEZEL_TEST(codegen_excdisp_818, guide_detachlog_idiom_leak_free) {
+    int lsan = runUnderLeakSanitizer(kDetachLogIdiom);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
 }  // namespace
