@@ -1759,6 +1759,10 @@ bool Emitter::lowerWhile(const ast::WhileStmt& ws) {
 // Iterator (state-machine) methods map the loop variable to a frame field and
 // have their own resume/spill handling, so we never rebox there.
 bool Emitter::lowerForBody(const ast::ForStmt& fs) {
+    // #793 / §27.5: the fresh-per-iteration for-var capture cell (set below) when
+    // the for-var is captured ONLY by non-escaping lambdas — eligible to free at
+    // the end of each iteration's body.
+    llvm::AllocaInst* forVarFreshCell = nullptr;
     if (!smStateStruct_) {
         auto it = locals_.find(&fs);
         if (it != locals_.end()) {
@@ -1767,10 +1771,41 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
                 llvm::AllocaInst* nb = nullptr;
                 boxLocalSlot(slot, nb, /*forLoopVar=*/true);
                 locals_[&fs] = nb;
+                // #793: boxLocalSlot(forLoopVar=true) allocates a FRESH cell each
+                // iteration, and those cells were never freed (a per-iteration
+                // leak, O(iterations)). When collectCellFreeEligible proves the
+                // for-var is captured ONLY by non-escaping lambdas (keyed by &fs —
+                // it already classifies for-vars), each iteration's cell can be
+                // freed at the end of that iteration's body, after the capturing
+                // closure has been released. An ESCAPING capture is NOT in
+                // cellFreeEligible_, so its cell is never freed here (it outlives
+                // the loop — keeps leaking, the safe direction).
+                if (currentFn_ == cellFreeEligibleFn_ &&
+                    cellFreeEligible_.count(static_cast<const void*>(&fs)))
+                    forVarFreshCell = nb;
             }
         }
     }
-    return lowerScopedBlock(fs.body);
+    if (!forVarFreshCell)
+        return lowerScopedBlock(fs.body);
+    // #793: wrap the body in an OUTER per-iteration disposal scope holding the
+    // for-var cell free. lowerScopedBlock opens the INNER body scope where the
+    // capturing closure's bz_closure_release (which runs the envdtor that reads
+    // captured values through the cell) is registered. By LIFO scope-exit order
+    // the inner scope fires FIRST (closure released), then this outer scope frees
+    // the cell — no UAF. The body block re-runs each iteration, so every
+    // iteration's fresh cell is freed; nested loops each get their own scope pair;
+    // break/continue/return/throw unwind both scopes (the loop's recorded depth is
+    // below this outer scope). free(null) is a no-op, so a never-allocated guard
+    // cell is safe.
+    disposeStack_.emplace_back();
+    Disposal d{forVarFreshCell, nullptr};
+    d.boxedCellFree = true;
+    disposeStack_.back().push_back(d);
+    bool terminated = lowerScopedBlock(fs.body);
+    if (!terminated) emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
+    return terminated;
 }
 
 
