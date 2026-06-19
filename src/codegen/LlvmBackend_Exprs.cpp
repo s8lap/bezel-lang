@@ -5312,6 +5312,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // closure release branches (a box has an Object static type, never
         // String/Function).
         bool                   releaseBoxInEnvdtor = false;
+        // §27.5 / §28.9 / #694: true when this capture's boxed cell is held by
+        // exactly ONE env (singleCaptureLocals_) whose lambda DEFINITELY escapes
+        // (returned — definitelyEscapingLambdas_). The escaped closure's envdtor
+        // frees the 8-byte capture cell at last-drop. Single holder ⇒ no
+        // double-free; definite escape ⇒ outer scope gone ⇒ no UAF.
+        bool                   freeCellInEnvdtor = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -5516,6 +5522,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 emitBoxRetain(box);
             }
         }
+        // #694: free the 8-byte capture cell in the envdtor when this local is
+        // captured by exactly ONE env (singleCaptureLocals_) and THIS lambda
+        // DEFINITELY escapes (definitelyEscapingLambdas_ — directly returned). The
+        // scope-end boxedCellFree does not fire for an escaping closure, so the
+        // sole env's envdtor is the cell's only free (no double-free); the defining
+        // scope is gone before the escaped closure dies (no UAF). Exclude
+        // guarded/for-var cells (shared/per-iteration holders).
+        if (!alreadyBoxed && !wasGuardedLocal && !isForVar &&
+            currentFn_ == boxCaptureLocalsFn_ &&
+            definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
+            singleCaptureLocals_.count(static_cast<const void*>(decl)))
+            ce.freeCellInEnvdtor = true;
         captures.push_back(ce);
     }
 
@@ -5993,6 +6011,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     emitBoxRelease(box);
                 }
                 // All other capture types (value, class borrow): no action.
+                // §27.5 / #694: free the 8-byte capture CELL itself when this is
+                // the sole env of a DEFINITELY-escaping capture (freeCellInEnvdtor).
+                // Runs AFTER the content release above (which reads through the
+                // cell). The scope-end boxedCellFree did not fire (the closure
+                // escaped), and this is the single holder, so this is the cell's
+                // only free — no double-free; the defining scope is gone before the
+                // escaped closure dies, so no later access through the cell — no UAF.
+                if (ce.freeCellInEnvdtor)
+                    builder_.CreateCall(freeFn(), {cell});
             }
             builder_.CreateRetVoid();
 

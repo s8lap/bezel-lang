@@ -4395,6 +4395,20 @@ private:
     // Computed once per body by collectBoxCaptureLocals; consulted at the lambda
     // capture site in lowerLambda to arm the envdtor box release + per-env retain.
     std::unordered_set<const void*> boxCaptureLocals_;
+    // §27.5 / §28.9 / #694: LOCAL DECL NODES captured by EXACTLY ONE lambda env
+    // (computed alongside boxCaptureLocals_, guarded by boxCaptureLocalsFn_).
+    // Combined with a DEFINITELY-escaping sole capturer (definitelyEscapingLambdas_)
+    // at the capture site, the escaped closure's envdtor frees the boxed capture
+    // cell at last-drop — closing the 8B/cell escaping-capture leak. Single holder
+    // ⇒ no double-free; definite escape ⇒ the outer scope is gone before the
+    // closure dies ⇒ no UAF.
+    std::unordered_set<const void*> singleCaptureLocals_;
+    // §27.5 / #694: LambdaExpr nodes that DEFINITELY escape the function (directly
+    // returned). Computed once per body by collectDefinitelyEscapingLambdas;
+    // consulted in lowerLambda to arm the envdtor cell-free.
+    std::unordered_set<const void*> definitelyEscapingLambdas_;
+    void collectDefinitelyEscapingLambdas(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // The function for which boxCaptureLocals_ was computed (mirrors
     // boxReleaseEligibleFn_): a lambda/thunk body lowered mid-function inherits
     // no eligibility, so its captured boxes just leak (never double-freed).

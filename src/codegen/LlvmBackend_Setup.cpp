@@ -3306,6 +3306,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // one lambda env, so the owning lambda's envdtor may perform the deferred
     // (escape-suppressed) scope-end box release.
     boxCaptureLocals_.clear();
+    singleCaptureLocals_.clear();          // #694
+    definitelyEscapingLambdas_.clear();    // #694
     boxCaptureLocalsFn_ = fn;
     // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
     // and may have their boxed cells freed at outer-scope exit.
@@ -3318,6 +3320,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
         collectBoxCaptureLocals(*ci.stmts);
+        collectDefinitelyEscapingLambdas(*ci.stmts);  // #694
         // Must run AFTER collectClosureReleaseEligible (uses the result).
         collectCellFreeEligible(*ci.stmts);
     }
@@ -8144,6 +8147,7 @@ void Emitter::collectBoxReleaseEligible(
 void Emitter::collectBoxCaptureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     boxCaptureLocals_.clear();
+    singleCaptureLocals_.clear();  // #694
 
     // Candidate box-producer locals (same predicate as collectBoxReleaseEligible).
     std::unordered_set<const void*> candidates;
@@ -8174,9 +8178,10 @@ void Emitter::collectBoxCaptureLocals(
         }
     };
     for (auto& s : body) scan(s.get());
-    if (candidates.empty()) return;
 
-    // Tally how many distinct lambda envs capture each candidate.
+    // Tally how many distinct lambda envs capture each LOCAL — ALL captured
+    // locals (#694 needs the general count for singleCaptureLocals_), not just the
+    // box-producer candidates.
     std::vector<const ast::LambdaExpr*> lambdas;
     collectAllLambdas(body, lambdas);
     std::unordered_map<const void*, int> captureCount;
@@ -8185,13 +8190,61 @@ void Emitter::collectBoxCaptureLocals(
         collectCapturedSyms(*lam, caps);
         for (const sema::Symbol* s : caps) {
             if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
-                const void* d = static_cast<const void*>(loc->decl);
-                if (candidates.count(d)) captureCount[d]++;
+                if (loc->decl)
+                    captureCount[static_cast<const void*>(loc->decl)]++;
             }
         }
     }
-    for (const auto& [d, n] : captureCount)
-        if (n >= 1) boxCaptureLocals_.insert(d);  // #802: any captured box producer
+    for (const auto& [d, n] : captureCount) {
+        if (n >= 1 && candidates.count(d))
+            boxCaptureLocals_.insert(d);      // #802: any captured box producer
+        if (n == 1)
+            singleCaptureLocals_.insert(d);   // #694: captured by exactly one env
+    }
+}
+
+
+// §27.5 / #694: collect the LambdaExpr nodes that DEFINITELY escape the function
+// — those directly returned (`return () => …`). For such a closure the defining
+// scope is gone before the closure can be dropped, so its envdtor (run at the
+// closure's last-drop) can safely free a capture cell it solely holds. This is a
+// DEFINITE-escape under-approximation (the inverse of the conservative
+// capturedByEscaping): a lambda only enters this set when it is syntactically the
+// returned value, never speculatively — required for the cell-free in lowerLambda
+// to be sound (a non-escaping closure's envdtor runs at scope end, where freeing
+// the cell would UAF the outer scope's later access).
+void Emitter::collectDefinitelyEscapingLambdas(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    definitelyEscapingLambdas_.clear();
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(r->value.get()))
+                definitelyEscapingLambdas_.insert(
+                    static_cast<const void*>(lam));
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
 }
 
 

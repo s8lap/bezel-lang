@@ -529,3 +529,79 @@ BEZEL_TEST(codegen_env_disposer_672, box_multi_capture_value_lsan_clean_802) {
 BEZEL_TEST(codegen_env_disposer_672, box_guarded_capture_no_double_free_27_5) {
     expectValueAndNoCorruption(kBoxGuardedOuterCaptureNoDoubleFree, 1);
 }
+
+// #694 (the fix): a closure that DEFINITELY escapes (directly returned) and is the
+// SOLE holder of a capture cell has that 8-byte cell freed by its envdtor at
+// last-drop. The defining scope (Make) is gone before the closure is dropped in
+// Main, so the free is safe (no UAF); single holder ⇒ no double-free. Previously
+// the cell leaked. LSan-CLEAN; returns the captured int 7.
+const char* kEscapingReturnedIntCell =
+    "module M; class C "
+    "  public static method Make(): () -> int "
+    "    var x: int := 7; "
+    "    return () => x; "
+    "  end Make; "
+    "  public static method Main(): int "
+    "    var f: () -> int := Make(); "
+    "    return f(); "   // 7
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_returned_int_cell_freed_lsan_clean_694) {
+    expectValueAndLeakFree(kEscapingReturnedIntCell, 7);
+}
+
+// #694: a returned closure capturing a BOXED value — both the box (envdtor box
+// release, #672) and the capture cell (#694) are reclaimed at last-drop. LSan-
+// clean; returns 5 (the box reads as `int`).
+const char* kEscapingReturnedBoxCell =
+    "module M; class C "
+    "  public static method Make(): () -> bool "
+    "    var o: Object := 42; "
+    "    return () => o is int; "
+    "  end Make; "
+    "  public static method Main(): int "
+    "    var f: () -> bool := Make(); "
+    "    if f() then return 5; end; return 0; "
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_returned_box_cell_freed_lsan_clean_694) {
+    expectValueAndLeakFree(kEscapingReturnedBoxCell, 5);
+}
+
+// #694: a returned closure capturing a +1 STRING — both the string (envdtor string
+// release) and the capture cell (#694) are reclaimed. LSan-clean; "abcd".Length = 4.
+const char* kEscapingReturnedStringCell =
+    "module M; class C "
+    "  public static method Make(): () -> int "
+    "    var s: string := \"ab\" + \"cd\"; "
+    "    return () => s.Length; "
+    "  end Make; "
+    "  public static method Main(): int "
+    "    var f: () -> int := Make(); "
+    "    return f(); "   // 4
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_returned_string_cell_freed_lsan_clean_694) {
+    expectValueAndLeakFree(kEscapingReturnedStringCell, 4);
+}
+
+// #694 (soundness boundary): a NON-escaping single capture (the lambda is invoked
+// in scope, NOT returned) is NOT in definitelyEscapingLambdas_, so the cell is
+// freed by the scope-end boxedCellFree — NOT the envdtor. Pins that the envdtor
+// cell-free does not fire for non-escaping closures (which would UAF the outer
+// scope). LSan-clean; returns 7.
+const char* kNonEscapingSingleNotEnvdtorFreed =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var r: int := 0; "
+    "    do "
+    "      var x: int := 7; "
+    "      var f: () -> int := () => x; "
+    "      r := f(); "
+    "    end; "
+    "    return r; "   // 7
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_env_disposer_672, non_escaping_single_not_envdtor_freed_lsan_clean_694) {
+    expectValueAndLeakFree(kNonEscapingSingleNotEnvdtorFreed, 7);
+}
