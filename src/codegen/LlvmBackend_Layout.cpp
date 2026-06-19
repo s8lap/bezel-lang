@@ -68,6 +68,11 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
         if (llvm::Value* a = fieldAddr(*ma, elemTy)) return a;
     }
     if (llvm::GlobalVariable* gv = staticFieldGlobal(target)) {
+        // #720 / §22.13: a static-field lvalue (write or compound assign) is a
+        // "first use" — lazily initialize the owning type BEFORE the access, so a
+        // write-before-read is not later clobbered by the lazy initializer.
+        if (auto* sym = ctx_.exprSymbol(target))
+            emitEnsureStaticInit(memberOwner(sym));
         elemTy = gv->getValueType();
         return gv;
     }

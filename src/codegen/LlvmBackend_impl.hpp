@@ -444,6 +444,22 @@ private:
     };
     std::vector<StaticCtorEntry> staticCtors_;
 
+    // #720 / §22.13 / §22.7: lazy static initialization (NON-GENERIC types only;
+    // generic per-instantiation lazy init is a tracked follow-up). For each
+    // non-generic type with static state (an sfinit and/or a cctor), a
+    // `bz$<T>$ensureinit()` function runs that type's initializers ONCE, on first
+    // use, with a per-type state guard `bz$<T>$initstate` (0=uninit, 1=in-progress,
+    // 2=done, 3=failed) and a saved-exception global `bz$<T>$initexc`. On an
+    // uncaught initializer exception the type enters the permanent failed state
+    // and every subsequent access re-raises the saved TypeInitializationException
+    // (§22.7). Static-access lowering sites call emitEnsureStaticInit(owner) before
+    // the access so the (possible) TIE routes through the current unwind target.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> ensureInitFns_;
+    // Per-type sfinit / cctor functions, indexed for ensureinit emission. Built
+    // from staticCtors_ in declareStaticInitializers.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> cctorFnOf_;
+
     // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
     // `continue` jumps to `continueTarget` (the loop's condition block),
     // `break` to `breakTarget` (the loop's exit block). Innermost loop is
@@ -2337,6 +2353,13 @@ private:
     static bool isExtensionMethod(const sema::MethodSymbol* ms) {
         return ms && ms->extensionDecl != nullptr;
     }
+    // #720: the declaring type of a field/property/method symbol (its `parent`),
+    // or null. Used to find the type whose static state to lazily initialize.
+    static const sema::TypeSymbol* memberOwner(const sema::Symbol* sym) {
+        if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(sym))
+            return ms->parent;
+        return nullptr;
+    }
     // §26.1: the receiver (`this`) representation for an extension method.
     // Returns the LLVM type of the `this` parameter and sets *byPointer to
     // true when `this` is passed as a pointer (class receiver, or a record
@@ -3904,6 +3927,18 @@ private:
     void emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                                    const sema::TypeSymbol* type,
                                    llvm::Function* fn);
+
+    // #720 / §22.13 / §22.7: build the per-(non-generic-)type `bz$<T>$ensureinit()`
+    // functions (one per type that has an sfinit and/or cctor), with their state +
+    // saved-exception globals. Called from declareStaticInitializers after
+    // staticCtors_ (and sfinitFnOf_/cctorFnOf_) are populated.
+    void emitEnsureInitFns();
+
+    // #720: emit a call to `owner`'s ensureinit (if it has one — non-generic with
+    // static state) at a static-access site, then route a possible
+    // TypeInitializationException through the current unwind target. No-op for a
+    // type without lazy static state (generic types, types with no static init).
+    void emitEnsureStaticInit(const sema::TypeSymbol* owner);
 
     void emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn);
 

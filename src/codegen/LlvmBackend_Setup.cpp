@@ -902,6 +902,7 @@ void Emitter::declareFunctions() {
                     voidFnType, llvm::Function::InternalLinkage,
                     "bz$" + cls + "$sfinit", module_.get());
                 staticCtors_.push_back({nullptr, ts, fn});
+                sfinitFnOf_[ts] = fn;  // #720: index for ensureinit
             }
         }
         // (b) User-written cctor.
@@ -913,8 +914,14 @@ void Emitter::declareFunctions() {
                 voidFnType, llvm::Function::ExternalLinkage,
                 "bz$" + cls + "$cctor", module_.get());
             staticCtors_.push_back({cs, cs->parent, fn});
+            if (cs->parent) cctorFnOf_[cs->parent] = fn;  // #720
         }
     }
+
+    // #720 / §22.13 / §22.7: build the lazy `bz$<T>$ensureinit()` functions for
+    // every non-generic type with static state. Emitted here (after the sfinit/
+    // cctor declarations exist) so static-access sites can call them.
+    emitEnsureInitFns();
 
     // CG13 / §28.2: declare, for every class, the public idempotent Dispose
     // `void(this)` (vtable slot 2, CG35-itable) AND an unguarded "DisposeCore" that runs the
@@ -3351,7 +3358,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                 builder_.CreateCall(initFn, {vit->second});
             }
         }
+        // #720 / §22.13: NON-GENERIC types now initialize LAZILY on first use
+        // (via bz$<T>$ensureinit at each static-access site), so they are NOT run
+        // here. GENERIC types keep eager program-start init (their
+        // per-instantiation lazy init is a tracked follow-up).
         for (auto& e : staticCtors_) {
+            if (e.type && e.type->genericParams.empty()) continue;  // lazy
             builder_.CreateCall(e.fn, {});
             emitPendingCheck();
         }
@@ -3393,6 +3405,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                 rt->declaration->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = rt->declaration;
     }
+
+    // #720 / §22.13: a static method call triggers its declaring type's lazy
+    // initialization before the body runs ("once initialization begins for a
+    // type, all of its static fields are initialized before any of its methods
+    // can run"). No-op for a type without lazy static state. Skipped for Main —
+    // its own class initializes lazily via the accesses in its body; forcing it
+    // at program start would prevent an own-class static-init failure from being
+    // caught inside Main's body.
+    if (isStaticMethod(ms) && !isMain(ms))
+        emitEnsureStaticInit(ms->parent);
 
     bool terminated = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
@@ -3608,6 +3630,170 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     } else {
         builder_.CreateRetVoid();
     }
+}
+
+
+// #720 / §22.13 / §22.7: build the per-type lazy-init function `bz$<T>$ensureinit`
+// for every NON-GENERIC type that has static state (an sfinit and/or a cctor).
+// The function runs that type's initializers exactly once, on first use, guarded
+// by a per-type state global (0=uninit, 1=in-progress, 2=done, 3=failed):
+//   * done      → return immediately.
+//   * in-progress → return immediately (a re-entrant access during this type's own
+//                   init sees its partially-initialized state, per §22.13 textual
+//                   order; this also prevents unbounded recursion).
+//   * failed    → re-raise the saved TypeInitializationException (§22.7).
+//   * uninit    → mark in-progress, run sfinit then cctor; if either leaves a
+//                 pending exception (already wrapped in TypeInitializationException
+//                 by emitStaticConstructorBody), save it, mark failed, and leave it
+//                 pending for the caller's emitPendingCheck to route. Otherwise mark
+//                 done.
+// Generic per-instantiation lazy init is NOT handled here (those types keep eager
+// init at Main start) — tracked as a follow-up.
+void Emitter::emitEnsureInitFns() {
+    // Collect every non-generic type that has static state.
+    std::vector<const sema::TypeSymbol*> types;
+    std::unordered_set<const sema::TypeSymbol*> seen;
+    auto consider = [&](const sema::TypeSymbol* t) {
+        if (!t || !t->genericParams.empty()) return;  // non-generic only
+        if (seen.insert(t).second) types.push_back(t);
+    };
+    for (auto& [t, fn] : sfinitFnOf_) consider(t);
+    for (auto& [t, fn] : cctorFnOf_) consider(t);
+
+    auto* voidFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+
+    // Save the per-function builder state (emitEnsureInitFns runs during setup,
+    // before/around other function emission).
+    llvm::Function* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+
+    for (const sema::TypeSymbol* t : types) {
+        std::string cls(t->name);
+        // Per-type state guard + saved-exception globals.
+        auto* stateGV = new llvm::GlobalVariable(
+            *module_, i8Ty, /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i8Ty, 0), "bz$" + cls + "$initstate");
+        auto* excGV = new llvm::GlobalVariable(
+            *module_, ptrTy(), /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantPointerNull::get(ptrTy()), "bz$" + cls + "$initexc");
+
+        auto* fn = llvm::Function::Create(
+            voidFnTy, llvm::GlobalValue::InternalLinkage,
+            "bz$" + cls + "$ensureinit", module_.get());
+        ensureInitFns_[t] = fn;
+
+        currentFn_ = fn;
+        auto* entry   = llvm::BasicBlock::Create(llvm_, "entry",   fn);
+        auto* failedB = llvm::BasicBlock::Create(llvm_, "reraise", fn);
+        auto* initB   = llvm::BasicBlock::Create(llvm_, "doinit",  fn);
+        auto* failB   = llvm::BasicBlock::Create(llvm_, "setfail", fn);
+        auto* doneB   = llvm::BasicBlock::Create(llvm_, "setdone", fn);
+        auto* retB    = llvm::BasicBlock::Create(llvm_, "ret",     fn);
+
+        builder_.SetInsertPoint(entry);
+        llvm::Value* s = builder_.CreateLoad(i8Ty, stateGV, "state");
+        llvm::Value* isDone =
+            builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 2));
+        auto* chkFailed = llvm::BasicBlock::Create(llvm_, "chkfail", fn);
+        builder_.CreateCondBr(isDone, retB, chkFailed);
+
+        builder_.SetInsertPoint(chkFailed);
+        llvm::Value* isFailed =
+            builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 3));
+        auto* chkProg = llvm::BasicBlock::Create(llvm_, "chkprog", fn);
+        builder_.CreateCondBr(isFailed, failedB, chkProg);
+
+        builder_.SetInsertPoint(chkProg);
+        llvm::Value* isProg =
+            builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 1));
+        builder_.CreateCondBr(isProg, retB, initB);
+
+        // doinit: mark in-progress, run sfinit then cctor with pending-exc checks.
+        builder_.SetInsertPoint(initB);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), stateGV);
+        auto sfIt = sfinitFnOf_.find(t);
+        auto ccIt = cctorFnOf_.find(t);
+        auto* afterSf = llvm::BasicBlock::Create(llvm_, "after_sf", fn);
+        if (sfIt != sfinitFnOf_.end()) {
+            builder_.CreateCall(sfIt->second, {});
+            llvm::Value* e = builder_.CreateLoad(ptrTy(), emitExcSlot());
+            llvm::Value* thrown = builder_.CreateICmpNE(
+                e, llvm::ConstantPointerNull::get(ptrTy()));
+            builder_.CreateCondBr(thrown, failB, afterSf);
+        } else {
+            builder_.CreateBr(afterSf);
+        }
+        builder_.SetInsertPoint(afterSf);
+        if (ccIt != cctorFnOf_.end()) {
+            builder_.CreateCall(ccIt->second, {});
+            llvm::Value* e = builder_.CreateLoad(ptrTy(), emitExcSlot());
+            llvm::Value* thrown = builder_.CreateICmpNE(
+                e, llvm::ConstantPointerNull::get(ptrTy()));
+            builder_.CreateCondBr(thrown, failB, doneB);
+        } else {
+            builder_.CreateBr(doneB);
+        }
+
+        builder_.SetInsertPoint(doneB);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 2), stateGV);
+        builder_.CreateBr(retB);
+
+        // setfail: bz_exc holds the TypeInitializationException (inner=original;
+        // sfinit/cctor self-wrap in emitStaticConstructorBody). Save the INNER
+        // (the ORIGINAL) — NOT the TIE — because once the first raised TIE is
+        // caught its heap block is reclaimed by the handler, so re-storing that
+        // pointer on a later access would be a use-after-free (the TIE's disposer
+        // is a no-op, so the inner is never freed and safely survives). Mark
+        // failed; leave bz_exc = the TIE for this first raise.
+        builder_.SetInsertPoint(failB);
+        llvm::Value* tie0 = builder_.CreateLoad(ptrTy(), emitExcSlot());
+        llvm::Value* inner0 = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(i8Ty, tie0, builder_.getInt64(16)));
+        builder_.CreateStore(inner0, excGV);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 3), stateGV);
+        builder_.CreateBr(retB);
+
+        // reraise: failed state — wrap a FRESH TypeInitializationException around
+        // the saved original (§22.7) and raise it. A fresh TIE each time avoids
+        // re-raising a reclaimed block.
+        builder_.SetInsertPoint(failedB);
+        llvm::Value* savedInner = builder_.CreateLoad(ptrTy(), excGV);
+        auto tieVit = builtinVtable_.find("TypeInitializationException");
+        if (tieVit != builtinVtable_.end()) {
+            llvm::Value* tie = builder_.CreateCall(
+                callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+            builder_.CreateStore(tieVit->second, tie);  // vtable at offset 0
+            builder_.CreateStore(savedInner,
+                builder_.CreateGEP(i8Ty, tie, builder_.getInt64(16)));  // inner@16
+            builder_.CreateStore(tie, emitExcSlot());
+        } else {
+            builder_.CreateStore(savedInner, emitExcSlot());  // fallback: raw
+        }
+        builder_.CreateBr(retB);
+
+        builder_.SetInsertPoint(retB);
+        builder_.CreateRetVoid();
+    }
+
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+}
+
+
+// #720: at a static-access site, ensure `owner`'s static state is initialized
+// (lazy, §22.13) before the access, routing a possible TypeInitializationException
+// through the current unwind target. No-op for a type with no lazy ensureinit
+// (generic types, or types with no static initializer).
+void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
+    if (!owner) return;
+    auto it = ensureInitFns_.find(owner);
+    if (it == ensureInitFns_.end()) return;
+    builder_.CreateCall(it->second, {});
+    emitPendingCheck();
 }
 
 

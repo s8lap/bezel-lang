@@ -3133,6 +3133,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // fields have no instance slot, so fieldAddr misses; read the
         // backing global directly.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
+            // #720 / §22.13: lazily initialize the owning type on first use.
+            if (auto* sym = ctx_.exprSymbol(e)) emitEnsureStaticInit(memberOwner(sym));
             return builder_.CreateLoad(gv->getValueType(), gv);
         }
     }
@@ -3174,6 +3176,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // CG12: a bare identifier resolving to a static field reads
         // its backing global.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
+            // #720 / §22.13: lazily initialize the owning type on first use.
+            if (auto* sym = ctx_.exprSymbol(e)) emitEnsureStaticInit(memberOwner(sym));
             return builder_.CreateLoad(gv->getValueType(), gv);
         }
         // CG9: a bare identifier resolving to an instance field is an
