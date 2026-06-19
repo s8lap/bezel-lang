@@ -3,12 +3,18 @@
 // dependencies between modules are permitted. Circular static-initialization
 // dependencies are not; the compiler detects and rejects them."
 //
-// checkStaticInitCycles builds the DIRECT static-init dependency graph — type T
-// depends on U when T's static field initializers or static-constructor body
-// directly reference a static member (field/method/property) of U — and rejects
-// any cycle. Direct references only: a dependency reached solely through a called
-// method's body is a (safe) false negative, deferred. These drive the real Driver
-// (the pass runs in the driver front-end after typecheck).
+// checkStaticInitCycles builds the static-init dependency graph — type T depends
+// on U when T's static field initializers or static-constructor body reference a
+// static member (field/method/property) of U — and rejects any cycle.
+//
+// #804: the graph is now INTERPROCEDURAL within a module — a dependency reached
+// inside a CALLED static method's body or a READ static property's getter body is
+// folded into T's edge set (transitive reachability, recursion-guarded). A method
+// referenced as a value (not called) is NOT followed (its body does not run), and
+// a static property in a WRITE-target position runs its setter, not its getter, so
+// the getter is not followed there — both avoid false positives. CROSS-MODULE
+// static-init cycles remain a deferred (safe) false negative (#804). These drive
+// the real Driver (the pass runs in the driver front-end after typecheck).
 
 #include <cstdio>
 #include <filesystem>
@@ -141,4 +147,76 @@ BEZEL_TEST(static_init_cycles_797, one_way_static_method_dependency_accepted) {
         "class Config public static _value: int := 20; end Config; "
         "class Helper public static _base: int := Config._value + 1; end Helper; "
         "class C public static method Main(): int => Helper._base; end C;"), 21);
+}
+
+// #804 / §2.5 / §22.13: a TRANSITIVE cycle through a CALLED static method's BODY.
+// A's static init calls A.Helper(); Helper's body reads B._b (so A -> B); B's
+// init reads A._a (B -> A). This is a real runtime cycle (A's init runs Helper
+// which reads B._b, triggering B's init, which reads A._a mid-init) that the
+// direct analysis missed (it saw only A -> Helper(self) and B -> A). The
+// interprocedural walk folds Helper's body into A's edges and rejects it.
+BEZEL_TEST(static_init_cycles_797, transitive_cycle_through_method_body_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; "
+        "class A "
+        "  public static _a: int := Helper(); "
+        "  public static method Helper(): int => B._b; "
+        "end A; "
+        "class B public static _b: int := A._a + 1; end B; "
+        "class C public static method Main(): int => A._a; end C;"));
+}
+
+// #804 / §2.5: a transitive cycle through a READ static PROPERTY's getter body —
+// A's init reads A.P; P's getter reads B._b (A -> B); B reads A._a (B -> A).
+// Reading a property runs its getter, so the getter body is folded into A's set.
+BEZEL_TEST(static_init_cycles_797, transitive_cycle_through_getter_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; "
+        "class A "
+        "  public static _a: int := P; "
+        "  public static property P: int => B._b; "
+        "end A; "
+        "class B public static _b: int := A._a + 1; end B; "
+        "class C public static method Main(): int => A._a; end C;"));
+}
+
+// #804 (no false positive): an ACYCLIC transitive dependency through a called
+// method — A's init calls Helper() which reads Config._value, but nothing
+// references A's statics back. No cycle; A._a = Config._value = 20.
+BEZEL_TEST(static_init_cycles_797, acyclic_transitive_method_accepted) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class Config public static _value: int := 20; end Config; "
+        "class A "
+        "  public static _a: int := Helper(); "
+        "  public static method Helper(): int => Config._value; "
+        "end A; "
+        "class C public static method Main(): int => A._a; end C;"), 20);
+}
+
+// #804 (no false positive): an acyclic transitive dependency through a read
+// getter — A._a := P, P's getter reads Config._value; no cycle. A._a = 7.
+BEZEL_TEST(static_init_cycles_797, acyclic_transitive_getter_accepted) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class Config public static _value: int := 7; end Config; "
+        "class A "
+        "  public static _a: int := P; "
+        "  public static property P: int => Config._value; "
+        "end A; "
+        "class C public static method Main(): int => A._a; end C;"), 7);
+}
+
+// #804 (recursion guard / no false positive, no hang): a SELF-RECURSIVE static
+// method reached during static init must not loop the interprocedural walk and
+// must not be flagged as a cycle (the recursion is in the call graph, not a
+// static-init dependency cycle). A._a = Rec(3) = 0.
+BEZEL_TEST(static_init_cycles_797, self_recursive_static_method_accepted) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class A "
+        "  public static _a: int := Rec(3); "
+        "  public static method Rec(n: int): int => case n 0 => 0, _ => Rec(n - 1) end; "
+        "end A; "
+        "class C public static method Main(): int => A._a; end C;"), 0);
 }

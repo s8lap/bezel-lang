@@ -33,6 +33,16 @@ struct DepCollector {
     const TypeSymbol* owner;            // the type whose static-init we are walking
     // edge target -> a representative source location of a reference creating it
     std::unordered_map<const TypeSymbol*, SourceLocation>& out;
+    // #804: interprocedural recursion guard — each static method / property
+    // getter whose body we have already folded into `owner`'s edge set. Keyed on
+    // the callee symbol so a self- or mutually-recursive static call graph
+    // terminates. Scoped to one collectDeps walk (one owner).
+    std::unordered_set<const Symbol*> visited;
+    // #804: while walking the TOP node of an assignment / increment TARGET, a
+    // static property runs its SETTER, not its getter, so suppress getter-body
+    // following there (recording the edge is still correct). Erring toward a
+    // missed transitive edge (a safe false negative) over a false one.
+    bool suppressGetterFollow = false;
 
     // A reference to a static FIELD / METHOD / PROPERTY of another local type
     // triggers that type's static initialization, so it is a dependency edge.
@@ -52,9 +62,72 @@ struct DepCollector {
                         dynamic_cast<PropertySymbol*>(s);
         if (!relevant) return;
         const TypeSymbol* u = mem->parent;
-        if (u == owner) return;            // own static — not a cycle
-        if (ctx.isImported(u)) return;     // cross-module dependency deferred
-        out.emplace(u, e->span.begin);     // first reference's location wins
+        if (u != owner && !ctx.isImported(u))
+            out.emplace(u, e->span.begin); // first reference's location wins
+        // #804: a READ of a static property runs its getter body — fold the
+        // statics it references into `owner`'s edge set (transitive dependency).
+        // A method reference is NOT followed here (referencing a method value
+        // does not run its body); a called method is followed at the CallExpr.
+        if (!suppressGetterFollow)
+            if (auto* prop = dynamic_cast<PropertySymbol*>(s))
+                followProperty(prop);
+    }
+
+    // #804: fold a called static method's body into `owner`'s dependency set —
+    // statics it references run during `owner`'s static init (interprocedural
+    // reachability). An imported method has no local AST decl → naturally
+    // skipped (cross-module cycles are the deferred dimension). Recursion-guarded.
+    void followMethod(const MethodSymbol* m) {
+        if (!m || !visited.insert(m).second) return;
+        auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl);
+        if (!md) return;
+        if (md->bodyKind == ast::MethodBodyKind::Expression)
+            expr(md->exprBody.get());
+        else
+            for (auto& st : md->stmts) stmt(st.get());
+    }
+
+    // #804: fold a read static property's GETTER body into `owner`'s set.
+    void followProperty(const PropertySymbol* p) {
+        if (!p || !visited.insert(p).second) return;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(p->decl);
+        if (!pd) return;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+            expr(pd->exprBody.get());
+        } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            for (auto& acc : pd->accessors) {
+                if (acc.isSet) continue;   // getter only
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression)
+                    expr(acc.exprBody.get());
+                else
+                    for (auto& st : acc.stmts) stmt(st.get());
+            }
+        }
+        // Auto-property getter is a plain field read — no body to fold.
+    }
+
+    // #804: if a call's callee resolves to a static method, fold its body.
+    void followCalledStaticMethod(const ast::Expr* callee) {
+        if (!callee) return;
+        Symbol* s = ctx.exprSymbol(*callee);
+        if (auto* meth = dynamic_cast<MethodSymbol*>(s))
+            if (hasStaticModifier(meth)) followMethod(meth);
+    }
+
+    // #804: a write target's top node — record the property edge but do NOT run
+    // its getter; still walk the receiver as reads (whose getters DO run).
+    void writeTarget(const ast::Expr* e) {
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            if (dynamic_cast<PropertySymbol*>(ctx.exprSymbol(*e))) {
+                bool sav = suppressGetterFollow;
+                suppressGetterFollow = true;
+                recordRef(e);              // edge only (getter-follow suppressed)
+                suppressGetterFollow = sav;
+                expr(m->target.get());     // receiver sub-reads follow normally
+                return;
+            }
+        }
+        expr(e);
     }
 
     void expr(const ast::Expr* e) {
@@ -69,10 +142,12 @@ struct DepCollector {
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             expr(c->callee.get());
             for (auto& a : c->args) expr(a.value.get());
+            followCalledStaticMethod(c->callee.get());
             return; }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             expr(c->callee.get());
             for (auto& a : c->args) expr(a.value.get());
+            followCalledStaticMethod(c->callee.get());
             return; }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
             expr(ix->target.get());
@@ -134,9 +209,9 @@ struct DepCollector {
         if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
             expr(ts->value.get()); return; }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            expr(as->target.get()); expr(as->value.get()); return; }
+            writeTarget(as->target.get()); expr(as->value.get()); return; }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
-            expr(inc->target.get()); return; }
+            writeTarget(inc->target.get()); return; }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
             expr(ds->value.get()); return; }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
@@ -185,7 +260,7 @@ struct DepCollector {
 // initializers + static-constructor body).
 void collectDeps(const SemaContext& ctx, const TypeSymbol* t,
                  std::unordered_map<const TypeSymbol*, SourceLocation>& out) {
-    DepCollector c{ctx, t, out};
+    DepCollector c{ctx, t, out, /*visited=*/{}, /*suppressGetterFollow=*/false};
     for (const Symbol* m : t->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
             if (!hasStaticModifier(fs)) continue;
