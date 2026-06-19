@@ -2713,6 +2713,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
             v = ensureNullableElem(v);
+            // #819 / §14.4: an element bound to an INTERFACE/Object element slot
+            // must be heap-boxed when it is a value type (record/enum/primitive)
+            // so a vtable sits at word 0 of the stored pointer. Otherwise the raw
+            // value bytes are stored in the pointer-sized slot and the element
+            // disposer (elementDisposerThunk) treats the first word as a vtable
+            // pointer → SIGSEGV. boxForTarget is a no-op for a class/already-
+            // pointer element or a non-Object element slot.
+            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                v = boxForTarget(v, recvTy->genericArgs[0],
+                                 call.args[0].value.get());
             // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a borrowing Array<string>
             // co-owns a +1 per element. Take an INDEPENDENT +1 at insert, released
             // per element on free (via stringElementReleaseThunk — RuntimeManaged row).

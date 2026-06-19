@@ -392,3 +392,78 @@ BEZEL_TEST(owned_llist_iface_619_spec_28_11_14_4,
         "end; "
         "return ImplA._nA * 10 + ImplB._nB;"), 11);
 }
+
+// ===========================================================================
+// #819 / §14.4: a RECORD implementing an interface, added to an
+// OwnedArray<IFace>, must be HEAP-BOXED so a vtable sits at word 0. Before the
+// fix the raw record bytes were stored in the pointer-sized slot and the element
+// disposer treated the first field as a vtable pointer → SIGSEGV on disposal.
+// (The class-element case above already worked; records are the gap.)
+// ===========================================================================
+
+const char* kRecordIfaceProg =
+    "module M; "
+    "interface IFoo method Foo(): int; end IFoo; "
+    "record R(n: int) : IFoo "
+    "  public method Foo(): int => n; "
+    "end R; ";
+
+// Count after adding a record-boxed element: 1 (was a SIGSEGV on scope-end
+// disposal).
+BEZEL_TEST(owned_coll_iface_819_record_box, record_added_count) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(kRecordIfaceProg) +
+        "class C public static method Main(): int "
+        "  using var arr := new OwnedArray<IFoo>(); "
+        "  arr.Add(new R(5)); "
+        "  return arr.Count; "                         // 1
+        "end Main; end C;"), 1);
+}
+
+// Interface dispatch through the boxed record's itable returns the field value.
+BEZEL_TEST(owned_coll_iface_819_record_box, record_dispatch_through_box) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(kRecordIfaceProg) +
+        "class C public static method Main(): int "
+        "  using var arr := new OwnedArray<IFoo>(); "
+        "  arr.Add(new R(5)); "
+        "  return arr[0].Foo(); "                       // 5
+        "end Main; end C;"), 5);
+}
+
+// Disposal of an OwnedArray<IFoo> holding boxed records is leak-free and
+// crash-free (the boxes are reclaimed exactly once).
+BEZEL_TEST(owned_coll_iface_819_record_box, record_elements_disposed_leak_free) {
+    const std::string p =
+        std::string(kRecordIfaceProg) +
+        "class C public static method Main(): int "
+        "  do "
+        "    using var arr := new OwnedArray<IFoo>(); "
+        "    arr.Add(new R(1)); "
+        "    arr.Add(new R(2)); "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(p), 0);
+    int lsan = runUnderLeakSanitizer(p);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// Regression guard: a CLASS implementing the interface still works (boxForTarget
+// is a no-op for an already-pointer element). Dispatch returns 7.
+BEZEL_TEST(owned_coll_iface_819_record_box, class_element_unaffected) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; interface IFoo method Foo(): int; end IFoo; "
+        "sealed class K : IFoo "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Foo(): int => _v; "
+        "  destructor end destructor; "
+        "end K; "
+        "class C public static method Main(): int "
+        "  using var arr := new OwnedArray<IFoo>(); "
+        "  arr.Add(new K(7)); "
+        "  return arr[0].Foo(); "                       // 7
+        "end Main; end C;"), 7);
+}
