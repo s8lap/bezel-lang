@@ -864,4 +864,100 @@ BEZEL_TEST(codegen_excdisp_467, cross_method_inner_finally_throw_leak_free) {
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// --------------------------------------------------------------------------
+// [822] §28.3 — an owned local in an OUTER try body is disposed on the
+// unwind path when an INNER try/catch (no finally) re-propagates an unmatched
+// exception. The #467 intervening-scope discharge was only emitted for the
+// try-WITH-finally re-propagation path; the pure try/catch (no finally)
+// no-arm-matched path branched straight to the enclosing handler without it,
+// leaking the outer `using var`.
+// --------------------------------------------------------------------------
+
+// Outer `using var r`; inner try throws E1 which the inner catch (E2) does not
+// match → re-propagates to the outer catch. r must be disposed during the
+// unwind, so R._n == 1 in the outer arm (was 0).
+const char* kNestedTryNoFinallyReprop =
+    "module M; "
+    "class R public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; end R; "
+    "class E1 end E1; "
+    "class E2 end E2; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      try "
+    "        throw new E1(); "
+    "      catch E2 => var d := 0; "
+    "      end; "
+    "    catch E1 => return R._n; "       // 1 (r disposed on re-propagation)
+    "    end; "
+    "    return -1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_822, outer_using_var_disposed_on_nested_reprop) {
+    BEZEL_EXPECT_EQ(run(kNestedTryNoFinallyReprop), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_822, outer_using_var_nested_reprop_leak_free) {
+    // ASan/LSan-clean: r reclaimed exactly once during the unwind to the outer
+    // handler; no leak (the bug) and no double-free.
+    int lsan = runUnderLeakSanitizer(kNestedTryNoFinallyReprop);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// Two outer owned locals → both disposed (reverse order) on re-propagation: 2.
+const char* kNestedTryTwoOuterLocals =
+    "module M; "
+    "class R public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; end R; "
+    "class E1 end E1; "
+    "class E2 end E2; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r1 := new R(); "
+    "      using var r2 := new R(); "
+    "      try "
+    "        throw new E1(); "
+    "      catch E2 => var d := 0; "
+    "      end; "
+    "    catch E1 => return R._n; "       // 2
+    "    end; "
+    "    return -1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_822, two_outer_using_vars_both_disposed) {
+    BEZEL_EXPECT_EQ(run(kNestedTryTwoOuterLocals), 2);
+}
+
+// Regression guard: when the INNER catch MATCHES (no re-propagation), the outer
+// `using var` is disposed exactly ONCE (not double-freed by the new range
+// discharge). R._n == 1.
+const char* kNestedTryInnerMatches =
+    "module M; "
+    "class R public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; end R; "
+    "class E1 end E1; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      try "
+    "        throw new E1(); "
+    "      catch E1 => var d := 0; "
+    "      end; "
+    "    catch E1 => return 99; "
+    "    end; "
+    "    return R._n; "                   // 1 (disposed once, no double-free)
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_822, inner_match_outer_local_disposed_once) {
+    expectExitAndLeakFree(kNestedTryInnerMatches, 1);
+}
+
 }  // namespace

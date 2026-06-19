@@ -1449,7 +1449,19 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     }
     // No arm matched → exception still pending; run finally (if any)
     // then re-propagate to the enclosing unwind target.
-    builder_.CreateBr(hasFin ? finUnwindBB : unwindBB());
+    if (hasFin) {
+        builder_.CreateBr(finUnwindBB);
+    } else {
+        // #822 / §28.3: with no finally, the throw site disposed only down to
+        // this try's depth, so owned locals in the scopes BETWEEN this try and
+        // the enclosing handler (e.g. an outer `using var` declared before the
+        // inner try in the same block) are still live and would LEAK on the
+        // unmatched-arm re-propagation path. Dispose that intervening range
+        // before re-propagating — the same discharge finUnwindBB performs after
+        // its finally body (above).
+        emitUnwindDisposalsInRange(savedDepth, thisTryDepth);
+        builder_.CreateBr(unwindBB());
+    }
 
     if (hasFin) {
         // Pop the frame — outer frames (if any) are now at back().
