@@ -3705,6 +3705,38 @@ void Emitter::emitEnsureInitFns() {
     };
     for (auto& [t, fn] : sfinitFnOf_) consider(t);
     for (auto& [t, fn] : cctorFnOf_) consider(t);
+    // #798: also emit an (exported) ensureinit for every LOCAL public non-generic
+    // type that has a static MEMBER but no static STATE (const-only static fields
+    // / static methods). The importer calls bz$<T>$ensureinit at each cross-module
+    // static-member access; since all imported types are public, the symbol must
+    // exist even when the type's init is a no-op — otherwise the importer would
+    // reference a missing ensureinit and the link would fail. A type with no
+    // static member is never init-triggered, so it needs none.
+    auto isStaticMod = [](const sema::MemberSymbol* m) {
+        return std::find(m->modifiers.begin(), m->modifiers.end(),
+                         std::string_view("static")) != m->modifiers.end();
+    };
+    auto hasAnyStaticMember = [&](const sema::TypeSymbol* t) {
+        for (const sema::Symbol* m : t->members) {
+            if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
+                if (isStaticMod(fs)) return true;
+            } else if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(m)) {
+                if (isStaticMod(ms)) return true;
+            } else if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m)) {
+                if (isStaticMod(ps)) return true;
+            } else if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m)) {
+                if (cs->isStatic) return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& sym : ctx_.symbols()) {
+        auto* t = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!t || ctx_.isImported(t)) continue;
+        if (!t->genericParams.empty()) continue;   // generics: cross-module deferred
+        if (t->visibility != ast::Visibility::Public) continue;
+        if (hasAnyStaticMember(t)) consider(t);
+    }
 
     auto* voidFnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
@@ -3727,8 +3759,17 @@ void Emitter::emitEnsureInitFns() {
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantPointerNull::get(ptrTy()), "bz$" + cls + "$initexc");
 
+        // #798: a public non-generic type's ensureinit is EXPORTED so an importer
+        // can trigger its static init on first cross-module use (§22.13). The
+        // per-type state/exc globals stay internal — only this module's ensureinit
+        // body touches them, so the single guard is shared via the one exported
+        // function. Non-public / generic types keep internal linkage.
+        bool exportInit = t->visibility == ast::Visibility::Public &&
+                          t->genericParams.empty();
         auto* fn = llvm::Function::Create(
-            voidFnTy, llvm::GlobalValue::InternalLinkage,
+            voidFnTy,
+            exportInit ? llvm::GlobalValue::ExternalLinkage
+                       : llvm::GlobalValue::InternalLinkage,
             "bz$" + cls + "$ensureinit", module_.get());
         ensureInitFns_[t] = fn;
 
@@ -3830,16 +3871,38 @@ void Emitter::emitEnsureInitFns() {
 }
 
 
-// #720 / #796: at a static-access site, ensure `owner`'s static state is
+// #720 / #796 / #798: at a static-access site, ensure `owner`'s static state is
 // initialized (lazy, §22.13) before the access, routing a possible
 // TypeInitializationException through the current unwind target. No-op for a type
 // with no lazy ensureinit (a type with no static initializer at all).
 void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
     if (!owner) return;
     auto it = ensureInitFns_.find(owner);
-    if (it == ensureInitFns_.end()) return;
-    builder_.CreateCall(it->second, {});
-    emitPendingCheck();
+    if (it != ensureInitFns_.end()) {
+        builder_.CreateCall(it->second, {});
+        emitPendingCheck();
+        return;
+    }
+    // #798 / §2.5 / §22.13: an IMPORTED type's static init runs in its DEFINING
+    // module. The importer triggers it on first cross-module static-member access
+    // by calling the exported `bz$<T>$ensureinit` (declared external here). Every
+    // imported type is public, and the defining module exports an ensureinit for
+    // each public non-generic type with a static member — so the symbol resolves
+    // at link. Generic imported types are excluded (cross-module generic static
+    // init is the #428 family).
+    if (ctx_.isImported(owner) && owner->genericParams.empty()) {
+        std::string name = "bz$" + std::string(owner->name) + "$ensureinit";
+        llvm::Function* fn = module_->getFunction(name);
+        if (!fn) {
+            auto* voidFnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+            fn = llvm::Function::Create(
+                voidFnTy, llvm::GlobalValue::ExternalLinkage, name,
+                module_.get());
+        }
+        builder_.CreateCall(fn, {});
+        emitPendingCheck();
+    }
 }
 
 
