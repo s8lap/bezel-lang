@@ -3224,6 +3224,36 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         return;
     }
 
+    // §30.1: an EXPRESSION-bodied async method (`async method M(): Task<T> =>
+    // expr`) must also flow through the async state-machine lowering. The async
+    // detection above requires a Block body, so an expression body fell through
+    // to the regular expression path below, which emitted a raw `ret <value>`
+    // whose type is the UNWRAPPED result, not the Task<T> the function returns —
+    // malformed IR ("return type does not match operand"). Synthesize a single
+    // `return <exprBody>` and route it exactly like a block body. The synthesized
+    // ReturnStmt BORROWS the AST-owned exprBody; release it after lowering so the
+    // synthesized body's destructor does not free the AST node.
+    if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody &&
+        isAsyncMethod(ms)) {
+        std::vector<std::unique_ptr<ast::Stmt>> synthBody;
+        auto ret = std::make_unique<ast::ReturnStmt>();
+        ret->span = ci.exprBody->span;
+        ret->value.reset(const_cast<ast::Expr*>(ci.exprBody));
+        synthBody.push_back(std::move(ret));
+        CallableInfo aci = ci;
+        aci.bodyKind = ast::MethodBodyKind::Block;
+        aci.stmts = &synthBody;
+        aci.exprBody = nullptr;
+        if (returnsAsyncIteratorType(ms))
+            emitAsyncIteratorMethod(ms, fn, aci);
+        else
+            emitAsyncMethod(ms, fn, aci);
+        // Release the borrowed exprBody so synthBody's destructor does not free
+        // the AST-owned expression node.
+        static_cast<ast::ReturnStmt*>(synthBody[0].get())->value.release();
+        return;
+    }
+
     currentFn_ = fn;
     currentThis_ = nullptr;
     locals_.clear();
