@@ -8224,15 +8224,38 @@ void Emitter::collectDefinitelyEscapingLambdas(
     // reassignment) could UAF a later read of the captured local.
     std::unordered_set<const void*> reassigned;
     std::vector<const ast::LocalDecl*> returnedVars;
+    // #694 field-store: `this.f := () => …` stores the closure on the receiver,
+    // which outlives the method → a definite escape. Counted per field so a field
+    // assigned more than once (its earlier lambda dropped mid-method) is excluded
+    // (the same reassignment hazard as a returned var). Only `this.f`/implicit `f`
+    // (the receiver's own field); `other.f` is excluded (other may be scope-bound).
+    std::unordered_map<const sema::Symbol*, int> fieldAssignCount;
+    std::unordered_map<const sema::Symbol*, const ast::LambdaExpr*> fieldLambda;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            if (auto* id =
-                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
-                if (auto* loc =
-                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
-                    if (loc->decl)
-                        reassigned.insert(static_cast<const void*>(loc->decl));
+            sema::Symbol* tsym =
+                as->target ? ctx_.exprSymbol(*as->target) : nullptr;
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+                if (loc->decl)
+                    reassigned.insert(static_cast<const void*>(loc->decl));
+            } else if (auto* fld = dynamic_cast<sema::FieldSymbol*>(tsym)) {
+                bool thisField =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get())
+                        != nullptr;
+                if (!thisField)
+                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            as->target.get()))
+                        if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get()))
+                            thisField = (rid->name == "this");
+                if (thisField) {
+                    fieldAssignCount[fld]++;
+                    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                            as->value.get()))
+                        fieldLambda[fld] = lam;
+                }
+            }
             return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
@@ -8274,6 +8297,16 @@ void Emitter::collectDefinitelyEscapingLambdas(
         if (auto* lam =
                 dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
             definitelyEscapingLambdas_.insert(static_cast<const void*>(lam));
+    }
+    // #694 field-store: a `this.f := () => …` whose field is assigned EXACTLY ONCE
+    // in the method (no within-method reassignment that would drop the lambda
+    // mid-scope) escapes via the receiver — add it.
+    for (const auto& [fld, n] : fieldAssignCount) {
+        if (n != 1) continue;
+        auto it = fieldLambda.find(fld);
+        if (it != fieldLambda.end())
+            definitelyEscapingLambdas_.insert(
+                static_cast<const void*>(it->second));
     }
 }
 

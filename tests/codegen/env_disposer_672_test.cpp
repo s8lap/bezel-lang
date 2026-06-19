@@ -648,3 +648,48 @@ const char* kEscapingReassignedVarNotFreed =
 BEZEL_TEST(codegen_env_disposer_672, escaping_reassigned_var_no_corruption_694) {
     expectValueAndNoCorruption(kEscapingReassignedVarNotFreed, 5);
 }
+
+// #694 field-store: `this.f := () => x` stores the closure on the receiver, which
+// outlives the method — a definite escape. The field is assigned exactly once, so
+// the lambda's envdtor (run when the Holder is disposed) frees the sole capture
+// cell. LSan-CLEAN; returns 7.
+const char* kEscapingFieldStoreCell =
+    "module M; class Holder "
+    "  public f: () -> int := () => 0; "
+    "  public method Set() "
+    "    var x: int := 7; "
+    "    f := () => x; "
+    "  end Set; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  var r: int := 0; "
+    "  do using var h := new Holder(); h.Set(); r := h.f(); end; "
+    "  return r; "   // 7
+    "end Main; end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_field_store_cell_freed_lsan_clean_694) {
+    expectValueAndLeakFree(kEscapingFieldStoreCell, 7);
+}
+
+// #694 field-store (soundness boundary): a field assigned a lambda TWICE — the
+// first lambda is dropped mid-method (the field's old value released), so freeing
+// its cell could UAF a later `var z := x`. The exactly-once guard excludes it: the
+// cell leaks (safe), with NO use-after-free / double-free. Returns the reassigned
+// `() => y` (y = 5).
+const char* kEscapingFieldReassignedNotFreed =
+    "module M; class Holder "
+    "  public f: () -> int := () => 0; "
+    "  public method Set() "
+    "    var x: int := 3; var y: int := 5; "
+    "    f := () => x; "
+    "    f := () => y; "
+    "    var z: int := x; "
+    "  end Set; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  var r: int := 0; "
+    "  do using var h := new Holder(); h.Set(); r := h.f(); end; "
+    "  return r; "   // 5
+    "end Main; end C;";
+BEZEL_TEST(codegen_env_disposer_672, escaping_field_reassigned_no_corruption_694) {
+    expectValueAndNoCorruption(kEscapingFieldReassignedNotFreed, 5);
+}
