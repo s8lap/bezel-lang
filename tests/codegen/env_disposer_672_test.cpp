@@ -364,13 +364,12 @@ const char* kBoxEscapingCapture =
     "  end Main; "
     "end C;";
 
-// §8.6 / §28.9 / #672 MULTI-CAPTURE (deferred, leak-tolerated): the SAME boxed
-// `o` captured by TWO lambdas — two envs hold the one box.  The single
-// suppressed scope-end release cannot be performed by BOTH envdtors without a
-// double-free, so this case is deliberately EXCLUDED from box release (capture
-// count 2 ≠ 1) and the box leaks (the safe PRIME-DIRECTIVE direction).  This
-// test pins that there is NO double-free / UAF — only a tolerated leak.
-// Returns 1.
+// §8.6 / §28.9 / #802 (the fix) MULTI-CAPTURE: the SAME boxed `o` captured by TWO
+// non-escaping lambdas — two envs hold the one box. The rc-retain model keeps it
+// sound: the first capture transfers the producer's +1, the second bz_box_retains
+// an independent +1, and BOTH envdtors release — so the box is reclaimed exactly
+// once (rc 2 -> 0). Previously this was an excluded leak (#672 admitted only
+// capture-count 1). LSan-CLEAN now. Returns 1.
 const char* kBoxMultiCaptureNoDoubleFree =
     "module M; class C "
     "  public static method Main(): int "
@@ -382,6 +381,39 @@ const char* kBoxMultiCaptureNoDoubleFree =
     "      if f() then if g() then hit := 1; end; end; "
     "    end; "
     "    return hit; "   // 1
+    "  end Main; "
+    "end C;";
+
+// §8.6 / §28.9 / #802: THREE non-escaping captures of the same box — producer +1
+// plus two retains = rc 3, three envdtor releases -> 0. LSan-CLEAN. Returns 1.
+const char* kBoxThreeCapture =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var hit: int := 0; "
+    "    do "
+    "      var o: Object := 42; "
+    "      var f: () -> bool := () => o is int; "
+    "      var g: () -> bool := () => o is int; "
+    "      var h: () -> bool := () => o is int; "
+    "      if f() then if g() then if h() then hit := 1; end; end; end; "
+    "    end; "
+    "    return hit; "   // 1
+    "  end Main; "
+    "end C;";
+
+// §8.6 / #802 value-correctness: the box read by TWO closures yields the right
+// value (both observe `o is int`), and the box is reclaimed exactly once. 1+1 = 2.
+const char* kBoxMultiCaptureValue =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var r: int := 0; "
+    "    do "
+    "      var o: Object := 42; "
+    "      var f: () -> int := () => case o var n: int => 1, _ => 0 end; "
+    "      var g: () -> int := () => case o var n: int => 1, _ => 0 end; "
+    "      r := f() + g(); "
+    "    end; "
+    "    return r; "   // 2
     "  end Main; "
     "end C;";
 
@@ -475,8 +507,19 @@ BEZEL_TEST(codegen_env_disposer_672, box_escaping_capture_no_corruption_28_9) {
 // EXCLUDED from envdtor release (count 2 ≠ 1) — it leaks rather than risk a
 // double-free.  Pins NO double-free / UAF (the leak itself is tolerated and
 // tracked for the general rc-retain solution).  Returns 1.
-BEZEL_TEST(codegen_env_disposer_672, box_multi_capture_no_double_free_28_9) {
-    expectValueAndNoCorruption(kBoxMultiCaptureNoDoubleFree, 1);
+BEZEL_TEST(codegen_env_disposer_672, box_multi_capture_rc_retain_lsan_clean_802) {
+    expectValueAndLeakFree(kBoxMultiCaptureNoDoubleFree, 1);
+}
+
+// #802: three non-escaping captures — rc-retain reclaims the box once. LSan-clean.
+BEZEL_TEST(codegen_env_disposer_672, box_three_capture_rc_retain_lsan_clean_802) {
+    expectValueAndLeakFree(kBoxThreeCapture, 1);
+}
+
+// #802: the multi-captured box reads correctly from both closures (value 2) and
+// is leak-free.
+BEZEL_TEST(codegen_env_disposer_672, box_multi_capture_value_lsan_clean_802) {
+    expectValueAndLeakFree(kBoxMultiCaptureValue, 2);
 }
 
 // §8.6 / §27.5 / #672: a guarded-boxing capture (box producer outside the loop,

@@ -4382,27 +4382,25 @@ private:
     void collectBoxReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
-    // §27.5 / §28.9 / #672: the set of +1-box-producer LOCAL DECL NODES
-    // (ast::Node*) that are captured by EXACTLY ONE lambda env in the function
+    // §27.5 / §28.9 / #672 / #802: the set of +1-box-producer LOCAL DECL NODES
+    // (ast::Node*) that are captured by AT LEAST ONE lambda env in the function
     // body. A captured boxed-value local has its scope-end bz_box_release
-    // SUPPRESSED by BoxEscapeWalker (the capture marks it escaped); the owning
-    // lambda's per-lambda envdtor must perform that deferred release instead
-    // (mirroring the string/closure capture handling). The transfer model —
-    // one suppressed release, performed by the single envdtor — is sound ONLY
-    // when exactly one env holds the box; two capturing lambdas (two envdtors)
-    // would each perform the single suppressed release → double-free. So this
-    // set admits a box-producer local only when its whole-body capture count is
-    // exactly 1. Multi-captured boxes keep leaking (the safe direction, PRIME
-    // DIRECTIVE) — tracked separately for the general rc-retain solution.
-    // Computed once per body by collectBoxSingleCaptureLocals; consulted at the
-    // lambda capture site in lowerLambda to arm the envdtor box release.
-    std::unordered_set<const void*> boxSingleCaptureLocals_;
-    // The function for which boxSingleCaptureLocals_ was computed (mirrors
+    // SUPPRESSED by BoxEscapeWalker (the capture marks it escaped); each capturing
+    // lambda's per-lambda envdtor performs a release instead (mirroring the
+    // string/closure capture handling). rc-retain model (#802): the FIRST capture
+    // transfers the producer's single suppressed +1; every ADDITIONAL capture
+    // bz_box_retains an independent +1 (in lowerLambda) so its envdtor's release
+    // is balanced. N envs ⇒ rc = 1 + (N-1) = N, and N envdtor releases reach 0
+    // after the last env dies — no leak, no double-free, for any capture count.
+    // Computed once per body by collectBoxCaptureLocals; consulted at the lambda
+    // capture site in lowerLambda to arm the envdtor box release + per-env retain.
+    std::unordered_set<const void*> boxCaptureLocals_;
+    // The function for which boxCaptureLocals_ was computed (mirrors
     // boxReleaseEligibleFn_): a lambda/thunk body lowered mid-function inherits
     // no eligibility, so its captured boxes just leak (never double-freed).
-    llvm::Function* boxSingleCaptureLocalsFn_ = nullptr;
-    // Compute boxSingleCaptureLocals_ for a block body (see the .cpp).
-    void collectBoxSingleCaptureLocals(
+    llvm::Function* boxCaptureLocalsFn_ = nullptr;
+    // Compute boxCaptureLocals_ for a block body (see the .cpp).
+    void collectBoxCaptureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // #429 / §27.5: the set of LOCAL DECL NODES (ast::Node*) and PARAMETER

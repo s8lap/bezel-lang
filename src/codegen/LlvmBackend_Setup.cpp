@@ -3305,8 +3305,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
     // one lambda env, so the owning lambda's envdtor may perform the deferred
     // (escape-suppressed) scope-end box release.
-    boxSingleCaptureLocals_.clear();
-    boxSingleCaptureLocalsFn_ = fn;
+    boxCaptureLocals_.clear();
+    boxCaptureLocalsFn_ = fn;
     // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
     // and may have their boxed cells freed at outer-scope exit.
     cellFreeEligible_.clear();
@@ -3317,7 +3317,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectStringReleaseEligible(*ci.stmts);
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
-        collectBoxSingleCaptureLocals(*ci.stmts);
+        collectBoxCaptureLocals(*ci.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses the result).
         collectCellFreeEligible(*ci.stmts);
     }
@@ -8123,25 +8123,27 @@ void Emitter::collectBoxReleaseEligible(
 }
 
 
-// §27.5 / §28.9 / #672: compute boxSingleCaptureLocals_ for the function body.
+// §27.5 / §28.9 / #672 / #802: compute boxCaptureLocals_ for the function body.
 //
 // A +1-box-producer local that is CAPTURED by a lambda has its scope-end
 // bz_box_release suppressed by BoxEscapeWalker (the capture is an escape, so the
 // local is NOT in boxReleaseEligible_). The owning lambda's per-lambda envdtor
-// must perform that deferred release instead — but ONLY when exactly one closure
-// env holds the box. If two lambdas capture it, each env holds the same box
-// pointer and each envdtor would perform the single suppressed release → a
-// double-free of the box wrapper. So a box-producer local qualifies here iff its
-// whole-body capture count across ALL lambdas is exactly 1. Multi-captured boxes
-// are excluded and keep leaking (the safe direction, PRIME DIRECTIVE).
+// performs that deferred release instead. With ONE capturing env this is a pure
+// transfer (the env releases the producer's +1). With N>1 envs (#802) each env
+// holds the same box pointer; the rc-retain model keeps it sound: the FIRST
+// capture transfers the producer's +1, every ADDITIONAL capture bz_box_retains an
+// independent +1, and EVERY env's envdtor releases exactly one — so the rc
+// reaches 0 after the last env dies (no leak, no double-free). This set therefore
+// admits a box-producer local captured by AT LEAST ONE lambda; the per-capture
+// retain (in lowerLambda) and the per-envdtor release balance the count.
 //
 // Counting uses FULL-DESCENT lambda collection (collectAllLambdas) + per-lambda
 // collectCapturedSyms (which itself descends): a box captured by a nested lambda
 // is counted at BOTH the enclosing and the nested lambda (each env holds it), so
 // any multi-env case yields count >= 2 and is conservatively excluded.
-void Emitter::collectBoxSingleCaptureLocals(
+void Emitter::collectBoxCaptureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    boxSingleCaptureLocals_.clear();
+    boxCaptureLocals_.clear();
 
     // Candidate box-producer locals (same predicate as collectBoxReleaseEligible).
     std::unordered_set<const void*> candidates;
@@ -8189,7 +8191,7 @@ void Emitter::collectBoxSingleCaptureLocals(
         }
     }
     for (const auto& [d, n] : captureCount)
-        if (n == 1) boxSingleCaptureLocals_.insert(d);
+        if (n >= 1) boxCaptureLocals_.insert(d);  // #802: any captured box producer
 }
 
 

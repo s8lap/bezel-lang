@@ -5306,7 +5306,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //     captured object itself.
         const sema::TypeRef*   semaTy = nullptr;
         // §27.5 / §28.9 / #672: true when this capture is a +1-box-producer local
-        // captured by exactly ONE lambda env (boxSingleCaptureLocals_) — the
+        // captured by exactly ONE lambda env (boxCaptureLocals_) — the
         // envdtor performs the DEFERRED scope-end bz_box_release that
         // BoxEscapeWalker suppressed at the capture. Disjoint from the string/
         // closure release branches (a box has an Object static type, never
@@ -5492,16 +5492,30 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 }
             }
         }
-        // §27.5 / §28.9 / #672: arm the envdtor box release for a +1-box-producer
-        // local captured by exactly one lambda env. Exclude the already-boxed
-        // (a second capturing lambda — would mean count > 1, already filtered by
-        // the pre-scan, but defensive) and guarded-boxing (a box producer in an
-        // outer scope captured by an inner-loop lambda reuses ONE box/cell across
-        // iterations, so N envdtors would release the same box — leak instead).
-        if (!alreadyBoxed && !wasGuardedLocal &&
-            currentFn_ == boxSingleCaptureLocalsFn_ &&
-            boxSingleCaptureLocals_.count(static_cast<const void*>(decl)))
+        // §27.5 / §28.9 / #672 / #802: arm the envdtor box release for a
+        // +1-box-producer local captured by a closure. Every capturing env's
+        // envdtor releases one box reference; the rc stays balanced via the
+        // rc-retain model — the FIRST capture transfers the producer's +1 (its
+        // scope-end release was suppressed by BoxEscapeWalker), and every
+        // ADDITIONAL (alreadyBoxed) capture bz_box_retains an independent +1 here.
+        // So N envs ⇒ rc = 1 (producer) + (N-1) (retains) = N, and N envdtor
+        // releases bring it to 0 after the last env dies — no leak, no double-free.
+        // Exclude guarded-boxing (a box producer in an outer scope captured by an
+        // inner-LOOP lambda reuses ONE cell across iterations; the retain/release
+        // bookkeeping would not match the per-iteration boxing — leak instead).
+        if (!wasGuardedLocal &&
+            currentFn_ == boxCaptureLocalsFn_ &&
+            boxCaptureLocals_.count(static_cast<const void*>(decl))) {
             ce.releaseBoxInEnvdtor = true;
+            if (alreadyBoxed) {
+                // 2nd+ capturing env: retain so this env owns an independent +1 to
+                // release in its envdtor. ce.envValue is the shared cell pointer;
+                // the box pointer is its loaded contents.
+                llvm::Value* box =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "box.recap");
+                emitBoxRetain(box);
+            }
+        }
         captures.push_back(ce);
     }
 
@@ -5965,14 +5979,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     emitClosureRelease(cl);
                 } else if (ce.releaseBoxInEnvdtor) {
                     // §8.6 / §28.9 / #672: boxed-VALUE capture, held by exactly
-                    // one env (boxSingleCaptureLocals_). BoxEscapeWalker
+                    // one env (boxCaptureLocals_). BoxEscapeWalker
                     // suppressed the producer's scope-end bz_box_release because
                     // the local was captured; this envdtor performs that single
                     // deferred release. Mirrors the scope-end boxRelease disposal
                     // (load the box pointer from the cell, bz_box_release). The
                     // box is a value-type leaf so only the wrapper is freed; never
                     // a class instance (a class coerced to Object is not a box
-                    // producer, so it never enters boxSingleCaptureLocals_).
+                    // producer, so it never enters boxCaptureLocals_).
                     // bz_box_release is null-safe.
                     llvm::Value* box =
                         builder_.CreateLoad(ptrTy(), cell, "box");
