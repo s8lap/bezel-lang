@@ -338,6 +338,7 @@ set(BEZEL_TEST_SOURCES
     codegen/loop_var_capture_nested_if_754_test.cpp
     codegen/interface_indexer_dispatch_730_test.cpp
     codegen/lazy_static_init_720_test.cpp
+    codegen/lazy_static_init_generic_796_test.cpp
     codegen/await_for_frame_dispose_792_test.cpp
     codegen/escaping_member_ref_borrow_791_test.cpp
     codegen/move_result_owned_724_test.cpp

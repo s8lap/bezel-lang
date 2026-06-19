@@ -3394,12 +3394,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                 builder_.CreateCall(initFn, {vit->second});
             }
         }
-        // #720 / §22.13: NON-GENERIC types now initialize LAZILY on first use
-        // (via bz$<T>$ensureinit at each static-access site), so they are NOT run
-        // here. GENERIC types keep eager program-start init (their
-        // per-instantiation lazy init is a tracked follow-up).
+        // #720 / #796 / §22.13: every type with static state now initializes
+        // LAZILY on first use (via bz$<T>$ensureinit at each static-access site)
+        // — non-generic since #720, generic since #796. Skip any type that has a
+        // lazy ensureinit; only a type WITHOUT one (none today) would run here.
         for (auto& e : staticCtors_) {
-            if (e.type && e.type->genericParams.empty()) continue;  // lazy
+            if (e.type && ensureInitFns_.count(e.type)) continue;  // lazy
             builder_.CreateCall(e.fn, {});
             emitPendingCheck();
         }
@@ -3669,8 +3669,9 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
 }
 
 
-// #720 / §22.13 / §22.7: build the per-type lazy-init function `bz$<T>$ensureinit`
-// for every NON-GENERIC type that has static state (an sfinit and/or a cctor).
+// #720 / #796 / §22.13 / §22.7: build the per-type lazy-init function
+// `bz$<T>$ensureinit` for every type that has static state (an sfinit and/or a
+// cctor) — non-generic (#720) and generic (#796).
 // The function runs that type's initializers exactly once, on first use, guarded
 // by a per-type state global (0=uninit, 1=in-progress, 2=done, 3=failed):
 //   * done      → return immediately.
@@ -3683,14 +3684,23 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
 //                 by emitStaticConstructorBody), save it, mark failed, and leave it
 //                 pending for the caller's emitPendingCheck to route. Otherwise mark
 //                 done.
-// Generic per-instantiation lazy init is NOT handled here (those types keep eager
-// init at Main start) — tracked as a follow-up.
+// For a GENERIC type the guard is per-TYPE: the single sfinit initializes every
+// instantiation at once, so first use of ANY instantiation runs it once (§22.13
+// timing fixed; per-instantiation INIT-timing independence for T-dependent
+// initializers stays a follow-up — see #796).
 void Emitter::emitEnsureInitFns() {
-    // Collect every non-generic type that has static state.
+    // Collect every type that has static state — non-generic (#720) AND generic
+    // (#796). For a generic type the single per-type sfinit initializes ALL of
+    // its instantiations at once (it stores each T-independent initializer into
+    // every per-instantiation global — emitStaticConstructorBody / #709), so a
+    // per-TYPE lazy guard defers that all-at-once init to first use, exactly as
+    // for a non-generic type. (Per-INSTANTIATION init *timing* independence —
+    // only observable for T-DEPENDENT initializers, which are not yet supported,
+    // emitStaticConstructorBody L~3647 — remains a tracked follow-up.)
     std::vector<const sema::TypeSymbol*> types;
     std::unordered_set<const sema::TypeSymbol*> seen;
     auto consider = [&](const sema::TypeSymbol* t) {
-        if (!t || !t->genericParams.empty()) return;  // non-generic only
+        if (!t) return;
         if (seen.insert(t).second) types.push_back(t);
     };
     for (auto& [t, fn] : sfinitFnOf_) consider(t);
@@ -3820,10 +3830,10 @@ void Emitter::emitEnsureInitFns() {
 }
 
 
-// #720: at a static-access site, ensure `owner`'s static state is initialized
-// (lazy, §22.13) before the access, routing a possible TypeInitializationException
-// through the current unwind target. No-op for a type with no lazy ensureinit
-// (generic types, or types with no static initializer).
+// #720 / #796: at a static-access site, ensure `owner`'s static state is
+// initialized (lazy, §22.13) before the access, routing a possible
+// TypeInitializationException through the current unwind target. No-op for a type
+// with no lazy ensureinit (a type with no static initializer at all).
 void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
     if (!owner) return;
     auto it = ensureInitFns_.find(owner);
