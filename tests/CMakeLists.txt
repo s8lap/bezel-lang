@@ -78,6 +78,7 @@ set(BEZEL_TEST_SOURCES
     parser/lambda_conditional_body_589_test.cpp
     parser/catch_arm_expr_body_588_test.cpp
     sema/symbol_collection_test.cpp
+    sema/static_init_cycles_797_test.cpp
     sema/type_resolution_test.cpp
     sema/expr_literal_types_test.cpp
     # --- fix #743: §21.9 owned-value discard-as-statement is an error ---

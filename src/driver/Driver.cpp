@@ -18,6 +18,7 @@
 #include "parser/Parser.hpp"
 #include "sema/DefiniteAssignment.hpp"
 #include "sema/EntryPoint.hpp"
+#include "sema/StaticInitCycles.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
@@ -123,6 +124,10 @@ CompileResult Driver::compileFile(const std::string& path,
         // Definite-assignment runs after expression typecheck so it
         // can see the same scope structure ExprTypecheck built.
         sema::checkDefiniteAssignment(*unit, semaCtx);
+        // §2.5 / §22.13 (#797): reject circular static-initialization
+        // dependencies — runs after typecheck so static-member references are
+        // resolved.
+        sema::checkStaticInitCycles(*unit, semaCtx);
 
         // Ownership milestone — runs after sema since it needs
         // resolved local symbols + producer info.
@@ -232,6 +237,7 @@ CompileResult Driver::compileObject(const std::string& path,
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
         sema::checkDefiniteAssignment(*unit, semaCtx);
+        sema::checkStaticInitCycles(*unit, semaCtx);  // §2.5 / #797
         ownership::checkOwnership(*unit, semaCtx);
 
         TypeChecker typeChecker(diagnostics);
