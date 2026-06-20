@@ -235,6 +235,7 @@ set(BEZEL_TEST_SOURCES
     sema/shared_sync_sendable_689_test.cpp            # #689: Shared<T> sendable iff T in sync-set (§28.13 v0.140)
     sema/using_var_reassign_830_test.cpp              # fix #830: §28.10 reject reassigning a `using var` local
     sema/compound_assign_operator_result_851_test.cpp # fix #851: §25.1 reject compound op whose overload result differs from LHS
+    sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range
     sema/bare_drain_discard_832_test.cpp              # fix #832: §21.9 reject bare owning-collection drain discard
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
@@ -366,6 +367,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nullable_value_format_interp_849_test.cpp
     codegen/string_compound_concat_857_test.cpp
     codegen/float_to_int_truncation_858_test.cpp
+    codegen/enum_cast_range_859_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp

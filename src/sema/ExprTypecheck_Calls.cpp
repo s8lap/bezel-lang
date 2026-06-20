@@ -464,6 +464,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     }
     if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
         if (ts->kind == ast::TypeDeclKind::Enum) {
+            // §5.4 (#859): `E(n)` with a compile-time-constant `n` outside the
+            // enum's underlying type range is a COMPILE ERROR (a runtime cast
+            // raises OverflowException instead — handled in codegen). Mirror the
+            // §10.3 member-range check on the underlying type (explicit
+            // enumUnderlyingType, or the default `int`).
+            if (ce.args.size() == 1 && ce.args[0].value) {
+                if (auto cv = foldIntConstExprTC(*ce.args[0].value)) {
+                    PrimitiveType up = PrimitiveType::Int;
+                    if (ts->enumUnderlyingType &&
+                        ts->enumUnderlyingType->kind ==
+                            TypeRef::Kind::Primitive)
+                        up = ts->enumUnderlyingType->primitive;
+                    auto fits = [](long long v, PrimitiveType p) -> bool {
+                        using P = PrimitiveType;
+                        switch (p) {
+                            case P::Byte:   return v >= 0 && v <= 255;
+                            case P::SByte:  return v >= -128 && v <= 127;
+                            case P::Short:  return v >= -32768 && v <= 32767;
+                            case P::UShort: return v >= 0 && v <= 65535;
+                            case P::Int:    return v >= -2147483648LL &&
+                                                   v <= 2147483647LL;
+                            case P::UInt:   return v >= 0 && v <= 4294967295LL;
+                            default:        return true;  // long/ulong: 64-bit
+                        }
+                    };
+                    if (!fits(*cv, up))
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "enum cast `" + std::string(ts->name) + "(" +
+                            std::to_string(*cv) +
+                            ")` — the constant is outside the enum's underlying "
+                            "type range and cannot be represented (§5.4)");
+                }
+            }
             TypeRef* et = ctx_.makeTypeRef();
             et->kind = TypeRef::Kind::Named;
             et->declaration = ts;

@@ -8113,6 +8113,26 @@ llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
     if (auto* st = ctx_.exprType(*call.args[0].value))
         if (st->kind == sema::TypeRef::Kind::Primitive)
             srcUnsigned = isUnsignedPrim(st->primitive);
+    // §5.4 (#859): at runtime `E(n)` raises OverflowException when `n` exceeds
+    // the underlying type's range. On a NARROWING (source wider than the
+    // underlying type) range-check the value using the UNDERLYING type's
+    // signedness, mirroring the int→int narrowing guard: truncate, extend back
+    // with the underlying signedness, and compare to the original — a mismatch
+    // means the value did not fit. Without this `Color(300)` (byte-backed)
+    // silently wrapped to 44 and `Color(-1)` to 255. A widening to the underlying
+    // type cannot overflow, so it keeps the plain extension.
+    unsigned srcBits = src->getType()->getIntegerBitWidth();
+    unsigned dstBits = uTy->getIntegerBitWidth();
+    if (dstBits < srcBits) {
+        bool dstUns = enumIsUnsigned(enumTy);
+        llvm::Value* trunc = builder_.CreateTrunc(src, uTy, "enum.cast.trunc");
+        llvm::Value* back = dstUns
+            ? builder_.CreateZExt(trunc, src->getType(), "enum.cast.back")
+            : builder_.CreateSExt(trunc, src->getType(), "enum.cast.back");
+        emitGuardThrow(builder_.CreateICmpNE(back, src, "enum.cast.oor"),
+                       "OverflowException");
+        return trunc;
+    }
     return srcUnsigned ? builder_.CreateZExtOrTrunc(src, uTy, "enum.cast")
                        : builder_.CreateSExtOrTrunc(src, uTy, "enum.cast");
 }
