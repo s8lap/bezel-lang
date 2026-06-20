@@ -4608,6 +4608,25 @@ private:
     bool lowerBoxFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
                             llvm::Value* newVal, const ast::Expr* valueExpr);
 
+    // #824 / §28.5 / §28.9: is `target` an `owned` heap-collection CLASS
+    // instance field lvalue (OwnedArray<T>/OwnedStack<T>/OwnedQueue<T>/
+    // OwnedSet<T>/OwnedLinkedList<T>/OwnedBuffer<T>/OwnedDictionary<T> etc.)?
+    // Only such a location is auto-disposed by the enclosing class's destructor
+    // (emitOwnedFieldDisposals) and needs dispose-old/store-new on reassignment.
+    // Excludes locals, ref params, static fields, record fields, and
+    // non-collection-typed fields.
+    bool isOwnedCollectionFieldLvalue(const ast::Expr& target);
+    // #824 / §28.5 / §28.9: store `newVal` into the owned collection class
+    // field at `fieldAddr`, disposing the prior value first. Order: load-old →
+    // store-new → dispose-old (bz_array_free / bz_llist_free are null-safe so
+    // no null-guard needed; disposal mirrors emitOwnedFieldDisposals). Ownership
+    // transfers into the field; the caller must NOT additionally dispose the
+    // source local (the ownership checker discharges the local's obligation at
+    // the assignment). Returns true when handled.
+    bool lowerOwnedCollectionFieldStore(const ast::Expr& target,
+                                        llvm::Value* fieldAddr,
+                                        llvm::Value* newVal);
+
     // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: the per-module set of
     // class field symbols (FieldSymbol / auto-property PropertySymbol) for which
     // EVERY store (across all methods + constructors + field initializers of the

@@ -7488,6 +7488,101 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
 }
 
 
+// #824 / §28.5 / §28.9: is `target` an `owned` heap-collection CLASS instance
+// field lvalue (OwnedArray<T>/OwnedStack<T>/OwnedQueue<T>/OwnedSet<T>/
+// OwnedLinkedList<T>/OwnedBuffer<T>/OwnedDictionary<T> etc.)? Classification
+// mirrors isClosureFieldLvalue: exclude locals, ref params, static fields;
+// require symbol to be a FieldSymbol of a Class. Only fields whose type passes
+// ownedCollectionFieldType (i.e. `owned` modifier + a collection builtin name)
+// are matched, so borrowed Array<T> fields and value-type slots are excluded.
+bool Emitter::isOwnedCollectionFieldLvalue(const ast::Expr& target) {
+    // Must be a pointer-typed location (collection pointer is a ptr).
+    if (localSlot(target)) return false;       // a plain local / parameter
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;  // a ref/out alias
+    }
+    if (staticFieldGlobal(target)) return false;  // program-lifetime storage
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    // Must be a class field (not a record field — records have no destructor
+    // that would auto-dispose it, §9.7).
+    if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return false;
+    // Must be an `owned` heap collection field per §28.5.
+    return ownedCollectionFieldType(fs) != nullptr;
+}
+
+
+// #824 / §28.5 / §28.9: dispose the prior value of an owned collection CLASS
+// field before storing the new pointer. Mirrors emitOwnedFieldDisposals for
+// the collection path: build the element disposer from elementPolicyFor, then
+// call bz_array_free or bz_llist_free on the old pointer.
+// bz_array_free / bz_llist_free are null-safe (no-op on null), so the first
+// assignment in a constructor (where the slot holds an uninitialized null
+// pointer) is correctly handled without an explicit null-guard — matching the
+// emitOwnedFieldDisposals comment at §2184.
+// Store-new BEFORE dispose-old (like lowerStringFieldStore retain-before-
+// release): the field points to the new value from the moment of the store, so
+// even if the disposal path is re-entrant (unlikely for collections, but
+// consistent), the field is never observed holding the old value after dispose.
+bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
+                                             llvm::Value* fieldAddr,
+                                             llvm::Value* newVal) {
+    if (!isOwnedCollectionFieldLvalue(target)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+
+    // Load the old collection pointer before overwriting it.
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "ocf.old");
+
+    // Store the new pointer — field now owns the new collection.
+    builder_.CreateStore(newVal, fieldAddr);
+
+    // Identify the collection element type and whether this is an owning family.
+    // Reuse the same logic as emitOwnedFieldDisposals (§2185-§2218).
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    const sema::TypeRef* collTy = fs ? ownedCollectionFieldType(fs) : nullptr;
+
+    const sema::TypeRef* collElem =
+        (collTy && !collTy->genericArgs.empty()) ? collTy->genericArgs[0]
+                                                 : nullptr;
+    bool collIsOwning =
+        collTy && collTy->astNode && collTy->astNode->name &&
+        !collTy->astNode->name->parts.empty() &&
+        collTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+
+    ElementPolicy pol = elementPolicyFor(collElem, collIsOwning);
+    llvm::Function* elemDisp = pol.disposerThunk;
+    // §28.11: borrowing Array/Stack/Queue<string> co-owns a +1 per element
+    // (retainRelease path); use the string-release thunk. Mirrors §2200-§2208.
+    if (!elemDisp && pol.cat == ElementPolicy::Category::RuntimeManaged &&
+            collElem &&
+            collElem->kind == sema::TypeRef::Kind::Primitive &&
+            collElem->primitive == sema::PrimitiveType::String &&
+            !collElem->nullable &&
+            collTy && collTy->astNode && collTy->astNode->name &&
+            !collTy->astNode->name->parts.empty() &&
+            [](std::string_view n){ return n == "Array" || n == "Stack" ||
+                n == "Queue"; }(collTy->astNode->name->parts[0]))
+        elemDisp = stringElementReleaseThunk();
+
+    llvm::Value* disp = elemDisp
+        ? llvm::cast<llvm::Value>(elemDisp)
+        : llvm::ConstantPointerNull::get(ptrTy());
+
+    // per §4.6/§4.7: LinkedList/OwnedLinkedList free via bz_llist_free.
+    bool isLL = collTy && isLinkedListTypeName(collTy);
+    const char* freeName = isLL ? "bz_llist_free" : "bz_array_free";
+    auto* freeFn = declareC(freeName,
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+    builder_.CreateCall(freeFn, {oldVal, disp});
+    return true;
+}
+
+
 namespace {
 // #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
 // SPECIFIC closure (function-typed) `var` local ever escapes its scope. A

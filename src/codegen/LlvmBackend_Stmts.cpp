@@ -230,7 +230,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 if (llvm::Value* arr =
                                         materializeHeapCollectionLiteral(cl,
                                                                          tRt)) {
-                                    builder_.CreateStore(arr, aaddr);
+                                    // #824 / §28.5 / §28.9: if target is an
+                                    // `owned` collection CLASS field, dispose the
+                                    // old collection before overwriting. Delegates
+                                    // to lowerOwnedCollectionFieldStore which does
+                                    // load-old / store-new / bz_array_free(old).
+                                    // For locals / borrowed fields / non-owned
+                                    // targets the helper returns false and we fall
+                                    // through to the plain store below.
+                                    if (!lowerOwnedCollectionFieldStore(
+                                            *as->target, aaddr, arr))
+                                        builder_.CreateStore(arr, aaddr);
                                     return false;  // handled
                                 }
                             }
@@ -352,6 +362,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerBoxFieldStore(*as->target, addr, rhs,
                                                  as->value.get());
+                // #824 / §28.5 / §28.9: a store into a CLASS `owned` collection
+                // field (OwnedArray<T>/OwnedStack<T>/OwnedQueue<T>/OwnedSet<T>/
+                // OwnedLinkedList<T>/OwnedBuffer<T>/OwnedDictionary<T> etc.)
+                // must dispose the old collection (and its owned elements) BEFORE
+                // overwriting the pointer. Without this the old pointer is lost
+                // and the old collection leaks. Mirrors the string/closure/box
+                // field-store family above; bz_array_free/bz_llist_free are
+                // null-safe so the first assignment (ctor-init, null old value)
+                // is handled correctly without an explicit guard.
+                if (!handled)
+                    handled = lowerOwnedCollectionFieldStore(*as->target, addr,
+                                                             rhs);
                 if (!handled) {
                     builder_.CreateStore(rhs, addr);
                     // §27.5 / #673: guarded-boxed (non-for-var) locals keep the
