@@ -361,6 +361,7 @@ set(BEZEL_TEST_SOURCES
     codegen/int_min_mod_neg_one_844_test.cpp
     codegen/unary_plus_overload_852_test.cpp
     codegen/generic_nullable_value_param_846_test.cpp
+    codegen/nullable_record_user_equality_848_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp

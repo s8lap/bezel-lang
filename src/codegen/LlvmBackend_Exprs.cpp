@@ -3496,6 +3496,65 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
 }
 
 
+// §8.4 (#848): null-safe `=`/`<>` for a record that overloads `operator =`/`<>`,
+// when at least one operand is nullable (`T?`) or the `null` literal. Per §8.4,
+// `null = null` is `true`, `null = nonNull` is `false`, and both-present invokes
+// the equality (here the user operator). The operator (declared on bare `T`) is
+// called ONLY on the both-present path — branch-guarded so it never runs on a
+// null/zero payload (a record with a reference-typed field would otherwise have
+// its comparison dereference a null field). The operator `opm` matches `bin.op`
+// (`operator =` for `=`, `operator <>` for `<>`); the not-both-present answer is
+// `both-null` for `=` and `exactly-one-null` for `<>`.
+llvm::Value* Emitter::lowerNullSafeRecordEquality(const ast::BinaryExpr& bin,
+                                                  sema::MethodSymbol* opm) {
+    struct Side { llvm::Value* has; llvm::Value* payload; };
+    auto eval = [&](const ast::Expr* e) -> Side {
+        if (dynamic_cast<const ast::NullLiteralExpr*>(e))
+            return {builder_.getFalse(), nullptr};  // payload filled once recTy known
+        llvm::Value* v = lowerExpr(*e);
+        if (!v) return {nullptr, nullptr};
+        const sema::TypeRef* t = ctx_.exprType(*e);
+        if (t && isNullableValueTy(t) && v->getType()->isStructTy())
+            return {nullablePrimHasValue(v), nullablePrimValue(v)};
+        return {builder_.getTrue(), v};  // a bare non-nullable record value
+    };
+    Side L = eval(bin.left.get());
+    Side R = eval(bin.right.get());
+    if (!L.has || !R.has) return nullptr;
+    llvm::Type* recTy = L.payload ? L.payload->getType()
+                      : R.payload ? R.payload->getType() : nullptr;
+    if (!recTy) return nullptr;  // both null literals — sema would not resolve opm
+    if (!L.payload) L.payload = llvm::Constant::getNullValue(recTy);
+    if (!R.payload) R.payload = llvm::Constant::getNullValue(recTy);
+
+    llvm::BasicBlock* entryBB = builder_.GetInsertBlock();
+    llvm::Function* fn = entryBB->getParent();
+    llvm::Value* bothPresent = builder_.CreateAnd(L.has, R.has, "eq.bothpr");
+    auto* callBB  = llvm::BasicBlock::Create(llvm_, "eq.op", fn);
+    auto* mergeBB = llvm::BasicBlock::Create(llvm_, "eq.merge", fn);
+    builder_.CreateCondBr(bothPresent, callBB, mergeBB);
+
+    builder_.SetInsertPoint(callBB);
+    std::vector<llvm::Value*> args{L.payload, R.payload};
+    llvm::Value* opres = emitMethodCall(opm, args, /*baseQualified=*/false);
+    if (!opres) return nullptr;
+    llvm::BasicBlock* callEnd = builder_.GetInsertBlock();  // emitMethodCall may split
+    builder_.CreateBr(mergeBB);
+
+    builder_.SetInsertPoint(mergeBB);
+    auto* present = builder_.CreatePHI(builder_.getInt1Ty(), 2, "eq.present");
+    present->addIncoming(builder_.getFalse(), entryBB);
+    present->addIncoming(opres, callEnd);
+    // Not-both-present answer: `=` → both-null; `<>` → exactly-one-null.
+    llvm::Value* tail =
+        (bin.op == "=")
+            ? builder_.CreateAnd(builder_.CreateNot(L.has),
+                                 builder_.CreateNot(R.has), "eq.bothnull")
+            : builder_.CreateXor(L.has, R.has, "eq.onenull");
+    return builder_.CreateOr(present, tail, "eq.nullsafe");
+}
+
+
 llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     if (!bin.left || !bin.right) return nullptr;
     // CG: short-circuit `and`/`or` (§17) — the right operand is
@@ -3513,6 +3572,23 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     if (auto* opm =
             dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(bin))) {
         if (opm->isOperator) {
+            // §8.4 (#848): a user `operator =`/`<>` on a record is invoked
+            // through the null-safe equality wrapper when either operand is a
+            // nullable `T?` or the `null` literal — both-null → equal, one-null
+            // → not-equal, both-present → the operator on the UNWRAPPED payloads.
+            // Without this the `{i8, T}` wrapper (or `ptr null`) was passed
+            // straight to the operator (which takes bare `T`) → malformed IR.
+            if (bin.op == "=" || bin.op == "<>") {
+                auto nullishOperand = [&](const ast::Expr* e) {
+                    if (!e) return false;
+                    if (dynamic_cast<const ast::NullLiteralExpr*>(e)) return true;
+                    const sema::TypeRef* t = ctx_.exprType(*e);
+                    return t && isNullableValueTy(t);
+                };
+                if (nullishOperand(bin.left.get()) ||
+                    nullishOperand(bin.right.get()))
+                    return lowerNullSafeRecordEquality(bin, opm);
+            }
             llvm::Value* ol = lowerExpr(*bin.left);
             llvm::Value* orr = lowerExpr(*bin.right);
             if (!ol || !orr) return nullptr;

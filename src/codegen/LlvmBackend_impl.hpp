@@ -5037,6 +5037,10 @@ private:
                                    const sema::TypeRef* fieldTy);
 
     llvm::Value* lowerBinary(const ast::BinaryExpr& bin);
+    // §8.4 (#848): null-safe `=`/`<>` for a record overloading `operator =`/`<>`
+    // when an operand is nullable (`T?`) or the `null` literal.
+    llvm::Value* lowerNullSafeRecordEquality(const ast::BinaryExpr& bin,
+                                             sema::MethodSymbol* opm);
 
     // CG: short-circuit `and`/`or` via a branch + phi — the right operand
     // runs only on the deciding path (§17 logical operators).
