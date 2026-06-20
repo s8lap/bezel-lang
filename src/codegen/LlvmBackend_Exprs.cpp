@@ -8488,6 +8488,64 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
 
+    // #836 / §19.3: a pattern CONSTANT or range/relop BOUND expression usually
+    // has no resolved sema exprType (pattern exprs are not value-typechecked the
+    // way ordinary expressions are), so its literal lowers at the DEFAULT width —
+    // i32 for an integer literal, double for a float literal — regardless of the
+    // scrutinee's actual width. Comparing such a value against a scrutinee of a
+    // different width (a `long`/`ulong` i64, a `short`/`ushort` i16, an
+    // `sbyte`/`byte` i8, or a `float` f32) made CreateICmp*/CreateFCmp* assert on
+    // mismatched operand types — a hard compiler abort. `reconcile` brings a
+    // pattern value to the scrutinee's LLVM type before the comparison: integer
+    // trunc / (z|s)ext by the scrutinee's signedness, FP ext/trunc.
+    bool scrutUnsigned = scrutTy &&
+                         scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                         isUnsignedPrim(scrutTy->primitive);
+    auto reconcile = [&](llvm::Value* v, llvm::Type* targetTy) -> llvm::Value* {
+        if (!v || !targetTy) return v;
+        llvm::Type* st = v->getType();
+        if (st == targetTy) return v;
+        if (st->isIntegerTy() && !st->isIntegerTy(1) &&
+            targetTy->isIntegerTy() && !targetTy->isIntegerTy(1)) {
+            unsigned sw = st->getIntegerBitWidth();
+            unsigned tw = targetTy->getIntegerBitWidth();
+            if (sw == tw) return v;
+            if (sw > tw) return builder_.CreateTrunc(v, targetTy);
+            return scrutUnsigned ? builder_.CreateZExt(v, targetTy)
+                                 : builder_.CreateSExt(v, targetTy);
+        }
+        if (st->isFloatingPointTy() && targetTy->isFloatingPointTy()) {
+            unsigned sw = st->getPrimitiveSizeInBits();
+            unsigned tw = targetTy->getPrimitiveSizeInBits();
+            if (sw < tw) return builder_.CreateFPExt(v, targetTy);
+            if (sw > tw) return builder_.CreateFPTrunc(v, targetTy);
+        }
+        return v;
+    };
+    // #836: lower an integer-literal pattern constant DIRECTLY at the
+    // scrutinee's width. The general lowerExpr path defaults an untyped integer
+    // literal to i32 and builds the ConstantInt at that width, which TRUNCATES a
+    // value exceeding i32 (e.g. a `long` constant `5000000000L`, or a `ulong`
+    // constant above 2^63) before `reconcile` could widen it — yielding a wrong
+    // match. Building the constant at the target width up front preserves the
+    // full value. Returns null for any expr that is not an integer literal (or a
+    // negated one), so the caller falls back to lowerExpr + reconcile.
+    auto litAtWidth = [&](const ast::Expr& c,
+                          llvm::Type* wantTy) -> llvm::Value* {
+        if (!wantTy || !wantTy->isIntegerTy() || wantTy->isIntegerTy(1))
+            return nullptr;
+        const ast::Expr* e = &c;
+        bool neg = false;
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e))
+            if (un->op == "-" && un->operand) { neg = true; e = un->operand.get(); }
+        auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(e);
+        if (!lit) return nullptr;
+        std::uint64_t mag =
+            static_cast<std::uint64_t>(parseIntLiteral(lit->text));
+        std::uint64_t bits = neg ? (static_cast<std::uint64_t>(0) - mag) : mag;
+        return llvm::ConstantInt::get(wantTy, bits, /*isSigned=*/true);
+    };
+
     // §7 / §19 / issues #447 + #448: a nullable VALUE type scrutinee is a
     // tagged {i8 hasValue; T value} struct, NOT a pointer. All pointer-based
     // pattern tests (null-check via ConstantPointerNull, emitEquals on the
@@ -8525,7 +8583,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             llvm::Value* any = builder_.getInt1(false);
             for (const auto& c : cp->constants) {
                 if (!c) continue;
-                llvm::Value* cv = lowerExpr(*c);
+                llvm::Value* cv = litAtWidth(*c, innerVal->getType());  // #836
+                if (!cv) cv = reconcile(lowerExpr(*c), innerVal->getType());
                 if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
                 if (!cv) return nullptr;
                 llvm::Value* eq = emitEquals(innerVal, cv, /*isStr=*/false);
@@ -8557,20 +8616,28 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 bool fp = innerVal->getType()->isFloatingPointTy();
                 llvm::Value* geL = builder_.getInt1(true);
                 if (range->lo) {
-                    llvm::Value* lo = lowerExpr(*range->lo);
+                    llvm::Value* lo = litAtWidth(*range->lo, innerVal->getType());
+                    if (!lo) lo = reconcile(lowerExpr(*range->lo),
+                                            innerVal->getType());  // #836
                     if (!lo) return nullptr;
                     geL = fp ? builder_.CreateFCmpOGE(innerVal, lo)
-                             : builder_.CreateICmpSGE(innerVal, lo);
+                             : (scrutUnsigned ? builder_.CreateICmpUGE(innerVal, lo)
+                                              : builder_.CreateICmpSGE(innerVal, lo));
                 }
                 llvm::Value* leH = builder_.getInt1(true);
                 if (range->hi) {
-                    llvm::Value* hi = lowerExpr(*range->hi);
+                    llvm::Value* hi = litAtWidth(*range->hi, innerVal->getType());
+                    if (!hi) hi = reconcile(lowerExpr(*range->hi),
+                                            innerVal->getType());  // #836
                     if (!hi) return nullptr;
                     leH = fp
                         ? (range->inclusive ? builder_.CreateFCmpOLE(innerVal, hi)
                                             : builder_.CreateFCmpOLT(innerVal, hi))
-                        : (range->inclusive ? builder_.CreateICmpSLE(innerVal, hi)
-                                            : builder_.CreateICmpSLT(innerVal, hi));
+                        : (range->inclusive
+                               ? (scrutUnsigned ? builder_.CreateICmpULE(innerVal, hi)
+                                                : builder_.CreateICmpSLE(innerVal, hi))
+                               : (scrutUnsigned ? builder_.CreateICmpULT(innerVal, hi)
+                                                : builder_.CreateICmpSLT(innerVal, hi)));
                 }
                 llvm::Value* inRange = builder_.CreateAnd(geL, leH);
                 return builder_.CreateAnd(hasVal, inRange, "nv.range.match");
@@ -8648,33 +8715,45 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         llvm::Value* any = builder_.getInt1(false);
         for (const auto& c : cp->constants) {
             if (!c) continue;
-            llvm::Value* cv = lowerExpr(*c);
+            // #836: lower an integer-literal constant at the scrutinee's width
+            // up front (avoids the default-i32 truncation of a wide value).
+            llvm::Value* cv = isStr ? nullptr : litAtWidth(*c, scrut->getType());
+            if (!cv) cv = lowerExpr(*c);
             // CG43: an enum-constant alternative (`E.Red`, `E.Green`) has
             // no resolved symbol on the pattern expression, so lowerExpr
             // misses; resolve it by name against the scrutinee's enum.
             if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
             if (!cv) return nullptr;
+            // #836: reconcile a non-literal constant's width to the scrutinee
+            // (no-op for string / enum / already-matching types).
+            if (!isStr) cv = reconcile(cv, scrut->getType());
             // CG27b: string scrutinee → content comparison (not ptr cmp).
             any = builder_.CreateOr(any, emitEquals(scrut, cv, isStr));
         }
         return any;
     }
     if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(pat)) {
-        llvm::Value* rv = rp->expr ? lowerExpr(*rp->expr) : nullptr;
+        llvm::Value* rv =
+            rp->expr ? litAtWidth(*rp->expr, scrut->getType()) : nullptr;  // #836
+        if (!rv && rp->expr) rv = reconcile(lowerExpr(*rp->expr), scrut->getType());
         if (!rv) return nullptr;
         bool fp = scrut->getType()->isFloatingPointTy();
         if (rp->op == "<")
             return fp ? builder_.CreateFCmpOLT(scrut, rv)
-                      : builder_.CreateICmpSLT(scrut, rv);
+                      : (scrutUnsigned ? builder_.CreateICmpULT(scrut, rv)
+                                       : builder_.CreateICmpSLT(scrut, rv));
         if (rp->op == ">")
             return fp ? builder_.CreateFCmpOGT(scrut, rv)
-                      : builder_.CreateICmpSGT(scrut, rv);
+                      : (scrutUnsigned ? builder_.CreateICmpUGT(scrut, rv)
+                                       : builder_.CreateICmpSGT(scrut, rv));
         if (rp->op == "<=")
             return fp ? builder_.CreateFCmpOLE(scrut, rv)
-                      : builder_.CreateICmpSLE(scrut, rv);
+                      : (scrutUnsigned ? builder_.CreateICmpULE(scrut, rv)
+                                       : builder_.CreateICmpSLE(scrut, rv));
         if (rp->op == ">=")
             return fp ? builder_.CreateFCmpOGE(scrut, rv)
-                      : builder_.CreateICmpSGE(scrut, rv);
+                      : (scrutUnsigned ? builder_.CreateICmpUGE(scrut, rv)
+                                       : builder_.CreateICmpSGE(scrut, rv));
     }
     // §19: range patterns `lo..hi` and `lo..<hi` — same semantics as
     // the `in` operator but in a case arm. The pattern matches when
@@ -8692,20 +8771,26 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // §19.3: range patterns — use FP comparisons for float scrutinees.
             llvm::Value* geL = builder_.getInt1(true);
             if (range->lo) {
-                llvm::Value* lo = lowerExpr(*range->lo);
+                llvm::Value* lo = litAtWidth(*range->lo, scrut->getType());  // #836
+                if (!lo) lo = reconcile(lowerExpr(*range->lo), scrut->getType());
                 if (!lo) return nullptr;
                 geL = fp ? builder_.CreateFCmpOGE(scrut, lo)
-                         : builder_.CreateICmpSGE(scrut, lo);
+                         : (scrutUnsigned ? builder_.CreateICmpUGE(scrut, lo)
+                                          : builder_.CreateICmpSGE(scrut, lo));
             }
             llvm::Value* leH = builder_.getInt1(true);
             if (range->hi) {
-                llvm::Value* hi = lowerExpr(*range->hi);
+                llvm::Value* hi = litAtWidth(*range->hi, scrut->getType());  // #836
+                if (!hi) hi = reconcile(lowerExpr(*range->hi), scrut->getType());
                 if (!hi) return nullptr;
                 leH = fp
                     ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
                                         : builder_.CreateFCmpOLT(scrut, hi))
-                    : (range->inclusive ? builder_.CreateICmpSLE(scrut, hi)
-                                        : builder_.CreateICmpSLT(scrut, hi));
+                    : (range->inclusive
+                           ? (scrutUnsigned ? builder_.CreateICmpULE(scrut, hi)
+                                            : builder_.CreateICmpSLE(scrut, hi))
+                           : (scrutUnsigned ? builder_.CreateICmpULT(scrut, hi)
+                                            : builder_.CreateICmpSLT(scrut, hi)));
             }
             return builder_.CreateAnd(geL, leH);
         }
