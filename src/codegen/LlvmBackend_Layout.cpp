@@ -2588,11 +2588,28 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                     newSema[td->genericParams[gi].name] =
                         resolveTypeParamRef(targetTy->genericArgs[gi]);
                 }
-                // If any resolved type is i32 (unresolved generic fallback),
+                // If any generic ARG is genuinely an unresolved type parameter,
                 // try looking up the local's stored concrete substitution.
+                // #828: detect this from the SEMA arg (a bare single-part Named
+                // ref with no declaration — an actual type parameter), NOT from
+                // the lowered LLVM type being i32. A concrete `int` arg also
+                // lowers to i32, so the old `ty == i32()` test misfired on a
+                // nested `Box<Box<int>>` / `Box<int>`: it read the inner instance's
+                // legitimate `T = int` as "unresolved" and overrode it with the
+                // OUTER local's substitution (`T → ptr`), loading the inner field
+                // at ptr width (ret-ptr-vs-i32 IR_FAIL / a cast-assertion abort).
                 bool hasUnresolved = false;
-                for (auto& [n, ty] : newSubst)
-                    if (ty == i32()) { hasUnresolved = true; break; }
+                for (std::size_t gi = 0;
+                     gi < td->genericParams.size(); ++gi) {
+                    const sema::TypeRef* arg = targetTy->genericArgs[gi];
+                    if (arg && arg->kind == sema::TypeRef::Kind::Named &&
+                        !arg->declaration && arg->astNode &&
+                        arg->astNode->name &&
+                        arg->astNode->name->parts.size() == 1) {
+                        hasUnresolved = true;
+                        break;
+                    }
+                }
                 if (hasUnresolved) {
                     // Chase through PostfixBangExpr/MemberAccessExpr to
                     // find the root local variable (e.g. root._left!._val
