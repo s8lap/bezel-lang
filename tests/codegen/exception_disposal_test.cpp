@@ -1245,4 +1245,61 @@ BEZEL_TEST(codegen_excdisp_831, owned_array_try_pop_empty_false_no_corruption) {
     expectExitAndLeakFree(kArrTryPopEmptyThenScopeEnd, 1);
 }
 
+// --------------------------------------------------------------------------
+// [837] §4.10 / §8.3 — OwnedSet<T> deduplicates a class element by the user's
+// Equals; the rejected duplicate is disposed exactly once and the retained
+// elements are disposed at scope-end. Verifies the dedup-dispose path is
+// ownership-correct (no leak, no double-free), not merely that the count is
+// right.
+// --------------------------------------------------------------------------
+
+// Add the same logical Box(1) twice + a distinct Box(2): the duplicate is
+// disposed on the second Add, the two retained are disposed at scope-end → 3.
+const char* kSetAddDupDisposed =
+    "module M; "
+    "class Box public static count: int := 0; public X: int; "
+    "  public constructor(x: int) X := x; end constructor; "
+    "  destructor Box.count := Box.count + 1; end destructor; "
+    "  public override method Equals(other: Object?): bool "
+    "    if other is Box then var b := other as Box; return b!.X = X; end; "
+    "    return false; end Equals; "
+    "  public override method GetHashCode(): int => X; end Box; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var s := new OwnedSet<Box>(); "
+    "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
+    "    s.Add(move (new Box(1))); "
+    "  end; "
+    "  return Box.count; "                // 3
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_837, owned_set_add_duplicate_disposed_once) {
+    expectExitAndLeakFree(kSetAddDupDisposed, 3);
+}
+
+// Same invariant via TryAdd: the rejected duplicate is disposed once.
+const char* kSetTryAddDupDisposed =
+    "module M; "
+    "class Box public static count: int := 0; public X: int; "
+    "  public constructor(x: int) X := x; end constructor; "
+    "  destructor Box.count := Box.count + 1; end destructor; "
+    "  public override method Equals(other: Object?): bool "
+    "    if other is Box then var b := other as Box; return b!.X = X; end; "
+    "    return false; end Equals; "
+    "  public override method GetHashCode(): int => X; end Box; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var s := new OwnedSet<Box>(); "
+    "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
+    "    var r := s.TryAdd(move (new Box(1))); "
+    "  end; "
+    "  return Box.count; "                // 3
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_837, owned_set_tryadd_duplicate_disposed_once) {
+    expectExitAndLeakFree(kSetTryAddDupDisposed, 3);
+}
+
 }  // namespace

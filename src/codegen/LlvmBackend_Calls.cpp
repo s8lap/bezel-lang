@@ -2708,6 +2708,71 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         };
 
         // .Add(v) / .Push(v) / .Enqueue(v)
+        // stdlib §4.10 / §8.3 (#837): OwnedSet<T>.Add(owned item) for class-typed
+        // T DEDUPLICATES — on a duplicate (per T's equality contract, honouring a
+        // user `Equals` override) it silently disposes the passed item rather than
+        // appending. The generic array Add below just appends, which on a set is a
+        // wrong-Count / duplicate-membership bug. Mirrors the TryAdd scan but
+        // returns unit. Gated to OwnedSet (OwnedArray.Add must still append).
+        {
+            bool isOwnedSetRecv = recvTy && recvTy->astNode &&
+                recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+                recvTy->astNode->name->parts[0] == "OwnedSet";
+            if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
+                isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* arrLen =
+                    builder_.CreateCall(lenFn, {recv}, "sa.len");
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.b", currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "sa.n", currentFn_);
+                auto* dupBB  = llvm::BasicBlock::Create(llvm_, "sa.dup", currentFn_);
+                auto* newBB  = llvm::BasicBlock::Create(llvm_, "sa.new", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end", currentFn_);
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* curIdx = builder_.CreateLoad(i64(), idxSlot, "sa.i");
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(curIdx, arrLen), bodyBB, newBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                       {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(
+                    ptrFn, {recv, curIdx, builder_.getInt64(esz)}, "sa.ep");
+                llvm::Value* existing =
+                    builder_.CreateLoad(ptrTy(), ep, "sa.ex");
+                llvm::Value* same = emitRemoveElementEquality(
+                    existing, item, recvTy->genericArgs[0], /*elemIsClass=*/true);
+                if (!same) return nullptr;
+                builder_.CreateCondBr(same, dupBB, nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(
+                    builder_.CreateAdd(curIdx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                // duplicate: dispose the passed item (§4.10), do not append.
+                builder_.SetInsertPoint(dupBB);
+                if (arrElemPol.disposerThunk)
+                    builder_.CreateCall(arrElemPol.disposerThunk, {item});
+                builder_.CreateBr(endBB);
+                // new: append.
+                builder_.SetInsertPoint(newBB);
+                {
+                    llvm::AllocaInst* slot = entryAlloca(item->getType());
+                    builder_.CreateStore(item, slot);
+                    auto* addFn = declareC("bz_array_add",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+                    builder_.CreateCall(addFn,
+                        {recv, slot, builder_.getInt64(esz)});
+                }
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+                return llvm::ConstantInt::get(i32(), 0);  // unit
+            }
+        }
         if ((m == "Add" || m == "Push" || m == "Enqueue") &&
             call.args.size() == 1 && call.args[0].value) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
@@ -2744,11 +2809,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // fix #654-tail B / stdlib §4.10: OwnedSet<T>.TryAdd(owned item): bool
         // for class-typed T (array-backed path — class elements are ineligible
         // for the dict-backed set path since genericBackingType returns null for
-        // class types).  Equality for class T is reference identity (§8.3).
-        // Semantics: scan the array for an element with the same pointer; if not
-        // found, append and return true; if found, dispose the passed item
-        // (caller transferred ownership; §4.10 "on false, the item is disposed")
-        // and return false.
+        // class types). Equality for class T follows §8.3: a user `Equals`
+        // override is honoured (#837), otherwise reference identity.
+        // Semantics: scan the array for an EQUAL element; if not found, append
+        // and return true; if found, dispose the passed item (caller transferred
+        // ownership; §4.10 "on false, the item is disposed") and return false.
         if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value &&
             arrElemIsClass && arrIsOwning) {
             llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -2778,8 +2843,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* ep = builder_.CreateCall(
                 ptrFn, {recv, curIdx, builder_.getInt64(esz)}, "ta.ep");
             llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "ta.ex");
-            builder_.CreateCondBr(
-                builder_.CreateICmpEQ(existing, item, "ta.same"), foundBB, nextBB);
+            // §8.3 / §4.10 (#837): match by the element's equality contract — a
+            // user `Equals` override is dispatched (so a content-equal element is
+            // a duplicate), else reference identity (the §8.3 class default).
+            llvm::Value* same = emitRemoveElementEquality(
+                existing, item, recvTy->genericArgs[0], /*elemIsClass=*/true);
+            if (!same) return nullptr;
+            builder_.CreateCondBr(same, foundBB, nextBB);
             // nextBB: advance index, loop back.
             builder_.SetInsertPoint(nextBB);
             builder_.CreateStore(
