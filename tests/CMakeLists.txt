@@ -373,6 +373,7 @@ set(BEZEL_TEST_SOURCES
     codegen/float_to_int_truncation_858_test.cpp
     codegen/enum_cast_range_859_test.cpp
     codegen/nested_catch_rethrow_866_test.cpp
+    codegen/nested_owning_collection_dispose_868_test.cpp
     codegen/owned_collection_field_reassign_824_test.cpp
     codegen/generic_nullable_peel_850_test.cpp
     codegen/closure_loop_capture_823_test.cpp

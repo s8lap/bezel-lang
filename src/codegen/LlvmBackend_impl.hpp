@@ -816,6 +816,10 @@ private:
     // §2.11 (#838): bz_subscription_dispose thunk for OwnedArray<Subscription>
     // (and other owning collections) element disposal.
     llvm::Function* subscriptionDisposeThunk_ = nullptr;
+    // §28.11 (#868): per-element-collection-type thunks for nested owning
+    // collections (e.g. OwnedArray<OwnedArray<R>>). Keyed by the TypeRef* of
+    // the inner collection element type (unique per sema type).
+    std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -3213,6 +3217,11 @@ private:
     llvm::Function* weakReleaseThunk();
     llvm::Function* groupingFreeThunk(); // stdlib §5 (#651): IGrouping disposal
     llvm::Function* subscriptionDisposeThunk(); // §2.11 (#838): Subscription elem
+    // §28.11 (#868): void(void*) thunk that calls the right free fn on a nested
+    // builtin owning collection element (e.g. the OwnedArray<R> inside an
+    // OwnedArray<OwnedArray<R>>). Recursively resolves the inner element's
+    // disposer via elementPolicyFor. Cached per element-collection TypeRef*.
+    llvm::Function* nestedCollectionDisposerThunk(const sema::TypeRef* elemCollTy);
 
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the

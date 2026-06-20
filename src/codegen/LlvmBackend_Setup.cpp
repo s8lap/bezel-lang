@@ -3094,6 +3094,107 @@ llvm::Function* Emitter::subscriptionDisposeThunk() {
     return fn;
 }
 
+// §28.11 (#868): void(void*) thunk that frees a nested builtin owning collection
+// element (e.g. the OwnedArray<R> inside an OwnedArray<OwnedArray<R>>) by calling
+// the right runtime free fn with the recursive inner-element disposer.
+// Mirrors sharedReleaseThunk / groupingFreeThunk in shape: own IRBuilder, null
+// check, call free fn, return void. Cached per inner element-collection TypeRef*.
+//
+// Free fn selection (mirrors emitOwnedFieldDisposals / emitDisposals):
+//   OwnedArray / OwnedStack / OwnedQueue  → bz_array_free(ptr, innerDisposer)
+//   OwnedLinkedList                       → bz_llist_free(ptr, innerDisposer)
+//   OwnedDictionary                       → bz_dict_free(ptr, innerValueDisposer)
+//     (OwnedDictionary<K,V> owns its V elements; genericArgs[1] is V)
+//   OwnedSet / OwnedBuffer                → bz_array_free(ptr, null)
+//     (OwnedSet stores elements as dict keys — element disposal for OwnedSet<class>
+//     is not supported via the nested-thunk path; a separate fix is needed. For now
+//     the set backing is freed without cascading into class elements, same as before.)
+//
+// The recursion terminates: each level peels one collection layer; eventually the
+// inner element is a class R → elementDisposerThunk, or a plain value → null.
+llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elemCollTy) {
+    // Cache hit.
+    auto it = nestedCollectionDisposerThunks_.find(elemCollTy);
+    if (it != nestedCollectionDisposerThunks_.end()) return it->second;
+
+    // Determine the inner element type and free fn name from the collection's
+    // kind (using the same name-detection as isCollectionTypeName /
+    // isLinkedListTypeName / isDictTypeName, per §28.11 #868).
+    std::string_view collName;
+    if (elemCollTy && elemCollTy->kind == sema::TypeRef::Kind::Named &&
+        !elemCollTy->declaration &&
+        elemCollTy->astNode && elemCollTy->astNode->name &&
+        !elemCollTy->astNode->name->parts.empty())
+        collName = elemCollTy->astNode->name->parts[0];
+
+    bool isLL   = (collName == "OwnedLinkedList");
+    bool isDict = (collName == "OwnedDictionary");
+
+    const char* freeName = isLL ? "bz_llist_free"
+                         : isDict ? "bz_dict_free"
+                         : "bz_array_free";
+
+    // Resolve the inner element type (the thing the inner collection owns):
+    //   OwnedArray/Stack/Queue/LinkedList/Buffer → genericArgs[0]
+    //   OwnedDictionary                          → genericArgs[1] (the value)
+    //   OwnedSet                                 → null (no disposable value slot)
+    const sema::TypeRef* innerElem = nullptr;
+    if (elemCollTy && !isDict && collName != "OwnedSet") {
+        innerElem = (!elemCollTy->genericArgs.empty()) ? elemCollTy->genericArgs[0]
+                                                       : nullptr;
+    } else if (isDict) {
+        innerElem = (elemCollTy->genericArgs.size() > 1) ? elemCollTy->genericArgs[1]
+                                                         : nullptr;
+    }
+
+    // Recursively get the inner element's disposer (elementPolicyFor does its
+    // own caching / base cases, including further nested-collection detection).
+    llvm::Function* innerDisposer =
+        elementPolicyFor(innerElem, /*owningFamily=*/true).disposerThunk;
+
+    // Build the thunk: void(void* innerCollPtr) { if(!ptr) return;
+    //                                              freeFn(ptr, innerDisposer); }
+    // Uses its own IRBuilder so `builder_` insert point is untouched.
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    // Name the thunk after the collection kind for debuggability.
+    std::string thunkName = std::string("bz$nestedFree$") + std::string(collName);
+    // Make unique if same collection name appears multiple times (shouldn't, but
+    // guard against symbol clash if two OwnedArray<R1> and OwnedArray<R2> both
+    // need a thunk — give each its own symbol via the cache key pointer).
+    if (module_->getFunction(thunkName)) {
+        thunkName += "$" + std::to_string(
+            reinterpret_cast<std::uintptr_t>(elemCollTy));
+    }
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      thunkName, module_.get());
+    llvm::Argument* ptr = &*fn->args().begin();
+    auto* entry  = llvm::BasicBlock::Create(llvm_, "entry",    fn);
+    auto* freeBB = llvm::BasicBlock::Create(llvm_, "coll.free", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "coll.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    // Null-guard: bz_array_free/bz_llist_free/bz_dict_free are null-safe but
+    // check here anyway (mirrors sharedReleaseThunk pattern).
+    b.CreateCondBr(
+        b.CreateICmpEQ(ptr, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, freeBB);
+    b.SetInsertPoint(freeBB);
+    llvm::Value* innerDispArg = innerDisposer
+        ? llvm::cast<llvm::Value>(innerDisposer)
+        : llvm::ConstantPointerNull::get(ptrTy());
+    auto* freeFn = declareC(freeName,
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+    b.CreateCall(freeFn, {ptr, innerDispArg});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+
+    nestedCollectionDisposerThunks_[elemCollTy] = fn;
+    return fn;
+}
+
+
 bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     // fix #619 / §28.11 v0.135 / §14.4: the §28.11 table's owned/borrow column
     // applies to "class / interface type" — both class AND interface elements are

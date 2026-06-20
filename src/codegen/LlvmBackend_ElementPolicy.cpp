@@ -133,6 +133,45 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
             /*retainRelease=*/false
         };
     }
+    // §28.11 (#868): builtin OWNING-collection element types (OwnedArray<R> etc.
+    // as elements of an outer collection). These have declaration==nullptr
+    // (compiler-known builtins, same as Shared/Weak/IGrouping/Subscription) so
+    // they fall past the declaration-based class check below → were silently
+    // treated as plain Value → inner collection never freed → leak.
+    // Detect by name prefix and route to nestedCollectionDisposerThunk for the
+    // owning-family (outer collection owns the inner), or ClassBorrow for the
+    // borrowing-family (outer borrows inner — must NOT dispose it, or double-free).
+    auto isOwningBuiltinCollection = [](const sema::TypeRef* t) {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        if (t->declaration) return false;
+        if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+            return false;
+        std::string_view n = t->astNode->name->parts[0];
+        return n == "OwnedArray" || n == "OwnedStack" || n == "OwnedQueue" ||
+               n == "OwnedLinkedList" || n == "OwnedDictionary" || n == "OwnedSet";
+    };
+    if (isOwningBuiltinCollection(elemTy)) {
+        if (owningFamily) {
+            // per §28.11, #868: owned slot — the inner collection must be freed
+            // via its own runtime free fn + inner element disposer (recursive).
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                nestedCollectionDisposerThunk(elemTy),
+                /*retainRelease=*/false
+            };
+        } else {
+            // per §28.11, #868: borrowing outer collection — must NOT dispose the
+            // inner collections (they are owned elsewhere); borrow-only slot.
+            return ElementPolicy{
+                ElementPolicy::Category::ClassBorrow,
+                ptrTy(),
+                /*disposerThunk=*/nullptr,
+                /*retainRelease=*/false
+            };
+        }
+    }
+
     bool isSharedWeakElem = isSharedOrWeak(elemTy);
     // Distinguish Shared vs Weak for per-element release thunk selection.
     auto isWeakElem = [](const sema::TypeRef* t) {
