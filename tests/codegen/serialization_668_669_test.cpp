@@ -355,8 +355,9 @@ BEZEL_TEST(codegen_serialization_669,
         "    using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "    using var p2 := Parent.Deserialize(d); "
         "    if p2.Tag <> 7 then return 91; end; "
-        "    if p2.OptChild = null then return 92; end; "
-        "    return (42 if p2.OptChild.V = 99 else 93); "
+        "    var oc := p2.OptChild; "
+        "    if oc = null then return 92; end; "
+        "    return (42 if oc.V = 99 else 93); "
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(compileAndRun668(src), 42);

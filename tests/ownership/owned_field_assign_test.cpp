@@ -241,15 +241,16 @@ BEZEL_TEST(owned_field_assign, owned_returning_call_into_owned_field_accepted) {
 // permitted — `null` has no value to own and is compatible with an owned
 // target (the field enters the owned-currently-null state). ACCEPTED. This
 // guards against a too-broad rule that rejects every non-`new`/non-`move` RHS.
+// per §7.4 (#862): the null check uses the null-conditional `?.Dispose()` form
+// (§7.5) because fields are not narrowable — the direct `this._c.Dispose()`
+// inside `if this._c <> null then` is a §7.4 compile error.
 BEZEL_TEST(owned_field_assign, null_into_nullable_owned_field_accepted) {
     auto r = parseAndCheckOwnership(std::string("module M; "
         "class Inner end Inner; "
         "class Wrap "
         "  private owned _c: Inner? := new Inner(); "
         "  public method Clear() "
-        "    if this._c <> null then "
-        "      this._c.Dispose(); "
-        "    end; "
+        "    this._c?.Dispose(); "
         "    this._c := null; "
         "  end Clear; "
         "end Wrap;"));

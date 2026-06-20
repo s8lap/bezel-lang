@@ -4336,25 +4336,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 checkEventVisibilityFence(es, ma.member, ma.span.begin);
         }
     }
-    // §7.4 (issue #418): member access (and method calls) on a NULLABLE value is
-    // a compile error unless the compiler has narrowed it to non-null. This gate
-    // is SCOPED TO SIMPLE VARIABLES — bare locals and parameters — exactly the
-    // operands the compiler narrows (§7.4 "Narrowing applies to locals only").
-    // Non-null knowledge comes from: a null guard (`if x <> null` / `is not
-    // null` then-block, `if x = null` else-block, an early-return `= null`
-    // guard), an assignment of a non-null value, a §12.7 type-narrowing, and the
-    // all-paths join of an if (see the IfStmt handler). The safe forms stay
-    // legal because they never reach this check with a bare-variable target:
-    // `x?.M` (§7.5) is a distinct AST node (NullCondMemberExpr); `x!.M` (§7.8)
-    // has a PostfixBangExpr (non-variable) target.
+    // §7.4 (issues #418, #862): member access (and method calls) on a NULLABLE
+    // value is a compile error unless the compiler has narrowed it to non-null.
+    // The compiler narrows only local variables — never fields or properties
+    // (§7.4 "Narrowing applies to locals only"). Two sub-cases are enforced:
     //
-    // DEFERRED (see issue #418 / §7.4): a NULLABLE FIELD or property access
-    // (`this._c.M`, `obj.Field.M`) is NOT gated here. §7.4 resolves that case
-    // only by copying the field to a local first (fields are un-narrowable for
-    // the TOCTOU reason §7.4 states); enforcing it would reject the existing
-    // field-guard idiom wholesale without a narrowing path to the guarded form.
-    // The original unsoundness (#416) for the common simple-variable case is
-    // closed; the field case remains a documented gap.
+    // (a) SIMPLE VARIABLE (bare local or parameter IdentifierExpr): gated via
+    //     `nullNarrowed_` / `narrowings_`. Safe forms are already non-nullable
+    //     at this point: `x?.M` (§7.5) is a NullCondMemberExpr node;
+    //     `x!.M` (§7.8) has a PostfixBangExpr target whose exprType is
+    //     non-nullable.
+    //
+    // (b) FIELD, PROPERTY, or any other non-narrowable expression: the target's
+    //     resolved exprType (set by a prior MemberAccess visit) is nullable.
+    //     Fields are NEVER narrowable (TOCTOU hazard); the standard fix is to
+    //     copy the field to a local first — `var copy := field; if copy <> null`.
+    //     Bare-identifier field references (`_name.Length` where `_name` is an
+    //     implicit-this field, exprType not set for the IdentifierExpr itself)
+    //     are handled via the FieldSymbol / PropertySymbol declared type.
     if (ma.target) {
         if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                 ma.target.get())) {
@@ -4384,6 +4383,56 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         std::string(ma.member) + "`");
                     return;
                 }
+                // per §7.4 (#862): a bare identifier resolving to a FIELD or
+                // PROPERTY is never narrowable — fields can be reassigned by
+                // another thread between the null check and the use (TOCTOU).
+                // Copy the field to a local first and narrow the local.
+                if (!isSimpleVar && tsym) {
+                    TypeRef* fieldType = nullptr;
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(tsym)) {
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (fd && fd->type)
+                            fieldType = ctx_.resolvedType(*fd->type);
+                        else if (fs->posParam && fs->posParam->type)
+                            fieldType = ctx_.resolvedType(*fs->posParam->type);
+                    } else if (auto* ps = dynamic_cast<PropertySymbol*>(tsym)) {
+                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                        if (pd && pd->type)
+                            fieldType = ctx_.resolvedType(*pd->type);
+                    }
+                    if (fieldType && fieldType->nullable) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("member access `.") +
+                            std::string(ma.member) +
+                            "` on nullable field `" +
+                            std::string(tid->name) +
+                            "` requires a local copy first (§7.4): "
+                            "fields are not narrowable — copy to a local "
+                            "with `var tmp := " +
+                            std::string(tid->name) +
+                            "` and guard the local");
+                        return;
+                    }
+                }
+            }
+        } else if (dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
+            // per §7.4 (#862): the target is itself a member access (a field or
+            // property read, e.g. `obj.Field.Member`). Fields and properties are
+            // never narrowable — copy to a local first and narrow the local.
+            // `x!.M` (PostfixBangExpr) and `x?.M` (NullCondMemberExpr) are
+            // already non-nullable at this point, so they don't reach this branch.
+            TypeRef* tgt = ctx_.exprType(*ma.target);
+            if (tgt && tgt->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("member access `.") +
+                    std::string(ma.member) +
+                    "` on a nullable field or property requires narrowing to "
+                    "non-null first (§7.4): copy the nullable value to a "
+                    "local variable and guard with `<> null`, "
+                    "force-unwrap with `!`, or use `?.`");
+                return;
             }
         }
     }
