@@ -1496,6 +1496,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
         llvm::Value* savedCaught = currentCaughtExc_;
         std::string_view savedCaughtName = currentCaughtName_;
+        llvm::BasicBlock* savedArmTarget = caughtExcArmTarget_;
         currentCaughtExc_ = exc;
         // #387 / §31.1: the name (if any) this arm binds the caught exception
         // to, so a `throw <newExpr>` from the body can tell whether the new
@@ -1529,6 +1530,15 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // An exception thrown by the arm body must still run finally.
         if (hasFin) { unwindTarget_ = finUnwindBB; unwindScopeDepth_ =
                           disposeStack_.size(); }
+        // #866: record the target a throw uses to LEAVE this arm. emitThrowValue
+        // frees the caught exception (the #397 optimization) only when a throw's
+        // unwind target equals this; a throw caught by an INNER try within the arm
+        // targets that inner dispatch instead and must NOT free it (the arm
+        // continues; the caught exception stays in flight for the arm's own exit).
+        // Use the RESOLVED block (unwindBB() maps a null target to the function's
+        // propagate boundary) so a single try with no enclosing handler still
+        // compares correctly against a throw's resolved target.
+        caughtExcArmTarget_ = unwindBB();
         bool armTerm = false;
         if (arm.body) armTerm = lowerStmt(*arm.body);
         if (hasFin) { unwindTarget_ = savedUnwind;
@@ -1541,6 +1551,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         disposeStack_.pop_back();
         currentCaughtExc_ = savedCaught;
         currentCaughtName_ = savedCaughtName;
+        caughtExcArmTarget_ = savedArmTarget;
         if (!armTerm) builder_.CreateBr(normalExit);
 
         builder_.SetInsertPoint(nextBB);

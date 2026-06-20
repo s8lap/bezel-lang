@@ -1993,8 +1993,16 @@ void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
             const auto* id = dynamic_cast<const ast::IdentifierExpr*>(excAst);
             isDirectRethrow = id && id->name == currentCaughtName_;
         }
+        // #866: free the caught exception ONLY when this throw actually LEAVES
+        // the enclosing catch arm — i.e. its unwind target is the arm-leaving
+        // target. A throw caught by an INNER try/catch within the arm targets
+        // that inner dispatch instead; the arm continues afterwards and the
+        // caught exception is still in flight, so freeing it here would
+        // double-free it at the arm's own exit (crash).
+        bool throwLeavesArm =
+            caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
         if (currentCaughtExc_ && excVal != currentCaughtExc_ &&
-            !isDirectRethrow) {
+            !isDirectRethrow && throwLeavesArm) {
             // #397 / §28.2 / §31.1: the caught object's lifetime is ending
             // here with nothing retaining it — dispatch its idempotent
             // Dispose and reclaim its block once. This is the sole free on

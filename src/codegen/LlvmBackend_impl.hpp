@@ -892,6 +892,14 @@ private:
     // emitThrowValue to detect a direct re-throw `throw ex;` (the one case
     // that must not free the caught exception when throwing from the arm).
     std::string_view currentCaughtName_;
+    // #866 / §31.2: the unwind target that LEAVES the enclosing catch arm (the
+    // arm's `unwindTarget_` at entry — the enclosing handler / finally / propagate
+    // boundary). emitThrowValue's #397 free of the caught exception is sound ONLY
+    // when the throw actually exits the arm (unwindBB() == this). When the throw
+    // is caught by an INNER try/catch within the arm, unwindBB() is that inner
+    // dispatch instead, the arm continues, and the caught exception must NOT be
+    // freed (it stays in flight for the arm's own exit) — else a double-free.
+    llvm::BasicBlock* caughtExcArmTarget_ = nullptr;
     // CG40: set true by lowering a `throw` expression (§31.2) — the
     // expression diverges (branches to the unwind target), leaving the
     // current block terminated. Phi-building consumers (conditional, `??`)
