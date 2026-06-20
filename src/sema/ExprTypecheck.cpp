@@ -2524,6 +2524,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // fix #830 / §28.10: `using var` is implicitly non-reassignable —
+            // reassigning a `using var` local is a compile error. Before this
+            // fix the reassignment was accepted silently and only the SECOND
+            // resource was disposed at scope end; the first leaked. Detect any
+            // assignment (`:=`, `+=`, …) whose target is a local declared
+            // `using var`. (A `_` discard target is not a using-var rebind.)
+            if (as->target) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get())) {
+                    if (id->name != "_") {
+                        if (auto* loc = dynamic_cast<LocalSymbol*>(
+                                ctx_.exprSymbol(*as->target))) {
+                            if (loc->isUsing)
+                                ctx_.diagnostics().report(
+                                    Severity::Error, as->span.begin,
+                                    std::string("cannot reassign `using var` "
+                                    "local `") + std::string(id->name) +
+                                    "` — `using var` is implicitly non-"
+                                    "reassignable; use a new `do ... end` block "
+                                    "for a different resource (§28.10)");
+                        }
+                    }
+                }
+            }
             // §9.4 (#624): DictionaryEntry<K,V>.Key and .Value are positional
             // read-only fields — any assignment through the entry loop variable
             // (e.Key := …, e.Value := …, e.Value += …, etc.) must be rejected.

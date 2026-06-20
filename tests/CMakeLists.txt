@@ -233,6 +233,7 @@ set(BEZEL_TEST_SOURCES
     sema/buffer_545_test.cpp                  # issue #545: Buffer<T> T-restriction, Length, Dispose, unknown-method sema
     sema/builtin_674_uniform_unknown_member_test.cpp  # fix #674: uniform no-member diag for Shared/Weak/Mutex/ChannelSender/ArraySpan/BinarySerializer
     sema/shared_sync_sendable_689_test.cpp            # #689: Shared<T> sendable iff T in sync-set (§28.13 v0.140)
+    sema/using_var_reassign_830_test.cpp              # fix #830: §28.10 reject reassigning a `using var` local
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
