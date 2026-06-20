@@ -8032,13 +8032,33 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         auto pow2 = [](unsigned e) { double v = 1.0; for (unsigned i = 0; i < e; ++i) v *= 2.0; return v; };
         unsigned nbits = dstTy->getIntegerBitWidth();
         double maxBound = dstUns ? pow2(nbits) : pow2(nbits - 1);
-        double minBound = dstUns ? 0.0 : -pow2(nbits - 1);
-        llvm::Value* minC = llvm::ConstantFP::get(srcTy, minBound);
         llvm::Value* maxC = llvm::ConstantFP::get(srcTy, maxBound);
-        // Ordered comparisons: both are false for NaN, so geMin∧ltMax excludes
-        // NaN and ±Infinity automatically as well as finite out-of-range values.
-        llvm::Value* geMin   = builder_.CreateFCmpOGE(src, minC, "f2i.gemin");
-        llvm::Value* ltMax   = builder_.CreateFCmpOLT(src, maxC, "f2i.ltmax");
+        // Upper bound is exclusive (MAX+1 = 2^(N-1) or 2^N, an exact power of
+        // two), so e.g. 2147483647.9 → int is accepted (truncates to int.MaxValue)
+        // while 2147483648.0 overflows.
+        llvm::Value* ltMax = builder_.CreateFCmpOLT(src, maxC, "f2i.ltmax");
+        // Lower bound (§5.2 / #858-cluster): truncation TOWARD ZERO lands in
+        // [MIN, MAX] for a source in the OPEN interval (MIN-1, MAX+1) — e.g.
+        // sbyte(-128.9) truncates to -128 = sbyte.MinValue and must NOT raise.
+        // The old `src >= MIN` wrongly rejected the (MIN-1, MIN] band. Use the
+        // EXCLUSIVE lower bound `src > MIN-1` when MIN-1 is exactly representable
+        // in the source FP type; when it is NOT (a large target whose MIN-1 rounds
+        // to MIN — int←float, long←float/double), the FP granularity at that
+        // magnitude is ≥ 1, so no source value lies strictly between MIN-1 and MIN
+        // and `src >= MIN` is exact and correct. An integer is exact in float iff
+        // |v| < 2^24, in double iff |v| < 2^53. Both forms are ORDERED comparisons
+        // (false for NaN), so NaN/±Infinity stay rejected.
+        unsigned srcMantBits = srcTy->isFloatTy() ? 24u : 53u;
+        bool minMinus1Exact = dstUns || (nbits - 1) < srcMantBits;
+        llvm::Value* geMin;
+        if (minMinus1Exact) {
+            double minExcl = (dstUns ? 0.0 : -pow2(nbits - 1)) - 1.0;
+            geMin = builder_.CreateFCmpOGT(
+                src, llvm::ConstantFP::get(srcTy, minExcl), "f2i.gtmin");
+        } else {
+            geMin = builder_.CreateFCmpOGE(
+                src, llvm::ConstantFP::get(srcTy, -pow2(nbits - 1)), "f2i.gemin");
+        }
         llvm::Value* inRange = builder_.CreateAnd(geMin, ltMax, "f2i.inrange");
         emitGuardThrow(builder_.CreateNot(inRange, "f2i.oor"), "OverflowException");
         return dstUns ? builder_.CreateFPToUI(src, dstTy)
