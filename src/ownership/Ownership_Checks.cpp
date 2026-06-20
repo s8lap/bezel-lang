@@ -402,7 +402,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     consumed = true;
                 }
             }
-            if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
+            if (!consumed) {
+                // #835 / §28.8: an argument that is itself a `new`/call (a nested
+                // producer, e.g. `f(new Box(_c))`) must have ITS OWN owned-argument
+                // transfers checked — recurse so a borrow flowing into the inner
+                // producer's `owned` parameter is rejected, exactly as a top-level
+                // `new Box(_c)` is. Otherwise a plain read.
+                if (dynamic_cast<const ast::NewExpr*>(a.value.get()) ||
+                    dynamic_cast<const ast::CallExpr*>(a.value.get()))
+                    handleDischarge(*a.value);
+                else
+                    checkRead(*a.value, /*selfTarget=*/false);
+            }
             ++pos;
         }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -525,7 +536,20 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     consumed = true;
                 }
             }
-            if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
+            if (!consumed) {
+                // #835 / §28.8: a constructor argument that is itself a `new`/call
+                // (`new Outer(new Box(_c))`) must have ITS OWN owned-argument
+                // transfers checked — recurse so a borrow flowing into the inner
+                // producer's `owned` parameter is rejected, exactly as a top-level
+                // `new Box(_c)` is (without this the inner producer's args were
+                // only `checkRead`, so the borrow→owned violation was a silent
+                // accept → double-free / SIGSEGV).
+                if (dynamic_cast<const ast::NewExpr*>(a.value.get()) ||
+                    dynamic_cast<const ast::CallExpr*>(a.value.get()))
+                    handleDischarge(*a.value);
+                else
+                    checkRead(*a.value, /*selfTarget=*/false);
+            }
             ++pos;
         }
         return;

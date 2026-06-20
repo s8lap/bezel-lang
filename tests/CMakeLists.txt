@@ -735,7 +735,8 @@ set(BEZEL_TEST_SOURCES
     ownership/move_interface_slot_test.cpp
     ownership/value_builtin_ownership_test.cpp
     ownership/use_after_dispose_warn_601_test.cpp
-    ownership/channel_spawn_sink_692_693_test.cpp)
+    ownership/channel_spawn_sink_692_693_test.cpp
+    ownership/nested_new_owned_arg_835_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
