@@ -10168,9 +10168,53 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
 llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                                        std::vector<llvm::Value*>& args,
                                        const CallableInfo& ci) {
-    // Build the function type with concrete arg/ret types.
+    // Build the function type with concrete arg/ret types. Each param type
+    // defaults to its argument's LLVM type, BUT when the declared parameter is a
+    // nullable VALUE type `T?` (a bare value-type generic param under the active
+    // substitution) and the argument arrived as the bare `T` (or a null ptr),
+    // the specialized body reads the param as the tagged `{i8, T}` struct — so
+    // the argument must be wrapped HERE and the param typed as that struct.
+    // Without this, a bare-`int` argument bound to a `T?` parameter leaves the
+    // param as `i32`, and `v!` / `v ?? …` in the body extract a field from a
+    // non-struct → LLVM GEP assertion crash (#846) / IR-verify failure (#845).
+    // `args` is [this?, params...]; map back to ms->params with the `this`
+    // offset. (#568/#604 resolve the same `T?` shape at the `!` / return sites.)
     std::vector<llvm::Type*> paramTys;
-    for (auto* a : args) paramTys.push_back(a->getType());
+    std::size_t thisOff = isStaticMethod(ms) ? 0u : 1u;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (i >= thisOff && (i - thisOff) < ms->params.size()) {
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    ms->params[i - thisOff])) {
+                const sema::TypeRef* formal =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                sema::TypeRef concBuf;
+                const sema::TypeRef* nvTy = nullptr;
+                if (formal && isNullableValueTy(formal)) {
+                    nvTy = formal;
+                } else if (formal && formal->nullable &&
+                           formal->kind == sema::TypeRef::Kind::Named &&
+                           !formal->declaration &&
+                           nullableTypeParamConcrete(formal, concBuf) &&
+                           isNullableValueTy(&concBuf)) {
+                    nvTy = &concBuf;
+                }
+                if (nvTy) {
+                    auto* expectedSt = nullableValueStructTy(nvTy);
+                    if (args[i]->getType() != expectedSt) {
+                        if (args[i]->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(args[i])) {
+                            args[i] = nullableValueNull(nvTy);
+                        } else if (args[i]->getType() ==
+                                   expectedSt->getElementType(1)) {
+                            args[i] = wrapNullableValue(nvTy, args[i]);
+                        }
+                    }
+                }
+            }
+        }
+        paramTys.push_back(args[i]->getType());
+    }
     llvm::Function* specFn = buildSpecializedMethodFn(ms, ci, paramTys);
     if (!specFn) return nullptr;
     // Call the specialized function.
