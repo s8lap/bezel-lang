@@ -8076,18 +8076,17 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
                 builder_.CreateStore(src, srcSlot);
                 if (lowerPrimitive(target)->getIntegerBitWidth() <= 32) {
                     // Target fits in int32 (byte, sbyte, short, ushort, int, char).
-                    // Strategy: convert decimal → int64 (no vtable — decimal values
-                    // in the int32 range never overflow int64), then do an IR-level
-                    // range check with emitGuardThrow.  This avoids the bz_set_exc
-                    // vtable-pointer indirection, which is unreliable in the JIT
-                    // harness where the vtable lives in JIT memory but the check
-                    // happens in the host process.  (fix #664 §5.2)
+                    // §5.2, fix #872: pass the OverflowException vtable so that a
+                    // decimal exceeding int64 range (e.g. 1e19) raises OverflowException
+                    // here; a decimal in int64 range but out of int32 range is caught by
+                    // the IR range-check below.  The vtable path is the same one used by
+                    // the int64-target branch and works in the JIT harness in practice.
                     auto* fn64 = declareC("bz_decimal_to_int64", i64(),
                                          {ptrTy(), ptrTy()});
                     llvm::Value* v64 = builder_.CreateCall(
-                        fn64, {srcSlot,
-                               llvm::ConstantPointerNull::get(ptrTy())},
+                        fn64, {srcSlot, getOVEVtable()},
                         "dec.toi64v");
+                    emitPendingCheck();  // §5.2, #872: raises if decimal > int64 range
                     // Range check: [-2147483648 .. 2147483647]
                     llvm::Value* lo = builder_.CreateICmpSLT(
                         v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MIN),
