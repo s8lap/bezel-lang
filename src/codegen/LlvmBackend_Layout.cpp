@@ -120,6 +120,15 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
 
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
                             llvm::Value* r, bool fp, bool uns) {
+    // §4.6 (#857): string compound concatenation when BOTH operands are string
+    // pointers (e.g. an indexer/property `s[i] += t`). A string is a pointer, not
+    // a number, so the integer checked-add intrinsic below emits malformed IR.
+    // The main local/field `s += t` path intercepts before this with full sema
+    // types (and the value-conversion / refcount discipline); this is the safety
+    // net for the remaining call sites — value-correct concat. (Only fires for
+    // `+`; other ops on a string pointer never typecheck.)
+    if (op == "+" && l->getType()->isPointerTy() && r->getType()->isPointerTy())
+        return emitStringConcat(l, r);
     if (fp) {
         if (op == "+") return builder_.CreateFAdd(l, r);
         if (op == "-") return builder_.CreateFSub(l, r);

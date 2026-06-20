@@ -459,6 +459,43 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         return false;
                     }
                 }
+                // §4.6 (#857): string compound concatenation `s += t`. A string
+                // is a pointer, not a number — emitCompoundOp below would feed the
+                // string pointers to the integer checked-add intrinsic (malformed
+                // IR). When the target is a string, `+=` is a concat: mirror the
+                // working `s := s + t` path (emitStringConcat + the `:=`
+                // retain/release discipline). A non-string RHS (`s += 5`) is
+                // converted via the §4.6 `string + T` rule. The concat result is a
+                // +1 producer, transferred into a string LOCAL/FIELD slot with the
+                // old value released (other lvalues — array element, static, ref/
+                // out, `string?` — get a plain store, leak-safe as before).
+                if (op == "+") {
+                    const sema::TypeRef* tgtTy = ctx_.exprType(*as->target);
+                    if (tgtTy &&
+                        tgtTy->kind == sema::TypeRef::Kind::Primitive &&
+                        tgtTy->primitive == sema::PrimitiveType::String) {
+                        llvm::Value* curS = builder_.CreateLoad(elemTy, addr);
+                        llvm::Value* rStr = rhs;
+                        const sema::TypeRef* rtv = ctx_.exprType(*as->value);
+                        if (rtv &&
+                            rtv->kind == sema::TypeRef::Kind::Primitive &&
+                            rtv->primitive != sema::PrimitiveType::String)
+                            rStr = emitPrimitiveToString(rhs, rtv->primitive);
+                        llvm::Value* res = emitStringConcat(curS, rStr);
+                        if (rStr != rhs) emitStringRelease(rStr);
+                        bool isLocal = localSlot(*as->target) &&
+                                       elemTy->isPointerTy() &&
+                                       !tgtTy->nullable &&
+                                       currentFn_ == stringReleaseEligibleFn_;
+                        bool isField = isStringFieldLvalue(*as->target);
+                        builder_.CreateStore(res, addr);
+                        if (isLocal || isField)
+                            emitStringRelease(curS);  // release the old value
+                        if (llvm::AllocaInst* ns = localSlot(*as->target))
+                            syncCellToOrigSlot(ns, res);
+                        return false;
+                    }
+                }
                 // CG31: built-in numeric compound assignment — read,
                 // apply OP (overflow-checked like plain arithmetic),
                 // write back.
