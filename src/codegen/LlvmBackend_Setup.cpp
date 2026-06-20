@@ -2133,7 +2133,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // its vtable) or — #362 / stdlib §4.5 — a heap collection (freed via
     // bz_array_free, cascading into class elements for an owning collection),
     // or — §28.13 / stdlib §2.16 (#620) — a Shared<T>/Weak<T> handle (released
-    // via bz_shared_release / bz_weak_release).
+    // via bz_shared_release / bz_weak_release),
+    // or — §28.5/§24.4 (#879) — a Subscription handle (unsubscribed via
+    // bz_subscription_dispose, which is null-safe).
     struct OwnedField {
         const sema::FieldSymbol* fs;
         const sema::TypeRef* collTy;  // non-null → collection field
@@ -2142,6 +2144,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         bool sharedField = false;
         // §28.13 (#620): true for Weak<T> owned field (bz_weak_release).
         bool weakField = false;
+        // §28.5/§24.4 (#879): true for Subscription (or Subscription?) owned
+        // field (bz_subscription_dispose — null-safe, so no guard needed).
+        bool subscriptionField = false;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -2160,6 +2165,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             owned.push_back({fs, nullptr});
         } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
             owned.push_back({fs, ct});
+        } else if (isOwnedSubscriptionField(fs)) {
+            // §28.5/§24.4 (#879): an `owned` field of Subscription (or
+            // Subscription?) type.  Subscription is a compiler-known opaque
+            // handle with no vtable; unsubscribe via bz_subscription_dispose
+            // (null-safe: `if (!subp) return;` — so Subscription? is safe too).
+            OwnedField of{fs, nullptr};
+            of.subscriptionField = true;
+            owned.push_back(of);
         } else {
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
             // Weak<T> type.  These are compiler-known ref-counted heap objects
@@ -2215,6 +2228,17 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {val, disp});
+            continue;
+        }
+        // §28.5/§24.4 (#879): owned Subscription (or Subscription?) field —
+        // unsubscribe via bz_subscription_dispose (null-safe: first thing it
+        // does is `if (!subp) return;`, so Subscription? left null is safe).
+        // Null the field after so a re-entrant dispose is a no-op.
+        if (it->subscriptionField) {
+            auto* dispFn = declareC("bz_subscription_dispose",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(dispFn, {val});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             continue;
         }
         // §28.13 / stdlib §2.16 (#620): owned Shared<T>/Weak<T> field —
@@ -4154,7 +4178,10 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                    ownedCollectionFieldType(fs) ||
                    // §28.13 (#620): owned Shared<T>/Weak<T> field also needs
                    // cleanup if the constructor body throws.
-                   isOwnedSharedWeakField(fs))) {
+                   isOwnedSharedWeakField(fs) ||
+                   // §28.5/§24.4 (#879): owned Subscription field also needs
+                   // cleanup if the constructor body throws.
+                   isOwnedSubscriptionField(fs))) {
             hasOwnedToClean = true;
             break;
         }

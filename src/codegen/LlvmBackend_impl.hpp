@@ -3549,6 +3549,24 @@ private:
         return false;
     }
 
+    // §28.5/§24.4 (#879): true when `fs` is an `owned` field of type
+    // Subscription (or Subscription?).  Subscription is a compiler-known opaque
+    // handle with no user TypeDecl / no vtable; it is disposed via
+    // bz_subscription_dispose (which is null-safe: `if (!subp) return;`), not
+    // through the vtable-Dispose path.  This mirrors isOwnedSharedWeakField.
+    bool isOwnedSubscriptionField(const sema::FieldSymbol* fs) const {
+        if (!hasOwnedModifier(fs)) return false;
+        const sema::TypeRef* rt = nullptr;
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
+        return isSubscriptionType(rt);
+    }
+
     // #362 / stdlib §4.5: if `fs` is an `owned` field whose type is a heap
     // collection (Array<T>/OwnedArray<T>/…, builtins with no TypeSymbol so
     // isOwnedReferenceField does not match them), return its resolved TypeRef;
