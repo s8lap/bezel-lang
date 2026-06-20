@@ -2395,6 +2395,37 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             if (auto* md = dynamic_cast<const ast::MethodDecl*>(
                                     ms->decl))
                                 ownedProduced = md->returnOwned;
+                // §21.9 (#832): a builtin owning-collection DRAIN — Pop /
+                // Dequeue / PopFirst / PopLast / PopAt / PopValue on an Owned*
+                // collection — returns `owned T` but has no user MethodDecl, so
+                // returnOwned is unavailable. Detect it by the member name plus
+                // the receiver being an Owned* collection (Get/Peek BORROW the
+                // element and are excluded). Without this, a bare drain statement
+                // silently leaked the popped owned element.
+                if (!ownedProduced && ce->callee) {
+                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get())) {
+                        std::string_view mm = ma->member;
+                        bool drain = mm == "Pop" || mm == "Dequeue" ||
+                                     mm == "PopFirst" || mm == "PopLast" ||
+                                     mm == "PopAt" || mm == "PopValue";
+                        if (drain && ma->target) {
+                            if (auto* rt = ctx_.exprType(*ma->target))
+                                if (rt->kind == TypeRef::Kind::Named &&
+                                    rt->astNode && rt->astNode->name &&
+                                    !rt->astNode->name->parts.empty()) {
+                                    std::string_view head =
+                                        rt->astNode->name->parts.front();
+                                    ownedProduced =
+                                        head == "OwnedArray" ||
+                                        head == "OwnedStack" ||
+                                        head == "OwnedQueue" ||
+                                        head == "OwnedLinkedList" ||
+                                        head == "OwnedDictionary";
+                                }
+                        }
+                    }
+                }
             }
             if (ownedProduced) {
                 const TypeRef* t = ctx_.exprType(*es->expr);
