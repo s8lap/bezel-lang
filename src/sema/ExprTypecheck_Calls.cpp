@@ -688,6 +688,57 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     if (argRef->nullable || r == 1) report("value");
                                 } else if (item.kind == "notnull") {
                                     if (argRef->nullable) report("notnull");
+                                } else if (item.kind == "new") {
+                                    // §14.2 (#864 part 2): `where T: new()`
+                                    // requires an accessible parameterless ctor.
+                                    // Mirrors Resolver::argSatisfiesNew for the
+                                    // method-call-site check.
+                                    if (!argDecl) continue;  // built-in/unresolved: defer
+                                    bool satisfied = false;
+                                    bool decided = false;
+                                    if (argDecl->kind == ast::TypeDeclKind::Enum ||
+                                        argDecl->kind == ast::TypeDeclKind::Record) {
+                                        // Enums and records (positional fields
+                                        // default-constructible when no non-nullable
+                                        // ref field) satisfy new(); conservatively
+                                        // accept — the exhaustive check is in
+                                        // Resolver::argSatisfiesNew. Defer (decided=false).
+                                        continue;
+                                    }
+                                    if (argDecl->kind == ast::TypeDeclKind::Interface) {
+                                        decided = true;
+                                        satisfied = false;  // §11.2: not constructible
+                                    } else if (argDecl->kind == ast::TypeDeclKind::Class) {
+                                        auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                            argDecl->decl);
+                                        decided = true;
+                                        if (td && td->hasPositionalFields &&
+                                            !td->positionalFields.empty()) {
+                                            satisfied = false;  // primary ctor has params
+                                        } else {
+                                            std::vector<const ConstructorSymbol*> ctors;
+                                            for (Symbol* mem : argDecl->members) {
+                                                if (auto* cs =
+                                                        dynamic_cast<const ConstructorSymbol*>(
+                                                            mem))
+                                                    if (!cs->isStatic)
+                                                        ctors.push_back(cs);
+                                            }
+                                            if (ctors.empty()) {
+                                                satisfied = true;  // implicit default ctor
+                                            } else {
+                                                for (const ConstructorSymbol* cs : ctors) {
+                                                    if (cs->params.empty() &&
+                                                        cs->visibility !=
+                                                            ast::Visibility::Private) {
+                                                        satisfied = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (decided && !satisfied) report("new()");
                                 }
                             }
                         }

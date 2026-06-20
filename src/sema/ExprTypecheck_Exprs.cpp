@@ -1361,6 +1361,62 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (de->type) {
             if (auto* rt = ctx_.resolvedType(*de->type)) {
                 ctx_.setExprType(&e, rt);
+                // §17.11 (#864 part 1): `default(T)` under `where T: class` or
+                // a type-bound constraint is a compile error — the constraint
+                // guarantees T is non-nullable, and `default(T)` would produce
+                // null, which does not fit T's contract. `default(T?)` (nullable)
+                // stays accepted; only the non-nullable form triggers this error.
+                // `where T: value` and unconstrained T are OK (value types have
+                // a well-defined zero; unconstrained T may be a value type).
+                if (rt->kind == TypeRef::Kind::Named &&
+                    rt->declaration == nullptr &&   // generic type parameter
+                    !rt->nullable &&                // non-nullable `T`, not `T?`
+                    de->type->name && !de->type->name->parts.empty()) {
+                    std::string_view paramName = de->type->name->parts.front();
+                    // Walk the enclosing method's constraints first, then the
+                    // enclosing class's constraints (for class-level params).
+                    auto checkConstraintsFor =
+                        [&](const std::vector<ast::GenericConstraint>& gcs) {
+                        for (const auto& gc : gcs) {
+                            if (gc.typeParam != paramName) continue;
+                            for (const auto& item : gc.items) {
+                                if (item.kind == "class" || item.kind == "type") {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, de->span.begin,
+                                        "`default(T)` is a compile error when T "
+                                        "is constrained non-null (`where " +
+                                        std::string(paramName) + ": " +
+                                        (item.kind == "class"
+                                             ? "class"
+                                             : (item.typeArg && item.typeArg->name &&
+                                                !item.typeArg->name->parts.empty()
+                                                    ? std::string(item.typeArg->name->parts.front())
+                                                    : "type")) +
+                                        "`) — the null value `default(T)` does not "
+                                        "fit T's non-null contract (§17.11); "
+                                        "write `default(T?)` to produce null of the "
+                                        "nullable counterpart");
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    // Check method-level constraints first; fall through to
+                    // class-level constraints only when the name is not a
+                    // method-level generic param (avoids false positives when
+                    // the class has a same-named param with looser constraints).
+                    bool isMethodParam = false;
+                    if (currentMethodDecl_) {
+                        for (const auto& gp : currentMethodDecl_->genericParams)
+                            if (gp.name == paramName) { isMethodParam = true; break; }
+                        if (isMethodParam)
+                            checkConstraintsFor(currentMethodDecl_->genericConstraints);
+                    }
+                    if (!isMethodParam && currentType_ && currentType_->decl)
+                        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                currentType_->decl))
+                            checkConstraintsFor(td->genericConstraints);
+                }
             }
         }
     }

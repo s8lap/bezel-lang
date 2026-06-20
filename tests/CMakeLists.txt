@@ -238,6 +238,7 @@ set(BEZEL_TEST_SOURCES
     sema/compound_assign_operator_result_851_test.cpp # fix #851: §25.1 reject compound op whose overload result differs from LHS
     sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range
     sema/bare_drain_discard_832_test.cpp              # fix #832: §21.9 reject bare owning-collection drain discard
+    sema/generic_default_new_constraint_864_test.cpp  # fix #864: §17.11 default(T) under where T:class rejected; §14.2 new() at method call site
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
