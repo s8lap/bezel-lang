@@ -240,6 +240,7 @@ set(BEZEL_TEST_SOURCES
     sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range
     sema/bare_drain_discard_832_test.cpp              # fix #832: §21.9 reject bare owning-collection drain discard
     sema/generic_default_new_constraint_864_test.cpp  # fix #864: §17.11 default(T) under where T:class rejected; §14.2 new() at method call site
+    sema/with_expression_target_validation_875_test.cpp  # fix #875-#878: §9.5/§5.1 validate with-expression targets (type, existence, method, computed-property)
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp

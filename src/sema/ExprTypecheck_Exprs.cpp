@@ -2736,8 +2736,101 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         checkCaseExhaustiveness(*ce, scrutTy);
     } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
         if (we->source) visitExpr(*we->source);
+        // §9.5, #875-878: validate each `with` assignment target.
+        // Resolve the source's TypeSymbol so we can look up named fields.
+        TypeSymbol* srcTs = nullptr;
+        if (we->source) {
+            if (auto* st = ctx_.exprType(*we->source)) {
+                if (st->kind == TypeRef::Kind::Named && st->declaration &&
+                    st->declaration->kind == ast::TypeDeclKind::Record)
+                    srcTs = st->declaration;
+            }
+        }
         for (const auto& ia : we->assigns) {
             if (ia.value) visitExpr(*ia.value);
+            // §9.5: validate only when we have a known record source type.
+            if (!srcTs) continue;
+            SourceLocation valLoc =
+                ia.value ? ia.value->span.begin : we->span.begin;
+            Symbol* mem = lookupMember(srcTs, ia.name);
+            if (!mem) {
+                // #876: nonexistent field name.
+                ctx_.diagnostics().report(
+                    Severity::Error, valLoc,
+                    "field `" + std::string(ia.name) + "` does not exist "
+                    "in record `" + std::string(srcTs->name) +
+                    "` — `with` targets must be positional-field properties, "
+                    "auto-properties, or public fields (§9.5, #876)");
+                continue;
+            }
+            if (dynamic_cast<MethodSymbol*>(mem) ||
+                dynamic_cast<ConstructorSymbol*>(mem) ||
+                dynamic_cast<DestructorSymbol*>(mem)) {
+                // #877: method is not a valid with target.
+                ctx_.diagnostics().report(
+                    Severity::Error, valLoc,
+                    "`" + std::string(ia.name) + "` is a method, not a "
+                    "valid `with` target — `with` targets must be "
+                    "positional-field properties, auto-properties, or "
+                    "public fields (§9.5, #877)");
+                continue;
+            }
+            if (auto* ps = dynamic_cast<PropertySymbol*>(mem)) {
+                if (!isAutoPropertySymbol(ps)) {
+                    // #878: computed (expression-bodied) property has no
+                    // backing storage and is not a valid with target.
+                    ctx_.diagnostics().report(
+                        Severity::Error, valLoc,
+                        "`" + std::string(ia.name) + "` is a computed "
+                        "property and cannot be a `with` target — `with` "
+                        "requires backing storage (auto-property) (§9.5, #878)");
+                    continue;
+                }
+                // Auto-property: check replacement value type (§5.1, #875).
+                if (ia.value) {
+                    TypeRef* valTy = ctx_.exprType(*ia.value);
+                    if (auto* pd =
+                            dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                        if (pd->type) {
+                            TypeRef* fieldTy = ctx_.resolvedType(*pd->type);
+                            checkAssignable(
+                                valTy, fieldTy, valLoc,
+                                "replacement value for `" +
+                                std::string(ia.name) + "`",
+                                ia.value.get());
+                        }
+                    }
+                }
+                continue;
+            }
+            if (auto* fs = dynamic_cast<FieldSymbol*>(mem)) {
+                // Valid field target: check replacement value type (§5.1, #875).
+                if (ia.value) {
+                    TypeRef* valTy = ctx_.exprType(*ia.value);
+                    TypeRef* fieldTy = nullptr;
+                    if (fs->posParam && fs->posParam->type) {
+                        fieldTy = ctx_.resolvedType(*fs->posParam->type);
+                    } else if (auto* fd =
+                                   dynamic_cast<const ast::FieldDecl*>(
+                                       fs->decl)) {
+                        if (fd->type)
+                            fieldTy = ctx_.resolvedType(*fd->type);
+                    }
+                    if (fieldTy)
+                        checkAssignable(
+                            valTy, fieldTy, valLoc,
+                            "replacement value for `" +
+                            std::string(ia.name) + "`",
+                            ia.value.get());
+                }
+                continue;
+            }
+            // Any other member kind (EnumConstant, NestedType, etc.) is invalid.
+            ctx_.diagnostics().report(
+                Severity::Error, valLoc,
+                "`" + std::string(ia.name) + "` is not a valid `with` "
+                "target — `with` requires a positional-field property, "
+                "auto-property, or public field (§9.5)");
         }
         // §A.7: a `source with …` expression has the same type as its
         // source (an object initializer / record copy preserves type).
