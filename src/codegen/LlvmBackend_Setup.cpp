@@ -4924,10 +4924,34 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             if (auto* st = llvm::dyn_cast<llvm::StructType>(declaredTy)) {
                 if (st->getNumElements() == 2 &&
                     st->getElementType(0) == nullablePrimHasValTy()) {
+                    auto* vNullSt = llvm::dyn_cast<llvm::StructType>(v->getType());
+                    bool vIsNullableStruct =
+                        vNullSt && vNullSt->getNumElements() == 2 &&
+                        vNullSt->getElementType(0) == nullablePrimHasValTy();
                     if (v->getType()->isPointerTy() &&
                         llvm::isa<llvm::ConstantPointerNull>(v)) {
                         // null → {false, 0}
                         v = llvm::ConstantAggregateZero::get(declaredTy);
+                    } else if (vIsNullableStruct) {
+                        // #840 / §5.1 / §7: a nullable→nullable LIFTED widening
+                        // (`var d: double? := n` with `n: int?`). Keep hasValue;
+                        // convert the inner value to the target inner type
+                        // (int→double SIToFP, int→long SExt/ZExt, …). Before this
+                        // the int? struct was stored as-is into the double? slot,
+                        // losing the value. A same-inner-type source never reaches
+                        // here (v->getType() == declaredTy short-circuits above).
+                        llvm::Value* hasVal =
+                            builder_.CreateExtractValue(v, {0u}, "lift.has");
+                        llvm::Value* srcInner =
+                            builder_.CreateExtractValue(v, {1u}, "lift.in");
+                        llvm::Value* conv = coerceNumericToType(
+                            srcInner, st->getElementType(1),
+                            init && isUnsignedTargetExpr(*init));
+                        if (conv->getType() == st->getElementType(1)) {
+                            llvm::Value* res = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(declaredTy), hasVal, {0u});
+                            v = builder_.CreateInsertValue(res, conv, {1u});
+                        }
                     } else {
                         // #839 / §5.1 / §7: widen/convert a narrower numeric
                         // initializer to the nullable's inner type BEFORE wrapping

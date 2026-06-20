@@ -355,6 +355,7 @@ set(BEZEL_TEST_SOURCES
     codegen/owned_array_subscription_838_test.cpp
     codegen/nullable_init_widening_842_test.cpp
     codegen/nullable_return_widening_843_test.cpp
+    codegen/nullable_lifted_widening_840_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp
