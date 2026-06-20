@@ -1788,9 +1788,15 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
 
 // §17.1 result-type table for unary operators (slice 3c).
 // §25: a user-defined unary `operator <op>` (one parameter) declared on
-// the operand's type. Overloadable prefix unary operators are `-`/`~`.
+// the operand's type. Overloadable prefix unary operators are `+`/`-`/`~`.
 MethodSymbol* ExprTC::findUnaryOperator(const ast::UnaryExpr& ue) {
-    if (ue.op != "-" && ue.op != "~") return nullptr;
+    // §25.1: the overloadable unary operators are `+`, `-`, `~` (and `++`/`--`,
+    // which are handled at their statement/expression sites, not here). Unary
+    // `+` was previously omitted, so a record's `operator +(c)` was never
+    // resolved and `+c` silently lowered to the primitive identity — the user
+    // overload was ignored. The `params.size() == 1` filter below distinguishes
+    // the unary overload from the binary `operator +(a, b)`.
+    if (ue.op != "+" && ue.op != "-" && ue.op != "~") return nullptr;
     TypeSymbol* ts = ue.operand ? memberTargetType(ue.operand.get())
                                 : nullptr;
     if (!ts) return nullptr;
