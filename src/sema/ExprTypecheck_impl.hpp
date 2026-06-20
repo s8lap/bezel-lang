@@ -157,6 +157,17 @@ private:
     // cleared) by visitExpr(LambdaExpr).
     TypeRef* pendingLambdaParamType_ = nullptr;
 
+    // fix #829 / §A.7: when a lambda's expected type is a known function type
+    // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a
+    // call argument bound to a function-typed parameter), this holds those
+    // positional parameter types so an UNTYPED lambda parameter (`(a, b) => …`)
+    // is given its inferred type. Without it the params stay untyped and the
+    // body's operator/member resolution falls back to primitives — e.g. a
+    // user-defined `operator +` on a record is missed and codegen emits a raw
+    // `add` on the record struct (malformed IR). Consumed (and cleared) by
+    // visitExpr(LambdaExpr); positionally matched to the lambda's params.
+    std::vector<TypeRef*> pendingLambdaParamTypes_;
+
     // issue #777 / §30.6: when about to visit an `async` lambda whose expected
     // function type is `(…) -> Task<T>` / `(…) -> OwnedTask<T>`, this holds the
     // peeled element type T so the lambda visitor can reject a forgotten `await`

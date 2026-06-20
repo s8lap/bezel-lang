@@ -2134,6 +2134,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // `async` lambda, thread the peeled element T to the lambda visitor so it
         // can reject a forgotten `await` in the body. Restored after the visit.
         TypeRef* savedLamRet = pendingLambdaReturnType_;
+        std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
         if (ld->type && ld->initializer) {
             if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
                 if (auto* dt = ctx_.resolvedType(*ld->type)) {
@@ -2142,11 +2143,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         !dt->funcReturn->genericArgs.empty())
                         pendingLambdaReturnType_ =
                             dt->funcReturn->genericArgs.front();
+                    // fix #829: thread the target's positional parameter types so
+                    // an untyped lambda param `(a, b) => …` is given its inferred
+                    // type (the body's operator/member resolution then sees the
+                    // real type instead of falling back to primitives).
+                    if (dt->kind == TypeRef::Kind::Function &&
+                        !dt->funcParams.empty()) {
+                        pendingLambdaParamTypes_.clear();
+                        for (const auto& fp : dt->funcParams)
+                            pendingLambdaParamTypes_.push_back(fp.type);
+                    }
                 }
             }
         }
         if (ld->initializer) visitExpr(*ld->initializer);
         pendingLambdaReturnType_ = savedLamRet;
+        pendingLambdaParamTypes_ = savedLamParams;
         currentLiteralWideningHint_ = savedHint;
         // stdlib §5 (#755): reject STORING a bare lazy GroupBy result in a local —
         // the lazy IGrouping<TKey,T> enumerator dangles after the store and

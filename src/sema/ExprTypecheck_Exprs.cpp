@@ -2122,10 +2122,33 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // element T, so its body resolves member access on the param.
                 TypeRef* savedPending = pendingLambdaParamType_;
                 TypeRef* savedLamRet = pendingLambdaReturnType_;
+                std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
                 if (auto* lam =
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
                     else if (linqElem)    pendingLambdaParamType_ = linqElem;
+                    // fix #829: a lambda bound to a function-typed parameter
+                    // `(T1, …, Tn) -> R` — thread the positional Ti so an untyped
+                    // lambda arg `(a, b) => …` gets its inferred param types (the
+                    // body's operator/member resolution then sees real types).
+                    // Skip a GENERIC callee: there the function-param type may be
+                    // an unresolved type parameter (`(T) -> int`) inferred from
+                    // another argument; the existing generic-inference path types
+                    // the lambda param correctly, and threading the bare `T` here
+                    // would override it with the unsubstituted parameter (#505).
+                    if (calleeMd2 && calleeMd2->genericParams.empty() &&
+                        pos2 < calleeMd2->params.size() &&
+                        calleeMd2->params[pos2].type) {
+                        if (auto* pt = ctx_.resolvedType(
+                                *calleeMd2->params[pos2].type)) {
+                            if (pt->kind == TypeRef::Kind::Function &&
+                                !pt->funcParams.empty()) {
+                                pendingLambdaParamTypes_.clear();
+                                for (const auto& fp : pt->funcParams)
+                                    pendingLambdaParamTypes_.push_back(fp.type);
+                            }
+                        }
+                    }
                     // issue #777 / §30.6: when an async lambda is bound to a
                     // function-typed parameter `(…) -> Task<T>` / `OwnedTask<T>`,
                     // thread the peeled element T so the lambda visitor rejects a
@@ -2151,6 +2174,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 visitExpr(*a.value);
                 pendingLambdaParamType_ = savedPending;
                 pendingLambdaReturnType_ = savedLamRet;
+                pendingLambdaParamTypes_ = savedLamParams;
             }
             ++pos2;
         }
@@ -2229,6 +2253,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // don't inherit it.
         TypeRef* eventParamType = pendingLambdaParamType_;
         pendingLambdaParamType_ = nullptr;
+        // fix #829: the inferred positional parameter types from the lambda's
+        // expected function type (typed-local init / assignment / call arg).
+        // Consumed once and cleared so a nested lambda doesn't inherit them.
+        std::vector<TypeRef*> inferredParamTypes = pendingLambdaParamTypes_;
+        pendingLambdaParamTypes_.clear();
         // issue #777 / §30.6: the expected async element type T (peeled from a
         // `(…) -> Task<T>` context), threaded in to detect a forgotten `await`.
         // Consumed once so nested lambdas don't inherit it.
@@ -2237,13 +2266,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         Scope lamScope;
         lamScope.parent = currentScope_;
         std::vector<sema::Symbol*> lamParamSyms;
-        for (const auto& p : lam->params) {
+        for (size_t pi = 0; pi < lam->params.size(); ++pi) {
+            const auto& p = lam->params[pi];
             auto* ps = ctx_.makeSymbol<ParameterSymbol>();
             ps->name = p.name;
             ps->modifier = p.modifier;
             if (p.type) ps->declType = p.type.get();
             else if (eventParamType && lam->params.size() == 1)
                 ps->resolvedDeclType = eventParamType;  // §24.3 handler param
+            // fix #829: an untyped param takes its inferred type from the
+            // lambda's expected function type, positionally.
+            else if (pi < inferredParamTypes.size() && inferredParamTypes[pi])
+                ps->resolvedDeclType = inferredParamTypes[pi];
             lamParamSyms.push_back(ps);
             if (!p.name.empty()) lamScope.names[p.name] = ps;
         }
@@ -2307,11 +2341,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         {
             auto* lamTy = ctx_.makeTypeRef();
             lamTy->kind = TypeRef::Kind::Function;
-            for (const auto& p : lam->params) {
+            for (size_t pi = 0; pi < lam->params.size(); ++pi) {
+                const auto& p = lam->params[pi];
                 TypeRef::FuncParam fp;
                 fp.modifier = p.modifier;
                 fp.name = p.name;
                 if (p.type) fp.type = ctx_.resolvedType(*p.type);
+                // fix #829: reflect an inferred param type in the lambda's own
+                // function type so a later `f(...)` call type-checks against it.
+                else if (pi < inferredParamTypes.size() && inferredParamTypes[pi])
+                    fp.type = inferredParamTypes[pi];
                 lamTy->funcParams.push_back(std::move(fp));
             }
             // Infer the return type: from exprBody for expression lambdas,

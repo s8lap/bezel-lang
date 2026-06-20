@@ -346,6 +346,7 @@ set(BEZEL_TEST_SOURCES
     codegen/mixed_sign_int_signedness_814_test.cpp
     codegen/case_wide_int_836_test.cpp
     codegen/owned_collection_trypop_831_test.cpp
+    codegen/lambda_inferred_param_operator_829_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp
