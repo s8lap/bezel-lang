@@ -2742,6 +2742,83 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     as->value->span.begin, "assigned value",
                     as->value.get());  // §27.6 #756 property-ref
             }
+            // §25.1 (#851): a compound assignment `lhs <op>= rhs` desugars to
+            // `lhs := lhs <op> rhs` using the binary operator's overload. When
+            // `lhs` is a user type (record/class) whose `operator <op>` returns
+            // a type NOT assignable back to `lhs`, the implied assignment is a
+            // type error and must be rejected — it was silently accepted,
+            // storing the foreign result reinterpreted as the LHS type (e.g.
+            // `operator +(Point, Point): int` made `p += q` store an `int` into
+            // a `Point` slot). Only USER operator overloads are checked; a
+            // built-in primitive compound op keeps the operand type. (Event
+            // `+=`/`-=` and `??=` are excluded: neither resolves to a 2-param
+            // `operator <bin>` here.)
+            if (as->op != ":=" && as->target && as->value) {
+                auto binTok = [](std::string_view o) -> std::string_view {
+                    if (o == "+=")  return "+";
+                    if (o == "-=")  return "-";
+                    if (o == "*=")  return "*";
+                    if (o == "/=")  return "/";
+                    if (o == "&=")  return "&";
+                    if (o == "|=")  return "|";
+                    if (o == "^=")  return "^";
+                    if (o == "<<=") return "<<";
+                    if (o == ">>=") return ">>";
+                    return {};
+                }(as->op);
+                TypeRef* toTy = ctx_.exprType(*as->target);
+                // Only a USER record/class LHS is in scope: a built-in primitive
+                // LHS (string, int, decimal, …) keeps the operand type under the
+                // language's own compound rules, and its `operator <op>` lives on
+                // a built-in type whose result is the same primitive (so e.g.
+                // `s += "x"` for `string` must not be flagged — `string` is a
+                // Primitive while `String.operator +` is declared on a Named
+                // built-in, a benign kind mismatch).
+                if (!binTok.empty() && toTy &&
+                    toTy->kind == TypeRef::Kind::Named && toTy->declaration &&
+                    (toTy->declaration->kind == ast::TypeDeclKind::Record ||
+                     toTy->declaration->kind == ast::TypeDeclKind::Class)) {
+                    if (TypeSymbol* lts = memberTargetType(as->target.get())) {
+                        MethodSymbol* opm = nullptr;
+                        for (Symbol* m : lts->members) {
+                            auto* ms = dynamic_cast<MethodSymbol*>(m);
+                            if (ms && ms->isOperator &&
+                                ms->operatorToken == binTok &&
+                                ms->params.size() == 2) { opm = ms; break; }
+                        }
+                        TypeRef* resTy = nullptr;
+                        if (opm)
+                            if (auto* od = dynamic_cast<const ast::OperatorDecl*>(
+                                    opm->decl))
+                                if (od->returnType)
+                                    resTy = ctx_.resolvedType(*od->returnType);
+                        if (resTy) {
+                            // The result must be assignable back to the user
+                            // type. Conservative: report only a clear mismatch
+                            // (a non-Named result, or a different unrelated
+                            // record/class).
+                            bool ok = resTy->kind == TypeRef::Kind::Named &&
+                                      (resTy->declaration
+                                           ? (resTy->declaration ==
+                                                  toTy->declaration ||
+                                              isSubtype(resTy->declaration,
+                                                        toTy->declaration))
+                                           : true);  // unresolved — be lenient
+                            if (!ok)
+                                ctx_.diagnostics().report(
+                                    Severity::Error, as->span.begin,
+                                    std::string("compound assignment `") +
+                                    std::string(as->op) + "` desugars to "
+                                    "`lhs := lhs " + std::string(binTok) +
+                                    " rhs`, but `operator " + std::string(binTok)
+                                    + "` returns a value that is not assignable "
+                                    "to the left-hand side's type — the "
+                                    "operator's result type differs from the "
+                                    "target (§25.1)");
+                        }
+                    }
+                }
+            }
         }
         // §7.4 (issue #418): a plain `:=` of a non-null value to a simple
         // variable proves it non-null from here; assigning a (possibly-)null
