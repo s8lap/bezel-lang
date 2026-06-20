@@ -145,13 +145,23 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         if (uns)
             return op == "/" ? builder_.CreateUDiv(l, r)
                              : builder_.CreateURem(l, r);
+        // Signed INT_MIN op -1 (§6.1): only division overflows; modulo is 0 and
+        // must not raise. srem of INT_MIN,-1 is UB, so force divisor to 1 and
+        // select 0 on that path. (`mod=` is not valid syntax per §17.2, so the
+        // `mod` arm is currently unreachable, but kept correct for parallelism.)
         llvm::Value* negOne = llvm::ConstantInt::getSigned(r->getType(), -1);
-        emitGuardThrow(
+        llvm::Value* isMinNegOne =
             builder_.CreateAnd(builder_.CreateICmpEQ(l, minIntLike(r)),
-                               builder_.CreateICmpEQ(r, negOne)),
-            "OverflowException");
-        return op == "/" ? builder_.CreateSDiv(l, r)
-                         : builder_.CreateSRem(l, r);
+                               builder_.CreateICmpEQ(r, negOne));
+        if (op == "/") {
+            emitGuardThrow(isMinNegOne, "OverflowException");
+            return builder_.CreateSDiv(l, r);
+        }
+        llvm::Value* safeR = builder_.CreateSelect(
+            isMinNegOne, llvm::ConstantInt::getSigned(r->getType(), 1), r);
+        llvm::Value* rem = builder_.CreateSRem(l, safeR);
+        return builder_.CreateSelect(
+            isMinNegOne, llvm::ConstantInt::get(r->getType(), 0), rem);
     }
     if (op == "&") return builder_.CreateAnd(l, r);
     if (op == "|") return builder_.CreateOr(l, r);

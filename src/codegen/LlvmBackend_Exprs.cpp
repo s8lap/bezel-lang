@@ -4068,15 +4068,29 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                             payloadResult = (op == "/") ? builder_.CreateUDiv(lp, rp)
                                                         : builder_.CreateURem(lp, rp);
                         } else {
+                            // Signed INT_MIN op -1 (§6.1): only division overflows
+                            // (result not representable); modulo is 0 and must not
+                            // raise. srem of INT_MIN,-1 is UB, so force divisor to 1
+                            // and select 0 on that path.
                             llvm::Value* minV   = minIntLike(rp);
                             llvm::Value* negOne = llvm::ConstantInt::getSigned(
                                 rp->getType(), -1);
-                            emitGuardThrow(
+                            llvm::Value* isMinNegOne =
                                 builder_.CreateAnd(builder_.CreateICmpEQ(lp, minV),
-                                                   builder_.CreateICmpEQ(rp, negOne)),
-                                "OverflowException");
-                            payloadResult = (op == "/") ? builder_.CreateSDiv(lp, rp)
-                                                        : builder_.CreateSRem(lp, rp);
+                                                   builder_.CreateICmpEQ(rp, negOne));
+                            if (op == "/") {
+                                emitGuardThrow(isMinNegOne, "OverflowException");
+                                payloadResult = builder_.CreateSDiv(lp, rp);
+                            } else {
+                                llvm::Value* safeR = builder_.CreateSelect(
+                                    isMinNegOne,
+                                    llvm::ConstantInt::getSigned(rp->getType(), 1),
+                                    rp);
+                                llvm::Value* rem = builder_.CreateSRem(lp, safeR);
+                                payloadResult = builder_.CreateSelect(
+                                    isMinNegOne,
+                                    llvm::ConstantInt::get(rp->getType(), 0), rem);
+                            }
                         }
                     }
                 }
@@ -4612,16 +4626,27 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (uns)
                 return op == "/" ? builder_.CreateUDiv(l, r)
                                  : builder_.CreateURem(l, r);
-            // Signed: INT_MIN / -1 (and mod) overflow the result type.
+            // Signed INT_MIN op -1 (§6.1): division's mathematical result
+            // (-INT_MIN) is not representable in the result type → raise
+            // OverflowException. Modulo's mathematical result is 0, which IS
+            // representable, so `mod` must NOT raise. But LLVM `srem` of
+            // INT_MIN,-1 is undefined behaviour (LangRef) and x86 IDIV faults
+            // (SIGFPE), so on that one path force the divisor to 1 and select 0.
             llvm::Value* minV = minIntLike(r);
             llvm::Value* negOne =
                 llvm::ConstantInt::getSigned(r->getType(), -1);
-            emitGuardThrow(
+            llvm::Value* isMinNegOne =
                 builder_.CreateAnd(builder_.CreateICmpEQ(l, minV),
-                                   builder_.CreateICmpEQ(r, negOne)),
-                "OverflowException");
-            return op == "/" ? builder_.CreateSDiv(l, r)
-                             : builder_.CreateSRem(l, r);
+                                   builder_.CreateICmpEQ(r, negOne));
+            if (op == "/") {
+                emitGuardThrow(isMinNegOne, "OverflowException");
+                return builder_.CreateSDiv(l, r);
+            }
+            llvm::Value* safeR = builder_.CreateSelect(
+                isMinNegOne, llvm::ConstantInt::getSigned(r->getType(), 1), r);
+            llvm::Value* rem = builder_.CreateSRem(l, safeR);
+            return builder_.CreateSelect(
+                isMinNegOne, llvm::ConstantInt::get(r->getType(), 0), rem);
         }
     }
     if (op == "+") return builder_.CreateAdd(l, r);

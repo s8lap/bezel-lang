@@ -357,6 +357,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nullable_return_widening_843_test.cpp
     codegen/nullable_lifted_widening_840_test.cpp
     codegen/async_iter_var_frame_width_833_test.cpp
+    codegen/int_min_mod_neg_one_844_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp
