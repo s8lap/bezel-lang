@@ -111,6 +111,28 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
             /*retainRelease=*/false
         };
     }
+    // §2.11 (#838): a Subscription is a runtime-managed handle (bz_subscription_t*,
+    // null declaration — a compiler-known builtin like Shared/Weak/IGrouping) that
+    // is disposed by bz_subscription_dispose (unsubscribing). An owning collection
+    // OWNS its Subscriptions and must dispose each at scope-end / clear / remove;
+    // before this it fell through to the Value policy (null disposer) and the
+    // subscriptions leaked (the handler kept firing after the collection died). A
+    // borrowing collection of Subscriptions just borrows them (no disposal).
+    if (isSubscriptionType(elemTy)) {
+        if (owningFamily)
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                subscriptionDisposeThunk(),
+                /*retainRelease=*/false
+            };
+        return ElementPolicy{
+            ElementPolicy::Category::ClassBorrow,
+            ptrTy(),
+            /*disposerThunk=*/nullptr,
+            /*retainRelease=*/false
+        };
+    }
     bool isSharedWeakElem = isSharedOrWeak(elemTy);
     // Distinguish Shared vs Weak for per-element release thunk selection.
     auto isWeakElem = [](const sema::TypeRef* t) {

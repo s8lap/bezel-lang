@@ -3054,6 +3054,38 @@ llvm::Function* Emitter::groupingFreeThunk() {
     return fn;
 }
 
+// §2.11 (#838): the per-element disposer thunk for a Subscription element of an
+// owning collection (OwnedArray<Subscription>, etc.). A Subscription is a
+// runtime-managed opaque handle (bz_subscription_t*) disposed by
+// bz_subscription_dispose (which unsubscribes), not via a vtable — so an owning
+// collection of Subscriptions needs this thunk to unsubscribe each element at
+// scope-end/clear/remove. Null-safe + idempotent (mirrors the `using var`
+// Subscription auto-dispose). Same shape as groupingFreeThunk.
+llvm::Function* Emitter::subscriptionDisposeThunk() {
+    if (subscriptionDisposeThunk_) return subscriptionDisposeThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$subscriptionDispose", module_.get());
+    llvm::Argument* h = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* dispBB = llvm::BasicBlock::Create(llvm_, "s.disp", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "s.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    b.CreateCondBr(
+        b.CreateICmpEQ(h, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, dispBB);
+    b.SetInsertPoint(dispBB);
+    auto* dispFn = declareC("bz_subscription_dispose",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(dispFn, {h});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    subscriptionDisposeThunk_ = fn;
+    return fn;
+}
+
 bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     // fix #619 / §28.11 v0.135 / §14.4: the §28.11 table's owned/borrow column
     // applies to "class / interface type" — both class AND interface elements are

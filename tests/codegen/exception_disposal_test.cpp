@@ -1302,4 +1302,14 @@ BEZEL_TEST(codegen_excdisp_837, owned_set_tryadd_duplicate_disposed_once) {
     expectExitAndLeakFree(kSetTryAddDupDisposed, 3);
 }
 
+// NOTE [838]: an OwnedArray<Subscription>'s scope-end unsubscribe is verified by
+// the value tests in owned_array_subscription_838_test.cpp (the handler stops
+// firing). An LSan assertion is intentionally NOT added here: a capturing
+// subscription handler's closure ENVIRONMENT is not freed when the subscription
+// is disposed — a pre-existing leak that also affects a plain
+// `using var sub := <event>.Subscribe(closure)` (no array), tracked separately
+// (orthogonal to the #838 element-disposal fix, which only ensures the array
+// disposes its elements at all). The array's own bz_array_t backing IS freed
+// (covered by the LSan-clean OwnedArray<Cell> tests #819/#820).
+
 }  // namespace

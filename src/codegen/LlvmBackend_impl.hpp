@@ -813,6 +813,9 @@ private:
     llvm::Function* weakReleaseThunk_ = nullptr;
     // stdlib §5 (#651): bz_grouping_free thunk for Array<IGrouping> disposal.
     llvm::Function* groupingFreeThunk_ = nullptr;
+    // §2.11 (#838): bz_subscription_dispose thunk for OwnedArray<Subscription>
+    // (and other owning collections) element disposal.
+    llvm::Function* subscriptionDisposeThunk_ = nullptr;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -3200,6 +3203,7 @@ private:
     llvm::Function* sharedReleaseThunk();
     llvm::Function* weakReleaseThunk();
     llvm::Function* groupingFreeThunk(); // stdlib §5 (#651): IGrouping disposal
+    llvm::Function* subscriptionDisposeThunk(); // §2.11 (#838): Subscription elem
 
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the
