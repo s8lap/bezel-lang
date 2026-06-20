@@ -45,6 +45,19 @@ void Emitter::collectSuspendLocals(
                 llvm::Type* ty = i32();  // range/int loop var default
                 if (fs->varType) {
                     if (auto* rt = ctx_.resolvedType(*fs->varType)) ty = lowerTypeRef(rt);
+                } else if (fs->iterable) {
+                    // #833 (§30.7): an INFERRED loop variable (`await for var x in
+                    // seq` / `for var x in coll`) has no annotation, so without
+                    // this it took the i32 default — but a class/string/wide
+                    // element (a ptr, or a value struct) overflows the i32 frame
+                    // slot into the adjacent outerTask field on spill → SIGSEGV.
+                    // Derive the element type from the iterable's element
+                    // (genericArgs[0]), exactly as the for-loop lowering does
+                    // (LlvmBackend_Stmts.cpp). Range loops keep the i32 default
+                    // (a RangeExpr iterable has no genericArgs).
+                    if (auto* it = ctx_.exprType(*fs->iterable))
+                        if (!it->genericArgs.empty() && it->genericArgs[0])
+                            ty = lowerTypeRef(it->genericArgs[0]);
                 }
                 out.push_back({fs, ty});
             }
