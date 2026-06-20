@@ -1097,4 +1097,57 @@ BEZEL_TEST(codegen_excdisp_821, iterator_two_using_vars_disposed) {
     expectExitAndLeakFree(kIterTwoUsingVars, 2);
 }
 
+// --------------------------------------------------------------------------
+// [N] §29.7 / §30.7 — the ASYNC iterator sibling of [821]. The async iterator's
+// generated Dispose only re-ran explicit try/finally chains (smIterFinallyAt-
+// State_) and its MoveNextAsync normal-completion path freed the frame without
+// disposing active using-vars → leak. The fix ports the smIterDisposalsAtState_
+// handling (sync iterator's Dispose + normal-completion) into the async path.
+// --------------------------------------------------------------------------
+
+// Full async iteration to completion: the using-var r is disposed once
+// (R.count = 1) on the normal-completion (run-off-the-end) path of the async
+// iterator's MoveNextAsync.
+const char* kAsyncIterUsingVarFullIteration =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C "
+    "  public async static method Gen(): IAsyncEnumerable<int> "
+    "    using var r := new R(); "
+    "    yield return 1; "
+    "  end Gen; "
+    "  public static async method Main(): Task<int> "
+    "    await for var x in Gen() do end; "
+    "    return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_821, async_iterator_using_var_full_iteration_disposed) {
+    expectExitAndLeakFree(kAsyncIterUsingVarFullIteration, 1);
+}
+
+// Early break: the async consumer stops after the first yield; the async
+// iterator's Dispose disposes the still-active using-var (R.count = 1) via the
+// union of smIterFinallyAtState_ + smIterDisposalsAtState_.
+const char* kAsyncIterUsingVarEarlyBreak =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C "
+    "  public async static method Gen(): IAsyncEnumerable<int> "
+    "    using var r := new R(); "
+    "    yield return 1; "
+    "    yield return 2; "
+    "  end Gen; "
+    "  public static async method Main(): Task<int> "
+    "    await for var x in Gen() do break; end; "
+    "    return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_821, async_iterator_using_var_early_break_disposed) {
+    expectExitAndLeakFree(kAsyncIterUsingVarEarlyBreak, 1);
+}
+
 }  // namespace

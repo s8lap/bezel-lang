@@ -1,5 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include <set>
+
 namespace bezel::codegen {
 
 // ===========================================================================
@@ -1440,6 +1442,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // §29.7 (#623): clear the finally-chain tracking for this async iterator.
         finallyBodyStack_.clear();
         smIterFinallyAtState_.clear();
+        smIterDisposalsAtState_.clear();  // #821 (async)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
@@ -1510,12 +1513,19 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         builder_.SetInsertPoint(stateBBs[0]);
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
-        disposeStack_.pop_back();
         if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+            // #821 / §29.7 (async): on NORMAL completion (the async iterator body
+            // runs off its end), dispose the `using var` resources still active
+            // at the end before reporting done. The abandonment path — Dispose
+            // while suspended at a yield — is handled by smIterDisposalsAtState_
+            // in the Dispose body below. State is set to -1 so a later advance /
+            // Dispose stays a no-op → each resource is disposed exactly once.
+            emitDisposals(disposeStack_.back());
             emitAsyncIterComplete(/*hasValue=*/false);
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRetVoid();
         }
+        disposeStack_.pop_back();
 
         // §28.12 / §30: terminate any orphaned await-using state blocks (same as
         // emitAsyncMethod above — sync-fallback `await using` that did not consume
@@ -1591,8 +1601,13 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             builder_.CreateRetVoid();
         };
 
-        if (smIterFinallyAtState_.empty()) {
-            // No yields inside try/finally — just mark done and free.
+        // #821 (async): an async iterator Dispose must dispose `using var`
+        // resources active at the suspension point too — not only explicit
+        // try/finally chains. Mirrors the sync iterator Dispose
+        // (LlvmBackend_Iterators.cpp).
+        if (smIterFinallyAtState_.empty() && smIterDisposalsAtState_.empty()) {
+            // No yields inside try/finally and no active using-var — mark done
+            // and free.
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
@@ -1604,19 +1619,40 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
             // Mark done immediately so re-entrant Dispose is a no-op.
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            std::set<unsigned> states;
+            for (auto& kv : smIterFinallyAtState_) states.insert(kv.first);
+            for (auto& kv : smIterDisposalsAtState_) states.insert(kv.first);
             auto* sw = builder_.CreateSwitch(curState, doneBB,
-                (unsigned)smIterFinallyAtState_.size());
+                                             (unsigned)states.size());
 
-            for (auto& [stateIdx, chain] : smIterFinallyAtState_) {
+            for (unsigned stateIdx : states) {
                 auto* chainBB = llvm::BasicBlock::Create(
                     llvm_, "dsp.s" + std::to_string(stateIdx), disposeFn);
                 sw->addCase(builder_.getInt32((int)stateIdx), chainBB);
                 builder_.SetInsertPoint(chainBB);
+                // #821: dispose the using-var resources active at this yield,
+                // innermost-first; rebind each slot to the restored local.
+                auto dit = smIterDisposalsAtState_.find(stateIdx);
+                if (dit != smIterDisposalsAtState_.end()) {
+                    for (auto rit = dit->second.rbegin();
+                         rit != dit->second.rend(); ++rit) {
+                        auto lit = locals_.find(rit->first);
+                        if (lit == locals_.end()) continue;
+                        Disposal d = rit->second;
+                        d.slot = lit->second;
+                        std::vector<Disposal> one{d};
+                        emitDisposals(one);
+                    }
+                }
                 // Run finally bodies innermost-first (chain is outermost-first).
-                for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-                    disposeStack_.emplace_back();
-                    lowerBody(**it);
-                    disposeStack_.pop_back();
+                auto fit = smIterFinallyAtState_.find(stateIdx);
+                if (fit != smIterFinallyAtState_.end()) {
+                    for (auto it = fit->second.rbegin();
+                         it != fit->second.rend(); ++it) {
+                        disposeStack_.emplace_back();
+                        lowerBody(**it);
+                        disposeStack_.pop_back();
+                    }
                 }
                 builder_.CreateBr(doneBB);
             }
@@ -1626,6 +1662,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         }
 
         smIterFinallyAtState_.clear();
+        smIterDisposalsAtState_.clear();  // #821
         finallyBodyStack_.clear();
     }
 }
