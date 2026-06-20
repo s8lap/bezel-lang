@@ -370,6 +370,7 @@ set(BEZEL_TEST_SOURCES
     codegen/float_to_int_truncation_858_test.cpp
     codegen/enum_cast_range_859_test.cpp
     codegen/nested_catch_rethrow_866_test.cpp
+    codegen/generic_nullable_peel_850_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp

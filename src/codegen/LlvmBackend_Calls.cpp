@@ -7705,8 +7705,27 @@ void Emitter::unifyMethodReturnTypeArg(
         for (const auto& gp : genericParams)
             if (gp.name == nm) { isParam = true; break; }
         if (isParam && !subst.count(nm)) {
-            subst[nm] = lowerTypeRef(resultTy);
-            semaTy[nm] = resultTy;
+            // §14.1 / #850: peel the nullable when the declared parameter type
+            // is `T?` (nullable) and the concrete argument type is also nullable
+            // — bind T to the non-nullable concrete type so the monomorphized
+            // body lowers `T` as i32 (not {i8,i32}) and `T?` as the proper
+            // nullable struct. Mirrors the sema fix in unifyArgSubst.
+            const sema::TypeRef* concreteTy = resultTy;
+            if (declRet->nullable && resultTy->nullable) {
+                if (resultTy->kind == sema::TypeRef::Kind::Primitive) {
+                    concreteTy = ctx_.primitiveTypeRef(resultTy->primitive,
+                                                       /*nullable=*/false);
+                } else {
+                    // Named value type (record/enum): allocate a ctx-owned
+                    // non-nullable copy for a stable semaTy pointer.
+                    sema::TypeRef* nn = ctx_.makeTypeRef();
+                    *nn = *resultTy;
+                    nn->nullable = false;
+                    concreteTy = nn;
+                }
+            }
+            subst[nm] = lowerTypeRef(concreteTy);
+            semaTy[nm] = concreteTy;
             added = true;
         }
         return;

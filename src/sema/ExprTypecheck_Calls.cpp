@@ -197,23 +197,52 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 }
 
 namespace {
-// §14.1 (#785): structurally unify a value parameter's declared type (`pt`,
-// AST) against the call argument's resolved type (`argTy`), binding each method
-// type parameter named in `paramNames` to the matching component of the
+// §14.1 (#785, #850): structurally unify a value parameter's declared type
+// (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
+// method type parameter named in `paramNames` to the matching component of the
 // argument's type. A bare `p: T` binds T; a generic-typed `p: Pair<A, B>`
 // recurses pairwise into the generic args (binding A and B from a
 // `Pair<int, string>` argument). The first binding for a name wins (a later or
 // already-receiver-bound occurrence is left). Mirrors codegen's
-// unifyMethodReturnTypeArg. // per §14.1
+// unifyMethodReturnTypeArg.
+// §14.1 / #850: when the parameter is `T?` (nullable named type-param) and the
+// argument is `int?` (or another nullable type), peel the shared `?` so that T
+// is bound to `int` (non-nullable), not `int?`. This makes `where T: value`
+// hold (int satisfies value, int? does not) and the return type `T` stays
+// non-nullable. A bare `T` parameter (pt->nullable == false) with a nullable
+// argument still binds T = int? and is correctly rejected by the constraint
+// check. ctx is used to allocate a stable non-nullable TypeRef in the peel
+// case. // per §14.1
 void unifyArgSubst(
     const ast::Type* pt, TypeRef* argTy,
     const std::unordered_set<std::string_view>& paramNames,
-    std::unordered_map<std::string_view, TypeRef*>& argSubst) {
+    std::unordered_map<std::string_view, TypeRef*>& argSubst,
+    SemaContext& ctx) {
     if (!pt || !argTy) return;
     if (pt->kind == ast::TypeKind::Named && pt->name &&
         pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
         std::string_view nm = pt->name->parts[0];
-        if (!argSubst.count(nm)) argSubst[nm] = argTy;
+        if (!argSubst.count(nm)) {
+            TypeRef* bound = argTy;
+            // §14.1 / #850: peel the nullable when the parameter declares `T?`
+            // and the argument is also nullable — infer the non-nullable T so
+            // `where T: value` and the non-nullable return type `T` work
+            // correctly. A bare `T` parameter (pt->nullable == false) with a
+            // nullable argument is left as-is and rejected downstream.
+            if (pt->nullable && argTy->nullable) {
+                if (argTy->kind == TypeRef::Kind::Primitive) {
+                    bound = ctx.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
+                } else {
+                    // Named (record / enum) value type: allocate a ctx-owned
+                    // non-nullable copy so the pointer remains stable.
+                    TypeRef* nn = ctx.makeTypeRef();
+                    *nn = *argTy;
+                    nn->nullable = false;
+                    bound = nn;
+                }
+            }
+            argSubst[nm] = bound;
+        }
         return;
     }
     if (!pt->genericArgs.empty() &&
@@ -221,7 +250,7 @@ void unifyArgSubst(
         argTy->genericArgs.size() == pt->genericArgs.size()) {
         for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
             unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
-                          paramNames, argSubst);
+                          paramNames, argSubst, ctx);
     }
 }
 
@@ -746,7 +775,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (!md->params[pi].type || !ce.args[pi].value) continue;
                         TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, argSubst);
+                                      paramNames, argSubst, ctx_);
                     }
                     // #729: enforce the method's where-constraints on the
                     // argument-inferred type args (only when no explicit type

@@ -4952,9 +4952,26 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // is the tagged struct {i8 hasValue; T value}. If hasValue is true, return
     // the inner value; otherwise evaluate and return the rhs. For an enum the
     // inner value (and the rhs, e.g. `Color.Red`) is the underlying i32.
+    // §14.1 / #850: also fires inside a monomorphized generic body where the
+    // LHS has sema-type `T?` (a bare nullable type-param, Named/no-declaration),
+    // and T resolves under genericSubstSemaTy_ to a concrete value type (e.g.
+    // int). The LLVM value is already the {i8, T} struct (emitGenericSpecialization
+    // wraps the argument), but isNullableValueTy returned false for the bare T?
+    // TypeRef — falling through to the pointer null-check branch, which is wrong
+    // for a non-pointer struct. Resolve the concrete nullable here too.
     if (!l->getType()->isPointerTy() && bin.left) {
         if (auto* lt = ctx_.exprType(*bin.left)) {
-            if (isNullableValueTy(lt)) {
+            // Resolve T? → its concrete nullable form when T is a bound value-type
+            // generic parameter (mirrors emitGenericSpecialization lines 10214-10219).
+            sema::TypeRef concBuf;
+            const sema::TypeRef* effectiveLt = lt;
+            if (!isNullableValueTy(lt) && lt->nullable &&
+                lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
+                nullableTypeParamConcrete(lt, concBuf) &&
+                isNullableValueTy(&concBuf)) {
+                effectiveLt = &concBuf;
+            }
+            if (isNullableValueTy(effectiveLt)) {
                 auto* entryBB = builder_.GetInsertBlock();
                 auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coal.rhs", currentFn_);
                 auto* endBB = llvm::BasicBlock::Create(llvm_, "coal.end", currentFn_);
