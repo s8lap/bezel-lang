@@ -1262,6 +1262,67 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // return type made NULLABLE (null when f was null). Was unimplemented
     // (NullCondCallExpr produced a wrong value).
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        // §5.3 (#839): T?(x) — nullable-target primitive cast. The lexer fuses
+        // `?` and `(` into the two-char `?(` punctuator, so `long?(x)` is
+        // parsed as NullCondCallExpr{callee=IdentifierExpr{"long"}, args=[x]}
+        // rather than a CallExpr.  When the callee is a bare primitive-type
+        // keyword with no symbol this is NOT a null-conditional function call
+        // but a §5.3 LIFTED CAST: null stays null, a value is cast to the
+        // target primitive and re-wrapped in the nullable struct.
+        if (nc->callee && nc->args.size() == 1 && nc->args[0].value) {
+            if (auto* cid =
+                    dynamic_cast<const ast::IdentifierExpr*>(nc->callee.get())) {
+                if (!ctx_.exprSymbol(*nc->callee)) {
+                    using P = sema::PrimitiveType;
+                    P targetPt = sema::primitiveFromName(cid->name);
+                    if (targetPt != P::None && targetPt != P::String &&
+                        targetPt != P::Decimal) {
+                        const ast::Expr& argE = *nc->args[0].value;
+                        llvm::Value* srcV = lowerExpr(argE);
+                        if (!srcV) return nullptr;
+                        // Determine source primitive and whether it is nullable.
+                        P srcPt = P::None;
+                        bool srcNullable = false;
+                        if (auto* rt = ctx_.exprType(argE)) {
+                            if (rt->kind == sema::TypeRef::Kind::Primitive)
+                                srcPt = rt->primitive;
+                            srcNullable = rt->nullable;
+                        }
+                        // Extract hasValue + payload from a nullable source, or
+                        // treat a non-nullable source as hasValue=true, payload=src.
+                        llvm::Value* hasV;
+                        llvm::Value* payload;
+                        if (srcNullable && srcV->getType()->isStructTy() &&
+                            isNullableValueTy(ctx_.exprType(argE))) {
+                            hasV    = nullablePrimHasValue(srcV);  // i1
+                            payload = nullablePrimValue(srcV);     // inner scalar
+                        } else {
+                            hasV    = builder_.getTrue();
+                            payload = srcV;
+                        }
+                        // Convert the payload from source primitive to target.
+                        // For an identity cast (same primitive) lowerPrimCastScalar
+                        // returns the payload unchanged.
+                        bool srcUns = (srcPt != P::None) ? isUnsignedPrim(srcPt)
+                                                         : false;
+                        llvm::Value* converted =
+                            lowerPrimCastScalar(targetPt, srcPt, payload, srcUns);
+                        if (!converted) return nullptr;
+                        // Re-wrap as {i8 hasValue, targetScalar} nullable struct.
+                        // Per §5.3: null stays null (hasV=0); value is re-wrapped
+                        // with the same hasV (1) from the source.
+                        llvm::StructType* st = nullablePrimStructTy(targetPt);
+                        llvm::Value* hv8 =
+                            builder_.CreateZExt(hasV, nullablePrimHasValTy(),
+                                                "nc.hv8");
+                        llvm::Value* res = builder_.CreateInsertValue(
+                            llvm::UndefValue::get(st), hv8, {0u});
+                        return builder_.CreateInsertValue(res, converted, {1u},
+                                                          "nc.cast");
+                    }
+                }
+            }
+        }
         const sema::TypeRef* fnRt =
             nc->callee ? ctx_.exprType(*nc->callee) : nullptr;
         if (!fnRt || fnRt->kind != sema::TypeRef::Kind::Function ||
@@ -7787,6 +7848,114 @@ llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
         return builder_.CreateLoad(decimalStructType(), out);
     }
     return v;  // no §5.1 numeric widening applies — leave the value as is.
+}
+
+
+// §5.3 (#839): scalar-level primitive conversion shared by lowerConversion
+// (non-nullable target) and the NullCondCallExpr nullable-cast path. Takes
+// the ALREADY-UNWRAPPED `payload` value (of source primitive `srcPt`) and
+// converts it to `targetPt` using the §5.2 rules:
+//   • same type → identity (with signed↔unsigned bit-width check per §5.2/#753)
+//   • FP ↔ FP   → FPExt / FPTrunc
+//   • FP → int  → range-checked FPToSI/FPToUI (OverflowException)
+//   • int → FP  → SIToFP / UIToFP (lossless for all supported widths)
+//   • int → int → widening SExt/ZExt or narrowing Trunc with range check
+//   • int → char → §5.2 L421 Unicode range check + Trunc
+// `srcUns` is isUnsignedPrim(srcPt), pre-computed by the caller.
+llvm::Value* Emitter::lowerPrimCastScalar(sema::PrimitiveType targetPt,
+                                          sema::PrimitiveType srcPt,
+                                          llvm::Value* payload,
+                                          bool srcUns) {
+    using P = sema::PrimitiveType;
+    // §5.2 (L421): casting an integer to char requires the value to be in
+    // U+0000–U+10FFFF excluding the surrogate range U+D800–U+DFFF.
+    if (targetPt == P::Char && payload->getType()->isIntegerTy()) {
+        llvm::Type* i64ty = llvm::Type::getInt64Ty(llvm_);
+        llvm::Value* v64  = builder_.CreateSExt(payload, i64ty, "ctoi64");
+        llvm::Value* neg  = builder_.CreateICmpSLT(
+            v64, llvm::ConstantInt::get(i64ty, 0), "cneg");
+        llvm::Value* hi   = builder_.CreateICmpSGT(
+            v64, llvm::ConstantInt::get(i64ty, 0x10FFFF), "chi");
+        llvm::Value* sg_lo = builder_.CreateICmpSGE(
+            v64, llvm::ConstantInt::get(i64ty, 0xD800), "csglo");
+        llvm::Value* sg_hi = builder_.CreateICmpSLE(
+            v64, llvm::ConstantInt::get(i64ty, 0xDFFF), "csghi");
+        llvm::Value* surr  = builder_.CreateAnd(sg_lo, sg_hi, "csurr");
+        llvm::Value* bad   = builder_.CreateOr(
+            builder_.CreateOr(neg, hi, "coor"), surr, "cbad");
+        emitGuardThrow(bad, "OverflowException");
+        llvm::Type* dstCharTy = lowerPrimitive(P::Char);  // i32
+        if (payload->getType() != dstCharTy)
+            return builder_.CreateTrunc(payload, dstCharTy);
+        return payload;
+    }
+    llvm::Type* dstTy = lowerPrimitive(targetPt);
+    llvm::Type* srcTy = payload->getType();
+    bool dstFP  = dstTy->isFloatingPointTy();
+    bool srcFP  = srcTy->isFloatingPointTy();
+    bool dstUns = isUnsignedPrim(targetPt);
+    if (srcTy == dstTy) {
+        // §5.2 (#753): same-width signed↔unsigned cast is a CHECKED conversion.
+        if (srcTy->isIntegerTy() && srcUns != dstUns) {
+            llvm::Value* bad = builder_.CreateICmpSLT(
+                payload, llvm::ConstantInt::get(srcTy, 0), "swflip.oor");
+            emitGuardThrow(bad, "OverflowException");
+        }
+        return payload;
+    }
+    if (srcFP && dstFP) {
+        return srcTy->getPrimitiveSizeInBits() < dstTy->getPrimitiveSizeInBits()
+               ? builder_.CreateFPExt(payload, dstTy)
+               : builder_.CreateFPTrunc(payload, dstTy);
+    }
+    if (srcFP) {  // FP → int: range-checked per §5.2.
+        auto pow2 = [](unsigned e) {
+            double v = 1.0;
+            for (unsigned i = 0; i < e; ++i) v *= 2.0;
+            return v;
+        };
+        unsigned nbits = dstTy->getIntegerBitWidth();
+        double maxBound = dstUns ? pow2(nbits) : pow2(nbits - 1);
+        llvm::Value* maxC  = llvm::ConstantFP::get(srcTy, maxBound);
+        llvm::Value* ltMax = builder_.CreateFCmpOLT(payload, maxC, "f2i.ltmax");
+        unsigned srcMantBits = srcTy->isFloatTy() ? 24u : 53u;
+        bool minMinus1Exact = dstUns || (nbits - 1) < srcMantBits;
+        llvm::Value* geMin;
+        if (minMinus1Exact) {
+            double minExcl = (dstUns ? 0.0 : -pow2(nbits - 1)) - 1.0;
+            geMin = builder_.CreateFCmpOGT(
+                payload, llvm::ConstantFP::get(srcTy, minExcl), "f2i.gtmin");
+        } else {
+            geMin = builder_.CreateFCmpOGE(
+                payload, llvm::ConstantFP::get(srcTy, -pow2(nbits - 1)),
+                "f2i.gemin");
+        }
+        llvm::Value* inRange = builder_.CreateAnd(geMin, ltMax, "f2i.inrange");
+        emitGuardThrow(builder_.CreateNot(inRange, "f2i.oor"), "OverflowException");
+        return dstUns ? builder_.CreateFPToUI(payload, dstTy)
+                      : builder_.CreateFPToSI(payload, dstTy);
+    }
+    if (dstFP)  // int → FP
+        return srcUns ? builder_.CreateUIToFP(payload, dstTy)
+                      : builder_.CreateSIToFP(payload, dstTy);
+    // int → int.
+    unsigned sb = srcTy->getIntegerBitWidth();
+    unsigned db = dstTy->getIntegerBitWidth();
+    if (db < sb) {
+        // Narrowing: checked per §5.2.
+        llvm::Value* trunc = builder_.CreateTrunc(payload, dstTy);
+        llvm::Value* back = dstUns ? builder_.CreateZExt(trunc, srcTy)
+                                   : builder_.CreateSExt(trunc, srcTy);
+        emitGuardThrow(builder_.CreateICmpNE(back, payload), "OverflowException");
+        return trunc;
+    }
+    if (db > sb) {
+        if (srcTy->isIntegerTy(1))
+            return builder_.CreateZExt(payload, dstTy);  // bool→int always zero-ext
+        return srcUns ? builder_.CreateZExt(payload, dstTy)
+                      : builder_.CreateSExt(payload, dstTy);
+    }
+    return payload;  // same-width, same-sign — already handled above; unreachable
 }
 
 

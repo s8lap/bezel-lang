@@ -356,6 +356,7 @@ set(BEZEL_TEST_SOURCES
     codegen/lambda_inferred_param_operator_829_test.cpp
     codegen/nested_generic_chained_field_828_test.cpp
     codegen/nullable_primitive_cast_827_test.cpp
+    codegen/nullable_target_cast_839_test.cpp
     codegen/owned_set_equality_837_test.cpp
     codegen/owned_array_subscription_838_test.cpp
     codegen/nullable_init_widening_842_test.cpp

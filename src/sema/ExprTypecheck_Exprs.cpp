@@ -2245,19 +2245,41 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         for (const auto& a : nc->args) {
             if (a.value) visitExpr(*a.value);
         }
-        // §27.7 (#738): `f?(args)` invokes the nullable function value `f` when
-        // non-null, else is a no-op; the result is the function's return type
-        // made NULLABLE (null when f is null). Type it so an inferred local /
-        // null check / arithmetic on the result resolves (previously untyped →
-        // codegen produced a wrong value).
+        // §5.3 (#839): `T?(x)` — nullable-target primitive cast. The lexer
+        // produces `?(` as a 2-char punctuator, so `long?(x)` is parsed as a
+        // NullCondCallExpr whose callee is the bare primitive-type keyword.
+        // When the callee is a primitive name with no symbol, set the result
+        // type to that primitive nullable (e.g. `long?`) so that inferred
+        // locals, null checks, and the `!` unwrap all see the correct type.
+        bool typedAsPrimCast = false;
         if (nc->callee) {
-            if (TypeRef* ft = ctx_.exprType(*nc->callee))
-                if (ft->kind == TypeRef::Kind::Function && ft->funcReturn) {
-                    TypeRef* r = ctx_.makeTypeRef();
-                    *r = *ft->funcReturn;
-                    r->nullable = true;
-                    ctx_.setExprType(&e, r);
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(nc->callee.get())) {
+                if (!ctx_.exprSymbol(*nc->callee)) {
+                    PrimitiveType pt = primitiveFromName(id->name);
+                    if (pt != PrimitiveType::None) {
+                        ctx_.setExprType(
+                            &e, ctx_.primitiveTypeRef(pt, /*nullable=*/true));
+                        typedAsPrimCast = true;
+                    }
                 }
+            }
+        }
+        if (!typedAsPrimCast) {
+            // §27.7 (#738): `f?(args)` invokes the nullable function value `f`
+            // when non-null, else is a no-op; the result is the function's
+            // return type made NULLABLE (null when f is null). Type it so an
+            // inferred local / null check / arithmetic on the result resolves
+            // (previously untyped → codegen produced a wrong value).
+            if (nc->callee) {
+                if (TypeRef* ft = ctx_.exprType(*nc->callee))
+                    if (ft->kind == TypeRef::Kind::Function && ft->funcReturn) {
+                        TypeRef* r = ctx_.makeTypeRef();
+                        *r = *ft->funcReturn;
+                        r->nullable = true;
+                        ctx_.setExprType(&e, r);
+                    }
+            }
         }
     } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) visitExpr(*ix->target);

@@ -5120,6 +5120,20 @@ private:
     llvm::Value* lowerConversion(sema::PrimitiveType target,
                                  const ast::CallExpr& call);
 
+    // §5.3 (#839): scalar-level primitive conversion used by both
+    // lowerConversion (non-nullable target) and the nullable-to-nullable cast
+    // path in lowerExpr (NullCondCallExpr with a primitive callee). Converts
+    // `payload` from `srcPt` to `targetPt` applying the same checked rules as
+    // §5.2 (OverflowException on narrowing / range failure, etc.). Returns the
+    // converted scalar (same type as lowerPrimitive(targetPt)) or `payload`
+    // unchanged when the types are already identical (identity cast).
+    // `srcUns` is the source primitive's signedness (isUnsignedPrim(srcPt));
+    // passing it explicitly avoids repeating isUnsignedPrim at every call site.
+    llvm::Value* lowerPrimCastScalar(sema::PrimitiveType targetPt,
+                                     sema::PrimitiveType srcPt,
+                                     llvm::Value* payload,
+                                     bool srcUns);
+
     // §5.1: apply an implicit numeric widening to coerce a lowered value to
     // a target LLVM type when the pair is a §5.1-admitted widening — int →
     // float / double, float → double (FPExt), or integer widening. Returns
