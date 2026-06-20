@@ -16,6 +16,16 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         if (un->op == "move") {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     un->operand.get())) {
+                // §28.8.1 / #825: a bare `move _field` is syntactically
+                // identical to `move this._field` — both leave the field in
+                // moved-from state and must be restored before the method exits.
+                // exprIsOwnedFieldRead resolves the bare identifier via sema
+                // and returns true only for an `owned` field of the current class.
+                if (exprIsOwnedFieldRead(*un->operand)) {
+                    fieldMovedFrom_[id->name] = true;
+                    fieldMoveLoc_[id->name] = un->span.begin;
+                    return;
+                }
                 markMovedByName(id->name, id->span.begin);
                 return;
             }
@@ -431,6 +441,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         if (un->op == "move") {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     un->operand.get())) {
+                // §28.8.1 / #825: a bare `move _field` (in return/assignment/
+                // expr position) is the same operation as `move this._field` —
+                // it leaves the field moved-from. Check via sema symbol before
+                // falling through to the local-move path.
+                if (exprIsOwnedFieldRead(*un->operand)) {
+                    fieldMovedFrom_[id->name] = true;
+                    fieldMoveLoc_[id->name] = un->span.begin;
+                    return;
+                }
                 markMovedByName(id->name, id->span.begin);
                 return; // don't re-check the now-moved-from operand
             }

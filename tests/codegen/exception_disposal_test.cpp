@@ -961,16 +961,24 @@ BEZEL_TEST(codegen_excdisp_822, inner_match_outer_local_disposed_once) {
 }
 
 // --------------------------------------------------------------------------
-// [818] §28.8.1 / Guide 1 §6 — the UNQUALIFIED owned-field detach idiom
-// `return move _field` transfers the field's object out; the field slot must be
+// [818] §28.8.1 / Guide 1 §6 — the owned-field move-and-transfer codegen.
+// `move _field` transfers the field's object out; the field slot must be
 // nulled so the owner's destructor (null-guarded owned-field disposal) skips it
 // instead of disposing the already-transferred object again. Before the fix the
 // move codegen nulled only LOCAL using-var slots, not fields, so the owner's
 // destructor double-freed the moved-out object → SIGSEGV.
+// After fix #825 (§28.8.1), a bare `move _field` without restoration is a
+// compile error. These tests use the SWAP pattern — move-and-replace — which
+// satisfies §28.8.1 (the field is restored before method exit) and exercises
+// the same codegen property: when `move _v` transfers the field out, the slot
+// must be nulled in the IR so the owner's destructor skips it. // per §28.8.1
 // --------------------------------------------------------------------------
 
-// Detach a Cell out of a Box via `move _v`, take ownership, dispose both. The
-// Cell's destructor runs exactly ONCE (Cell.n returns to 0); no double-free.
+// Swap a Cell out of a Box: take the old Cell, replace with a fresh one, return
+// the old. Both Cells get disposed exactly once (Cell.n returns to 0). The old
+// Cell's disposal occurs via `using var taken` scope-end; the fresh Cell's
+// disposal occurs via Box's destructor (which sees a non-null _v → disposes it
+// once, not twice).
 const char* kDetachOwnedFieldMove =
     "module M; "
     "class Cell public static n: int := 0; "
@@ -980,24 +988,27 @@ const char* kDetachOwnedFieldMove =
     "  private owned _v: Cell; "
     "  public constructor(owned x: Cell) _v := x; end constructor; "
     "  destructor end destructor; "
-    "  public method Take(): owned Cell return move _v; end Take; "
+    "  public method Swap(owned fresh: Cell): owned Cell "
+    "    var old := move _v; _v := fresh; return old; "
+    "  end Swap; "
     "end Box; "
     "class C public static method Main(): int "
     "  do "
-    "    var c := new Cell(); "
-    "    using var b := new Box(move c); "
-    "    using var taken := b.Take(); "
+    "    var c1 := new Cell(); "
+    "    using var b := new Box(move c1); "
+    "    var c2 := new Cell(); "
+    "    using var taken := b.Swap(move c2); "
     "  end; "
-    "  return Cell.n; "                 // 0 — disposed once, owner field skipped
+    "  return Cell.n; "                 // 0 — both disposed once, no double-free
     "end Main; end C;";
 
 BEZEL_TEST(codegen_excdisp_818, detached_field_disposed_once_no_double_free) {
     expectExitAndLeakFree(kDetachOwnedFieldMove, 0);
 }
 
-// The Guide 1 §6 `DetachLog` idiom: `return move _log` with no restoration. The
-// returned value carries the right field (id=5); the owner's destructor does not
-// double-free the moved-out object.
+// The Guide 1 §6 owned-field transfer idiom: swap the current Logfile for a
+// fresh one, returning the old (id=5). Uses the move-and-restore swap pattern
+// (§28.8.1 compliant). The returned value carries the original id (5).
 const char* kDetachLogIdiom =
     "module M; "
     "class Logfile public id: int; "
@@ -1007,11 +1018,13 @@ const char* kDetachLogIdiom =
     "  private owned _log: Logfile; "
     "  public constructor(owned l: Logfile) _log := l; end constructor; "
     "  destructor end destructor; "
-    "  public method DetachLog(): owned Logfile return move _log; end DetachLog; "
+    "  public method SwapLog(owned fresh: Logfile): owned Logfile "
+    "    var old := move _log; _log := fresh; return old; "
+    "  end SwapLog; "
     "end Logger; "
     "class C public static method Main(): int "
     "  using var lg := new Logger(new Logfile(5)); "
-    "  using var d := lg.DetachLog(); "
+    "  using var d := lg.SwapLog(new Logfile(0)); "
     "  return d.id; "                   // 5
     "end Main; end C;";
 

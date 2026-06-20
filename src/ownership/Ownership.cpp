@@ -1064,6 +1064,17 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             }
             return;
         }
+        // §28.8.1 / #825: name not found in local states — this bare identifier
+        // may resolve to an owned FIELD (implicit `this`). If so, clear the
+        // field's moved-from mark: `_field := value` is the unqualified
+        // restoration form, symmetric to `this._field := value` (below). We
+        // check this here (inside the IdentifierExpr branch) because the
+        // outer IdentifierExpr block returns before reaching the named-field
+        // clear that follows. exprIsOwnedFieldRead confirms the sema symbol is
+        // a FieldSymbol with the `owned` modifier. // per §28.8.1, #825
+        if (exprIsOwnedFieldRead(*as.target)) {
+            fieldMovedFrom_[id->name] = false;
+        }
         return;
     }
     // Slice O8: `this.field := value` clears the moved-from mark

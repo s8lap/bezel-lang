@@ -130,11 +130,15 @@ If a caller needs to look at `_transactions` without taking it, return a borrow 
 
 ## 6. `move`: handing an owned field's contents away
 
-To transfer an owned field *out* of its container, use `move`:
+To transfer an owned field *out* of its container, use `move`. Because `move` leaves the field in moved-from state, the **field-restoration rule** (§28.8.1) requires that every path to method exit puts something back. For a *nullable* owned field the idiomatic pattern is to null the field after the move — `null` is a valid restoration for a `Logfile?`:
 
 ```bezel
-method DetachLog(): owned Logfile
-  return move _log;     // _log is now in moved-from state
+// Field declared nullable so that null is a valid post-move restoration.
+// private owned _log: Logfile?;
+method DetachLog(): owned Logfile?
+  var d := move _log;   // _log is now in moved-from state
+  _log := null;         // restore the field — required by §28.8.1
+  return d;
 end DetachLog;
 ```
 
