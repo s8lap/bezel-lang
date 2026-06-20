@@ -981,7 +981,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (v && currentReturnTypeNode_) {
             if (const sema::TypeRef* declRet =
                     ctx_.resolvedType(*currentReturnTypeNode_))
-                v = coerceReturnToNullableValue(v, declRet);
+                v = coerceReturnToNullableValue(
+                    v, declRet,
+                    rs->value && isUnsignedTargetExpr(*rs->value));  // #843
         }
         // §5.1 (#746 R41-H): a numeric return value narrower than the declared
         // return type is implicitly widened (e.g. `return arr[0]` where

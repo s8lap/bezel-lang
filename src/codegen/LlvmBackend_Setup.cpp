@@ -3533,6 +3533,17 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     !returnedStringLocalOwnsPlusOne(ci.exprBody))
                     emitStringRetain(v);
             }
+            // #843 / §7.1: an arrow body returning a nullable VALUE type must
+            // wrap (and widen) the bare value into the `{i8, T}` struct, exactly
+            // as the ReturnStmt path does. Without this `=> 42` for a `long?`
+            // method `ret`'d a bare i32 against the nullable-struct return type
+            // (IR_FAIL).
+            if (v && currentReturnTypeNode_) {
+                if (const sema::TypeRef* declRet =
+                        ctx_.resolvedType(*currentReturnTypeNode_))
+                    v = coerceReturnToNullableValue(
+                        v, declRet, isUnsignedTargetExpr(*ci.exprBody));
+            }
             terminated = emitReturn(fn, v);
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {

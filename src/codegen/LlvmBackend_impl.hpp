@@ -2135,7 +2135,8 @@ private:
     // a reference `?` / non-nullable return is untouched). Defined in
     // LlvmBackend_Layout.cpp (needs nullableValueStructTy / recordStruct).
     llvm::Value* coerceReturnToNullableValue(llvm::Value* v,
-                                             const sema::TypeRef* declRet);
+                                             const sema::TypeRef* declRet,
+                                             bool srcUnsigned = false);
 
     // §22.10 / §23.4: find the indexer PropertySymbol on a TypeSymbol, if any.
     // When `argTy` is non-null, select the OVERLOAD (#774) whose first

@@ -1093,7 +1093,8 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
 
 // fix #568 / §14.1 / §7.1: see the declaration comment in LlvmBackend_impl.hpp.
 llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
-                                                  const sema::TypeRef* declRet) {
+                                                  const sema::TypeRef* declRet,
+                                                  bool srcUnsigned) {
     if (!v || !declRet) return v;
     // Resolve the EFFECTIVE nullable value type. A bare nullable type-parameter
     // (`T?`) resolves through the active monomorphization to its concrete value
@@ -1117,6 +1118,17 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
         return nullableValueNull(nv);
 
     llvm::Type* slotTy = nst->getElementType(1);
+    // #843 / §5.1 / §7: widen/convert a NARROWER numeric return value to the
+    // nullable's inner type before wrapping — `return 42` from a `long?` method
+    // needs the i32 literal i32→i64, `return someInt` from a `double?` method
+    // needs SIToFP. Without this the bare narrower value fell through unwrapped
+    // and emitReturn then `ret`'d it against the `{i8, T}` struct return type
+    // (IR-verify failure). Mirrors the local-decl fix (#842).
+    if ((v->getType()->isIntegerTy() || v->getType()->isFloatingPointTy()) &&
+        v->getType() != slotTy) {
+        llvm::Value* inner = coerceNumericToType(v, slotTy, srcUnsigned);
+        if (inner->getType() == slotTy) return wrapNullableValue(nv, inner);
+    }
     // A bare value matching the value slot — or a layout-equal but differently-
     // named aggregate (the specialized-vs-unspecialized record struct mismatch a
     // monomorphized body induces, #460) — is wrapped. wrapNullableValue
