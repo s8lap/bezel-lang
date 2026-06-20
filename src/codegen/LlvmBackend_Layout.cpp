@@ -190,6 +190,15 @@ bool Emitter::isNullablePrimTy(const sema::TypeRef* rt) {
         case P::Int: case P::UInt:
         case P::Long: case P::ULong:
         case P::Float: case P::Double:
+        // fix #849 / §7.1: `char` is a value type (lowered to i32), so `char?`
+        // is a nullable VALUE type with the {i8 hasValue; i32} tagged-struct
+        // representation, exactly like `int?`. It was previously excluded
+        // (lumped with the reference primitives String/Object) → `char?` was
+        // classified as NEITHER a nullable value NOR a nullable reference, so
+        // its representation was inconsistent across code paths: a null `char?`
+        // interpolated as a NUL byte instead of "null", and `c ?? x` crashed
+        // with a PHI type mismatch (the struct vs the bare i32).
+        case P::Char:
         // per §4.4 / fix #663: decimal is a 16-byte struct value type
         // (§4.4, #521) — not a scalar, but still a nullable value type that
         // needs the {i8 hasValue; %bz.decimal value} tagged-struct representation

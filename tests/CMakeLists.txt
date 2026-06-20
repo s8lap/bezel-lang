@@ -363,6 +363,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_nullable_value_param_846_test.cpp
     codegen/nullable_record_user_equality_848_test.cpp
     codegen/typed_binding_string_pattern_856_test.cpp
+    codegen/nullable_value_format_interp_849_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp

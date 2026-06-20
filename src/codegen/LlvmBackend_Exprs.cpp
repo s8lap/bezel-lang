@@ -156,8 +156,44 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (!ev) continue;
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
-                    pv = emitWithFormatSpec(ev, part.formatSpec,
-                                            ctx_.exprType(*part.expr));
+                    auto* frt = ctx_.exprType(*part.expr);
+                    // §18.5 / §7: a nullable VALUE part WITH a format spec —
+                    // branch on hasValue (absent → "null"; present → apply the
+                    // spec to the UNWRAPPED payload). emitWithFormatSpec expects
+                    // the bare primitive, not the {i8, T} tagged struct: feeding
+                    // it the struct sign-extended a struct (`{i8,i32}` → i64) or
+                    // dropped the spec (#849).
+                    if (frt && isNullableValueTy(frt) &&
+                        ev->getType()->isStructTy()) {
+                        llvm::Value* hasVal = nullablePrimHasValue(ev);
+                        llvm::Value* primVal = nullablePrimValue(ev);
+                        auto* valBB = llvm::BasicBlock::Create(
+                            llvm_, "fs.val", currentFn_);
+                        auto* nullBB = llvm::BasicBlock::Create(
+                            llvm_, "fs.null", currentFn_);
+                        auto* endBB = llvm::BasicBlock::Create(
+                            llvm_, "fs.end", currentFn_);
+                        builder_.CreateCondBr(hasVal, valBB, nullBB);
+                        builder_.SetInsertPoint(valBB);
+                        sema::TypeRef innerTy = *frt;
+                        innerTy.nullable = false;
+                        llvm::Value* vStr = emitWithFormatSpec(
+                            primVal, part.formatSpec, &innerTy);
+                        if (!vStr) vStr = emitValueToString(primVal, &innerTy);
+                        auto* valEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(nullBB);
+                        llvm::Value* nStr = lowerStringLiteral("\"null\"", false);
+                        auto* nullEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        auto* phi = builder_.CreatePHI(ptrTy(), 2);
+                        phi->addIncoming(vStr, valEnd);
+                        phi->addIncoming(nStr, nullEnd);
+                        appendPart(phi);
+                        continue;
+                    }
+                    pv = emitWithFormatSpec(ev, part.formatSpec, frt);
                     if (pv) {
                         appendPart(pv);
                         continue;
