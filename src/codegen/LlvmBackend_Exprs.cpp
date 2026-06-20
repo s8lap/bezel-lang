@@ -7664,6 +7664,35 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     llvm::Value* src = lowerExpr(argE);
     if (!src) return nullptr;
 
+    // §5.3 (#827): an explicit cast of a NULLABLE value to a NON-NULLABLE
+    // primitive target unwraps the nullable first — "casting a nullable to its
+    // non-nullable form requires the value to be non-null at runtime", raising
+    // NullReferenceException when null (mirrors the postfix `!` unwrap). Without
+    // this the {i8, T} nullable struct flowed into the scalar conversion paths
+    // below as if it were a bare T: `int(n:int?)` aborted on a cast<IntegerType>
+    // and `double(n:double?)` emitted `sitofp` on the struct (IR_FAIL). A
+    // nullable TARGET (`long?(x)`, §5.3 "null stays null") keeps the struct and
+    // is handled by its own lifted path, so guard on the result being
+    // non-nullable.
+    {
+        bool targetNullable = false;
+        if (auto* ct = ctx_.exprType(call)) targetNullable = ct->nullable;
+        if (!targetNullable && src->getType()->isStructTy()) {
+            bool isNullableVal = false;
+            if (auto* rt = ctx_.exprType(argE))
+                isNullableVal = isNullableValueTy(rt);
+            auto* st = llvm::cast<llvm::StructType>(src->getType());
+            if (!isNullableVal && st->getNumElements() >= 1 &&
+                st->getElementType(0) == nullablePrimHasValTy())
+                isNullableVal = true;  // robust LLVM-shape fallback
+            if (isNullableVal) {
+                emitGuardThrow(builder_.CreateNot(nullablePrimHasValue(src)),
+                               "NullReferenceException");
+                src = nullablePrimValue(src);
+            }
+        }
+    }
+
     // §5.2 / fix #664: decimal is a 16-byte struct, not a scalar — the
     // generic FP/integer cast paths below would crash on it.  Handle the four
     // decimal conversion directions here, before any scalar-type logic runs.

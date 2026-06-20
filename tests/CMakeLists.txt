@@ -349,6 +349,7 @@ set(BEZEL_TEST_SOURCES
     codegen/owned_collection_trypop_831_test.cpp
     codegen/lambda_inferred_param_operator_829_test.cpp
     codegen/nested_generic_chained_field_828_test.cpp
+    codegen/nullable_primitive_cast_827_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp
