@@ -1150,4 +1150,99 @@ BEZEL_TEST(codegen_excdisp_821, async_iterator_using_var_early_break_disposed) {
     expectExitAndLeakFree(kAsyncIterUsingVarEarlyBreak, 1);
 }
 
+// --------------------------------------------------------------------------
+// [831] §4.5 / §4.7 / §4.9 — the TRY-pop family on owning collections removes
+// the element WITHOUT disposing it (ownership transfers to the out param). The
+// popped element must be disposed exactly once (by the caller, via the out
+// param) and the elements left behind disposed at the collection's scope-end —
+// no leak, no double-free. (The bug was that these calls were not lowered at
+// all; this verifies the transfer is ownership-correct, not just that it runs.)
+// --------------------------------------------------------------------------
+
+// OwnedArray<R>: 2 elements; TryPopFirst transfers one out (disposed via
+// `using var _`); the other disposed at scope-end. Each disposed once → 2.
+const char* kArrTryPopFirstTransfer =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwnedArray<R>(); "
+    "    a.Add(move (new R())); a.Add(move (new R())); "
+    "    var got: R? := null; var ok := a.TryPopFirst(out got); "
+    "    if ok then if got <> null then "
+    "      do using var _ := got; end; end; end; "
+    "  end; "
+    "  return R.count; "                  // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_831, owned_array_try_pop_first_transfer_disposed_once) {
+    expectExitAndLeakFree(kArrTryPopFirstTransfer, 2);
+}
+
+// OwnedLinkedList<R>: same transfer + dispose-once invariant.
+const char* kLListTryPopFirstTransfer =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var l := new OwnedLinkedList<R>(); "
+    "    l.AddLast(move (new R())); l.AddLast(move (new R())); "
+    "    var got: R? := null; var ok := l.TryPopFirst(out got); "
+    "    if ok then if got <> null then "
+    "      do using var _ := got; end; end; end; "
+    "  end; "
+    "  return R.count; "                  // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_831, owned_linkedlist_try_pop_first_transfer_disposed_once) {
+    expectExitAndLeakFree(kLListTryPopFirstTransfer, 2);
+}
+
+// OwnedDictionary<string,R>: TryPopValue transfers one value out (disposed via
+// `using var _`); the other entry disposed at scope-end. Each disposed once → 2.
+const char* kDictTryPopValueTransfer =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var d := new OwnedDictionary<string, R>(); "
+    "    d.Add(\"a\", move (new R())); d.Add(\"b\", move (new R())); "
+    "    var v: R? := null; var hit := d.TryPopValue(\"a\", out v); "
+    "    if hit then if v <> null then "
+    "      do using var _ := v; end; end; end; "
+    "  end; "
+    "  return R.count; "                  // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_831, owned_dict_try_pop_value_transfer_disposed_once) {
+    expectExitAndLeakFree(kDictTryPopValueTransfer, 2);
+}
+
+// TryPopFirst on an EMPTY OwnedArray<R> returns false and disposes nothing
+// extra; the one element added afterwards (never popped) is disposed at
+// scope-end exactly once → 1 (the false path must not corrupt ownership).
+const char* kArrTryPopEmptyThenScopeEnd =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwnedArray<R>(); "
+    "    var got: R? := null; var ok := a.TryPopFirst(out got); "
+    "    a.Add(move (new R())); "
+    "  end; "
+    "  return R.count; "                  // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_831, owned_array_try_pop_empty_false_no_corruption) {
+    expectExitAndLeakFree(kArrTryPopEmptyThenScopeEnd, 1);
+}
+
 }  // namespace

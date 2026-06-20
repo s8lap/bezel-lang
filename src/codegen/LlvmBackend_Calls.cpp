@@ -3123,6 +3123,46 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 {recv, idx, out, builder_.getInt64(esz)});
             return builder_.CreateLoad(retTy, out, "popat.val");
         }
+        // fix #831 / stdlib §4.5: .TryPopFirst(out owned item): bool /
+        // .TryPopLast(out owned item): bool — the TRY analogue of PopFirst /
+        // PopLast on OwnedArray<T>. On a non-empty array write the first/last
+        // element to the out param and remove it WITHOUT disposal (ownership
+        // transfers to the out param), returning true; on empty return false and
+        // leave the out param unchanged. Before this fix it fell through to no
+        // handler and the result was a non-i1 value used as a branch condition →
+        // malformed IR (bug16). Modeled on TryPop + the PopFirst/PopLast pop.
+        if ((m == "TryPopFirst" || m == "TryPopLast") &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Type* outTy = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
+            if (!outAddr) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "trypopfl.len");
+            llvm::Value* nonEmpty = builder_.CreateICmpNE(
+                len, builder_.getInt64(0), "trypopfl.ne");
+            auto* foundBB =
+                llvm::BasicBlock::Create(llvm_, "trypopfl.found", currentFn_);
+            auto* endBB =
+                llvm::BasicBlock::Create(llvm_, "trypopfl.end", currentFn_);
+            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(nonEmpty, foundBB, endBB);
+            builder_.SetInsertPoint(foundBB);
+            llvm::Value* idx = (m == "TryPopFirst")
+                ? builder_.getInt64(0)
+                : builder_.CreateSub(len, builder_.getInt64(1), "trypopfl.idx");
+            // bz_array_pop_at copies the element into *outAddr, then removes the
+            // slot WITHOUT disposal — same non-disposing transfer PopFirst uses.
+            auto* popFn = declareC("bz_array_pop_at",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(popFn,
+                {recv, idx, outAddr, builder_.getInt64(esz)});
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "trypopfl.r");
+            phi->addIncoming(builder_.getTrue(), foundBB);
+            phi->addIncoming(builder_.getFalse(), preBB);
+            return phi;
+        }
         // .Clear()
         if (m == "Clear" && call.args.empty()) {
             // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.134:
@@ -3620,6 +3660,70 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 return builder_.CreateTrunc(asI64, valLlvm);
             }
             return valPtr;  // pointer value (class/string)
+        }
+        // .TryPopValue(k, out owned v): bool — stdlib §4.9 OwnedDictionary.
+        // The TRY analogue of PopValue: get-then-remove WITHOUT disposing the
+        // value (ownership transfers to the out param), but return false and
+        // leave the out param unchanged when the key is absent (instead of
+        // throwing). Combines PopValue's pop runtime call (bz_dict_pop_value_*)
+        // with TryGetValue's out-param decode. Before this fix TryPopValue fell
+        // through to no handler → bz_dict_try_get was never emitted and the
+        // result was a wrong/always-false bool (#831, bug15).
+        if (m == "TryPopValue" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            llvm::Type* outTy = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
+            if (!outAddr) return nullptr;
+            auto* tmpSlot = entryAlloca(ptrTy());
+            llvm::Value* found;
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_pop_value_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
+                                            "tpv.found");
+            } else {
+                auto [kd2, kl2] = strDataLen(k);
+                auto* fn = declareC("bz_dict_pop_value_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                            "tpv.found");
+            }
+            llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot, "tpv.vptr");
+            // Decode the stored void* into *outAddr — mirror TryGetValue: a
+            // struct (record / nullable / decimal) is heap-boxed, copy it back
+            // under a null-guard (null on not-found); a scalar is ptrtoint-
+            // decoded; a pointer (class/string) is stored directly.
+            if (outTy && outTy->isStructTy()) {
+                auto* copyBB = llvm::BasicBlock::Create(llvm_, "tpv.copy", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "tpv.end", currentFn_);
+                llvm::Value* nonNull = builder_.CreateICmpNE(
+                    valPtr, llvm::ConstantPointerNull::get(ptrTy()), "tpv.nn");
+                builder_.CreateCondBr(nonNull, copyBB, endBB);
+                builder_.SetInsertPoint(copyBB);
+                llvm::Value* recVal = builder_.CreateLoad(outTy, valPtr, "tpv.rec");
+                builder_.CreateStore(recVal, outAddr);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+            } else if (outTy && !outTy->isPointerTy()) {
+                llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+                llvm::Value* decoded = asI64;
+                if (outTy->isFloatingPointTy()) {
+                    if (outTy->isDoubleTy())
+                        decoded = builder_.CreateBitCast(asI64, outTy);
+                    else {
+                        llvm::Value* trunc = builder_.CreateTrunc(asI64, i32());
+                        decoded = builder_.CreateBitCast(trunc, outTy);
+                    }
+                } else if (!outTy->isIntegerTy(64)) {
+                    decoded = builder_.CreateTrunc(asI64, outTy);
+                }
+                builder_.CreateStore(decoded, outAddr);
+            } else {
+                builder_.CreateStore(valPtr, outAddr);
+            }
+            return found;
         }
         // .TryGetValue(k, out v): bool
         // (Note: the out-var slot is pre-created by ensureOutVarSlots)
@@ -11980,6 +12084,44 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, out, builder_.getInt64(esz)});
         }
         return builder_.CreateLoad(elemLLTy, out, "llpop.val");
+    }
+    // --- TryPopFirst(out owned item): bool / TryPopLast(out owned item): bool ---
+    // fix #831 / stdlib §4.7: the TRY analogue of PopFirst / PopLast on
+    // OwnedLinkedList<T>. On a non-empty list write the first/last element to the
+    // out param and remove it WITHOUT disposal (ownership transfers to the out
+    // param), returning true; on empty return false and leave the out param
+    // unchanged. Before this fix it fell through → malformed IR (bug16).
+    if ((m == "TryPopFirst" || m == "TryPopLast") &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Type* outTy = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
+        if (!outAddr) return nullptr;
+        auto* cntFn = declareC("bz_llist_count", i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "lltrypop.cnt");
+        llvm::Value* nonEmpty = builder_.CreateICmpNE(
+            cnt, builder_.getInt64(0), "lltrypop.ne");
+        auto* foundBB =
+            llvm::BasicBlock::Create(llvm_, "lltrypop.found", currentFn_);
+        auto* endBB =
+            llvm::BasicBlock::Create(llvm_, "lltrypop.end", currentFn_);
+        llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+        builder_.CreateCondBr(nonEmpty, foundBB, endBB);
+        builder_.SetInsertPoint(foundBB);
+        if (m == "TryPopFirst") {
+            auto* fn = declareC("bz_llist_pop_first",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, outAddr, builder_.getInt64(esz)});
+        } else {
+            auto* fn = declareC("bz_llist_pop_last",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, outAddr, builder_.getInt64(esz)});
+        }
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "lltrypop.r");
+        phi->addIncoming(builder_.getTrue(), foundBB);
+        phi->addIncoming(builder_.getFalse(), preBB);
+        return phi;
     }
     // --- RemoveFirst() ---
     if (m == "RemoveFirst" && call.args.empty()) {

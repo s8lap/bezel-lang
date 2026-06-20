@@ -1,0 +1,120 @@
+// fix #831 / stdlib §4.5 / §4.7 / §4.9: the TRY-pop family on owning
+// collections was not lowered, so the calls either emitted a non-i1 value used
+// as a branch condition (malformed IR — OwnedArray/OwnedLinkedList
+// TryPopFirst/TryPopLast) or returned an always-false bool with no removal
+// (OwnedDictionary TryPopValue).
+//
+//   OwnedArray<T>.TryPopFirst / TryPopLast (out owned item): bool
+//   OwnedLinkedList<T>.TryPopFirst / TryPopLast (out owned item): bool
+//   OwnedDictionary<K,V>.TryPopValue (key, out owned value): bool
+//
+// Each writes the element to the out param and removes it WITHOUT disposal
+// (ownership transfers to the out param), returning true; on empty / absent it
+// returns false and leaves the out param unchanged.
+//
+// Value tests — runJit returns the raw int (kept in 0..255).
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& prog) {
+    auto r = runJit(prog);
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+
+// OwnedArray.TryPopFirst on a non-empty array returns true and writes the first
+// element (was malformed IR: br on a non-i1 value).
+BEZEL_TEST(owned_collection_trypop_831, array_try_pop_first_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  do using var a := new OwnedArray<int>(); a.Add(10); a.Add(20); "
+        "    var item: int := 0; var ok := a.TryPopFirst(out item); "
+        "    if ok then return item; end; return 0; end; return 0; "
+        "end Main; end C;"), 10);
+}
+
+// OwnedArray.TryPopLast writes the last element.
+BEZEL_TEST(owned_collection_trypop_831, array_try_pop_last_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  do using var a := new OwnedArray<int>(); a.Add(10); a.Add(20); "
+        "    var item: int := 0; var ok := a.TryPopLast(out item); "
+        "    if ok then return item; end; return 0; end; return 0; "
+        "end Main; end C;"), 20);
+}
+
+// OwnedArray.TryPopFirst on an empty array returns false and leaves the out
+// param unchanged.
+BEZEL_TEST(owned_collection_trypop_831, array_try_pop_empty_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  do using var a := new OwnedArray<int>(); var item: int := 7; "
+        "    var ok := a.TryPopFirst(out item); "
+        "    if ok then return 1; end; return item; end; return 0; "
+        "end Main; end C;"), 7);
+}
+
+// OwnedLinkedList.TryPopFirst on a non-empty list returns true and writes the
+// first element.
+BEZEL_TEST(owned_collection_trypop_831, linkedlist_try_pop_first_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  do using var l := new OwnedLinkedList<int>(); l.AddLast(7); "
+        "    var item: int := 0; var ok := l.TryPopFirst(out item); "
+        "    if ok then return item; end; return 0; end; return 0; "
+        "end Main; end C;"), 7);
+}
+
+// OwnedLinkedList.TryPopLast on an empty list returns false (out unchanged).
+BEZEL_TEST(owned_collection_trypop_831, linkedlist_try_pop_empty_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  do using var l := new OwnedLinkedList<int>(); var item: int := 9; "
+        "    var ok := l.TryPopLast(out item); "
+        "    if ok then return 1; end; return item; end; return 0; "
+        "end Main; end C;"), 9);
+}
+
+// OwnedDictionary.TryPopValue on a present key returns true and writes the
+// owned value (was always false → the `return 3` miss path).
+BEZEL_TEST(owned_collection_trypop_831, dict_try_pop_value_hit) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C public static method Main(): int "
+        "  do using var d := new OwnedDictionary<string, R>(); "
+        "    d.Add(\"a\", move (new R())); var v: R? := null; "
+        "    var hit := d.TryPopValue(\"a\", out v); "
+        "    if hit then if v <> null then "
+        "      do using var _ := v; end; return 1; end; return 2; end; "
+        "    return 3; end; return 0; "
+        "end Main; end C;"), 1);
+}
+
+// OwnedDictionary.TryPopValue on an absent key returns false (out unchanged).
+BEZEL_TEST(owned_collection_trypop_831, dict_try_pop_value_miss) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C public static method Main(): int "
+        "  do using var d := new OwnedDictionary<string, R>(); "
+        "    d.Add(\"a\", move (new R())); var v: R? := null; "
+        "    var hit := d.TryPopValue(\"zzz\", out v); "
+        "    if hit then return 1; end; return 3; end; return 0; "
+        "end Main; end C;"), 3);
+}
+
+// A primitive-valued OwnedDictionary TryPopValue decodes the scalar value.
+BEZEL_TEST(owned_collection_trypop_831, dict_try_pop_value_int) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  do using var d := new OwnedDictionary<string, int>(); "
+        "    d.Add(\"a\", 42); var v: int := 0; "
+        "    var hit := d.TryPopValue(\"a\", out v); "
+        "    if hit then return v; end; return 0; end; return 0; "
+        "end Main; end C;"), 42);
+}
