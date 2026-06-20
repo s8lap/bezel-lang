@@ -4917,12 +4917,26 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         llvm::isa<llvm::ConstantPointerNull>(v)) {
                         // null → {false, 0}
                         v = llvm::ConstantAggregateZero::get(declaredTy);
-                    } else if (v->getType() == st->getElementType(1)) {
-                        // plain prim → {true, value}
-                        llvm::Value* res = builder_.CreateInsertValue(
-                            llvm::UndefValue::get(declaredTy),
-                            llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
-                        v = builder_.CreateInsertValue(res, v, {1u});
+                    } else {
+                        // #839 / §5.1 / §7: widen/convert a narrower numeric
+                        // initializer to the nullable's inner type BEFORE wrapping
+                        // — `var x: long? := 42` needs the int literal widened
+                        // i32→i64; `var d: double? := someInt` needs SIToFP.
+                        // Without this the exact-type-match check below failed and
+                        // the value was stored UNWIDENED into the {i8, T} slot
+                        // (slotTy was still set to the nullable struct) — a layout
+                        // / value corruption (e.g. long? read back as garbage).
+                        llvm::Value* inner = coerceNumericToType(
+                            v, st->getElementType(1),
+                            init && isUnsignedTargetExpr(*init));
+                        if (inner->getType() == st->getElementType(1)) {
+                            // plain prim → {true, value}
+                            llvm::Value* res = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(declaredTy),
+                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                                {0u});
+                            v = builder_.CreateInsertValue(res, inner, {1u});
+                        }
                     }
                     slotTy = declaredTy;
                 }

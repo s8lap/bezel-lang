@@ -353,6 +353,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nullable_primitive_cast_827_test.cpp
     codegen/owned_set_equality_837_test.cpp
     codegen/owned_array_subscription_838_test.cpp
+    codegen/nullable_init_widening_842_test.cpp
     codegen/closure_loop_capture_823_test.cpp
     codegen/lazy_static_init_720_test.cpp
     codegen/lazy_static_init_generic_796_test.cpp
