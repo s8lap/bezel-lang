@@ -8986,6 +8986,52 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                         scrutTy &&
                         scrutTy->kind == sema::TypeRef::Kind::Primitive &&
                         scrutTy->primitive == rt->primitive && !scrutTy->nullable;
+                    // §19.5 (#856): `var n: string` against a string scrutinee
+                    // that is NOT the statically-present non-nullable case — a
+                    // `string?` (a possibly-null pointer, NOT the {i8,T} tagged
+                    // struct, so it never reached the nullable-VALUE branch above)
+                    // or a boxed `Object`/`Object?` holding a string. It fell into
+                    // the boxed-primitive path below, whose `bz_obj_is_string`
+                    // short-circuit returns FALSE for a real string (correct for
+                    // `var n: int` — a string is not an int — but WRONG for
+                    // `var n: string`). A non-null `string?` IS a `string`. Match
+                    // iff the value is a non-null string.
+                    if (!scrutIsSamePrim &&
+                        rt->primitive == sema::PrimitiveType::String &&
+                        scrut->getType()->isPointerTy()) {
+                        llvm::Value* nonNull = builder_.CreateICmpNE(
+                            scrut, llvm::ConstantPointerNull::get(ptrTy()),
+                            "tb.str.nonnull");
+                        // A statically `string`/`string?` scrutinee: a non-null
+                        // value is necessarily a string, so non-null is the test.
+                        if (scrutTy &&
+                            scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                            scrutTy->primitive == sema::PrimitiveType::String)
+                            return nonNull;
+                        // An `Object`/`Object?` scrutinee: a runtime is-string
+                        // test, guarded by non-null (bz_obj_is_string on null is
+                        // not called).
+                        llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+                        auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                                 {ptrTy(), ptrTy()});
+                        auto* chkBB = llvm::BasicBlock::Create(
+                            llvm_, "tb.str.chk", currentFn_);
+                        auto* joinBB = llvm::BasicBlock::Create(
+                            llvm_, "tb.str.join", currentFn_);
+                        builder_.CreateCondBr(nonNull, chkBB, joinBB);
+                        builder_.SetInsertPoint(chkBB);
+                        llvm::Value* isStr = builder_.CreateICmpNE(
+                            builder_.CreateCall(isStrFn,
+                                                {scrut, vtableTablePtr()}),
+                            builder_.getInt32(0));
+                        llvm::BasicBlock* chkEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(joinBB);
+                        builder_.SetInsertPoint(joinBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2);
+                        phi->addIncoming(builder_.getInt1(false), preBB);
+                        phi->addIncoming(isStr, chkEnd);
+                        return phi;
+                    }
                     // #746 / §19.3/§19.5: when the scrutinee is a BOXED reference
                     // (`Object`/`Object?` — `scrut` is a box pointer, not the
                     // primitive itself), the typed binding is a RUNTIME type-test
