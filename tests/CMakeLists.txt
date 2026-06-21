@@ -247,6 +247,7 @@ set(BEZEL_TEST_SOURCES
     sema/with_expression_target_validation_875_test.cpp  # fix #875-#878: §9.5/§5.1 validate with-expression targets (type, existence, method, computed-property)
     sema/base_abstract_call_874_test.cpp                 # fix #874: §12.3/§12.5 reject base.M() call to abstract base method
     sema/pascalcase_type_aliases_884_test.cpp            # fix #884: §3.4 PascalCase System type-name aliases (String/Int32/…) resolve
+    sema/generic_inconsistent_type_arg_896_test.cpp     # fix #896: §14.1 inconsistent type-arg inference (Merge<T>(int?,bool?)) rejected cleanly — no crash
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp

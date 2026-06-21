@@ -213,35 +213,48 @@ namespace {
 // argument still binds T = int? and is correctly rejected by the constraint
 // check. ctx is used to allocate a stable non-nullable TypeRef in the peel
 // case. // per §14.1
+// §14.1 / #896: `conflicts` (optional) receives the name of any type parameter
+// whose second-occurrence inferred binding is DIFFERENT from the first-occurrence
+// binding (e.g. T already bound to int, now seeing bool from a second T? arg).
+// The caller emits a §14.1 compile error and aborts the call. Without this
+// detection the first-binding-wins logic silently drops the conflict, and codegen
+// later produces a PHINode mixing int and bool → SIGABRT.
 void unifyArgSubst(
     const ast::Type* pt, TypeRef* argTy,
     const std::unordered_set<std::string_view>& paramNames,
     std::unordered_map<std::string_view, TypeRef*>& argSubst,
-    SemaContext& ctx) {
+    SemaContext& ctx,
+    std::unordered_set<std::string_view>* conflicts = nullptr) {
     if (!pt || !argTy) return;
     if (pt->kind == ast::TypeKind::Named && pt->name &&
         pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
         std::string_view nm = pt->name->parts[0];
+        // Compute the would-be-bound TypeRef applying the same §14.1/#850
+        // nullable-peeling rule used on the first occurrence.
+        TypeRef* bound = argTy;
+        if (pt->nullable && argTy->nullable) {
+            if (argTy->kind == TypeRef::Kind::Primitive) {
+                bound = ctx.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
+            } else {
+                TypeRef* nn = ctx.makeTypeRef();
+                *nn = *argTy;
+                nn->nullable = false;
+                bound = nn;
+            }
+        }
         if (!argSubst.count(nm)) {
-            TypeRef* bound = argTy;
             // §14.1 / #850: peel the nullable when the parameter declares `T?`
             // and the argument is also nullable — infer the non-nullable T so
             // `where T: value` and the non-nullable return type `T` work
             // correctly. A bare `T` parameter (pt->nullable == false) with a
             // nullable argument is left as-is and rejected downstream.
-            if (pt->nullable && argTy->nullable) {
-                if (argTy->kind == TypeRef::Kind::Primitive) {
-                    bound = ctx.primitiveTypeRef(argTy->primitive, /*nullable=*/false);
-                } else {
-                    // Named (record / enum) value type: allocate a ctx-owned
-                    // non-nullable copy so the pointer remains stable.
-                    TypeRef* nn = ctx.makeTypeRef();
-                    *nn = *argTy;
-                    nn->nullable = false;
-                    bound = nn;
-                }
-            }
             argSubst[nm] = bound;
+        } else if (conflicts && !typeRefEqual(argSubst[nm], bound)) {
+            // §14.1 / #896: existing binding for `nm` disagrees with what this
+            // argument would bind — record the conflict so the caller can emit a
+            // clean compile error instead of silently accepting the inconsistency
+            // and letting codegen crash (PHINode type mismatch).
+            conflicts->insert(nm);
         }
         return;
     }
@@ -250,7 +263,7 @@ void unifyArgSubst(
         argTy->genericArgs.size() == pt->genericArgs.size()) {
         for (std::size_t i = 0; i < pt->genericArgs.size(); ++i)
             unifyArgSubst(pt->genericArgs[i].get(), argTy->genericArgs[i],
-                          paramNames, argSubst, ctx);
+                          paramNames, argSubst, ctx, conflicts);
     }
 }
 
@@ -850,12 +863,97 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     for (const auto& gp : md->genericParams)
                         paramNames.insert(gp.name);
                     std::unordered_map<std::string_view, TypeRef*> argSubst;
+                    // §14.1 / #896: collect type-param names whose inference
+                    // produces a conflict (two args would bind the same T to
+                    // different types). Passing &inferConflicts to unifyArgSubst
+                    // lets it detect the second-binding mismatch instead of
+                    // silently dropping it (first-binding-wins would otherwise
+                    // let codegen mix int and bool in a PHINode → SIGABRT).
+                    std::unordered_set<std::string_view> inferConflicts;
                     for (std::size_t pi = 0;
                          pi < md->params.size() && pi < ce.args.size(); ++pi) {
                         if (!md->params[pi].type || !ce.args[pi].value) continue;
                         TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                        // §14.1 / #885/#886: skip null-literal arguments during
+                        // type-parameter inference — a null literal is typed as
+                        // nullable Object (the sema sentinel for an uncontexted
+                        // null), which carries no concrete type information.
+                        // Binding T=Object from null would block the correct
+                        // binding from a subsequent concrete argument.
+                        // Mirror the same skip that codegen's lowerCall performs.
+                        if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                            argTy->primitive == PrimitiveType::Object &&
+                            argTy->nullable)
+                            continue;
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, argSubst, ctx_);
+                                      paramNames, argSubst, ctx_,
+                                      &inferConflicts);
+                    }
+                    // §14.1 / #896: if any type parameter was bound to two
+                    // incompatible types across the arguments, emit a compile
+                    // error and abandon codegen for this call. Report all
+                    // conflicting params (there is rarely more than one).
+                    if (!inferConflicts.empty()) {
+                        // Build a readable type-name for a TypeRef (matching the
+                        // style used by the §14.2 argNameOf lambda above).
+                        // Spell a resolved TypeRef as a source-level name for
+                        // the error message. Mirrors the §14.2 argNameOf lambda
+                        // above but also handles the primitive case (where
+                        // declaration is always null). per §14.1 / #896.
+                        auto spellTR = [&](const TypeRef* a) -> std::string {
+                            if (!a) return "?";
+                            if (a->kind == TypeRef::Kind::Primitive) {
+                                using P = PrimitiveType;
+                                const char* n = "?";
+                                switch (a->primitive) {
+                                    case P::Bool:   n = "bool";    break;
+                                    case P::Char:   n = "char";    break;
+                                    case P::String: n = "string";  break;
+                                    case P::Byte:   n = "byte";    break;
+                                    case P::SByte:  n = "sbyte";   break;
+                                    case P::Short:  n = "short";   break;
+                                    case P::UShort: n = "ushort";  break;
+                                    case P::Int:    n = "int";     break;
+                                    case P::UInt:   n = "uint";    break;
+                                    case P::Long:   n = "long";    break;
+                                    case P::ULong:  n = "ulong";   break;
+                                    case P::Float:  n = "float";   break;
+                                    case P::Double: n = "double";  break;
+                                    case P::Decimal: n = "decimal"; break;
+                                    case P::Object: n = "Object";  break;
+                                    default:        n = "?";       break;
+                                }
+                                std::string s(n);
+                                if (a->nullable) s += '?';
+                                return s;
+                            }
+                            if (a->kind == TypeRef::Kind::Named) {
+                                std::string s;
+                                if (a->declaration)
+                                    s = std::string(a->declaration->name);
+                                else if (a->astNode && a->astNode->name &&
+                                         !a->astNode->name->parts.empty())
+                                    s = std::string(a->astNode->name->parts.back());
+                                else
+                                    s = "?";
+                                if (a->nullable) s += '?';
+                                return s;
+                            }
+                            return "?";
+                        };
+                        for (std::string_view cnm : inferConflicts) {
+                            // argSubst holds the FIRST (winning) binding.
+                            const TypeRef* first =
+                                argSubst.count(cnm) ? argSubst.at(cnm) : nullptr;
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "inconsistent type-argument inference: type "
+                                "parameter `" + std::string(cnm) +
+                                "` cannot be bound to both `" + spellTR(first) +
+                                "` and a different type — all arguments for a "
+                                "type parameter must agree (§14.1, #896)");
+                        }
+                        return;  // skip constraint check + codegen for this call
                     }
                     // #729: enforce the method's where-constraints on the
                     // argument-inferred type args (only when no explicit type
