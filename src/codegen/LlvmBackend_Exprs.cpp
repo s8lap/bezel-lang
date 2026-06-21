@@ -8770,6 +8770,18 @@ llvm::Value* Emitter::buildRecordValue(
                 }
                 auto idxIt = fieldIndex_.find(fields[i]);
                 if (idxIt == fieldIndex_.end()) return nullptr;
+                // §5/§6/§9.1: widen/narrow a numeric positional argument to the
+                // field's storage type before the store — e.g. an `int` literal
+                // `10` (i32) into a `long` field (i64). With opaque pointers
+                // `store i32 into ptr` silently writes only the low 4 bytes,
+                // leaving the field's upper bits as uninitialized alloca garbage
+                // (wrong value / a spurious OverflowException when the garbage is
+                // later read). The CLASS positional-field path already coerces;
+                // mirror it here. A no-op for the nullable-value struct handled
+                // above and for already-matching types.
+                llvm::Type* fieldLlvmTy = st->getElementType(idxIt->second);
+                v = coerceNumericToType(
+                    v, fieldLlvmTy, isUnsignedTargetExpr(*fieldArg[i]->value));
                 builder_.CreateStore(
                     v, builder_.CreateStructGEP(st, slot, idxIt->second));
             }
