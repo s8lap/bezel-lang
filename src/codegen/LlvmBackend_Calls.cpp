@@ -3747,6 +3747,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
             if (!outAddr) return nullptr;
             auto* tmpSlot = entryAlloca(ptrTy());
+            // §28.11, #891: pre-null tmpSlot so that on the key-not-found
+            // (false) path — where bz_dict_pop_value_* does NOT write *out —
+            // the subsequent load yields null rather than uninitialized garbage.
+            // Without this, a nullable class out-param receives a garbage
+            // pointer and v?.Dispose() dereferences it → SIGSEGV.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                  tmpSlot);
             llvm::Value* found;
             if (keyTy) {
                 auto* fn = declareC("bz_dict_pop_value_gen", i1(),
@@ -3812,6 +3819,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // issue D4: for a record value the void* is the heap box; copy the
             // record bytes from the box into the out slot.
             auto* tmpSlot = entryAlloca(ptrTy());
+            // §28.11, #891: pre-null tmpSlot so that on the key-not-found
+            // (false) path — where bz_dict_try_get_* does NOT write *out —
+            // the subsequent load yields null rather than uninitialized garbage.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                  tmpSlot);
             llvm::Value* found;
             if (keyTy) {
                 auto* fn = declareC("bz_dict_try_get_gen", i1(),

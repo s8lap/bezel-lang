@@ -381,6 +381,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nested_catch_rethrow_866_test.cpp
     codegen/out_owned_writeback_889_test.cpp   # fix #889: §28.11 Try*(out owned)/out using var writeback — write the moved-out owned element back + dispose exactly once
     codegen/out_using_var_elem_type_890_test.cpp  # fix #890: §28.11 derive element type for out using var from owning-collection Try* receivers
+    codegen/trypopvalue_missing_key_891_test.cpp  # fix #891: §28.11 TryPopValue(missing) — pre-null tmpSlot so out param is null (not garbage) on not-found path
     codegen/string_gethashcode_882_test.cpp
     codegen/generic_nullable_null_arg_885_886_test.cpp
     codegen/bare_method_value_880_881_test.cpp
