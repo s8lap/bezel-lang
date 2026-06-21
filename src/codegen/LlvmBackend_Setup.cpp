@@ -3375,6 +3375,23 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return;
 
+    // #817 / §14.2: mark this as an unspecialized generic TEMPLATE body when the
+    // method belongs to a generic class or is itself a generic method. emitReturn
+    // consults this to neutralize an irreconcilable placeholder-vs-concrete
+    // return-type mismatch in the (dead) template — see emittingGenericTemplateBody_.
+    {
+        bool genericTemplate = false;
+        if (ms->parent && ms->parent->decl) {
+            if (auto* ptd = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl))
+                if (!ptd->genericParams.empty()) genericTemplate = true;
+        }
+        if (!genericTemplate && ms->decl) {
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                if (!md->genericParams.empty()) genericTemplate = true;
+        }
+        emittingGenericTemplateBody_ = genericTemplate;
+    }
+
     // §29.3 / §30.7 / #442: detect iterator and async-iterator methods BEFORE
     // creating the entry block (emitIteratorMethod / emitAsyncIteratorMethod
     // handle their own entry block + bindParameters).
@@ -4850,6 +4867,19 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
                 }
             }
         }
+        // #817 / §14.2: in an UNSPECIALIZED generic TEMPLATE body, a `T`-typed
+        // field/local read takes the i32/`{i8,i32}` placeholder layout, which can
+        // be irreconcilable with a CONCRETE signature return type (e.g.
+        // `GetConcrete(): Counter?` returning a `T?` field → `{i8,i32}` value vs a
+        // `ptr` return). CreateRet requires an exact type match, so this would be
+        // malformed IR rejected by the verifier — even though the template is dead
+        // code (every call binds the substitution and routes to a specialization,
+        // where this flag is false and the layouts agree). Substitute a type-safe
+        // `ret null` for the dead template. Gated on the flag so a genuine
+        // return-coercion bug in a non-generic method (or a live specialization)
+        // still fails loudly at the verifier rather than being silently nulled.
+        if (emittingGenericTemplateBody_ && v && v->getType() != retTy)
+            v = llvm::Constant::getNullValue(retTy);
         builder_.CreateRet(v ? v : llvm::Constant::getNullValue(retTy));
     }
     return true;

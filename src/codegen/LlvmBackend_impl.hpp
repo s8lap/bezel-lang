@@ -286,6 +286,7 @@ public:
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
+        emittingGenericTemplateBody_ = false;  // #817: don't leak into ctors/etc.
         for (auto& [sym, fn] : ctorFns_) {
             emitConstructorBody(sym, fn);
         }
@@ -986,6 +987,19 @@ private:
     // carries the ORIGINAL MethodSymbol* being specialized so lowerWith can find
     // the parent TypeSymbol without requiring specFn to be in methodFns_.
     sema::MethodSymbol* currentSpecMethodSymbol_ = nullptr;
+
+    // #817 / §14.2: true ONLY while emitting the UNSPECIALIZED generic TEMPLATE
+    // body of a generic-class / generic method (emitFunctionBody). The template
+    // is never the call target — every call binds the concrete substitution and
+    // routes to a specialization — but it must still IR-verify. Its `T`-typed
+    // field/local reads take the i32/`{i8,i32}` placeholder layout, which can
+    // disagree with a CONCRETE signature return type (e.g. `GetConcrete():
+    // Counter?` returning a `T?` field → `{i8,i32}` value vs `ptr` return).
+    // When set, emitReturn replaces an irreconcilable return-type mismatch with a
+    // type-safe `ret null` so the (dead) template verifies, without masking real
+    // return-coercion bugs in non-generic methods or in the live specializations
+    // (where this flag is false). Saved/restored false around a specialization.
+    bool emittingGenericTemplateBody_ = false;
 
     // #383 / §28.8.1: true while emitting a class's compiler-generated Dispose
     // (a destructor body). A `using var u := move this._f;` inside a destructor

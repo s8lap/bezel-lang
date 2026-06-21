@@ -10437,6 +10437,12 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // the duration of the body so lowerWith can use it as a fallback.
     sema::MethodSymbol* savedSpecMs = currentSpecMethodSymbol_;
     currentSpecMethodSymbol_ = ms;
+    // #817: a specialization is the LIVE call target with the substitution
+    // active, so its layouts match its signature — the template-only return
+    // backstop must be OFF here (it may be ON because this specialization is
+    // being built lazily while a generic TEMPLATE body is mid-emission).
+    bool savedGenTemplate = emittingGenericTemplateBody_;
+    emittingGenericTemplateBody_ = false;
 
     currentFn_ = specFn;
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", specFn);
@@ -10511,6 +10517,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     disposeStack_ = std::move(savedDispose);
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
+    emittingGenericTemplateBody_ = savedGenTemplate;  // #817
 
     return specFn;
 }
