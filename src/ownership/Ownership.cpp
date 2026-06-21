@@ -508,14 +508,28 @@ FlowState MethodOwnership::runDataflow(
         };
         auto foldPred = [&](const flow::CFGBlock* p, bool dischargeEdge) {
             if (!evaluated.count(p)) return;
+            // §28.3 / #892: for a loop-header → after-block skip edge, the
+            // condition expression was NOT executed (TryPop returned false and
+            // did not write the out-owned local), so the correct state on this
+            // edge is the PRE-CONDITION state captured in loopSkipExitState_.
+            // Use it when available; otherwise fall back to exitState[p] (which
+            // is the post-condition state and would wrongly mark item Owned).
+            // For back-edges and all non-skip edges, exitState[p] is correct.
+            const bool skipEdge = isLoopSkipEdge(p, b);
+            auto skipIt = skipEdge ? loopSkipExitState_.find(p)
+                                   : loopSkipExitState_.end();
+            const FlowState& predFlow =
+                (skipEdge && skipIt != loopSkipExitState_.end())
+                    ? skipIt->second
+                    : exitState[p];
             // §28.8.1 (#867): merge this predecessor's field-moved-from facts
             // (OR). Done for every evaluated predecessor regardless of edge
             // kind — field facts are not discharged on exception/completion
             // edges (see comment above).
-            joinFieldsInto(inFields, exitState[p].fields);
+            joinFieldsInto(inFields, predFlow.fields);
             const bool loopEdge =
-                backEdges.count({p, b}) != 0 || isLoopSkipEdge(p, b);
-            const BlockState& peRaw = exitState[p].locals;
+                backEdges.count({p, b}) != 0 || skipEdge;
+            const BlockState& peRaw = predFlow.locals;
             BlockState peDischarged;
             if (dischargeEdge)
                 peDischarged =
@@ -732,6 +746,35 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // already extracted that control flow).
     for (const ast::Stmt* s : block.stmts) {
         if (s) visitStmt(*s);
+    }
+    // §28.3 / #892: process the branch block's CONDITION expression through
+    // handleDischarge so that out-owned argument marking (markOutOwnedArgs /
+    // §28.3 §28.11 #860) and move recording (recordMovesIn) happen for a
+    // call used as an if/while condition.  Without this a Try*(out owned item)
+    // call in the condition never invokes markOutOwnedArgs, so the receiving
+    // local is never marked Owned and the §28.3 discharge check does not fire
+    // when item is later dropped — a silent leak.
+    //
+    // The condition evaluates on EVERY iteration of a while loop and on the
+    // if-test for an if statement. The out-owned marking must propagate into
+    // the body (true edge). For the FALSE edge (skip, after the loop):
+    // the TryPop call returned false so it did NOT write to `item` — the
+    // local carries the same state as BEFORE the condition ran (e.g. null /
+    // Disposed from the prior iteration's body). We capture the pre-condition
+    // state for loop headers in loopSkipExitState_ so computeEntry can use
+    // it when folding the header→after skip edge, giving the false edge the
+    // correct pre-condition state instead of the Owned post-condition state.
+    // For if/elif conditions (isLoopHeader=false) the false edge IS the else
+    // branch and sema already models `item?.Dispose()` covering both paths.
+    if (block.kind == flow::CFGBlock::Kind::Branch && block.condition) {
+        if (block.isLoopHeader) {
+            // Capture the pre-condition state for the skip edge.  Both the
+            // locals map and the field-moved-from facts are saved so the
+            // skip-edge entry faithfully represents the state when TryPop
+            // returned false (did NOT write item). // per §28.3, #892
+            loopSkipExitState_[&block] = FlowState{states_, fieldMovedFrom_};
+        }
+        handleDischarge(*block.condition);
     }
 }
 

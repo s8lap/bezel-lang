@@ -139,6 +139,20 @@ private:
     FieldMovedFrom fieldMovedFrom_;
     std::unordered_map<std::string_view, SourceLocation> fieldMoveLoc_;
 
+    // §28.3 / #892: for loop-header Branch blocks, the ownership state
+    // BEFORE the condition expression is evaluated. A while condition
+    // `s.TryPop(out owned item)` marks `item` Owned in the post-condition
+    // exit state (which flows to the body-entry on the true edge). But on
+    // the false (skip) exit — when TryPop returns false and `item` was not
+    // written — the local should still carry its pre-condition state (e.g.
+    // null/Disposed from the prior body iteration), not the Owned state that
+    // the post-condition exit has. This map stores, for each loop header,
+    // the locals (and fields) state captured just before processBlock calls
+    // handleDischarge on the condition so computeEntry can use it when
+    // folding the header→after skip edge. Populated by processBlock; consumed
+    // by computeEntry's foldPred lambda. // per §28.3, #892
+    std::unordered_map<const flow::CFGBlock*, FlowState> loopSkipExitState_;
+
     // Slice O3b: the loop fixpoint re-processes loop bodies until the
     // per-block states stabilize. The transfer functions emit diagnostics
     // as a side effect; running them while iterating to the fixpoint would

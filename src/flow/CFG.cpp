@@ -405,6 +405,13 @@ private:
     CFGBlock* visitWhile(const ast::WhileStmt& s, CFGBlock* from) {
         CFGBlock* header = cfg_.makeBlock(CFGBlock::Kind::Branch);
         header->isLoopHeader = true;
+        // §28.3 / #892: store the while condition on the header block so
+        // processBlock can process it through handleDischarge (out-owned
+        // marking + move recording). Mirrors what visitBranch does for
+        // if/elif conditions. The nullEdgeName discriminator in computeEntry
+        // already skips loop-header blocks (`isLoopHeader` guard), so this
+        // additive store does not affect null-edge discrimination.
+        header->condition = s.condition.get();
         // Async-readiness 3a: the while-condition is re-evaluated each pass
         // in the header; record any `await` in it as a suspend site there.
         recordAwaitsInExpr(cfg_, header, s.condition.get());

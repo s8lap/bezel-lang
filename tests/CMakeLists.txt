@@ -238,6 +238,7 @@ set(BEZEL_TEST_SOURCES
     sema/field_restoration_path_sensitive_867_test.cpp # fix #867: §28.8.1 field-restoration check is path-sensitive (partial restore rejected)
     sema/owned_iter_var_discharge_834_test.cpp        # fix #834: §29.2 owned iteration variable of an OwnedEnumerable/OwnedAsyncEnumerable for-loop must be discharged
     sema/out_owned_transfer_860_test.cpp              # fix #860: §28.3/§28.11 model the caller-side out-owned transfer — Try*(out owned item) receives ownership; dropping it leaks
+    sema/out_owned_condition_892_test.cpp             # fix #892: §28.3 mark out-owned Try* recipients owned in if/while conditions — drop accepted (leak) before fix
     sema/nullable_field_narrowing_862_test.cpp        # fix #862: §7.4 reject nullable-field member access — fields are not narrowable
     sema/compound_assign_operator_result_851_test.cpp # fix #851: §25.1 reject compound op whose overload result differs from LHS
     sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range

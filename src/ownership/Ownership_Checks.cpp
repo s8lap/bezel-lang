@@ -349,7 +349,20 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         for (const auto& a : call->args) {
             if (!a.value) { ++pos; continue; }
             bool consumed = false;
-            if (a.modifier == "owned") {
+            // §28.3 / §28.11 (#860 / #892): an `out owned` arg is a WRITE
+            // target — the call deposits an owned value into the local; it does
+            // NOT read the local. Skip read-checking it (a stale Disposed state
+            // from a prior loop iteration would otherwise produce a spurious
+            // use-after-dispose warning). The actual Owned marking is done by
+            // markOutOwnedArgs at the end of this CallExpr arm; detect the
+            // out-owned position here via the call-site modifier and the formal
+            // parameter / builtin dispatch so `consumed=true` suppresses the
+            // unwanted read. User `out owned` is reliable; `builtinOutOwnedArg`
+            // covers builtin TryPop / TryDequeue / etc. // per §28.3, §28.11
+            if (a.modifier == "out owned" ||
+                builtinOutOwnedArg(call->callee.get(), pos)) {
+                consumed = true;  // write target: skip read-check; markOutOwnedArgs handles it
+            } else if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         a.value.get())) {
                     // §28.8 (#395): an `owned`-modified arg must be owned, not
