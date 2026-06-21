@@ -703,6 +703,25 @@ FlowState MethodOwnership::runDataflow(
 }
 
 void MethodOwnership::processBlock(const flow::CFGBlock& block) {
+    // §29.2 (#834) "Iterator yield ownership": when this block is the
+    // body-entry of a `for`/`await for` loop whose iterable is an owning
+    // enumerable (`OwnedEnumerable<T>` / `OwnedAsyncEnumerable<T>`), the
+    // iteration variable `x` is a *plain owned local* — "owned and must be
+    // discharged inside the loop body. Falling off the body without
+    // discharging is a compile error." Seed `x` as Owned at the body entry of
+    // EACH iteration (this runs once per fixpoint pass on the body-entry
+    // block, overwriting any state carried around the back-edge — the value is
+    // freshly bound each iteration per §29.2). The existing §28.3 owned-local
+    // discharge machinery then carries it through the body: an undischarged
+    // `x` survives Owned to the back-edge / break / continue / return and is
+    // reported by the end-of-method undischarged-owned check, exactly as a
+    // body-declared owned local is. A BORROWING for-loop (Array<T> /
+    // IEnumerable<T>, range, inline array, string) is NOT seeded — its
+    // iteration variable is a borrow with no discharge obligation (§29.2:
+    // default iteration is borrowing), so ordinary for-loops are unaffected.
+    if (block.forBodyEntry) {
+        seedOwnedIterVar(*block.forBodyEntry);
+    }
     // Each CFG block holds only straight-line statements plus the leaf
     // terminators break / continue / return / throw. The existing
     // per-statement transfer functions handle them. As of O11-real the CFG
@@ -714,6 +733,62 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     for (const ast::Stmt* s : block.stmts) {
         if (s) visitStmt(*s);
     }
+}
+
+// §29.2 (#834): seed the iteration variable of `fs` as Owned when the loop's
+// iterable resolves to an owning enumerable. The iteration variable's
+// LocalSymbol was created by ExprTypecheck with `decl == &fs` (the ForStmt);
+// find it and set its dataflow state to Owned with the ForStmt as the
+// obligation origin (so the undischarged diagnostic points at the loop). A
+// no-op for a borrowing iterable, a value/range iterable, or when no iteration
+// variable symbol exists (`for var _ in ...` is rejected earlier; a missing
+// symbol simply seeds nothing).
+void MethodOwnership::seedOwnedIterVar(const ast::ForStmt& fs) {
+    if (!iterableIsOwningEnumerable(fs)) return;
+    sema::LocalSymbol* iterSym = findForLoopVarSymbol(fs);
+    if (!iterSym) return;
+    LocalOwnership lo;
+    lo.state = OwnershipState::Owned;
+    lo.implicitDischarge = false;
+    // The obligation originates at the loop: a fresh owned value is bound to
+    // `x` each iteration (§29.2). Anchor the diagnostic at the ForStmt span.
+    lo.obligationOrigin = &fs;
+    states_[iterSym] = lo;
+}
+
+// §29.2 (#834): true when the for-loop's iterable has static type
+// `OwnedEnumerable<T>` or `OwnedAsyncEnumerable<T>` (the owning-enumerator
+// desugaring path). Detected by the resolved iterable type's name-head,
+// mirroring the owned-call classification at producerState (which name-checks
+// `OwnedEnumerable` among the always-owned handle heads). A Named TypeRef
+// carries its name either on the AST node (`astNode->name->parts`) or, for an
+// imported type, in `importedName`; check both. Any other iterable kind
+// (Array<T>/IEnumerable<T> borrowing, range, inline array, string, span)
+// returns false, so its iteration variable is left a borrow with no discharge
+// obligation.
+bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    const sema::TypeRef* tt = ctx_.exprType(*fs.iterable);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named) return false;
+    std::string_view head;
+    if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
+        head = tt->astNode->name->parts.front();
+    else if (!tt->importedName.empty())
+        head = tt->importedName;
+    return head == "OwnedEnumerable" || head == "OwnedAsyncEnumerable";
+}
+
+// §29.2 (#834): find the LocalSymbol ExprTypecheck created for `fs`'s
+// iteration variable. Sema anchors that symbol on the ForStmt
+// (`lsym->decl = fs`), so it is the LocalSymbol whose `decl` is `&fs`.
+sema::LocalSymbol* MethodOwnership::findForLoopVarSymbol(
+    const ast::ForStmt& fs) {
+    for (const auto& s : ctx_.symbols()) {
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s.get())) {
+            if (ls->decl == &fs) return ls;
+        }
+    }
+    return nullptr;
 }
 
 void MethodOwnership::visitStmt(const ast::Stmt& s) {

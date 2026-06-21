@@ -413,12 +413,36 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             }
             if (!consumed) {
+                // §30.5 / §30.4 (#834): an `await <bound owned `OwnedTask`
+                // local>` ARGUMENT consumes its operand task local — an
+                // `OwnedTask<T>` is single-consumer and the await disposes it
+                // (the implicit task-disposal IS the discharge). This is the
+                // §29.2 `for var task in src.Drain() do results.Add(await task)
+                // end` drain-and-await pattern (stdlib §2.13 `WhenAllOwned<T>`):
+                // the owned iteration variable `task` is discharged by the await
+                // inside the `Add(owned item)` owned-consuming context. Without
+                // recording the consume here the await arg only reached
+                // checkRead (which does not consume), so `task` was wrongly
+                // reported as dropped without disposal at the loop's end. Gated
+                // on the operand's STATIC TYPE being `OwnedTask` rather than on
+                // awaitTaskKind == PatternB, which cannot prove the result type
+                // argument T is a concrete class inside a generic body; the
+                // operand consume does not depend on the result kind.
+                // recordAwaitOperandConsume itself acts only on a bare owned
+                // local, so a borrow/parameter operand is unaffected.
+                // // per §30.5, §30.4, §29.2
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                        a.value.get());
+                    un && isAsync_ && un->op == "await" && un->operand &&
+                    operandIsOwnedTaskType(*un->operand)) {
+                    recordAwaitOperandConsume(*un->operand, un->span.begin);
+                }
                 // #835 / §28.8: an argument that is itself a `new`/call (a nested
                 // producer, e.g. `f(new Box(_c))`) must have ITS OWN owned-argument
                 // transfers checked — recurse so a borrow flowing into the inner
                 // producer's `owned` parameter is rejected, exactly as a top-level
                 // `new Box(_c)` is. Otherwise a plain read.
-                if (dynamic_cast<const ast::NewExpr*>(a.value.get()) ||
+                else if (dynamic_cast<const ast::NewExpr*>(a.value.get()) ||
                     dynamic_cast<const ast::CallExpr*>(a.value.get()))
                     handleDischarge(*a.value);
                 else
@@ -2779,6 +2803,26 @@ void MethodOwnership::checkAwaitSitesExpr(
     }
     // A LambdaExpr is its own async scope (§30.6) — its awaits are checked when
     // its body is analysed, not here. Other leaf expressions hold no awaits.
+}
+
+// §30.5 / §30.4 (#834): true when `e`'s static type is an `OwnedTask<...>`
+// (name-head), the single-consumer owning task whose await consumes it. Used
+// to record the operand consume of an `await task` independently of the
+// result-kind gate in awaitTaskKind, which cannot see through a generic result
+// type argument T (the `WhenAllOwned<T>` drain-and-await pattern). A Named
+// TypeRef carries its name on the AST node or, for an imported/generic
+// argument, in importedName; check both.
+bool MethodOwnership::operandIsOwnedTaskType(const ast::Expr& e) {
+    const sema::TypeRef* ot = ctx_.exprType(e);
+    if (!ot || ot->kind != sema::TypeRef::Kind::Named || ot->nullable)
+        return false;
+    std::string_view head;
+    if (ot->astNode && ot->astNode->name &&
+        ot->astNode->name->parts.size() == 1)
+        head = ot->astNode->name->parts.front();
+    else if (!ot->importedName.empty())
+        head = ot->importedName;
+    return head == "OwnedTask";
 }
 
 void MethodOwnership::recordAwaitOperandConsume(

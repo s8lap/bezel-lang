@@ -441,6 +441,10 @@ private:
         // header (the block the desugaring re-evaluates each pass).
         if (s.isAwait) cfg_.recordAwaitSite(header, &s);
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
+        // §29.2 (#834): tag the body-entry block with its originating ForStmt
+        // so the ownership pass can seed an owned iteration variable there when
+        // the iterable is an owning enumerable ("Iterator yield ownership").
+        bodyEntry->forBodyEntry = &s;
         CFGBlock* after = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, header);
         cfg_.addEdge(header, bodyEntry);

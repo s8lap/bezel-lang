@@ -482,6 +482,19 @@ private:
 
     sema::LocalSymbol* findLocalSymbol(const ast::LocalDecl& ld);
 
+    // §29.2 (#834): seed the iteration variable of `fs` as Owned at the loop
+    // body entry when its iterable resolves to an owning enumerable, so the
+    // §28.3 discharge check rejects an undischarged iteration variable.
+    void seedOwnedIterVar(const ast::ForStmt& fs);
+
+    // §29.2 (#834): true when `fs`'s iterable has static type
+    // `OwnedEnumerable<T>` / `OwnedAsyncEnumerable<T>` (owning iteration).
+    bool iterableIsOwningEnumerable(const ast::ForStmt& fs);
+
+    // §29.2 (#834): the LocalSymbol ExprTypecheck created for `fs`'s iteration
+    // variable (its `decl` is `&fs`); null when none exists.
+    sema::LocalSymbol* findForLoopVarSymbol(const ast::ForStmt& fs);
+
     LocalOwnership* lookupState(std::string_view name);
 
     void markDisposedByName(std::string_view name, SourceLocation loc);
@@ -671,6 +684,11 @@ private:
     // discharge/decl transfer functions on each await operand. // per §30.5
     void recordAwaitOperandConsume(const ast::Expr& awaitOperand,
                                    SourceLocation loc);
+
+    // §30.5 / §30.4 (#834): true when `e`'s static type is `OwnedTask<...>`
+    // (the single-consumer owning task an `await` consumes); generic-safe
+    // (name-head based), unlike awaitTaskKind's result-class gate.
+    bool operandIsOwnedTaskType(const ast::Expr& e);
 };
 
 } // namespace bezel::ownership

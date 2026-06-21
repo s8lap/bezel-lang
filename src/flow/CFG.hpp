@@ -102,6 +102,18 @@ struct CFGBlock {
     // separate dominator computation.
     bool isLoopHeader = false;
 
+    // §29.2 (#834): when this Linear block is the BODY-ENTRY of a `for`/`await
+    // for` loop, `forBodyEntry` points at the originating `ForStmt`. The
+    // ownership pass uses it to seed the iteration variable as Owned at the
+    // body entry of EACH iteration when the loop's iterable is an owning
+    // enumerable (`OwnedEnumerable<T>` / `OwnedAsyncEnumerable<T>`), so the
+    // standard §28.3 owned-local discharge check rejects an undischarged
+    // iteration variable ("Iterator yield ownership", §29.2). Null for every
+    // other block (including a borrowing for-loop's body entry — the seeding
+    // is gated on the iterable type, not on this pointer alone). Additive;
+    // populated only by the CFG builder's visitFor.
+    const ast::ForStmt* forBodyEntry = nullptr;
+
     // #764: for an if/elif condition Branch block, the condition expression —
     // so a forward analysis can null-discriminate the successors (`x <> null`
     // makes x non-null on succs[0] and null on succs[1]; `x = null` the reverse).
