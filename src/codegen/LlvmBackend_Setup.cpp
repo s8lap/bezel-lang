@@ -9426,8 +9426,20 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
                     bool isOwned = (md && md->returnOwned) ||
                                    (!md && ctx_.importedReturnOwned(ms));
+                    // §28.10 / §14.2 (sweep #6): the return type may be a bare
+                    // generic type PARAMETER `T` (declaration==null), e.g.
+                    // `Make(): owned T` in a generic class. isClassOrInterfaceRef
+                    // rejects it, so `using var x := Make()` leaked the owned T.
+                    // In the per-instantiation specialization (where this disposal
+                    // is registered) the active substitution resolves T to its
+                    // concrete type — accept it when that resolves to a class /
+                    // interface (a value-typed T resolves to a non-reference and
+                    // correctly stays unregistered).
+                    const sema::TypeRef* initTy =
+                        ctx_.exprType(*ld->initializer);
                     if (isOwned &&
-                        isClassOrInterfaceRef(ctx_.exprType(*ld->initializer)))
+                        (isClassOrInterfaceRef(initTy) ||
+                         isClassOrInterfaceRef(resolveTypeParamRef(initTy))))
                         return true;
                 }
                 // (b2) fix #642/#643: builtin collection Pop* methods (PopLast,
