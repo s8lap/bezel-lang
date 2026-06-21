@@ -932,7 +932,17 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
     // carry no vtable/disposed-flag header (§9 — a record is a value type;
     // §9.7 — no disposer unless borrow-bearing), so fields start at index 0,
     // unlike classStruct which reserves indices 0/1 for the vtable + flag.
-    if (!genericSubst_.empty()) {
+    //
+    // #847: only a record that is ITSELF generic can have a substitution-
+    // dependent layout. A non-generic record (e.g. `record Point(X:int,Y:int)`)
+    // used as a generic type ARGUMENT (`Identity<Point>`, `Box<Point>`) has a
+    // fixed `[i32,i32]` layout regardless of the active substitution — minting a
+    // distinct `%record.Point$spec0` here makes it differ from the canonical
+    // `%record.Point` that the call-site argument/field already uses, so a
+    // `return v` (param passthrough) or by-value field read fails IR
+    // verification (`%record.Point` vs `%record.Point$spec0`). Mirror the
+    // `t->genericParams.empty()` gate that classStruct uses for the same reason.
+    if (!genericSubst_.empty() && !t->genericParams.empty()) {
         std::vector<llvm::Type*> specFieldTys;
         specFieldTys.reserve(storage.size());
         for (const sema::Symbol* m : storage)
