@@ -375,6 +375,7 @@ set(BEZEL_TEST_SOURCES
     codegen/float_to_int_truncation_858_test.cpp
     codegen/enum_cast_range_859_test.cpp
     codegen/nested_catch_rethrow_866_test.cpp
+    codegen/bare_method_value_880_881_test.cpp
     codegen/owned_subscription_field_dispose_879_test.cpp
     codegen/decimal_to_int_overflow_872_test.cpp
     codegen/base_primary_ctor_param_873_test.cpp

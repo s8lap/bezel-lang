@@ -3322,8 +3322,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // CG60: a bare identifier resolving to a static method —
         // produce a closure struct { thunk_ptr, null_env } so it can
         // be passed as a function-typed value (§A.7 / §17.14).
+        // §27.6/§24.4, #880 #881: a bare identifier resolving to an INSTANCE
+        // method used in value position binds the implicit `this` receiver,
+        // exactly as `this.MethodName` does in the qualified MemberAccessExpr
+        // path below. Without this, the env block held a null/garbage receiver
+        // — a silent no-op for event handlers (#880) and a SIGSEGV at the
+        // call site (#881). Route through makeMethodThunk with currentThis_.
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
             if (isStaticMethod(ms)) return makeMethodThunk(ms, nullptr);
+            else if (currentThis_) return makeMethodThunk(ms, currentThis_);
         }
     }
     // CG60: `Class.StaticMethod` or `obj.InstanceMethod` used as a
