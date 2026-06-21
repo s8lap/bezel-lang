@@ -177,7 +177,10 @@ private:
     // or re-moving an already-Disposed/MovedFrom local is a diagnostic
     // (the §28.3 "read of moved-from / disposed" rules).
     // §28.8: check if argument at position `pos` in `args` is an implicit
-    // ownership transfer based on the callee's formal parameter list.
+    // owned-IN transfer based on the callee's formal parameter list — true
+    // only for a plain `owned` formal (the argument is consumed). An
+    // `out owned` formal is the owned-OUT direction (the argument local
+    // RECEIVES ownership) and is NOT an implicit owned sink (#860).
     bool isImplicitOwned(const std::vector<ast::CallArgument>& args,
                          std::size_t pos, const ast::Expr* callee);
 
@@ -501,6 +504,12 @@ private:
 
     void markMovedByName(std::string_view name, SourceLocation loc);
 
+    // §28.3 / §28.11 (issue #860): mark a tracked local Owned because it
+    // received ownership through an `out owned` argument. `origin` is the
+    // AST node the dropped-without-disposal diagnostic points at. // per §28.3
+    void markOwnedByName(std::string_view name, SourceLocation loc,
+                         const ast::Node* origin);
+
     // §28.8 owned-sink check (issue #395): true when `argValue` — an
     // argument destined for an `owned` parameter, or the RHS of an
     // owning-collection `set(owned)` indexer assignment — denotes a *borrow*
@@ -576,6 +585,34 @@ private:
     // receiver type means it never mis-fires on a user method of the same name
     // (those go through the precise declaration-based path). // per §28.8
     bool builtinOwnedSinkArg(const ast::Expr* callee, std::size_t argPos);
+
+    // §28.3 / §28.11 (issue #860): true when `callee` is a member access
+    // `recv.M` whose receiver `recv` has a *built-in* type carrying an
+    // `out owned` parameter at argument index `argPos` — the caller-side
+    // out-owned transfer that moves an element OUT of an owning collection
+    // (or a Channel<T>/Weak<T> handle) into the caller's local. The owned-OUT
+    // direction is the mirror of `builtinOwnedSinkArg` (which models owned-IN
+    // sinks): there the argument local LOSES ownership, here it RECEIVES it.
+    // Recognised: `OwnedStack<T>.TryPop`, `OwnedQueue<T>.TryDequeue`,
+    // `OwnedLinkedList<T>.TryPopFirst/TryPopLast`, `OwnedSet<T>.TryTake`
+    // (argPos 1), `OwnedDictionary<K,V>.TryPopValue` (argPos 1),
+    // `Channel<T>.TryReceive` (class T only — §6.9 value-T drops the
+    // modifiers), and `Weak<T>.TryUpgrade` (stdlib §4.5/§4.7/§4.9/§6.9/§2.16).
+    // The borrow forms `TryPop(out item)` / `TryPeek(out item)` carry no
+    // `owned` and are NOT recognised. // per §28.3, §28.11
+    bool builtinOutOwnedArg(const ast::Expr* callee, std::size_t argPos);
+
+    // §28.3 / §28.11 (issue #860): after a call, mark each argument that is an
+    // `out owned` transfer (a call-site `out owned` modifier on a method whose
+    // formal is genuinely `out owned`, a user `out owned` parameter, or a
+    // built-in out-owned method per `builtinOutOwnedArg`) and is a bare LOCAL
+    // identifier as Owned — the local received ownership of the moved-out value
+    // and now carries the §28.3 discharge obligation. Marked unconditionally
+    // (conservative for the Try* false-return path, where the local is unchanged
+    // / null); the canonical null-safe consumer `item?.Dispose()` discharges it.
+    // // per §28.3, §28.11
+    void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
+                          const ast::Expr* callee);
 
     // -- Async-readiness 3c: at-await-site Pattern A / B enforcement -----------
     //

@@ -204,10 +204,15 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
             const std::vector<ast::Param>* params = nullptr;
             if (calleeMethod)  params = &calleeMethod->params;
             if (calleeCtor)    params = &calleeCtor->params;
+            // §28.3 / §28.11 (#860): an `out owned` formal is the owned-OUT
+            // direction — the argument local RECEIVES ownership, it is NOT a
+            // moved-from owned-IN sink. (It is marked Owned post-call by
+            // markOutOwnedArgs.) Only a plain `owned` formal consumes the
+            // argument here; including `out owned` would wrongly mark the
+            // receiving local moved-from.
             const bool userOwned =
                 params && pos < params->size() &&
-                ((*params)[pos].modifier == "owned" ||
-                 (*params)[pos].modifier == "out owned");
+                (*params)[pos].modifier == "owned";
             const bool ownedSink =
                 userOwned || builtinOwnedSinkArg(callee, pos);
             if (ownedSink) {
@@ -248,6 +253,13 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         recordMovesIn(*a.value);
         ++pos;
     }
+    // §28.3 / §28.11 (#860): after the arguments' owned-IN consumption is
+    // recorded, model the caller-side owned-OUT transfer — a local passed as
+    // `out owned` RECEIVES ownership of the moved-out element and becomes Owned
+    // (so dropping it is flagged by the §28.3 discharge check). Done last so it
+    // is not disturbed by the consume walk above; the two directions are
+    // disjoint per argument (an arg is either owned-IN or owned-OUT).
+    markOutOwnedArgs(args, callee);
 }
 
 bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args,
@@ -264,7 +276,13 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
         md ? &md->params : (cd ? &cd->params : nullptr);
     if (!params || pos >= params->size()) return false;
     const std::string_view mod = (*params)[pos].modifier;
-    return mod == "owned" || mod == "out owned";
+    // §28.3 / §28.11 (#860): only a plain `owned` formal is an owned-IN
+    // consuming sink (the argument is consumed by the call). An `out owned`
+    // formal is the owned-OUT direction — the argument local RECEIVES
+    // ownership, it is not consumed here — so it must NOT be classified as
+    // an implicit owned sink (that mis-marked the receiving local moved-from
+    // and mis-classified an `await` in out-position as owned-consuming).
+    return mod == "owned";
 }
 
 void MethodOwnership::handleDischarge(const ast::Expr& e) {
@@ -459,6 +477,26 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             }
         }
+        // §28.2 / §28.3 (#860): a null-conditional dispose `local?.Dispose()`
+        // parses as a CallExpr whose callee is a NullCondMemberExpr
+        // (`local ?. Dispose`). It is the canonical null-safe discharge of a
+        // conservatively-Owned local (e.g. an `out owned` item that is null on
+        // the Try* false path): `?.` no-ops when null and disposes otherwise.
+        // Recognise it the same as a plain `.Dispose()`. // per §28.2, §28.3
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                call->callee.get())) {
+            if (nm->member == "Dispose") {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        nm->target.get())) {
+                    markDisposedByName(id->name, id->span.begin);
+                }
+            }
+        }
+        // §28.3 / §28.11 (#860): model the caller-side owned-OUT transfer for a
+        // bare-statement call `s.TryPop(out owned item);` (the initializer /
+        // assignment-RHS forms route through recordMovesInArgs instead). After
+        // the owned-IN consumption above, mark each `out owned` local Owned.
+        markOutOwnedArgs(call->args, call->callee.get());
         return;
     }
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -1957,6 +1995,29 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     st->state = OwnershipState::MovedFrom;
 }
 
+// §28.3 / §28.11 (issue #860): a tracked local received ownership of a value
+// moved OUT through an `out owned` argument; mark it Owned so the end-of-scope
+// discharge check requires it to be disposed / moved / returned.
+void MethodOwnership::markOwnedByName(std::string_view name, SourceLocation loc,
+                                      const ast::Node* origin) {
+    auto* st = lookupState(name);
+    if (!st) return;                       // not a tracked local: nothing to do
+    // A `using var` is scope-bound and implicitly discharged; do not disturb
+    // its obligation. (A pre-declared `var` target — the modelled form — is
+    // never implicitDischarge, so this only guards the unusual case.)
+    if (st->implicitDischarge) return;
+    // Conservatively mark Owned. On the Try* false-return path the local is
+    // unchanged (null), but marking Owned unconditionally is sound: the
+    // canonical null-safe consumer `item?.Dispose()` discharges it on both
+    // paths, and an undischarged local is correctly flagged (§28.3). A leading
+    // explicit-Dispose or move on the same statement runs after this in the
+    // dataflow and transitions the state as usual.
+    st->state = OwnershipState::Owned;
+    st->obligationOrigin = origin;
+    st->source.reset();
+    (void)loc;
+}
+
 // §28.11 indexer-set owned check (issue #395). See the header for the contract.
 bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
     const auto* ix = dynamic_cast<const ast::IndexExpr*>(&target);
@@ -2057,6 +2118,99 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
     if (m == "AddBefore" || m == "AddAfter")
         return argPos == 1;                       // Add*(node, owned item)
     return false;
+}
+
+// §28.3 / §28.11 built-in out-owned methods (issue #860). See the header for
+// the contract. The owned-OUT argument *index* differs per method, so this
+// maps (receiver-type family, method name) → out-owned-arg position. Mirrors
+// builtinOwnedSinkArg's MemberAccessExpr/receiver-type-name-head dispatch.
+bool MethodOwnership::builtinOutOwnedArg(const ast::Expr* callee,
+                                         std::size_t argPos) {
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+    // Built-in collections / handles resolve to a Named TypeRef with a null
+    // declaration and carry the type name on the AST node. A user type (non-
+    // null declaration) is handled by the declaration-based path instead.
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return false;
+    if (!tt->astNode || !tt->astNode->name ||
+        tt->astNode->name->parts.empty())
+        return false;
+    const std::string_view cn = tt->astNode->name->parts[0];
+    const std::string_view m = ma->member;
+    // Owning collections — `where T: class`, so the moved-out element is
+    // always a disposable reference type (stdlib §4.5 / §4.7 / §4.9).
+    if (cn == "OwnedStack"  && m == "TryPop")      return argPos == 0;
+    if (cn == "OwnedQueue"  && m == "TryDequeue")  return argPos == 0;
+    if (cn == "OwnedLinkedList" &&
+        (m == "TryPopFirst" || m == "TryPopLast")) return argPos == 0;
+    // OwnedSet<T>.TryTake(query, out owned removed: T?) — out-owned at arg 1.
+    if (cn == "OwnedSet"    && m == "TryTake")     return argPos == 1;
+    // OwnedDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
+    if (cn == "OwnedDictionary" && m == "TryPopValue") return argPos == 1;
+    // Weak<T>.TryUpgrade(out owned s: Shared<T>?) — arg 0 (stdlib §2.16). The
+    // accepted call-site form is `out using var s`, which declares a fresh
+    // local the dataflow does not track; recognised here for completeness.
+    if (cn == "Weak"        && m == "TryUpgrade")  return argPos == 0;
+    // Channel<T>.TryReceive(out owned item: T?) — arg 0, but only when T is a
+    // class/interface: for value-typed T and string the ownership modifiers
+    // drop out (stdlib §6.9), so there is no owned-out transfer to model.
+    if (cn == "Channel" && m == "TryReceive" && argPos == 0) {
+        if (!tt->genericArgs.empty() && tt->genericArgs[0]) {
+            const sema::TypeRef* elemT = tt->genericArgs[0];
+            return elemT->kind == sema::TypeRef::Kind::Named &&
+                   elemT->declaration &&
+                   (elemT->declaration->kind == ast::TypeDeclKind::Class ||
+                    elemT->declaration->kind == ast::TypeDeclKind::Interface);
+        }
+        return false;
+    }
+    return false;
+}
+
+// §28.3 / §28.11 caller-side out-owned transfer (issue #860). See the header.
+void MethodOwnership::markOutOwnedArgs(
+        const std::vector<ast::CallArgument>& args,
+        const ast::Expr* callee) {
+    // Resolve the callee's parameter list so a USER method's `out owned`
+    // formal is recognised (the built-in collections have no AST declaration
+    // and are handled by builtinOutOwnedArg below).
+    const std::vector<ast::Param>* params = nullptr;
+    if (callee) {
+        sema::Symbol* sym = ctx_.exprSymbol(*callee);
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                params = &md->params;
+        }
+    }
+    std::size_t pos = 0;
+    for (const auto& a : args) {
+        if (!a.value) { ++pos; continue; }
+        // The argument is an out-owned transfer when the formal is genuinely
+        // `out owned`. We do NOT trust the call-site `out owned` modifier on
+        // its own: a user may write `out owned item` on a plain `out`
+        // (borrow-form) builtin and sema does not always reject it, so keying
+        // off the modifier alone would over-fire on a value-typed `out`
+        // (e.g. `Stack<int>.TryPop(out owned item)`, no disposal obligation).
+        const bool userOutOwned =
+            params && pos < params->size() &&
+            (*params)[pos].modifier == "out owned";
+        const bool builtinOutOwned = builtinOutOwnedArg(callee, pos);
+        if (userOutOwned || builtinOutOwned) {
+            // Only a bare LOCAL identifier receives the obligation here. The
+            // call-site declaring forms `out using var x` (implicitly
+            // discharged) and `out owned var x` declare a fresh local the
+            // dataflow tracks elsewhere; a bare pre-declared local `x` is the
+            // form this models. markOwnedByName acts only on a tracked local
+            // (states_), so a discard `_` or a non-local target is a no-op.
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                markOwnedByName(id->name, id->span.begin, id);
+            }
+        }
+        ++pos;
+    }
 }
 
 // §28.3 (issue #398): is `e` a read of an `owned` field? See the header.
