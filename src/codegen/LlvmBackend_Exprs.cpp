@@ -9482,8 +9482,24 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         }
         // §19.3/§19.5: type-test pattern on a class/interface scrutinee.
         if (llvm::GlobalVariable* desc =
-                descriptorForPatternName(np->name.get()))
+                descriptorForPatternName(np->name.get())) {
+            // sweep #7: a class/interface type-test only matches a heap object
+            // that carries a vtable/descriptor (a class, an interface, or
+            // Object). Against a value-type primitive (e.g. an `int` scrutinee →
+            // emitIsA compares an i32 to a ptr → LLVM SIGABRT) or a runtime-
+            // managed reference like `string` (→ emitIsA loads a vtable from a
+            // non-object → SIGSEGV), the test can NEVER match — return false.
+            bool objectLike = !scrutTy ||
+                (scrutTy->kind == sema::TypeRef::Kind::Named &&
+                 scrutTy->declaration &&
+                 (scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
+                  scrutTy->declaration->kind == ast::TypeDeclKind::Interface)) ||
+                (scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                 scrutTy->primitive == sema::PrimitiveType::Object);
+            if (!scrut->getType()->isPointerTy() || !objectLike)
+                return builder_.getInt1(false);
             return emitIsA(scrut, desc);
+        }
         return nullptr;  // unresolved name — deferred
     }
     // #473 / §19.3: a primitive type pattern `int`, `string`, … (TypePattern).
@@ -9495,7 +9511,22 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // §19.5's "matches only non-null values" holds trivially. (A nullable
     // VALUE-type scrutinee is handled by the isNullableVal branch above,
     // which never falls through to here.)
-    if (dynamic_cast<const ast::TypePattern*>(pat)) {
+    if (auto* tp = dynamic_cast<const ast::TypePattern*>(pat)) {
+        // sweep #7 [4]: a primitive type pattern (`string`, `int`, …) against a
+        // scrutinee of a DIFFERENT concrete primitive type can NEVER match — e.g.
+        // a `string` pattern on an `int` scrutinee. The unconditional match below
+        // wrongly fired such an arm (a wrong value). When both the pattern and the
+        // (non-nullable, non-Object) scrutinee are concrete primitives that
+        // differ, return false; an Object/boxed scrutinee keeps the runtime path.
+        if (tp->type && scrutTy &&
+            scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+            scrutTy->primitive != sema::PrimitiveType::Object) {
+            const sema::TypeRef* patTy = ctx_.resolvedType(*tp->type);
+            if (patTy && patTy->kind == sema::TypeRef::Kind::Primitive &&
+                patTy->primitive != sema::PrimitiveType::Object &&
+                patTy->primitive != scrutTy->primitive)
+                return builder_.getInt1(false);
+        }
         // §19.5 (#760): "A bare type pattern T matches only non-null values."
         // A nullable runtime-managed-reference scrutinee (`string?`, a function
         // type, a boxed value) is a *pointer*, not the tagged struct the

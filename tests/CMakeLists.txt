@@ -551,6 +551,7 @@ set(BEZEL_TEST_SOURCES
     codegen/decimal_compound_assign_test.cpp
     codegen/generic_using_var_owned_return_test.cpp
     codegen/event_raise_reentrant_dispose_908_test.cpp
+    codegen/case_incompatible_type_pattern_test.cpp
     codegen/generic_record_with_eq_nullable_462_test.cpp
     codegen/generic_record_this_with_method_test.cpp
     codegen/iterator_native_test.cpp
