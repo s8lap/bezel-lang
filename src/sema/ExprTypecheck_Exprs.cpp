@@ -2126,19 +2126,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     currentScope_->names[id->name] = lsym;
                 }
             }
-            // §28.13 / stdlib §2.16 (#603): `out using var x` declares a
-            // using-var–scoped Shared<T> handle from Weak<T>.TryUpgrade.
-            // Mirror the `out var` path above but skip the formal-param
-            // type inference (TryUpgrade is a builtin with no MethodDecl)
-            // and instead derive the type directly from the receiver:
-            //   Weak<T> receiver → Shared<T> out type.
+            // §28.13 / §28.11 / stdlib §2.16 (#603 #890): `out using var x`
+            // declares a using-var–scoped handle whose type is derived from
+            // the receiver's generic element argument.
+            //
+            // Handled cases (all are builtins with no MethodDecl):
+            //   Weak<T>.TryUpgrade          → Shared<T>         (arg 0)
+            //   OwnedStack<T>.TryPop        → T                 (arg 0)
+            //   OwnedQueue<T>.TryDequeue    → T                 (arg 0)
+            //   OwnedLinkedList<T>.TryPopFirst/TryPopLast → T   (arg 0)
+            //   OwnedSet<T>.TryTake         → T  (from T? param, arg 1)
+            //   OwnedDictionary<K,V>.TryPopValue → V            (arg 1)
+            //   Channel<T>.TryReceive       → T  (from T? param, arg 0)
+            //
+            // For T?-typed out params the spec still delivers the non-nullable
+            // T to the `out using var` (parallel to the `out var` strip above).
             if (a.modifier == "out using var" && a.value && currentScope_) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                                    a.value.get())) {
                     auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                     lsym->name = id->name;
                     lsym->decl = id;
-                    // Derive Shared<T> from Weak<T> receiver type.
+                    // Derive the type from the builtin receiver.
                     if (auto* maCallee =
                             dynamic_cast<const ast::MemberAccessExpr*>(
                                 ce->callee.get())) {
@@ -2148,29 +2157,87 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 if (rt->kind == TypeRef::Kind::Named &&
                                     !rt->declaration && rt->astNode &&
                                     rt->astNode->name &&
-                                    !rt->astNode->name->parts.empty() &&
-                                    rt->astNode->name->parts[0] == "Weak" &&
-                                    !rt->genericArgs.empty() &&
-                                    rt->genericArgs[0]) {
-                                    // Build a synthetic Shared<T> astNode
-                                    // (same lambda pattern as kWeakNode in
-                                    // ExprTypecheck_Calls.cpp ~L1762).
-                                    static const ast::Type* kSharedNode =
-                                        []() -> ast::Type* {
-                                            auto* qn = new ast::QualifiedName;
-                                            qn->parts.push_back("Shared");
-                                            auto* t  = new ast::Type;
-                                            t->kind  = ast::TypeKind::Named;
-                                            t->name.reset(qn);
-                                            return t;
-                                        }();
-                                    TypeRef* sharedTy = ctx_.makeTypeRef();
-                                    sharedTy->kind = TypeRef::Kind::Named;
-                                    sharedTy->declaration = nullptr;
-                                    sharedTy->astNode = kSharedNode;
-                                    sharedTy->genericArgs.push_back(
-                                        const_cast<TypeRef*>(rt->genericArgs[0]));
-                                    lsym->declType = sharedTy;
+                                    !rt->astNode->name->parts.empty()) {
+                                    const std::string_view cn =
+                                        rt->astNode->name->parts[0];
+                                    const std::string_view mn =
+                                        maCallee->member;
+
+                                    if (cn == "Weak" &&
+                                        mn == "TryUpgrade" &&
+                                        pos2 == 0 &&
+                                        !rt->genericArgs.empty() &&
+                                        rt->genericArgs[0]) {
+                                        // Weak<T>.TryUpgrade → Shared<T>
+                                        // Build a synthetic Shared<T> astNode
+                                        // (same lambda pattern as kWeakNode in
+                                        // ExprTypecheck_Calls.cpp ~L1762).
+                                        static const ast::Type* kSharedNode =
+                                            []() -> ast::Type* {
+                                                auto* qn = new ast::QualifiedName;
+                                                qn->parts.push_back("Shared");
+                                                auto* t  = new ast::Type;
+                                                t->kind  = ast::TypeKind::Named;
+                                                t->name.reset(qn);
+                                                return t;
+                                            }();
+                                        TypeRef* sharedTy = ctx_.makeTypeRef();
+                                        sharedTy->kind = TypeRef::Kind::Named;
+                                        sharedTy->declaration = nullptr;
+                                        sharedTy->astNode = kSharedNode;
+                                        sharedTy->genericArgs.push_back(
+                                            const_cast<TypeRef*>(rt->genericArgs[0]));
+                                        lsym->declType = sharedTy;
+
+                                    } else if (
+                                        // per §28.11, #890: owning-collection
+                                        // Try* methods — element type from
+                                        // receiver's generic argument.
+                                        ((cn == "OwnedStack" &&
+                                          mn == "TryPop" && pos2 == 0) ||
+                                         (cn == "OwnedQueue" &&
+                                          mn == "TryDequeue" && pos2 == 0) ||
+                                         (cn == "OwnedLinkedList" &&
+                                          (mn == "TryPopFirst" ||
+                                           mn == "TryPopLast") &&
+                                          pos2 == 0) ||
+                                         (cn == "OwnedSet" &&
+                                          mn == "TryTake" && pos2 == 1) ||
+                                         (cn == "Channel" &&
+                                          mn == "TryReceive" && pos2 == 0)) &&
+                                        !rt->genericArgs.empty() &&
+                                        rt->genericArgs[0]) {
+                                        // Element type = genericArgs[0] (T).
+                                        // Strip nullable if the stdlib param
+                                        // is T? (TryTake/TryReceive).
+                                        const TypeRef* elemT = rt->genericArgs[0];
+                                        if (elemT->nullable) {
+                                            TypeRef* nn = ctx_.makeTypeRef(*elemT);
+                                            nn->nullable = false;
+                                            lsym->declType = nn;
+                                        } else {
+                                            lsym->declType =
+                                                const_cast<TypeRef*>(elemT);
+                                        }
+
+                                    } else if (
+                                        // OwnedDictionary<K,V>.TryPopValue
+                                        // — value type = genericArgs[1] (V).
+                                        cn == "OwnedDictionary" &&
+                                        mn == "TryPopValue" &&
+                                        pos2 == 1 &&
+                                        rt->genericArgs.size() >= 2 &&
+                                        rt->genericArgs[1]) {
+                                        const TypeRef* valT = rt->genericArgs[1];
+                                        if (valT->nullable) {
+                                            TypeRef* nn = ctx_.makeTypeRef(*valT);
+                                            nn->nullable = false;
+                                            lsym->declType = nn;
+                                        } else {
+                                            lsym->declType =
+                                                const_cast<TypeRef*>(valT);
+                                        }
+                                    }
                                 }
                             }
                         }
