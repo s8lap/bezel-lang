@@ -562,6 +562,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     }
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        // §12.3/§12.5, #874: `base.M()` where M is abstract has no
+        // implementation to call — the vtable slot is unfilled.  Diagnose this
+        // as a compile error so the caller never reaches garbage at runtime.
+        // Only fires for `base.`-qualified calls (not `this.M()` virtual calls,
+        // which dispatch to the concrete override).
+        if (auto* calleeMA =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            if (auto* baseId = dynamic_cast<const ast::IdentifierExpr*>(
+                    calleeMA->target.get())) {
+                if (baseId->name == "base") {
+                    // Detect abstract: modifier list OR MethodBodyKind::Abstract.
+                    bool isMsAbstract = false;
+                    for (auto mod : ms->modifiers)
+                        if (mod == "abstract") { isMsAbstract = true; break; }
+                    if (!isMsAbstract && md)
+                        isMsAbstract =
+                            (md->bodyKind == ast::MethodBodyKind::Abstract);
+                    if (isMsAbstract) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "cannot call abstract base method `" +
+                                std::string(ms->name) +
+                                "` via `base` — it has no implementation "
+                                "(§12.3/§12.5)");
+                        return;
+                    }
+                }
+            }
+        }
         if (md && md->returnType) {
             if (auto* rt = ctx_.resolvedType(*md->returnType)) {
                 // per §14.1 (generics are monomorphized): a method whose
