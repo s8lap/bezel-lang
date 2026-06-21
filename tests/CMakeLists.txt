@@ -236,6 +236,7 @@ set(BEZEL_TEST_SOURCES
     sema/using_var_reassign_830_test.cpp              # fix #830: §28.10 reject reassigning a `using var` local
     sema/move_bare_field_restoration_825_test.cpp     # fix #825: §28.8.1 bare `move _field` must trigger field-restoration check
     sema/field_restoration_path_sensitive_867_test.cpp # fix #867: §28.8.1 field-restoration check is path-sensitive (partial restore rejected)
+    sema/move_after_move_field_897_898_test.cpp       # fix #897 #898: §28.8.1 a `move` of an already-moved-from owned field is diagnosed at the move site
     sema/owned_iter_var_discharge_834_test.cpp        # fix #834: §29.2 owned iteration variable of an OwnedEnumerable/OwnedAsyncEnumerable for-loop must be discharged
     sema/out_owned_transfer_860_test.cpp              # fix #860: §28.3/§28.11 model the caller-side out-owned transfer — Try*(out owned item) receives ownership; dropping it leaks
     sema/out_owned_condition_892_test.cpp             # fix #892: §28.3 mark out-owned Try* recipients owned in if/while conditions — drop accepted (leak) before fix

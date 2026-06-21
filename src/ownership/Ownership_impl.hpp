@@ -518,6 +518,20 @@ private:
 
     void markMovedByName(std::string_view name, SourceLocation loc);
 
+    // §28.8.1 (#897 #898): record a `move this.field` / `move _field` (qualified
+    // OR bare owned-field move). This is the field analogue of markMovedByName
+    // for locals: BEFORE marking the field moved-from, it CHECKS the current
+    // (path-sensitive, #867) `fieldMovedFrom_` fact — if the field is already
+    // moved-from on the path reaching this move site, the move has no ownership
+    // to transfer and is a use-after-move; report a §28.8.1 error. Otherwise
+    // mark the field moved-from and record the move-site location. The check
+    // routes through `report()` so the loop-fixpoint suppression (#867) emits
+    // each diagnostic exactly once on the converged final pass — so a loop whose
+    // body moves the field but restores it only conditionally is rejected at the
+    // move site on the moved-from back-edge path (#898), while a move-restore-
+    // move sequence and a loop with unconditional restore are accepted.
+    void recordFieldMove(std::string_view name, SourceLocation loc);
+
     // §28.3 / §28.11 (issue #860): mark a tracked local Owned because it
     // received ownership through an `out owned` argument. `origin` is the
     // AST node the dropped-without-disposal diagnostic points at. // per §28.3

@@ -22,8 +22,9 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 // exprIsOwnedFieldRead resolves the bare identifier via sema
                 // and returns true only for an `owned` field of the current class.
                 if (exprIsOwnedFieldRead(*un->operand)) {
-                    fieldMovedFrom_[id->name] = true;
-                    fieldMoveLoc_[id->name] = un->span.begin;
+                    // §28.8.1, #897 #898: check-then-mark via recordFieldMove
+                    // so a second move of an already-moved-from field errors.
+                    recordFieldMove(id->name, un->span.begin);
                     return;
                 }
                 markMovedByName(id->name, id->span.begin);
@@ -35,8 +36,8 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                         dynamic_cast<const ast::IdentifierExpr*>(
                             ma->target.get())) {
                     if (tid->name == "this") {
-                        fieldMovedFrom_[ma->member] = true;
-                        fieldMoveLoc_[ma->member] = un->span.begin;
+                        // §28.8.1, #897 #898: qualified `move this.field`.
+                        recordFieldMove(ma->member, un->span.begin);
                         return;
                     }
                 }
@@ -402,8 +403,8 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                 dynamic_cast<const ast::IdentifierExpr*>(
                                     ma->target.get())) {
                             if (tid->name == "this") {
-                                fieldMovedFrom_[ma->member] = true;
-                                fieldMoveLoc_[ma->member] = un->span.begin;
+                                // §28.8.1, #897 #898: `M(move this.field)`.
+                                recordFieldMove(ma->member, un->span.begin);
                                 consumed = true;
                             }
                         }
@@ -521,8 +522,8 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // it leaves the field moved-from. Check via sema symbol before
                 // falling through to the local-move path.
                 if (exprIsOwnedFieldRead(*un->operand)) {
-                    fieldMovedFrom_[id->name] = true;
-                    fieldMoveLoc_[id->name] = un->span.begin;
+                    // §28.8.1, #897 #898: check-then-mark.
+                    recordFieldMove(id->name, un->span.begin);
                     return;
                 }
                 markMovedByName(id->name, id->span.begin);
@@ -537,8 +538,8 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                         dynamic_cast<const ast::IdentifierExpr*>(
                             ma->target.get())) {
                     if (tid->name == "this") {
-                        fieldMovedFrom_[ma->member] = true;
-                        fieldMoveLoc_[ma->member] = un->span.begin;
+                        // §28.8.1, #897 #898: qualified `move this.field`.
+                        recordFieldMove(ma->member, un->span.begin);
                         return;
                     }
                 }
@@ -2006,6 +2007,37 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     st->state = OwnershipState::MovedFrom;
+}
+
+// §28.8.1, #897 #898: the field analogue of markMovedByName. Mirrors the
+// locals' read/move-after-move diagnostic (markMovedByName above, which reports
+// "was already moved out at this point (§28.3)" when the local is MovedFrom):
+// BEFORE marking the field moved-from, check whether it is ALREADY moved-from
+// on the current path (`fieldMovedFrom_`, the path-sensitive #867 per-block
+// field facts seeded from the converged CFG entry). If so, this `move x.f` has
+// no ownership left to transfer — it is a use-after-move that, undiagnosed,
+// double-owns the underlying object (#897: a straight-line second move reads the
+// same field pointer → double-dispose → use-after-free). Report a §28.8.1 error
+// at the move site. Because #867 made the facts path-sensitive and the loop
+// fixpoint OR-merges the moved-from fact along the back-edge, this also rejects
+// a loop that moves the field but restores it only conditionally (#898): on the
+// moved-from back-edge path the 2nd-iteration move sees fieldMovedFrom_=true.
+void MethodOwnership::recordFieldMove(std::string_view name,
+                                      SourceLocation loc) {
+    auto it = fieldMovedFrom_.find(name);
+    if (it != fieldMovedFrom_.end() && it->second) {
+        report(Severity::Error, loc,
+               std::string("owned field `") + std::string(name) +
+                   "` is already moved-from at this point; cannot move it "
+                   "again — restore it (`this." + std::string(name) +
+                   " := ...`) before moving again (§28.8.1)");
+        // Leave the field moved-from; the move-site error stands. (No Poisoned
+        // state for fields — the moved-from fact already reflects the worst
+        // path and the at-exit restoration check, #867, remains accurate.)
+        return;
+    }
+    fieldMovedFrom_[name] = true;
+    fieldMoveLoc_[name] = loc;
 }
 
 // §28.3 / §28.11 (issue #860): a tracked local received ownership of a value

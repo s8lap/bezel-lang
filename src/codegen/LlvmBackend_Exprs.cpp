@@ -5287,15 +5287,63 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // Mirrors the local using-var null above and the collection-slot
                 // move (lowerMoveFromCollectionSlot). Only pointer-typed
                 // (class/interface) owned fields carry a disposal obligation.
-                // NOTE: the qualified `move this._field` form is handled (and
-                // currently rejected) by the ownership pass before codegen, so it
-                // never reaches here; this only makes the unqualified form sound.
                 if (isOwnedReferenceField(fs)) {
                     llvm::Type* fty = nullptr;
                     if (llvm::Value* addr = implicitFieldAddr(*un.operand, fty)) {
                         if (fty && fty->isPointerTy())
                             builder_.CreateStore(
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
+                    }
+                }
+            }
+        } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                       un.operand.get())) {
+            // §28.8.1, #897 #898 (Part B): the QUALIFIED `move this._field`
+            // form. Part A (ownership pass) now rejects a SECOND move of an
+            // already-moved-from field, so a sound program never double-owns;
+            // but to make the qualified move consistent with the bare `move
+            // _field` above (form-parity, #825) and remove the use-after-free
+            // even if a path evades Part A, null the field slot after the move
+            // so a subsequent read sees null, not the still-populated original
+            // pointer. The owner's destructor owned-field disposal is null-
+            // guarded (emitOwnedFieldDisposals), so nulling here makes it skip
+            // the already-transferred object instead of double-freeing it.
+            //
+            // Only the `this._field` form is nulled. Compute the slot via
+            // currentThis_ + the field index — the same lightweight StructGEP
+            // implicitFieldAddr uses for the bare form — NOT lvalueAddr/
+            // fieldAddr, whose re-lowering of the `this` receiver and generic-
+            // substitution side effects produced malformed IR for the canonical
+            // destructor `using var u := move this._inner;` case (it re-emitted
+            // the receiver after the field value `v` had already been read).
+            //
+            // NOT inside a destructor body (emittingDisposerBody_): per the
+            // #383/#763 design, a `move this._f` in a destructor does NOT get its
+            // own scope-end disposal — emitDispose suppresses it — and the
+            // SOLE disposal site is the owned-field auto-dispose pass
+            // (emitOwnedFieldDisposals), which loads the field and disposes it.
+            // Nulling the field here would make that pass skip the still-owned
+            // object → a LEAK (destructor_field_move_runtime_763). The Part A
+            // sema check already rejects a double-move in a destructor (so the
+            // UAF this null guards against cannot occur there), so skipping the
+            // null in the disposer body is both necessary and sound.
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma->target.get());
+                tid && tid->name == "this" && currentThis_ &&
+                !emittingDisposerBody_) {
+                if (auto* fs = dynamic_cast<sema::FieldSymbol*>(
+                        ctx_.exprSymbol(*ma))) {
+                    auto idxIt = fieldIndex_.find(fs);
+                    if (isOwnedReferenceField(fs) && fs->parent &&
+                        idxIt != fieldIndex_.end()) {
+                        llvm::StructType* st = classStruct(fs->parent);
+                        if (st && st->getElementType(idxIt->second)
+                                      ->isPointerTy()) {
+                            llvm::Value* addr = builder_.CreateStructGEP(
+                                st, currentThis_, idxIt->second);
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), addr);
+                        }
                     }
                 }
             }
