@@ -3596,6 +3596,11 @@ private:
         // heap collections — freed via bz_llist_free, not bz_array_free; but
         // they are identified here so emitOwnedFieldDisposals handles them.
         if (isLinkedListTypeName(rt)) return rt;
+        // §28.5/§28.11, #893 #894: owned Dictionary<K,V>/OwnedDictionary<K,V>
+        // fields are heap-backed (bz_dict_t*) and must be freed via bz_dict_free.
+        // They own their V values for the OwnedDictionary case; emitOwnedFieldDisposals
+        // and lowerOwnedCollectionFieldStore detect isDict and use genericArgs[1].
+        if (isDictTypeName(rt)) return rt;
         return nullptr;
     }
 

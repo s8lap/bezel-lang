@@ -2201,16 +2201,29 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // A borrowing Array/Stack/Queue<string> co-owns a +1 per element
             // (retainRelease=true); use the string-release thunk for that row.
             // The two paths are mutually exclusive (string is not a class).
+            //
+            // §28.5/§28.11, #893 #894: OwnedDictionary<K,V> owns its V values
+            // (genericArgs[1]), NOT its K keys (genericArgs[0]).  Free via
+            // bz_dict_free(ptr, valueDisposer) so class V elements are disposed.
+            // Array/Stack/Queue/LinkedList/Buffer own their single generic element
+            // (genericArgs[0]) and use bz_array_free / bz_llist_free as before.
+            bool isDict = isDictTypeName(it->collTy);
             const sema::TypeRef* collElem =
-                (!it->collTy->genericArgs.empty()) ? it->collTy->genericArgs[0]
-                                                   : nullptr;
+                isDict
+                    ? ((it->collTy->genericArgs.size() > 1)
+                           ? it->collTy->genericArgs[1]
+                           : nullptr)
+                    : ((!it->collTy->genericArgs.empty())
+                           ? it->collTy->genericArgs[0]
+                           : nullptr);
             bool collIsOwning =
                 it->collTy->astNode && it->collTy->astNode->name &&
                 !it->collTy->astNode->name->parts.empty() &&
                 it->collTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
             ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
             llvm::Function* elemDisp = fieldCollPol.disposerThunk;
-            if (!elemDisp && fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            if (!elemDisp && !isDict &&
+                    fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
                     collElem && collElem->kind == sema::TypeRef::Kind::Primitive &&
                     collElem->primitive == sema::PrimitiveType::String &&
                     !collElem->nullable &&
@@ -2223,8 +2236,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());
             // per §4.6/§4.7: LinkedList fields free via bz_llist_free.
+            // §28.5/§28.11, #893: OwnedDictionary fields free via bz_dict_free.
             bool isLL = isLinkedListTypeName(it->collTy);
-            const char* freeName = isLL ? "bz_llist_free" : "bz_array_free";
+            const char* freeName = isLL   ? "bz_llist_free"
+                                  : isDict ? "bz_dict_free"
+                                  :          "bz_array_free";
             auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {val, disp});
@@ -7677,9 +7693,18 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
     const sema::TypeRef* collTy = fs ? ownedCollectionFieldType(fs) : nullptr;
 
+    // §28.5/§28.11, #894: OwnedDictionary<K,V> owns its V values (genericArgs[1]),
+    // NOT its K keys (genericArgs[0]).  Free the OLD dict via bz_dict_free so that
+    // class V elements of the displaced dict are disposed on field reassignment.
+    bool isDict = collTy && isDictTypeName(collTy);
     const sema::TypeRef* collElem =
-        (collTy && !collTy->genericArgs.empty()) ? collTy->genericArgs[0]
-                                                 : nullptr;
+        isDict
+            ? ((collTy && collTy->genericArgs.size() > 1)
+                   ? collTy->genericArgs[1]
+                   : nullptr)
+            : ((collTy && !collTy->genericArgs.empty())
+                   ? collTy->genericArgs[0]
+                   : nullptr);
     bool collIsOwning =
         collTy && collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
@@ -7689,7 +7714,8 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     llvm::Function* elemDisp = pol.disposerThunk;
     // §28.11: borrowing Array/Stack/Queue<string> co-owns a +1 per element
     // (retainRelease path); use the string-release thunk. Mirrors §2200-§2208.
-    if (!elemDisp && pol.cat == ElementPolicy::Category::RuntimeManaged &&
+    if (!elemDisp && !isDict &&
+            pol.cat == ElementPolicy::Category::RuntimeManaged &&
             collElem &&
             collElem->kind == sema::TypeRef::Kind::Primitive &&
             collElem->primitive == sema::PrimitiveType::String &&
@@ -7705,8 +7731,11 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
         : llvm::ConstantPointerNull::get(ptrTy());
 
     // per §4.6/§4.7: LinkedList/OwnedLinkedList free via bz_llist_free.
+    // §28.5/§28.11, #894: OwnedDictionary fields free via bz_dict_free.
     bool isLL = collTy && isLinkedListTypeName(collTy);
-    const char* freeName = isLL ? "bz_llist_free" : "bz_array_free";
+    const char* freeName = isLL   ? "bz_llist_free"
+                          : isDict ? "bz_dict_free"
+                          :          "bz_array_free";
     auto* freeFn = declareC(freeName,
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
     builder_.CreateCall(freeFn, {oldVal, disp});

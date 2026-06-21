@@ -524,6 +524,7 @@ set(BEZEL_TEST_SOURCES
     codegen/linked_list_test.cpp
     codegen/bug_453_454_455_test.cpp
     codegen/owned_dict_disposal_test.cpp
+    codegen/owned_dict_field_value_dispose_893_894_test.cpp
     codegen/dict_clear_test.cpp
     codegen/dict_get_or_add_test.cpp
     codegen/collection_indexer_test.cpp
