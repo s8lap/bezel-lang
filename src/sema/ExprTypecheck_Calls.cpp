@@ -4708,6 +4708,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     if (mbr == "IsDigit" || mbr == "IsLetter" ||
                         mbr == "IsLetterOrDigit" || mbr == "IsWhiteSpace" ||
                         mbr == "IsUpper" || mbr == "IsLower" ||
+                        mbr == "IsControl" ||
                         mbr == "IsPunctuation" || mbr == "IsSymbol") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;

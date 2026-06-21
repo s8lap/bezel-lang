@@ -6605,6 +6605,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         else if (m == "IsUpper") fnName = "isupper";
         else if (m == "IsLower") fnName = "islower";
         else if (m == "IsPunctuation") fnName = "ispunct";
+        else if (m == "IsControl") fnName = "iscntrl";   // stdlib §9.5 (sweep #7)
         if (fnName) {
             auto* fn = module_->getFunction(fnName);
             if (!fn) {
