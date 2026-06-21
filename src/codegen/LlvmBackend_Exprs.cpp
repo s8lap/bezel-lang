@@ -810,6 +810,53 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 return builder_.CreateSub(gtI, ltI, "cmp.res");
                             }
                         }
+                        // #863 / stdlib §9.1–§9.5: Equals(other: T): bool —
+                        // IEquatable<T> contract for numeric, char, and bool
+                        // primitives (string is handled by tryLowerStringMethod
+                        // above). Value equality; FP uses ordered eq (oeq). This
+                        // is reached for `a.Equals(b)` on a generic `T` bound
+                        // `where T: IEquatable<T>` after the #730 substitution
+                        // resolves the bare type-parameter receiver to its concrete
+                        // primitive type — without this handler the call fell
+                        // through to an interface dispatch that returned false.
+                        if (call->args.size() == 1 && call->args[0].value &&
+                            ma->member == "Equals") {
+                            using P = sema::PrimitiveType;
+                            P pt = tt->primitive;
+                            bool isUnsignedInt = pt == P::UInt || pt == P::ULong ||
+                                                 pt == P::UShort || pt == P::Byte;
+                            bool isInt = pt == P::Int   || pt == P::Long  ||
+                                         pt == P::Short || pt == P::SByte ||
+                                         pt == P::Char  || pt == P::Bool  ||
+                                         isUnsignedInt;
+                            bool isFP  = pt == P::Double || pt == P::Float;
+                            if (isInt || isFP) {
+                                llvm::Value* lhs = lowerExpr(*ma->target);
+                                llvm::Value* rhs = lowerExpr(*call->args[0].value);
+                                if (!lhs || !rhs) return nullptr;
+                                if (lhs->getType() != rhs->getType()) {
+                                    if (isFP) {
+                                        auto* dty = llvm::Type::getDoubleTy(llvm_);
+                                        lhs = builder_.CreateFPExt(lhs, dty, "eq.ldw");
+                                        rhs = builder_.CreateFPExt(rhs, dty, "eq.rdw");
+                                    } else {
+                                        unsigned lb = lhs->getType()->getIntegerBitWidth();
+                                        unsigned rb = rhs->getType()->getIntegerBitWidth();
+                                        if (lb < rb)
+                                            lhs = isUnsignedInt
+                                                ? builder_.CreateZExt(lhs, rhs->getType(), "eq.lzx")
+                                                : builder_.CreateSExt(lhs, rhs->getType(), "eq.lsx");
+                                        else if (rb < lb)
+                                            rhs = isUnsignedInt
+                                                ? builder_.CreateZExt(rhs, lhs->getType(), "eq.rzx")
+                                                : builder_.CreateSExt(rhs, lhs->getType(), "eq.rsx");
+                                    }
+                                }
+                                return isFP
+                                    ? builder_.CreateFCmpOEQ(lhs, rhs, "eq.res")
+                                    : builder_.CreateICmpEQ(lhs, rhs, "eq.res");
+                            }
+                        }
                         // §9.x: ToString(format) — formatted numeric string.
                         if (call->args.size() == 1 && call->args[0].value &&
                             ma->member == "ToString") {
