@@ -999,6 +999,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 llvm::ConstantInt::get(i32(), 0));
             return builder_.CreateOr(cmpTrue, cmpOne, "tobool");
         }
+        // stdlib §9.6, #882: GetHashCode(): int — content-based hash consistent
+        // with string Equals/`=` (two content-equal strings hash equal).
+        // Reuses emitValueHashCode with a string TypeRef, which folds code points
+        // via h = h*31 + cp (same hash the synthesized record GetHashCode uses
+        // when hashing a string-typed field, ensuring cross-context consistency).
+        if (method == "GetHashCode") {
+            sema::TypeRef strTy;
+            strTy.kind = sema::TypeRef::Kind::Primitive;
+            strTy.primitive = sema::PrimitiveType::String;
+            return emitValueHashCode(self, &strTy);
+        }
     }
 
     // §9.6: Equals(other: string): bool — content equality (same as `=`).

@@ -5506,7 +5506,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "IndexOf" ||
                         ma.member == "LastIndexOf" ||
                         ma.member == "CountOf" ||
-                        ma.member == "ToInt32" || ma.member == "ToUInt32") {
+                        ma.member == "ToInt32" || ma.member == "ToUInt32" ||
+                        ma.member == "GetHashCode") {  // stdlib §9.6, #882
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                         return;
