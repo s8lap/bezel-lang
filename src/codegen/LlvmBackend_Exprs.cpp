@@ -5287,7 +5287,21 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // Mirrors the local using-var null above and the collection-slot
                 // move (lowerMoveFromCollectionSlot). Only pointer-typed
                 // (class/interface) owned fields carry a disposal obligation.
-                if (isOwnedReferenceField(fs)) {
+                //
+                // §28.8.1, #899: NOT inside a destructor body
+                // (emittingDisposerBody_). The same reasoning as for the qualified
+                // `move this._f` form (see the MemberAccessExpr branch below, fixed
+                // in #897/#898): inside a destructor the SOLE disposal site for an
+                // owned field is the auto-dispose pass (emitOwnedFieldDisposals),
+                // which null-guards the load before disposing. Nulling the field
+                // slot here (before that pass runs) makes it skip the still-owned
+                // object → a LEAK. The using-var scope-end disposal is also
+                // suppressed in a destructor body (emitDispose checks
+                // emittingDisposerBody_), so no disposal site remains → leak.
+                // Guard the null-store on !emittingDisposerBody_, mirroring the
+                // qualified-form fix, so inside a destructor the field is left
+                // non-null and the auto-dispose pass disposes it exactly once.
+                if (isOwnedReferenceField(fs) && !emittingDisposerBody_) {
                     llvm::Type* fty = nullptr;
                     if (llvm::Value* addr = implicitFieldAddr(*un.operand, fty)) {
                         if (fty && fty->isPointerTy())
