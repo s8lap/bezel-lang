@@ -9365,6 +9365,23 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             return nullptr;
         }
 
+        // #887 / §19.3: a record DESTRUCTURING pattern `T(x, y, ...)` on a
+        // nullable record `T?` matches only when the value is present. Extract
+        // the unwrapped record value (nullablePrimValue → element 1) and run the
+        // non-nullable destructuring extraction on it — which binds the field
+        // slots from the record's fields — then AND with hasValue. Passing a null
+        // scrutTy on the recursion takes the non-nullable path, reaching the
+        // DestructuringPattern handler below with the record struct as scrutinee.
+        // Without this the pattern fell through to the "deferred" null return
+        // below, and the case lowering then emitted an unterminated basic block
+        // (IR verification failure).
+        if (dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+            llvm::Value* sub =
+                patternMatches(pat, innerVal, enumTy, isStr, /*scrutTy=*/nullptr);
+            if (!sub) return nullptr;
+            return builder_.CreateAnd(hasVal, sub, "nv.destr.match");
+        }
+
         // Other pattern kinds on a nullable value are deferred.
         return nullptr;
     }
