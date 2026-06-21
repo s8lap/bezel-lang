@@ -376,6 +376,7 @@ set(BEZEL_TEST_SOURCES
     codegen/int_min_mod_neg_one_844_test.cpp
     codegen/unary_plus_overload_852_test.cpp
     codegen/generic_nullable_value_param_846_test.cpp
+    codegen/generic_nullable_value_param_845_test.cpp
     codegen/nullable_record_user_equality_848_test.cpp
     codegen/typed_binding_string_pattern_856_test.cpp
     codegen/nullable_value_format_interp_849_test.cpp
