@@ -3433,6 +3433,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
+    outOwnedRecipients_.clear();  // §28.11 / #889: per-body out-owned recipients
     disposeStack_.clear();
     loopStack_.clear(); finallyStack_.clear();
     propagateBB_ = nullptr;
@@ -3704,6 +3705,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
+    outOwnedRecipients_.clear();  // §28.11 / #889: per-body out-owned recipients
     disposeStack_.clear();
     loopStack_.clear(); finallyStack_.clear();
     propagateBB_ = nullptr;
@@ -4103,6 +4105,7 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
+    outOwnedRecipients_.clear();  // §28.11 / #889: per-body out-owned recipients
     disposeStack_.clear();
     loopStack_.clear(); finallyStack_.clear();
     propagateBB_ = nullptr;

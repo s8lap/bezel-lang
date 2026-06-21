@@ -4356,6 +4356,19 @@ private:
     // value-typed local). Returns false for any non-(inline-owned-array) local.
     bool registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld);
 
+    // §28.11 / #889: the set of LocalDecl nodes that RECEIVED ownership of a
+    // moved-out owned element via an `out owned` argument (e.g.
+    // `s.TryPop(out owned item)`). The element is written into the local's slot
+    // by the Try* writeback; the local becomes the SOLE owner (the ownership
+    // pass marks it Owned per §28.11, and there is no scope-end auto-dispose for
+    // an out-owned recipient — discharge is the programmer's explicit
+    // `item?.Dispose()` / `move item`). Recorded in ensureOutVarSlots when the
+    // `out owned` arg targets an identifier local. Consulted by
+    // explicitDisposeOwnedReceiverSlot so an explicit `.Dispose()` / `?.Dispose()`
+    // on such a local RECLAIMS the heap block (and nulls the slot) exactly once,
+    // rather than only dispatching the destructor (which would leak the block).
+    std::unordered_set<const void*> outOwnedRecipients_;
+
     // #422 / §4.6 / §28.9: the set of `var` string LocalDecl nodes PROVABLY
     // eligible for scope-end bz_string_release — initialized once by a
     // codegen-internal +1 producer (string `+` / interpolation) and never

@@ -7147,20 +7147,66 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                 bool alreadyMapped = (loc2 && loc2->decl &&
                                       locals_.count(loc2->decl)) ||
                                      locals_.count(id2);
+                // §28.13 vs §28.11 / #889: the scope-end disposal kind depends on
+                // what the out value IS. Weak<T>.TryUpgrade(out using var h) binds
+                // a Shared<T> control-block HANDLE → bz_shared_release. Every other
+                // owned-OUT `out using var` (an owning-collection / channel Try*:
+                // TryPop/TryDequeue/TryPopFirst/TryPopLast/TryReceive) binds a moved-
+                // out OWNED CLASS ELEMENT → dispatch its destructor + reclaim the
+                // block via the object's own vtable (dynamicDispose). Using the
+                // sharedHandle path for a class element calls bz_shared_release on a
+                // raw object pointer, corrupting the heap and leaking the element.
+                // Discriminate by the RECEIVER builtin type name.
+                bool isUpgrade = false;
+                if (auto* maC = dynamic_cast<const ast::MemberAccessExpr*>(
+                        call.callee.get())) {
+                    if (maC->target) {
+                        if (const sema::TypeRef* rt =
+                                ctx_.exprType(*maC->target)) {
+                            isUpgrade = (builtinTypeName(rt) == "Weak");
+                        }
+                    }
+                }
                 if (!alreadyMapped) {
                     llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
-                    // Zero-initialize: null → upgrade did not happen (no-op on release).
+                    // Zero-initialize: null → the Try* false path (no upgrade / no
+                    // element). emitDisposals' null-guard then skips the release.
                     builder_.CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy()), outSlot);
                     locals_[id2] = outSlot;
                     if (loc2 && loc2->decl) locals_[loc2->decl] = outSlot;
-                    // Register a sharedHandle disposal so bz_shared_release is
-                    // called at scope end (null-guarded by emitDisposals).
                     if (!disposeStack_.empty()) {
                         Disposal disp{outSlot, nullptr};
-                        disp.sharedHandle = true;
+                        if (isUpgrade)
+                            disp.sharedHandle = true;  // §28.13: Shared<T> handle
+                        else
+                            disp.dynamicDispose = true;  // §28.11: owned class elem
                         disposeStack_.back().push_back(disp);
                     }
+                }
+            }
+            pos++;
+            continue;
+        }
+        // §28.11 / #889: `s.TryPop(out owned item)` (and the other owned-OUT
+        // Try* — TryDequeue/TryPopFirst/TryPopLast/TryPopValue/TryReceive) writes
+        // the moved-out OWNED element into `item`'s pre-declared slot; the local
+        // then SOLELY owns the element (the ownership pass marks it Owned per
+        // §28.11, and there is no scope-end auto-dispose for an out-owned
+        // recipient). Record the recipient LocalDecl so a later explicit
+        // `item.Dispose()` / `item?.Dispose()` RECLAIMS the heap block (and nulls
+        // the slot) exactly once via explicitDisposeOwnedReceiverSlot, rather than
+        // only dispatching the destructor (which leaks the block). The slot itself
+        // is the pre-declared local's — already created by its LocalDecl; we only
+        // record ownership here.
+        if (a.modifier == "out owned" && a.value) {
+            if (auto* idoo = dynamic_cast<const ast::IdentifierExpr*>(
+                    a.value.get())) {
+                sema::Symbol* symoo = ctx_.exprSymbol(*idoo);
+                if (auto* locoo = dynamic_cast<sema::LocalSymbol*>(symoo)) {
+                    if (locoo->decl)
+                        outOwnedRecipients_.insert(
+                            static_cast<const void*>(locoo->decl));
                 }
             }
             pos++;
@@ -7790,6 +7836,13 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
             // reclaims elsewhere, so reclaiming here would double-free.
             if (loc->isUsing) return lvalueAddr(receiver, slotTy);
             if (unwindOwnedLocalClass(ld)) return lvalueAddr(receiver, slotTy);
+            // §28.11 / #889: a local that RECEIVED a moved-out owned element via
+            // `out owned` (e.g. `s.TryPop(out owned item)`) is the sole owner of
+            // that element — recorded in outOwnedRecipients_ at the call site. Its
+            // slot is the only reclaim path (no scope-end auto-dispose covers an
+            // out-owned recipient), so reclaim + null here makes free happen once.
+            if (outOwnedRecipients_.count(static_cast<const void*>(ld)))
+                return lvalueAddr(receiver, slotTy);
             return nullptr;
         }
         return nullptr;
@@ -10729,6 +10782,52 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
 llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                const ast::NullCondMemberExpr& nm) {
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    // §28.11 / §28.2 / #889: `local?.Dispose()` — the canonical null-safe
+    // discharge of a conservatively-Owned local (e.g. an `out owned` item that is
+    // null on a Try* false path). `Dispose()` is compiler-synthesized and has NO
+    // MethodSymbol (it is rejected as a user member by §28.2), so the generic
+    // dispatch below (which needs `ms`) cannot lower it — the call would silently
+    // emit nothing and the element would leak. Handle it like the regular
+    // `obj.Dispose()` path: guard on a non-null receiver, then dynamic-dispatch
+    // the destructor; when the receiver slot is one this scope OWNS (an out-owned
+    // recipient, a `using var`, …) RECLAIM the block and null the slot so a
+    // repeated `?.Dispose()` is a clean no-op (mirrors lowerCall's Dispose arm).
+    if (!ms && nm.member == "Dispose" && call.args.empty() && nm.target) {
+        const sema::TypeRef* recvTy0 = ctx_.exprType(*nm.target);
+        bool recvIsClassOrIface =
+            recvTy0 && recvTy0->kind == sema::TypeRef::Kind::Named &&
+            recvTy0->declaration &&
+            (recvTy0->declaration->kind == ast::TypeDeclKind::Class ||
+             recvTy0->declaration->kind == ast::TypeDeclKind::Interface);
+        if (recvIsClassOrIface) {
+            llvm::Value* recvD = lowerExpr(*nm.target);
+            if (!recvD || !recvD->getType()->isPointerTy()) return nullptr;
+            // The `?.` null-guard is the dispose's own non-null guard: a null
+            // receiver simply skips (no-op), matching the §7.5 short-circuit.
+            auto* doBB = llvm::BasicBlock::Create(llvm_, "ncdisp.do", currentFn_);
+            auto* endBB =
+                llvm::BasicBlock::Create(llvm_, "ncdisp.end", currentFn_);
+            builder_.CreateCondBr(
+                builder_.CreateICmpNE(
+                    recvD, llvm::ConstantPointerNull::get(ptrTy())),
+                doBB, endBB);
+            builder_.SetInsertPoint(doBB);
+            llvm::Type* slotTy = nullptr;
+            llvm::Value* slot =
+                explicitDisposeOwnedReceiverSlot(*nm.target, slotTy);
+            if (slot) {
+                emitDisposeAndReclaim(recvD);
+                if (!checkedDisposal_)
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), slot);
+            } else {
+                emitDynamicDispose(recvD);
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+        }
+        return nullptr;  // Dispose() is void — result discarded.
+    }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
     llvm::FunctionType* fnTy = methodFnType(ms);
     if (!fnTy) return nullptr;

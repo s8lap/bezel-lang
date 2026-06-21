@@ -379,6 +379,7 @@ set(BEZEL_TEST_SOURCES
     codegen/float_to_int_truncation_858_test.cpp
     codegen/enum_cast_range_859_test.cpp
     codegen/nested_catch_rethrow_866_test.cpp
+    codegen/out_owned_writeback_889_test.cpp   # fix #889: §28.11 Try*(out owned)/out using var writeback — write the moved-out owned element back + dispose exactly once
     codegen/string_gethashcode_882_test.cpp
     codegen/generic_nullable_null_arg_885_886_test.cpp
     codegen/bare_method_value_880_881_test.cpp
