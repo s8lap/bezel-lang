@@ -277,7 +277,51 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         // a class-BODY `polymorphic(...);` member clause (parseMember path). The
         // field-level `serialized skip`/`serialized "name"`/`serialized optional`
         // clauses are unaffected (parseSerializedClause, still parsed below).
-        decl->baseTypes = parseInheritance();
+        // §11.1 / #873: for a class with primary-constructor parameters, the
+        // first base item may carry a base-ctor arg list `Base(args...)`. Parse
+        // it and store in decl->primaryBaseCtorArgs so the codegen can pre-
+        // populate the base's positional-param fields before field initializers
+        // run (§22.8 step 0 / §11.1 "chain to base before field initializers").
+        // For non-primary-ctor classes and records the existing tokenize-away
+        // behaviour is preserved (the arg list is only valid on the first base
+        // class of a primary-ctor class; sema enforces that separately).
+        if (decl->kind == ast::TypeDeclKind::Class && decl->hasPositionalFields) {
+            // Custom inheritance parse that captures the first base's arg list.
+            if (isPunctuator(":")) {
+                advance();  // past ':'
+                // Parse the first base type.
+                auto firstBase = parseType();
+                decl->baseTypes.push_back(std::move(firstBase));
+                // Capture base-ctor args if present.
+                if (isPunctuator("(")) {
+                    advance();  // past '('
+                    if (!isPunctuator(")"))
+                        decl->primaryBaseCtorArgs = parseArgList();
+                    if (!consumePunctuator(")"))
+                        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ')' to close base constructor argument list");
+                }
+                // Remaining base types (interfaces) — only one class base is
+                // valid for a primary-ctor class (sema enforces); parse further
+                // items for completeness, discarding their '(...)' groups.
+                while (isPunctuator(",")) {
+                    advance();
+                    auto t = parseType();
+                    decl->baseTypes.push_back(std::move(t));
+                    if (isPunctuator("(")) {
+                        int depth = 1;
+                        advance();
+                        while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+                            if (isPunctuator("("))      ++depth;
+                            else if (isPunctuator(")")) --depth;
+                            advance();
+                        }
+                    }
+                }
+            }
+        } else {
+            decl->baseTypes = parseInheritance();
+        }
         decl->genericConstraints = parseGenericConstraints();
     }
 

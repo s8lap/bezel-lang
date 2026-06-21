@@ -78,6 +78,17 @@ struct TopDecl : Node {};
 struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
 struct Expr; // defined further below; used by FieldDecl::initializer.
 
+// §11.1 / #873: forward-declared here so TypeDecl::primaryBaseCtorArgs can use
+// it. The full definition appears below (after Expr is defined in full).
+// A.4 / §A.5 Argument: `ArgModifiers? (Identifier ":=")? ArgExpression`
+struct CallArgument {
+    std::string_view modifier;  // "", "ref", "out", "out var",
+                                // "out using var", "out owned", "owned"
+    std::string_view name;      // "" when no `Identifier :=` named-arg prefix
+    bool isDiscard = false;
+    std::unique_ptr<Expr> value; // null when isDiscard
+};
+
 // A.3 `GenericParam ::= Variance? Identifier`. Used by both type declarations
 // (via TypeDecl::genericParams) and methods (via MethodDecl::genericParams);
 // declared up here so MethodDecl can reference it before TypeDecl is defined.
@@ -494,6 +505,13 @@ struct TypeDecl : TopDecl {
     // Record-only: `record Foo(...) ;` shorthand body (no `end`).
     bool isRecordShorthand = false;
     std::string_view endLabel; // empty when the `end` had no label
+    // §11.1 / #873: Class-only. When the class has a primary constructor AND a
+    // base class whose constructor takes arguments, the inheritance clause may
+    // carry a base-call arg list: `class D(v: int): Base(v)`. Parser stores the
+    // base-call arguments here (parallel to baseTypes[0] for classes). Empty
+    // when no such arg list was written; non-empty only for kind == Class &&
+    // hasPositionalFields.
+    std::vector<CallArgument> primaryBaseCtorArgs;
     // A.3 SerializedClassClause (slice 42). Null when not present.
     std::unique_ptr<SerializedClassClause> serializedClass;
 };
@@ -634,19 +652,9 @@ struct MemberAccessExpr : Expr {
     std::vector<std::unique_ptr<Type>> typeArgs;
 };
 
-// A.4 / §A.5 Argument:
-//   Argument      ::= ArgModifiers? (Identifier ":=")? ArgExpression
-//   ArgModifiers  ::= "ref" | "out" "var"? | "out" "using" "var"
-//                   | "out" "owned" | "owned"
-//   ArgExpression ::= Expression | "_"
-// `isDiscard` is the `_` form (valid only in `out` positions per sema).
-struct CallArgument {
-    std::string_view modifier;  // "", "ref", "out", "out var",
-                                // "out using var", "out owned", "owned"
-    std::string_view name;      // "" when no `Identifier :=` named-arg prefix
-    bool isDiscard = false;
-    std::unique_ptr<Expr> value; // null when isDiscard
-};
+// A.4 / §A.5 Argument (CallArgument): declared earlier in this file (before
+// TypeDecl) so TypeDecl::primaryBaseCtorArgs can use it. The struct definition
+// lives near the top of the file, next to the Expr/Type forward declarations.
 
 // A.5: `expr "(" ArgList? ")"`. Postfix call.
 struct CallExpr : Expr {

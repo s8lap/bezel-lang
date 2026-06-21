@@ -5774,6 +5774,30 @@ private:
                             bool isStr = false);
 
     llvm::Value* lowerConditional(const ast::ConditionalExpr& c);
+
+    // §11.1 / #873: before emitInstanceInit runs a class's field initializers,
+    // pre-populate the positional-param field slots of every base class in the
+    // hierarchy so that initializers like `_field := v` (where `v` is a
+    // primary-ctor parameter) read the value that was passed via the base(...)
+    // chain call rather than the calloc-zeroed default.
+    //
+    // `t`    — the most-derived class being constructed (the `new` target)
+    // `obj`  — the freshly calloc'd instance pointer (currentThis_ is set to it)
+    // `st`   — LLVM struct type for `t`
+    // `ne`   — the NewExpr (supplies the ctor argument list)
+    //
+    // For a class with a TypeDecl::primaryBaseCtorArgs, those expressions are
+    // evaluated (primary params are already pre-stored into their field slots)
+    // and stored into the first base class's positional-param field slots.
+    // For an explicit ctor with a leading `base(...)` call, the ctor params are
+    // temporarily bound to the evaluated `ne.args` values and the chain-call
+    // arg expressions are evaluated and stored into the base's slots.
+    // Recursive: the base class itself is also processed if needed.
+    void prePopulateBasePositionalFields(
+        const sema::TypeSymbol* t,
+        llvm::Value* obj,
+        const std::vector<llvm::Value*>& ctorArgVals,  // already-evaluated ctor args
+        const sema::ConstructorSymbol* cs);             // null if no explicit ctor
 };
 
 }  // namespace bezel::codegen

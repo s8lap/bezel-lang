@@ -6585,6 +6585,133 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
 }
 
 
+// §11.1 / #873: Pre-populate positional-param field slots of BASE classes
+// before emitInstanceInit runs the field initializers. Field initializers such
+// as `_field := v` resolve `v` to the base class's positional-param FieldSymbol
+// (via implicitFieldAddr), so the slot must hold the value passed via the
+// `base(...)` chain call BEFORE the initializer evaluates it.
+//
+// The function is called once per construction site (from lowerNew) with:
+//   t           — the TypeSymbol of the class being constructed
+//   obj         — the allocated-but-zeroed instance (currentThis_ must be set)
+//   ctorArgVals — evaluated constructor arg values [0..n-1], parallel to cs->params
+//   cs          — the ConstructorSymbol chosen for this site; null if no explicit ctor
+//
+// Strategy per class level:
+//   (a) If `t` has a TypeDecl with primaryBaseCtorArgs: those expressions are
+//       evaluated in the current context (primary-param slots for `t` are already
+//       pre-stored by the caller) and stored into the first base's positional slots.
+//   (b) If `t` has an explicit ctor (cs != null) with a leading base(...) call:
+//       temporarily bind cs->params to ctorArgVals, evaluate the chain-call arg
+//       expressions, and store the results into the base's positional-param slots.
+//   Recurse into the base class so that multi-level chains (B: A(x), A: Root(x))
+//   are handled correctly.
+void Emitter::prePopulateBasePositionalFields(
+        const sema::TypeSymbol* t,
+        llvm::Value* obj,
+        const std::vector<llvm::Value*>& ctorArgVals,
+        const sema::ConstructorSymbol* cs) {
+    if (!t || !obj) return;
+
+    // Find the first base class that has positional (primary-ctor) param fields.
+    const sema::TypeSymbol* baseTs = baseClassOf(t);
+    if (!baseTs) return;  // no base class, nothing to do
+
+    // Check if the base class has any positional-param fields to populate.
+    auto* baseTd = dynamic_cast<const ast::TypeDecl*>(baseTs->decl);
+    if (!baseTd || !baseTd->hasPositionalFields || baseTd->positionalFields.empty())
+        return;  // base has no primary-ctor params — field inits don't reference them
+
+    // Collect the base's positional FieldSymbols in declaration order.
+    std::vector<sema::FieldSymbol*> basePosFields;
+    for (sema::Symbol* m : baseTs->members) {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+        if (fs && fs->posParam) basePosFields.push_back(fs);
+    }
+    if (basePosFields.empty()) return;
+
+    // Determine the arg values to store into the base's positional fields.
+    // We look for them from two sources:
+    //   (a) TypeDecl::primaryBaseCtorArgs on the CURRENT class (parsed from
+    //       the `: Base(args...)` inheritance clause).
+    //   (b) The leading base(...) chain call in the explicit ctor body.
+    // In both cases, evaluate the arg expressions in the current Emitter context
+    // (where primary-param slots for `t` are already populated by the caller).
+
+    std::vector<llvm::Value*> baseArgVals;
+
+    auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+
+    // --- Case (a): primary-ctor class with primaryBaseCtorArgs ---
+    if (td && td->kind == ast::TypeDeclKind::Class &&
+        !td->primaryBaseCtorArgs.empty()) {
+        for (const auto& arg : td->primaryBaseCtorArgs) {
+            if (!arg.value) { baseArgVals.clear(); break; }
+            llvm::Value* v = lowerExpr(*arg.value);
+            if (!v) { baseArgVals.clear(); break; }
+            baseArgVals.push_back(v);
+        }
+    }
+    // --- Case (b): explicit ctor with leading base(...) chain call ---
+    else if (cs && !cs->params.empty() && !ctorArgVals.empty() &&
+             cs->params.size() == ctorArgVals.size()) {
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (cd && !cd->body.empty()) {
+            bool isThis = false;
+            const ast::CallExpr* chainCall = chainCallOf(*cd->body[0], isThis);
+            if (chainCall && !isThis && !chainCall->args.empty()) {
+                // Temporarily bind ctor params to their values so that the
+                // chain-call arg expressions (which reference ctor params) can
+                // be evaluated correctly. Save and restore paramSlots_.
+                auto savedParams = paramSlots_;
+                for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
+                    auto* slot = entryAlloca(ctorArgVals[pi]->getType());
+                    builder_.CreateStore(ctorArgVals[pi], slot);
+                    paramSlots_[cs->params[pi]] = slot;
+                }
+                for (const auto& arg : chainCall->args) {
+                    if (!arg.value) { baseArgVals.clear(); break; }
+                    llvm::Value* v = lowerExpr(*arg.value);
+                    if (!v) { baseArgVals.clear(); break; }
+                    baseArgVals.push_back(v);
+                }
+                paramSlots_ = std::move(savedParams);
+            }
+        }
+    }
+
+    if (baseArgVals.empty()) {
+        // No base-call args determined — nothing to pre-populate.
+        // Still recurse in case the base's own base needs pre-population.
+        prePopulateBasePositionalFields(baseTs, obj, {}, nullptr);
+        return;
+    }
+
+    // Store the base-call arg values into the base's positional-param field slots.
+    llvm::StructType* baseSt = classStruct(baseTs);
+    std::size_t numToStore = std::min(baseArgVals.size(), basePosFields.size());
+    for (std::size_t i = 0; i < numToStore; ++i) {
+        sema::FieldSymbol* fs = basePosFields[i];
+        auto idxIt = fieldIndex_.find(fs);
+        if (idxIt == fieldIndex_.end()) continue;
+        llvm::Value* v = baseArgVals[i];
+        if (!v) continue;
+        llvm::Type* fieldTy = baseSt->getElementType(idxIt->second);
+        v = coerceNumericToType(v, fieldTy, /*srcUnsigned=*/false);
+        builder_.CreateStore(v, builder_.CreateStructGEP(baseSt, obj, idxIt->second));
+    }
+
+    // Recurse: the base class itself may also have a base with positional params
+    // (e.g. C(z): B(z): A(z) — B's and A's params both need pre-population).
+    // Find what ctor symbol the base class has (if any) for use in recursion.
+    const sema::ConstructorSymbol* baseCs = nullptr;
+    if (!baseArgVals.empty()) {
+        baseCs = ctorByArity(baseTs, baseArgVals.size(), nullptr);
+    }
+    prePopulateBasePositionalFields(baseTs, obj, baseArgVals, baseCs);
+}
+
+
 llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     if (!ne.type) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*ne.type);
@@ -7441,6 +7568,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // Classes WITH an explicit constructor remain gated: the ctor body is
     // absent from the metadata (Foundation C / Blocker 3).  Records ride the
     // #428b path.  The backstop comment applies to those still-gated shapes.
+    // §11.1 / #873: when lowerNew pre-evaluates the ctor args (to allow
+    // prePopulateBasePositionalFields to bind params before emitInstanceInit),
+    // the results are stored here and reused by the ctor-call section below so
+    // that arg expressions with side effects are never evaluated twice.
+    // Only populated for local (non-imported, non-generic) classes with an
+    // explicit ctor matching the call's arity.
+    std::vector<llvm::Value*>      prebuiltCtorArgs;    // args[0]=obj, [1..n]=params
+    std::vector<const ast::Expr*>  prebuiltCtorExprs;   // parallel to [1..n]
+    sema::ConstructorSymbol*       prebuiltCtorCs   = nullptr;
+    llvm::Function*                prebuiltCtorFn   = nullptr;
+
     const bool importedGeneric =
         ctx_.isImported(t) && !t->genericParams.empty();
     // #662 foundation A: an imported generic class with no explicit ctor uses
@@ -7526,6 +7664,70 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                 }
             }
+        }
+        // §11.1 / #873: pre-populate base classes' positional-param field slots
+        // BEFORE emitInstanceInit so that base field initializers (e.g.
+        // `_field := v`) can read the value passed via the base(v) chain call
+        // rather than the calloc-zeroed default. Evaluate the ctor args once
+        // here (under the outer substitution, matching the ctor-call path below)
+        // so they can be reused by the ctor call WITHOUT re-evaluation.
+        //
+        // Two cases for currentThis_ during arg evaluation:
+        //   (a) primaryBaseCtorArgs (class-header `Base(v)` form, no explicit ctor):
+        //       `v` is a primary-ctor FieldSymbol on `t` → implicitFieldAddr GEPs
+        //       against `obj` → keep currentThis_ = obj.
+        //   (b) explicit ctor call-site args (`new Pair<T>(_second, _first)`):
+        //       `_second`/`_first` are fields of the ENCLOSING scope's `this`,
+        //       not the new object → must evaluate under savedThisForInit.
+        // Explicit ctor path (b) saves/restores currentThis_ around buildOrderedArgs.
+        {
+            auto ctorArgSubstSave = genericSubst_;
+            auto ctorArgSemaSave  = genericSubstSemaTy_;
+            genericSubst_       = savedSubst;
+            genericSubstSemaTy_ = savedSemaTy;
+            if (sema::ConstructorSymbol* earlyCs = ctorForArgs(t, ne.args)) {
+                auto earlyIt = ctorFns_.find(earlyCs);
+                auto* earlyCd =
+                    dynamic_cast<const ast::ConstructorDecl*>(earlyCs->decl);
+                if (earlyIt != ctorFns_.end() && earlyCd) {
+                    std::vector<llvm::Value*> eArgs;
+                    eArgs.push_back(obj);
+                    // Collect arg exprs for +1-string-release bookkeeping later.
+                    std::vector<const ast::Expr*> eArgExprs;
+                    // (b): explicit ctor args belong to the enclosing scope —
+                    // evaluate under savedThisForInit so implicit field accesses
+                    // (e.g. `_second` in `new Pair<T>(_second, _first)`) resolve
+                    // against the enclosing `this`, not the new object.
+                    llvm::Value* savedThisForArgs = currentThis_;
+                    currentThis_ = savedThisForInit;
+                    bool ok = buildOrderedArgs(earlyCd->params, ne.args, eArgs,
+                                              &eArgExprs);
+                    currentThis_ = savedThisForArgs;
+                    if (ok) {
+                        // Store for the ctor-call section below to reuse.
+                        prebuiltCtorArgs  = std::move(eArgs);
+                        prebuiltCtorExprs = std::move(eArgExprs);
+                        prebuiltCtorCs    = earlyCs;
+                        prebuiltCtorFn    = earlyIt->second;
+                        // Pre-populate base positional-param fields using
+                        // args[1..n] (param values, not the `this` in args[0]).
+                        std::vector<llvm::Value*> paramVals(
+                            prebuiltCtorArgs.begin() + 1,
+                            prebuiltCtorArgs.end());
+                        prePopulateBasePositionalFields(t, obj, paramVals, earlyCs);
+                    }
+                }
+            }
+            if (prebuiltCtorArgs.empty()) {
+                // No explicit ctor (primary-ctor class with primaryBaseCtorArgs
+                // or no chain at all): still pre-populate from primaryBaseCtorArgs.
+                // (a): primaryBaseCtorArgs expressions reference primary-ctor
+                // FieldSymbols on `t` → evaluated via implicitFieldAddr(GEP obj),
+                // so currentThis_ = obj is already correct here.
+                prePopulateBasePositionalFields(t, obj, {}, nullptr);
+            }
+            genericSubst_       = std::move(ctorArgSubstSave);
+            genericSubstSemaTy_ = std::move(ctorArgSemaSave);
         }
         emitInstanceInit(t, obj, st);
         currentThis_ = savedThisForInit;
@@ -7670,7 +7872,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (it != ctorFns_.end() && cd) {
             std::vector<llvm::Value*> args;
-            args.push_back(obj);
+            std::vector<const ast::Expr*> ctorArgExprs;
+            bool builtArgs = false;
+            // §11.1 / #873: reuse pre-evaluated ctor args from the
+            // prePopulateBasePositionalFields step above (to avoid
+            // double-evaluating side-effecting arg expressions).
+            if (cs == prebuiltCtorCs && it->second == prebuiltCtorFn &&
+                !prebuiltCtorArgs.empty()) {
+                args        = std::move(prebuiltCtorArgs);
+                ctorArgExprs = std::move(prebuiltCtorExprs);
+                builtArgs   = true;
+            } else {
             // issue #597 (§14.1 / §22.4): the constructor ARGUMENT expressions
             // belong to the ENCLOSING scope, so they must be lowered under the
             // outer substitution (`savedSubst`), not the new type's own
@@ -7688,13 +7900,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             auto ctorArgSemaTy = genericSubstSemaTy_;
             genericSubst_ = savedSubst;
             genericSubstSemaTy_ = savedSemaTy;
+            args.push_back(obj);
             // #429 (ARGUMENT-PASS category): collect per-param arg expressions
             // so we can release any +1 string producer after the ctor runs.
-            std::vector<const ast::Expr*> ctorArgExprs;
-            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args,
+            builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs);
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
+            }
             if (builtArgs &&
                 args.size() == it->second->arg_size()) {
                 // Check for type mismatch (generic substitution active).

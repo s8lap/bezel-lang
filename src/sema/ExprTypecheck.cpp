@@ -1646,6 +1646,26 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
         for (const auto& m : td->members) {
             if (m) visitMember(*m);
         }
+        // §11.1 / #873: visit primaryBaseCtorArgs so that identifier
+        // expressions like `v` in `class D(v: int): Base(v)` get their
+        // exprSymbol attached.  These expressions live in the same scope as
+        // field initializers (primary-ctor params are reachable via
+        // currentType_->members as FieldSymbols with posParam != null).
+        // Without this pass, lowerExpr returns nullptr for those identifiers
+        // because ctx_.exprSymbol() is null → base fields stay zero.
+        if (td->kind == ast::TypeDeclKind::Class &&
+            td->hasPositionalFields &&
+            !td->primaryBaseCtorArgs.empty()) {
+            bool saveIFI = inFieldInitializer_;
+            inFieldInitializer_ = true;
+            Scope* saveScope = currentScope_;
+            if (!currentScope_) currentScope_ = moduleScope_.get();
+            for (const auto& arg : td->primaryBaseCtorArgs) {
+                if (arg.value) visitExpr(*arg.value);
+            }
+            currentScope_ = saveScope;
+            inFieldInitializer_ = saveIFI;
+        }
         currentType_ = save;
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §26.1: inside an extension block, `this` is the receiver. For an

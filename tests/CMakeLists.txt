@@ -376,6 +376,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nested_catch_rethrow_866_test.cpp
     codegen/owned_subscription_field_dispose_879_test.cpp
     codegen/decimal_to_int_overflow_872_test.cpp
+    codegen/base_primary_ctor_param_873_test.cpp
     codegen/nested_owning_collection_dispose_868_test.cpp
     codegen/owned_collection_field_reassign_824_test.cpp
     codegen/generic_nullable_peel_850_test.cpp
