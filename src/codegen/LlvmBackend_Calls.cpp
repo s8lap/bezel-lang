@@ -7542,9 +7542,20 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     llvm::Value* i = builder_.CreateLoad(i64(), iSlot);
     builder_.CreateCondBr(builder_.CreateICmpSLT(i, n), bodyBB, endBB);
 
+    auto* invokeBB = llvm::BasicBlock::Create(llvm_, "raise.invoke", fn);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "raise.cont", fn);
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* iv = builder_.CreateLoad(i64(), iSlot);
     llvm::Value* closure = builder_.CreateCall(atFn, {srcPtr, iv}, "event.h");
+    // §24.5 (#908): a handler deactivated MID-RAISE — e.g. another handler in this
+    // same Raise disposed this subscription — leaves a null slot;
+    // bz_event_handler_at returns null for it. Loading the function pointer from
+    // null would SIGSEGV, so skip a null handler and continue the iteration.
+    llvm::Value* closNull = builder_.CreateICmpEQ(
+        closure, llvm::ConstantPointerNull::get(ptrTy()), "h.null");
+    builder_.CreateCondBr(closNull, contBB, invokeBB);
+
+    builder_.SetInsertPoint(invokeBB);
     llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "h.fn");
     llvm::Value* envSlot =
         builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
@@ -7559,8 +7570,8 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
         builder_.CreateLoad(ptrTy(), emitExcSlot(), "raise.exc");
     llvm::Value* threw = builder_.CreateICmpNE(
         pend, llvm::ConstantPointerNull::get(ptrTy()), "raise.threw");
-    auto* contBB = llvm::BasicBlock::Create(llvm_, "raise.cont", fn);
     builder_.CreateCondBr(threw, endBB, contBB);
+
     builder_.SetInsertPoint(contBB);
     builder_.CreateStore(builder_.CreateAdd(iv, builder_.getInt64(1)), iSlot);
     builder_.CreateBr(loopBB);
