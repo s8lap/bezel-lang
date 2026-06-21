@@ -7724,6 +7724,22 @@ void Emitter::unifyMethodReturnTypeArg(
                     concreteTy = nn;
                 }
             }
+            // §14.1 / #885 #886: do NOT bind a type param when the concrete
+            // candidate is itself an unresolved type param (Named, no
+            // declaration) OR the Object primitive (which is how sema types
+            // null literals that weren't resolved to a concrete nullable value
+            // type). Either form carries no real concrete-type information for
+            // the generic param and blocks the correct binding from a subsequent
+            // concrete argument or explicit type arg. Skip here; the outer
+            // lowerCall loop already skips NullLiteralExpr args, but this guard
+            // is a second line of defence for other null-typed sources.
+            // per §14.1/§14.2, fixes #885/#886.
+            if (concreteTy->kind == sema::TypeRef::Kind::Named &&
+                !concreteTy->declaration)
+                return;
+            if (concreteTy->kind == sema::TypeRef::Kind::Primitive &&
+                concreteTy->primitive == sema::PrimitiveType::Object)
+                return;
             subst[nm] = lowerTypeRef(concreteTy);
             semaTy[nm] = concreteTy;
             added = true;
@@ -9690,6 +9706,17 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             for (std::size_t pi = 0; pi < md->params.size() &&
                  pi < call.args.size(); ++pi) {
                 if (!md->params[pi].type || !call.args[pi].value) continue;
+                // §14.1 / #885 #886: a `null` literal carries no concrete type
+                // information — it is typed by sema as Object (the root reference
+                // type) or as the declared param type T?, neither of which reveals
+                // T's concrete binding. Binding T → Object here blocks the correct
+                // binding from a subsequent concrete argument or explicit type arg,
+                // causing nullableTypeParamConcrete to fail → null not wrapped →
+                // PHI/ICmp type-mismatch crash in the specialized body. Skip null
+                // literals during type-param inference. per §14.1/§14.2, #885/#886.
+                if (dynamic_cast<const ast::NullLiteralExpr*>(
+                        call.args[pi].value.get()))
+                    continue;
                 const sema::TypeRef* declPt =
                     ctx_.resolvedType(*md->params[pi].type);
                 sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
