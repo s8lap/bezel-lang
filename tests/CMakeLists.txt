@@ -235,6 +235,7 @@ set(BEZEL_TEST_SOURCES
     sema/shared_sync_sendable_689_test.cpp            # #689: Shared<T> sendable iff T in sync-set (§28.13 v0.140)
     sema/using_var_reassign_830_test.cpp              # fix #830: §28.10 reject reassigning a `using var` local
     sema/move_bare_field_restoration_825_test.cpp     # fix #825: §28.8.1 bare `move _field` must trigger field-restoration check
+    sema/field_restoration_path_sensitive_867_test.cpp # fix #867: §28.8.1 field-restoration check is path-sensitive (partial restore rejected)
     sema/nullable_field_narrowing_862_test.cpp        # fix #862: §7.4 reject nullable-field member access — fields are not narrowable
     sema/compound_assign_operator_result_851_test.cpp # fix #851: §25.1 reject compound op whose overload result differs from LHS
     sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range

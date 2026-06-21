@@ -35,7 +35,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // Seed the dataflow entry state with `owned` / `out owned` parameters
     // (slice O10): each enters the method in the Owned state and must
     // reach a discharge point on every normal-exit path (§28.8).
-    BlockState entry;
+    FlowState entry;
     if (paramSyms) {
         for (sema::Symbol* sym : *paramSyms) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
@@ -46,7 +46,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 lo.state = OwnershipState::Owned;
                 lo.implicitDischarge = false;
                 lo.obligationOrigin = ps->decl;
-                entry[sym] = lo;
+                entry.locals[sym] = lo;
             }
         }
     }
@@ -69,7 +69,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         annotateSuspendLocals(*cfg);
         addCompletionEdges(*cfg);
     }
-    BlockState endState = runDataflow(*cfg, entry);
+    FlowState endFlow = runDataflow(*cfg, entry);
+    const BlockState& endState = endFlow.locals;
     // §28.3 "Owned-local discharge requirement": an owned local must reach
     // an owned slot (or be disposed) before it goes out of scope on a
     // *normal-exit* path. The exception-path discharge is handled inside the
@@ -93,22 +94,27 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         }
     }
     // Slice O8 / §28.8.1: a `move this.field` leaves the field in
-    // moved-from state. The field must be reassigned before the
-    // surrounding method exits — otherwise the field's invariant
-    // is broken on method return. Per §28.8.1 "Exception paths are not
-    // exempt", this is NOT covered by the §28.3 exception-path discharge:
-    // even when the method exits via a throw, the destructor on `this`
-    // would observe the field moved-from during unwinding, so the check
-    // fires unconditionally (path-insensitively) here.
+    // moved-from state. The field must be reassigned (restored) before the
+    // surrounding method exits — otherwise the field's invariant is broken on
+    // method return. Per §28.8.1 the field must be restored on EVERY path from
+    // the move to method exit; "Exception paths are not exempt", so this is NOT
+    // covered by the §28.3 exception-path discharge: even when the method exits
+    // via a throw, the destructor on `this` would observe the field moved-from
+    // during unwinding (the field facts deliberately pass through discharge
+    // edges UNTOUCHED — unwinding disposes live locals, it does not restore a
+    // moved-from field).
+    // §28.8.1 (#867): the field facts are PATH-SENSITIVE — `endFlow.fields` is
+    // the OR-over-every-path-reaching-exit merge of the per-block moved-from
+    // facts (see runDataflow / joinFieldsInto), so a field restored on only
+    // SOME paths is reported here exactly because the unrestored path leaves it
+    // moved-from at the merged exit state.
     // §28.8.1 (#763): the field-restoration rule does NOT apply inside a
     // destructor — "the object is being torn down and no future read of the
     // field will occur," so a `move this.f` whose taken value is otherwise
     // discharged (checked by the ordinary owned-local discharge above) leaves
-    // the field validly moved-from at destructor exit. Skip the check there;
-    // for every other method/constructor body it still fires unconditionally
-    // (path-insensitively — exception paths are not exempt).
+    // the field validly moved-from at destructor exit. Skip the check there.
     if (!isDestructor_) {
-        for (const auto& [name, moved] : fieldMovedFrom_) {
+        for (const auto& [name, moved] : endFlow.fields) {
             if (moved) {
                 ctx_.diagnostics().report(
                     Severity::Error,
@@ -216,6 +222,30 @@ bool sameState(const BlockState& a, const BlockState& b) {
         if (la.implicitDischarge != it->second.implicitDischarge) return false;
     }
     return true;
+}
+
+// §28.8.1 (#867): fixpoint convergence over the field-moved-from facts. Two
+// maps agree when every field present-and-true in one is present-and-true in
+// the other (an absent or false entry both mean "restored / never moved").
+// The loop fixpoint must consider these alongside the locals so a field fact
+// that needs another pass to propagate around a back-edge is not declared
+// stable prematurely. // per §28.8.1, #867
+bool sameFields(const FieldMovedFrom& a, const FieldMovedFrom& b) {
+    auto subsetTrue = [](const FieldMovedFrom& x, const FieldMovedFrom& y) {
+        for (const auto& [name, moved] : x) {
+            if (!moved) continue;
+            auto it = y.find(name);
+            if (it == y.end() || !it->second) return false;
+        }
+        return true;
+    };
+    return subsetTrue(a, b) && subsetTrue(b, a);
+}
+
+// §28.8.1 (#867): same FlowState for the loop fixpoint — both the locals
+// lattice and the field-moved-from facts must be stable.
+bool sameFlow(const FlowState& a, const FlowState& b) {
+    return sameState(a.locals, b.locals) && sameFields(a.fields, b.fields);
 }
 
 // Collect every LocalDecl AST node declared (directly or in a nested
@@ -330,8 +360,22 @@ BlockState dischargeOnExceptionEdge(
 
 } // namespace
 
-BlockState MethodOwnership::runDataflow(
-    const flow::CFG& cfg, const BlockState& entry) {
+void MethodOwnership::joinFieldsInto(FieldMovedFrom& into,
+                                    const FieldMovedFrom& other) {
+    // §28.8.1 (#867): OR-over-predecessors. A field moved-from on the `other`
+    // path becomes moved-from at the join (restored only when restored on ALL
+    // incoming paths). A field absent from one operand was never moved on that
+    // path (i.e. restored), so it does not force the result true. We therefore
+    // only need to propagate `other`'s TRUE entries into `into`: any field
+    // already true in `into` stays true; a field true in `other` becomes true
+    // in `into`; everything else (false/absent in both) stays restored.
+    for (const auto& [name, moved] : other) {
+        if (moved) into[name] = true;
+    }
+}
+
+FlowState MethodOwnership::runDataflow(
+    const flow::CFG& cfg, const FlowState& entry) {
     // Identify back-edges, then a reverse-postorder over the forward edges.
     std::unordered_set<Edge, EdgeHash> backEdges;
     {
@@ -355,7 +399,7 @@ BlockState MethodOwnership::runDataflow(
     }
     std::reverse(post.begin(), post.end()); // postorder → reverse-postorder
 
-    std::unordered_map<const flow::CFGBlock*, BlockState> exitState;
+    std::unordered_map<const flow::CFGBlock*, FlowState> exitState;
     std::unordered_set<const flow::CFGBlock*> evaluated;
 
     // §28.3 exception-path discharge scoping. For an exception edge that
@@ -390,11 +434,22 @@ BlockState MethodOwnership::runDataflow(
     // if/elif/else Merge block does, and only on the final pass via
     // `emitOnMerge`).
     auto computeEntry = [&](const flow::CFGBlock* b,
-                            bool emitOnMerge) -> BlockState {
+                            bool emitOnMerge) -> FlowState {
         BlockState in;
+        // §28.8.1 (#867): the field-moved-from facts at this block's entry,
+        // merged OR-over-predecessors (a field moved-from on ANY incoming path
+        // → moved-from at entry). Unlike the locals, field facts get NO
+        // discharge / null-guard transform: unwinding disposes live locals but
+        // does NOT restore a moved-from field (§28.8.1 "Exception paths are not
+        // exempt"), so they pass through every edge — normal, exception,
+        // completion, loop — unchanged and merge purely by OR. The merge is
+        // order-independent, so every evaluated predecessor is folded in
+        // uniformly below (no normal-first / discharge ordering needed).
+        FieldMovedFrom inFields;
         bool haveIn = false;
         if (b == cfg.entry()) {
-            in = entry;
+            in = entry.locals;
+            inFields = entry.fields;
             haveIn = true;
         }
         SourceLocation joinLoc =
@@ -453,9 +508,14 @@ BlockState MethodOwnership::runDataflow(
         };
         auto foldPred = [&](const flow::CFGBlock* p, bool dischargeEdge) {
             if (!evaluated.count(p)) return;
+            // §28.8.1 (#867): merge this predecessor's field-moved-from facts
+            // (OR). Done for every evaluated predecessor regardless of edge
+            // kind — field facts are not discharged on exception/completion
+            // edges (see comment above).
+            joinFieldsInto(inFields, exitState[p].fields);
             const bool loopEdge =
                 backEdges.count({p, b}) != 0 || isLoopSkipEdge(p, b);
-            const BlockState& peRaw = exitState[p];
+            const BlockState& peRaw = exitState[p].locals;
             BlockState peDischarged;
             if (dischargeEdge)
                 peDischarged =
@@ -491,7 +551,7 @@ BlockState MethodOwnership::runDataflow(
             if (!isDischargeEdge(p)) foldPred(p, false);
         for (const flow::CFGBlock* p : b->preds)
             if (isDischargeEdge(p)) foldPred(p, true);
-        return in;
+        return FlowState{std::move(in), std::move(inFields)};
     };
 
     // --- O3b fixpoint phase (diagnostics suppressed) ----------------------
@@ -509,13 +569,22 @@ BlockState MethodOwnership::runDataflow(
     for (std::size_t pass = 0; pass < maxPasses; ++pass) {
         bool changed = false;
         for (const flow::CFGBlock* b : post) {
-            states_ = computeEntry(b, /*emitOnMerge=*/false);
+            // §28.8.1 (#867): seed the per-block working state for BOTH the
+            // locals (states_) and the field-moved-from facts (fieldMovedFrom_)
+            // from the merged entry. processBlock's transfer functions mutate
+            // both members in place; snapshot both into the block's FlowState
+            // exit afterward so the field facts participate in the next pass's
+            // joins exactly like the locals.
+            FlowState fs = computeEntry(b, /*emitOnMerge=*/false);
+            states_ = std::move(fs.locals);
+            fieldMovedFrom_ = std::move(fs.fields);
             processBlock(*b);
+            FlowState exit{states_, fieldMovedFrom_};
             auto it = exitState.find(b);
-            if (it == exitState.end() || !sameState(it->second, states_)) {
+            if (it == exitState.end() || !sameFlow(it->second, exit)) {
                 changed = true;
             }
-            exitState[b] = states_;
+            exitState[b] = std::move(exit);
             evaluated.insert(b);
         }
         if (!changed) break;
@@ -526,16 +595,20 @@ BlockState MethodOwnership::runDataflow(
     // The fixpoint above left `exitState` stable. Walk the RPO one last
     // time with diagnostics on, so each block's reads/moves/disposals and
     // branch-join clashes are reported exactly once, against the converged
-    // predecessor exit states. Reset the per-method field-move tracker so
-    // it reflects exactly this single walk (the suppressed fixpoint passes
-    // toggled it repeatedly).
+    // predecessor exit states.
+    // §28.8.1 (#867): `fieldMovedFrom_` is now seeded per block from the merged
+    // entry (it is the current-block working map), so it no longer needs a
+    // single-walk reset — each block starts from its own merged entry facts.
+    // `fieldMoveLoc_` is a global accumulator of move-site locations (used only
+    // to place the exit diagnostic); reset it once so it reflects this walk.
     suppressDiag_ = false;
-    fieldMovedFrom_.clear();
     fieldMoveLoc_.clear();
     for (const flow::CFGBlock* b : post) {
-        states_ = computeEntry(b, /*emitOnMerge=*/true);
+        FlowState fs = computeEntry(b, /*emitOnMerge=*/true);
+        states_ = std::move(fs.locals);
+        fieldMovedFrom_ = std::move(fs.fields);
         processBlock(*b);
-        exitState[b] = states_;
+        exitState[b] = FlowState{states_, fieldMovedFrom_};
     }
 
     // End-of-method state = the meet of every path reaching the CFG exit.
@@ -550,10 +623,18 @@ BlockState MethodOwnership::runDataflow(
     // which the unwound owned locals have been dropped (§28.3 exception-path
     // discharge), so the throw path never produces a leak diagnostic.
     BlockState endState;
+    // §28.8.1 (#867): the field-moved-from facts merged over every path that
+    // reaches exit (OR-over-paths). run() reads this for the field-restoration
+    // check, so a field left moved-from on ANY exit path is reported. Field
+    // facts are NOT discharged on the throw/completion exit edges (unwinding
+    // disposes locals but does not restore a moved-from field — §28.8.1
+    // "Exception paths are not exempt").
+    FieldMovedFrom endFields;
     bool haveEnd = false;
     auto foldExitPred = [&](const flow::CFGBlock* p, bool dischargeEdge) {
         if (!evaluated.count(p)) return;
-        const BlockState& peRaw = exitState[p];
+        joinFieldsInto(endFields, exitState[p].fields);
+        const BlockState& peRaw = exitState[p].locals;
         BlockState peDischarged;
         if (dischargeEdge)
             peDischarged =
@@ -613,9 +694,12 @@ BlockState MethodOwnership::runDataflow(
     if (!haveEnd) {
         // No path reaches exit. Fall back to the entry-block exit state.
         auto it = exitState.find(cfg.entry());
-        if (it != exitState.end()) endState = it->second;
+        if (it != exitState.end()) {
+            endState = it->second.locals;
+            endFields = it->second.fields;
+        }
     }
-    return endState;
+    return FlowState{std::move(endState), std::move(endFields)};
 }
 
 void MethodOwnership::processBlock(const flow::CFGBlock& block) {

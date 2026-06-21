@@ -49,6 +49,31 @@ namespace bezel::ownership {
 //     try/finally, so it is not reported as leaked on that edge.
 using BlockState = std::unordered_map<sema::Symbol*, LocalOwnership>;
 
+// §28.8.1 (#867): the per-block dataflow lattice for the field-restoration
+// check. A `move` of an owned field leaves the field moved-from; the field
+// must be RESTORED (reassigned a value, incl. `null` for a nullable owned
+// field) on EVERY control-flow path from the move to method exit. Earlier the
+// moved-from facts lived in a flat member map mutated linearly as statements
+// were visited, so a `move` restored on only SOME paths was wrongly accepted:
+// the map is not part of `BlockState`, so it never participated in the CFG
+// meet at joins. `FlowState` bundles the locals lattice WITH the field-moved-
+// from facts so both flow through `runDataflow`/`computeEntry` together (the
+// locals merged via `joinInto`, the fields via `joinFieldsInto`). The field
+// facts merge with the OPPOSITE polarity to the locals:
+// a field is moved-from at a join iff it is moved-from on ANY incoming path
+// (equivalently RESTORED iff restored on ALL paths) — an unrestored field on
+// even one path must be reported at exit. // per §28.8.1, #867
+using FieldMovedFrom = std::unordered_map<std::string_view, bool>;
+
+// §28.8.1 (#867): the full per-block dataflow state — the locals lattice plus
+// the field-moved-from facts, carried together so both participate in the CFG
+// meet (the locals via the §28.3 `joinInto`, the fields via the OR-over-paths
+// `joinFieldsInto`).
+struct FlowState {
+    BlockState locals;
+    FieldMovedFrom fields;
+};
+
 class MethodOwnership {
 public:
     MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}
@@ -101,10 +126,17 @@ private:
     // catch arms; symbols are unique per arm, so the set is path-insensitive
     // (a catch binding only appears within its own arm body). // per §31.1
     std::unordered_set<sema::Symbol*> catchBorrows_;
-    // Slice O8: per-method tracker for `move this.field` — the field's
-    // name maps to its moved-from state. fieldMoveLoc_ stores the
-    // move-site location for diagnostics.
-    std::unordered_map<std::string_view, bool> fieldMovedFrom_;
+    // Slice O8 / §28.8.1 (#867): the CURRENT block's `move this.field`
+    // tracker — the field's name maps to its moved-from state. The transfer
+    // functions (recordMovesIn / handleDischarge mark; handleAssignment clear)
+    // mutate this map exactly as they mutate `states_` for locals. The CFG
+    // driver (runDataflow) seeds it from the block's merged entry field facts
+    // before each block and snapshots it into the block's `FlowState` exit
+    // after, so the facts participate in the §28.8.1 join (moved-from on ANY
+    // path → reported at exit). fieldMoveLoc_ stores the move-site location for
+    // diagnostics (path-insensitive: last move site per field name wins; it
+    // only fixes the reported error location). // per §28.8.1, #867
+    FieldMovedFrom fieldMovedFrom_;
     std::unordered_map<std::string_view, SourceLocation> fieldMoveLoc_;
 
     // Slice O3b: the loop fixpoint re-processes loop bodies until the
@@ -431,7 +463,18 @@ private:
     // reaching the CFG exit (used as the end-of-method undischarged-owned
     // check). Diagnostics for reads/moves/disposals and branch-join
     // clashes are emitted on the single final (non-suppressed) pass.
-    BlockState runDataflow(const flow::CFG& cfg, const BlockState& entry);
+    //
+    // §28.8.1 (#867): the returned FlowState also carries the field-moved-from
+    // facts merged over every path reaching exit (OR-over-paths), which run()
+    // reads for the field-restoration check.
+    FlowState runDataflow(const flow::CFG& cfg, const FlowState& entry);
+
+    // §28.8.1 (#867): merge `other`'s field-moved-from facts into `into` with
+    // OR-over-predecessors — a field moved-from on ANY incoming path is
+    // moved-from at the join (restored only when restored on ALL paths). A
+    // field absent from one operand is treated as RESTORED (false) on that
+    // path: a field that was never moved on a path is not moved-from there.
+    void joinFieldsInto(FieldMovedFrom& into, const FieldMovedFrom& other);
 
     // Process one CFG block's straight-line statements, mutating
     // `states_` (which the caller has set to the block's entry state).
