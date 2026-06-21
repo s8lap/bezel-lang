@@ -25,6 +25,7 @@
 
 // C++ std for the thread-pool implementation
 #include <atomic>
+#include <algorithm>
 #include <deque>
 #include <mutex>
 #include <condition_variable>
@@ -1161,6 +1162,11 @@ bool bz_dict_remove_set_string(void* dp, const void* key) {
 struct bz_llist_node_t {
     bz_llist_node_t* prev;
     bz_llist_node_t* next;
+    // #869 / §28.11: monotonic insertion sequence, so OwnedLinkedList disposal
+    // can run in REVERSE-INSERTION order regardless of whether elements were
+    // added at the head (AddFirst) or tail (AddLast) — the head/tail POSITION is
+    // not insertion order once AddFirst/AddBefore are mixed in.
+    int64_t          seq;
     // element bytes follow immediately — flexible array trick via alloc
 };
 
@@ -1169,14 +1175,18 @@ struct bz_llist_t {
     bz_llist_node_t* tail;
     int64_t          count;
     int64_t          elem_size;
+    int64_t          next_seq;  // #869: next insertion sequence to assign.
 };
 
-// Allocate a node with elem_size bytes of value storage.
-static bz_llist_node_t* llist_node_alloc(int64_t elem_size, const void* elem) {
+// Allocate a node with elem_size bytes of value storage, stamping it with the
+// list's next insertion sequence (#869).
+static bz_llist_node_t* llist_node_alloc(bz_llist_t* l, int64_t elem_size,
+                                         const void* elem) {
     auto* n = (bz_llist_node_t*)calloc(
         1, sizeof(bz_llist_node_t) + (size_t)elem_size);
     if (elem && elem_size > 0)
         memcpy((char*)n + sizeof(bz_llist_node_t), elem, (size_t)elem_size);
+    n->seq = l->next_seq++;  // #869: monotonic insertion order
     return n;
 }
 
@@ -1193,7 +1203,7 @@ int64_t bz_llist_count(void* listp) {
 void* bz_llist_add_first(void* listp, const void* elem, int64_t elem_size) {
     auto* l = (bz_llist_t*)listp;
     if (!l) return nullptr;
-    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
     n->next = l->head;
     n->prev = nullptr;
     if (l->head) l->head->prev = n;
@@ -1206,7 +1216,7 @@ void* bz_llist_add_first(void* listp, const void* elem, int64_t elem_size) {
 void* bz_llist_add_last(void* listp, const void* elem, int64_t elem_size) {
     auto* l = (bz_llist_t*)listp;
     if (!l) return nullptr;
-    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
     n->prev = l->tail;
     n->next = nullptr;
     if (l->tail) l->tail->next = n;
@@ -1222,7 +1232,7 @@ void* bz_llist_add_before(void* listp, void* nodep, const void* elem,
     auto* node = (bz_llist_node_t*)nodep;
     if (!l || !node) return nullptr;
     if (node == l->head) return bz_llist_add_first(listp, elem, elem_size);
-    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
     n->next = node;
     n->prev = node->prev;
     if (node->prev) node->prev->next = n;
@@ -1237,7 +1247,7 @@ void* bz_llist_add_after(void* listp, void* nodep, const void* elem,
     auto* node = (bz_llist_node_t*)nodep;
     if (!l || !node) return nullptr;
     if (node == l->tail) return bz_llist_add_last(listp, elem, elem_size);
-    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
     n->prev = node;
     n->next = node->next;
     if (node->next) node->next->prev = n;
@@ -1340,19 +1350,46 @@ void* bz_llist_node_prev(void* nodep) {
 void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
     auto* l = (bz_llist_t*)listp;
     if (!l) return;
-    // Dispose elements in REVERSE insertion order per §28.11: OwnedLinkedList
-    // disposes last-inserted first (tail to head). Free nodes in the same
-    // reverse pass so no separate traversal is needed.
-    bz_llist_node_t* n = l->tail;
-    while (n) {
-        bz_llist_node_t* prv = n->prev;
-        if (dispose_elem) {
-            void* vp = (char*)n + sizeof(bz_llist_node_t);
-            void* obj = *(void**)vp;
-            if (obj) dispose_elem(obj);
+    // §28.11 (#869): dispose elements in REVERSE-INSERTION order — last-inserted
+    // first. The positional tail→head walk only equals reverse-insertion when
+    // every element was AddLast'd; once AddFirst/AddBefore are mixed in, the
+    // head/tail position no longer tracks insertion order, so dispose by
+    // DESCENDING insertion sequence (n->seq). Collect the live nodes, sort by
+    // seq descending, dispose in that order, then free the nodes and the list.
+    // dispose_elem is null for value-typed T (nothing to dispose), so the
+    // collect+sort is skipped in that common case.
+    if (dispose_elem && l->count > 0) {
+        int64_t cap = l->count;
+        bz_llist_node_t** arr =
+            (bz_llist_node_t**)malloc((size_t)cap * sizeof(bz_llist_node_t*));
+        if (arr) {
+            int64_t i = 0;
+            for (bz_llist_node_t* p = l->head; p && i < cap; p = p->next)
+                arr[i++] = p;
+            std::sort(arr, arr + i,
+                      [](bz_llist_node_t* a, bz_llist_node_t* b) {
+                          return a->seq > b->seq;  // descending = reverse-insertion
+                      });
+            for (int64_t k = 0; k < i; k++) {
+                void* obj = *(void**)((char*)arr[k] + sizeof(bz_llist_node_t));
+                if (obj) dispose_elem(obj);
+            }
+            free(arr);
+        } else {
+            // Allocation failed: fall back to the positional reverse walk (still
+            // correct for the AddLast-only case; best effort otherwise).
+            for (bz_llist_node_t* p = l->tail; p; p = p->prev) {
+                void* obj = *(void**)((char*)p + sizeof(bz_llist_node_t));
+                if (obj) dispose_elem(obj);
+            }
         }
+    }
+    // Free all nodes (order irrelevant now) and the list header.
+    bz_llist_node_t* n = l->head;
+    while (n) {
+        bz_llist_node_t* nx = n->next;
         free(n);
-        n = prv;
+        n = nx;
     }
     free(l);
 }
