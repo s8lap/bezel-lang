@@ -32,6 +32,24 @@ PrimitiveType primitiveFromName(std::string_view name) {
     if (name == "double")  return PrimitiveType::Double;
     if (name == "decimal") return PrimitiveType::Decimal;
     if (name == "Object")  return PrimitiveType::Object;
+    // §3.4, #884: PascalCase System type-name aliases.  Each maps to the same
+    // PrimitiveType as its lowercase keyword counterpart, so `String`, `Int32`,
+    // `Double`, etc. resolve identically to `string`, `int`, `double`, etc. in
+    // type positions, explicit-cast positions, and static-member dispatch.
+    if (name == "Boolean") return PrimitiveType::Bool;
+    if (name == "Char")    return PrimitiveType::Char;
+    if (name == "String")  return PrimitiveType::String;
+    if (name == "Byte")    return PrimitiveType::Byte;
+    if (name == "SByte")   return PrimitiveType::SByte;
+    if (name == "Int16")   return PrimitiveType::Short;
+    if (name == "UInt16")  return PrimitiveType::UShort;
+    if (name == "Int32")   return PrimitiveType::Int;
+    if (name == "UInt32")  return PrimitiveType::UInt;
+    if (name == "Int64")   return PrimitiveType::Long;
+    if (name == "UInt64")  return PrimitiveType::ULong;
+    if (name == "Single")  return PrimitiveType::Float;
+    if (name == "Double")  return PrimitiveType::Double;
+    if (name == "Decimal") return PrimitiveType::Decimal;
     return PrimitiveType::None;
 }
 

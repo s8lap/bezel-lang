@@ -4682,6 +4682,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+                // §9.3 / #884: Decimal (now Primitive) static members.
+                // TryParse(string, out decimal): bool; Parse(string): decimal;
+                // Zero/One/MinValue/MaxValue → decimal (covered by the generic
+                // MaxValue/MinValue/Zero/One branch at line 4577, Parse at 4604).
+                if (pt == PrimitiveType::Decimal) {
+                    if (mbr == "TryParse") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                }
                 // per §3.4: the primitive-static handler above recognises a
                 // fixed, closed set of names.  Any name that reached this
                 // point is NOT in that set — emit a diagnostic and return so
