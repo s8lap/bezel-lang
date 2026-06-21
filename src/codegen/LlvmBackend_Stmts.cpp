@@ -518,6 +518,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         return false;
                     }
                 }
+                // §6.4 (sweep #6): decimal compound assignment `d += x` / `-=` /
+                // `*=` / `/=`. `decimal` is a Kind::Primitive struct, so the
+                // user-operator guard above (which requires Kind::Named) misses
+                // it; feeding the {i32,i32,i32,i32} struct to the integer
+                // emitCompoundOp below emits an integer overflow intrinsic on a
+                // struct (IR_FAIL; a `/=` SIGABRTs in LLVM). Route through the
+                // decimal arithmetic helper instead.
+                if (elemTy == decimalStructType()) {
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    if (llvm::Value* res = emitDecimalArith(op, cur, rhs)) {
+                        builder_.CreateStore(res, addr);
+                        if (llvm::AllocaInst* ns = localSlot(*as->target))
+                            syncCellToOrigSlot(ns, res);
+                    }
+                    return false;
+                }
                 // CG31: built-in numeric compound assignment — read,
                 // apply OP (overflow-checked like plain arithmetic),
                 // write back.
@@ -584,6 +600,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (res) {
                         builder_.CreateStore(res, addr);
                         // §27.5 / #673: sync to original alloca.
+                        if (llvm::AllocaInst* ns = localSlot(*inc->target))
+                            syncCellToOrigSlot(ns, res);
+                    }
+                } else if (elemTy == decimalStructType()) {
+                    // §6.4 (sweep #6): decimal `d++` / `d--`. decimal is a
+                    // Kind::Primitive struct; the integer path below would build
+                    // ConstantInt of a struct type and feed it to an integer
+                    // overflow intrinsic (IR_FAIL). Compute `d ± 1m` via the
+                    // decimal arithmetic helper.
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    if (llvm::Value* res = emitDecimalArith(
+                            inc->op == "++" ? "+" : "-", cur, emitDecimalOne())) {
+                        builder_.CreateStore(res, addr);
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))
                             syncCellToOrigSlot(ns, res);
                     }

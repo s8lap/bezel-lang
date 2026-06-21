@@ -5283,6 +5283,10 @@ private:
     llvm::Value* coerceNumericToType(llvm::Value* v, llvm::Type* targetTy) {
         return coerceNumericToType(v, targetTy, /*srcUnsigned=*/false);
     }
+    // §6.4: decimal arithmetic for compound-assign / increment (sweep #6).
+    llvm::Value* emitDecimalArith(const std::string& op, llvm::Value* lhs,
+                                  llvm::Value* rhs);
+    llvm::Value* emitDecimalOne();
 
     // CG44: lower an enum cast `E(i)` (§5.4). The enum's underlying type is
     // i32, so width-adjust the integer argument to i32. (Out-of-range

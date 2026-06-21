@@ -8128,6 +8128,58 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
 // raw integer bits (issue #408). Only the widening directions §5.1 admits are
 // applied; everything else (pointers, structs, equal types, narrowing) is left
 // untouched, so callers can invoke this unconditionally.
+// §6.4 (discovery sweep #6): decimal arithmetic for a compound assignment or
+// increment (`d += x`, `d /= x`, `d++`). `lhs`/`rhs` are bare %bz.decimal struct
+// VALUES. Mirrors the decimal branch of the binary-operator lowering: a div/mod
+// guard against a zero divisor, then call bz_decimal_<op> with the
+// OverflowException vtable so the runtime can raise on overflow (emitPendingCheck
+// unwinds). Returns the result decimal value, or null for a non-arithmetic op.
+// Needed because `decimal` is a Kind::Primitive struct, so the compound-assign /
+// increment user-operator guards (which require Kind::Named) miss it and the
+// integer emitCompoundOp path would feed the struct to an integer overflow
+// intrinsic (IR_FAIL / a `/=` SIGABRT).
+llvm::Value* Emitter::emitDecimalArith(const std::string& op,
+                                       llvm::Value* lhs, llvm::Value* rhs) {
+    if (!(op == "+" || op == "-" || op == "*" || op == "/" || op == "mod"))
+        return nullptr;
+    llvm::StructType* dst = decimalStructType();
+    if (op == "/" || op == "mod") {
+        llvm::Value* lo  = builder_.CreateExtractValue(rhs, {0u});
+        llvm::Value* mid = builder_.CreateExtractValue(rhs, {1u});
+        llvm::Value* hi  = builder_.CreateExtractValue(rhs, {2u});
+        llvm::Value* orv = builder_.CreateOr(builder_.CreateOr(lo, mid), hi);
+        emitGuardThrow(
+            builder_.CreateICmpEQ(orv, llvm::ConstantInt::get(i32(), 0)),
+            "DivideByZeroException");
+    }
+    llvm::AllocaInst* aSlot = entryAlloca(dst);
+    llvm::AllocaInst* bSlot = entryAlloca(dst);
+    llvm::AllocaInst* oSlot = entryAlloca(dst);
+    builder_.CreateStore(lhs, aSlot);
+    builder_.CreateStore(rhs, bSlot);
+    const char* fn_name =
+        op == "+" ? "bz_decimal_add" :
+        op == "-" ? "bz_decimal_sub" :
+        op == "*" ? "bz_decimal_mul" :
+        op == "/" ? "bz_decimal_div" : "bz_decimal_mod";
+    llvm::Value* oveVt = llvm::ConstantPointerNull::get(ptrTy());
+    auto vit = builtinVtable_.find("OverflowException");
+    if (vit != builtinVtable_.end()) oveVt = vit->second;
+    auto* fn = declareC(fn_name, llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {aSlot, bSlot, oSlot, oveVt});
+    emitPendingCheck();
+    return builder_.CreateLoad(dst, oSlot, "dec.cassign.res");
+}
+
+// A bare %bz.decimal value of 1 (for decimal `++`/`--`).
+llvm::Value* Emitter::emitDecimalOne() {
+    llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+    emitIntToDecimal(llvm::ConstantInt::get(i32(), 1),
+                     sema::PrimitiveType::Int, slot);
+    return builder_.CreateLoad(decimalStructType(), slot, "dec.one");
+}
+
 llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
                                           llvm::Type* targetTy,
                                           bool srcUnsigned) {
