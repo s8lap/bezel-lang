@@ -2216,6 +2216,13 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     : ((!it->collTy->genericArgs.empty())
                            ? it->collTy->genericArgs[0]
                            : nullptr);
+            // #816: in a per-instantiation (specialized) disposer the element may
+            // be a generic type PARAMETER (`owned _arr: OwnedArray<T>`); resolve it
+            // to the concrete substituted type so elementPolicyFor classifies it
+            // (and builds the element disposer thunk) — otherwise a bare `T`
+            // element has a null declaration → Value policy → elements leak. A
+            // no-op outside a substitution (the shared disposer keeps the bare T).
+            collElem = resolveTypeParamRef(collElem);
             bool collIsOwning =
                 it->collTy->astNode && it->collTy->astNode->name &&
                 !it->collTy->astNode->name->parts.empty() &&
@@ -2488,8 +2495,23 @@ bool Emitter::classHasOwnedTypeParamField(const sema::TypeSymbol* ts) {
     if (!ts) return false;
     for (const sema::Symbol* m : ts->members) {
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (fs && isOwnedTypeParamFieldShape(fs)) return true;
+        if (!fs) continue;
+        // (a) a direct owned type-parameter field (`owned _f: T`).
+        if (isOwnedTypeParamFieldShape(fs)) return true;
+        // #816 (b): a direct owned generic OWNING-collection field whose element
+        // is a type parameter (`owned _arr: OwnedArray<T>`) — its elements are
+        // only disposed by a per-instantiation disposer.
+        if (isOwnedTypeParamCollectionField(fs)) return true;
     }
+    // #816 (c): a class whose (transitive) BASE has an owned type-parameter field
+    // (`class Child<T> : Base<T>` where Base has `owned _f: T`) must ALSO get a
+    // specialized disposer, so its emitBaseDisposeChain can invoke the base's
+    // SUBSTITUTED disposer (the shared base disposer is type-erased and skips the
+    // base's owned-T field — the leak in #816 repro (a)).
+    for (const sema::TypeSymbol* base : ts->baseTypes)
+        if (base && base->kind == ast::TypeDeclKind::Class &&
+            classHasOwnedTypeParamField(base))
+            return true;
     return false;
 }
 
@@ -3352,6 +3374,71 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
 }
 
 
+// #816 / §28.5: build (once per instantiation, cached) the specialized CORE
+// disposer for a class `ts` reached as the BASE of a specialized derived class,
+// with the current genericSubst_ active. Mirrors the core half of
+// emitSpecializedDisposer (which builds a public run-once wrapper + core for the
+// most-derived class) but returns just the core, since a base chain calls the
+// base CORE (unguarded — the run-once flag is checked once at the most-derived
+// public Dispose). Saves/restores the full emit state + insert point because it
+// is invoked mid-emission of the derived class's disposer (from
+// emitBaseDisposeChain).
+llvm::Function* Emitter::specializedDisposerCoreFor(const sema::TypeSymbol* ts) {
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ts, storage);
+    std::vector<llvm::Type*> specFieldTys;
+    specFieldTys.push_back(ptrTy());
+    specFieldTys.push_back(disposedFlagTy());
+    for (const sema::Symbol* m : storage)
+        specFieldTys.push_back(storageType(m));
+    auto& specMap = specializedDisposerCores_[ts];
+    auto sit = specMap.find(specFieldTys);
+    if (sit != specMap.end()) return sit->second;
+
+    std::string suffix = "$baseSpec" + std::to_string(specMap.size());
+    auto* fnType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+    auto* coreFn = llvm::Function::Create(
+        fnType, llvm::Function::InternalLinkage,
+        "bz$" + std::string(ts->name) + "$DisposeCore" + suffix, module_.get());
+    specMap[specFieldTys] = coreFn;  // register before emit (self/diamond safety)
+
+    // Save the caller's (derived-disposer) emit state + insert point.
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParamSlots = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    llvm::BasicBlock* savedPropagate = propagateBB_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::Value* savedCaughtExc = currentCaughtExc_;
+    std::string_view savedCaughtName = currentCaughtName_;
+    std::size_t savedScopeDepth = unwindScopeDepth_;
+    llvm::IRBuilder<>::InsertPoint savedIP = builder_.saveIP();
+
+    emitDisposerCore(ts, coreFn);  // genericSubst_ stays active
+
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParamSlots);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    propagateBB_ = savedPropagate;
+    unwindTarget_ = savedUnwind;
+    currentCaughtExc_ = savedCaughtExc;
+    currentCaughtName_ = savedCaughtName;
+    unwindScopeDepth_ = savedScopeDepth;
+    builder_.restoreIP(savedIP);
+    return coreFn;
+}
+
+
 void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
     // §28.4 step 3: chain to the base class's CORE disposer (unguarded), NOT its
     // public Dispose. The per-object run-once flag (§28.2 / §28.6) is checked
@@ -3361,8 +3448,47 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
     // core runs the base's destructor + owned-field disposal + its own base
     // chain unconditionally, which is correct because the whole chain executes
     // within the single guarded most-derived disposal.
-    for (const sema::TypeSymbol* base : ts->baseTypes) {
+    for (std::size_t bi = 0; bi < ts->baseTypes.size(); ++bi) {
+        const sema::TypeSymbol* base = ts->baseTypes[bi];
         if (!base || base->kind != ast::TypeDeclKind::Class) continue;
+        // #816: if the base (transitively) has an owned type-parameter field, the
+        // shared, type-erased base core disposer skips it (the concrete T is
+        // unknown there) → leak. Bind the base's concrete type arguments — from
+        // ts->baseTypeRefs[bi], resolved under any active OUTER substitution — and
+        // call a SPECIALIZED base core emitted with that substitution active. The
+        // baseTypeRefs derivation covers BOTH `class Child<T> : Base<T>` (T already
+        // bound to e.g. Cell in the active subst) and the non-generic
+        // `class ConcreteChild : Base<Cell>` (Cell is concrete in baseTypeRefs) —
+        // the same per-base-arg map classStruct builds for inherited fields.
+        const ast::TypeDecl* btd =
+            base->decl ? dynamic_cast<const ast::TypeDecl*>(base->decl) : nullptr;
+        if (classHasOwnedTypeParamField(base) && btd &&
+            !btd->genericParams.empty() && bi < ts->baseTypeRefs.size() &&
+            ts->baseTypeRefs[bi] &&
+            btd->genericParams.size() == ts->baseTypeRefs[bi]->genericArgs.size()) {
+            const sema::TypeRef* baseRef = ts->baseTypeRefs[bi];
+            std::unordered_map<std::string_view, llvm::Type*> newSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+            for (std::size_t gi = 0; gi < btd->genericParams.size(); ++gi) {
+                // Resolve each base arg under the OUTER subst BEFORE installing
+                // the new one (so `Base<T>` with the outer T=Cell maps to Cell).
+                newSubst[btd->genericParams[gi].name] =
+                    lowerTypeRef(baseRef->genericArgs[gi]);
+                newSema[btd->genericParams[gi].name] =
+                    resolveTypeParamRef(baseRef->genericArgs[gi]);
+            }
+            auto savedSubst = genericSubst_;
+            auto savedSema = genericSubstSemaTy_;
+            genericSubst_ = std::move(newSubst);
+            genericSubstSemaTy_ = std::move(newSema);
+            llvm::Function* specCore = specializedDisposerCoreFor(base);
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSema);
+            if (specCore) {
+                builder_.CreateCall(specCore, {currentThis_});
+                return;
+            }
+        }
         auto it = disposerCoreFns_.find(base);
         if (it != disposerCoreFns_.end()) builder_.CreateCall(it->second,
                                                           {currentThis_});

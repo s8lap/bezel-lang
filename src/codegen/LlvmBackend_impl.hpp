@@ -3072,6 +3072,16 @@ private:
              std::map<std::vector<llvm::Type*>, llvm::GlobalVariable*>>
         specializedVtables_;
 
+    // #816: per-instantiation CORE disposer (unguarded destructor body + owned-
+    // field disposal + base chain) for a class reached as a BASE of a specialized
+    // derived class. emitBaseDisposeChain calls this (instead of the shared,
+    // type-erased disposerCoreFns_[base]) so the base's owned type-parameter
+    // field is disposed with the substitution active. Keyed like specializedVtables_.
+    std::map<const sema::TypeSymbol*,
+             std::map<std::vector<llvm::Type*>, llvm::Function*>>
+        specializedDisposerCores_;
+    llvm::Function* specializedDisposerCoreFor(const sema::TypeSymbol* ts);
+
     // CG18 (§28.5): dispose the class's owned reference fields (class- OR
     // interface-typed) in reverse declaration order, null-checking each.
     // Disposal is DYNAMIC — dispatched through the field object's own
@@ -3473,6 +3483,48 @@ private:
             !ty->genericArgs.empty())
             return false;
         std::string_view pname = ty->name->parts[0];
+        for (const sema::Symbol* gp : fs->parent->genericParams)
+            if (gp && gp->name == pname) return true;
+        return false;
+    }
+
+    // #816 / §28.5/§28.11: is `fs` an `owned` generic OWNING-collection field
+    // (OwnedArray<T> / OwnedStack<T> / OwnedQueue<T> / OwnedLinkedList<T> /
+    // OwnedSet<T> / OwnedBuffer<T> / OwnedDictionary<K,T>) whose disposed element
+    // type is a generic type PARAMETER of the enclosing class? Such a field needs
+    // a PER-INSTANTIATION disposer: only an owning collection disposes its
+    // elements, and the element's concrete type (and so whether each element must
+    // be disposed at all) is unknown in the shared, type-erased disposer — so the
+    // elements leak unless the disposer is emitted with the substitution active.
+    // A borrowing `owned Array<T>` field (frees the backing, borrows elements) is
+    // intentionally excluded: its elements are never disposed regardless of T.
+    bool isOwnedTypeParamCollectionField(const sema::FieldSymbol* fs) {
+        const sema::TypeRef* collTy = ownedCollectionFieldType(fs);
+        if (!collTy || !collTy->astNode || !collTy->astNode->name ||
+            collTy->astNode->name->parts.empty())
+            return false;
+        // Owning families (name prefixed "Owned") dispose their elements.
+        if (collTy->astNode->name->parts[0].rfind("Owned", 0) != 0) return false;
+        // OwnedDictionary owns its V value (genericArgs[1]); the ordered/set
+        // families own their single element (genericArgs[0]).
+        bool isDict = isDictTypeName(collTy);
+        const sema::TypeRef* elem =
+            isDict ? (collTy->genericArgs.size() > 1 ? collTy->genericArgs[1]
+                                                     : nullptr)
+                   : (!collTy->genericArgs.empty() ? collTy->genericArgs[0]
+                                                    : nullptr);
+        if (!elem || elem->kind != sema::TypeRef::Kind::Named ||
+            elem->declaration)
+            return false;
+        std::string_view pname;
+        if (elem->astNode && elem->astNode->name &&
+            elem->astNode->name->parts.size() == 1)
+            pname = elem->astNode->name->parts[0];
+        else if (!elem->importedName.empty())
+            pname = elem->importedName;
+        else
+            return false;
+        if (!fs->parent) return false;
         for (const sema::Symbol* gp : fs->parent->genericParams)
             if (gp && gp->name == pname) return true;
         return false;

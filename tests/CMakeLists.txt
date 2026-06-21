@@ -543,6 +543,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_record_field_460_test.cpp
     codegen/generic_record_as_type_arg_847_test.cpp
     codegen/generic_concrete_return_817_test.cpp
+    codegen/generic_owned_field_disposal_816_test.cpp
     codegen/generic_record_with_eq_nullable_462_test.cpp
     codegen/generic_record_this_with_method_test.cpp
     codegen/iterator_native_test.cpp
