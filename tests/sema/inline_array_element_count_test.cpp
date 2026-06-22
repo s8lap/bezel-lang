@@ -77,3 +77,33 @@ BEZEL_TEST(inline_array_element_count, const_sized_mismatch_rejected) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasElementCountError(r));
 }
+
+// ===========================================================================
+// §15.1 (#953): N must be greater than zero — `[0]T` is a compile error.
+// ===========================================================================
+
+// REJECT: a zero-sized inline array (no initializer).
+BEZEL_TEST(inline_array_element_count, zero_size_rejected) {
+    auto r = parseSemaAll(wrap("var a: [0]int; return 0;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("greater than zero") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// REJECT: a zero-sized inline array via a `const` size.
+BEZEL_TEST(inline_array_element_count, zero_size_via_const_rejected) {
+    auto r = parseSemaAll(
+        "module M; class C public const Z: int := 0; "
+        "public static method Main(): int var a: [Z]int; return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: a positive-sized inline array is fine.
+BEZEL_TEST(inline_array_element_count, positive_size_accepted) {
+    auto r = parseSemaAll(wrap("var a: [3]int; return 0;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

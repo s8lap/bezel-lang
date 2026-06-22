@@ -1544,8 +1544,19 @@ void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
         if (!val) return std::nullopt;
         return foldIntConst(*val, resolve, d + 1);
     };
-    if (auto v = foldIntConst(*declType->arraySize, resolve, 0))
-        if (*v >= 0) declType->arraySizeValue = *v;
+    if (auto v = foldIntConst(*declType->arraySize, resolve, 0)) {
+        // §15.1 (#953): N must be greater than zero. A local-`const`-sized
+        // `[N]T` with N <= 0 reaches here (member/literal sizes are caught at
+        // type resolution). Report once, using the size expression's location.
+        if (*v <= 0) {
+            ctx_.diagnostics().report(
+                Severity::Error, declType->arraySize->span.begin,
+                "an inline-array size must be greater than zero — "
+                "`[0]T` is not a valid type (§15.1)");
+        } else {
+            declType->arraySizeValue = *v;
+        }
+    }
 }
 
 // §12.7: a single `<simple var> is T` / `is not T` type-test contributes a

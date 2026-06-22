@@ -539,8 +539,20 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
             // malformed element GEPs). Unfoldable sizes leave the value at -1
             // (codegen falls back to the scalar default).
             if (const ast::Expr* sz = t.arraySize.get()) {
-                if (auto v = foldIntConstExpr(*sz, scope, 0))
-                    if (*v >= 0) ref->arraySizeValue = *v;
+                if (auto v = foldIntConstExpr(*sz, scope, 0)) {
+                    // §15.1: "N must be greater than zero; `[0]T` is a compile
+                    // error." A zero- (or negative-) sized inline array has no
+                    // valid storage; it was silently accepted (a degenerate
+                    // `[0 x T]`). Report and leave arraySizeValue unfolded.
+                    if (*v <= 0) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            "an inline-array size must be greater than zero — "
+                            "`[0]T` is not a valid type (§15.1)");
+                    } else {
+                        ref->arraySizeValue = *v;
+                    }
+                }
             }
             break;
         case ast::TypeKind::Function:
