@@ -5621,24 +5621,34 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         //
         //   The cell will continue to leak (its prior contained-leak status is
         //   preserved); this is the correct sound choice per the PRIME DIRECTIVE.
-        const auto& curScope = disposeStack_.back();
         for (const auto& ce : lastLambdaCapturedCells_) {
             // Check: does this cell's slot have any reads-through-cell disposal?
+            // #966: the cell must outlive ANY disposal that reads the captured
+            // value THROUGH it — INCLUDING one registered in an ENCLOSING scope
+            // (a `using var` declared in an outer block, captured by a lambda in
+            // an inner block). Searching only the current scope (disposeStack_
+            // .back()) freed the cell at the inner-block exit while the outer
+            // local still read + disposed through it → use-after-free (the #966
+            // SIGSEGV on `do var g := () => r.V; end; return r.V;`). Search EVERY
+            // live scope, not just the innermost one.
             bool hasOwnerDisposal = false;
-            for (const auto& existing : curScope) {
-                if (existing.slot != ce.newSlot) continue;
-                // These flags indicate disposals that do NOT read through the
-                // cell (they just release a runtime-managed value stored in the
-                // slot, not a value reached by dereferencing the slot as a cell
-                // pointer).  All other disposals use boxedStorage(slot) which
-                // dereferences the cell — unsafe to free beforehand.
-                if (existing.stringRelease || existing.closureRelease ||
-                    existing.boxRelease    || existing.boxedCellFree)
-                    continue;
-                // This existing disposal READS THROUGH the cell; freeing the
-                // cell via boxedCellFree would be a UAF.
-                hasOwnerDisposal = true;
-                break;
+            for (const auto& scope : disposeStack_) {
+                for (const auto& existing : scope) {
+                    if (existing.slot != ce.newSlot) continue;
+                    // These flags indicate disposals that do NOT read through the
+                    // cell (they just release a runtime-managed value stored in
+                    // the slot, not a value reached by dereferencing the slot as a
+                    // cell pointer). All other disposals use boxedStorage(slot)
+                    // which dereferences the cell — unsafe to free beforehand.
+                    if (existing.stringRelease || existing.closureRelease ||
+                        existing.boxRelease    || existing.boxedCellFree)
+                        continue;
+                    // This existing disposal READS THROUGH the cell; freeing the
+                    // cell via boxedCellFree would be a UAF.
+                    hasOwnerDisposal = true;
+                    break;
+                }
+                if (hasOwnerDisposal) break;
             }
             if (hasOwnerDisposal) continue;  // leave cell alive for owner disposal
             Disposal dc{ce.newSlot, nullptr};
