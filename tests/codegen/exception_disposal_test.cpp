@@ -1381,4 +1381,61 @@ BEZEL_TEST(exception_disposal_865, conditional_true_dispose_no_double_free) {
         "end Main; end C;", 1);
 }
 
+// --------------------------------------------------------------------------
+// [900] §28.3 — an `out owned` recipient (the local populated by
+// TryPop/TryDequeue/TryPop*/TryPopValue) is auto-disposed on the exception path.
+// The recipient solely owns the moved-out element and has no scope-end
+// auto-dispose, so a throw before its explicit discharge leaked it. The walker
+// wrongly treated the `out owned` argument as a consuming use (so the local was
+// marked unwind-ineligible); now an `out`/`out var`/`out owned` argument is an
+// OUTPUT (non-consuming), and the recipient is registered for unwind disposal.
+// --------------------------------------------------------------------------
+
+// A throw after a successful TryPop, before the explicit `item?.Dispose()`, must
+// auto-dispose the moved-out element (Cell._n back to 0).
+const char* kCellCtorDtor =
+    "class Cell public static _n: int := 0; "
+    "  public constructor() Cell._n := Cell._n + 1; end constructor; "
+    "  destructor Cell._n := Cell._n - 1; end destructor; end Cell; ";
+
+BEZEL_TEST(exception_disposal_900, out_owned_recipient_unwind_disposed) {
+    expectExitAndLeakFree(
+        std::string("module M; ") + kCellCtorDtor +
+        "class C public static method Main(): int "
+        "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
+        "    try do var item: Cell? := null; var ok := s.TryPop(out owned item); "
+        "           throw new Exception(\"x\"); item?.Dispose(); end; "
+        "    catch Exception => return Cell._n; end; "  // 0
+        "    return -1; end; "
+        "end Main; end C;", 0);
+}
+
+// Double-free control: an `out owned` recipient explicitly disposed BEFORE the
+// throw must not be re-disposed on unwind (the nulled slot + null-guard) — and
+// LSan asserts no double-free.
+BEZEL_TEST(exception_disposal_900, out_owned_dispose_then_throw_no_double_free) {
+    expectExitAndLeakFree(
+        std::string("module M; ") + kCellCtorDtor + "class E end E; "
+        "class C public static method Main(): int "
+        "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
+        "    try do var item: Cell? := null; var ok := s.TryPop(out owned item); "
+        "           item?.Dispose(); throw new E(); end; "
+        "    catch E => return Cell._n; end; "  // 0 — disposed once
+        "    return -1; end; "
+        "end Main; end C;", 0);
+}
+
+// Control: an `out owned` recipient disposed on a NORMAL exit (no throw) — single
+// dispose, no double-free.
+BEZEL_TEST(exception_disposal_900, out_owned_normal_exit_disposed_once) {
+    expectExitAndLeakFree(
+        std::string("module M; ") + kCellCtorDtor +
+        "class C public static method Main(): int "
+        "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
+        "    do var item: Cell? := null; var ok := s.TryPop(out owned item); "
+        "       item?.Dispose(); end; "
+        "    return Cell._n; end; "  // 0
+        "end Main; end C;", 0);
+}
+
 }  // namespace

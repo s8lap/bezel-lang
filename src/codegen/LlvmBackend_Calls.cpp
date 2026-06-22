@@ -7229,9 +7229,35 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     a.value.get())) {
                 sema::Symbol* symoo = ctx_.exprSymbol(*idoo);
                 if (auto* locoo = dynamic_cast<sema::LocalSymbol*>(symoo)) {
-                    if (locoo->decl)
+                    if (locoo->decl) {
                         outOwnedRecipients_.insert(
                             static_cast<const void*>(locoo->decl));
+                        // §28.3 (#900): the recipient now SOLELY owns the
+                        // moved-out element and has NO scope-end auto-dispose, so
+                        // an exception propagating before its explicit discharge
+                        // leaked it. Register a null-guarded unwindOnly disposal
+                        // (the same mechanism as a plain owned local) so the
+                        // implicit unwind cleanup disposes the still-owned element
+                        // exactly once. Null-guarded: a failed TryPop leaves the
+                        // slot null (skip); an explicit `item?.Dispose()` /
+                        // transfer before the throw nulls the slot
+                        // (explicitDisposeOwnedReceiverSlot) → skip (no
+                        // double-free). Gated on unwindIneligible_ so a recipient
+                        // that is later moved/transferred out (whose slot a move
+                        // may not null) is excluded, and on the analyzed-body
+                        // guard (currentFn_ == unwindIneligibleFn_), mirroring
+                        // registerUnwindOwnedLocal.
+                        auto slotIt = locals_.find(locoo->decl);
+                        if (slotIt != locals_.end() && !disposeStack_.empty() &&
+                            currentFn_ == unwindIneligibleFn_ &&
+                            !emittingDisposerBody_ &&
+                            !unwindIneligible_.count(
+                                static_cast<const void*>(locoo->decl))) {
+                            Disposal d{slotIt->second, nullptr};
+                            d.unwindOnly = true;
+                            disposeStack_.back().push_back(d);
+                        }
+                    }
                 }
             }
             pos++;

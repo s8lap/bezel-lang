@@ -6537,6 +6537,16 @@ namespace {
 // at worst it leaves a value un-disposed on its unwind path, never double-
 // disposed). `mark(node)` records the ineligible key (a LocalDecl node for a
 // local, the ParameterSymbol for a parameter).
+
+// §28.3 (#900): an `out` / `out var` / `out owned` argument is an OUTPUT — the
+// callee WRITES the local (an `out owned` recipient receives OWNERSHIP and must
+// be unwind-disposed), it does not consume it. So such an argument must NOT taint
+// the local as unwind-ineligible. `ref` is conservatively left consuming (the
+// callee may move out through it).
+inline bool isOutArg(std::string_view m) {
+    return m == "out" || m == "out var" || m == "out owned";
+}
+
 struct UnwindIneligibleWalker {
     const sema::SemaContext& ctx;
     std::unordered_set<const void*>& out;
@@ -6600,7 +6610,8 @@ struct UnwindIneligibleWalker {
             } else {
                 expr(c->callee.get(), /*consuming=*/false);
             }
-            for (auto& a : c->args) expr(a.value.get(), /*consuming=*/true);
+            for (auto& a : c->args)
+                expr(a.value.get(), /*consuming=*/!isOutArg(a.modifier));
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
@@ -6613,7 +6624,8 @@ struct UnwindIneligibleWalker {
             } else {
                 expr(c->callee.get(), /*consuming=*/false);
             }
-            for (auto& a : c->args) expr(a.value.get(), /*consuming=*/true);
+            for (auto& a : c->args)
+                expr(a.value.get(), /*consuming=*/!isOutArg(a.modifier));
             return;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
