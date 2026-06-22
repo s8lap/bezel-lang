@@ -1363,6 +1363,41 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (de->type) {
             if (auto* rt = ctx_.resolvedType(*de->type)) {
                 ctx_.setExprType(&e, rt);
+                // §17.11 (#951): `default(T)` is a compile error for a
+                // non-nullable REFERENCE type — it has no well-defined zero
+                // value, and producing `null` would violate the non-null
+                // contract (the same defect the type system prevents for an
+                // uninitialized non-nullable reference field, §7.9). Covers
+                // `string` (runtime-managed, §4.6), a user class/interface, and
+                // a function value (§28.9). `default(T?)` (nullable) and value
+                // types stay accepted; value-builtins (DateTime/Range/…) and
+                // enums/records are value types and are not flagged here. (A
+                // record with a non-nullable-ref field, and an inline array with
+                // non-nullable-ref elements, are the recursive cases of §17.11 —
+                // a documented follow-up in #951.)
+                bool nonNullRef = false;
+                if (!rt->nullable) {
+                    if (rt->kind == TypeRef::Kind::Primitive &&
+                        rt->primitive == PrimitiveType::String)
+                        nonNullRef = true;
+                    else if (rt->kind == TypeRef::Kind::Function)
+                        nonNullRef = true;
+                    else if (rt->kind == TypeRef::Kind::Named &&
+                             rt->declaration && !rt->declaration->isValueBuiltin &&
+                             (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                              rt->declaration->kind ==
+                                  ast::TypeDeclKind::Interface))
+                        nonNullRef = true;
+                }
+                if (nonNullRef) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, de->span.begin,
+                        "`default(T)` is a compile error for a non-nullable "
+                        "reference type (a class, interface, `string`, or "
+                        "function type) — it has no well-defined zero value; "
+                        "write `default(T?)` to produce null of the nullable "
+                        "counterpart (§17.11)");
+                }
                 // §17.11 (#864 part 1): `default(T)` under `where T: class` or
                 // a type-bound constraint is a compile error — the constraint
                 // guarantees T is non-nullable, and `default(T)` would produce

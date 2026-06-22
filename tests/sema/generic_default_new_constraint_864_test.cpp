@@ -177,3 +177,41 @@ BEZEL_TEST(generic_default_new_constraint_864, part2_implicit_ctor_accepted) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasError(r, "new()"));
 }
+
+// ===========================================================================
+// §17.11 (#951): default(T) for a CONCRETE non-nullable reference type — a
+// class, interface, `string`, or function type — is a compile error (no
+// well-defined zero value). `default(T?)` and value types stay accepted.
+// ===========================================================================
+
+// REJECT: default(string) — string is a non-nullable runtime-managed reference.
+BEZEL_TEST(generic_default_new_constraint_864, default_string_rejected_951) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := default(string); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, "default(T)") && hasError(r, "17.11"));
+}
+
+// REJECT: default(ClassType) — a user class is a non-nullable reference type.
+BEZEL_TEST(generic_default_new_constraint_864, default_class_rejected_951) {
+    auto r = parseSemaAll(
+        "module M; class Cell destructor end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var c: Cell? := default(Cell); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, "default(T)") && hasError(r, "17.11"));
+}
+
+// ACCEPT: default(T?) of the nullable counterpart, and value-type defaults.
+BEZEL_TEST(generic_default_new_constraint_864, default_nullable_and_value_accepted_951) {
+    auto r = parseSemaAll(
+        "module M; class Cell destructor end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var c: Cell? := default(Cell?); "
+        "  var s: string? := default(string?); "
+        "  var i: int := default(int); var b: bool := default(bool); "
+        "  return i + (1 if b else 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

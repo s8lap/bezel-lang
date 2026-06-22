@@ -170,10 +170,12 @@ BEZEL_TEST(sema_ident, member_access_target_resolves) {
 
 BEZEL_TEST(sema_ident, type_name_resolves_in_method_body) {
     // `C` in the method body resolves to the enclosing class symbol
-    // (visible via module-level scope).
+    // (visible via module-level scope). Uses `default(C?)` — `default(C)` for a
+    // non-nullable class is a §17.11 compile error (#951); the nullable form
+    // still exercises type-name resolution of `C`.
     auto r = parseSema(
         "module M; class C public method M() "
-        "  _ := default(C); "
+        "  _ := default(C?); "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

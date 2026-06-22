@@ -34,8 +34,11 @@ BEZEL_TEST(codegen_cg37, default_double_is_zero) {
 }
 
 BEZEL_TEST(codegen_cg37, default_reference_is_null) {
+    // §17.11 (#951): `default(T)` for a non-nullable reference type is a compile
+    // error; the null value of a reference type is `default(T?)` (the nullable
+    // counterpart). T is `class T`; `default(T?)` is null.
     BEZEL_EXPECT_EQ(run(
-        "var t: T? := default(T); "
+        "var t: T? := default(T?); "
         "try var u := t!; return 0; "
         "catch NullReferenceException => return 9; end;"), 9);
 }
