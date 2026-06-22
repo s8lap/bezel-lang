@@ -56,3 +56,53 @@ BEZEL_TEST(async_using_var_await_dispose_910, await_using_var_still_disposes) {
         "  end Main; "
         "end C;"), 0);
 }
+
+// §28.3 / §30.1 (#938): a `using var` at the METHOD-LEVEL scope of an async body
+// (no nested block, no await, no explicit return) is disposed on normal fall-off.
+// Previously the async body's top-level dispose scope was popped without emitting
+// its disposals, so this leaked (only nested `do…end` scopes were freed).
+BEZEL_TEST(async_using_var_await_dispose_910, method_level_using_var_disposed_938) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method LeakAsync(): Task "
+        "    using var c := new Cell(); "
+        "  end LeakAsync; "
+        "  public static async method Main(): Task<int> "
+        "    await C.LeakAsync(); "
+        "    return Cell.n; "  // 0 — c disposed at method-level scope end
+        "  end Main; "
+        "end C;"), 0);
+}
+
+// §28.3 / §30.1 (#938): two method-level `using var`s both disposed on fall-off.
+BEZEL_TEST(async_using_var_await_dispose_910, method_level_two_using_vars_disposed_938) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method M2(): Task "
+        "    using var a := new Cell(); using var b := new Cell(); "
+        "  end M2; "
+        "  public static async method Main(): Task<int> "
+        "    await C.M2(); "
+        "    return Cell.n; "  // 0
+        "  end Main; "
+        "end C;"), 0);
+}
+
+// §28.3 / §30.1 (#938): a method-level `using var` that CROSSES an await is
+// disposed exactly once on the final fall-off (the frame-spilled value).
+BEZEL_TEST(async_using_var_await_dispose_910, method_level_using_var_across_await_938) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method M3(): Task "
+        "    using var a := new Cell(); "
+        "    var r: int := await Task.FromResult(1); "
+        "  end M3; "
+        "  public static async method Main(): Task<int> "
+        "    await C.M3(); "
+        "    return Cell.n; "  // 0
+        "  end Main; "
+        "end C;"), 0);
+}

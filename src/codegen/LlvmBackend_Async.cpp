@@ -826,6 +826,17 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         builder_.SetInsertPoint(stateBBs[0]);
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
+        // §28.3 / §30.1 (#938): on NORMAL fall-off, dispose the async body's
+        // method-level scope's owned locals (`using var` / owned) BEFORE
+        // completing the task. Previously pop_back() discarded the scope's
+        // registered disposals without emitting them, so a method-level
+        // `using var c := new Cell()` (with no nested block, await, or explicit
+        // return) leaked — only nested `do…end` scopes, which run their own
+        // emitDisposals, were freed. A body that terminated (an explicit
+        // `return`, which runs emitAllDisposals via the return handler) already
+        // disposed them, so this is gated on the un-terminated fall-off path.
+        if (!term && !builder_.GetInsertBlock()->getTerminator())
+            emitDisposals(disposeStack_.back());
         disposeStack_.pop_back();
         // If the body fell through without a terminator, complete with no value
         // and return (§30.1 fall-off == return;).
