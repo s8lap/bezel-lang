@@ -9776,7 +9776,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             } else if (recvTy &&
                        recvTy->kind == sema::TypeRef::Kind::Named &&
                        recvTy->declaration && recvTy->declaration != ms->parent &&
-                       !recvTy->genericArgs.empty() &&
                        !ms->parent->genericParams.empty()) {
                 // §12 / §14 (issue #585): an INHERITED method declared on a
                 // generic BASE (`ms->parent`) called on a derived instance
@@ -9786,6 +9785,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // and reads a non-int base field at the wrong width (#585). Walk
                 // the base chain to bind the base's generic params to the
                 // concrete arguments the derived class supplied.
+                //
+                // #902: this also covers a CONCRETE (non-generic) class derived
+                // from a generic base — `class CtrHolder : Holder<Counter>`. Such
+                // a receiver has NO generic args of its own, so the previous
+                // `!recvTy->genericArgs.empty()` guard excluded it and the
+                // inherited `holder.GetConcrete()` dispatched to the type-erased
+                // template (which after #817 nulls its irreconcilable `T`-typed
+                // return → wrong null). computeAncestorGenericSubst walks the base
+                // chain and returns false when there is nothing to bind, so it is
+                // safe to reach here for a concrete-derived receiver too.
                 std::unordered_map<std::string_view, llvm::Type*> ancSubst;
                 std::unordered_map<std::string_view, const sema::TypeRef*>
                     ancSema;
