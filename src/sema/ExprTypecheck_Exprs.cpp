@@ -1992,6 +1992,36 @@ ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
     return {};
 }
 
+// §28.11 / §4.15 (#871): a borrowing-span indexer slot owns no storage, so
+// `move span[i]` cannot transfer ownership. The borrowing spans view a
+// non-owning source — `ArraySpan<T>` / `ReadOnlyArraySpan<T>` view a borrowing
+// `Array<T>`, and the read-only spans (`ReadOnlySpan<T>`, `IReadOnlySpan<T>`,
+// `ReadOnlyStringSpan`, `ReadOnlyAsciiByteSpan`) view a borrowed string / buffer
+// — so their slots hold borrows with nothing to move out. (The OWNING `Span<T>`
+// over an `OwnedBuffer` is intentionally NOT matched.) Returns the span type
+// name when `operand` is `span[i]` over such a span, else the empty string.
+std::string
+ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(&operand);
+    if (!ix || !ix->target) return {};
+    const TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != TypeRef::Kind::Named) return {};
+    // The span types may resolve either as a built-in (null declaration, name on
+    // the AST node) or via a record declaration; read the name from whichever is
+    // present so both representations are covered.
+    std::string_view name;
+    if (tt->declaration)
+        name = tt->declaration->name;
+    else if (tt->astNode && tt->astNode->name &&
+             !tt->astNode->name->parts.empty())
+        name = tt->astNode->name->parts[0];
+    if (name == "ArraySpan" || name == "ReadOnlyArraySpan" ||
+        name == "ReadOnlySpan" || name == "IReadOnlySpan" ||
+        name == "ReadOnlyStringSpan" || name == "ReadOnlyAsciiByteSpan")
+        return std::string(name);
+    return {};
+}
+
 void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     const auto& op = ue.op;
     // §25: a user-defined unary operator overload.
@@ -2040,6 +2070,22 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "admitted only on concrete owning collections: `OwnedArray<T>`, "
                 "`OwnedDictionary<K, V>`, class-typed `OwnedBuffer<T>` / "
                 "`Span<T>`, and owning inline arrays)");
+        }
+        // §28.11 / §4.15 (#871): `move arrSpan[i]` is rejected for a borrowing
+        // span (ArraySpan/ReadOnlyArraySpan view a borrowing Array<T>; the
+        // read-only spans view a borrowed string/buffer). Their slots hold
+        // borrows with no ownership to transfer; accepting the move corrupts
+        // memory at runtime (a SIGSEGV / double-free of a borrow-backed slot).
+        std::string span = moveThroughBorrowingSpanSlotName(*ue.operand);
+        if (!span.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted through a borrowing span "
+                            "slot: `") + span +
+                "` views a borrowing source (a non-owning `Array<T>`, `string`, "
+                "or read-only buffer), so its slots hold borrows with no "
+                "ownership to transfer (§28.11 / §4.15 — `move arrSpan[i]` is "
+                "rejected; use the plain indexer-get to read the borrow)");
         }
     }
     // `move x` (§28.3) keeps the operand's type — the result is the

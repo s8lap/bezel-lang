@@ -724,6 +724,14 @@ private:
     // them — so a non-empty result is rejected by `typeUnary`'s `move` branch.
     std::string moveThroughInterfaceSlotName(const ast::Expr& operand) const;
 
+    // §28.11 / §4.15 (#871): if `operand` is `coll[i]` whose receiver `coll` has
+    // a BORROWING-span static type (ArraySpan<T>/ReadOnlyArraySpan<T> — views into
+    // a borrowing Array<T> — or any read-only span), return that span type name;
+    // otherwise the empty string. Such spans' slots hold borrows with no
+    // ownership to transfer, so `move span[i]` is rejected at compile time. The
+    // OWNING `Span<T>` (over an `OwnedBuffer`) is NOT matched here.
+    std::string moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const;
+
     // §30.14 / §3.6 (#600): sendability derived-type property.
     // Returns true iff `rt` satisfies the §30.14 sendable table for a
     // Channel<T> element or Domain.Spawn argument/result.
