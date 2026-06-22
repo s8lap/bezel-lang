@@ -719,10 +719,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // indexer result type is the element T = genericArgs[0].
                         cn == "IReadOnlyList" || cn == "IList" ||
                         cn == "IOwnedList";
-                    // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> indexer
-                    // returns T = genericArgs[0].
+                    // §4.15 (#549) / §4.14 (#779): ArraySpan/ReadOnlyArraySpan
+                    // (borrowing) and Span/ReadOnlySpan (owning) indexer returns
+                    // T = genericArgs[0].
                     bool isSpan =
-                        cn == "ArraySpan" || cn == "ReadOnlyArraySpan";
+                        cn == "ArraySpan" || cn == "ReadOnlyArraySpan" ||
+                        cn == "Span" || cn == "ReadOnlySpan";
                     bool isDict =
                         cn == "Dictionary" || cn == "OwnedDictionary";
                     if ((isArrLike || isSpan) && !tt->genericArgs.empty() &&
@@ -2086,6 +2088,45 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "or read-only buffer), so its slots hold borrows with no "
                 "ownership to transfer (§28.11 / §4.15 — `move arrSpan[i]` is "
                 "rejected; use the plain indexer-get to read the borrow)");
+        }
+        // §4.14 (#779): `move sp[i]` on a VALUE-typed owning `Span<T>` is not
+        // admitted — value elements are read with the plain indexer and copied
+        // at the use site (spec §4.14: "For value T: move span[i] is not
+        // admitted"). The class-typed owning `Span<T>` DOES admit `move` (it
+        // transfers the owned slot — handled by lowerMoveFromCollectionSlot).
+        if (const auto* mix =
+                dynamic_cast<const ast::IndexExpr*>(ue.operand.get())) {
+            if (mix->target) {
+                const TypeRef* tt = ctx_.exprType(*mix->target);
+                if (tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty() &&
+                    tt->astNode->name->parts[0] == "Span") {
+                    const TypeRef* el =
+                        (!tt->genericArgs.empty()) ? tt->genericArgs[0] : nullptr;
+                    bool elemIsClass = false;
+                    if (el && el->kind == TypeRef::Kind::Named) {
+                        if (el->declaration &&
+                            (el->declaration->kind == ast::TypeDeclKind::Class ||
+                             el->declaration->kind ==
+                                 ast::TypeDeclKind::Interface))
+                            elemIsClass = true;
+                        else if (!el->declaration && el->astNode &&
+                                 el->astNode->name &&
+                                 !el->astNode->name->parts.empty()) {
+                            auto en = el->astNode->name->parts[0];
+                            if (en == "Shared" || en == "Weak")
+                                elemIsClass = true;
+                        }
+                    }
+                    if (!elemIsClass)
+                        ctx_.diagnostics().report(
+                            Severity::Error, ue.span.begin,
+                            "`move` is not admitted through a value-typed "
+                            "`Span<T>` slot — value elements are read with the "
+                            "plain indexer and copied at the use site (§4.14)");
+                }
+            }
         }
     }
     // `move x` (§28.3) keeps the operand's type — the result is the

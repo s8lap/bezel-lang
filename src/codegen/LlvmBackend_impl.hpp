@@ -1495,14 +1495,33 @@ private:
         return arraySpanStructTy_;
     }
 
-    // §4.15: test whether a TypeRef is ArraySpan<T> or ReadOnlyArraySpan<T>.
-    static bool isArraySpanTypeName(const sema::TypeRef* rt) {
+    // §4.14 / §4.15: test whether a TypeRef is one of the span-like value types
+    // that share the bz.arrayspan layout { ptr source, i32 start, i32 length }.
+    // Covers the borrowing spans over Array<T> (ArraySpan/ReadOnlyArraySpan,
+    // §4.15) AND the owning spans over OwnedBuffer<T> (Span/ReadOnlySpan, §4.14).
+    // All four reuse the same shared-surface lowering (indexer get/set, Slice,
+    // IndexOf, Contains, SequenceEqual, Length/IsEmpty, for-in); the owning
+    // class-T behaviour (disposing set, `move`, Clear/MoveFrom/MoveTo) is gated
+    // separately on isOwningSpanTypeName.
+    static bool isSpanLikeTypeName(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
             return false;
         if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
             return false;
         auto n = rt->astNode->name->parts[0];
-        return n == "ArraySpan" || n == "ReadOnlyArraySpan";
+        return n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
+               n == "Span" || n == "ReadOnlySpan";
+    }
+
+    // §4.14 (#779): test whether a TypeRef is the OWNING `Span<T>` over an
+    // OwnedBuffer<T> (its slots own their class-typed elements). `ReadOnlySpan<T>`
+    // is a read-only view (no set/move/clear), so it is NOT matched here.
+    static bool isOwningSpanTypeName(const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+            return false;
+        return rt->astNode->name->parts[0] == "Span";
     }
 
     // §4.15: extract the `Source` array pointer (field 0) from a lowered span struct value.

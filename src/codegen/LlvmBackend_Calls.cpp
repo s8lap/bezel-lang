@@ -13031,10 +13031,17 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     }
 
     // -----------------------------------------------------------------------
-    // ArraySpan<T> / ReadOnlyArraySpan<T> instance method calls.
+    // ArraySpan<T> / ReadOnlyArraySpan<T> (§4.15, borrowing) and
+    // Span<T> / ReadOnlySpan<T> (§4.14, owning over OwnedBuffer) instance method
+    // calls. All four share the bz.arrayspan layout, so the read-only / value
+    // surface (Length, IsEmpty, Slice, IndexOf, Contains, SequenceEqual,
+    // AsReadOnly, CopyTo, CopyFrom, Fill, Reverse) lowers identically. The owning
+    // Span<classT> additionally exposes Clear / MoveFrom / MoveTo (§4.14).
     // -----------------------------------------------------------------------
-    if (rcn != "ArraySpan" && rcn != "ReadOnlyArraySpan") return nullptr;
-    bool isWritable = (rcn == "ArraySpan");
+    if (rcn != "ArraySpan" && rcn != "ReadOnlyArraySpan" &&
+        rcn != "Span" && rcn != "ReadOnlySpan") return nullptr;
+    bool isWritable   = (rcn == "ArraySpan" || rcn == "Span");
+    bool isOwningSpan = (rcn == "Span");
 
     llvm::Value* spanVal = lowerExpr(*ma->target);
     if (!spanVal) return nullptr;
@@ -13427,6 +13434,129 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         phi->addIncoming(builder_.getFalse(), neqBB);
         phi->addIncoming(builder_.getTrue(),  condBB);
         return phi;
+    }
+
+    // -- Clear() — owning Span<classT> only (§4.14) ---------------------------
+    // Dispose every owned element and leave each slot NULL (moved-from), so the
+    // underlying OwnedBuffer's scope-end disposal skips them (no double-free).
+    if (m == "Clear" && isOwningSpan && call.args.empty()) {
+        llvm::Function* disp =
+            elementPolicyFor(spanElemRef, /*owningFamily=*/true).disposerThunk;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* setDispFn = declareC("bz_array_set_disposing",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+        auto* setFn = declareC("bz_array_set",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
+        auto* nullSlot = entryAlloca(ety);
+        builder_.CreateStore(llvm::Constant::getNullValue(ety), nullSlot);
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "spclr.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "spclr.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "spclr.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "clr.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* ai = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        // dispose-then-null (bz_array_set_disposing reads the old slot, disposes
+        // it if non-null, then stores the new value — here NULL).
+        if (disp)
+            builder_.CreateCall(setDispFn,
+                {src, ai, nullSlot, builder_.getInt64(esz), disp});
+        else
+            builder_.CreateCall(setFn, {src, ai, nullSlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- MoveFrom(source: Span<T>) / MoveTo(destination: Span<T>) -------------
+    // owning Span<classT> only (§4.14): move ownership slot-by-slot. The dest's
+    // previously-owned element is disposed before the moved owner is stored; the
+    // source slot is left NULL (moved-from). Lengths must match.
+    if ((m == "MoveFrom" || m == "MoveTo") && isOwningSpan &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+        if (!otherVal) return nullptr;
+        auto* otherSlot = entryAlloca(spanSt);
+        builder_.CreateStore(otherVal, otherSlot);
+        llvm::Value *srcSrc, *srcBase, *srcLen, *dstSrc, *dstBase, *dstLen;
+        if (m == "MoveTo") {                 // this(src) → other(dst)
+            srcSrc = loadSource(); srcBase = loadStart(); srcLen = loadLen();
+            dstSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            dstBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            dstLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        } else {                             // MoveFrom: other(src) → this(dst)
+            dstSrc = loadSource(); dstBase = loadStart(); dstLen = loadLen();
+            srcSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            srcBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            srcLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        }
+        emitGuardThrow(builder_.CreateICmpNE(srcLen, dstLen), "ArgumentException");
+        llvm::Function* disp =
+            elementPolicyFor(spanElemRef, /*owningFamily=*/true).disposerThunk;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* setDispFn = declareC("bz_array_set_disposing",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+        auto* setFn = declareC("bz_array_set",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
+        auto* nullSlot = entryAlloca(ety);
+        builder_.CreateStore(llvm::Constant::getNullValue(ety), nullSlot);
+        auto* valSlot = entryAlloca(ety);
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "spmv.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "spmv.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "spmv.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "mv.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, srcLen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* si = builder_.CreateAdd(
+            builder_.CreateSExt(srcBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* di = builder_.CreateAdd(
+            builder_.CreateSExt(dstBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        // read the moved element out of the source slot
+        llvm::Value* sp = builder_.CreateCall(ptrAtFn,
+            {srcSrc, si, builder_.getInt64(esz)});
+        llvm::Value* v = builder_.CreateLoad(ety, sp, "mv.v");
+        builder_.CreateStore(v, valSlot);
+        // dispose displaced dest, then store the moved owner
+        if (disp)
+            builder_.CreateCall(setDispFn,
+                {dstSrc, di, valSlot, builder_.getInt64(esz), disp});
+        else
+            builder_.CreateCall(setFn, {dstSrc, di, valSlot, builder_.getInt64(esz)});
+        // leave the source slot moved-from (NULL)
+        builder_.CreateCall(setFn, {srcSrc, si, nullSlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
     }
 
     return nullptr;

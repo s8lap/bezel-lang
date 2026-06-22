@@ -2279,7 +2279,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         if (ma->target &&
             (ma->member == "Length" || ma->member == "IsEmpty")) {
             auto* tt = ctx_.exprType(*ma->target);
-            if (isArraySpanTypeName(tt)) {
+            if (isSpanLikeTypeName(tt)) {
                 llvm::Value* sv = lowerExpr(*ma->target);
                 if (!sv) return nullptr;
                 llvm::Value* slen = builder_.CreateExtractValue(

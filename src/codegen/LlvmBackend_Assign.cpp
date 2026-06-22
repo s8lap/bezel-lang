@@ -48,7 +48,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
 
     // §4.15 (#549): ArraySpan<T>[i] / ReadOnlyArraySpan<T>[i]
     // → Source[Start + i] with bounds-check against Length (not array Count).
-    if (isArraySpanTypeName(recvTy)) {
+    if (isSpanLikeTypeName(recvTy)) {
         llvm::Value* spanVal = lowerExpr(*ix.target);
         if (!spanVal) return nullptr;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
@@ -364,6 +364,60 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
             llvm::Constant::getNullValue(slotElemTy), slotAddr);
         return moved;
     }
+    // §4.14 / §28.11 (#907): `move sp[i]` on an OWNING `Span<classT>` (the span
+    // returned by `OwnedBuffer<classT>.AsSpan()`). The span's slots own their
+    // elements, so a move transfers ownership OUT of the underlying buffer slot
+    // at absolute index Start+i and leaves it NULL (moved-from) — the buffer's
+    // scope-end disposal then skips it (no double-free). The borrowing spans
+    // (ArraySpan/ReadOnly*) reject `move` in sema (#871); a value-typed Span has
+    // nothing to own, so it falls through to a plain read.
+    if (isOwningSpanTypeName(recvTy)) {
+        const sema::TypeRef* spEl =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        if (!elementPolicyFor(spEl, /*owningFamily=*/true).disposerThunk)
+            return nullptr;  // value-typed Span: plain read, not an owning move
+        llvm::Value* spanVal = lowerExpr(*ix.target);
+        if (!spanVal) return nullptr;
+        auto* spanSt = arraySpanStructType();
+        auto* slot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, slot);
+        llvm::Value* src  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, slot, 0), "spm.src");
+        llvm::Value* base = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 1), "spm.st");
+        llvm::Value* slen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 2), "spm.len");
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);   // evaluate once
+        if (!idx) return nullptr;
+        if (!idx->getType()->isIntegerTy(32))
+            idx = builder_.CreateTrunc(idx, i32());
+        llvm::Value* idxNeg = builder_.CreateICmpSLT(idx, builder_.getInt32(0));
+        llvm::Value* idxOOB = builder_.CreateICmpSGE(idx, slen);
+        emitGuardThrow(builder_.CreateOr(idxNeg, idxOOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx,  i64()), "spm.absi");
+        int64_t esz = collectionElemSize(recvTy);
+        llvm::Type* retTy = ptrTy();
+        if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) retTy = et;
+        // Read the owned element out of the underlying buffer slot.
+        llvm::AllocaInst* out = entryAlloca(retTy);
+        auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(getFn, {src, absIdx, out, builder_.getInt64(esz)});
+        llvm::Value* moved = builder_.CreateLoad(retTy, out, "spm.elem");
+        // Leave the slot moved-from (null) via the NON-disposing setter.
+        llvm::AllocaInst* nullSlot = entryAlloca(retTy);
+        builder_.CreateStore(llvm::Constant::getNullValue(retTy), nullSlot);
+        auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(setFn,
+                            {src, absIdx, nullSlot, builder_.getInt64(esz)});
+        return moved;
+    }
+
     bool isArr  = isCollectionTypeName(recvTy);
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return nullptr;
@@ -503,13 +557,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     auto* recvTy = ctx_.exprType(*ix.target);
 
     // §4.15 (#549): ArraySpan<T>[i] := value — borrowing-set; no disposal.
-    // ReadOnlyArraySpan<T> has no setter; codegen should never reach here for it,
-    // but guard defensively.
-    if (isArraySpanTypeName(recvTy)) {
+    // §4.14 (#779): the OWNING Span<T>[i] := value over an OwnedBuffer DISPOSES
+    // the displaced class-typed element (the slot owns it), mirroring the direct
+    // OwnedBuffer<T>[i] disposing-set. ReadOnly spans have no setter.
+    if (isSpanLikeTypeName(recvTy)) {
         std::string_view rcn = (recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty())
             ? std::string_view(recvTy->astNode->name->parts[0]) : "";
-        if (rcn == "ReadOnlyArraySpan") return false;  // read-only: no setter
+        if (rcn == "ReadOnlyArraySpan" || rcn == "ReadOnlySpan")
+            return false;  // read-only: no setter
         llvm::Value* spanVal = lowerExpr(*ix.target);
         if (!spanVal) return false;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
@@ -533,12 +589,29 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             builder_.CreateSExt(base, i64()),
             builder_.CreateSExt(idx,  i64()), "sp.absi");
         int64_t esz = collectionElemSize(recvTy);
-        // Borrowing set — no disposal of the displaced slot (§4.15 / §4.4).
         llvm::AllocaInst* valSlot = entryAlloca(val->getType());
         builder_.CreateStore(val, valSlot);
-        auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
-                               {ptrTy(), i64(), ptrTy(), i64()});
-        builder_.CreateCall(setFn, {src, absIdx, valSlot, builder_.getInt64(esz)});
+        // §4.14 (#779): for an owning Span<classT> the displaced owner must be
+        // disposed exactly once before the new owner is stored (the slot owns the
+        // element). For a borrowing ArraySpan (or a value-typed Span) the slot is
+        // a borrow / a value — no disposal (§4.15 / §4.4).
+        const sema::TypeRef* spEl =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        llvm::Function* elemDisp = isOwningSpanTypeName(recvTy)
+            ? elementPolicyFor(spEl, /*owningFamily=*/true).disposerThunk
+            : nullptr;
+        if (elemDisp) {
+            auto* setFn = declareC("bz_array_set_disposing",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(setFn,
+                {src, absIdx, valSlot, builder_.getInt64(esz), elemDisp});
+        } else {
+            auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(setFn,
+                {src, absIdx, valSlot, builder_.getInt64(esz)});
+        }
         return true;
     }
 

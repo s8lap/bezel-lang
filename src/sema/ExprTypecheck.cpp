@@ -2698,8 +2698,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // per §24.4: an event += / -= is not a real compound assignment, so
         // the readonly / assignability checks below do not apply to it.
         if (!eventPayload) {
-            // §4.15 (#549): ReadOnlyArraySpan<T>[i] := v is disallowed —
-            // the read-only span has no indexer setter.
+            // §4.15 (#549) / §4.14 (#779): ReadOnlyArraySpan<T>[i] := v and
+            // ReadOnlySpan<T>[i] := v are disallowed — a read-only span has no
+            // indexer setter.
             if (as->op == ":=" && as->target) {
                 if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
                         as->target.get())) {
@@ -2709,13 +2710,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 !rt->declaration &&
                                 rt->astNode && rt->astNode->name &&
                                 !rt->astNode->name->parts.empty() &&
-                                rt->astNode->name->parts[0] ==
-                                    "ReadOnlyArraySpan") {
+                                (rt->astNode->name->parts[0] ==
+                                    "ReadOnlyArraySpan" ||
+                                 rt->astNode->name->parts[0] ==
+                                    "ReadOnlySpan")) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
                                     "cannot assign through a read-only span "
-                                    "indexer — ReadOnlyArraySpan<T> has no "
-                                    "setter (§4.15)");
+                                    "indexer — a read-only span has no setter "
+                                    "(§4.14 / §4.15)");
                             }
                         }
                     }

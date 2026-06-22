@@ -2345,7 +2345,7 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     // span.Start .. span.Start+span.Length with bz_array_ptr_at on Source).
     {
         auto* iterTy = ctx_.exprType(*fs.iterable);
-        if (isArraySpanTypeName(iterTy)) {
+        if (isSpanLikeTypeName(iterTy)) {
             llvm::Value* spanVal = lowerExpr(*fs.iterable);
             if (!spanVal) return false;
             auto* spanSt = arraySpanStructType();

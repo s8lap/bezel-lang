@@ -2118,21 +2118,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // Array<T>.AsReadOnlySpan() and overloads → ReadOnlyArraySpan<T>.
                     // Only on Array<T> (the borrowing collection); OwnedArray<T>
                     // does not expose AsSpan (its elements are owned — see §4.5).
-                    // §4.14 / #636: OwnedBuffer<T>.AsSpan() → ArraySpan<T>;
-                    // OwnedBuffer<T>.AsReadOnlySpan() → ReadOnlyArraySpan<T>.
-                    // OwnedBuffer uses the same bz_array_t* backing as Array, so
-                    // the span struct layout ({ ptr, i32, i32 }) is identical.
-                    // The codegen routes through tryLowerArraySpanCall (same path
-                    // as Array<T>) rather than the serialization handler.
+                    // §4.14 (#779): OwnedBuffer<T>.AsSpan() → the OWNING Span<T>;
+                    // OwnedBuffer<T>.AsReadOnlySpan() → ReadOnlySpan<T>. These are
+                    // distinct from Array<T>'s borrowing ArraySpan<T> (§4.15): the
+                    // owning span's class-typed slots own their elements, so it
+                    // exposes Clear/MoveFrom/MoveTo + a disposing indexer-set +
+                    // `move sp[i]`, and forbids Fill/CopyFrom/CopyTo on class-T.
+                    // The runtime struct layout ({ ptr, i32, i32 }) is identical,
+                    // so codegen routes both through tryLowerArraySpanCall and the
+                    // shared isSpanLikeTypeName surface; the owning behaviour is
+                    // gated on the "Span" name (isOwningSpanTypeName).
                     if ((colName == "Array" || colName == "OwnedBuffer") &&
                         !recvTy->genericArgs.empty() &&
                         recvTy->genericArgs[0] &&
                         (m == "AsSpan" || m == "AsReadOnlySpan") &&
                         (ce.args.size() <= 2)) {
-                        std::string_view spanName =
-                            (m == "AsSpan") ? "ArraySpan" : "ReadOnlyArraySpan";
-                        // Build a synthetic ArraySpan<T> / ReadOnlyArraySpan<T> TypeRef.
-                        // Re-use the static-astNode pattern used by makeConcreteCollectionResult.
+                        bool owning = (colName == "OwnedBuffer");
+                        // Build synthetic span-type TypeRefs. Array → borrowing
+                        // ArraySpan/ReadOnlyArraySpan (§4.15); OwnedBuffer → owning
+                        // Span/ReadOnlySpan (§4.14).
                         static const ast::Type* kArraySpanNode = []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;
                             qn->parts.push_back("ArraySpan");
@@ -2149,10 +2153,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             t->name.reset(qn);
                             return t;
                         }();
+                        static const ast::Type* kSpanNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("Span");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        static const ast::Type* kROSpanNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("ReadOnlySpan");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        const ast::Type* node =
+                            (m == "AsSpan")
+                                ? (owning ? kSpanNode   : kArraySpanNode)
+                                : (owning ? kROSpanNode : kROArraySpanNode);
                         auto* tr = ctx_.makeTypeRef();
                         tr->kind = TypeRef::Kind::Named;
                         tr->declaration = nullptr;
-                        tr->astNode = (m == "AsSpan") ? kArraySpanNode : kROArraySpanNode;
+                        tr->astNode = node;
                         tr->genericArgs.push_back(recvTy->genericArgs[0]);
                         ctx_.setExprType(&ce, tr);
                     }
@@ -2785,10 +2809,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Add" || m == "Subtract" || m == "Negate")
                             ctx_.setExprType(&ce, tsTy);
                     }
-                    // §4.15 (#549): ArraySpan<T> / ReadOnlyArraySpan<T> instance
-                    // method return types.  The receiver carries an astNode-backed
-                    // TypeRef (no declaration) so rcn == "ArraySpan" etc.
-                    if (rcn == "ArraySpan" || rcn == "ReadOnlyArraySpan") {
+                    // §4.15 (#549) / §4.14 (#779): span instance-method return
+                    // types. The receiver carries an astNode-backed TypeRef (no
+                    // declaration) so rcn is one of ArraySpan / ReadOnlyArraySpan
+                    // (borrowing, §4.15) or Span / ReadOnlySpan (owning, §4.14).
+                    if (rcn == "ArraySpan" || rcn == "ReadOnlyArraySpan" ||
+                        rcn == "Span" || rcn == "ReadOnlySpan") {
+                        bool isWritable   = (rcn == "ArraySpan" || rcn == "Span");
+                        bool isOwningSpan = (rcn == "Span");  // owning + writable
+                        // §4.14: an owning Span<classT>'s slots own their elements,
+                        // so Clear/MoveFrom/MoveTo apply (and Fill/CopyFrom/CopyTo —
+                        // which would alias one borrow into many owning slots — are
+                        // forbidden); the value-typed owning Span keeps the
+                        // value-copy surface (Fill/CopyFrom/CopyTo), no Clear/Move.
+                        const TypeRef* spEl =
+                            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                           : nullptr;
+                        bool elemIsClass = false;
+                        if (spEl && spEl->kind == TypeRef::Kind::Named) {
+                            if (spEl->declaration &&
+                                (spEl->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 spEl->declaration->kind ==
+                                     ast::TypeDeclKind::Interface))
+                                elemIsClass = true;
+                            else if (!spEl->declaration && spEl->astNode &&
+                                     spEl->astNode->name &&
+                                     !spEl->astNode->name->parts.empty()) {
+                                auto en = spEl->astNode->name->parts[0];
+                                if (en == "Shared" || en == "Weak")
+                                    elemIsClass = true;
+                            }
+                        }
+                        bool owningClassSpan = isOwningSpan && elemIsClass;
+                        // The OWNING family (Span/ReadOnlySpan over OwnedBuffer)
+                        // with a class element: its slots own their elements, so
+                        // the value-copy surface (Fill/CopyFrom/CopyTo) is
+                        // forbidden on EITHER the writable or the read-only form.
+                        bool owningClassFamily =
+                            (rcn == "Span" || rcn == "ReadOnlySpan") && elemIsClass;
                         // Length / IsEmpty are readonly properties; for-call form:
                         if (m == "Length")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
@@ -2808,12 +2867,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             tr->astNode = recvTy->astNode;  // same synthetic node
                             tr->genericArgs.push_back(recvTy->genericArgs[0]);
                             ctx_.setExprType(&ce, tr);
-                        } else if (m == "AsReadOnly" && rcn == "ArraySpan" &&
+                        } else if (m == "AsReadOnly" && isWritable &&
                                    !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
-                            // ArraySpan<T>.AsReadOnly() → ReadOnlyArraySpan<T>
-                            static const ast::Type* kRONode = []() -> ast::Type* {
+                            // ArraySpan<T>.AsReadOnly() → ReadOnlyArraySpan<T>;
+                            // Span<T>.AsReadOnly() → ReadOnlySpan<T>.
+                            static const ast::Type* kROArr = []() -> ast::Type* {
                                 auto* qn = new ast::QualifiedName;
                                 qn->parts.push_back("ReadOnlyArraySpan");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            static const ast::Type* kROSpan = []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("ReadOnlySpan");
                                 auto* t = new ast::Type;
                                 t->kind = ast::TypeKind::Named;
                                 t->name.reset(qn);
@@ -2822,31 +2890,79 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             auto* tr = ctx_.makeTypeRef();
                             tr->kind = TypeRef::Kind::Named;
                             tr->declaration = nullptr;
-                            tr->astNode = kRONode;
+                            tr->astNode = isOwningSpan ? kROSpan : kROArr;
                             tr->genericArgs.push_back(recvTy->genericArgs[0]);
                             ctx_.setExprType(&ce, tr);
-                        } else if (
-                            // Void-return bulk-mutation / copy methods (§4.15):
-                            m == "Fill"   || m == "CopyFrom" ||
-                            m == "CopyTo" || m == "Reverse") {
-                            // All return unit; no return type needs to be set.
+                        } else if (m == "Reverse" && isWritable) {
+                            // In-place permutation — unit; valid on any writable span.
+                        } else if (m == "Fill" || m == "CopyFrom") {
+                            // §4.15/§4.14: Fill/CopyFrom MUTATE this span, so the
+                            // receiver must be WRITABLE (ArraySpan / Span). And an
+                            // owning Span<classT> forbids them (#870) — they would
+                            // alias one borrowed reference into many owning slots
+                            // (double-free). Value-copy surface stays on
+                            // ArraySpan<T> and value-typed Span<T>.
+                            if (!isWritable) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`") + std::string(m) +
+                                    "` is not admitted on a read-only span `" +
+                                    std::string(rcn) +
+                                    "<T>` (stdlib \xC2\xA7""4.14/\xC2\xA7""4.15)");
+                            } else if (owningClassFamily) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`") + std::string(m) +
+                                    "` is not admitted on an owning `Span<T>` whose "
+                                    "element type is a class — it would copy one "
+                                    "borrowed reference into multiple owning slots "
+                                    "(a double-free). Use `MoveFrom`/`MoveTo` to "
+                                    "transfer ownership, or `Clear` to dispose the "
+                                    "elements (stdlib \xC2\xA7""4.14)");
+                            }
+                            // else unit; no return type.
+                        } else if (m == "CopyTo") {
+                            // §4.15/§4.14: CopyTo's receiver is the SOURCE — valid
+                            // on a read-only OR writable value/borrowing span (it
+                            // writes into the destination argument). Forbidden on an
+                            // owning class span (#870 — copies owned references).
+                            if (owningClassFamily) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`CopyTo` is not admitted on an owning "
+                                    "`Span<T>` whose element type is a class — it "
+                                    "would copy one owned reference into multiple "
+                                    "owning slots (a double-free). Use `MoveTo` to "
+                                    "transfer ownership (stdlib \xC2\xA7""4.14)");
+                            }
+                            // else unit; no return type.
+                        } else if ((m == "Clear" || m == "MoveFrom" ||
+                                    m == "MoveTo")) {
+                            // §4.14: Clear/MoveFrom/MoveTo are admitted only on an
+                            // owning Span<classT> (the slots own their elements).
+                            if (!owningClassSpan) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`") + std::string(m) +
+                                    "` is admitted only on an owning `Span<T>` "
+                                    "whose element type is a class (returned by "
+                                    "`OwnedBuffer<classT>.AsSpan()`); `" +
+                                    std::string(rcn) + "<T>` has no `" +
+                                    std::string(m) + "` (stdlib \xC2\xA7""4.14)");
+                            }
+                            // else unit; no return type.
                         } else {
-                            // §4.15 / #674: ArraySpan<T>/ReadOnlyArraySpan<T>
-                            // documented surface: Length, IsEmpty, IndexOf,
-                            // Contains, SequenceEqual, Slice, AsReadOnly
-                            // (ArraySpan only), Fill/CopyFrom/CopyTo/Reverse
-                            // (ArraySpan only).  Any other member is an error.
+                            // Documented surface exhausted — any other member errs.
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
                                 "` on `" + std::string(rcn) + "<T>`; "
-                                "documented surface: Length, IsEmpty, "
-                                "IndexOf(), Contains(), SequenceEqual(), "
-                                "Slice(), AsReadOnly() [ArraySpan only], "
-                                "Fill()/CopyFrom()/CopyTo()/Reverse() "
-                                "[ArraySpan only] (stdlib \xC2\xA7""4.15)");
+                                "documented surface: Length, IsEmpty, IndexOf(), "
+                                "Contains(), SequenceEqual(), Slice(), "
+                                "AsReadOnly()/Reverse()/Fill()/CopyFrom()/CopyTo() "
+                                "[writable spans], Clear()/MoveFrom()/MoveTo() "
+                                "[owning class Span<T>] (stdlib \xC2\xA7""4.14/\xC2\xA7""4.15)");
                         }
-                        // Fill/CopyFrom/CopyTo/Reverse → unit (void); no type set.
                     }
                     // §28.13 / stdlib §2.16 (#603): Shared<T> instance method
                     // return types.  The receiver TypeRef has no declaration
@@ -5449,9 +5565,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
-        // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> readonly properties.
-        // Neither type has a user TypeSymbol, so the ordinary member-lookup path
-        // never types these.  Handle Length and IsEmpty here.
+        // §4.15 (#549) / §4.14 (#779): span readonly properties (ArraySpan /
+        // ReadOnlyArraySpan / Span / ReadOnlySpan). Neither has a user TypeSymbol,
+        // so the ordinary member-lookup path never types these. Handle Length
+        // and IsEmpty here.
         if (ma.target &&
             (ma.member == "Length" || ma.member == "IsEmpty")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
@@ -5459,7 +5576,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     !tt->declaration && tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
                     (tt->astNode->name->parts[0] == "ArraySpan" ||
-                     tt->astNode->name->parts[0] == "ReadOnlyArraySpan");
+                     tt->astNode->name->parts[0] == "ReadOnlyArraySpan" ||
+                     tt->astNode->name->parts[0] == "Span" ||
+                     tt->astNode->name->parts[0] == "ReadOnlySpan");
                 if (isSpan) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(
