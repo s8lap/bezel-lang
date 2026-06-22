@@ -80,7 +80,24 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "LinkedListNode" ||
         // §4.14 / issue #550: OwnedBuffer<T> (e.g. OwnedBuffer<byte> returned
         // by BinarySerializer.ToBytes() per stdlib §2.15).
-        n == "OwnedBuffer") {
+        n == "OwnedBuffer" ||
+        // §4.14-§4.15 / issue #959: the concrete span VALUE types — borrowing
+        // spans over Array<T> (ArraySpan/ReadOnlyArraySpan, §4.15) and owning
+        // spans over OwnedBuffer<T> (Span/ReadOnlySpan, §4.14). Each carries a
+        // single element-type parameter and resolves to a Named TypeRef with a
+        // null declaration (no user TypeDecl); codegen lowers them to the shared
+        // bz.arrayspan struct {ptr,i32,i32} (lowerTypeRef / isSpanLikeTypeName).
+        // Registering them lets a span be used as a parameter type, local
+        // annotation, or record field type — not just inferred from `.AsSpan()`.
+        //
+        // The IReadOnlySpan<T> INTERFACE (§4.16) is deliberately NOT registered:
+        // a span is a value struct, and passing it where an interface reference
+        // is expected emits malformed IR (a span "carrying a borrow cannot be
+        // boxed into a heap-bound interface reference" — §4.14). It stays an
+        // "unresolved type name" reject; see the follow-up issue for the
+        // struct-backed-interface lowering it would require.
+        n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
+        n == "Span" || n == "ReadOnlySpan") {
         return 1;
     }
     // §3 stdlib two-parameter collection types (arity 2):

@@ -683,6 +683,7 @@ set(BEZEL_TEST_SOURCES
     codegen/serialization_edges_635_637_638_test.cpp
     codegen/ownedbuffer_span_636_test.cpp
     codegen/owning_span_779_test.cpp
+    codegen/span_type_annotation_959_test.cpp
     codegen/file_io_644_test.cpp
     codegen/diagnostics_646_test.cpp
     codegen/decimal_integration_664_666_test.cpp
