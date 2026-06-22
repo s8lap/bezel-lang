@@ -3830,34 +3830,53 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             std::vector<llvm::Value*> args{ol, orr};
             llvm::Value* res =
                 emitMethodCall(opm, args, /*baseQualified=*/false);
-            // §28.3 / §25.1 (#912): in a CHAINED operator expression
-            // (`a + b + c` = `(a + b) + c`), an operand that is itself an
-            // owned-returning operator call produces an INTERMEDIATE owned
-            // temporary. It is passed here as a borrow argument and, once the
-            // call returns, has no owner — so dispose it now. The detection
-            // mirrors the #911 `using var := a + b` owned-operator test
-            // (OperatorDecl::returnOwned + a class/interface result), so a
-            // named-local / borrow operand — which is never a BinaryExpr with
-            // an owned operator — is left untouched (no double-free). The
-            // result `res` is returned to the enclosing owner (the next
-            // operator call, or a `using var` that disposes it at scope end).
+            // §28.3 / §25.1 (#912, #965): an operand of a class-operator call
+            // that is itself an OWNED TEMPORARY — a chained owned-returning
+            // operator result (`(a + b)` in `a + b + c`), a bare `new C(...)`,
+            // or an `owned`-returning method/function call (`Make(1)`) — is
+            // passed here as a borrow argument and, once the call returns, has
+            // no owner. Dispose it now. A named-local / member-access borrow
+            // operand is none of these shapes, so it is left untouched (no
+            // double-free). The result `res` is returned to the enclosing owner
+            // (the next operator call, or a `using var` that disposes it at
+            // scope end).
             auto classOrIfaceRef = [](const sema::TypeRef* rt) -> bool {
                 return rt && rt->kind == sema::TypeRef::Kind::Named &&
                        rt->declaration &&
                        (rt->declaration->kind == ast::TypeDeclKind::Class ||
                         rt->declaration->kind == ast::TypeDeclKind::Interface);
             };
-            auto isOwnedOperatorTemp = [&](const ast::Expr* e) -> bool {
-                auto* be = dynamic_cast<const ast::BinaryExpr*>(e);
-                if (!be) return false;
-                auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                    ctx_.exprSymbol(*be));
-                if (!ms || !ms->isOperator) return false;
-                auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
-                const sema::TypeRef* ty = ctx_.exprType(*be);
-                return od && od->returnOwned &&
-                       (classOrIfaceRef(ty) ||
-                        classOrIfaceRef(resolveTypeParamRef(ty)));
+            auto isOwnedTempOperand = [&](const ast::Expr* e) -> bool {
+                if (!e) return false;
+                const sema::TypeRef* ty = ctx_.exprType(*e);
+                if (!classOrIfaceRef(ty) &&
+                    !classOrIfaceRef(resolveTypeParamRef(ty)))
+                    return false;  // value-typed result owns nothing to dispose
+                // (1) a bare `new ClassType(...)` operand.
+                if (dynamic_cast<const ast::NewExpr*>(e)) return true;
+                // (2) a chained owned-returning operator result.
+                if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx_.exprSymbol(*be));
+                    auto* od = (ms && ms->isOperator)
+                        ? dynamic_cast<const ast::OperatorDecl*>(ms->decl)
+                        : nullptr;
+                    return od && od->returnOwned;
+                }
+                // (3) an `owned`-returning method/function call result. The
+                // owned-return flag lives on the MethodDecl, or (imported, no
+                // AST decl) in SemaContext::importedReturnOwned_. A borrow
+                // return must NOT be disposed, so require the owned flag.
+                if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+                    if (!call->callee) return false;
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx_.exprSymbol(*call->callee));
+                    if (!ms) return false;
+                    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                    return (md && md->returnOwned) ||
+                           (!md && ctx_.importedReturnOwned(ms));
+                }
+                return false;
             };
             // Soundness guard: if THIS operator's parameter is `owned` (it
             // consumes the operand and takes over disposal), the intermediate
@@ -3871,9 +3890,9 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return m == "owned" || m == "out owned";
             };
             if (res) {
-                if (!paramConsumes(0) && isOwnedOperatorTemp(bin.left.get()))
+                if (!paramConsumes(0) && isOwnedTempOperand(bin.left.get()))
                     emitDisposeAndReclaim(ol);
-                if (!paramConsumes(1) && isOwnedOperatorTemp(bin.right.get()))
+                if (!paramConsumes(1) && isOwnedTempOperand(bin.right.get()))
                     emitDisposeAndReclaim(orr);
             }
             return res;

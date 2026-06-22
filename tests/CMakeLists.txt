@@ -562,6 +562,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_using_var_await_dispose_910_test.cpp
     codegen/using_var_operator_owned_911_test.cpp
     codegen/operator_chain_temp_dispose_912_test.cpp
+    codegen/operator_owned_temp_operand_965_test.cpp
     codegen/owned_array_set_dispose_919_test.cpp
     codegen/extension_property_primitive_test.cpp
     codegen/for_range_runtime_step_test.cpp
