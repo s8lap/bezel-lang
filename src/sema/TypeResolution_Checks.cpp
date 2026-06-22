@@ -40,6 +40,60 @@ void Resolver::checkBaseVisibility() {
     }
 }
 
+// §13.3 (#956): every type appearing in a member's signature must be at least
+// as visible as the member; "a private member is unconstrained". A private
+// (nested) type is the least visible level, so a NON-private member whose
+// signature names a private type is the unambiguous violation (the repro:
+// `internal _x: NestedPrivate?`). We target that clear case — a broader rank
+// comparison across internal/protected/public is a follow-up. Builtins and
+// generic parameters (null declaration) are fully visible and never flagged.
+void Resolver::checkMemberSignatureVisibility() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        checkTypeMemberSignatureVisibility(t);
+        for (Symbol* m : t->members)
+            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m))
+                if (nt->type) checkTypeMemberSignatureVisibility(nt->type);
+    }
+}
+
+void Resolver::checkTypeMemberSignatureVisibility(TypeSymbol* t) {
+    auto checkSig = [&](const ast::Type* astTy, const MemberSymbol* mem,
+                        std::string_view what) {
+        if (!astTy) return;
+        const TypeRef* rt = ctx_.resolvedType(*astTy);
+        if (!rt || !rt->declaration) return;  // builtin / generic param
+        if (rt->declaration->visibility == ast::Visibility::Private) {
+            ctx_.diagnostics().report(
+                Severity::Error, mem->declLoc,
+                std::string("the ") + std::string(what) + " type `" +
+                std::string(rt->declaration->name) +
+                "` is private and less visible than `" +
+                std::string(mem->name) +
+                "` — a type in a member's signature must be at least as "
+                "visible as the member (§13.3)");
+        }
+    };
+    for (Symbol* m : t->members) {
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem) continue;
+        // §13.3: a private member is unconstrained.
+        if (mem->visibility == ast::Visibility::Private) continue;
+        if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                checkSig(fd->type.get(), mem, "field");
+        } else if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                checkSig(md->returnType.get(), mem, "return");
+                for (const auto& p : md->params)
+                    checkSig(p.type.get(), mem, "parameter");
+            }
+        }
+    }
+}
+
 void Resolver::checkStaticConstructorParams() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {

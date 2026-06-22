@@ -120,3 +120,54 @@ BEZEL_TEST(sema_priv, unrelated_class_private_access_still_diagnoses_954) {
         "public class B public static method Peek(a: A): int => a._x; end B;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §13.3 (#956): a member's signature type must be at least as visible as the
+// member. A NON-private member whose signature names a PRIVATE (nested) type is
+// rejected; a private member is unconstrained.
+
+// REJECT: internal field whose type is a private nested class.
+BEZEL_TEST(sema_priv, internal_field_of_private_nested_type_rejected_956) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Outer "
+        "  private class NestedPrivate destructor end destructor; end NestedPrivate; "
+        "  internal _x: NestedPrivate?; "
+        "  destructor end destructor; "
+        "  public static method Main(): int => 0; "
+        "end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("must be at least as visible") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// REJECT: internal method whose return type is a private nested class.
+BEZEL_TEST(sema_priv, internal_method_returning_private_type_rejected_956) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Outer "
+        "  private class Token destructor end destructor; end Token; "
+        "  internal method MakeToken(): owned Token => new Token(); "
+        "  destructor end destructor; "
+        "  public static method Main(): int => 0; "
+        "end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: a PRIVATE member may use a private nested type (unconstrained), and a
+// public field of a public (builtin) type is fine.
+BEZEL_TEST(sema_priv, private_member_of_private_type_accepted_956) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Outer "
+        "  private class Token destructor end destructor; end Token; "
+        "  private _t: Token?; "
+        "  public _x: int; "
+        "  private method Make(): owned Token => new Token(); "
+        "  destructor end destructor; "
+        "  public static method Main(): int => 0; "
+        "end Outer;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

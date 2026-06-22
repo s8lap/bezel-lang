@@ -69,6 +69,10 @@ private:
     static int effVisRank(ast::Visibility v);
 
     void checkBaseVisibility();
+    // §13.3 (#956): a member's signature types must be at least as visible as
+    // the member (targets the clear private-type-in-non-private-member case).
+    void checkMemberSignatureVisibility();
+    void checkTypeMemberSignatureVisibility(TypeSymbol* t);
 
     // Slice S37 (§22.7 / Appendix C.5): a static constructor takes no
     // parameters. (The no-access-modifier rule is a parser concern.)

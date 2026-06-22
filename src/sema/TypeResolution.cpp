@@ -166,6 +166,9 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticConstructorParams();
     // Slice S38: base/interface visibility (§13.7).
     checkBaseVisibility();
+    // §13.3 (#956): a member's signature types must be at least as visible as
+    // the member (private-type-in-non-private-member case).
+    checkMemberSignatureVisibility();
     // §12.9 / issue #431: variance position enforcement on interface members.
     // `out T` must appear only in output positions; `in T` only in input.
     checkVariancePositions();
