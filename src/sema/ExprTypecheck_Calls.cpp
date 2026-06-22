@@ -3746,6 +3746,60 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             if (!cs->isStatic) ctors.push_back(cs);
         }
     }
+    // §22.3 / §22.6 (#967): a `ref`/`out` constructor parameter is mandatory at
+    // the call site, exactly as for a method (#952). Enforce it for the single
+    // bound constructor — a `ref` parameter requires a `ref` argument, an
+    // `out`/`out owned` parameter an `out`-family argument, and a plain/`owned`
+    // parameter none. (Without this the codegen ref-param fix would let a
+    // missing-`ref` `new C(x)` silently mutate the argument.) Returns true and
+    // emits a §22.3 diagnostic on a mismatch. Constructor OVERLOAD sets with
+    // call-site modifiers remain deferred below (filed follow-up).
+    auto refOutMatch = [](std::string_view argMod,
+                          std::string_view paramMod) -> bool {
+        auto isOut = [](std::string_view m) {
+            return m == "out" || m == "out var" || m == "out using var" ||
+                   m == "out owned";
+        };
+        bool argRef = argMod == "ref", argOut = isOut(argMod);
+        bool paramRef = paramMod == "ref";
+        bool paramOut = paramMod == "out" || paramMod == "out owned";
+        if (paramRef) return argRef;
+        if (paramOut) return argOut;
+        return !argRef && !argOut;
+    };
+    auto emitModifierMismatch = [&](const std::vector<ast::Param>& params,
+                                    const BindResult& b) -> bool {
+        for (std::size_t j = 0; j < params.size(); ++j) {
+            int ai = b.paramToArg[j];
+            std::string_view argMod =
+                ai >= 0 ? ne.args[static_cast<std::size_t>(ai)].modifier
+                        : std::string_view{};
+            if (refOutMatch(argMod, params[j].modifier)) continue;
+            std::string pname(params[j].name), pm(params[j].modifier),
+                am(argMod);
+            bool prefOut = pm == "ref" || pm == "out" || pm == "out owned";
+            std::string detail =
+                prefOut && am.empty()
+                    ? "parameter `" + pname + "` is `" + pm +
+                          "` — pass the argument with `" +
+                          (pm == "out owned" ? std::string("out") : pm) +
+                          "` at the call site"
+                : (!prefOut && !am.empty()
+                       ? "parameter `" + pname +
+                             "` is not `ref`/`out` — remove the `" + am +
+                             "` at the call site"
+                       : "the `" + am + "` argument does not match parameter `" +
+                             pname + "`'s `" + pm + "` modifier");
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                "call to `new " + std::string(t->name) +
+                "` has a call-site `ref`/`out` mismatch: " + detail +
+                " (§22.3 — the caller writes `ref`/`out` at the call site, and "
+                "only for a `ref`/`out` parameter)");
+            return true;
+        }
+        return false;
+    };
     // §2.5 / §22.7 (issue #328 FINDING [7] B): an IMPORTED type's constructors
     // carry no ast::ConstructorDecl — their parameters are ParameterSymbols whose
     // resolved types ride `resolvedDeclType`. Check `new ImportedT(args)` against
@@ -3774,6 +3828,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         }
         if (decls.empty()) return;  // no bindable ctor — defer (no check)
         if (decls.size() == 1) {
+            if (emitModifierMismatch(decls[0]->params, binds[0])) return;
             checkArgsAgainstParams(decls[0]->params, ne.args, ne.span.begin,
                                    std::string("`new ") +
                                        std::string(t->name) + "`");
@@ -3842,6 +3897,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     }
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(ctors[0]->decl);
     if (!cd) return;
+    // §22.3 (#967): enforce the mandatory call-site `ref`/`out` keyword.
+    BindResult b = bindArgsToParams(cd->params, ne.args, ne.span.begin,
+                                    /*calleeDesc=*/std::string(), /*emit=*/false);
+    if (b.ok && emitModifierMismatch(cd->params, b)) return;
     checkArgsAgainstParams(cd->params, ne.args, ne.span.begin,
                            std::string("`new ") + std::string(t->name) +
                            "`");

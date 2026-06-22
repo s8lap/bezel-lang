@@ -833,7 +833,15 @@ void Emitter::declareFunctions() {
         std::vector<llvm::Type*> paramTys;
         paramTys.push_back(ptrTy());  // this
         for (const auto& p : cd->params) {
-            paramTys.push_back(lowerType(p.type.get()));
+            // CG50 / §22.3 (#967): a `ref`/`out` constructor parameter is passed
+            // by reference — the caller (lowerNew) passes the storage address, so
+            // its slot type is a pointer, exactly as for a method ref/out param
+            // (above). Without this the signature declared the value type while
+            // lowerNew passed a pointer and bindParameters read through it as a
+            // ref param → malformed IR.
+            paramTys.push_back(isByRefMod(p.modifier)
+                                   ? ptrTy()
+                                   : lowerType(p.type.get()));
         }
         auto* fnType = llvm::FunctionType::get(
             llvm::Type::getVoidTy(llvm_), paramTys, /*isVarArg=*/false);

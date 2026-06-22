@@ -456,6 +456,7 @@ set(BEZEL_TEST_SOURCES
     codegen/named_args_test.cpp
     codegen/overload_test.cpp
     codegen/ref_out_overload_952_test.cpp
+    codegen/ctor_ref_param_967_test.cpp
     codegen/ctor_args_test.cpp
     codegen/static_ctor_test.cpp
     codegen/static_init_exception_529_test.cpp
