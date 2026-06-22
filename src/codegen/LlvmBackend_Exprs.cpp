@@ -3828,7 +3828,55 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             llvm::Value* orr = lowerExpr(*bin.right);
             if (!ol || !orr) return nullptr;
             std::vector<llvm::Value*> args{ol, orr};
-            return emitMethodCall(opm, args, /*baseQualified=*/false);
+            llvm::Value* res =
+                emitMethodCall(opm, args, /*baseQualified=*/false);
+            // §28.3 / §25.1 (#912): in a CHAINED operator expression
+            // (`a + b + c` = `(a + b) + c`), an operand that is itself an
+            // owned-returning operator call produces an INTERMEDIATE owned
+            // temporary. It is passed here as a borrow argument and, once the
+            // call returns, has no owner — so dispose it now. The detection
+            // mirrors the #911 `using var := a + b` owned-operator test
+            // (OperatorDecl::returnOwned + a class/interface result), so a
+            // named-local / borrow operand — which is never a BinaryExpr with
+            // an owned operator — is left untouched (no double-free). The
+            // result `res` is returned to the enclosing owner (the next
+            // operator call, or a `using var` that disposes it at scope end).
+            auto classOrIfaceRef = [](const sema::TypeRef* rt) -> bool {
+                return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                       rt->declaration &&
+                       (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                        rt->declaration->kind == ast::TypeDeclKind::Interface);
+            };
+            auto isOwnedOperatorTemp = [&](const ast::Expr* e) -> bool {
+                auto* be = dynamic_cast<const ast::BinaryExpr*>(e);
+                if (!be) return false;
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*be));
+                if (!ms || !ms->isOperator) return false;
+                auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
+                const sema::TypeRef* ty = ctx_.exprType(*be);
+                return od && od->returnOwned &&
+                       (classOrIfaceRef(ty) ||
+                        classOrIfaceRef(resolveTypeParamRef(ty)));
+            };
+            // Soundness guard: if THIS operator's parameter is `owned` (it
+            // consumes the operand and takes over disposal), the intermediate
+            // must NOT be disposed here — that would double-free. A normal
+            // operator takes borrows, so paramConsumes is false and the
+            // temporary is disposed exactly once.
+            auto* opmDecl = dynamic_cast<const ast::OperatorDecl*>(opm->decl);
+            auto paramConsumes = [&](std::size_t i) -> bool {
+                if (!opmDecl || i >= opmDecl->params.size()) return false;
+                std::string_view m = opmDecl->params[i].modifier;
+                return m == "owned" || m == "out owned";
+            };
+            if (res) {
+                if (!paramConsumes(0) && isOwnedOperatorTemp(bin.left.get()))
+                    emitDisposeAndReclaim(ol);
+                if (!paramConsumes(1) && isOwnedOperatorTemp(bin.right.get()))
+                    emitDisposeAndReclaim(orr);
+            }
+            return res;
         }
     }
     // §17.5: `x in lo..hi` — true if lo <= x <= hi (inclusive) or
