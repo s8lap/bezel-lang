@@ -225,3 +225,56 @@ BEZEL_TEST(with_expression_target_validation_875, with_on_existing_record_accept
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §9.5 (#935): a field name may appear at most once in a `with` initializer
+// list (the names are static identifiers, so a duplicate is always detectable
+// — mirrors §15.4 duplicate-Dictionary-key). The first assignment is dead.
+// ===========================================================================
+
+// REJECT: duplicate field name in a record `with`.
+BEZEL_TEST(with_expression_target_validation_875, duplicate_field_in_record_with_rejected_935) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(1, 2); "
+        "  var p2 := p with X := 5, X := 10 end; "  // X twice — rejected
+        "  return p2.X; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("assigned more than once") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// REJECT: duplicate field name in a class object-initializer `with`.
+BEZEL_TEST(with_expression_target_validation_875, duplicate_field_in_class_with_rejected_935) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box "
+        "  public property V: int; "
+        "  public constructor() V := 0; end constructor; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box() with V := 3, V := 4 end; "  // V twice
+        "  return b.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: distinct field names (record copy + class object-initializer).
+BEZEL_TEST(with_expression_target_validation_875, distinct_fields_in_with_accepted_935) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(1, 2); "
+        "  var p2 := p with X := 5, Y := 9 end; "
+        "  return p2.X + p2.Y; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

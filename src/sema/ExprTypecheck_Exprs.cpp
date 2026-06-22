@@ -1,5 +1,7 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
+#include <unordered_set>
+
 namespace bezel::sema {
 
 namespace {
@@ -2837,8 +2839,24 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     srcTs = st->declaration;
             }
         }
+        // §9.5 (#935): a field name may appear at most once in a `with`
+        // initializer list. The names are static identifiers, so a duplicate is
+        // always statically detectable; the first assignment would be dead code.
+        // This mirrors the collection-literal rule (§15.4): a duplicate
+        // Dictionary key is a compile error when all duplicates are compile-time
+        // constants. Applies to record copies and class object-initializers
+        // alike (independent of the source-type validation below).
+        std::unordered_set<std::string_view> seenWithNames;
         for (const auto& ia : we->assigns) {
             if (ia.value) visitExpr(*ia.value);
+            if (!seenWithNames.insert(ia.name).second) {
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    ia.value ? ia.value->span.begin : we->span.begin,
+                    "field `" + std::string(ia.name) + "` is assigned more "
+                    "than once in this `with` expression (§9.5)");
+                continue;
+            }
             // §9.5: validate only when we have a known record source type.
             if (!srcTs) continue;
             SourceLocation valLoc =
