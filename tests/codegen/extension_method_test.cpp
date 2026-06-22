@@ -318,3 +318,65 @@ BEZEL_TEST(codegen_extension, method_on_string_longer_than_spec_26_5_702) {
         "  end Main; "
         "end Program;"), 1);
 }
+
+// ===========================================================================
+// §26.5 (#927) — an extension on a BASE class (or implemented INTERFACE) must
+// be found via a receiver whose static type is a SUBTYPE of the extension's
+// target. Before the fix, extension lookup matched only the receiver's exact
+// type and rejected `d.GetV()` with "no member GetV on type Derived".
+// ===========================================================================
+
+// Extension on a direct base class, called through a derived receiver.
+BEZEL_TEST(codegen_extension, method_on_base_via_derived_receiver_spec_26_5_927) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "class Base "
+        "  public v: int; "
+        "  public constructor(n: int) this.v := n; end constructor; "
+        "  destructor end destructor; "
+        "end Base; "
+        "class Derived : Base "
+        "  public constructor() base(7); end constructor; "
+        "end Derived; "
+        "extension Base "
+        "  public method GetV(): int => this.v; "
+        "end; "
+        "class C public static method Main(): int "
+        "  using var d := new Derived(); "
+        "  return d.GetV(); "  // 7
+        "end Main; end C;"), 7);
+}
+
+// Two levels of inheritance (Leaf : Mid : Base); the extension lives on Base.
+BEZEL_TEST(codegen_extension, method_on_base_via_grandchild_spec_26_5_927) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "class Base public v: int; "
+        "  public constructor(n: int) this.v := n; end constructor; "
+        "  destructor end destructor; end Base; "
+        "class Mid : Base public constructor() base(5); end constructor; end Mid; "
+        "class Leaf : Mid public constructor() base(); end constructor; end Leaf; "
+        "extension Base public method GetV(): int => this.v; end; "
+        "class C public static method Main(): int "
+        "  using var d := new Leaf(); "
+        "  return d.GetV(); "  // 5
+        "end Main; end C;"), 5);
+}
+
+// Extension on an INTERFACE, reached through an implementing class receiver.
+BEZEL_TEST(codegen_extension, method_on_interface_via_impl_spec_26_5_927) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IShape method Area(): int; end; "
+        "class Square : IShape "
+        "  public side: int; "
+        "  public constructor(s: int) this.side := s; end constructor; "
+        "  public method Area(): int => this.side * this.side; "
+        "  destructor end destructor; "
+        "end Square; "
+        "extension IShape public method Describe(): int => this.Area() + 1; end; "
+        "class C public static method Main(): int "
+        "  using var s := new Square(4); "
+        "  return s.Describe(); "  // 4*4 + 1 = 17
+        "end Main; end C;"), 17);
+}

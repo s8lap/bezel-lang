@@ -1332,6 +1332,35 @@ static bool extensionTargetMatchesReceiver(
     }
 }
 
+// §26.5 (#927): an extension declared on `target` also applies to a receiver
+// whose static type is a SUBTYPE of `target` — the lookup must search the
+// receiver's "type, base types, or implemented interfaces" (§26.5 step 2), not
+// just its exact type. Walk the receiver's ancestor chain (BFS over
+// baseTypeRefs, which carry resolved generic args) and retry the exact match
+// for each ancestor. Reuses extensionTargetMatchesReceiver so generic-extension
+// free-var unification (e.g. `extension IEnumerable<T>` against an inherited
+// `IEnumerable<int>`) is handled uniformly.
+static bool extensionTargetMatchesReceiverOrBase(
+    const TypeRef* target, const TypeRef* recv,
+    const std::unordered_set<std::string_view>& freeVars) {
+    if (extensionTargetMatchesReceiver(target, recv, freeVars)) return true;
+    if (!recv || recv->kind != TypeRef::Kind::Named || !recv->declaration)
+        return false;
+    std::vector<const TypeRef*> frontier;
+    for (const TypeRef* b : recv->declaration->baseTypeRefs)
+        if (b) frontier.push_back(b);
+    std::size_t i = 0;
+    while (i < frontier.size()) {
+        const TypeRef* anc = frontier[i++];
+        if (!anc) continue;
+        if (extensionTargetMatchesReceiver(target, anc, freeVars)) return true;
+        if (anc->kind == TypeRef::Kind::Named && anc->declaration)
+            for (const TypeRef* b : anc->declaration->baseTypeRefs)
+                if (b) frontier.push_back(b);
+    }
+    return false;
+}
+
 // §26.5 (#773): does an ast::Type name (transitively through generic args /
 // array element / function signature) reference one of `freeVars`?
 static bool typeNamesFreeVar(
@@ -1377,7 +1406,7 @@ Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
         std::unordered_set<std::string_view> freeVars;
         for (const auto& gc : decl->genericConstraints)
             freeVars.insert(gc.typeParam);
-        if (!extensionTargetMatchesReceiver(target, receiver, freeVars))
+        if (!extensionTargetMatchesReceiverOrBase(target, receiver, freeVars))
             continue;
         for (Symbol* m : ext->members) {
             if (!m || m->name != name) continue;
