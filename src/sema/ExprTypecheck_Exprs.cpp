@@ -2491,8 +2491,59 @@ void ExprTC::visitChildren(const ast::Expr& e) {
     } else if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
         if (bg->operand) visitExpr(*bg->operand);
     } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        // §22.4 (#968): `out var x` at a CONSTRUCTOR call site declares x in the
+        // current scope, exactly as for a method call (the CallExpr path above).
+        // Without this `new C(out var y)` reported `unresolved identifier y`.
+        // Resolve the constructed type's single (or arity-matching) constructor
+        // to infer the out-var's type from the matching `out` parameter.
+        const ast::ConstructorDecl* ctorDecl = nullptr;
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration) {
+                    std::vector<const ast::ConstructorDecl*> cds;
+                    for (Symbol* m : rt->declaration->members)
+                        if (auto* cs = dynamic_cast<ConstructorSymbol*>(m))
+                            if (!cs->isStatic)
+                                if (auto* cd =
+                                        dynamic_cast<const ast::ConstructorDecl*>(
+                                            cs->decl))
+                                    cds.push_back(cd);
+                    if (cds.size() == 1)
+                        ctorDecl = cds[0];
+                    else
+                        for (auto* cd : cds)
+                            if (cd->params.size() == ne->args.size()) {
+                                ctorDecl = cd;
+                                break;
+                            }
+                }
+            }
+        }
+        std::size_t posn = 0;
         for (const auto& a : ne->args) {
+            if (a.modifier == "out var" && a.value && currentScope_) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                   a.value.get())) {
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = id->name;
+                    lsym->decl = id;
+                    if (ctorDecl && posn < ctorDecl->params.size() &&
+                        ctorDecl->params[posn].type) {
+                        lsym->declType = ctx_.resolvedType(
+                            *ctorDecl->params[posn].type);
+                        // out params are nullable refs — strip nullable (the
+                        // variable holds the non-nullable value), as for methods.
+                        if (lsym->declType && lsym->declType->nullable) {
+                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
+                            nn->nullable = false;
+                            lsym->declType = nn;
+                        }
+                    }
+                    currentScope_->names[id->name] = lsym;
+                }
+            }
             if (a.value) visitExpr(*a.value);
+            ++posn;
         }
     } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
         if (ce->condition) {

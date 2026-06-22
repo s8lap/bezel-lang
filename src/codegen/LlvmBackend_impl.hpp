@@ -5742,6 +5742,13 @@ private:
     // the call. Must be called at the start of lowerCall.
     void ensureOutVarSlots(const ast::CallExpr& call);
 
+    // §22.4 (#968): the constructor-call analogue of ensureOutVarSlots. Pre-
+    // creates the `out var x` slot for a `new T(out var x)` argument (typed from
+    // the matching constructor's out parameter) and registers it in locals_ so
+    // lowerNew's arg lowering passes its address and a later read sees the value
+    // the constructor wrote. Must be called at the start of lowerNew.
+    void ensureCtorOutVarSlots(const ast::NewExpr& ne, const sema::TypeRef* rt);
+
     llvm::Value* lowerCall(const ast::CallExpr& call);
 
     // per §14.1/§14.2 + §26.5 (issue #391): bind a generic method's

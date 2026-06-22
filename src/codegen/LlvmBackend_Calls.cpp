@@ -7312,6 +7312,49 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 }
 
 
+void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
+                                    const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    // Resolve the matching constructor decl (single, or arity match) for the
+    // out-parameter types — mirrors checkNewExprArgs / the sema out-var path.
+    const ast::ConstructorDecl* ctorDecl = nullptr;
+    std::vector<const ast::ConstructorDecl*> cds;
+    for (sema::Symbol* m : rt->declaration->members)
+        if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m))
+            if (!cs->isStatic)
+                if (auto* cd =
+                        dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+                    cds.push_back(cd);
+    if (cds.size() == 1)
+        ctorDecl = cds[0];
+    else
+        for (auto* cd : cds)
+            if (cd->params.size() == ne.args.size()) { ctorDecl = cd; break; }
+
+    std::size_t pos = 0;
+    for (const auto& a : ne.args) {
+        if (a.modifier != "out var" || !a.value) { pos++; continue; }
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+        if (!id) { pos++; continue; }
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+        if ((loc && loc->decl && locals_.count(loc->decl)) ||
+            locals_.count(id)) { pos++; continue; }
+        llvm::Type* slotTy = i32();
+        if (ctorDecl && pos < ctorDecl->params.size() &&
+            ctorDecl->params[pos].type) {
+            sema::TypeRef* pt = ctx_.resolvedType(*ctorDecl->params[pos].type);
+            if (pt) slotTy = lowerTypeRef(pt);
+        }
+        llvm::AllocaInst* slot = entryAlloca(slotTy);
+        locals_[id] = slot;
+        if (loc && loc->decl) locals_[loc->decl] = slot;
+        pos++;
+    }
+}
+
+
 // §8 / §9 / §10: intercept the compiler-synthesized value-semantics members
 // — `ToString`, `GetHashCode`, and (for records) `Equals` — on a record- or
 // enum-typed receiver when the type declares no user member of that name.

@@ -7000,6 +7000,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             rt = const_cast<sema::TypeRef*>(sit->second);
         }
     }
+    // §22.4 (#968): pre-create the `out var x` slot(s) for `new T(out var x)` so
+    // the arg lowering below passes the slot's address and a later read sees the
+    // value the constructor wrote (the call-site analogue of ensureOutVarSlots).
+    ensureCtorOutVarSlots(ne, rt);
     if (!rt->declaration) {
         // CG22: built-in exception types (Exception, ArgumentException, …)
         // have no user TypeSymbol (rt->declaration == null) but do have a
