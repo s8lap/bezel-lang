@@ -126,6 +126,15 @@ private:
     // catch arms; symbols are unique per arm, so the set is path-insensitive
     // (a catch binding only appears within its own arm body). // per §31.1
     std::unordered_set<sema::Symbol*> catchBorrows_;
+    // §28.3 / §28.9 (#861): block-nesting depth of each local's declaration,
+    // keyed by its `LocalDecl` AST node (== `LocalSymbol::decl`). The method
+    // body is depth 0; each nested do-end / if-branch / loop / try-arm body adds
+    // one. Populated at the start of run(). Used by checkBorrowStoreEscape to
+    // decide whether a closure assigned to a plain local escapes: the target
+    // outlives the captured source iff its declaring block is strictly
+    // shallower (smaller depth) — sound because both are in scope at the
+    // assignment, so their blocks lie on a single nesting path.
+    std::unordered_map<const ast::Node*, int> localDepth_;
     // Slice O8 / §28.8.1 (#867): the CURRENT block's `move this.field`
     // tracker — the field's name maps to its moved-from state. The transfer
     // functions (recordMovesIn / handleDischarge mark; handleAssignment clear)
@@ -406,6 +415,13 @@ private:
     void collectCatchBorrows(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void collectCatchBorrowsStmt(const ast::Stmt& s);
+
+    // §28.3 / §28.9 (#861): populate `localDepth_` with each LocalDecl's
+    // block-nesting depth. Mirrors collectCatchBorrowsStmt's statement-form
+    // coverage so no block form is missed. Called once at the start of run().
+    void collectLocalDepths(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void collectLocalDepthsStmt(const ast::Stmt& s, int depth);
 
     // Issue #392 / §31.1: a returned bare catch-binding identifier
     // (`return ex;`) lets the in-flight exception instance escape the arm

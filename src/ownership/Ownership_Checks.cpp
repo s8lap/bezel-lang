@@ -1557,6 +1557,60 @@ void MethodOwnership::collectCatchBorrows(
     for (const auto& s : body) if (s) collectCatchBorrowsStmt(*s);
 }
 
+// §28.3 / §28.9 (#861): record each LocalDecl's block-nesting depth. The method
+// body is depth 0; each nested do-end / if-branch / loop / try-arm body adds one.
+// Mirrors collectCatchBorrowsStmt's statement coverage so no scope-introducing
+// form is missed. A consistent over-count (e.g. a catch arm whose body is itself
+// a do-end) is harmless: only the monotonic ordering along a single nesting path
+// matters, and that is preserved. We do NOT recurse into lambda expression
+// bodies — locals declared inside a closure are closure-scoped, not method-scope
+// locals, and are never the target/source of this method's escape check.
+void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        localDepth_[ld] = depth;
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& bs : el.body)
+                if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        for (const auto& arm : ts->catches)
+            if (arm.body) collectLocalDepthsStmt(*arm.body, depth + 1);
+        for (const auto& bs : ts->finallyBody)
+            if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        return;
+    }
+}
+
+void MethodOwnership::collectLocalDepths(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) if (s) collectLocalDepthsStmt(*s, 0);
+}
+
 void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
     // §31.1: `return ex;` where `ex` is the bare catch-bound exception
     // variable. Returning the binding (as `owned`, the only way a class
@@ -1690,9 +1744,10 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
 
     // Identify the kind of escaping destination, and the diagnostic flavour.
-    // Two destinations outlive a method-scope local:
-    enum class Dest { None, Field, OutParam };
+    // Three destinations outlive a method-scope local:
+    enum class Dest { None, Field, OutParam, OuterLocal };
     Dest dest = Dest::None;
+    sema::LocalSymbol* targetLocal = nullptr;  // for the OuterLocal case (#861)
     if (dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
         // `obj.f := …` / `this.f := …` — a field/property write. The field's
         // object outlives the local; §28.3 forbids storing a borrow in any
@@ -1712,9 +1767,18 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
             if (ps->modifier == "out" || ps->modifier == "ref" ||
                 ps->modifier == "out owned")
                 dest = Dest::OutParam;
+        } else if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // §28.3 / §28.9 (#861): the target is a plain LOCAL. Assigning a
+            // closure that captures an owned scope-bound local to a local in an
+            // ENCLOSING block lets the closure outlive the captured local (a
+            // use-after-dispose / SIGSEGV when the closure is called after the
+            // inner block exits). Whether the target outlives the source is
+            // decided by their block depths once `src` is known below — so
+            // remember the candidate target here.
+            targetLocal = ls;
         }
     }
-    if (dest == Dest::None) return false;
+    if (dest == Dest::None && !targetLocal) return false;
 
     // §28.3 / §28.8 (issue #402): a BARE read of an owned LOCAL stored into an
     // OWNED field is a move-on-read into an owned slot ("Reading an owned local
@@ -1744,6 +1808,38 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     sema::Symbol* src = ownedLocalBorrowSource(*as.value);
     if (!src) return false;
 
+    // §28.3 / §28.9 (#861): resolve a plain-local target into an OuterLocal
+    // escape. Require (a) the RHS to be a closure (a LambdaExpr — a closure
+    // BORROWS its captures, so this is a borrow store, never a move; gating on a
+    // lambda avoids any move-vs-borrow ambiguity of a bare local read), and
+    // (b) the target local's declaring block to strictly ENCLOSE the source's
+    // (a smaller nesting depth). Both `targetLocal` and `src` are in lexical
+    // scope at the assignment, so their blocks lie on a single nesting path and
+    // the depths are comparable; the smaller depth is the longer-lived block. A
+    // target at the same or a deeper block dies no later than the source, so it
+    // is not an escape. If either depth is unknown (e.g. a for-loop variable —
+    // not a LocalDecl statement), we conservatively do NOT flag it.
+    if (dest == Dest::None && targetLocal) {
+        std::function<bool(const ast::Expr&)> hasLambda =
+            [&](const ast::Expr& e) -> bool {
+                if (dynamic_cast<const ast::LambdaExpr*>(&e)) return true;
+                if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e))
+                    return (cd->thenValue && hasLambda(*cd->thenValue)) ||
+                           (cd->elseValue && hasLambda(*cd->elseValue));
+                return false;
+            };
+        auto depthOf = [&](const ast::Node* declNode) -> int {
+            auto it = localDepth_.find(declNode);
+            return it == localDepth_.end() ? -1 : it->second;
+        };
+        int td = targetLocal->decl ? depthOf(targetLocal->decl) : -1;
+        int sd = src->decl ? depthOf(src->decl) : -1;
+        if (hasLambda(*as.value) && td >= 0 && sd >= 0 && td < sd)
+            dest = Dest::OuterLocal;
+        else
+            return false;
+    }
+
     // §31.1 (issue #392): the borrow source is a catch-bound exception
     // variable. A caught exception's lifetime is the catch arm body; storing
     // a borrow of it into a field (or through an out/ref param) lets the
@@ -1752,7 +1848,19 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // §3. Distinct message from the owned-local case so the §31.1 rule is
     // pointed to directly.
     if (isCatchBorrow(src)) {
-        if (dest == Dest::Field) {
+        if (dest == Dest::OuterLocal) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string("caught exception `") + std::string(src->name) +
+                "` may not be captured by a closure assigned to `" +
+                std::string(targetLocal->name) +
+                "` — a caught exception is a borrow whose lifetime is the catch "
+                "arm body (the runtime disposes it after the arm completes), and "
+                "`" + std::string(targetLocal->name) +
+                "` lives in an enclosing block that outlives the arm, so calling "
+                "the closure later would read a disposed exception (§31.1; copy "
+                "the data you need out of it into an owned value instead)");
+        } else if (dest == Dest::Field) {
             report(
                 Severity::Error, as.span.begin,
                 std::string("caught exception `") + std::string(src->name) +
@@ -1777,7 +1885,20 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
         return true;
     }
 
-    if (dest == Dest::Field) {
+    if (dest == Dest::OuterLocal) {
+        report(
+            Severity::Error, as.span.begin,
+            std::string("closure capturing `") + std::string(src->name) +
+            "` is assigned to `" + std::string(targetLocal->name) +
+            "`, which outlives it — `" + std::string(src->name) +
+            "` is an owned scope-bound local disposed at the end of its block, "
+            "but `" + std::string(targetLocal->name) +
+            "` lives in an enclosing block, so calling the closure after the "
+            "inner block exits reads a disposed value (§28.3 / §28.9; move an "
+            "owned value into the closure, or keep `" + std::string(src->name) +
+            "` in a block that outlives `" + std::string(targetLocal->name) +
+            "`)");
+    } else if (dest == Dest::Field) {
         report(
             Severity::Error, as.span.begin,
             std::string("borrow of `") + std::string(src->name) +

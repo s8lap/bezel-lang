@@ -32,6 +32,10 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // the arm (store-to-owned-field, return-as-owned, escaping closure
     // capture). Done first so the per-statement escape checks see it.
     collectCatchBorrows(body);
+    // §28.3 / §28.9 (#861): record each local's block-nesting depth so the
+    // borrow-store escape check can tell whether a closure assigned to a plain
+    // local outlives the owned local it captures.
+    collectLocalDepths(body);
     // Seed the dataflow entry state with `owned` / `out owned` parameters
     // (slice O10): each enters the method in the Owned state and must
     // reach a discharge point on every normal-exit path (§28.8).
