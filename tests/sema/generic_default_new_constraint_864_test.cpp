@@ -215,3 +215,39 @@ BEZEL_TEST(generic_default_new_constraint_864, default_nullable_and_value_accept
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §17.11 (#951 remainder): the RECURSIVE cases — default(T) for a record any of
+// whose fields is a non-nullable reference type, or an inline array whose
+// element type is one, is a compile error. A record/array of value-typed
+// members stays accepted.
+
+// REJECT: default(record with a non-nullable string field).
+BEZEL_TEST(generic_default_new_constraint_864, default_record_ref_field_rejected_951) {
+    auto r = parseSemaAll(
+        "module M; record Named(Name: string, Value: int); "
+        "class C public static method Main(): int "
+        "  var n: Named := default(Named); return n.Value; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, "default(T)") && hasError(r, "17.11"));
+}
+
+// REJECT: default(inline array of a non-nullable class).
+BEZEL_TEST(generic_default_new_constraint_864, default_inline_array_ref_elem_rejected_951) {
+    auto r = parseSemaAll(
+        "module M; class Cell destructor end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var a: [3]Cell := default([3]Cell); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, "default(T)") && hasError(r, "17.11"));
+}
+
+// ACCEPT: default(record of value fields) and default([N]value-type).
+BEZEL_TEST(generic_default_new_constraint_864, default_value_record_and_array_accepted_951) {
+    auto r = parseSemaAll(
+        "module M; record Point(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p: Point := default(Point); var a: [3]int := default([3]int); "
+        "  return p.X + a[0]; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

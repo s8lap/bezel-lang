@@ -212,6 +212,13 @@ private:
     // types, and free names are all permitted.
     void checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym);
 
+    // §17.11 (#951): does `default(T)` have NO well-defined zero value? True for
+    // a non-nullable reference type (string/class/interface/function) and,
+    // recursively, a record any of whose positional fields — or an inline array
+    // whose element — is such a type. Nullable types, enums, value primitives,
+    // value-builtins, and generic-parameter/unresolved refs return false.
+    bool defaultIllFormed(const TypeRef* t);
+
     // Slice DR1 (§21.7): does control definitely leave this statement
     // list abruptly (return / throw / non-terminating loop) before
     // reaching its end? Conservatively returns true only when certain,

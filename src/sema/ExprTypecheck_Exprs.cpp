@@ -126,6 +126,47 @@ static bool inheritsBuiltinException(const TypeSymbol* ts) {
 
 }  // namespace
 
+// §17.11 (#951): does `default(T)` have no well-defined zero value? See the
+// header declaration. Recurses into a record's positional fields and an inline
+// array's element type.
+bool ExprTC::defaultIllFormed(const TypeRef* t) {
+    if (!t || t->nullable) return false;  // nullable defaults to null — OK
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            // `string` is a runtime-managed reference (§4.6) with no zero. Value
+            // primitives (int/bool/char/…) have a zero. (Non-nullable Object is
+            // also a reference type, but left out here to keep this consistent
+            // with the original #951 scope — a separate consideration.)
+            return t->primitive == PrimitiveType::String;
+        case TypeRef::Kind::Function:
+            return true;  // a function value (§28.9) has no zero
+        case TypeRef::Kind::InlineArray:
+            return defaultIllFormed(t->arrayElement);
+        case TypeRef::Kind::Named: {
+            if (!t->declaration) return false;  // generic param / unresolved
+            auto k = t->declaration->kind;
+            if (k == ast::TypeDeclKind::Class ||
+                k == ast::TypeDeclKind::Interface)
+                return !t->declaration->isValueBuiltin;
+            if (k == ast::TypeDeclKind::Enum) return false;
+            if (k == ast::TypeDeclKind::Record) {
+                auto* td =
+                    dynamic_cast<const ast::TypeDecl*>(t->declaration->decl);
+                if (!td) return false;  // imported record — defer (don't reject)
+                for (const auto& pf : td->positionalFields) {
+                    if (!pf.type) continue;
+                    if (defaultIllFormed(ctx_.resolvedType(*pf.type)))
+                        return true;
+                }
+                return false;
+            }
+            return false;
+        }
+        default:
+            return false;  // Unit / Error
+    }
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // Slice 3b: IdentifierExpr name lookup. `this` / `base` are
     // implicit-meaning identifiers — leave them unresolved
@@ -1363,40 +1404,35 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (de->type) {
             if (auto* rt = ctx_.resolvedType(*de->type)) {
                 ctx_.setExprType(&e, rt);
-                // §17.11 (#951): `default(T)` is a compile error for a
-                // non-nullable REFERENCE type — it has no well-defined zero
-                // value, and producing `null` would violate the non-null
-                // contract (the same defect the type system prevents for an
-                // uninitialized non-nullable reference field, §7.9). Covers
-                // `string` (runtime-managed, §4.6), a user class/interface, and
-                // a function value (§28.9). `default(T?)` (nullable) and value
-                // types stay accepted; value-builtins (DateTime/Range/…) and
-                // enums/records are value types and are not flagged here. (A
-                // record with a non-nullable-ref field, and an inline array with
-                // non-nullable-ref elements, are the recursive cases of §17.11 —
-                // a documented follow-up in #951.)
-                bool nonNullRef = false;
-                if (!rt->nullable) {
-                    if (rt->kind == TypeRef::Kind::Primitive &&
-                        rt->primitive == PrimitiveType::String)
-                        nonNullRef = true;
-                    else if (rt->kind == TypeRef::Kind::Function)
-                        nonNullRef = true;
-                    else if (rt->kind == TypeRef::Kind::Named &&
-                             rt->declaration && !rt->declaration->isValueBuiltin &&
-                             (rt->declaration->kind == ast::TypeDeclKind::Class ||
-                              rt->declaration->kind ==
-                                  ast::TypeDeclKind::Interface))
-                        nonNullRef = true;
-                }
-                if (nonNullRef) {
+                // §17.11 (#951): `default(T)` is a compile error when T has no
+                // well-defined zero value — a non-nullable REFERENCE type
+                // (string/class/interface/function), or recursively a record
+                // with a non-nullable-ref field or an inline array with
+                // non-nullable-ref elements. The null such a default would
+                // produce violates the non-null contract (§7.9, the same defect
+                // the type system prevents for an uninitialized non-nullable
+                // reference field). `default(T?)` (nullable) and value types
+                // (value-builtins/enums/records of value fields) stay accepted.
+                // (The generic-parameter constrained case is the #864 check
+                // below; defaultIllFormed returns false for a bare type param.)
+                if (defaultIllFormed(rt)) {
+                    std::string detail;
+                    if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                        rt->declaration->kind == ast::TypeDeclKind::Record)
+                        detail = "a record any of whose fields is a "
+                                 "non-nullable reference type";
+                    else if (rt->kind == TypeRef::Kind::InlineArray)
+                        detail = "an inline array whose element type is a "
+                                 "non-nullable reference type";
+                    else
+                        detail = "a non-nullable reference type (a class, "
+                                 "interface, `string`, or function type)";
                     ctx_.diagnostics().report(
                         Severity::Error, de->span.begin,
-                        "`default(T)` is a compile error for a non-nullable "
-                        "reference type (a class, interface, `string`, or "
-                        "function type) — it has no well-defined zero value; "
-                        "write `default(T?)` to produce null of the nullable "
-                        "counterpart (§17.11)");
+                        "`default(T)` is a compile error for " + detail +
+                        " — it has no well-defined zero value; write "
+                        "`default(T?)` for the nullable counterpart where "
+                        "applicable (§17.11)");
                 }
                 // §17.11 (#864 part 1): `default(T)` under `where T: class` or
                 // a type-bound constraint is a compile error — the constraint
