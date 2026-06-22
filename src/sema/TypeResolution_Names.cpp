@@ -531,6 +531,19 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
             ref->arrayOwned = t.arrayOwned;
             if (t.arrayElement) {
                 ref->arrayElement = resolveType(*t.arrayElement, scope);
+                // §15.1 (#953): an inline array may not be the element of
+                // another inline array (`[N][M]T`). Multi-dimensional inline
+                // arrays are deferred ("The current spec admits only
+                // one-dimensional inline arrays"). It was silently accepted and
+                // literal initialization miscompiled (garbage/OOB reads).
+                if (ref->arrayElement &&
+                    ref->arrayElement->kind == TypeRef::Kind::InlineArray) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "an inline array may not be the element of another "
+                        "inline array (`[N][M]T`) — multi-dimensional inline "
+                        "arrays are not admitted (§15.1)");
+                }
             }
             // §15.1 (issue #734): N must be a compile-time integer expression
             // (integer literals, `const` declarations, and arithmetic on these).

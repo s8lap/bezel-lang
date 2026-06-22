@@ -107,3 +107,21 @@ BEZEL_TEST(inline_array_element_count, positive_size_accepted) {
     auto r = parseSemaAll(wrap("var a: [3]int; return 0;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §15.1 (#953): an inline array may not be the element of another inline array
+// (`[N][M]T`) — multi-dimensional inline arrays are not admitted.
+BEZEL_TEST(inline_array_element_count, multi_dimensional_rejected) {
+    auto r = parseSemaAll(wrap("var m: [2][3]int; return 0;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("element of another inline array") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// One-dimensional inline arrays remain accepted.
+BEZEL_TEST(inline_array_element_count, one_dimensional_accepted) {
+    auto r = parseSemaAll(wrap("var a: [3]int; return 0;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
