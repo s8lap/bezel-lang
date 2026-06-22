@@ -2547,9 +2547,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // §21.9 / §2.11 (#949): an `<event>.Subscribe(...)` statement drops
+            // the owned Subscription it returns. Its result is untyped, so the
+            // ownedProduced/type-based path above misses it — recognize it
+            // structurally and reject directly.
+            bool subDrop = isEventSubscribeDrop(es->expr.get());
+            if (subDrop) ownedProduced = true;
             if (ownedProduced) {
                 const TypeRef* t = ctx_.exprType(*es->expr);
-                bool reject = false;
+                bool reject = subDrop;
                 if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
                     reject = true;
                 } else if (t && !t->nullable &&
@@ -2981,7 +2987,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         //     — a safe, narrower follow-up; this never breaks a trivial discard.
         if (ds->value) {
             const TypeRef* t = ctx_.exprType(*ds->value);
-            bool reject = false;
+            // §17.13 / §2.11 (#949): `_ := <event>.Subscribe(...)` discards the
+            // owned Subscription. The result is untyped, so the type-based path
+            // misses it — recognize it structurally.
+            bool reject = isEventSubscribeDrop(ds->value.get());
             if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
                 reject = true;
             } else if (t && !t->nullable &&

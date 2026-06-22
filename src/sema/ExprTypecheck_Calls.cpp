@@ -3918,6 +3918,23 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
     return ctx_.resolvedType(*ed->type);
 }
 
+// §21.9 / §17.13 / §2.11 (#949): is `e` an `<event>.Subscribe(...)` call whose
+// owned-`Subscription` result is being dropped/discarded? The Subscribe call
+// result is not typed by sema (codegen recognizes it structurally for disposal,
+// LlvmBackend_Calls.cpp isSubscribeCall), so the type-based drop/discard checks
+// gate on a null exprType and never fire. Recognize the same structural shape —
+// a `.Subscribe` member call whose target resolves to an event member — so the
+// hard error fires. (A Subscription obtained via other APIs — CancellationToken
+// .Register, a stored IEvent value, a method returning `owned Subscription` —
+// is a narrower follow-up; this targets the §24.3 direct-event case of #949.)
+bool ExprTC::isEventSubscribeDrop(const ast::Expr* e) {
+    auto* ce = dynamic_cast<const ast::CallExpr*>(e);
+    if (!ce || !ce->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || ma->member != "Subscribe" || !ma->target) return false;
+    return dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target)) != nullptr;
+}
+
 // stdlib §5 (D7): if `callee` is a LINQ operator/aggregate on a collection or
 // lazy IEnumerable receiver whose lambda argument is `(T) -> …` over the
 // source element type T, return T (the receiver's first generic arg). This lets

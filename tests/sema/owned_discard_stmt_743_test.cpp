@@ -100,3 +100,68 @@ BEZEL_TEST(owned_discard_743, void_call_statement_ok) {
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiscardLeakError(r));
 }
+
+// ===========================================================================
+// §21.9 / §17.13 / §2.11 (#949): `<event>.Subscribe(...)` returns an owned
+// Subscription (non-trivial-dispose). Dropping it as a statement or discarding
+// it with `_ :=` is a hard error; binding it (`using var`) or disposing it is
+// fine. The Subscribe call result is untyped, so it is recognized structurally.
+// ===========================================================================
+
+namespace {
+const char* kButton =
+    "module M; "
+    "public class Button "
+    "  public event Clicked: int; "
+    "  public method Click(v: int) Clicked.Raise(v); end Click; "
+    "end Button; ";
+}  // namespace
+
+// REJECT: bare-statement drop of a Subscribe result (§21.9).
+BEZEL_TEST(owned_discard_743, subscribe_statement_drop_is_error_949) {
+    auto r = parseSemaAll(
+        std::string(kButton) +
+        "public class C public static method Main(): int "
+        "  using var btn: Button := new Button(); "
+        "  btn.Clicked.Subscribe((v) => do end); "  // dropped Subscription
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiscardLeakError(r));
+}
+
+// REJECT: `_ :=` discard of a Subscribe result (§17.13).
+BEZEL_TEST(owned_discard_743, subscribe_underscore_discard_is_error_949) {
+    auto r = parseSemaAll(
+        std::string(kButton) +
+        "public class C public static method Main(): int "
+        "  using var btn: Button := new Button(); "
+        "  _ := btn.Clicked.Subscribe((v) => do end); "  // discarded Subscription
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: `using var` binding of a Subscribe result.
+BEZEL_TEST(owned_discard_743, subscribe_using_var_ok_949) {
+    auto r = parseSemaAll(
+        std::string(kButton) +
+        "public class C public static method Main(): int "
+        "  using var btn: Button := new Button(); "
+        "  using var s := btn.Clicked.Subscribe((v) => do end); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: explicit `.Dispose()` of a Subscribe result.
+BEZEL_TEST(owned_discard_743, subscribe_explicit_dispose_ok_949) {
+    auto r = parseSemaAll(
+        std::string(kButton) +
+        "public class C public static method Main(): int "
+        "  using var btn: Button := new Button(); "
+        "  var s := btn.Clicked.Subscribe((v) => do end); s.Dispose(); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

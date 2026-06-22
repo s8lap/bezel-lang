@@ -184,6 +184,13 @@ private:
     // pendingLambdaParamType_ before visiting the handler argument.
     TypeRef* eventHandlerPayloadType(const ast::Expr* callee);
 
+    // §21.9 / §17.13 / §2.11 (#949): true when `e` is an `<event>.Subscribe(...)`
+    // call. Subscribe returns an `owned Subscription` (a non-trivial-dispose
+    // class, stdlib §2.11) but sema does not (yet) type the call result, so the
+    // type-based drop/discard checks cannot see it. Recognized structurally so a
+    // dropped or discarded Subscription is the hard error §21.9 / §17.13 require.
+    bool isEventSubscribeDrop(const ast::Expr* e);
+
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
     // First/OrderBy/…), or null otherwise. Used to set pendingLambdaParamType_
