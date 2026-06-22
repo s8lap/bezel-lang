@@ -3562,9 +3562,16 @@ private:
         // substituted type of the current instantiation.
         if (!rt->declaration) {
             const sema::TypeRef* concr = ownedTypeParamConcreteType(fs);
-            if (!concr || concr->kind != sema::TypeRef::Kind::Named ||
-                !concr->declaration)
+            if (!concr || concr->kind != sema::TypeRef::Kind::Named)
                 return false;
+            // §28.5 (#937): a type param substituting to a heap COLLECTION is
+            // disposed by the collection path (ownedCollectionFieldType), which
+            // frees the backing AND cascades into class elements — NOT here,
+            // which would free the backing but leak the elements. Defer to it.
+            if (isCollectionTypeName(concr) || isLinkedListTypeName(concr) ||
+                isDictTypeName(concr))
+                return false;
+            if (!concr->declaration) return false;
             auto ck = concr->declaration->kind;
             return ck == ast::TypeDeclKind::Class ||
                    ck == ast::TypeDeclKind::Interface;
@@ -3656,6 +3663,19 @@ private:
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->type) return nullptr;
             rt = ctx_.resolvedType(*fd->type);
+        }
+        // §28.5 (#937): an owned type-PARAMETER field (`owned _v: T`) whose
+        // concrete instantiation is a heap collection (`T = OwnedArray<Cell>`)
+        // is a collection field — it must free its backing AND cascade disposal
+        // into its class elements. Resolve the bare type param to its concrete
+        // substituted type (only when a per-instantiation substitution is
+        // active) and classify on THAT; returning the concrete (not the bare
+        // `T`) gives emitOwnedFieldDisposals the right name + genericArgs for
+        // the element disposer. Without this the field falls to
+        // isOwnedReferenceField (or to nothing) and its elements leak.
+        if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration) {
+            if (const sema::TypeRef* concr = ownedTypeParamConcreteType(fs))
+                rt = concr;
         }
         if (isCollectionTypeName(rt)) return rt;
         // per §4.6/§4.7: owned LinkedList<T>/OwnedLinkedList<T> fields are also

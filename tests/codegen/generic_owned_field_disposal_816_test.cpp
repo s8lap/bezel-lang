@@ -105,3 +105,60 @@ BEZEL_TEST(generic_owned_field_disposal_816, value_instantiation_no_spurious_dis
         "  return Cell.n; "  // 1 (only probe is live)
         "end Main; end C;"), 1);
 }
+
+// ===========================================================================
+// #937: a generic class with a bare owned type-PARAMETER field (`owned _v: T`)
+// instantiated with T = a stdlib OWNING COLLECTION (OwnedArray/OwnedStack/
+// OwnedLinkedList/OwnedDictionary). The field was classified as a plain owned
+// class reference (vtable Dispose freed the backing but did not cascade into
+// the elements), so the elements leaked. ownedCollectionFieldType now resolves
+// the type param to its concrete instantiation and routes a collection-typed
+// param through the element-cascading collection disposal path.
+// ===========================================================================
+
+namespace {
+const char* kCellBox =
+    "class Cell public static n: int := 0; "
+    "  public constructor() Cell.n := Cell.n+1; end constructor; "
+    "  destructor Cell.n := Cell.n-1; end destructor; end Cell; "
+    "class Box<T> where T: class public owned _v: T; "
+    "  public constructor(owned v: T) _v := v; end constructor; end Box; ";
+}  // namespace
+
+// T = OwnedArray<Cell>: the array's class element is disposed (no leak).
+BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_array_disposes_elements_937) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCellBox +
+        "class Program public static method Main(): int "
+        "  do "
+        "    var arr := new OwnedArray<Cell>(); "
+        "    arr.Add(new Cell()); arr.Add(new Cell()); "
+        "    using var b := new Box<OwnedArray<Cell>>(arr); "
+        "  end; "
+        "  return Cell.n; "  // 0
+        "end Main; end Program;"), 0);
+}
+
+// T = OwnedDictionary<string, Cell>: the owned V values are disposed.
+BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_dict_disposes_values_937) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCellBox +
+        "class Program public static method Main(): int "
+        "  do "
+        "    var d := new OwnedDictionary<string, Cell>(); "
+        "    d.Add(\"a\", new Cell()); d.Add(\"b\", new Cell()); "
+        "    using var b := new Box<OwnedDictionary<string, Cell>>(d); "
+        "  end; "
+        "  return Cell.n; "  // 0
+        "end Main; end Program;"), 0);
+}
+
+// T = plain Cell still works (no spurious collection routing / no regression).
+BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_plain_class_still_disposes_937) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCellBox +
+        "class Program public static method Main(): int "
+        "  do using var b := new Box<Cell>(new Cell()); end; "
+        "  return Cell.n; "  // 0
+        "end Main; end Program;"), 0);
+}
