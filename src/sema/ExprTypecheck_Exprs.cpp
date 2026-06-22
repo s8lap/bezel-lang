@@ -2803,6 +2803,30 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         checkCaseExhaustiveness(*ce, scrutTy);
     } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
         if (we->source) visitExpr(*we->source);
+        // §9.5 (#933): `with` on a CLASS (or interface) source is the
+        // object-initializer form (§22.11), valid ONLY on a freshly-`new`-
+        // constructed instance. Applied to an existing class instance, codegen
+        // mutates that instance in place and returns an alias of it (lowerWith)
+        // — silently violating non-destructive-update expectations. The spec is
+        // explicit: "`with` does not apply to existing class instances for
+        // non-destructive update; classes use property assignment." Records
+        // (value types) are a copy and accept any source, so this gate is
+        // class/interface-only and skips a `new` source.
+        if (we->source) {
+            if (auto* st = ctx_.exprType(*we->source)) {
+                if (st->kind == TypeRef::Kind::Named && st->declaration &&
+                    st->declaration->kind != ast::TypeDeclKind::Record &&
+                    st->declaration->kind != ast::TypeDeclKind::Enum &&
+                    !dynamic_cast<const ast::NewExpr*>(we->source.get())) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, we->source->span.begin,
+                        "`with` does not apply to an existing class instance — "
+                        "the object-initializer `with` form is valid only on a "
+                        "`new` class expression; mutate an existing instance "
+                        "through property assignment instead (§9.5)");
+                }
+            }
+        }
         // §9.5, #875-878: validate each `with` assignment target.
         // Resolve the source's TypeSymbol so we can look up named fields.
         TypeSymbol* srcTs = nullptr;

@@ -173,3 +173,55 @@ BEZEL_TEST(with_expression_target_validation_875, auto_property_target_accepted)
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §9.5 (#933): `with` on an EXISTING class instance is the object-initializer
+// form (§22.11) and is valid only on a freshly-`new`-constructed instance.
+// Applied to an existing class variable it would silently mutate/alias it.
+// ===========================================================================
+
+// REJECT: `with` on an existing class variable.
+BEZEL_TEST(with_expression_target_validation_875, with_on_existing_class_rejected_933) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box "
+        "  public property V: int; "
+        "  public constructor() V := 0; end constructor; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b1 := new Box(); b1.V := 7; "
+        "  var b2 := b1 with V := 42 end; "  // existing class instance — rejected
+        "  return b2.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: the object-initializer form on a `new` class expression.
+BEZEL_TEST(with_expression_target_validation_875, with_on_new_class_accepted_933) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box "
+        "  public property V: int; "
+        "  public constructor() V := 0; end constructor; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box() with V := 42 end; "  // new source — accepted
+        "  return b.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: `with` on an existing RECORD variable (value-type copy — unaffected).
+BEZEL_TEST(with_expression_target_validation_875, with_on_existing_record_accepted_933) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(1, 2); "
+        "  var p2 := p with X := 5 end; "  // record copy — accepted
+        "  return p2.X; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
