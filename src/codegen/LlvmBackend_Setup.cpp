@@ -4985,6 +4985,53 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
 void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
     const sema::TypeSymbol* b = baseClassOf(cls);
     if (!b) return;
+    // §11.1 / §22.8 (#929): a primary-ctor class `cls(...): b(baseArgs)` chains to
+    // b's constructor. If b has an EXPLICIT constructor of matching arity, call it
+    // with the evaluated inheritance-clause arguments (running its body), so a
+    // primary-ctor derived class actually invokes a PARAMETERIZED base ctor
+    // (previously only base positional FIELDS were pre-populated and only an
+    // arity-0 base ctor was ever called, so `Derived(v): Base(v)` with an explicit
+    // `Base.constructor(x)` left the base unconstructed). The args reference cls's
+    // primary-ctor params, which are stored as positional backing fields at the
+    // `new` site (read here via implicitFieldAddr against currentThis_ == obj). A
+    // primary / no-explicit-ctor base has no ConstructorSymbol, so ctorByArity
+    // returns null and control falls through to prePopulateBasePositionalFields +
+    // the no-ctor field-init below — keeping the two mechanisms mutually exclusive.
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(cls->decl)) {
+        if (!td->primaryBaseCtorArgs.empty()) {
+            std::size_t n = td->primaryBaseCtorArgs.size();
+            if (sema::ConstructorSymbol* bt = ctorByArity(b, n, nullptr)) {
+                auto bit = ctorFns_.find(bt);
+                if (bit == ctorFns_.end() && ctx_.isImported(b)) {
+                    declareImportedCtor(bt);
+                    bit = ctorFns_.find(bt);
+                }
+                if (bit != ctorFns_.end() &&
+                    bit->second->arg_size() == n + 1) {
+                    std::vector<llvm::Value*> args;
+                    args.push_back(obj);
+                    bool ok = true;
+                    for (std::size_t i = 0; i < td->primaryBaseCtorArgs.size();
+                         ++i) {
+                        const auto& a = td->primaryBaseCtorArgs[i];
+                        if (!a.value) { ok = false; break; }
+                        llvm::Value* v = lowerExpr(*a.value);
+                        if (!v) { ok = false; break; }
+                        // Coerce a numeric arg to the base ctor's param type
+                        // (a no-op for pointer/struct args, per §5.1).
+                        v = coerceNumericToType(
+                            v, bit->second->getFunctionType()->getParamType(i + 1),
+                            /*srcUnsigned=*/false);
+                        args.push_back(v);
+                    }
+                    if (ok && args.size() == n + 1) {
+                        builder_.CreateCall(bit->second, args);
+                        return;
+                    }
+                }
+            }
+        }
+    }
     if (sema::ConstructorSymbol* target = ctorByArity(b, 0, nullptr)) {
         auto it = ctorFns_.find(target);
         // §2.5 / §12 (issue #328 / #103): an implicit base chain into an IMPORTED

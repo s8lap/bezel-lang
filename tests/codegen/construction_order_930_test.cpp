@@ -155,3 +155,67 @@ BEZEL_TEST(construction_order_930, throwing_field_init_disposes_base_once) {
         "  return 99;"
         "end Main; end C;"), 0);
 }
+
+// §11.1 (#929): a primary constructor `Derived(v): Base(v)` invokes the base
+// class's PARAMETERIZED constructor (running its body), not just pre-populating
+// positional fields. Base.constructor(x) sets `_x := x`, so `new Derived(42)`
+// gives `_x == 42` (previously 0 — the base ctor was never called).
+BEZEL_TEST(construction_order_929, primary_ctor_calls_parameterized_base_ctor) {
+    BEZEL_EXPECT_EQ(run(
+        "module M;"
+        "public class Base public _x: int;"
+        "  public constructor(x: int) _x := x; end constructor;"
+        "  destructor end destructor;"
+        "end Base;"
+        "public class Derived(v: int): Base(v) end Derived;"
+        "public class Program public static method Main(): int"
+        "  using var d := new Derived(42); return d._x;"
+        "end Main; end Program;"), 42);
+}
+
+// §11.1 (#929): a multi-parameter base constructor invoked from a primary-ctor
+// derived class — `Derived(x, y): Base(x, y)` runs `Base.constructor(a, b)`.
+BEZEL_TEST(construction_order_929, primary_ctor_multi_param_base_ctor) {
+    BEZEL_EXPECT_EQ(run(
+        "module M;"
+        "public class Base public _a: int; public _b: int;"
+        "  public constructor(a: int, b: int) _a := a; _b := b; end constructor;"
+        "end Base;"
+        "public class Derived(x: int, y: int): Base(x, y) end Derived;"
+        "class C public static method Main(): int"
+        "  using var d := new Derived(30, 12); return d._a + d._b;"
+        "end Main; end C;"), 42);
+}
+
+// §11.1 (#929): the inheritance-clause argument may be an expression over the
+// primary-ctor parameter — `Base(v + 2)` runs `Base.constructor(40 + 2)`.
+BEZEL_TEST(construction_order_929, primary_ctor_base_arg_expression) {
+    BEZEL_EXPECT_EQ(run(
+        "module M;"
+        "public class Base public _x: int;"
+        "  public constructor(x: int) _x := x; end constructor; end Base;"
+        "public class Derived(v: int): Base(v + 2) end Derived;"
+        "class C public static method Main(): int"
+        "  using var d := new Derived(40); return d._x;"
+        "end Main; end C;"), 42);
+}
+
+// §11.1 / §28.3 (#929): a base constructor invoked via the primary-ctor chain
+// that allocates an owned field is disposed exactly once at scope end (no leak,
+// no double-free). The base ctor allocates a Tracker; after the scope the
+// destructor counter is back to 0.
+BEZEL_TEST(construction_order_929, primary_ctor_base_owned_field_disposed_once) {
+    BEZEL_EXPECT_EQ(run(
+        "module M;"
+        "public class Tracker public static live: int := 0;"
+        "  public constructor() Tracker.live := Tracker.live + 1; end constructor;"
+        "  destructor Tracker.live := Tracker.live - 1; end destructor;"
+        "end Tracker;"
+        "public class Base public owned _t: Tracker; public _v: int;"
+        "  public constructor(v: int) _t := new Tracker(); _v := v; end constructor;"
+        "end Base;"
+        "public class Derived(v: int): Base(v) end Derived;"
+        "class C public static method Main(): int"
+        "  do using var d := new Derived(5); end; return Tracker.live;"
+        "end Main; end C;"), 0);
+}
