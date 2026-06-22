@@ -813,7 +813,15 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     };
     if (from->kind == TypeRef::Kind::Primitive &&
         to->kind == TypeRef::Kind::Primitive) {
-        if (from->primitive == PrimitiveType::Object) return;
+        // The `null` literal is typed `Object?`. A non-nullable Object source is
+        // implicitly convertible here (an unbox), and a nullable one is fine when
+        // the TARGET is nullable (`var x: int? := null`); but a nullable Object
+        // source into a NON-nullable target is not — without this gate
+        // `var x: int := null` slipped past the early-return before the nullable
+        // check below and emitted malformed IR (§5.1 / §7).
+        if (from->primitive == PrimitiveType::Object &&
+            (!from->nullable || to->nullable))
+            return;
         if (from->nullable && !to->nullable) { reportNullable(); return; }
         if (from->primitive == to->primitive) return;
         if (primitiveWidens(from->primitive, to->primitive)) return;
@@ -871,6 +879,16 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         reportNotConvertible();
         return;
     }
+    // A nullable source assigned to a non-nullable target whose shapes did not
+    // match either branch above — notably the `null` literal (typed `Object?`, a
+    // Primitive) assigned to a non-nullable NAMED reference target
+    // (`var x: Box := null`). The Named-Named branch requires both sides Named,
+    // so this fell through unhandled and a null stored into a non-nullable
+    // reference faulted on first use. Reject it (§7 / §5.1). The Primitive→
+    // Primitive and Named→Named nullable cases are already handled above; the
+    // generic-deferral path returned before reaching here, so generics are
+    // unaffected.
+    if (from->nullable && !to->nullable) { reportNullable(); return; }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 

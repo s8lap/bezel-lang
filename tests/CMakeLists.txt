@@ -150,6 +150,7 @@ set(BEZEL_TEST_SOURCES
     sema/bare_throw_test.cpp
     sema/primitive_assignability_test.cpp
     sema/assignment_assignability_test.cpp
+    sema/null_to_nonnullable_test.cpp
     sema/mixed_numeric_test.cpp
     sema/missing_operator_diagnostic_test.cpp
     sema/return_assignability_test.cpp
