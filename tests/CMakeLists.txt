@@ -554,6 +554,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_raise_reentrant_dispose_908_test.cpp
     codegen/case_incompatible_type_pattern_test.cpp
     codegen/char_is_control_test.cpp
+    codegen/async_using_var_await_dispose_910_test.cpp
     codegen/generic_record_with_eq_nullable_462_test.cpp
     codegen/generic_record_this_with_method_test.cpp
     codegen/iterator_native_test.cpp

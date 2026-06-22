@@ -9410,6 +9410,21 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
     // interface-annotation by (a). This case covers `using var x := Make();`
     // where `Make(): owned IShape` / `owned Square` and x has no annotation.
     if (!ld->type) {
+        // (b0) #910 / §30.5 Pattern B: `using var c := await <expr>`. Awaiting an
+        // OwnedTask<T> yields an owned T (§30.5); the CallExpr branch below does
+        // not match the `await` UnaryExpr, so the owned result leaked. A `using
+        // var` of a non-owned value is a sema error, so a class/interface await
+        // result here is owned and must be disposed at scope end (synchronously,
+        // per the `using` form — `await using` handles its own async disposal).
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                ld->initializer.get())) {
+            if (un->op == "await") {
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (isClassOrInterfaceRef(initTy) ||
+                    isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
+                    return true;
+            }
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(
                 ld->initializer.get())) {
             if (call->callee) {
