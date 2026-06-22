@@ -811,6 +811,35 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
             std::string("the ") + what + " has a type that is not "
             "implicitly convertible to the target type (§5.1)");
     };
+    // §5.4 / §10 (#924): an enum is NOT implicitly convertible to or from its
+    // underlying integer type — both directions require an explicit cast
+    // (`int(e)` / `E(n)`). The mixed Named(enum)↔Primitive case falls through
+    // both the Primitive-Primitive and Named-Named branches below, so without
+    // this gate `var n: int := e` and `var e: E := n` were silently accepted
+    // and miscompiled. Enum→Object boxing stays accepted via the `Object`
+    // early-return above; explicit casts go through the cast-expression path.
+    {
+        bool fromEnum = from->kind == TypeRef::Kind::Named &&
+                        from->declaration &&
+                        from->declaration->kind == ast::TypeDeclKind::Enum;
+        bool toEnum = to->kind == TypeRef::Kind::Named && to->declaration &&
+                      to->declaration->kind == ast::TypeDeclKind::Enum;
+        // `Object` is the root type, not the enum's underlying integer type:
+        // enum→Object is boxing (an upcast) and Object→enum is unbox/downcast,
+        // both handled elsewhere. Only the underlying-integer (and other scalar)
+        // primitives are the conversion §5.4/§10 forbids without an explicit
+        // cast, so exclude Object here. (A `case` arm unifying enum constants
+        // with a `null` arm yields `Object?`, which must still reach an enum?
+        // target — see conformance spec_0025.)
+        bool fromIntPrim = from->kind == TypeRef::Kind::Primitive &&
+                           from->primitive != PrimitiveType::Object;
+        bool toIntPrim = to->kind == TypeRef::Kind::Primitive &&
+                         to->primitive != PrimitiveType::Object;
+        if ((fromEnum && toIntPrim) || (toEnum && fromIntPrim)) {
+            reportNotConvertible();
+            return;
+        }
+    }
     if (from->kind == TypeRef::Kind::Primitive &&
         to->kind == TypeRef::Kind::Primitive) {
         // The `null` literal is typed `Object?`. A non-nullable Object source is
