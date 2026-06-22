@@ -522,6 +522,58 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                 std::string("const `") + std::string(cs->name) +
                 "` must have a primitive value type or `string` "
                 "(§22.12)");
+            continue;
+        }
+        // §6.1 / Appendix C.11 (#958): a const initializer is a compile-time
+        // constant; an integer const whose folded initializer does not fit its
+        // declared integer type is a compile error (the value cannot be
+        // represented). Without this it compiled and raised OverflowException at
+        // runtime — const behaving like static-readonly. Fold the initializer
+        // (resolving sibling const references, with the shared depth guard) and
+        // range-check against the declared type.
+        using P = PrimitiveType;
+        const P p = rt->primitive;
+        const bool isIntConst =
+            p == P::Byte || p == P::SByte || p == P::Short || p == P::UShort ||
+            p == P::Int || p == P::UInt || p == P::Long || p == P::ULong;
+        if (isIntConst && cd->value) {
+            auto fits = [](long long v, P pt) -> bool {
+                switch (pt) {
+                    case P::Byte:   return v >= 0 && v <= 255;
+                    case P::SByte:  return v >= -128 && v <= 127;
+                    case P::Short:  return v >= -32768 && v <= 32767;
+                    case P::UShort: return v >= 0 && v <= 65535;
+                    case P::Int:    return v >= -2147483648LL &&
+                                           v <= 2147483647LL;
+                    case P::UInt:   return v >= 0 && v <= 4294967295LL;
+                    default:        return true;  // long / ulong: 64-bit
+                }
+            };
+            std::function<std::optional<long long>(std::string_view, int)>
+                resolve = [&](std::string_view name,
+                              int depth) -> std::optional<long long> {
+                for (Symbol* sm : t->members) {
+                    auto* scs = dynamic_cast<ConstMemberSymbol*>(sm);
+                    if (!scs || scs->name != name) continue;
+                    if (auto* scd =
+                            dynamic_cast<const ast::ConstDecl*>(scs->decl))
+                        if (scd->value)
+                            return foldIntConst(*scd->value, resolve, depth + 1);
+                    return std::nullopt;
+                }
+                return std::nullopt;
+            };
+            if (auto folded = foldIntConst(*cd->value, resolve)) {
+                if (!fits(*folded, p)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("const `") + std::string(cs->name) +
+                        "` initializer value " + std::to_string(*folded) +
+                        " does not fit its declared type — a const initializer "
+                        "must be a representable compile-time constant "
+                        "(§6.1 / Appendix C.11)");
+                }
+            }
         }
     }
 }

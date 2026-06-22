@@ -52,3 +52,34 @@ BEZEL_TEST(sema_const, object_const_diagnoses) {
     auto r = parseSemaAll(cls("public const O: Object := null;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §6.1 / Appendix C.11 (#958): a const initializer is a compile-time constant;
+// an integer const whose folded value does not fit its declared type is a
+// compile error (it raised OverflowException at runtime before).
+BEZEL_TEST(sema_const, int_const_overflow_rejected_958) {
+    auto r = parseSemaAll(cls("public const X: int := 2147483647 + 1;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("does not fit its declared type") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §6.1 (#958): a byte const out of range is rejected.
+BEZEL_TEST(sema_const, byte_const_overflow_rejected_958) {
+    auto r = parseSemaAll(cls("public const B: byte := 300;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// In-range integer consts (incl. a const-of-const and a long literal) are fine.
+BEZEL_TEST(sema_const, in_range_int_consts_accepted_958) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public const Y: int := 1000 + 1; "
+        "  public const Z: int := Y * 2; "
+        "  public const Big: long := 5000000000L; "
+        "  public const Neg: sbyte := -100; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
