@@ -160,3 +160,36 @@ BEZEL_TEST(sema_bug_483, nested_type_resolves_to_inner_tsym_spec_11_3) {
     }
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §9.5 (#955): a NESTED record/class called WITHOUT `new` (`Outer.Point(1,2)`)
+// is not construction and must be rejected with the same diagnostic as a
+// top-level record/class — it previously slipped past (the NestedTypeSymbol
+// callee misses the TypeSymbol-based §9.5 check) and miscompiled.
+BEZEL_TEST(sema_bug_483, nested_record_without_new_rejected_955) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Outer public record Point(X: int, Y: int); end Outer; "
+        "public class Program public static method Main(): int "
+        "  var p := Outer.Point(10, 20); return p.X; "  // no `new` — rejected
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("constructed with `new") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §9.5: `new Outer.Point(...)` (the correct form) and a nested enum cast
+// `Outer.E(1)` remain accepted (no over-rejection of the nested branch).
+BEZEL_TEST(sema_bug_483, new_nested_record_and_nested_enum_cast_accepted_955) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Outer public record Point(X: int, Y: int); "
+        "  enum E A, B; end E; end Outer; "
+        "public class Program public static method Main(): int "
+        "  var p := new Outer.Point(10, 20); var e: Outer.E := Outer.E(1); "
+        "  return p.X + int(e); "
+        "end Main; end Program;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

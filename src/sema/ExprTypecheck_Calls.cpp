@@ -503,6 +503,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             ctx_.setExprType(&ce, et);
             return;
         }
+        // §9.5 (#955): a NESTED record/class is constructed with `new`, not by
+        // calling the qualified type name (`Outer.Point(...)`). A
+        // NestedTypeSymbol does not inherit TypeSymbol, so the §9.5 reject below
+        // (which casts to TypeSymbol) misses it — a qualified `Outer.Point(1,2)`
+        // slipped past, left untyped, and miscompiled (the result read as a
+        // zero-valued record, or an IR type-mismatch at a typed use site). Mirror
+        // the top-level record/class rejection here.
+        if (nts->type && (nts->type->kind == ast::TypeDeclKind::Record ||
+                          nts->type->kind == ast::TypeDeclKind::Class)) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "`" + std::string(nts->type->name) +
+                    "` is constructed with `new " +
+                    std::string(nts->type->name) +
+                    "(...)`, not by calling the type name (§9.5)");
+            return;
+        }
     }
     if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
         if (ts->kind == ast::TypeDeclKind::Enum) {
