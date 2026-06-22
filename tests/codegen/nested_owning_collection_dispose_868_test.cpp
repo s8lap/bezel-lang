@@ -152,3 +152,68 @@ BEZEL_TEST(nested_owning_collection_dispose_868, single_level_control) {
         "  return R._n; "
         "end Main; end C;"), 1);
 }
+
+// §28.11, #888 — a nested OwnedSet<class> disposes its element. The set's class
+// element lives in the array backing freed by bz_array_free; the nested-disposer
+// thunk previously passed a NULL element disposer for OwnedSet (only the
+// top-level / field OwnedSet path supplied one), so an OwnedSet<class> inside
+// another owning collection leaked its elements. Routing genericArgs[0] through
+// elementPolicyFor — the same call the top-level path uses — disposes them.
+BEZEL_TEST(nested_owning_collection_dispose_868, nested_owned_set_888) {
+    BEZEL_EXPECT_EQ(run(std::string("module M; ") + kRClass +
+        "class C public static method Main(): int "
+        "  do "
+        "    using var outer := new OwnedArray<OwnedSet<R>>(); "
+        "    var inner := new OwnedSet<R>(); "
+        "    inner.Add(move (new R())); "
+        "    outer.Add(move inner); "
+        "  end; "
+        "  return R._n; "  // 1
+        "end Main; end C;"), 1);
+}
+
+// §28.11, #888 — two elements in the nested set → both disposed exactly once
+// (R._n == 2: not 0 = leak, not >2 = double-free, not -999 = crash).
+BEZEL_TEST(nested_owning_collection_dispose_868, nested_owned_set_two_elems_888) {
+    BEZEL_EXPECT_EQ(run(std::string("module M; ") + kRClass +
+        "class C public static method Main(): int "
+        "  do "
+        "    using var outer := new OwnedArray<OwnedSet<R>>(); "
+        "    var inner := new OwnedSet<R>(); "
+        "    inner.Add(move (new R())); "
+        "    inner.Add(move (new R())); "
+        "    outer.Add(move inner); "
+        "  end; "
+        "  return R._n; "  // 2
+        "end Main; end C;"), 2);
+}
+
+// §28.11, #888 — OwnedStack outer over a nested OwnedSet<class> also cascades.
+BEZEL_TEST(nested_owning_collection_dispose_868, owned_stack_of_owned_set_888) {
+    BEZEL_EXPECT_EQ(run(std::string("module M; ") + kRClass +
+        "class C public static method Main(): int "
+        "  do "
+        "    using var outer := new OwnedStack<OwnedSet<R>>(); "
+        "    var inner := new OwnedSet<R>(); "
+        "    inner.Add(move (new R())); "
+        "    outer.Push(move inner); "
+        "  end; "
+        "  return R._n; "  // 1
+        "end Main; end C;"), 1);
+}
+
+// §28.11, #888 — three levels with a nested OwnedSet at the leaf.
+BEZEL_TEST(nested_owning_collection_dispose_868, deep_nested_owned_set_888) {
+    BEZEL_EXPECT_EQ(run(std::string("module M; ") + kRClass +
+        "class C public static method Main(): int "
+        "  do "
+        "    using var outer := new OwnedArray<OwnedArray<OwnedSet<R>>>(); "
+        "    var mid := new OwnedArray<OwnedSet<R>>(); "
+        "    var inner := new OwnedSet<R>(); "
+        "    inner.Add(move (new R())); "
+        "    mid.Add(move inner); "
+        "    outer.Add(move mid); "
+        "  end; "
+        "  return R._n; "  // 1
+        "end Main; end C;"), 1);
+}

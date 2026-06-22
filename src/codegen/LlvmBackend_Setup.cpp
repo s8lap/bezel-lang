@@ -3230,10 +3230,9 @@ llvm::Function* Emitter::subscriptionDisposeThunk() {
 //   OwnedLinkedList                       → bz_llist_free(ptr, innerDisposer)
 //   OwnedDictionary                       → bz_dict_free(ptr, innerValueDisposer)
 //     (OwnedDictionary<K,V> owns its V elements; genericArgs[1] is V)
-//   OwnedSet / OwnedBuffer                → bz_array_free(ptr, null)
-//     (OwnedSet stores elements as dict keys — element disposal for OwnedSet<class>
-//     is not supported via the nested-thunk path; a separate fix is needed. For now
-//     the set backing is freed without cascading into class elements, same as before.)
+//   OwnedSet / OwnedBuffer                → bz_array_free(ptr, elementDisposer)
+//     (#888: an OwnedSet<class>'s elements are disposed by bz_array_free with the
+//     element disposer, the same call the top-level/field OwnedSet disposal uses.)
 //
 // The recursion terminates: each level peels one collection layer; eventually the
 // inner element is a class R → elementDisposerThunk, or a plain value → null.
@@ -3260,11 +3259,17 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
                          : "bz_array_free";
 
     // Resolve the inner element type (the thing the inner collection owns):
-    //   OwnedArray/Stack/Queue/LinkedList/Buffer → genericArgs[0]
-    //   OwnedDictionary                          → genericArgs[1] (the value)
-    //   OwnedSet                                 → null (no disposable value slot)
+    //   OwnedArray/Stack/Queue/LinkedList/Buffer/Set → genericArgs[0]
+    //   OwnedDictionary                              → genericArgs[1] (the value)
+    // §28.11 (#888): OwnedSet's class elements are freed via bz_array_free with
+    // the element disposer — the SAME call the top-level/field OwnedSet disposal
+    // uses (it is not a dict-type-name, so the field path at emitOwnedField-
+    // Disposals selects bz_array_free + the element disposer). Earlier this thunk
+    // passed a null disposer for a nested OwnedSet, so an OwnedSet<class> inside
+    // another owning collection leaked its elements; routing genericArgs[0]
+    // through elementPolicyFor disposes them, mirroring the top-level path.
     const sema::TypeRef* innerElem = nullptr;
-    if (elemCollTy && !isDict && collName != "OwnedSet") {
+    if (elemCollTy && !isDict) {
         innerElem = (!elemCollTy->genericArgs.empty()) ? elemCollTy->genericArgs[0]
                                                        : nullptr;
     } else if (isDict) {
