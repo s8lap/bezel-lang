@@ -2210,6 +2210,141 @@ llvm::Value* Emitter::lowerObjectToString(llvm::Value* recv) {
 }
 
 
+// §9.6 (#946/#947): lower `o.Equals(x)` where o: Object / interface (no resolved
+// MethodSymbol). Mirrors lowerObjectToString. The dynamic value is null, a bare
+// bz_string* (no vtable), or a class/box (vtable at word 0). A null receiver uses
+// reference identity (null == other, true iff other is also null); a string
+// receiver uses content equality when `other` is also a string (else not equal);
+// a class/box dispatches through vtable[kEqualsSlot] to the override (or §8.3
+// reference-identity default). Returns i1 — so an inferred `var r := o.Equals(x)`
+// is bool-typed and `not r` produces valid IR (#947).
+llvm::Value* Emitter::lowerObjectEquals(llvm::Value* recv, llvm::Value* other) {
+    if (!recv || !recv->getType()->isPointerTy() ||
+        !other || !other->getType()->isPointerTy())
+        return nullptr;
+
+    auto* nullBB  = llvm::BasicBlock::Create(llvm_, "eq.obj.null", currentFn_);
+    auto* liveBB  = llvm::BasicBlock::Create(llvm_, "eq.obj.live", currentFn_);
+    auto* strBB   = llvm::BasicBlock::Create(llvm_, "eq.obj.str", currentFn_);
+    auto* strEqBB = llvm::BasicBlock::Create(llvm_, "eq.obj.streq", currentFn_);
+    auto* strNeBB = llvm::BasicBlock::Create(llvm_, "eq.obj.strne", currentFn_);
+    auto* vtBB    = llvm::BasicBlock::Create(llvm_, "eq.obj.vt", currentFn_);
+    auto* endBB   = llvm::BasicBlock::Create(llvm_, "eq.obj.end", currentFn_);
+
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        recv, llvm::ConstantPointerNull::get(ptrTy()), "eq.obj.isnull");
+    builder_.CreateCondBr(isNull, nullBB, liveBB);
+
+    // null receiver → reference identity (null == other).
+    builder_.SetInsertPoint(nullBB);
+    llvm::Value* nullEq = builder_.CreateICmpEQ(recv, other, "eq.obj.nulleq");
+    builder_.CreateBr(endBB);
+
+    // non-null: string or vtable-bearing?
+    builder_.SetInsertPoint(liveBB);
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {recv, vtableTablePtr()}, "eq.obj.isstr");
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(isStr, builder_.getInt32(0)), strBB, vtBB);
+
+    // string receiver: content equality only when `other` is also a string
+    // (§9.6 string.Equals(Object?) — a string equals another object iff that
+    // object is a string of equal content). A null/non-string `other` → false.
+    builder_.SetInsertPoint(strBB);
+    llvm::Value* otherIsStr = builder_.CreateCall(
+        isStrFn, {other, vtableTablePtr()}, "eq.obj.oisstr");
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(otherIsStr, builder_.getInt32(0)),
+        strEqBB, strNeBB);
+    builder_.SetInsertPoint(strEqBB);
+    llvm::Value* strEq = emitStringEq(recv, other);
+    llvm::BasicBlock* strEqEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(strNeBB);
+    builder_.CreateBr(endBB);
+
+    // class/box receiver: dispatch vtable[kEqualsSlot](recv, other) → i1.
+    builder_.SetInsertPoint(vtBB);
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+    llvm::Value* slotPtr = builder_.CreateGEP(
+        ptrTy(), vptr, {builder_.getInt32(kEqualsSlot)}, "eq.obj.slot");
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                         /*isVarArg=*/false);
+    llvm::Value* vtEq = builder_.CreateCall(fnTy, fnPtr, {recv, other},
+                                            "eq.obj.r");
+    llvm::BasicBlock* vtEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(i1(), 4, "eq.obj.res");
+    phi->addIncoming(nullEq, nullBB);
+    phi->addIncoming(strEq, strEqEnd);
+    phi->addIncoming(builder_.getFalse(), strNeBB);
+    phi->addIncoming(vtEq, vtEnd);
+    return phi;
+}
+
+
+// §9.6 (#948): lower `o.GetHashCode()` where o: Object / interface. Mirrors
+// lowerObjectEquals: null → 0, a string → its content hash (consistent with
+// string equality), a class/box → vtable[kGetHashCodeSlot]. Returns i32 (int).
+llvm::Value* Emitter::lowerObjectGetHashCode(llvm::Value* recv) {
+    if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+
+    auto* nullBB = llvm::BasicBlock::Create(llvm_, "h.obj.null", currentFn_);
+    auto* liveBB = llvm::BasicBlock::Create(llvm_, "h.obj.live", currentFn_);
+    auto* strBB  = llvm::BasicBlock::Create(llvm_, "h.obj.str", currentFn_);
+    auto* vtBB   = llvm::BasicBlock::Create(llvm_, "h.obj.vt", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "h.obj.end", currentFn_);
+
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        recv, llvm::ConstantPointerNull::get(ptrTy()), "h.obj.isnull");
+    builder_.CreateCondBr(isNull, nullBB, liveBB);
+
+    // null → 0.
+    builder_.SetInsertPoint(nullBB);
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(liveBB);
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {recv, vtableTablePtr()}, "h.obj.isstr");
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(isStr, builder_.getInt32(0)), strBB, vtBB);
+
+    // string: content hash (same as string.GetHashCode / a string field hash).
+    builder_.SetInsertPoint(strBB);
+    sema::TypeRef strTy;
+    strTy.kind = sema::TypeRef::Kind::Primitive;
+    strTy.primitive = sema::PrimitiveType::String;
+    llvm::Value* strHash = emitValueHashCode(recv, &strTy);
+    if (strHash->getType()->isIntegerTy() && !strHash->getType()->isIntegerTy(32))
+        strHash = builder_.CreateZExtOrTrunc(strHash, i32());
+    llvm::BasicBlock* strEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+
+    // class/box: dispatch vtable[kGetHashCodeSlot](recv) → i32.
+    builder_.SetInsertPoint(vtBB);
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+    llvm::Value* slotPtr = builder_.CreateGEP(
+        ptrTy(), vptr, {builder_.getInt32(kGetHashCodeSlot)}, "h.obj.slot");
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    llvm::Value* vtHash = builder_.CreateCall(fnTy, fnPtr, {recv}, "h.obj.r");
+    llvm::BasicBlock* vtEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(i32(), 3, "h.obj.res");
+    phi->addIncoming(builder_.getInt32(0), nullBB);
+    phi->addIncoming(strHash, strEnd);
+    phi->addIncoming(vtHash, vtEnd);
+    return phi;
+}
+
+
 // §8.5 / §9.1 / §9.2: build `"TypeName(Prop1: value1, Prop2: value2)"` from the
 // record's storage members in declaration order — positional/body fields for a
 // positional record (§9.1), the auto-properties for an eligible body record

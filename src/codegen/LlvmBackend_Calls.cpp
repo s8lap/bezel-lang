@@ -8707,6 +8707,51 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // §9.6 (#946/#947/#948): `o.Equals(x)` / `o.GetHashCode()` where o is
+        // Object / interface (the universal Object members, no MethodSymbol —
+        // the receiver's static type has no override). Dispatch through the
+        // uniform vtable fixed slots (kEqualsSlot / kGetHashCodeSlot); a string
+        // operand (no vtable) uses the content intrinsic; a class/box dispatches
+        // to the override (or the §8.3 reference-identity / identity-hash
+        // default — a class WITH an override resolves a MethodSymbol and never
+        // reaches here). Equals returns i1 so `not (o.Equals(x))` is valid IR.
+        //
+        // Gated to Object- and interface-typed receivers ONLY: both are always
+        // heap pointers, so lowerObjectEquals/lowerObjectGetHashCode never bail
+        // out (their non-pointer guard never fires) and the receiver is lowered
+        // exactly once. A record/enum/primitive receiver is handled earlier by
+        // tryLowerValueSemanticsCall; a concrete class receiver with an override
+        // resolves a real MethodSymbol (ms != null) and dispatches there.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            bool isEqualsCall = ma->member == "Equals" && ma->target &&
+                                call.args.size() == 1 && call.args[0].value;
+            bool isHashCall = ma->member == "GetHashCode" && ma->target &&
+                              call.args.empty();
+            if (isEqualsCall || isHashCall) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                using K = sema::TypeRef::Kind;
+                using P = sema::PrimitiveType;
+                bool isObjectRecv = recvTy && recvTy->kind == K::Primitive &&
+                                    recvTy->primitive == P::Object;
+                bool isIfaceRecv =
+                    recvTy && recvTy->kind == K::Named && recvTy->declaration &&
+                    recvTy->declaration->kind == ast::TypeDeclKind::Interface;
+                if (isObjectRecv || isIfaceRecv) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (isEqualsCall) {
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (recv && other)
+                            if (llvm::Value* r = lowerObjectEquals(recv, other))
+                                return r;
+                    } else {
+                        if (recv)
+                            if (llvm::Value* r = lowerObjectGetHashCode(recv))
+                                return r;
+                    }
+                }
+            }
+        }
         // issue #494 / §29.2 / §29.3: explicit `e.MoveNext()` call where `e` is
         // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol for MoveNext). The iterator state

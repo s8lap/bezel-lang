@@ -1229,10 +1229,12 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
         slots = vtableMethods_[base];
         nameSlot = vtableNameSlot_[base];
     }
-    // Vtable (CG35-itable + §8.6 #417): [0]=td$C, [1]=itmap$C, [2]=Dispose,
-    // [3]=ToString, [4..]=virtual members. So a virtual member's slot is its
-    // position in `slots` + 4 (ToString occupies the fixed slot 3, like Dispose
-    // occupies the fixed slot 2). See declareVtables Pass D for the slot fill.
+    // Vtable (CG35-itable + §8.6 #417 + §9.6 #946): [0]=td$C, [1]=itmap$C,
+    // [2]=Dispose, [3]=ToString, [4]=Equals(Object?), [5]=GetHashCode,
+    // [6..]=virtual members. So a virtual member's slot is its position in
+    // `slots` + kVirtualMethodsBase (the three Object methods ToString/Equals/
+    // GetHashCode occupy fixed slots 3/4/5, like Dispose occupies fixed slot 2).
+    // See declareVtables Pass D for the slot fill.
     //
     // #481 / §12.1 / §12.5 / §23: virtual METHODS and virtual PROPERTY accessors
     // are enumerated together in member declaration order, each getting its own
@@ -1241,7 +1243,7 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
     // For a method-only class the layout is exactly the pre-#481 one (a property
     // just appends/interleaves additional slots); the IR verifier + the existing
     // virtual/interface dispatch tests guard against a perturbed method index.
-    const unsigned base = 4;
+    const unsigned base = kVirtualMethodsBase;
     auto assignSlot = [&](const std::string& key, VSlot vs) -> unsigned {
         auto it = nameSlot.find(key);
         if (it != nameSlot.end()) {       // override: reuse base slot
@@ -1676,10 +1678,11 @@ void Emitter::declareVtables() {
             "itmap$" + std::string(ts->name));
         itmaps_[ts] = itmapGV;
 
-        // Build vtable (CG35-itable + §8.6/§8.5 #417): [0]=td$C, [1]=itmap$C,
-        // [2]=Dispose, [3]=ToString, [4..]=virtuals.
+        // Build vtable (CG35-itable + §8.6/§8.5 #417 + §9.6 #946): [0]=td$C,
+        // [1]=itmap$C, [2]=Dispose, [3]=ToString, [4]=Equals, [5]=GetHashCode,
+        // [6..]=virtuals.
         const auto& slots = vtableMethods_[ts];
-        std::vector<llvm::Constant*> elems(kToStringSlot + 1 + slots.size(),
+        std::vector<llvm::Constant*> elems(kVirtualMethodsBase + slots.size(),
                                            llvm::ConstantPointerNull::get(
                                                ptrTy()));
         elems[0] = descArray_[ts];
@@ -1690,7 +1693,13 @@ void Emitter::declareVtables() {
         // §8.5 / §8.6 (#417): uniform ToString at the fixed slot 3 — the user
         // override (via the class chain) or the type-name default.
         elems[kToStringSlot] = classToStringThunk(ts);
-        // Virtual members at [4..] (kToStringSlot + 1 + i). A method slot holds
+        // §9.6 (#946/#947/#948): uniform Equals(Object?) at fixed slot 4 and
+        // GetHashCode at fixed slot 5 — the user override (via the class chain)
+        // or the §8.3 reference-identity / identity-hash default. This makes an
+        // override reachable through an Object-typed receiver.
+        elems[kEqualsSlot] = classEqualsThunk(ts);
+        elems[kGetHashCodeSlot] = classHashCodeThunk(ts);
+        // Virtual members at [6..] (kVirtualMethodsBase + i). A method slot holds
         // the most-derived method (already resolved in slots[]); a property
         // accessor slot (#481) holds the most-derived accessor FUNCTION for that
         // property, found by name on `ts`'s chain (so a derived override fills a
@@ -1701,7 +1710,7 @@ void Emitter::declareVtables() {
             if (vs.method) {
                 auto mit = methodFns_.find(vs.method);
                 if (mit != methodFns_.end())
-                    elems[kToStringSlot + 1 + i] =
+                    elems[kVirtualMethodsBase + i] =
                         llvm::cast<llvm::Constant>(mit->second);
             } else if (vs.prop) {
                 // #481 / §12.5: resolve the most-derived accessor on `ts`'s
@@ -1712,7 +1721,7 @@ void Emitter::declareVtables() {
                 if (impl)
                     if (llvm::Function* fn =
                             ensurePropertyAccessorFn(ts, impl, vs.isSet))
-                        elems[kToStringSlot + 1 + i] =
+                        elems[kVirtualMethodsBase + i] =
                             llvm::cast<llvm::Constant>(fn);
             }
         }
@@ -2704,18 +2713,22 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     //         that were resolved and stored by declareImportedFunctions) ---
     const auto& slots = vtableMethods_[ts];  // filled by declareVtables Pass A
     std::vector<llvm::Constant*> elems(
-        kToStringSlot + 1 + slots.size(),
+        kVirtualMethodsBase + slots.size(),
         llvm::ConstantPointerNull::get(ptrTy()));
     elems[0] = llvm::cast<llvm::Constant>(descGV);
     elems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
     elems[2] = llvm::cast<llvm::Constant>(specDispose);
     elems[kToStringSlot] = classToStringThunk(ts);
+    // §9.6 (#946/#947/#948): fixed Equals/GetHashCode slots, same as a local
+    // class vtable, so an Object-typed receiver of this specialization dispatches.
+    elems[kEqualsSlot] = classEqualsThunk(ts);
+    elems[kGetHashCodeSlot] = classHashCodeThunk(ts);
     for (std::size_t i = 0; i < slots.size(); ++i) {
         const VSlot& vs = slots[i];
         if (vs.method) {
             auto mit = methodFns_.find(vs.method);
             if (mit != methodFns_.end())
-                elems[kToStringSlot + 1 + i] =
+                elems[kVirtualMethodsBase + i] =
                     llvm::cast<llvm::Constant>(mit->second);
         }
         // Property accessor slots for imported generics: not yet supported
@@ -11342,15 +11355,23 @@ void Emitter::setupBoxDescriptors() {
             llvm::ConstantArray::get(itmapArrTy, itmapElems),
             "itmap$box$" + std::string(ts->name));
 
-        // Vtable (§8.6/§8.5 #417): [0]=td, [1]=itmap$box$C, [2]=Dispose (no-op),
-        // [3]=ToString (synthesized record/enum form, or user override).
-        std::vector<llvm::Constant*> elems(kToStringSlot + 1,
+        // Vtable (§8.6/§8.5 #417 + §9.6 #946): [0]=td, [1]=itmap$box$C,
+        // [2]=Dispose (no-op), [3]=ToString (synthesized record/enum form, or
+        // user override), [4]=Equals, [5]=GetHashCode (box defaults — see below).
+        std::vector<llvm::Constant*> elems(kVirtualMethodsBase,
                                            llvm::ConstantPointerNull::get(
                                                ptrTy()));
         elems[0] = descArray_[ts];
         elems[1] = llvm::ConstantExpr::getPointerCast(boxItmapGV, ptrTy());
         if (builtinDisposeFn_) elems[2] = builtinDisposeFn_;
         elems[kToStringSlot] = boxToStringThunk(ts);
+        // §9.6 (#946/#947/#948): keep the Object dispatch uniform — every
+        // vtable-bearing value has the fixed Equals/GetHashCode slots so
+        // lowerObjectEquals/lowerObjectGetHashCode's slot read is in bounds. A
+        // boxed value reached through Object uses the reference/identity default
+        // (structural/value equality through Object is a separate follow-up).
+        elems[kEqualsSlot] = boxDefaultEqualsThunk();
+        elems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         boxVtable_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
@@ -11393,7 +11414,11 @@ void Emitter::setupBoxDescriptors() {
                 ? static_cast<llvm::Constant*>(
                       llvm::ConstantPointerNull::get(ptrTy()))
                 : primBoxToStringThunk(p, nm);
-        auto* vtTy = llvm::ArrayType::get(ptrTy(), kToStringSlot + 1);
+        // §9.6 (#946): grow the primitive box vtable to the uniform
+        // kVirtualMethodsBase width so an Object-typed receiver's fixed
+        // Equals/GetHashCode slot read is in bounds (box reference/identity
+        // default — value equality through Object is a separate follow-up).
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
         primBoxVtable_[nm] = new llvm::GlobalVariable(
             *module_, vtTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage,
@@ -11403,7 +11428,9 @@ void Emitter::setupBoxDescriptors() {
                        builtinDisposeFn_
                            ? llvm::cast<llvm::Constant>(builtinDisposeFn_)
                            : llvm::ConstantPointerNull::get(ptrTy()),  // Dispose
-                       tostr}),
+                       tostr,
+                       boxDefaultEqualsThunk(),       // [4]=Equals
+                       boxDefaultHashCodeThunk()}),   // [5]=GetHashCode
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
     }
@@ -11487,6 +11514,158 @@ llvm::Constant* Emitter::classToStringThunk(const sema::TypeSymbol* ts) {
             result = lowerStringLiteral(
                 std::string("\"") + std::string(ts->name) + "\"", false);
         builder_.CreateRet(result);
+    }
+    return thunk;
+}
+
+
+// §9.6 (#946/#947/#948): the uniform Equals thunk for a CLASS. Returns the user
+// `Equals(other: Object?)` override if one exists anywhere on the class chain
+// (§8.4 "via virtual dispatch"); otherwise the §8.3 reference-identity default
+// (`this == other`). The thunk's signature is the vtable-uniform
+// `i1(ptr this, ptr other)`, so an Object-typed receiver reaches the override.
+llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
+    auto it = classEqualsFns_.find(ts);
+    if (it != classEqualsFns_.end()) return it->second;
+
+    // Walk the class chain for a user `Equals` (single parameter, non-static).
+    // The most-derived override wins (same lookup as classEqualsOverride).
+    sema::MethodSymbol* userEq = nullptr;
+    for (const sema::TypeSymbol* cur = ts; cur && !userEq;) {
+        for (sema::Symbol* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && !ms->isOperator && !isStaticMethod(ms) &&
+                ms->name == "Equals" && ms->params.size() == 1) {
+                userEq = ms; break;
+            }
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                         /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$eq$" + std::string(ts->name), module_.get());
+    classEqualsFns_[ts] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* result = nullptr;
+        if (userEq) {
+            auto fit = methodFns_.find(userEq);
+            if (fit != methodFns_.end()) {
+                // Call the real user Equals non-virtually (the thunk IS the
+                // dispatch target; calling it directly avoids re-entry).
+                llvm::Value* r = builder_.CreateCall(
+                    fit->second->getFunctionType(), fit->second,
+                    {thunk->getArg(0), thunk->getArg(1)});
+                // Coerce to i1 (a bool result may be a wider integer).
+                if (r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1))
+                    r = builder_.CreateICmpNE(
+                        r, llvm::ConstantInt::get(r->getType(), 0));
+                if (r->getType()->isIntegerTy(1)) result = r;
+            }
+        }
+        if (!result)
+            // §8.3 default: reference identity.
+            result = builder_.CreateICmpEQ(thunk->getArg(0), thunk->getArg(1));
+        builder_.CreateRet(result);
+    }
+    return thunk;
+}
+
+
+// §9.6 (#946/#947/#948): the uniform GetHashCode thunk for a CLASS. Returns the
+// user `GetHashCode(): int` override if one exists on the class chain; otherwise
+// the §8.3 identity-hash default (the receiver pointer bits truncated to i32).
+// Signature: the vtable-uniform `i32(ptr this)`.
+llvm::Constant* Emitter::classHashCodeThunk(const sema::TypeSymbol* ts) {
+    auto it = classHashCodeFns_.find(ts);
+    if (it != classHashCodeFns_.end()) return it->second;
+
+    sema::MethodSymbol* userHash = nullptr;
+    for (const sema::TypeSymbol* cur = ts; cur && !userHash;) {
+        for (sema::Symbol* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && !ms->isOperator && !isStaticMethod(ms) &&
+                ms->name == "GetHashCode" && ms->params.empty()) {
+                userHash = ms; break;
+            }
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$hash$" + std::string(ts->name), module_.get());
+    classHashCodeFns_[ts] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* result = nullptr;
+        if (userHash) {
+            auto fit = methodFns_.find(userHash);
+            if (fit != methodFns_.end()) {
+                llvm::Value* r = builder_.CreateCall(
+                    fit->second->getFunctionType(), fit->second,
+                    {thunk->getArg(0)});
+                if (r->getType()->isIntegerTy())
+                    result = builder_.CreateZExtOrTrunc(r, i32());
+            }
+        }
+        if (!result)
+            // §8.3 default: identity hash (pointer bits → i32).
+            result = builder_.CreateTrunc(
+                builder_.CreatePtrToInt(thunk->getArg(0), i64()), i32());
+        builder_.CreateRet(result);
+    }
+    return thunk;
+}
+
+
+// §9.6 (#946/#947/#948): the shared default Equals thunk `i1(ptr this, ptr other)`
+// installed in BOX vtables. A boxed value reached through an Object receiver uses
+// reference identity (the §8.3 default) — keeping the uniform slot read in bounds
+// and never crashing. Proper structural/value equality for a boxed value type
+// through Object is a separate follow-up (see the filed issue).
+llvm::Constant* Emitter::boxDefaultEqualsThunk() {
+    if (boxDefaultEqualsFn_) return boxDefaultEqualsFn_;
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                         /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, "bz$box$eq", module_.get());
+    boxDefaultEqualsFn_ = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        builder_.CreateRet(
+            builder_.CreateICmpEQ(thunk->getArg(0), thunk->getArg(1)));
+    }
+    return thunk;
+}
+
+
+// §9.6 (#946/#947/#948): the shared default GetHashCode thunk `i32(ptr this)`
+// installed in BOX vtables — identity hash (the box pointer bits → i32).
+llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
+    if (boxDefaultHashCodeFn_) return boxDefaultHashCodeFn_;
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, "bz$box$hash", module_.get());
+    boxDefaultHashCodeFn_ = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        builder_.CreateRet(builder_.CreateTrunc(
+            builder_.CreatePtrToInt(thunk->getArg(0), i64()), i32()));
     }
     return thunk;
 }

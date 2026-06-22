@@ -2098,7 +2098,8 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                     "thunk.ifn");
             }
         } else {
-            // §8.6 vtable: virtuals base at slot 4 (vtableSlot_ is absolute).
+            // §8.6/§9.6 vtable: virtuals base at slot 6 (kVirtualMethodsBase;
+            // [3]=ToString [4]=Equals [5]=GetHashCode). vtableSlot_ is absolute.
             dynFnPtr = builder_.CreateLoad(
                 ptrTy(),
                 builder_.CreateGEP(ptrTy(), vptr,

@@ -1170,6 +1170,12 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classToStringFns_;
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> boxToStringFns_;
     std::unordered_map<std::string, llvm::Function*> primBoxToStringFns_;
+    // §9.6 (#946/#947/#948): per-class Equals/GetHashCode thunk caches (slot
+    // kEqualsSlot / kGetHashCodeSlot) and the shared box-default thunks.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classEqualsFns_;
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classHashCodeFns_;
+    llvm::Function* boxDefaultEqualsFn_ = nullptr;
+    llvm::Function* boxDefaultHashCodeFn_ = nullptr;
     // §8.6 / §12.7 (#417): every vtable / box-vtable / exception-vtable global
     // emitted, collected so emitVtableTable() can publish a null-terminated
     // array `bz$vtable$table` that bz_obj_is_string scans to tell a string (no
@@ -2905,11 +2911,20 @@ private:
     // type-descriptor array (vtable[0])? Null operand → false. Returns i1.
     llvm::Value* emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc);
 
-    // §8.6 / §8.5 (#417): the fixed vtable slot index of the uniform virtual
-    // ToString method-pointer. Layout: [0]=td, [1]=itmap, [2]=Dispose,
-    // [3]=ToString, [4..]=virtuals. A dispatch `o.ToString()` on an Object /
-    // interface receiver loads vtable[3] and calls it.
-    static constexpr unsigned kToStringSlot = 3u;
+    // §8.6 / §8.5 / §9.6 (#417, #946/#947/#948): the fixed vtable slot indices
+    // of the uniform Object virtual members. Layout: [0]=td, [1]=itmap,
+    // [2]=Dispose, [3]=ToString, [4]=Equals(Object?), [5]=GetHashCode,
+    // [6..]=user virtuals. A dispatch `o.ToString()`/`o.Equals(x)`/
+    // `o.GetHashCode()` on an Object/interface receiver loads the fixed slot and
+    // calls it. The three Object methods (§9.6) each occupy a fixed slot so an
+    // override is reachable through an Object-typed receiver, exactly as ToString
+    // already was. `kVirtualMethodsBase` is where user-declared virtuals begin
+    // (it follows the last fixed Object slot); buildVtable assigns absolute slot
+    // indices from it, so growing this prefix shifts every user virtual uniformly.
+    static constexpr unsigned kToStringSlot     = 3u;
+    static constexpr unsigned kEqualsSlot       = 4u;
+    static constexpr unsigned kGetHashCodeSlot  = 5u;
+    static constexpr unsigned kVirtualMethodsBase = 6u;
 
     // §8.5 / §8.6 (#417): emit (once) a ToString thunk `ptr(ptr this)` for a
     // CLASS — the user override if present (walking the class chain), else a
@@ -2936,6 +2951,37 @@ private:
     // class/box dispatches through vtable[kToStringSlot]. Returns the result
     // string, or nullptr if the receiver cannot be lowered.
     llvm::Value* lowerObjectToString(llvm::Value* recv);
+
+    // §9.6 (#946/#947/#948): emit (once) an Equals thunk `i1(ptr this, ptr other)`
+    // for a CLASS — the user `Equals(Object?)` override if present (walking the
+    // class chain), else the §8.3 reference-identity default (`this == other`).
+    // Returned as a Constant for the class vtable's slot kEqualsSlot.
+    llvm::Constant* classEqualsThunk(const sema::TypeSymbol* ts);
+
+    // §9.6 (#946/#947/#948): emit (once) a GetHashCode thunk `i32(ptr this)` for
+    // a CLASS — the user `GetHashCode()` override if present, else the §8.3
+    // identity-hash default (the pointer bits truncated to i32). Returned as a
+    // Constant for the class vtable's slot kGetHashCodeSlot.
+    llvm::Constant* classHashCodeThunk(const sema::TypeSymbol* ts);
+
+    // §9.6 (#946/#947/#948): shared default Equals/GetHashCode thunks installed
+    // in BOX vtables (boxed records/enums/primitives). They give the §8.3
+    // reference-identity / identity-hash default so the uniform Object dispatch
+    // (lowerObjectEquals/lowerObjectGetHashCode reads the fixed slot on every
+    // vtable-bearing value) is in-bounds and never crashes. Structural/value
+    // equality for a boxed value type reached through Object is a separate gap
+    // (tracked as a follow-up issue), not these defaults.
+    llvm::Constant* boxDefaultEqualsThunk();
+    llvm::Constant* boxDefaultHashCodeThunk();
+
+    // §9.6 (#946/#947/#948): lower `o.Equals(x)` / `o.GetHashCode()` where `o`
+    // is Object/interface (no resolved MethodSymbol). Mirrors lowerObjectToString:
+    // a string operand (no vtable) uses the string content intrinsic; a null
+    // operand uses reference identity / hash 0; a class/box dispatches through
+    // the fixed vtable slot. Equals returns i1 (so `not r` on an inferred result
+    // is valid IR, #947); GetHashCode returns i32. nullptr if not lowerable.
+    llvm::Value* lowerObjectEquals(llvm::Value* recv, llvm::Value* other);
+    llvm::Value* lowerObjectGetHashCode(llvm::Value* recv);
 
     // §8.6: build box descriptor + vtable globals for boxable value types
     // (records, enums) and for the boxable primitives + string. Called once
