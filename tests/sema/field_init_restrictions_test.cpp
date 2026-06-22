@@ -170,3 +170,34 @@ BEZEL_TEST(sema_field_init, static_readonly_cross_type_ref_ok) {
         "end C;");
     BEZEL_EXPECT_FALSE(hasForwardRefError(r));
 }
+
+// §22.8 (#931): a field initializer may not reference an INHERITED instance
+// member either — `this` is not fully constructed when the initializer runs.
+// Before the fix only same-class instance members were flagged.
+BEZEL_TEST(sema_field_init, inherited_instance_member_ref_diagnoses_931) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Base public _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  destructor end destructor; end Base; "
+        "public class Derived: Base "
+        "  public _doubled: int := _x * 2; "  // inherited _x — forbidden
+        "  public constructor(x: int) base(x); end constructor; "
+        "end Derived;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §22.8 / §22.10 (#478, #931): a derived class's field initializer may still
+// reference its OWN primary-constructor parameter (available before field
+// initializers run); the exception is scoped to the current type.
+BEZEL_TEST(sema_field_init, own_primary_ctor_param_in_derived_init_accepted_931) {
+    auto r = parseSemaAll(
+        "module M; "
+        "public class Base public _b: int; "
+        "  public constructor() _b := 1; end constructor; "
+        "  destructor end destructor; end Base; "
+        "public class Derived(v: int): Base "
+        "  public _twice: int := v * 2; "  // own primary-ctor param — allowed
+        "end Derived;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

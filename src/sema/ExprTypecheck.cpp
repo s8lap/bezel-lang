@@ -131,16 +131,26 @@ void ExprTC::checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym) 
         if (mod == "static") { isStatic = true; break; }
     }
     if (isStatic) return;
-    // Only flag members of the type we're initializing.
-    if (currentType_ && mem->parent != currentType_) return;
+    // Flag instance members of the type we're initializing OR any ancestor:
+    // an INHERITED instance member is equally a forbidden implicit-`this`
+    // reference (§22.8, #931) — `this` is not fully constructed when a field
+    // initializer runs. isSubtype is reflexive, so this covers both the
+    // same-type case and the inherited case; an unrelated type's member is
+    // still skipped.
+    if (currentType_ && mem->parent && mem->parent != currentType_ &&
+        !isSubtype(currentType_, mem->parent))
+        return;
     // per §22.8 / §22.10: a primary-constructor parameter (a FieldSymbol
     // whose `posParam` is non-null AND whose parent type is a CLASS, not a
     // record) is explicitly permitted in field/property initializers. The
     // parameter's value is guaranteed available before field initializers
     // run (§22.8 step 0). A record's positional fields are genuine instance
-    // members and remain forbidden. Bug #478.
+    // members and remain forbidden. Bug #478. Scoped to the CURRENT type: an
+    // INHERITED base primary-ctor param is not a parameter of this class's
+    // initializer scope and is reached only through `this`, so it stays
+    // forbidden (#931).
     if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
-        if (fs->posParam && mem->parent &&
+        if (fs->posParam && mem->parent == currentType_ &&
             mem->parent->kind == ast::TypeDeclKind::Class)
             return;
     }
