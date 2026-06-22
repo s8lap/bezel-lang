@@ -3060,7 +3060,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // mismatched types → IR verifier failure).
             bool isEnumReceiver = propSym && propSym->parent &&
                                   propSym->parent->kind == ast::TypeDeclKind::Enum;
-            if (!obj->getType()->isPointerTy() && !isEnumReceiver) {
+            // sweep #8: an extension property on a PRIMITIVE value type
+            // (`extension int … property IsZero => this = 0`) uses `this` as the
+            // scalar value (i32/i1/…), exactly like an enum — NOT a struct
+            // pointer. Only a non-pointer AGGREGATE (a record/struct receiver)
+            // needs the spill-to-pointer so the getter's `this.field` access works;
+            // spilling a scalar and using the pointer as `this` makes the getter
+            // body read `this` at the wrong type (`this = 0` → `icmp ptr, i32` →
+            // LLVM assertion / IR_FAIL). Spill only non-pointer aggregates.
+            if (!obj->getType()->isPointerTy() &&
+                obj->getType()->isAggregateType() && !isEnumReceiver) {
                 llvm::AllocaInst* tmp = entryAlloca(obj->getType());
                 builder_.CreateStore(obj, tmp);
                 obj = tmp;
