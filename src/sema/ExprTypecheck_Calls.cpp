@@ -4057,6 +4057,21 @@ void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
 // sibling with the same name exists on the declaring type (i.e. there is a
 // public/internal overload of the same name), the error is suppressed — the
 // codegen overload-resolution step will pick the accessible variant.
+// §11.6 (#954): is `inner` a nested type of `outer` — directly, or transitively
+// through a deeper nesting chain? A nested type is recorded as a
+// NestedTypeSymbol in its enclosing type's member list (no back-pointer), so
+// the relationship is found by walking the enclosing type's members.
+static bool isNestedWithin(const TypeSymbol* inner, const TypeSymbol* outer) {
+    if (!inner || !outer) return false;
+    for (const Symbol* m : outer->members) {
+        if (auto* nts = dynamic_cast<const NestedTypeSymbol*>(m)) {
+            if (nts->type == inner) return true;
+            if (nts->type && isNestedWithin(inner, nts->type)) return true;
+        }
+    }
+    return false;
+}
+
 bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
                                    std::string_view memberName,
                                    SourceLocation loc) {
@@ -4066,6 +4081,20 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
 
     // public — always allowed (§13.1).
     if (vis == ast::Visibility::Public || vis == ast::Visibility::None)
+        return false;
+
+    // §11.6 (#954): a nested type and its enclosing type have mutual access to
+    // ALL of each other's members, including `private` and `protected` — "A
+    // nested class has access to all members (including private) of its
+    // enclosing class … The enclosing class similarly has full access to its
+    // nested types' members." Allow any access when currentType_ is nested
+    // within `declaring`, or `declaring` is nested within currentType_
+    // (directly or transitively). Field/method access is a plain offset/call in
+    // codegen (visibility is a sema-only concept), so this is purely lifting a
+    // false rejection.
+    if (currentType_ && currentType_ != declaring &&
+        (isNestedWithin(currentType_, declaring) ||
+         isNestedWithin(declaring, currentType_)))
         return false;
 
     // internal — allowed iff the member is in the same module (not imported).
