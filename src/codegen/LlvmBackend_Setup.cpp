@@ -4389,23 +4389,35 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         propagateBB_ = cleanupBB;
     }
 
+    // §22.8 step 2 (#929/#930): run this class's OWN field initializers AFTER the
+    // base chain (step 1) and BEFORE the body (step 3). Emitted after the
+    // cleanup-block install so a throwing field initializer routes to it and the
+    // already-assigned owned fields + the constructed base subobject are disposed
+    // (§22.9). emitInstanceInit at the `new` site now installs only the vtable.
+    // SKIP for a `this(...)` delegation: §22.8 step 1 says the chained sibling
+    // constructor runs its own steps 0-3 (including field initializers) to
+    // completion, so re-running them here would double-initialize.
+    if (!isThis)
+        emitOwnFieldInit(cs->parent, currentThis_, classStruct(cs->parent));
+
     bool terminated = lowerScopedBlock(cd->body, startIdx);
     if (!terminated) builder_.CreateRetVoid();
 }
 
 
-// §22.8 step 1+2 (issue #328 item 2+3): the shared instance-initialization
-// sequence, factored out of lowerNew so it runs identically at the in-module
-// `new` site and inside the cross-module `bz$<Type>$init` function. Installs the
-// most-derived vtable into slot 0, then runs the full-hierarchy field
-// initializers (base-first, own last; calloc already zeroed the rest, so an
-// uninitialized field is left zero), the collection-literal initializers, and
-// the §24.1 event-source initializers. NOTE: this is the in-module form — it
-// reads each field's AST initializer via `m->decl`, so it is NEVER called for an
-// imported type (whose symbols carry no decl); the importer instead calls the
-// linked init function (declareImportedInit). The old constant-foldable replay
-// is therefore gone: a foldable OR non-foldable initializer now crosses the
-// boundary by running the exporter's real initializer here.
+// §22.8 (issue #328 item 2+3; #929/#930): install the most-derived vtable into
+// instance slot 0. Factored out of lowerNew so it runs identically at the
+// in-module `new` site and inside the cross-module `bz$<Type>$init` function.
+//
+// Field initializers are NO LONGER run here. Per §22.8 (the v0.73 order
+// base-ctor → field-inits → ctor body) each class's OWN field initializers run
+// in its constructor body AFTER the base chain (emitConstructorBody /
+// inlineCtorBody, via emitOwnFieldInit), or — for a no-explicit-ctor class — in
+// the construction sequence after the base sequence (the `new` site's no-ctor
+// branch, emitChainCall's primary-base branch, and emitInstanceInitFunction for
+// a no-ctor public class). Running them here, at the `new` site before any base
+// ctor, was the pre-v0.73 ordering bug (#930). The vtable install stays here so
+// virtual dispatch during construction resolves to the most-derived class.
 void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
                                llvm::StructType* st) {
     // CG17: install the vtable pointer (instance slot 0) before field
@@ -4436,12 +4448,38 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
     if (llvm::GlobalVariable* vt = specializedVtableFor(t)) {
         builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
     }
+}
 
-    // Run field initializers, inherited (base-first) then own, so a
-    // `new Derived()` initializes base fields too. CG16's base-ctor chaining
-    // runs ctor *bodies*, not these initializers, so there is no double-init.
+
+// §22.8 step 2 (#929/#930): run class `t`'s OWN field initializers and own
+// EventSource allocations — NOT inherited ones. Per §22.8 the v0.73 order is
+// base/chained ctor (step 1) → field initializers (step 2) → ctor body (step 3).
+// This runs INSIDE the constructor AFTER the base chain (emitConstructorBody /
+// inlineCtorBody), and at the no-explicit-ctor construction site after the base
+// sequence, so a derived field initializer observes the fully-constructed base
+// subobject (fixing the pre-v0.73 ordering where emitInstanceInit ran the whole
+// hierarchy's field initializers at the `new` site, before any base ctor). Only
+// `t`'s own storage is initialized here; each base level's own fields are
+// initialized by that base's own constructor (or no-ctor construction sequence)
+// reached through the base chain — so there is no double-init. `st` is
+// classStruct(t) and `obj` points at the instance (base subobject at offset 0).
+void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
+                               llvm::StructType* st) {
+    // Own (non-inherited) instance storage only: `t`'s own non-static fields,
+    // auto-properties, and instance/sync event backing fields — in declaration
+    // order (the same per-member shape collectInstanceStorage records, minus the
+    // base-first recursion).
     std::vector<const sema::Symbol*> storage;
-    collectInstanceStorage(t, storage);
+    for (const sema::Symbol* m : t->members) {
+        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (fs && !isStaticField(fs)) { storage.push_back(m); continue; }
+        if (isAutoProperty(m)) { storage.push_back(m); continue; }
+        if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
+            if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
+                if (!ed->isStatic && !ed->isAsync) storage.push_back(m);
+            }
+        }
+    }
     for (const sema::Symbol* m : storage) {
         const ast::Expr* init = nullptr;
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
@@ -4654,7 +4692,17 @@ void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
+    // §22.8 (#929/#930): `bz$<T>$init` installs the vtable (step pre-1). For a
+    // class WITH a constructor the importer calls `bz$<T>$ctor` after this, which
+    // runs the base chain + field initializers + body — so init stays vtable-only
+    // to avoid double-init. For a NO-explicit-ctor class there is no `bz$<T>$ctor`
+    // for the importer to call, so init must itself run the construction sequence
+    // (base sequence then this class's own field initializers, §22.8 step 1+2).
     emitInstanceInit(ts, currentThis_, classStruct(ts));
+    if (!hasAnyConstructor(ts)) {
+        emitImplicitBase(ts, currentThis_);
+        emitOwnFieldInit(ts, currentThis_, classStruct(ts));
+    }
     builder_.CreateRetVoid();
 
     currentFn_ = savedFn;
@@ -4754,9 +4802,23 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     sema::ConstructorSymbol* target =
         ctorByArity(targetCls, n, isThis ? cs : nullptr);
     if (!target) {
-        // Explicit `base()` with no matching base ctor: the base's own
-        // base may still need an implicit chain.
-        if (!isThis && n == 0) emitImplicitBase(targetCls, currentThis_);
+        // Explicit `base(...)` with no matching base CONSTRUCTOR symbol. This is
+        // the primary-ctor / no-explicit-ctor base case (e.g. `class ED: Base`
+        // with `base(v)` where `Base(v: int)` is a primary-ctor class — it has no
+        // ConstructorSymbol). §22.8 (#929/#930): run the base's construction
+        // sequence — its own base chain (step 1) then its OWN field initializers
+        // (step 2) — so a base field initializer like `_field := v` runs. The
+        // base's positional-param fields were already stored by
+        // prePopulateBasePositionalFields at the `new` site, so the initializer
+        // reads them. currentThis_ is the constructing object (base subobject at
+        // offset 0), which emitOwnFieldInit's implicitFieldAddr resolves against.
+        if (!isThis && !hasAnyConstructor(targetCls)) {
+            emitImplicitBase(targetCls, currentThis_);
+            emitOwnFieldInit(targetCls, currentThis_, classStruct(targetCls));
+        } else if (!isThis && n == 0) {
+            // base() into a class whose own base still needs an implicit chain.
+            emitImplicitBase(targetCls, currentThis_);
+        }
         return;
     }
     // §2.5 / §2.6 / §12 (issue #328 / #103): a LOCAL class's `base(...)` chain to
@@ -4909,6 +4971,13 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     } else {
         emitImplicitBase(cs->parent, currentThis_);
     }
+    // §22.8 step 2 (#929/#930): own field initializers after the base chain,
+    // before the body (mirrors emitConstructorBody). The inline cleanup block
+    // installed above routes a throwing field initializer to owned-field + base
+    // disposal. Skipped for a `this(...)` delegation (the chained sibling ctor
+    // already ran them, §22.8 step 1).
+    if (!isThis)
+        emitOwnFieldInit(cs->parent, obj, classStruct(cs->parent));
     lowerScopedBlock(cd->body, startIdx);
 }
 
@@ -4929,7 +4998,14 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
             builder_.CreateCall(it->second, {obj});
         }
     } else {
+        // §22.8 (#930): `b` has no parameterless ctor. If `b` is a
+        // no-explicit-ctor class, run its own base sequence then its own field
+        // initializers (step 2) — there is no `b` ctor to do so. (If `b` had
+        // only parameterized ctors, an implicit `base()` is a sema error and
+        // never reaches codegen.)
         emitImplicitBase(b, obj);
+        if (!hasAnyConstructor(b))
+            emitOwnFieldInit(b, obj, classStruct(b));
     }
 }
 

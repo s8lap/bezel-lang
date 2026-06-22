@@ -8185,7 +8185,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     } else if (!hasAnyConstructor(t)) {
         // CG16: no explicit ctor → the implicit ctor runs an implicit
         // `base()`, so a base-class ctor still runs on `new Derived()`.
+        // §22.8 step 2 (#929/#930): after the base sequence (step 1), run this
+        // no-explicit-ctor class's OWN field initializers — emitInstanceInit at
+        // the `new` site now installs only the vtable, and there is no ctor body
+        // to run them. A base level's own fields were already initialized inside
+        // emitImplicitBase (its base ctor, or its no-ctor field-init).
+        // currentThis_ must be `obj` here so a field initializer that reads a
+        // primary-ctor parameter (a captured positional field) resolves via
+        // implicitFieldAddr against the NEW object, not the enclosing method's
+        // `this` (which was restored after the vtable install above).
+        llvm::Value* savedThisNoCtor = currentThis_;
+        currentThis_ = obj;
         emitImplicitBase(t, obj);
+        emitOwnFieldInit(t, obj, st);
+        currentThis_ = savedThisNoCtor;
         // §22.9 / §28.3 (FINDING [4]): the implicit base ctor may throw; the
         // base ctor's own cleanup disposed the base subobject without freeing
         // `this`, so reclaim the instance block here on the throw edge.

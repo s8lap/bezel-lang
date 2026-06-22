@@ -4261,6 +4261,15 @@ private:
     void emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
                           llvm::StructType* st);
 
+    // §22.8 step 2 (#929/#930): run class `t`'s OWN (non-inherited) field
+    // initializers + own EventSource allocations. Called from a constructor
+    // body AFTER the base chain (emitConstructorBody / inlineCtorBody) and from
+    // the no-explicit-ctor construction sequence after the base sequence, so
+    // §22.8's base-ctor → field-init → body order holds. emitInstanceInit only
+    // installs the vtable; this performs step 2.
+    void emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
+                          llvm::StructType* st);
+
     // §2.5 / §2.6 / §22.8 (issue #328 item 2+3): emit the exported
     // `bz$<Type>$init(ptr this)` for a public non-generic class — it calls
     // emitInstanceInit so an importer's cross-module construction installs the
