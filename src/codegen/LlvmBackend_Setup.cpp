@@ -9425,6 +9425,22 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     return true;
             }
         }
+        // (b0b) #911 / §25: a user-defined binary operator whose `operator OP`
+        // returns `owned T` — `using var c := a + b`. The initializer is a
+        // BinaryExpr, not a CallExpr, so the call branch below missed it and the
+        // owned operator result leaked. Sema sets the BinaryExpr's exprSymbol to
+        // the operator MethodSymbol; its OperatorDecl carries returnOwned.
+        if (dynamic_cast<const ast::BinaryExpr*>(ld->initializer.get())) {
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*ld->initializer))) {
+                auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (od && od->returnOwned &&
+                    (isClassOrInterfaceRef(initTy) ||
+                     isClassOrInterfaceRef(resolveTypeParamRef(initTy))))
+                    return true;
+            }
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(
                 ld->initializer.get())) {
             if (call->callee) {
