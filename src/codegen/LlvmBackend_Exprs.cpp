@@ -2327,6 +2327,81 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // §30.3 (#942): Task.IsCompleted / IsFaulted / IsCancelled property reads.
+    // These are "readonly property" in the stdlib, so the parser produces a
+    // MemberAccessExpr (no parens), bypassing the Task static-call lowering.
+    // Semantics (spec §30.3 — faulted and cancelled are distinct states):
+    //   IsCompleted = the task is done (bz_task_is_done — true for a
+    //                 successful, faulted, OR cancelled task).
+    //   IsCancelled = the task is errored AND its error object is an
+    //                 OperationCanceledException (cancellation is represented as
+    //                 a faulted task carrying an OCE — see Task.FromCancelled /
+    //                 the cancellation-aware Task.Delay).
+    //   IsFaulted   = the task is errored with a NON-cancellation exception
+    //                 (is_error AND not an OCE), so IsFaulted and IsCancelled are
+    //                 mutually exclusive.
+    // The OCE is distinguished by its vtable word (the same vtable codegen
+    // installs in slot 0 of the OCE object Task.FromCancelled allocates).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target &&
+            (ma->member == "IsCompleted" || ma->member == "IsFaulted" ||
+             ma->member == "IsCancelled")) {
+            auto* tt = ctx_.exprType(*ma->target);
+            if (isTaskTypeName(tt)) {
+                llvm::Value* task = lowerExpr(*ma->target);
+                if (task) {
+                    if (ma->member == "IsCompleted") {
+                        auto* fn = declareC("bz_task_is_done", i1(), {ptrTy()});
+                        return builder_.CreateCall(fn, {task},
+                                                   "task.iscompleted");
+                    }
+                    // IsFaulted / IsCancelled both need is_error + the OCE test.
+                    auto* isErrFn =
+                        declareC("bz_task_is_error", i1(), {ptrTy()});
+                    llvm::Value* isErr =
+                        builder_.CreateCall(isErrFn, {task}, "task.iserr");
+                    // isOce: is_error AND error_obj != null AND its vtable word
+                    // == the OperationCanceledException vtable. Compute with a
+                    // null-guarded load (loading from a null error_obj is UB).
+                    llvm::Value* isOce = builder_.getFalse();
+                    auto vit = builtinVtable_.find("OperationCanceledException");
+                    if (vit != builtinVtable_.end()) {
+                        auto* errObjFn =
+                            declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+                        llvm::Value* errObj = builder_.CreateCall(
+                            errObjFn, {task}, "task.errobj");
+                        llvm::Value* notNull = builder_.CreateICmpNE(
+                            errObj,
+                            llvm::ConstantPointerNull::get(ptrTy()));
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* loadBB = llvm::BasicBlock::Create(
+                            llvm_, "task.oce.load", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "task.oce.cont", currentFn_);
+                        builder_.CreateCondBr(notNull, loadBB, contBB);
+                        builder_.SetInsertPoint(loadBB);
+                        llvm::Value* vt =
+                            builder_.CreateLoad(ptrTy(), errObj, "task.errvt");
+                        llvm::Value* oceVt = builder_.CreateBitCast(
+                            vit->second, ptrTy());
+                        llvm::Value* eq =
+                            builder_.CreateICmpEQ(vt, oceVt, "task.isoce.eq");
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2, "task.isoce");
+                        phi->addIncoming(builder_.getFalse(), entryBB);
+                        phi->addIncoming(eq, loadBB);
+                        isOce = builder_.CreateAnd(isErr, phi);
+                    }
+                    if (ma->member == "IsCancelled")
+                        return isOce;
+                    // IsFaulted = is_error AND not a cancellation.
+                    return builder_.CreateAnd(
+                        isErr, builder_.CreateNot(isOce), "task.isfaulted");
+                }
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.

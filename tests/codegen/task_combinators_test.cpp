@@ -432,3 +432,62 @@ BEZEL_TEST(task_combinators_443, when_all_delay_then_fault_cross_thread) {
     for (int i = 0; i < 3; ++i)
         BEZEL_EXPECT_EQ(compileAndRun(src), 70);
 }
+
+// ============================================================
+// §30.3 (#942): Task.IsCompleted / IsFaulted / IsCancelled property reads
+// ============================================================
+
+// §30.3: a Task.FromResult task is already completed → IsCompleted is true.
+// Regression for #942 (all three state properties returned false unconditionally).
+BEZEL_TEST(task_state_942, from_result_is_completed) {
+    expectValueLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var tc := Task.FromResult<int>(42); "
+        "  return (1 if tc.IsCompleted else 0); "
+        "end Main; end C;",
+        1);
+}
+
+// §30.3: a successful task is neither faulted nor cancelled.
+BEZEL_TEST(task_state_942, from_result_not_faulted_not_cancelled) {
+    expectValueLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var tc := Task.FromResult<int>(42); "
+        "  if tc.IsFaulted then return 9; end; "
+        "  if tc.IsCancelled then return 8; end; "
+        "  return 0; "
+        "end Main; end C;",
+        0);
+}
+
+// §30.3: a Task.FromException task is completed AND faulted, but NOT cancelled
+// (its error is not an OperationCanceledException).
+// Value-only (compileAndRun, not expectValueLeakFree): a FromException task
+// disposed without being awaited/caught leaks its exception object — a
+// pre-existing gap tracked as #962, independent of the #942 state-property fix.
+BEZEL_TEST(task_state_942, from_exception_is_faulted_not_cancelled) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  using var tf := Task.FromException<int>("
+        "      new InvalidOperationException(\"x\")); "
+        "  if not tf.IsCompleted then return 7; end; "
+        "  if tf.IsCancelled then return 8; end; "
+        "  return (1 if tf.IsFaulted else 0); "
+        "end Main; end C;"),
+        1);
+}
+
+// §30.3: a Task.FromCancelled task is completed AND cancelled, and — because
+// faulted and cancelled are distinct states — NOT faulted (the error is an
+// OperationCanceledException, distinguished by its vtable).
+// Value-only for the same pre-existing-leak reason as above (#962).
+BEZEL_TEST(task_state_942, from_cancelled_is_cancelled_not_faulted) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  using var tc := Task.FromCancelled<int>(); "
+        "  if not tc.IsCompleted then return 7; end; "
+        "  if tc.IsFaulted then return 8; end; "
+        "  return (1 if tc.IsCancelled else 0); "
+        "end Main; end C;"),
+        1);
+}
