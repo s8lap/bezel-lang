@@ -248,6 +248,7 @@ set(BEZEL_TEST_SOURCES
     sema/bare_drain_discard_832_test.cpp              # fix #832: §21.9 reject bare owning-collection drain discard
     sema/generic_default_new_constraint_864_test.cpp  # fix #864: §17.11 default(T) under where T:class rejected; §14.2 new() at method call site
     sema/with_expression_target_validation_875_test.cpp  # fix #875-#878: §9.5/§5.1 validate with-expression targets (type, existence, method, computed-property)
+    sema/inline_array_element_count_test.cpp             # sweep #11: §15.4 inline-array literal must have exactly N elements
     sema/base_abstract_call_874_test.cpp                 # fix #874: §12.3/§12.5 reject base.M() call to abstract base method
     sema/pascalcase_type_aliases_884_test.cpp            # fix #884: §3.4 PascalCase System type-name aliases (String/Int32/…) resolve
     sema/generic_inconsistent_type_arg_896_test.cpp     # fix #896: §14.1 inconsistent type-arg inference (Merge<T>(int?,bool?)) rejected cleanly — no crash

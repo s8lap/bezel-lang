@@ -2314,6 +2314,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // the const is in scope (member/module consts were folded at
                 // type resolution; locals were not yet bound there).
                 foldLocalConstArraySize(lsym->declType);
+                // §15.4 / §15.1 (sweep #11): an inline-array literal initializer
+                // must have EXACTLY N elements — "The list must contain exactly
+                // N elements; mismatch is a compile error" (§15.4). Too few left
+                // uninitialized slots (garbage reads); too many overran the slot
+                // storage at codegen (SIGSEGV). Both compiled silently before
+                // this gate. Checked once N is folded (>= 0).
+                if (ld->initializer && lsym->declType &&
+                    lsym->declType->kind == TypeRef::Kind::InlineArray &&
+                    lsym->declType->arraySizeValue >= 0) {
+                    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                            ld->initializer.get())) {
+                        if (!cl->isDict) {
+                            long long n = lsym->declType->arraySizeValue;
+                            long long got =
+                                static_cast<long long>(cl->elements.size());
+                            if (got != n) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error,
+                                    ld->initializer->span.begin,
+                                    "inline-array initializer has " +
+                                    std::to_string(got) + " element(s) but the "
+                                    "type requires exactly " +
+                                    std::to_string(n) +
+                                    " (`[" + std::to_string(n) +
+                                    "]…`) (§15.4)");
+                            }
+                        }
+                    }
+                }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
                 // generic method whose type parameter appears only in the
