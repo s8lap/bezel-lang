@@ -1965,6 +1965,56 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
 }
 
 
+// §19 / §A.8 (#957): a NamedPattern whose qualified name resolves to a named
+// CONST (`C.K`, or a bare own-class/module const) is a constant-equality
+// pattern, not a type test. The pattern name carries no resolved-symbol entry
+// (a QualifiedName, not an Expr), so resolve it by name against the const
+// symbols and fold its compile-time value (the same fold constMemberValue uses
+// for a const READ). Returns null when the name is not a const, leaving the
+// type-test / enum-constant handlers (or the deferred-null fall-through) to
+// take over.
+llvm::Value* Emitter::constValueForPatternName(
+        const ast::QualifiedName* name) {
+    if (!name || name->parts.empty()) return nullptr;
+    std::string_view last = name->parts.back();
+    auto fold = [&](sema::ConstMemberSymbol* cs) -> llvm::Value* {
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (cd && cd->value) return lowerExpr(*cd->value);
+        return nullptr;  // imported const w/o AST decl — decline (loud)
+    };
+    // Qualified `C.K`: `K` is a const member of the type named just before it.
+    if (name->parts.size() >= 2) {
+        std::string_view typeName = name->parts[name->parts.size() - 2];
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts || ts->name != typeName) continue;
+            for (sema::Symbol* m : ts->members)
+                if (m && m->name == last)
+                    if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(m))
+                        return fold(cs);
+        }
+        return nullptr;
+    }
+    // Bare `K`: accept only a UNIQUE const of that name (an ambiguous bare name
+    // is left deferred — never mis-resolved to an unrelated class's const). The
+    // same symbol can appear both flat in ctx_.symbols() and under its owning
+    // type's `members`, so dedup by pointer before counting.
+    std::unordered_set<const sema::ConstMemberSymbol*> seen;
+    auto consider = [&](sema::Symbol* m) {
+        if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(m))
+            if (cs->name == last) seen.insert(cs);
+    };
+    for (const auto& sym : ctx_.symbols()) {
+        consider(sym.get());
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get()))
+            for (sema::Symbol* m : ts->members) consider(m);
+    }
+    return seen.size() == 1
+               ? fold(const_cast<sema::ConstMemberSymbol*>(*seen.begin()))
+               : nullptr;
+}
+
+
 void Emitter::emitThrowBuiltin(const char* name) {
     auto vit = builtinVtable_.find(name);
     if (vit == builtinVtable_.end()) return;

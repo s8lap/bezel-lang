@@ -2771,6 +2771,14 @@ private:
     llvm::GlobalVariable* descriptorForPatternName(
         const ast::QualifiedName* name);
 
+    // §19 / §A.8 (#957): fold the value of a NamedPattern whose qualified name
+    // resolves to a named CONST (`C.K`, or a bare module/own-class const). A
+    // pattern name carries no resolved-symbol entry, so resolve it by name
+    // (mirrors descriptorForPatternName). Returns null when the name is not a
+    // const — the pattern is then a type-test / enum constant handled
+    // elsewhere, or deferred.
+    llvm::Value* constValueForPatternName(const ast::QualifiedName* name);
+
     // Returns true if `tt` is a Named type with no user declaration, i.e.,
     // one of the built-in exception types (Exception, ArgumentException, …).
     bool isBuiltinExceptionType(const sema::TypeRef* tt) const {

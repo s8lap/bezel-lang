@@ -2677,10 +2677,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         Scope armEnumScope;
         Scope* preArmEnumScope = currentScope_;
         bool savedEnumArms = inEnumScrutineeCaseArms_;
-        if (scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+        bool scrutIsEnum = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
             scrutTy->declaration &&
-            scrutTy->declaration->kind == ast::TypeDeclKind::Enum &&
-            currentScope_) {
+            scrutTy->declaration->kind == ast::TypeDeclKind::Enum;
+        if (scrutIsEnum && currentScope_) {
             armEnumScope.parent = currentScope_;
             for (Symbol* m : scrutTy->declaration->members)
                 if (dynamic_cast<EnumConstantSymbol*>(m))
@@ -2692,7 +2692,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
             // boolean CONDITION expression (a ConstantPattern) — typecheck its
             // constants so identifiers resolve and codegen can lower them.
-            if (!ce->scrutinee) {
+            // §19 / §A.8 (#957): a scrutinee-BEARING arm whose pattern is a
+            // ConstantPattern referencing a named const (`C.K`, a module-level
+            // const) must also be typechecked, so the const acquires an
+            // exprType/symbol and codegen can lower it. Enum-constant patterns
+            // over an enum scrutinee are excluded — those are bare/qualified
+            // member names resolved by name against the scrutinee enum in
+            // codegen (enumConstantOfPatternExpr); visiting them here would
+            // either fail to resolve (plain scope) or divert that path.
+            if (!ce->scrutinee || !scrutIsEnum) {
                 if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
                         arm.pattern.get()))
                     for (const auto& c : cp->constants)

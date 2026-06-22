@@ -9577,6 +9577,18 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     enumConstantByName(enumTy, np->name->parts.back()))
                 return emitEquals(scrut, cv, isStr);
         }
+        // §19 / §A.8 (#957): a NamedPattern whose qualified name resolves to a
+        // named CONST (`C.K`, a module/own-class const) is a constant-equality
+        // pattern, not a type test — the parser emits a NamedPattern for any
+        // non-primitive name and defers Constant-vs-Type to resolution here.
+        // Fold the const's value and compare (mirrors the ConstantPattern
+        // handler: reconcile width for non-string scrutinees, content-compare
+        // for strings). Checked before the type-descriptor branch; the two
+        // never collide (a const member's last name part is not a type name).
+        if (llvm::Value* cv = constValueForPatternName(np->name.get())) {
+            if (!isStr) cv = reconcile(cv, scrut->getType());
+            return emitEquals(scrut, cv, isStr);
+        }
         // §19.3/§19.5: type-test pattern on a class/interface scrutinee.
         if (llvm::GlobalVariable* desc =
                 descriptorForPatternName(np->name.get())) {
