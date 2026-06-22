@@ -2956,10 +2956,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // before-release-old keeps a self-set `a[i] := a[i]` safe). The
             // disposer is the string-release thunk.
             // arrIsStringElem and arrElemPol.retainRelease derived from arrElemPol.
-            if (llvm::Function* strDisp = arrIsStringElem
-                                          ? stringElementReleaseThunk()
-                                          : nullptr) {
-                if (!isPlusOneStringProducer(call.args[1].value.get()))
+            // #919: pick the displaced-element disposer — the string-release
+            // thunk for a borrowing Array<string>, OR the element disposer thunk
+            // for an OWNING collection of class elements (OwnedArray<Cell>).
+            // Without the latter, .Set leaked the replaced owned element; the
+            // array owns it, so disposing it (exactly as the indexer setter
+            // `arr[i] := v` does) is sound — no double-free.
+            llvm::Function* setDisp =
+                arrIsStringElem ? stringElementReleaseThunk()
+                                : (arrIsOwning ? arrElemPol.disposerThunk
+                                               : nullptr);
+            if (setDisp) {
+                // A borrowing string array co-owns a +1 per element: retain the
+                // new string unless it is already a +1 producer. A class element
+                // is moved into the slot, so no retain.
+                if (arrIsStringElem &&
+                    !isPlusOneStringProducer(call.args[1].value.get()))
                     emitStringRetain(v);
                 llvm::Value* oor2 = builder_.CreateICmpUGE(
                     idx, builder_.CreateCall(
@@ -2972,7 +2984,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Type::getVoidTy(llvm_),
                     {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
                 builder_.CreateCall(fn, {recv, idx, slot,
-                                         builder_.getInt64(esz), strDisp});
+                                         builder_.getInt64(esz), setDisp});
                 return llvm::ConstantInt::get(i32(), 0);
             }
             llvm::AllocaInst* slot = entryAlloca(v->getType());
