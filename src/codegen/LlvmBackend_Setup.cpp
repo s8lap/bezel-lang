@@ -6582,13 +6582,21 @@ struct UnwindIneligibleWalker {
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
-            // `x.Dispose()` consumes/disposes x; any other `x.Method(...)`
-            // borrows the receiver. Bare-call arguments are conservatively
-            // treated as owned-arg moves (consuming).
+            // §28.3 (#865): an `x.Method(...)` BORROWS the receiver — including
+            // `x.Dispose()`. An explicit `x.Dispose()` is NOT a transfer that the
+            // unwind disposal must skip: on the owned-local/param dispose path it
+            // frees the block AND NULLS the slot (explicitDisposeOwnedReceiverSlot
+            // → CreateStore null), and the unwind disposal is null-guarded — so a
+            // local that was already disposed before a throw is skipped (no
+            // double-free), while one whose `Dispose()` is UNREACHABLE or
+            // CONDITIONALLY-not-taken keeps a non-null slot and is correctly
+            // unwind-disposed (no leak). Marking the receiver ineligible here was
+            // a flow-INSENSITIVE over-approximation: it saw `x.Dispose()` anywhere
+            // (even after a `throw`, or guarded by a never-true `if`) and
+            // suppressed the unwind disposal, leaking `x` on the throw path.
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
-                if (ma->member == "Dispose") markIdent(ma->target.get());
-                else expr(ma->target.get(), /*consuming=*/false);
+                expr(ma->target.get(), /*consuming=*/false);
             } else {
                 expr(c->callee.get(), /*consuming=*/false);
             }
@@ -6596,10 +6604,12 @@ struct UnwindIneligibleWalker {
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            // §28.3 (#865): same as CallExpr — `x?.Dispose()` borrows + nulls the
+            // slot; the null-guarded unwind disposal makes it safe to leave `x`
+            // eligible (no double-free), and not marking it fixes the leak.
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
-                if (ma->member == "Dispose") markIdent(ma->target.get());
-                else expr(ma->target.get(), /*consuming=*/false);
+                expr(ma->target.get(), /*consuming=*/false);
             } else {
                 expr(c->callee.get(), /*consuming=*/false);
             }

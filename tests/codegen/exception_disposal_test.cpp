@@ -1325,4 +1325,60 @@ BEZEL_TEST(codegen_excdisp_837, owned_set_tryadd_duplicate_disposed_once) {
 // disposes its elements at all). The array's own bz_array_t backing IS freed
 // (covered by the LSan-clean OwnedArray<Cell> tests #819/#820).
 
+// --------------------------------------------------------------------------
+// [865] §28.3 — an owned local with an UNREACHABLE or CONDITIONAL Dispose() is
+// still auto-disposed on the exception-unwind path (the UnwindIneligibleWalker
+// was flow-insensitive: it saw `r.Dispose()` anywhere and suppressed the unwind
+// disposal, leaking `r` on the throw path). Explicit Dispose nulls the slot and
+// the unwind disposal is null-guarded, so leaving the local eligible is safe.
+// --------------------------------------------------------------------------
+
+// An UNREACHABLE `r.Dispose()` (after a throw) must not suppress the unwind
+// disposal: r is live when E propagates → disposed once (_n == 1), no leak.
+BEZEL_TEST(exception_disposal_865, unreachable_dispose_still_unwind_disposed) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class E end E; "
+        "class C public static method Main(): int "
+        "  try var r := new R(); throw new E(); r.Dispose(); "
+        "  catch E => var d := 0; end; "
+        "  return R._n; "  // 1
+        "end Main; end C;", 1);
+}
+
+// A Dispose() guarded by a runtime-FALSE condition did not run → r is live on
+// the throw → unwind-disposed once (_n == 1).
+BEZEL_TEST(exception_disposal_865, conditional_false_dispose_unwind_disposed) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class E end E; "
+        "class C public static method Main(): int "
+        "  var cond := false; "
+        "  try var r := new R(); if cond then r.Dispose(); end; throw new E(); "
+        "  catch E => var d := 0; end; "
+        "  return R._n; "  // 1
+        "end Main; end C;", 1);
+}
+
+// Double-free control: a Dispose() that DID run before the throw (runtime-true
+// condition) must NOT be re-disposed on unwind — the nulled slot + null-guard
+// keep it exactly once (_n == 1, not 2). LSan also asserts no double-free.
+BEZEL_TEST(exception_disposal_865, conditional_true_dispose_no_double_free) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class E end E; "
+        "class C public static method Main(): int "
+        "  var cond := true; "
+        "  try var r := new R(); if cond then r.Dispose(); end; throw new E(); "
+        "  catch E => var d := 0; end; "
+        "  return R._n; "  // 1 — disposed once by the explicit Dispose
+        "end Main; end C;", 1);
+}
+
 }  // namespace
