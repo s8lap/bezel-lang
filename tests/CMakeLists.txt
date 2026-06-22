@@ -558,6 +558,7 @@ set(BEZEL_TEST_SOURCES
     codegen/using_var_operator_owned_911_test.cpp
     codegen/owned_array_set_dispose_919_test.cpp
     codegen/extension_property_primitive_test.cpp
+    codegen/for_range_runtime_step_test.cpp
     codegen/generic_record_with_eq_nullable_462_test.cpp
     codegen/generic_record_this_with_method_test.cpp
     codegen/iterator_native_test.cpp

@@ -2081,7 +2081,48 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         llvm::Value* s = lowerExpr(*range->step);
         if (!s) return false;
         auto* cs = llvm::dyn_cast<llvm::ConstantInt>(s);
-        if (!cs || cs->isZero()) return false;  // non-const / zero: defer
+        if (cs && cs->isZero()) return false;  // zero constant step: empty, defer
+        if (!cs) {
+            // §16.4 (sweep #8): a RUNTIME-computed step (`for var i in 0..10 step s`).
+            // The constant-step path below picks the loop direction at compile
+            // time; a non-constant step must pick it at runtime by the step's
+            // sign. Emit a direction-aware loop, mirroring the Range-VARIABLE path
+            // above (previously this case bailed to the "not implemented" catch-all).
+            if (s->getType() != lo->getType())
+                s = builder_.CreateSExtOrTrunc(s, lo->getType());
+            llvm::Value* stepNeg = builder_.CreateICmpSLT(
+                s, llvm::ConstantInt::get(lo->getType(), 0), "rf.desc");
+            llvm::AllocaInst* rslot = entryAlloca(lo->getType());
+            locals_[&fs] = rslot;
+            builder_.CreateStore(lo, rslot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "rf.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rf.body", currentFn_);
+            auto* incBB  = llvm::BasicBlock::Create(llvm_, "rf.inc",  currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "rf.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* cur = builder_.CreateLoad(lo->getType(), rslot);
+            llvm::Value* asc = range->inclusive
+                ? builder_.CreateICmpSLE(cur, hi)
+                : builder_.CreateICmpSLT(cur, hi);
+            llvm::Value* desc = range->inclusive
+                ? builder_.CreateICmpSGE(cur, hi)
+                : builder_.CreateICmpSGT(cur, hi);
+            llvm::Value* cond =
+                builder_.CreateSelect(stepNeg, desc, asc, "rf.cnd");
+            builder_.CreateCondBr(cond, bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+            bool term = lowerForBody(fs);
+            loopStack_.pop_back();
+            if (!term) builder_.CreateBr(incBB);
+            builder_.SetInsertPoint(incBB);
+            llvm::Value* v = builder_.CreateLoad(lo->getType(), rslot);
+            builder_.CreateStore(builder_.CreateAdd(v, s), rslot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return true;
+        }
         stepVal = cs;
         descending = cs->getValue().isNegative();
     }
