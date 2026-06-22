@@ -166,3 +166,33 @@ BEZEL_TEST(codegen_cg38_nullable_value_case, int_nullable_null_arm_stmt_spec_19_
         "end; "
         "return r;"), 2);
 }
+
+// §19.2 (#932): a single-statement arm body that is an ASSIGNMENT (or compound
+// assign / increment) — an identifier-led statement. Before the fix the parser
+// committed to an expression arm and choked on `:=`. ArmBody admits a Statement,
+// so `result := 30;` must parse and run.
+BEZEL_TEST(codegen_cg38, assignment_statement_arm_body_932) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 3; var result := 0; "
+        "case x "
+        "  3 => result := 30; "  // bare assignment-statement arm
+        "end; "
+        "return result;"), 30);
+}
+
+// Compound-assign and increment arm bodies, mixed with do-block and a discard.
+BEZEL_TEST(codegen_cg38, compound_and_increment_arm_bodies_932) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; var r := 5; "
+        "case x "
+        "  1 => r := 10, "
+        "  2 => r += 20, "  // compound assign → r = 25
+        "  _ => do r := 0; end "
+        "end; "
+        "var y := 7; "
+        "case y "
+        "  7 => y++, "  // increment → y = 8
+        "  _ => y := 0 "
+        "end; "
+        "return r + y;"), 33);  // 25 + 8
+}

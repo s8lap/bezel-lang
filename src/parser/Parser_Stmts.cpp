@@ -87,19 +87,65 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
         auto s = parseStatement();
         if (s) arm.stmts.push_back(std::move(s));
     } else {
-        // Expression body (form 3). Parse the expression, then optionally
-        // consume `;` for compatibility with the explicit-semicolon style.
-        // Wrap in ExpressionStmt and store in stmts so the arm is uniformly
+        // Identifier-led body (forms 2/3): parse the leading expression, then —
+        // mirroring parseStatement — promote it to an IncrementStmt (`x++`/`x--`)
+        // or AssignmentStmt (`x := …`, compound assigns; `_ := …` → DiscardStmt)
+        // when an assignment/increment operator follows. §19.2 admits a single
+        // Statement here, so an identifier-led assignment `result := 30;` is
+        // valid; previously it fell to the bare-expression path, which stopped
+        // at `:=` and cascaded a parse error (#932). The terminating `;` is
+        // OPTIONAL — `,`/`end` may follow directly (§19.7). The arm is uniformly
         // represented as a Block with one statement.
         SourceLocation start = current_.location;
-        auto expr = parseExpression();
-        // Consume optional `;` (explicit statement-form style from §19.2).
-        consumePunctuator(";");
-        if (expr) {
-            auto es = std::make_unique<ast::ExpressionStmt>();
-            es->expr = std::move(expr);
-            es->span.begin = start;
-            arm.stmts.push_back(std::move(es));
+        auto lhs = parseExpression();
+        bool isInc = current_.kind == TokenKind::Punctuator &&
+                     (current_.text == "++" || current_.text == "--");
+        bool isAssign = current_.kind == TokenKind::Punctuator &&
+                        (current_.text == ":="  || current_.text == "+="  ||
+                         current_.text == "-="  || current_.text == "*="  ||
+                         current_.text == "/="  || current_.text == "&="  ||
+                         current_.text == "|="  || current_.text == "^="  ||
+                         current_.text == "<<=" || current_.text == ">>=" ||
+                         current_.text == "??=");
+        if (isInc) {
+            auto inc = std::make_unique<ast::IncrementStmt>();
+            inc->target = std::move(lhs);
+            inc->op = current_.text;
+            inc->span.begin = start;
+            advance();
+            consumePunctuator(";");
+            arm.stmts.push_back(std::move(inc));
+        } else if (isAssign) {
+            auto* idLhs = current_.text == ":="
+                              ? dynamic_cast<ast::IdentifierExpr*>(lhs.get())
+                              : nullptr;
+            if (idLhs && idLhs->name == "_") {
+                // Discard form `_ := expr`.
+                advance();
+                auto d = std::make_unique<ast::DiscardStmt>();
+                d->span.begin = start;
+                d->value = parseExpression();
+                consumePunctuator(";");
+                arm.stmts.push_back(std::move(d));
+            } else {
+                auto a = std::make_unique<ast::AssignmentStmt>();
+                a->target = std::move(lhs);
+                a->op = current_.text;
+                a->span.begin = start;
+                advance();
+                a->value = parseExpression();
+                consumePunctuator(";");
+                arm.stmts.push_back(std::move(a));
+            }
+        } else {
+            // Expression body (form 3). Optional trailing `;`.
+            consumePunctuator(";");
+            if (lhs) {
+                auto es = std::make_unique<ast::ExpressionStmt>();
+                es->expr = std::move(lhs);
+                es->span.begin = start;
+                arm.stmts.push_back(std::move(es));
+            }
         }
     }
     return arm;
