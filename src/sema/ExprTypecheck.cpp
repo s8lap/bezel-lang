@@ -1772,7 +1772,21 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
         ExtensionSymbol* saveExt = currentExtension_;
         currentType_ = targetSym;
         currentExtension_ = extSym;
-        for (const auto& m : ext->members) if (m) visitMember(*m);
+        for (const auto& m : ext->members) {
+            if (!m) continue;
+            // §26.3 (#936): an extension block may not declare an operator
+            // overload. Without this gate the declaration was silently accepted
+            // and then ignored at call sites (the built-in operator was used),
+            // leaving an invalid declaration with no diagnostic.
+            if (auto* od = dynamic_cast<const ast::OperatorDecl*>(m.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, od->span.begin,
+                    "an extension block may not declare an operator overload "
+                    "`operator " + std::string(od->opToken) + "` (§26.3)");
+                continue;
+            }
+            visitMember(*m);
+        }
         currentType_ = save;
         currentExtension_ = saveExt;
     }

@@ -131,3 +131,35 @@ BEZEL_TEST(sema_extension, missing_member_still_diagnosed) {
         "class P public method Use(f: Foo): int => f.Nope(); end P;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// §26.3 (#936) — an extension block may not declare an operator overload.
+// Before the fix the declaration was silently accepted (and ignored at call
+// sites). It must now be rejected with a §26.3 diagnostic.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sema_extension, operator_overload_in_extension_rejected_936) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension int "
+        "  public static method operator +(a: int, b: int): int => a + b + 100; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("operator overload") != std::string::npos &&
+            d.message.find("26.3") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §26.3 — a regular extension METHOD (not an operator) is still accepted.
+BEZEL_TEST(sema_extension, plain_method_in_extension_still_accepted_936) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension int public method twice(): int => this * 2; end; "
+        "class C public static method Main(): int "
+        "  var x: int := 21; return x.twice(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
