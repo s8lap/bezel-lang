@@ -8638,6 +8638,50 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
+    // #903 / §14.2 / §9.x: `a.CompareTo(b)` / `a.Equals(b)` where `a` is a bare
+    // type-parameter constrained `where T: IComparable<T>` / `IEquatable<T>` (the
+    // BUILTIN interfaces, which have a null TypeDecl, so sema's constraint-member
+    // resolution skipped them and left `calleeSym` null). When monomorphized with
+    // T = a concrete RECORD / CLASS that implements the contract member, resolve
+    // the receiver's type-parameter through genericSubstSemaTy_ to its concrete
+    // declaration and bind `calleeSym` to that type's own CompareTo / Equals, so
+    // the ordinary instance dispatch below devirtualizes to it (a record VALUE
+    // receiver is spilled by the same record-receiver shaping the user-interface
+    // constraint case uses). Without this the call fell through unresolved and
+    // emitted the default 0/false (the silent wrong value of #903). The primitive
+    // case (T = int) and the user-interface constraint case already work; this
+    // covers only the builtin-interface × user-type combination.
+    if (!calleeSym && !genericSubstSemaTy_.empty()) {
+        if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            bool isContractMember =
+                (cma->member == "CompareTo" || cma->member == "Equals") &&
+                call.args.size() == 1;
+            if (isContractMember && cma->target) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*cma->target);
+                if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->declaration && recvTy->astNode &&
+                    recvTy->astNode->name &&
+                    recvTy->astNode->name->parts.size() == 1) {
+                    auto sit = genericSubstSemaTy_.find(
+                        recvTy->astNode->name->parts[0]);
+                    if (sit != genericSubstSemaTy_.end() && sit->second &&
+                        sit->second->declaration &&
+                        (sit->second->declaration->kind ==
+                             ast::TypeDeclKind::Record ||
+                         sit->second->declaration->kind ==
+                             ast::TypeDeclKind::Class)) {
+                        if (sema::MethodSymbol* impl = findMethodByName(
+                                sit->second->declaration, cma->member))
+                            // The single-parameter CompareTo(T)/Equals(T) contract
+                            // shape (not an unrelated overload).
+                            if (impl->params.size() == 1)
+                                calleeSym = impl;
+                    }
+                }
+            }
+        }
+    }
     auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
     if (!ms) {
         // §8.5 / §8.6 (#417): `o.ToString()` where o: Object / interface (the

@@ -5855,6 +5855,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     else if (mbr == "Equals")
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    else if (mbr == "CompareTo")
+                        // #903 / §14.2: `a.CompareTo(b)` on a bare type-parameter
+                        // receiver — the IComparable<T> contract (a `where T:
+                        // IComparable<T>` constraint, enforced at the call site,
+                        // §14.2/#729). The builtin IComparable<T> has a null
+                        // TypeDecl, so the constraint-member resolution above skips
+                        // it; type the result int here (mirroring Equals→bool) so
+                        // the call typechecks, and codegen devirtualizes to the
+                        // monomorphized type's CompareTo (LlvmBackend_Calls.cpp).
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                     else if (mbr == "GetType") {
                         auto* typeTy = ctx_.makeTypeRef();
                         typeTy->kind = TypeRef::Kind::Named;

@@ -202,3 +202,82 @@ BEZEL_TEST(record_generic_constraint, non_generic_record_direct_call_control_spe
         "  return p.Val(); "           // 7
         "end Main; end C;"), 7);
 }
+
+// ── #903 §14.2/§9.x: constraint-method dispatch via the BUILTIN IComparable<T> /
+// IEquatable<T> constraint to a user RECORD/CLASS T. The builtin interfaces have
+// a null TypeDecl, so sema's constraint-member resolution skipped them and the
+// call returned the default 0/false; codegen now devirtualizes `a.CompareTo(b)` /
+// `a.Equals(b)` to the monomorphized type's own method. (Split from #863; the
+// primitive and user-interface cases already worked.) ──────────────────────────
+
+// A record T `where T: IComparable<T>` dispatches `a.CompareTo(b)` to the
+// record's CompareTo (Score(7).CompareTo(Score(42)) < 0 → 1).
+BEZEL_TEST(record_generic_constraint_903, record_compareto_builtin_icomparable) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Score(val: int) : IComparable<Score> "
+        "  public method CompareTo(other: Score): int => val - other.val; "
+        "end Score; "
+        "static class Utils "
+        "  public static method CmpG<T>(a: T, b: T): int where T: IComparable<T> "
+        "    return a.CompareTo(b); "
+        "  end CmpG; "
+        "end Utils; "
+        "class C public static method Main(): int "
+        "  return (1 if Utils.CmpG(new Score(7), new Score(42)) < 0 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// A record T `where T: IEquatable<T>` dispatches `a.Equals(b)` to the record's
+// Equals (Pt(5)==Pt(5) and Pt(5)!=Pt(9) → 1).
+BEZEL_TEST(record_generic_constraint_903, record_equals_builtin_iequatable) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pt(x: int) : IEquatable<Pt> "
+        "  public method Equals(other: Pt): bool => x = other.x; "
+        "end Pt; "
+        "static class U "
+        "  public static method EqG<T>(a: T, b: T): bool where T: IEquatable<T> "
+        "    return a.Equals(b); "
+        "  end EqG; "
+        "end U; "
+        "class C public static method Main(): int "
+        "  return (1 if U.EqG(new Pt(5), new Pt(5)) "
+        "             and not U.EqG(new Pt(5), new Pt(9)) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// A CLASS T `where T: IComparable<T>` dispatches `a.CompareTo(b)` to the class's
+// CompareTo (Box(7).CompareTo(Box(42)) < 0 → 1).
+BEZEL_TEST(record_generic_constraint_903, class_compareto_builtin_icomparable) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box : IComparable<Box> "
+        "  public v: int; "
+        "  public constructor(n: int) v := n; end constructor; "
+        "  public method CompareTo(other: Box): int => v - other.v; "
+        "end Box; "
+        "static class U "
+        "  public static method CmpG<T>(a: T, b: T): int where T: IComparable<T> "
+        "    return a.CompareTo(b); "
+        "  end CmpG; "
+        "end U; "
+        "class C public static method Main(): int "
+        "  using var a := new Box(7); using var b := new Box(42); "
+        "  return (1 if U.CmpG(a, b) < 0 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// Regression guard: the primitive case (T = int) still works after the fix.
+BEZEL_TEST(record_generic_constraint_903, primitive_compareto_unregressed) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "static class U "
+        "  public static method CmpG<T>(a: T, b: T): int where T: IComparable<T> "
+        "    return a.CompareTo(b); "
+        "  end CmpG; "
+        "end U; "
+        "class C public static method Main(): int "
+        "  return (1 if U.CmpG(7, 42) < 0 else 0); "
+        "end Main; end C;"), 1);
+}
