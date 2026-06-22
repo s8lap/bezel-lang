@@ -3645,6 +3645,26 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     locals_[&fs] = varSlot;
     registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
 
+    // §28.3 / §29.2 (#895): for an `OwnedEnumerable<T>` the loop variable OWNS
+    // each yielded element — sema requires it to be discharged on a normal body
+    // exit (a `for var x in Gen() do end` with no discharge is a compile error).
+    // On the EXCEPTION path, though, the current element must be auto-disposed
+    // implicitly (§28.3). Register a null-guarded unwindOnly disposal for the
+    // loop variable's slot so a throw out of the body disposes the current
+    // element exactly once. The enumerator's own Dispose (registered above) frees
+    // the iterator's remaining state, not the already-yielded current element, so
+    // there is no double-free. Null-init the slot so a throw in the first
+    // MoveNext (before any element is read) finds null and skips; an explicit
+    // discharge in the body nulls the slot → skip; on normal exhaustion the
+    // unwindOnly disposal skips (every element was discharged in the body).
+    if (n == "OwnedEnumerable" && elemTy->isPointerTy() &&
+        !disposeStack_.empty()) {
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
+        Disposal dv{varSlot, nullptr};
+        dv.unwindOnly = true;
+        disposeStack_.back().push_back(dv);
+    }
+
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
     auto* endBB  = llvm::BasicBlock::Create(llvm_, "ib.end",  currentFn_);

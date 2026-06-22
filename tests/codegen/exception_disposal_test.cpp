@@ -1438,4 +1438,67 @@ BEZEL_TEST(exception_disposal_900, out_owned_normal_exit_disposed_once) {
         "end Main; end C;", 0);
 }
 
+// --------------------------------------------------------------------------
+// [895] §28.3/§29.2 — the loop variable of a `for var x in <OwnedEnumerable<T>>`
+// loop OWNS each yielded element; on the exception path the current element is
+// auto-disposed. It was registered for neither normal nor unwind disposal (the
+// enumerator's Dispose frees the iterator's remaining state, not the already-
+// yielded current element), so a throw in the body leaked it.
+// --------------------------------------------------------------------------
+
+// A throw in the body auto-disposes the current owned element (_n == 1).
+BEZEL_TEST(exception_disposal_895, owned_iteration_var_unwind_disposed) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C "
+        "  public static method Gen(): OwnedEnumerable<R> "
+        "    yield return new R(); end Gen; "
+        "  public static method Main(): int "
+        "    var disposed := 0; "
+        "    try for var x in Gen() do throw new Exception(\"test\"); end; "
+        "    catch Exception => do disposed := R._n; end, end; "
+        "    return disposed; "  // 1
+        "  end Main; end C;", 1);
+}
+
+// Double-free control: the body disposes x BEFORE throwing — the nulled slot +
+// null-guard keep it exactly once (_n == 1, not 2); LSan asserts no double-free.
+BEZEL_TEST(exception_disposal_895, owned_iteration_var_dispose_then_throw_once) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C "
+        "  public static method Gen(): OwnedEnumerable<R> "
+        "    yield return new R(); end Gen; "
+        "  public static method Main(): int "
+        "    var disposed := 0; "
+        "    try for var x in Gen() do x.Dispose(); throw new Exception(\"t\"); end; "
+        "    catch Exception => do disposed := R._n; end, end; "
+        "    return disposed; "  // 1
+        "  end Main; end C;", 1);
+}
+
+// Control: normal exhaustion with an explicit discharge per element disposes
+// each exactly once (the unwindOnly disposal correctly skips the normal path —
+// _n == 2 for two elements, not 4). Value-only (compileAndRun, not
+// expectExitAndLeakFree): `x.Dispose()` on an OwnedEnumerable loop variable runs
+// the destructor but does not RECLAIM the element block on the normal path — a
+// pre-existing leak tracked as #963, independent of #895's exception-path fix.
+BEZEL_TEST(exception_disposal_895, owned_iteration_var_normal_discharge_once) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C "
+        "  public static method Gen(): OwnedEnumerable<R> "
+        "    yield return new R(); yield return new R(); end Gen; "
+        "  public static method Main(): int "
+        "    for var x in Gen() do x.Dispose(); end; "
+        "    return R._n; "  // 2
+        "  end Main; end C;"), 2);
+}
+
 }  // namespace
