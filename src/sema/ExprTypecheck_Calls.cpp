@@ -350,12 +350,98 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         binds.push_back(std::move(b));
     }
     if (cands.empty()) return arityFallback();
+
+    // §22.3 / §22.6 (#952): the call-site `ref`/`out` modifier participates in
+    // overload APPLICABILITY and is MANDATORY at the call site. A `ref`
+    // parameter is filled only by a `ref` argument; an `out`/`out owned`
+    // parameter only by an `out`-family argument; and a plain (or `owned`)
+    // parameter only by an argument with NO `ref`/`out` (a superfluous keyword
+    // is rejected). Filtering candidates by this rule both SELECTS the right
+    // overload (the call-site `ref` is no longer ignored — defects 1/2) and
+    // ENFORCES the mandatory keyword even for a single candidate (defects 3/4).
+    auto isOutMod = [](std::string_view m) {
+        return m == "out" || m == "out var" || m == "out using var" ||
+               m == "out owned";
+    };
+    auto refOutMatch = [&](std::string_view argMod,
+                           std::string_view paramMod) -> bool {
+        bool argRef = argMod == "ref";
+        bool argOut = isOutMod(argMod);
+        bool paramRef = paramMod == "ref";
+        bool paramOut = paramMod == "out" || paramMod == "out owned";
+        if (paramRef) return argRef;   // ref parameter ⟺ ref argument
+        if (paramOut) return argOut;   // out parameter ⟺ out argument
+        return !argRef && !argOut;     // plain/owned parameter: no ref/out arg
+    };
+    {
+        std::vector<MethodSymbol*> fc;
+        std::vector<const ast::MethodDecl*> fd;
+        std::vector<BindResult> fb;
+        for (std::size_t c = 0; c < cands.size(); ++c) {
+            bool ok = true;
+            const auto& params = decls[c]->params;
+            for (std::size_t j = 0; j < params.size() && ok; ++j) {
+                int ai = binds[c].paramToArg[j];
+                std::string_view argMod =
+                    ai >= 0 ? ce.args[static_cast<std::size_t>(ai)].modifier
+                            : std::string_view{};
+                if (!refOutMatch(argMod, params[j].modifier)) ok = false;
+            }
+            if (ok) {
+                fc.push_back(cands[c]);
+                fd.push_back(decls[c]);
+                fb.push_back(std::move(binds[c]));
+            }
+        }
+        if (fc.empty()) {
+            // No candidate's parameter modifiers match the call's `ref`/`out`
+            // modifiers — a mandatory keyword is missing or superfluous (§22.3).
+            // Build a precise message from the first candidate's first mismatch.
+            std::string detail;
+            const auto& params = decls[0]->params;
+            for (std::size_t j = 0; j < params.size(); ++j) {
+                int ai = binds[0].paramToArg[j];
+                std::string_view argMod =
+                    ai >= 0 ? ce.args[static_cast<std::size_t>(ai)].modifier
+                            : std::string_view{};
+                if (refOutMatch(argMod, params[j].modifier)) continue;
+                std::string pname(params[j].name);
+                std::string pm(params[j].modifier);
+                std::string am(argMod);
+                bool paramRefOut = pm == "ref" || pm == "out" || pm == "out owned";
+                if (paramRefOut && am.empty())
+                    detail = "parameter `" + pname + "` is `" + pm +
+                             "` — pass the argument with `" +
+                             (pm == "out owned" ? std::string("out")
+                                                : pm) +
+                             "` at the call site";
+                else if (!paramRefOut && !am.empty())
+                    detail = "parameter `" + pname +
+                             "` is not `ref`/`out` — remove the `" + am +
+                             "` at the call site";
+                else
+                    detail = "the `" + am + "` argument does not match "
+                             "parameter `" + pname + "`'s `" + pm + "` modifier";
+                break;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "call to `" + std::string(initial->name) +
+                "` has a call-site `ref`/`out` mismatch: " + detail +
+                " (§22.3 — the caller writes `ref`/`out` at the call site, and "
+                "only for a `ref`/`out` parameter)");
+            return initial;  // error emitted; return to avoid a cascade
+        }
+        cands.swap(fc);
+        decls.swap(fd);
+        binds.swap(fb);
+    }
     if (cands.size() == 1) return cands[0];
 
-    // Any argument carrying a call-site modifier (ref/out/...) is outside
-    // the value-conversion ranking of §22.6's worked examples; fall back.
+    // A discard argument (`out _`) is outside the value-conversion ranking of
+    // §22.6's worked examples; fall back to arity/first-bind.
     for (const auto& a : ce.args)
-        if (!a.modifier.empty() || a.isDiscard) return arityFallback();
+        if (a.isDiscard) return arityFallback();
 
     // §22.6 ranks the bound argument positions. For each candidate, build
     // its parameter-type vector and the matching per-parameter argument-type
