@@ -459,6 +459,7 @@ set(BEZEL_TEST_SOURCES
     codegen/ctor_ref_param_967_test.cpp
     codegen/ctor_out_var_968_test.cpp
     codegen/inner_closure_outer_capture_966_test.cpp
+    codegen/inner_closure_value_capture_969_test.cpp
     codegen/ctor_args_test.cpp
     codegen/static_ctor_test.cpp
     codegen/static_init_exception_529_test.cpp

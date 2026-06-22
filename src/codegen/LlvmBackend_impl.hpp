@@ -431,6 +431,14 @@ private:
         unsigned inlineArrayN = 0;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
+    // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each
+    // LOCAL at its declaration, keyed by its LocalDecl AST node. Used by the
+    // boxedCellFree registration to skip freeing a capture cell at an inner
+    // lambda's scope when the captured local was declared in an ENCLOSING scope
+    // (the cell must outlive the inner block — it is read through, after the
+    // inner block exits, by the outer local). Params are absent (handled by the
+    // existing reads-through-cell disposal guard, or left as a noted follow-up).
+    std::unordered_map<const void*, std::size_t> declScopeDepth_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.

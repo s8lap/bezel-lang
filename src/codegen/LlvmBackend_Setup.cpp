@@ -5220,6 +5220,12 @@ void Emitter::emitImplicitReturn(llvm::Function* fn) {
 
 void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     const ast::Type* declType) {
+    // §27.5 / §28.9 (#969): record this local's block-nesting depth so the
+    // boxedCellFree registration can tell whether a captured local lives in an
+    // enclosing scope (and must not have its capture cell freed at an inner
+    // lambda's scope). disposeStack_ already holds this local's scope.
+    if (declNode && !disposeStack_.empty())
+        declScopeDepth_[declNode] = disposeStack_.size();
     // §15.1 / §16: collection literal `[e1, e2, …]` used as an inline-array
     // initializer.  lowerExpr returns null for CollectionLiteralExpr (not a
     // general expression), so handle it here where we have the slot.
@@ -5651,6 +5657,19 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 if (hasOwnerDisposal) break;
             }
             if (hasOwnerDisposal) continue;  // leave cell alive for owner disposal
+            // §27.5 / §28.9 (#969): even a VALUE-typed captured local (which has
+            // no reads-through-cell disposal, so the guard above misses it) is
+            // read through the cell after the inner block exits when it was
+            // declared in an ENCLOSING scope (`var x := 55; do var g := () => x;
+            // end; return x;`). Freeing the cell at this inner lambda's scope
+            // would corrupt that later read. Skip boxedCellFree when the captured
+            // local's declaration depth is shallower than the current scope (the
+            // cell then leaks until the local's own scope exits — the sound
+            // trade-off). Only LOCALS are in declScopeDepth_; params are left to
+            // the disposal guard above (a noted follow-up).
+            auto dd = declScopeDepth_.find(ce.key);
+            if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size())
+                continue;
             Disposal dc{ce.newSlot, nullptr};
             dc.boxedCellFree = true;
             disposeStack_.back().push_back(dc);
