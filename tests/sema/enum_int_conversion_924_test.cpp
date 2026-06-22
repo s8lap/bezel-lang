@@ -65,3 +65,39 @@ BEZEL_TEST(enum_int_conversion_924, enum_to_object_boxing_accepted) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §5.4 / §10 (#960): `new` cannot construct an enum — an enum value is produced
+// by the int→enum cast `E(n)` (§5.4), not by construction. `new E(...)` and the
+// nested `new Outer.E(...)` form were silently accepted.
+BEZEL_TEST(enum_int_conversion_924, new_on_enum_rejected_960) {
+    auto r = parseAndCheckOwnership(
+        std::string(kEnum) +
+        "class P public static method Main(): int "
+        "  var e := new E(1); return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`new` cannot construct an enum") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §5.4 / §10 (#960): nested `new Outer.E(...)` is rejected too.
+BEZEL_TEST(enum_int_conversion_924, new_on_nested_enum_rejected_960) {
+    auto r = parseAndCheckOwnership(
+        "module M; public class Outer enum E A, B, C; end E; "
+        "  public static method Main(): int var e := new Outer.E(1); return 0; "
+        "end Main; end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §5.4 (#960): the cast `E(n)` (a CallExpr, not a NewExpr) remains accepted.
+BEZEL_TEST(enum_int_conversion_924, enum_cast_call_still_accepted_960) {
+    auto r = parseAndCheckOwnership(
+        std::string(kEnum) +
+        "class P public static method Main(): int "
+        "  var e: E := E(1); return int(e); "
+        "end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

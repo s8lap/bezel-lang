@@ -944,6 +944,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
                 ctx_.setExprType(&e, rt);
+                // §5.4 / §10 (#960): `new` cannot construct an enum. An enum
+                // value is produced by the int→enum CAST `E(n)` (§5.4), not by
+                // construction — an enum has no constructor (§10). `new E(...)`
+                // (and nested `new Outer.E(...)`) were silently accepted; reject
+                // and point at the cast form. (The correct cast `E(n)` is a
+                // CallExpr, not a NewExpr, and is unaffected.)
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne->span.begin,
+                        "`new` cannot construct an enum — an enum value is "
+                        "produced by the cast `" +
+                        std::string(rt->declaration->name) +
+                        "(n)` from its underlying integer, not with `new` "
+                        "(§5.4/§10)");
+                }
                 // per §15.4 / §22.7 (#599): a collection literal `[..]`
                 // in a `new` argument position is a compile error when the
                 // constructor parameter is not a collection type.  The
