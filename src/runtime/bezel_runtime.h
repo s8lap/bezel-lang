@@ -999,6 +999,13 @@ char* bz_string_to_utf8z(const void* str);
 // byte array into a fresh malloc'd null-terminated buffer. Caller frees.
 char* bz_cstring_from_bytes(const void* arr);
 
+// stdlib §10.1 / issue #1000: CString.ToBytes(): owned Array<byte> — returns a
+// FRESH, independently-owned bz_array_t holding a COPY of the CString's bytes
+// (count = strlen, the byte length excluding the null terminator; elem_size 1).
+// The buffer does NOT alias the CString, so disposing both the CString and the
+// returned array frees each allocation exactly once. Released via bz_array_free.
+void* bz_cstring_to_bytes(const char* cstr);
+
 // stdlib §10.2 / fix #977: WString.From(s: string) — encodes the Bezel string
 // as a null-terminated UTF-16LE buffer of uint16_t code units. Caller frees.
 void* bz_string_to_utf16z(const void* str);

@@ -288,6 +288,7 @@ set(BEZEL_TEST_SOURCES
     codegen/argpass_string_probe_test.cpp
     codegen/argpass_string_refcount_test.cpp
     codegen/collection_literal_arg_999_test.cpp
+    codegen/cstring_tobytes_1000_test.cpp
     codegen/operator_string_refcount_test.cpp
     codegen/encoding_test.cpp
     codegen/closure_refcount_test.cpp

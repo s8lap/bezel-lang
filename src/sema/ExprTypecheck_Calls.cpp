@@ -2856,6 +2856,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Add" || m == "Subtract" || m == "Negate")
                             ctx_.setExprType(&ce, tsTy);
                     }
+                    // stdlib §10.1 / issue #1000: CString.ToBytes(): owned
+                    // Array<byte>. Type the result as a concrete Array<byte>
+                    // (the same representation Encoding.GetBytes / ToArray use,
+                    // makeConcreteCollectionResult) so the inferred local
+                    // (`using var back := s.ToBytes()`) is recognized as an
+                    // array-backed owned collection: .Count / [i] resolve and
+                    // scope-end disposal runs bz_array_free. The codegen lowers
+                    // the call to bz_cstring_to_bytes, which returns a FRESH,
+                    // independently-owned buffer (a copy of the CString bytes),
+                    // so disposing both `back` and the source CString frees each
+                    // exactly once (§28.3 — no buffer aliasing / double-free).
+                    if (rcn == "CString" && m == "ToBytes" && ce.args.empty()) {
+                        ctx_.setExprType(
+                            &ce, makeConcreteCollectionResult(
+                                "Array", ctx_.primitiveTypeRef(P::Byte)));
+                    }
                     // §3.3 (#883): ReadOnlyStringSpan instance methods. The
                     // receiver is a string-backed view (Source: string, Start,
                     // Length); the search methods (IndexOf/Contains/StartsWith/

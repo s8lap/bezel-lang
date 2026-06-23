@@ -4395,6 +4395,31 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // stdlib §10.1 / issue #1000: CString.ToBytes(): owned Array<byte>. The
+    // receiver is a CString (a bare null-terminated char*); bz_cstring_to_bytes
+    // returns a FRESH, independently-owned bz_array_t holding a COPY of the
+    // strlen bytes (count = byte length excluding the null terminator, §10.1
+    // `Length`; elem_size 1). The copy is essential: without it the returned
+    // array's data would alias the CString's own buffer, and disposing both the
+    // CString (free) and the array (bz_array_free → free(data)) at scope end
+    // would free the same allocation twice (free(): invalid pointer / SIGABRT).
+    // A fresh malloc gives the result its own buffer, so each owner — the
+    // CString and the Array<byte> — frees exactly once (§28.3). The result type
+    // is set to Array<byte> in sema (ExprTypecheck_Calls.cpp, rcn == "CString"),
+    // so the local picks up the array-backed disposal path (bz_array_free).
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isCStr = recvTy &&
+            recvTy->kind == sema::TypeRef::Kind::Named &&
+            recvTy->declaration && recvTy->declaration->name == "CString";
+        if (isCStr && ma->member == "ToBytes" && call.args.empty()) {
+            llvm::Value* cstr = lowerExpr(*ma->target);
+            if (!cstr) return nullptr;
+            auto* fn = declareC("bz_cstring_to_bytes", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {cstr}, "cstr.tobytes");
+        }
+    }
+
     // stdlib §2.6: Guid instance methods — handled before the IdentifierExpr
     // guard below because the receiver may be a chained expression (e.g.
     // Guid.Empty.ToString()) whose target is not a bare identifier.

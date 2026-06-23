@@ -6390,6 +6390,37 @@ extern "C" char* bz_cstring_from_bytes(const void* arrp) {
 }
 
 // ---------------------------------------------------------------------------
+// stdlib §10.1 / issue #1000: CString.ToBytes(): owned Array<byte>
+// Returns a FRESH, independently-owned Array<byte> (bz_array_t) holding a COPY
+// of the CString's bytes. The count is the byte length EXCLUDING the null
+// terminator (the same value §10.1 `Length` reports via strlen); elem_size is 1.
+//
+// The result must NOT alias the CString's own buffer: the round-trip
+//   using var s := CString.FromBytes(b); using var back := s.ToBytes();
+// disposes BOTH `s` (free(char*)) and `back` (bz_array_free) at scope end. If the
+// returned array's `data` aliased the CString buffer, free() and bz_array_free's
+// free(arr->data) would release the same allocation twice (free(): invalid
+// pointer / SIGABRT). A fresh malloc + memcpy gives `back` its own buffer, so
+// each owner frees exactly once (§28.3 dispose-exactly-once).
+extern "C" void* bz_cstring_to_bytes(const char* cstr) {
+    auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (!arr) return nullptr;
+    if (!cstr) {
+        // Null CString → empty owned Array<byte> (count 0, no data buffer).
+        return arr;
+    }
+    size_t n = strlen(cstr);  // byte length excluding the null terminator (§10.1)
+    if (n > 0) {
+        arr->data = malloc(n);
+        if (!arr->data) { free(arr); return nullptr; }
+        memcpy(arr->data, cstr, n);
+        arr->capacity = (int64_t)n;
+        arr->count    = (int64_t)n;
+    }
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
 // stdlib §10.2 / §32.6 / fix #977: WString.From(s: string)
 // Produces a fresh malloc'd null-terminated UTF-16LE wchar_t* buffer from a
 // Bezel string. Each Bezel code point is encoded as one UTF-16 code unit for
