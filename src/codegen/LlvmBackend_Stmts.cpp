@@ -3796,10 +3796,19 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumPtr, enumSlot);
 
-    // Register enumerator for disposal via disposeStack_ so `break`,
-    // early `return`, or normal loop exit all call Dispose().
-    // We push a Disposal entry with the enumerator's TypeSymbol.
-    if (!disposeStack_.empty() && disposerFns_.count(enumTs))
+    // §29.2 / §28.3 (#972): push a dedicated disposal scope for the enumerator
+    // so that break / early return / normal exhaustion / exception ALL call
+    // Dispose() exactly once.  Mirror lowerIEnumerableBuiltinFor: record the
+    // outer depth (used by loopStack_ so `break` disposes the enumerator scope
+    // too), push a fresh scope, register the enumerator in it.  At normal-exit
+    // (endBB) we call emitDisposals + pop_back, just like the builtin sibling.
+    // Previously we added to disposeStack_.back() (the enclosing scope) which
+    // caused break/exception to double-dispose (the enclosing scope already ran
+    // it) AND normal exhaustion to never dispose (endBB had no emitDisposals
+    // call) — see issue #972.
+    std::size_t outerDepth = disposeStack_.size();
+    disposeStack_.emplace_back();
+    if (disposerFns_.count(enumTs))
         disposeStack_.back().push_back({enumSlot, enumTs});
 
     // Determine the loop variable's element type.
@@ -3889,12 +3898,19 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         }
     }
 
-    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    // §29.7 (#972): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
+    // so that emitLoopDisposals on `break` disposes both the body scope AND
+    // the enumerator scope (calls Dispose on the user class enumerator).
+    loopStack_.push_back({condBB, endBB, outerDepth});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
 
+    // §29.2 / §28.3 (#972): normal exhaustion — dispose the enumerator and pop
+    // the dedicated scope, mirroring lowerIEnumerableBuiltinFor's endBB handling.
     builder_.SetInsertPoint(endBB);
+    emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
     return true;
 }
 

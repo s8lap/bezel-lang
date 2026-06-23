@@ -688,6 +688,9 @@ set(BEZEL_TEST_SOURCES
     codegen/span_type_annotation_959_test.cpp
     codegen/string_span_883_test.cpp
     codegen/iterator_owned_param_945_test.cpp
+    # --- fix #972: user IEnumerable<T> enumerator dispose at normal exit ---
+    codegen/user_ienumerable_dispose_972_test.cpp
+    # --- end #972 ---
     codegen/case_pattern_type_compat_964_test.cpp
     codegen/file_io_644_test.cpp
     codegen/diagnostics_646_test.cpp
