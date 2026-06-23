@@ -549,6 +549,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_get_or_add_test.cpp
     codegen/collection_indexer_test.cpp
     codegen/interface_indexer_test.cpp
+    codegen/collection_interface_853_test.cpp
     codegen/user_indexer_record_test.cpp
     codegen/dict_record_value_indexer_test.cpp
     codegen/dict_record_value_leak_test.cpp

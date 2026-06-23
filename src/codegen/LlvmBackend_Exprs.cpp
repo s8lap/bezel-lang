@@ -2567,6 +2567,50 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateTrunc(len64, i32(), "col.len");
                 }
             }
+            // fix #853 / stdlib §4.1–§4.3: `.Count` on a LIST-INTERFACE receiver
+            // (IReadOnlyList<T> / IList<T> / IOwnedList<T>). These interfaces are
+            // implemented ONLY by Array<T> / OwnedArray<T> (both bz_array_t*-
+            // backed), so an interface-typed receiver carries the same array
+            // pointer as the concrete collection and `.Count` is bz_array_len —
+            // the same bridge the indexer get/set already uses (#401). Previously
+            // an interface-typed `.Count` fell through to a stub that returned 0
+            // (#853). (The non-list collection interfaces — IReadOnlyCollection /
+            // ICollection — are polymorphic over incompatible backings and are
+            // diagnosed below, not bridged.)
+            if (isListInterfaceName(tt)) {
+                llvm::Value* obj = lowerExpr(*ma->target);
+                if (obj) {
+                    auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len64 = builder_.CreateCall(fn, {obj});
+                    return builder_.CreateTrunc(len64, i32(), "ilist.len");
+                }
+            }
+            // fix #853 / stdlib §4.1–§4.3: `.Count` on a polymorphic COLLECTION-
+            // INTERFACE receiver (IReadOnlyCollection<T> / ICollection<T> /
+            // IOwnedCollection<T>). Unlike the list interfaces, these are
+            // implemented by collections with incompatible runtime
+            // representations (Array → bz_array_t* count@8; LinkedList →
+            // bz_llist_t* count@16; Dictionary/Set → bz_dict_t*) and the
+            // interface-typed receiver erases which one it holds. With no shared
+            // kind tag and no collection itable, no single runtime call is sound
+            // here (bz_array_len would read garbage for a LinkedList/Dictionary).
+            // Diagnose instead of silently returning 0 (the #853 miscompile).
+            // A real fix needs a runtime foundation; deferred (#853).
+            if (isCollectionInterfaceName(tt)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "`.Count` through a polymorphic collection interface "
+                    "(IReadOnlyCollection<T> / ICollection<T> / "
+                    "IOwnedCollection<T>) is not yet supported in codegen "
+                    "(stdlib \xC2\xA7""4.1\xE2\x80\x93\xC2\xA7""4.3, #853): these "
+                    "interfaces are implemented by collections with incompatible "
+                    "runtime representations (array / linked-list / hash-table) "
+                    "and the concrete backing is erased at the interface, so no "
+                    "single runtime dispatch is sound. Call `.Count` on the "
+                    "concrete collection, or pass a list interface "
+                    "(IReadOnlyList<T> / IList<T>) which is array-backed.");
+                return llvm::PoisonValue::get(i32());
+            }
             if (isDictTypeName(tt)) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {

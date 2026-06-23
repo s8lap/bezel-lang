@@ -432,6 +432,30 @@ bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
 }
 
 
+// fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces
+// (IReadOnlyCollection<T>, ICollection<T>, IOwnedCollection<T>).  Unlike the
+// list interfaces above — which only Array<T>/OwnedArray<T> implement, so an
+// interface-typed receiver is unambiguously the array-backed bz_array_t* — these
+// collection interfaces are implemented by collections with INCOMPATIBLE runtime
+// representations: Array/Stack/Queue (bz_array_t*, count at offset 8),
+// LinkedList (bz_llist_t*, count at offset 16), Dictionary/Set (bz_dict_t*).
+// The interface-typed receiver erases which concrete backing it holds, the
+// runtime structs share no kind-tag header, and there is no itable wiring these
+// members to the runtime.  So a compile-time "treat as bz_array_t*" assumption is
+// UNSOUND here (it would read garbage / no-op for a LinkedList/Dictionary/Set
+// receiver) — calls through these interfaces are diagnosed rather than silently
+// miscompiled (#853 root cause: they previously fell through to a stub returning
+// 0 / a no-op).  A real fix needs a runtime foundation (kind-tag header or a
+// per-backing collection itable); that is deferred (#853 stays open).
+bool Emitter::isCollectionInterfaceName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    std::string_view n = builtinTypeName(rt);
+    return n == "IReadOnlyCollection" || n == "ICollection" ||
+           n == "IOwnedCollection";
+}
+
+
 // issue #343 / §4.8: a Dictionary<K,V> key (idx=0) or Set<T> element (idx=0)
 // is a "record key" when the generic arg resolves to a record TypeSymbol that
 // actually carries synthesized GetHashCode/Equals (positional records, or
@@ -636,7 +660,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     const auto& m = ma->member;
 
     auto* recvTy = ctx_.exprType(*ma->target);
-    bool isArr  = isCollectionTypeName(recvTy);
+    // fix #853 / stdlib §4.1–§4.3: a BORROWING list-interface receiver
+    // (IReadOnlyList<T> / IList<T>) is implemented only by the array-backed
+    // Array<T>, so its runtime value is the same bz_array_t* as the concrete
+    // collection and its mutating/query methods (Add / Clear / Contains / Remove
+    // / IndexOf / Insert) lower through the identical bz_array_* runtime — the
+    // same bridge the indexer get/set already uses (#401). Without this they fell
+    // through to a stub: Add was a silent no-op (#853). The OWNING list interface
+    // IOwnedList<T> is excluded here (outOwning) — mutation through it disposes
+    // owned elements, which is deferred (diagnosed below). Read-only `.Count` is
+    // a property handled in LlvmBackend_Exprs.cpp, not here.
+    bool listIfaceOwning = false;
+    bool isBorrowingListIface =
+        isListInterfaceName(recvTy, &listIfaceOwning) && !listIfaceOwning;
+    bool isArr  = isCollectionTypeName(recvTy) || isBorrowingListIface;
     bool isDict = isDictTypeName(recvTy);
     // Check for StringBuilder
     bool isStrBld = (recvTy && recvTy->astNode && recvTy->astNode->name &&
@@ -682,6 +719,61 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
     bool lazyTerminal =
         (lazyRecv || isLinkedList || isRangeRecv) && isArrTerminal;
+
+    // fix #853 / stdlib §4.1–§4.3: a built-in collection member invoked through a
+    // POLYMORPHIC collection interface (IReadOnlyCollection<T> / ICollection<T> /
+    // IOwnedCollection<T>) OR through the OWNING list interface (IOwnedList<T>).
+    // These erase the concrete backing, which spans incompatible runtime
+    // representations (bz_array_t* / bz_llist_t* / bz_dict_t*) with no shared kind
+    // tag and no collection itable — so no single bz_* call is sound. Previously
+    // these fell through to a stub: ICollection<T>.Add was a silent no-op, etc.
+    // (#853). Diagnose the recognised built-in collection members rather than
+    // miscompile. (LINQ extension operators over IEnumerable<T> are handled by
+    // tryLowerLazyLinqCall before this function, so they are unaffected.) The
+    // sound subset — the array-backed BORROWING list interfaces — is bridged
+    // above (isBorrowingListIface). A real fix for the polymorphic interfaces
+    // needs a runtime foundation; deferred (#853 stays open).
+    {
+        bool ownerOnly = false;
+        bool isPolyCollIface =
+            isCollectionInterfaceName(recvTy) ||
+            (isListInterfaceName(recvTy, &ownerOnly) && ownerOnly);  // IOwnedList
+        bool isBuiltinCollMember =
+            m == "Add" || m == "Clear" || m == "Contains" || m == "Remove" ||
+            m == "Insert" || m == "IndexOf" || m == "DisposeElements";
+        if (isPolyCollIface && isBuiltinCollMember) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`." + std::string(m) +
+                "` through a polymorphic collection interface "
+                "(IReadOnlyCollection<T> / ICollection<T> / IOwnedCollection<T> "
+                "/ IOwnedList<T>) is not yet supported in codegen "
+                "(stdlib \xC2\xA7""4.1\xE2\x80\x93\xC2\xA7""4.3, #853): these "
+                "interfaces are implemented by collections with incompatible "
+                "runtime representations (array / linked-list / hash-table) and "
+                "the concrete backing is erased at the interface, so no single "
+                "runtime dispatch is sound. Call the method on the concrete "
+                "collection, or pass a borrowing list interface "
+                "(IReadOnlyList<T> / IList<T>) which is array-backed.");
+            // Return a poison value of the call's RESULT type so the enclosing
+            // expression (e.g. an expression-body lambda `=> c.Contains(x)`
+            // returning bool) emits well-formed IR — the diagnostic already
+            // failed the compile, so this placeholder is never executed, but it
+            // must type-match to avoid a spurious IR-verification error masking
+            // the real (clean) diagnostic. The result type is fixed by the
+            // stdlib §4.1 interface signatures: Contains → bool (i1); IndexOf →
+            // int (i32); Add / Clear / Insert / Remove / DisposeElements → unit
+            // (i32). (`Remove` is bool in the spec but its result is unused at the
+            // diagnosed call sites; i32 poison is harmless since the compile
+            // already failed — and exprType, when resolved, overrides it.)
+            llvm::Type* resTy = (m == "Contains") ? static_cast<llvm::Type*>(i1())
+                                                  : static_cast<llvm::Type*>(i32());
+            if (sema::TypeRef* rt = ctx_.exprType(call))
+                if (llvm::Type* lt = lowerTypeRef(rt))
+                    resTy = lt;
+            return llvm::PoisonValue::get(resTy);
+        }
+    }
 
     if (!isArr && !isDict && !isStrBld && !lazyTerminal) return nullptr;
 

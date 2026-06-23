@@ -5597,6 +5597,16 @@ private:
     static bool isListInterfaceName(const sema::TypeRef* rt,
                                     bool* outOwning = nullptr);
 
+    // fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces
+    // (IReadOnlyCollection<T>, ICollection<T>, IOwnedCollection<T>). These are
+    // genuinely polymorphic — implemented by collections with incompatible
+    // runtime representations (bz_array_t*/bz_llist_t*/bz_dict_t*) with no shared
+    // kind tag — so an interface-typed receiver cannot be soundly routed to a
+    // single runtime at compile time. Member calls through them are diagnosed,
+    // not miscompiled. (The list interfaces above are array-backed-only and ARE
+    // soundly bridged.)
+    static bool isCollectionInterfaceName(const sema::TypeRef* rt);
+
     // issue #343 / §4.8: if the type's key generic arg (genericArgs[idx]) is a
     // record (a value type with synthesized GetHashCode/Equals), return its
     // TypeSymbol; otherwise null (string/int keys use the existing fast paths).
