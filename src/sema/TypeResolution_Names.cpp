@@ -125,6 +125,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // maxCount); SemaphoreToken has NO public constructor (obtained only from
     // Semaphore.Acquire / TryAcquire); both are nullary class types here.
     if (n == "Semaphore" || n == "SemaphoreToken") return 0;
+    // §3.3 / issue #883: ReadOnlyStringSpan — a string-backed read-only span
+    // (System.Text, auto-imported). Non-generic record viewing a contiguous
+    // range of a `string` (Source: string, Start: int, Length: int). Distinct
+    // from ReadOnlySpan<char> (which views an OwnedBuffer<char>) because string
+    // storage is adaptive (1/2/4 bytes per code point — §4.6). Zero-arity.
+    if (n == "ReadOnlyStringSpan") return 0;
     // §9.4 / issue #654: Boolean — builtin record aliased by `bool`; zero-arity.
     // Registered so `Boolean.TryParse(...)` resolves without "unresolved type".
     if (n == "Boolean") return 0;

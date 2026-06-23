@@ -2809,6 +2809,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Add" || m == "Subtract" || m == "Negate")
                             ctx_.setExprType(&ce, tsTy);
                     }
+                    // §3.3 (#883): ReadOnlyStringSpan instance methods. The
+                    // receiver is a string-backed view (Source: string, Start,
+                    // Length); the search methods (IndexOf/Contains/StartsWith/
+                    // EndsWith/SequenceEqual) are deferred (substring search over
+                    // the adaptive string encoding — see the follow-up issue).
+                    if (rcn == "ReadOnlyStringSpan") {
+                        if (m == "Length")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "IsEmpty")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        else if (m == "Slice") {
+                            // Slice(start, length) → ReadOnlyStringSpan over the
+                            // same source.
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->declaration = nullptr;
+                            tr->astNode = recvTy->astNode;  // same synthetic node
+                            ctx_.setExprType(&ce, tr);
+                        } else if (m == "IndexOf" || m == "Contains" ||
+                                   m == "StartsWith" || m == "EndsWith" ||
+                                   m == "SequenceEqual") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`") + std::string(m) +
+                                "` on `ReadOnlyStringSpan` is not yet supported "
+                                "(substring search over the adaptive string "
+                                "encoding is deferred) — see the follow-up issue; "
+                                "for now materialize a substring with "
+                                "`s.Substring(...)` and use the `string` methods "
+                                "(stdlib \xC2\xA7""3.3)");
+                        } else {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `ReadOnlyStringSpan`; documented surface: "
+                                "Length, IsEmpty, Slice(), and the indexer `[i]` "
+                                "(stdlib \xC2\xA7""3.3)");
+                        }
+                    }
                     // §4.15 (#549) / §4.14 (#779): span instance-method return
                     // types. The receiver carries an astNode-backed TypeRef (no
                     // declaration) so rcn is one of ArraySpan / ReadOnlyArraySpan
@@ -5578,7 +5617,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     (tt->astNode->name->parts[0] == "ArraySpan" ||
                      tt->astNode->name->parts[0] == "ReadOnlyArraySpan" ||
                      tt->astNode->name->parts[0] == "Span" ||
-                     tt->astNode->name->parts[0] == "ReadOnlySpan");
+                     tt->astNode->name->parts[0] == "ReadOnlySpan" ||
+                     // §3.3 (#883): ReadOnlyStringSpan.Length / .IsEmpty
+                     tt->astNode->name->parts[0] == "ReadOnlyStringSpan");
                 if (isSpan) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(
@@ -6018,6 +6059,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         tr->astNode = kCharArrayAstNode;
                         tr->genericArgs.push_back(
                             ctx_.primitiveTypeRef(PrimitiveType::Char));
+                        ctx_.setExprType(&ma, tr);
+                        return;
+                    }
+                    // §9.6 / §3.3 (#883): string.AsSpan() and its overloads
+                    // ((start), (start, length), (r: Range<int>)) return a
+                    // ReadOnlyStringSpan — a non-allocating char-level view over a
+                    // contiguous range of the string. (string also has
+                    // AsAsciiByteSpan/TryAsAsciiByteSpan returning a
+                    // ReadOnlyAsciiByteSpan — deferred; see the follow-up issue.)
+                    if (ma.member == "AsSpan") {
+                        static const ast::Type* kStrSpanNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("ReadOnlyStringSpan");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kStrSpanNode;
                         ctx_.setExprType(&ma, tr);
                         return;
                     }

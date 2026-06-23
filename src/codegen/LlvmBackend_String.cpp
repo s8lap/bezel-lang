@@ -950,6 +950,81 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return lowerExpr(*call.args[idx].value);
     };
 
+    // §9.6 / §3.3 (#883): string.AsSpan() and its overloads → a ReadOnlyStringSpan
+    // { Source = self (string ptr), Start, Length } over a contiguous code-point
+    // range. Reuses the {ptr,i32,i32} span struct (buildArraySpan); the span's
+    // indexer / Length read code points from the string source (loadCodePoint),
+    // not array elements. Length/Start are CODE-POINT units (loadStringLen).
+    // Bounds-checks mirror Array<T>.AsSpan (IndexOutOfRangeException).
+    if (method == "AsSpan") {
+        llvm::Value* len64 = loadStringLen(self);                  // i64 code pts
+        llvm::Value* count = builder_.CreateTrunc(len64, i32(), "ss.count");
+        if (call.args.empty())
+            return buildArraySpan(self, builder_.getInt32(0), count);
+        // (r: Range<int>) — Start = r.Start, Length = element count.
+        if (call.args.size() == 1 && call.args[0].value &&
+            isRangeType(ctx_.exprType(*call.args[0].value))) {
+            llvm::Value* rv = lowerExpr(*call.args[0].value);
+            if (!rv || !rv->getType()->isStructTy()) return nullptr;
+            llvm::Value* lo = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {0u}), i32(), "ss.r.lo");
+            llvm::Value* hi = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {1u}), i32(), "ss.r.hi");
+            llvm::Value* incl = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {3u}), i1(), "ss.r.incl");
+            llvm::Value* span0 = builder_.CreateSub(hi, lo, "ss.r.span");
+            llvm::Value* len = builder_.CreateSelect(
+                incl, builder_.CreateAdd(span0, builder_.getInt32(1)), span0,
+                "ss.r.len");
+            llvm::Value* startNeg =
+                builder_.CreateICmpSLT(lo, builder_.getInt32(0));
+            llvm::Value* lenNeg = builder_.CreateICmpSLT(len, builder_.getInt32(0));
+            llvm::Value* endOOB =
+                builder_.CreateICmpSGT(builder_.CreateAdd(lo, len), count);
+            emitGuardThrow(
+                builder_.CreateOr(builder_.CreateOr(startNeg, lenNeg), endOOB),
+                "IndexOutOfRangeException");
+            return buildArraySpan(self, lo, len);
+        }
+        // (start) — [start, Length)
+        if (call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* start = getIntArg(0);
+            if (!start) return nullptr;
+            if (!start->getType()->isIntegerTy(32))
+                start = builder_.CreateTrunc(start, i32());
+            emitGuardThrow(
+                builder_.CreateOr(
+                    builder_.CreateICmpSLT(start, builder_.getInt32(0)),
+                    builder_.CreateICmpSGT(start, count)),
+                "IndexOutOfRangeException");
+            return buildArraySpan(self, start,
+                                  builder_.CreateSub(count, start, "ss.len"));
+        }
+        // (start, length)
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* start = getIntArg(0);
+            llvm::Value* len   = getIntArg(1);
+            if (!start || !len) return nullptr;
+            if (!start->getType()->isIntegerTy(32))
+                start = builder_.CreateTrunc(start, i32());
+            if (!len->getType()->isIntegerTy(32))
+                len = builder_.CreateTrunc(len, i32());
+            emitGuardThrow(
+                builder_.CreateOr(
+                    builder_.CreateICmpSLT(start, builder_.getInt32(0)),
+                    builder_.CreateICmpSGT(start, count)),
+                "IndexOutOfRangeException");
+            llvm::Value* avail = builder_.CreateSub(count, start);
+            emitGuardThrow(
+                builder_.CreateOr(
+                    builder_.CreateICmpSLT(len, builder_.getInt32(0)),
+                    builder_.CreateICmpSGT(len, avail)),
+                "IndexOutOfRangeException");
+            return buildArraySpan(self, start, len);
+        }
+        return nullptr;
+    }
+
     // §9.6: String parse methods — convenience wrappers over Convert.ToXxx.
     if (call.args.empty()) {
         llvm::Value* data = loadStringData(self);

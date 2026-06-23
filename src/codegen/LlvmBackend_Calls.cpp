@@ -12923,6 +12923,50 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         return nullptr;
     std::string_view rcn = recvTy->astNode->name->parts[0];
 
+    // §3.3 (#883): ReadOnlyStringSpan instance methods (call form). The struct is
+    // {string-ptr, i32 start, i32 length}; Length/IsEmpty are field reads and
+    // Slice reconstructs a sub-view. The indexer is handled in
+    // lowerCollectionIndexerGet (loadCodePoint); the search methods
+    // (IndexOf/Contains/StartsWith/EndsWith/SequenceEqual) are deferred — sema
+    // rejects them, so they never reach here.
+    if (rcn == "ReadOnlyStringSpan") {
+        llvm::Value* spanVal = lowerExpr(*ma->target);
+        if (!spanVal) return nullptr;
+        auto* spanSt = arraySpanStructType();
+        auto* spanSlot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, spanSlot);
+        auto fSrc = [&] { return builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 0), "ss.src"); };
+        auto fBase = [&] { return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 1), "ss.st"); };
+        auto fLen = [&] { return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 2), "ss.len"); };
+        if (m == "Length" && call.args.empty()) return fLen();
+        if (m == "IsEmpty" && call.args.empty())
+            return builder_.CreateICmpEQ(fLen(), builder_.getInt32(0), "ss.empty");
+        if (m == "Slice" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* st = lowerExpr(*call.args[0].value);
+            llvm::Value* sl = lowerExpr(*call.args[1].value);
+            if (!st || !sl) return nullptr;
+            if (!st->getType()->isIntegerTy(32))
+                st = builder_.CreateTrunc(st, i32());
+            if (!sl->getType()->isIntegerTy(32))
+                sl = builder_.CreateTrunc(sl, i32());
+            llvm::Value* b = fBase();
+            llvm::Value* L = fLen();
+            emitGuardThrow(builder_.CreateOr(
+                builder_.CreateICmpSLT(st, builder_.getInt32(0)),
+                builder_.CreateICmpSGT(st, L)), "IndexOutOfRangeException");
+            llvm::Value* avail = builder_.CreateSub(L, st);
+            emitGuardThrow(builder_.CreateOr(
+                builder_.CreateICmpSLT(sl, builder_.getInt32(0)),
+                builder_.CreateICmpSGT(sl, avail)), "IndexOutOfRangeException");
+            return buildArraySpan(fSrc(), builder_.CreateAdd(b, st), sl);
+        }
+        return nullptr;
+    }
+
     // Helper: get the element size for a span over Array<T>.
     // Uses recvTy->genericArgs[0] (the element type T of the span).
     auto spanElemSize = [&]() -> int64_t {

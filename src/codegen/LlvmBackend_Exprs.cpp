@@ -2279,7 +2279,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         if (ma->target &&
             (ma->member == "Length" || ma->member == "IsEmpty")) {
             auto* tt = ctx_.exprType(*ma->target);
-            if (isSpanLikeTypeName(tt)) {
+            // §3.3 (#883): ReadOnlyStringSpan shares the {ptr,i32,i32} layout, so
+            // Length/IsEmpty are the same field-2 read as the array-backed spans.
+            bool isStrSpan = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                !tt->declaration && tt->astNode && tt->astNode->name &&
+                !tt->astNode->name->parts.empty() &&
+                tt->astNode->name->parts[0] == "ReadOnlyStringSpan";
+            if (isSpanLikeTypeName(tt) || isStrSpan) {
                 llvm::Value* sv = lowerExpr(*ma->target);
                 if (!sv) return nullptr;
                 llvm::Value* slen = builder_.CreateExtractValue(

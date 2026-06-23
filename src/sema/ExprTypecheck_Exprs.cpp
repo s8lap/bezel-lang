@@ -757,6 +757,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     } else if (isDict && tt->genericArgs.size() > 1 &&
                              tt->genericArgs[1])
                         ctx_.setExprType(&e, tt->genericArgs[1]);
+                    // §3.3 (#883): ReadOnlyStringSpan[i] → char (the i-th code
+                    // point of the viewed range). Non-generic, so its element
+                    // type is the fixed `char` primitive (not genericArgs[0]).
+                    else if (cn == "ReadOnlyStringSpan")
+                        ctx_.setExprType(
+                            &e, ctx_.primitiveTypeRef(PrimitiveType::Char));
                     // #794 / §14.2 + §23.4: `x[i]` where `x` has the type of a
                     // bare generic parameter `T` constrained `where T: IIndexable`
                     // and the constraint interface declares an indexer. The stdlib

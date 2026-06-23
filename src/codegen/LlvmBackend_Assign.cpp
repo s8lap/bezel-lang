@@ -46,6 +46,41 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         return nullptr;
     auto* recvTy = ctx_.exprType(*ix.target);
 
+    // §3.3 (#883): ReadOnlyStringSpan[i] → the (Start + i)-th CODE POINT of the
+    // source string (a char), bounds-checked against the span's Length (not the
+    // string's). The source (field 0) is a string pointer, so the element is read
+    // via loadCodePoint — NOT bz_array_get (the array-span path below). This must
+    // precede the isSpanLikeTypeName branch, which would mis-treat the string
+    // source as an array.
+    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+        !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty() &&
+        recvTy->astNode->name->parts[0] == "ReadOnlyStringSpan") {
+        llvm::Value* spanVal = lowerExpr(*ix.target);
+        if (!spanVal) return nullptr;
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+        if (!idx) return nullptr;
+        auto* spanSt = arraySpanStructType();
+        auto* slot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, slot);
+        llvm::Value* src  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, slot, 0), "ss.src");
+        llvm::Value* base = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 1), "ss.st");
+        llvm::Value* slen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 2), "ss.len");
+        if (!idx->getType()->isIntegerTy(32))
+            idx = builder_.CreateTrunc(idx, i32());
+        llvm::Value* idxNeg = builder_.CreateICmpSLT(idx, builder_.getInt32(0));
+        llvm::Value* idxOOB = builder_.CreateICmpSGE(idx, slen);
+        emitGuardThrow(builder_.CreateOr(idxNeg, idxOOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx,  i64()), "ss.absi");
+        return loadCodePoint(src, absIdx);   // i32 code point (char)
+    }
+
     // §4.15 (#549): ArraySpan<T>[i] / ReadOnlyArraySpan<T>[i]
     // → Source[Start + i] with bounds-check against Length (not array Count).
     if (isSpanLikeTypeName(recvTy)) {

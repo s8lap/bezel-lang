@@ -425,7 +425,10 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 (rt->astNode->name->parts[0] == "ArraySpan" ||
                  rt->astNode->name->parts[0] == "ReadOnlyArraySpan" ||
                  rt->astNode->name->parts[0] == "Span" ||
-                 rt->astNode->name->parts[0] == "ReadOnlySpan")) {
+                 rt->astNode->name->parts[0] == "ReadOnlySpan" ||
+                 // §3.3 (#883): ReadOnlyStringSpan shares the {ptr,i32,i32} shape
+                 // (field 0 is a string pointer, not an array pointer).
+                 rt->astNode->name->parts[0] == "ReadOnlyStringSpan")) {
                 return arraySpanStructType();
             }
             // §2.15 / issue #687: JsonOptions is a compiler-known value record.
@@ -549,9 +552,10 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 if (n == "DateTime" || n == "TimeSpan") return i64();
                 if (n == "Guid")  return guidStructType();
                 if (n == "Range") return rangeStructType();
-                // §4.15 (#549) / §4.14 (#779): span types are value structs.
+                // §4.15 (#549) / §4.14 (#779) / §3.3 (#883): span value structs.
                 if (n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
-                    n == "Span" || n == "ReadOnlySpan")
+                    n == "Span" || n == "ReadOnlySpan" ||
+                    n == "ReadOnlyStringSpan")
                     return arraySpanStructType();
                 // Heap-pointer types — all stdlib collection/interface/task names.
                 if (n == "Array"       || n == "OwnedArray"     ||
