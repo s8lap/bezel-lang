@@ -1184,6 +1184,14 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classHashCodeFns_;
     llvm::Function* boxDefaultEqualsFn_ = nullptr;
     llvm::Function* boxDefaultHashCodeFn_ = nullptr;
+    // §9.1 / §9.6 (#961): per-type structural Equals/GetHashCode thunks for
+    // boxed records, enums, and primitives. Installed at kEqualsSlot /
+    // kGetHashCodeSlot of the box vtable so an Object-typed receiver gets
+    // value-semantics equality and hash, not reference identity.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> boxRecordEqualsFns_;
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> boxRecordHashFns_;
+    std::unordered_map<std::string, llvm::Function*> primBoxEqualsFns_;
+    std::unordered_map<std::string, llvm::Function*> primBoxHashFns_;
     // §8.6 / §12.7 (#417): every vtable / box-vtable / exception-vtable global
     // emitted, collected so emitVtableTable() can publish a null-terminated
     // array `bz$vtable$table` that bz_obj_is_string scans to tell a string (no
@@ -3008,6 +3016,24 @@ private:
     // (tracked as a follow-up issue), not these defaults.
     llvm::Constant* boxDefaultEqualsThunk();
     llvm::Constant* boxDefaultHashCodeThunk();
+
+    // §9.1 / §9.6 (#961): per-type structural Equals `i1(ptr this, ptr other)`
+    // and GetHashCode `i32(ptr this)` thunks for boxed RECORDS and ENUMS.
+    // Equals guards `other` is a box of the same type (matching vtable[0]
+    // descriptor), then loads both payloads and runs emitStructEquality (record)
+    // or an integer-value compare (enum). GetHashCode loads the payload and runs
+    // emitRecordHashCode (record) or emitValueHashCode (enum). These replace the
+    // box-default reference-identity thunks at kEqualsSlot/kGetHashCodeSlot.
+    llvm::Constant* boxRecordEqualsThunk(const sema::TypeSymbol* ts);
+    llvm::Constant* boxRecordHashThunk(const sema::TypeSymbol* ts);
+
+    // §9.1 / §9.6 (#961): per-primitive structural Equals and GetHashCode thunks
+    // for boxed PRIMITIVES (int, bool, char, …). Equals guards `other` is a box
+    // of the same primitive (matching vtable[0] descriptor), then loads both
+    // scalar payloads and ICmpEQ / FCmpOEQ. GetHashCode loads the scalar and
+    // runs emitValueHashCode with the primitive's TypeRef.
+    llvm::Constant* primBoxEqualsThunk(sema::PrimitiveType prim, const char* nm);
+    llvm::Constant* primBoxHashThunk(sema::PrimitiveType prim, const char* nm);
 
     // §9.6 (#946/#947/#948): lower `o.Equals(x)` / `o.GetHashCode()` where `o`
     // is Object/interface (no resolved MethodSymbol). Mirrors lowerObjectToString:

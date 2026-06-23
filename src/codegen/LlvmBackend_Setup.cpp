@@ -11611,13 +11611,12 @@ void Emitter::setupBoxDescriptors() {
         elems[1] = llvm::ConstantExpr::getPointerCast(boxItmapGV, ptrTy());
         if (builtinDisposeFn_) elems[2] = builtinDisposeFn_;
         elems[kToStringSlot] = boxToStringThunk(ts);
-        // §9.6 (#946/#947/#948): keep the Object dispatch uniform — every
-        // vtable-bearing value has the fixed Equals/GetHashCode slots so
-        // lowerObjectEquals/lowerObjectGetHashCode's slot read is in bounds. A
-        // boxed value reached through Object uses the reference/identity default
-        // (structural/value equality through Object is a separate follow-up).
-        elems[kEqualsSlot] = boxDefaultEqualsThunk();
-        elems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
+        // §9.1 / §9.6 (#961): structural Equals / GetHashCode for boxed
+        // records and enums so an Object-typed receiver gets value-semantics
+        // equality (§9.1: field-by-field for records; underlying-integer for
+        // enums) rather than reference identity (§8.3 default).
+        elems[kEqualsSlot]      = boxRecordEqualsThunk(ts);
+        elems[kGetHashCodeSlot] = boxRecordHashThunk(ts);
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         boxVtable_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
@@ -11660,10 +11659,20 @@ void Emitter::setupBoxDescriptors() {
                 ? static_cast<llvm::Constant*>(
                       llvm::ConstantPointerNull::get(ptrTy()))
                 : primBoxToStringThunk(p, nm);
-        // §9.6 (#946): grow the primitive box vtable to the uniform
-        // kVirtualMethodsBase width so an Object-typed receiver's fixed
-        // Equals/GetHashCode slot read is in bounds (box reference/identity
-        // default — value equality through Object is a separate follow-up).
+        // §9.1 / §9.6 (#961): primitive box vtable with structural Equals /
+        // GetHashCode so an Object-typed receiver gets value-semantics equality
+        // and hash rather than reference identity. String has no box payload
+        // (it stays a bare bz_string* in an Object slot) so it keeps the
+        // default reference/identity thunks (the box vtable exists only for
+        // the descriptor but the vtable is never dispatched through for a
+        // string operand — lowerObjectEquals/GetHashCode's bz_obj_is_string
+        // branch intercepts it first).
+        llvm::Constant* eqThunk  = (p == P::String)
+            ? boxDefaultEqualsThunk()
+            : primBoxEqualsThunk(p, nm);
+        llvm::Constant* hashThunk = (p == P::String)
+            ? boxDefaultHashCodeThunk()
+            : primBoxHashThunk(p, nm);
         auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
         primBoxVtable_[nm] = new llvm::GlobalVariable(
             *module_, vtTy, /*isConstant=*/true,
@@ -11675,8 +11684,8 @@ void Emitter::setupBoxDescriptors() {
                            ? llvm::cast<llvm::Constant>(builtinDisposeFn_)
                            : llvm::ConstantPointerNull::get(ptrTy()),  // Dispose
                        tostr,
-                       boxDefaultEqualsThunk(),       // [4]=Equals
-                       boxDefaultHashCodeThunk()}),   // [5]=GetHashCode
+                       eqThunk,    // [4]=Equals
+                       hashThunk}),  // [5]=GetHashCode
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
     }
@@ -11912,6 +11921,223 @@ llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
         builder_.CreateRet(builder_.CreateTrunc(
             builder_.CreatePtrToInt(thunk->getArg(0), i64()), i32()));
+    }
+    return thunk;
+}
+
+
+// §9.1 / §9.6 (#961): per-type structural Equals thunk `i1(ptr this, ptr other)`
+// for a boxed RECORD or boxed ENUM. `this` is the box pointer (the receiver);
+// `other` is the Object? argument. The thunk:
+//   1. Returns false if `other` is null.
+//   2. Loads `other`'s vtable[0] (its type descriptor) and compares it to the
+//      known descriptor for `ts`. A mismatch returns false (different type or
+//      a non-box class object in the other slot).
+//   3. Loads both payloads (two words past the box header, BZ_BOX layout) and
+//      runs emitStructEquality (record) or an integer ICmpEQ (enum), mirroring
+//      the statically-typed §8.3 value-equality path.
+llvm::Constant* Emitter::boxRecordEqualsThunk(const sema::TypeSymbol* ts) {
+    auto it = boxRecordEqualsFns_.find(ts);
+    if (it != boxRecordEqualsFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                         /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$boxeq$" + std::string(ts->name), module_.get());
+    boxRecordEqualsFns_[ts] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* self  = thunk->getArg(0);
+        llvm::Value* other = thunk->getArg(1);
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+
+        // Block 1: check other != null.
+        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "beq.nonnull", thunk);
+        auto* checkBB   = llvm::BasicBlock::Create(llvm_, "beq.check",   thunk);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "beq.end",     thunk);
+
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+
+        // other is non-null: load its vtable[0] (the type descriptor pointer).
+        builder_.SetInsertPoint(notNullBB);
+        llvm::Value* otherVtbl = builder_.CreateLoad(ptrTy(), other, "beq.ovtbl");
+        llvm::Value* otherDesc = builder_.CreateLoad(ptrTy(), otherVtbl, "beq.odesc");
+        // Compare with descArray_[ts] — the descriptor for this exact type.
+        llvm::Value* myDesc = llvm::ConstantExpr::getPointerCast(
+            llvm::cast<llvm::Constant>(descArray_.at(ts)), ptrTy());
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
+
+        // Types match: load both payloads (offset 2 words) and compare.
+        builder_.SetInsertPoint(checkBB);
+        llvm::Value* selfPayload  = builder_.CreateGEP(
+            ptrTy(), self,  {builder_.getInt32(2)}, "beq.spay");
+        llvm::Value* otherPayload = builder_.CreateGEP(
+            ptrTy(), other, {builder_.getInt32(2)}, "beq.opay");
+        llvm::Value* eq;
+        if (ts->kind == ast::TypeDeclKind::Record) {
+            llvm::StructType* st = recordStruct(ts);
+            llvm::Value* sv = builder_.CreateLoad(st, selfPayload,  "beq.sv");
+            llvm::Value* ov = builder_.CreateLoad(st, otherPayload, "beq.ov");
+            eq = emitStructEquality(sv, ov, st, ts);
+        } else {
+            // Enum: underlying integer comparison.
+            llvm::Type* ety = enumLlvmType(ts);
+            llvm::Value* sv = builder_.CreateLoad(ety, selfPayload,  "beq.sv");
+            llvm::Value* ov = builder_.CreateLoad(ety, otherPayload, "beq.ov");
+            eq = builder_.CreateICmpEQ(sv, ov);
+        }
+        llvm::BasicBlock* checkEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "beq.res");
+        phi->addIncoming(builder_.getFalse(), entry);     // other was null
+        phi->addIncoming(builder_.getFalse(), notNullBB); // descriptor mismatch
+        phi->addIncoming(eq, checkEnd);                   // structural result
+        builder_.CreateRet(phi);
+    }
+    return thunk;
+}
+
+
+// §9.1 / §9.6 (#961): per-type structural GetHashCode thunk `i32(ptr this)` for
+// a boxed RECORD or boxed ENUM. Loads the payload (two words past the box
+// header) and runs emitRecordHashCode (record) or emitValueHashCode (enum).
+llvm::Constant* Emitter::boxRecordHashThunk(const sema::TypeSymbol* ts) {
+    auto it = boxRecordHashFns_.find(ts);
+    if (it != boxRecordHashFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$boxhash$" + std::string(ts->name), module_.get());
+    boxRecordHashFns_[ts] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* self = thunk->getArg(0);
+        llvm::Value* payload = builder_.CreateGEP(
+            ptrTy(), self, {builder_.getInt32(2)}, "bhash.pay");
+        llvm::Value* h;
+        if (ts->kind == ast::TypeDeclKind::Record) {
+            llvm::StructType* st = recordStruct(ts);
+            llvm::Value* rv = builder_.CreateLoad(st, payload, "bhash.rv");
+            h = emitRecordHashCode(rv, ts);
+        } else {
+            // Enum: hash by underlying integer value.
+            llvm::Type* ety = enumLlvmType(ts);
+            llvm::Value* ev = builder_.CreateLoad(ety, payload, "bhash.ev");
+            sema::TypeRef enumRef;
+            enumRef.kind      = sema::TypeRef::Kind::Named;
+            enumRef.declaration = const_cast<sema::TypeSymbol*>(ts);
+            h = emitValueHashCode(ev, &enumRef);
+        }
+        if (h->getType() != i32())
+            h = builder_.CreateZExtOrTrunc(h, i32());
+        builder_.CreateRet(h);
+    }
+    return thunk;
+}
+
+
+// §9.1 / §9.6 (#961): per-primitive structural Equals thunk `i1(ptr this, ptr other)`
+// for a boxed PRIMITIVE (int, bool, char, …). Guards `other` is a box of the
+// same primitive (same vtable[0] descriptor), then loads both scalar payloads
+// and compares by value (ICmpEQ for integers, FCmpOEQ for floats).
+llvm::Constant* Emitter::primBoxEqualsThunk(sema::PrimitiveType prim,
+                                            const char* nm) {
+    auto it = primBoxEqualsFns_.find(nm);
+    if (it != primBoxEqualsFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                         /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        std::string("bz$primeq$") + nm, module_.get());
+    primBoxEqualsFns_[nm] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* self  = thunk->getArg(0);
+        llvm::Value* other = thunk->getArg(1);
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+
+        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "peq.nonnull", thunk);
+        auto* checkBB   = llvm::BasicBlock::Create(llvm_, "peq.check",   thunk);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "peq.end",     thunk);
+
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+
+        // Load other's vtable[0] and compare with this primitive's descriptor.
+        builder_.SetInsertPoint(notNullBB);
+        llvm::Value* otherVtbl = builder_.CreateLoad(ptrTy(), other, "peq.ovtbl");
+        llvm::Value* otherDesc = builder_.CreateLoad(ptrTy(), otherVtbl, "peq.odesc");
+        llvm::Value* myDesc = llvm::ConstantExpr::getPointerCast(
+            primBoxDesc_.at(nm), ptrTy());
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
+
+        // Same primitive type: load both payloads and compare.
+        builder_.SetInsertPoint(checkBB);
+        llvm::Type* valTy = lowerPrimitive(prim);
+        llvm::Value* selfPayload  = builder_.CreateGEP(
+            ptrTy(), self,  {builder_.getInt32(2)}, "peq.spay");
+        llvm::Value* otherPayload = builder_.CreateGEP(
+            ptrTy(), other, {builder_.getInt32(2)}, "peq.opay");
+        llvm::Value* sv = builder_.CreateLoad(valTy, selfPayload,  "peq.sv");
+        llvm::Value* ov = builder_.CreateLoad(valTy, otherPayload, "peq.ov");
+        llvm::Value* eq;
+        if (valTy->isFloatingPointTy())
+            eq = builder_.CreateFCmpOEQ(sv, ov);
+        else
+            eq = builder_.CreateICmpEQ(sv, ov);
+        llvm::BasicBlock* checkEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "peq.res");
+        phi->addIncoming(builder_.getFalse(), entry);     // other was null
+        phi->addIncoming(builder_.getFalse(), notNullBB); // descriptor mismatch
+        phi->addIncoming(eq, checkEnd);                   // value equality
+        builder_.CreateRet(phi);
+    }
+    return thunk;
+}
+
+
+// §9.1 / §9.6 (#961): per-primitive GetHashCode thunk `i32(ptr this)` for a
+// boxed PRIMITIVE. Loads the scalar payload and runs emitValueHashCode with
+// the primitive's TypeRef so equal values produce equal hashes.
+llvm::Constant* Emitter::primBoxHashThunk(sema::PrimitiveType prim,
+                                          const char* nm) {
+    auto it = primBoxHashFns_.find(nm);
+    if (it != primBoxHashFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        std::string("bz$primhash$") + nm, module_.get());
+    primBoxHashFns_[nm] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* self = thunk->getArg(0);
+        llvm::Value* payload = builder_.CreateGEP(
+            ptrTy(), self, {builder_.getInt32(2)}, "phash.pay");
+        llvm::Type* valTy = lowerPrimitive(prim);
+        llvm::Value* val = builder_.CreateLoad(valTy, payload, "phash.val");
+        sema::TypeRef primRef;
+        primRef.kind      = sema::TypeRef::Kind::Primitive;
+        primRef.primitive = prim;
+        llvm::Value* h = emitValueHashCode(val, &primRef);
+        if (h->getType() != i32())
+            h = builder_.CreateZExtOrTrunc(h, i32());
+        builder_.CreateRet(h);
     }
     return thunk;
 }

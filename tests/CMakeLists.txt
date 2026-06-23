@@ -312,6 +312,7 @@ set(BEZEL_TEST_SOURCES
     codegen/value_boxing_test.cpp
     codegen/object_downcast_test.cpp
     codegen/object_equals_dispatch_946_test.cpp
+    codegen/boxed_value_equals_961_test.cpp
     codegen/construction_order_930_test.cpp
     codegen/boxing_tostring_test.cpp
     codegen/exceptions_test.cpp
