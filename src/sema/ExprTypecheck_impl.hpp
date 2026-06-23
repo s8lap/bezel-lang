@@ -354,14 +354,17 @@ private:
     // §26.5: extension-member lookup. Consulted ONLY when no instance member
     // matches (instance members win — an extension never shadows a real
     // member). Searches the module's ExtensionSymbols for one whose target
-    // type equals `receiver` and that declares a member named `name`; returns
-    // that MemberSymbol, or null. `receiver` is the receiver's resolved
-    // TypeRef (its nullability is ignored — §26.2 forbids `extension int?`).
-    // This slice matches the receiver's type EXACTLY (primitive by kind, user
-    // type by declaration + generic args); base/interface/generic-extension
-    // resolution (§26.5 step 2/3) is deferred (#433).
-    Symbol* lookupExtensionMember(const TypeRef* receiver,
-                                  std::string_view name);
+    // type equals `receiver` (or one of its ancestor types, per §26.5 step 2)
+    // and that declares a member named `name`; returns that MemberSymbol, or
+    // null. `receiver` is the receiver's resolved TypeRef (its nullability is
+    // ignored — §26.2 forbids `extension int?`).
+    // §26.5 (#714): when a generic-extension method is found (extension has
+    // free type variables), the inferred binding (e.g. T → int) is written into
+    // `outBinding` so the caller can record it for typeCall and codegen.
+    Symbol* lookupExtensionMember(
+        const TypeRef* receiver,
+        std::string_view name,
+        std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr);
 
     // §26.1 / §26.5: bind a resolved extension member to the member-access
     // expression — set its exprSymbol and the access's exprType. For a method

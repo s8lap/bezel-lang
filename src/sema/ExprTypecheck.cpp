@@ -1292,13 +1292,28 @@ Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) {
     return nullptr;
 }
 
-// §26.5: does an extension declared on `target` apply to a receiver of type
-// `recv`? This slice matches EXACTLY (the receiver's own compile-time type),
-// ignoring nullability on both sides (§26.2 forbids `extension int?`, so an
-// extension on `int` applies to an `int`/`int?` receiver alike). Base-class,
-// interface, and generic-extension matching (§26.5 step 2/3) are deferred
-// (#433): a non-empty genericArgs list on either side disqualifies the match
-// here so an `extension Box<int>` is never mis-applied to a `Box<string>`.
+// §26.5 (#714): extract the simple name from a Named TypeRef — works for
+// both user-declared types (via declaration->name) and null-declaration
+// builtin types (via astNode->name->parts or importedName).
+static std::string_view namedTypeSimpleName(const TypeRef* ref) {
+    if (!ref || ref->kind != TypeRef::Kind::Named) return {};
+    if (ref->declaration) return ref->declaration->name;
+    if (!ref->importedName.empty()) return ref->importedName;
+    if (ref->astNode && ref->astNode->name &&
+        !ref->astNode->name->parts.empty())
+        return ref->astNode->name->parts.back();
+    return {};
+}
+
+// §26.5 (#714): does an extension declared on `target` apply to a receiver
+// of type `recv`? This slice matches EXACTLY (the receiver's own compile-time
+// type), ignoring nullability on both sides (§26.2 forbids `extension int?`,
+// so an extension on `int` applies to an `int`/`int?` receiver alike).
+// Base-class, interface, and generic-extension matching (§26.5 step 2/3) is
+// handled by extensionTargetMatchesReceiverOrBase; this function handles the
+// EXACT match, including for null-declaration builtin Named types (comparing
+// by name rather than declaration pointer so `extension IEnumerable<T>` can
+// match a synthesised `IEnumerable<int>` ancestor without a TypeDecl).
 static bool extensionTargetMatchesReceiver(
     const TypeRef* target, const TypeRef* recv,
     const std::unordered_set<std::string_view>& freeVars) {
@@ -1307,11 +1322,26 @@ static bool extensionTargetMatchesReceiver(
     switch (target->kind) {
         case TypeRef::Kind::Primitive:
             return target->primitive == recv->primitive;
-        case TypeRef::Kind::Named:
-            if (target->declaration == nullptr ||
-                recv->declaration == nullptr)
-                return false;
-            if (target->declaration != recv->declaration) return false;
+        case TypeRef::Kind::Named: {
+            // Two user-declared types: compare by declaration pointer (the
+            // existing path; generic-arg matching with freeVars below).
+            // One or both are null-declaration builtins: compare by name.
+            // A null-declaration + non-null-declaration pair is never equal
+            // (a builtin cannot match a user type and vice versa).
+            bool targetIsBuiltin = (target->declaration == nullptr);
+            bool recvIsBuiltin   = (recv->declaration   == nullptr);
+            if (targetIsBuiltin != recvIsBuiltin)
+                return false;   // builtin vs user-declared → never match
+            if (!targetIsBuiltin) {
+                // Both user-declared: pointer equality.
+                if (target->declaration != recv->declaration) return false;
+            } else {
+                // Both builtins (null declaration): compare by simple name.
+                std::string_view tname = namedTypeSimpleName(target);
+                std::string_view rname = namedTypeSimpleName(recv);
+                if (tname.empty() || rname.empty() || tname != rname)
+                    return false;
+            }
             // §26.5 (#773): generic-extension matching. The declarations agree
             // (same generic type); now match each type argument. A target arg
             // that is one of the extension's FREE TYPE VARIABLES (the `T` in
@@ -1337,38 +1367,187 @@ static bool extensionTargetMatchesReceiver(
                     return false;  // concrete arg must match exactly
             }
             return true;
+        }
         default:
             return false;  // function/array/unit types are not extensible
     }
 }
 
-// §26.5 (#927): an extension declared on `target` also applies to a receiver
-// whose static type is a SUBTYPE of `target` — the lookup must search the
-// receiver's "type, base types, or implemented interfaces" (§26.5 step 2), not
-// just its exact type. Walk the receiver's ancestor chain (BFS over
-// baseTypeRefs, which carry resolved generic args) and retry the exact match
-// for each ancestor. Reuses extensionTargetMatchesReceiver so generic-extension
-// free-var unification (e.g. `extension IEnumerable<T>` against an inherited
-// `IEnumerable<int>`) is handled uniformly.
-static bool extensionTargetMatchesReceiverOrBase(
-    const TypeRef* target, const TypeRef* recv,
-    const std::unordered_set<std::string_view>& freeVars) {
-    if (extensionTargetMatchesReceiver(target, recv, freeVars)) return true;
-    if (!recv || recv->kind != TypeRef::Kind::Named || !recv->declaration)
-        return false;
-    std::vector<const TypeRef*> frontier;
-    for (const TypeRef* b : recv->declaration->baseTypeRefs)
-        if (b) frontier.push_back(b);
-    std::size_t i = 0;
-    while (i < frontier.size()) {
-        const TypeRef* anc = frontier[i++];
-        if (!anc) continue;
-        if (extensionTargetMatchesReceiver(target, anc, freeVars)) return true;
-        if (anc->kind == TypeRef::Kind::Named && anc->declaration)
-            for (const TypeRef* b : anc->declaration->baseTypeRefs)
-                if (b) frontier.push_back(b);
+// §26.5 (#714): for a null-declaration builtin receiver type (e.g. `Array<int>`
+// or `OwnedArray<int>`), return its transitive interface ancestors as synthesised
+// null-declaration TypeRefs that carry the same generic args as the receiver.
+// This lets extensionTargetMatchesReceiverOrBase BFS the conceptual interface
+// hierarchy without requiring real TypeDecl nodes.
+//
+// The hierarchy (per stdlib §4.4/§4.5):
+//   Array<T>      : IList<T>
+//   OwnedArray<T> : IOwnedList<T>
+//   Stack<T>      : IReadOnlyCollection<T> (conservative; full chain when needed)
+//   IList<T>      : IReadOnlyList<T>, ICollection<T>
+//   IOwnedList<T> : IReadOnlyList<T>, IOwnedCollection<T>
+//   IReadOnlyList<T>       : IReadOnlyCollection<T>
+//   ICollection<T>         : IReadOnlyCollection<T>
+//   IOwnedCollection<T>    : IReadOnlyCollection<T>
+//   IReadOnlyCollection<T> : IEnumerable<T>
+//   IEnumerable<T>         : (root)
+//
+// Only arity-1 types are covered here; types without standard covariant element
+// chains (e.g. Dictionary<K,V>) are not in scope for this helper.
+static std::vector<const TypeRef*> builtinInterfaceAncestors(
+    std::string_view name, const std::vector<TypeRef*>& genericArgs,
+    std::vector<std::unique_ptr<TypeRef>>& owned) {
+    // Helper to create a synthesised null-declaration Named TypeRef.
+    // ifaceName MUST be a string-literal (static lifetime) so the
+    // string_view importedName field remains valid indefinitely.
+    auto makeBuiltin = [&](std::string_view ifaceName,
+                           std::vector<TypeRef*> args) -> TypeRef* {
+        auto ref = std::make_unique<TypeRef>();
+        ref->kind = TypeRef::Kind::Named;
+        ref->declaration = nullptr;
+        ref->importedName = ifaceName;  // caller supplies a string literal
+        ref->genericArgs = std::move(args);
+        TypeRef* raw = ref.get();
+        owned.push_back(std::move(ref));
+        return raw;
+    };
+    // Only handle arity-1 types with a meaningful interface chain.
+    if (genericArgs.size() != 1) return {};
+    TypeRef* T = genericArgs[0];
+    if (!T) return {};
+    // Build the transitive ancestor list in breadth-first order (topmost
+    // interfaces first so the BFS in extensionTargetMatchesReceiverOrBase
+    // encounters them in the most-specific → least-specific direction).
+    std::vector<const TypeRef*> ancestors;
+    // Tier 1 parents of the concrete collection types.
+    if (name == "Array")
+        ancestors.push_back(makeBuiltin("IList", {T}));
+    else if (name == "OwnedArray")
+        ancestors.push_back(makeBuiltin("IOwnedList", {T}));
+    else if (name == "Stack" || name == "OwnedStack" ||
+             name == "Queue" || name == "OwnedQueue" ||
+             name == "Set"   || name == "OwnedSet" ||
+             name == "LinkedList" || name == "OwnedLinkedList")
+        ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
+    else if (name == "IList")
+        ancestors.push_back(makeBuiltin("IReadOnlyList", {T})),
+        ancestors.push_back(makeBuiltin("ICollection", {T}));
+    else if (name == "IOwnedList")
+        ancestors.push_back(makeBuiltin("IReadOnlyList", {T})),
+        ancestors.push_back(makeBuiltin("IOwnedCollection", {T}));
+    else if (name == "ICollection")
+        ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
+    else if (name == "IOwnedCollection")
+        ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
+    else if (name == "IReadOnlyList")
+        ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
+    else if (name == "IReadOnlyCollection")
+        ancestors.push_back(makeBuiltin("IEnumerable", {T}));
+    // For a name we don't recognise at this level, return empty (no hierarchy
+    // known) — this is conservative: no false-positive extension matches.
+    if (ancestors.empty()) return {};
+    // Recursively expand each ancestor's own ancestors so the returned list is
+    // the full transitive closure.
+    std::vector<const TypeRef*> result;
+    std::vector<std::unique_ptr<TypeRef>> scratch;
+    std::vector<const TypeRef*> frontier(ancestors.begin(), ancestors.end());
+    std::size_t fi = 0;
+    while (fi < frontier.size()) {
+        const TypeRef* anc = frontier[fi++];
+        result.push_back(anc);
+        if (anc->kind == TypeRef::Kind::Named && !anc->importedName.empty()) {
+            std::vector<std::unique_ptr<TypeRef>> childOwned;
+            auto children = builtinInterfaceAncestors(
+                anc->importedName, anc->genericArgs, childOwned);
+            for (auto& u : childOwned) owned.push_back(std::move(u));
+            for (const TypeRef* c : children) frontier.push_back(c);
+        }
     }
-    return false;
+    return result;
+}
+
+// §26.5 (#714): convenience wrapper — same as above but derives name and args
+// from the receiver TypeRef directly (must be a null-decl Named builtin).
+static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
+    const TypeRef* recv,
+    std::vector<std::unique_ptr<TypeRef>>& owned) {
+    if (!recv || recv->kind != TypeRef::Kind::Named || recv->declaration)
+        return {};
+    std::string_view name = namedTypeSimpleName(recv);
+    if (name.empty()) return {};
+    return builtinInterfaceAncestors(name,
+        const_cast<std::vector<TypeRef*>&>(recv->genericArgs), owned);
+}
+
+// §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that
+// exactly matches `target` under freeVars unification, or return nullptr.
+// Walks user-declared receivers via their TypeDecl::baseTypeRefs chain (§26.5
+// step 2) and builtin receivers via the hardcoded stdlib interface hierarchy
+// (Array<T>→IList<T>→…→IEnumerable<T>). The returned ancestor's genericArgs
+// carry the concrete type bindings (e.g. IEnumerable<int> when T=int).
+static const TypeRef* extensionFindMatchingAncestor(
+    const TypeRef* target, const TypeRef* recv,
+    const std::unordered_set<std::string_view>& freeVars,
+    std::vector<std::unique_ptr<TypeRef>>& owned) {
+    if (!target || !recv) return nullptr;
+    if (extensionTargetMatchesReceiver(target, recv, freeVars)) return recv;
+    // Walk user-declared receiver's base type chain.
+    if (recv->kind == TypeRef::Kind::Named && recv->declaration) {
+        std::vector<const TypeRef*> frontier;
+        for (const TypeRef* b : recv->declaration->baseTypeRefs)
+            if (b) frontier.push_back(b);
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            const TypeRef* anc = frontier[i++];
+            if (!anc) continue;
+            if (extensionTargetMatchesReceiver(target, anc, freeVars))
+                return anc;
+            if (anc->kind == TypeRef::Kind::Named && anc->declaration)
+                for (const TypeRef* b : anc->declaration->baseTypeRefs)
+                    if (b) frontier.push_back(b);
+        }
+    }
+    // Walk builtin (null-declaration) receiver's conceptual interface chain.
+    if (recv->kind == TypeRef::Kind::Named && !recv->declaration) {
+        auto builtinAncs = builtinInterfaceAncestorsOf(recv, owned);
+        for (const TypeRef* anc : builtinAncs)
+            if (extensionTargetMatchesReceiver(target, anc, freeVars))
+                return anc;
+    }
+    return nullptr;
+}
+
+// §26.5 (#714): given the extension's `target` TypeRef (e.g. `IEnumerable<T>`)
+// and the matched ancestor of the receiver (e.g. `IEnumerable<int>`), extract
+// the concrete binding for each free var by positional alignment.
+// Example: target = IEnumerable<T (freeVar)>, ancestor = IEnumerable<int>
+//   → binding: [("T", TypeRef{int})]
+static void collectFreeVarBinding(
+    const TypeRef* target, const TypeRef* matchedAncestor,
+    const std::unordered_set<std::string_view>& freeVars,
+    std::vector<std::pair<std::string, TypeRef*>>& binding) {
+    if (!target || !matchedAncestor) return;
+    if (target->genericArgs.size() != matchedAncestor->genericArgs.size())
+        return;
+    for (std::size_t i = 0; i < target->genericArgs.size(); ++i) {
+        const TypeRef* ta = target->genericArgs[i];
+        TypeRef* ra = matchedAncestor->genericArgs[i];
+        if (!ta || !ra) continue;
+        // Is ta a free var? (null-decl Named whose name is in freeVars)
+        if (ta->kind == TypeRef::Kind::Named && !ta->declaration) {
+            std::string_view vname;
+            if (ta->astNode && ta->astNode->name &&
+                !ta->astNode->name->parts.empty())
+                vname = ta->astNode->name->parts.back();
+            else if (!ta->importedName.empty())
+                vname = ta->importedName;
+            if (!vname.empty() && freeVars.count(vname)) {
+                binding.emplace_back(std::string(vname), ra);
+                continue;
+            }
+        }
+        // ta is a concrete arg: recurse to pick up nested free vars.
+        collectFreeVarBinding(ta, ra, freeVars, binding);
+    }
 }
 
 // §26.5 (#773): does an ast::Type name (transitively through generic args /
@@ -1390,7 +1569,9 @@ static bool typeNamesFreeVar(
 
 // §26.5 (#773): true when an extension method's parameter or return types
 // reference a free type variable of the extension — the case whose codegen
-// substitution is deferred (see lookupExtensionMember).
+// substitution is deferred for user-declared extension targets (see
+// lookupExtensionMember). For builtin-target extensions (§26.5 #714), the
+// binding-and-codegen path is now implemented, so this check is not applied.
 static bool extSignatureUsesFreeVar(
     const ast::MethodDecl* md,
     const std::unordered_set<std::string_view>& freeVars) {
@@ -1400,8 +1581,10 @@ static bool extSignatureUsesFreeVar(
     return false;
 }
 
-Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
-                                      std::string_view name) {
+Symbol* ExprTC::lookupExtensionMember(
+    const TypeRef* receiver,
+    std::string_view name,
+    std::vector<std::pair<std::string, TypeRef*>>* outBinding) {
     if (!receiver || !ctx_.module()) return nullptr;
     for (Symbol* child : ctx_.module()->children) {
         auto* ext = dynamic_cast<ExtensionSymbol*>(child);
@@ -1409,28 +1592,72 @@ Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
         const TypeRef* target = ctx_.resolvedType(*decl->targetType);
-        // §26.5 (#773): the extension's free type variables — the `T` in
-        // `extension Bag<T> where T: class` — come from its `where`-constraint
-        // type-params; a target arg named by one of them unifies with any
-        // receiver arg of that position.
+        // §26.5 (#773/#714): the extension's free type variables are EITHER
+        // named in a `where T: …` constraint (`extension Bag<T> where T: class`)
+        // OR introduced implicitly as the generic-arg placeholder name in the
+        // target type (`extension IEnumerable<T>` without a where clause). In
+        // the latter case `genericConstraints` is empty but the target TypeRef's
+        // generic args include a null-declaration Named ref whose name is the
+        // free var — e.g. `IEnumerable<T>` has genericArgs[0] = {Named, null, "T"}.
+        // Collect both sources so a plain `extension IEnumerable<T>` is treated
+        // identically to `extension IEnumerable<T> where T: class` for matching.
         std::unordered_set<std::string_view> freeVars;
         for (const auto& gc : decl->genericConstraints)
             freeVars.insert(gc.typeParam);
-        if (!extensionTargetMatchesReceiverOrBase(target, receiver, freeVars))
-            continue;
+        // §26.5 (#714): for BUILTIN extension targets (null-declaration, e.g.
+        // `IEnumerable<T>` without a where clause), the generic args are type
+        // params scoped by TypeResolution (null-decl Named refs with empty
+        // genericArgs) that aren't already in freeVars via genericConstraints.
+        // Collect them so the extension matches correctly. This is ONLY safe for
+        // builtin targets: for a user-declared target like `Box<W>`, `W` becomes
+        // null-decl because TypeResolution treats all single-part bare names in
+        // extension generic args as type params (even if a class named W exists),
+        // but the matching semantics are different there — freeVars from
+        // genericConstraints only is the correct #773 behavior for that case.
+        if (target && target->kind == TypeRef::Kind::Named &&
+            !target->declaration) {
+            std::function<void(const TypeRef*)> scanFreeVars =
+                [&](const TypeRef* tr) {
+                if (!tr) return;
+                if (tr->kind == TypeRef::Kind::Named && !tr->declaration) {
+                    std::string_view vname;
+                    if (tr->astNode && tr->astNode->name &&
+                        !tr->astNode->name->parts.empty())
+                        vname = tr->astNode->name->parts.back();
+                    else if (!tr->importedName.empty())
+                        vname = tr->importedName;
+                    // A bare single-part null-decl name with no genericArgs is
+                    // a free type variable (builtins have non-empty genericArgs).
+                    if (!vname.empty() && tr->genericArgs.empty())
+                        freeVars.insert(vname);
+                }
+                for (const TypeRef* ga : tr->genericArgs) scanFreeVars(ga);
+            };
+            scanFreeVars(target);
+        }
+        // §26.5 (#714): find the ancestor of `receiver` that matches `target`
+        // (could be receiver itself if exact match). We need the ancestor both
+        // for the bool match AND for extracting the concrete T-binding.
+        std::vector<std::unique_ptr<TypeRef>> ownedAncs;
+        const TypeRef* matchedAnc = extensionFindMatchingAncestor(
+            target, receiver, freeVars, ownedAncs);
+        if (!matchedAnc) continue;
+        // Determine whether the extension target is a builtin (null-decl) type.
+        // For builtin-target extensions (e.g. `extension IEnumerable<T>`), the
+        // full binding-and-codegen path is implemented (#714). For user-declared
+        // extension targets (e.g. `extension Bag<T> where T: class`), methods
+        // whose SIGNATURES use the free type variable are still deferred (#773):
+        // skip them so the lookup falls through to a clean diagnostic rather than
+        // generating type-mismatched IR.
+        bool targetIsBuiltin =
+            target && target->kind == TypeRef::Kind::Named && !target->declaration;
         for (Symbol* m : ext->members) {
             if (!m || m->name != name) continue;
-            // §26.5 (#773): a generic-extension method whose SIGNATURE
-            // references a free type variable (`FirstOr(x: T): T`) needs the
-            // free var substituted by the receiver's concrete arg in codegen
-            // — not yet implemented; matching it would emit a type-mismatched
-            // call (IR_FAIL). Skip such a method so the lookup falls through to
-            // a clean "no member" diagnostic instead of malformed IR. A method
-            // that does NOT use the free var in its signature (`IsEmpty(): bool`
-            // — it uses T only via the receiver's own members) is fully
-            // supported. This scopes #773 to the sound subset; the
-            // free-var-in-signature case is a deferred follow-up.
-            if (!freeVars.empty()) {
+            if (!freeVars.empty() && !targetIsBuiltin) {
+                // User-declared generic extension (#773): skip methods whose
+                // signatures reference a free type variable — that case is
+                // deferred. Methods that do NOT use the free var in their
+                // signatures (e.g. `IsEmpty(): bool` on a `Bag<T>`) are fine.
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
                     if (auto* md =
                             dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
@@ -1438,6 +1665,16 @@ Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
                     }
                 }
             }
+            // §26.5 (#714/#773): when the extension has free type variables,
+            // compute the binding (T → concrete TypeRef) from the matched
+            // ancestor's generic args. This binding lets typeCall substitute
+            // the return type and codegen emit a specialized body.
+            std::vector<std::pair<std::string, TypeRef*>> binding;
+            if (!freeVars.empty()) {
+                // Collect T→concrete mapping positionally from matched ancestor.
+                collectFreeVarBinding(target, matchedAnc, freeVars, binding);
+            }
+            if (outBinding) *outBinding = binding;
             return m;
         }
     }

@@ -728,6 +728,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (ma->target && ms->parent)
                         rt = substituteMemberType(rt, ma->target.get(),
                                                   ms->parent);
+                    // §26.5 (#714): generic extension method — substitute the
+                    // return type using the free-var binding inferred at the
+                    // member-access site (e.g. T→int for `xs.FirstOr(0)` where
+                    // xs: Array<int> and the extension is on IEnumerable<T>).
+                    if (!ms->parent && ms->extensionDecl) {
+                        if (const auto* bnd = ctx_.exprExtBinding(*ma)) {
+                            if (!bnd->empty()) {
+                                std::unordered_map<std::string_view,
+                                                   TypeRef*> solved;
+                                for (const auto& [nm, ty] : *bnd)
+                                    solved[nm] = ty;
+                                rt = substituteReturnType(rt, solved);
+                            }
+                        }
+                    }
                 }
                 // per §14.1/§14.2 (issue #509): EXPLICIT method-level type
                 // arguments supplied at the call site (e.g. `Identity<int>(v)`
@@ -6291,7 +6306,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // The receiver's compile-time type is `ma.target`'s exprType.
         if (ma.target) {
             if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
-                if (Symbol* ext = lookupExtensionMember(recvTy, ma.member)) {
+                // §26.5 (#714): pass outBinding to capture the free-var
+                // binding when a generic extension matched via ancestor lookup.
+                std::vector<std::pair<std::string, sema::TypeRef*>> binding;
+                if (Symbol* ext = lookupExtensionMember(
+                        recvTy, ma.member, &binding)) {
+                    if (!binding.empty())
+                        ctx_.setExprExtBinding(&ma, std::move(binding));
                     resolveExtensionMember(ma, ext);
                     return;
                 }
@@ -6316,7 +6337,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             synth.declaration = targetType;
             recvTy = &synth;
         }
-        if (Symbol* ext = lookupExtensionMember(recvTy, ma.member)) {
+        // §26.5 (#714): pass outBinding to capture the free-var binding.
+        std::vector<std::pair<std::string, sema::TypeRef*>> binding;
+        if (Symbol* ext = lookupExtensionMember(
+                recvTy, ma.member, &binding)) {
+            if (!binding.empty())
+                ctx_.setExprExtBinding(&ma, std::move(binding));
             resolveExtensionMember(ma, ext);
             return;
         }

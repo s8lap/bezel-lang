@@ -9965,6 +9965,34 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
+    // §26.5 (#714): a GENERIC EXTENSION METHOD (ms->parent == null,
+    // ms->extensionDecl != null, extension has free type variables).  Sema
+    // recorded the free-var binding (e.g. T → int for `Array<int>` receiver
+    // on `extension IEnumerable<T>`) in the SemaContext keyed by the callee
+    // MemberAccessExpr.  Read it here to set up genericSubst_/
+    // genericSubstSemaTy_ so that emitInlineGenericMethod specialises the body
+    // with the correct concrete types (replacing the i32 placeholder).
+    if (!isStaticMethod(ms) && !ms->parent && ms->extensionDecl) {
+        if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (const auto* bnd = ctx_.exprExtBinding(*callMa)) {
+                if (!bnd->empty()) {
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                    std::unordered_map<std::string_view,
+                                       const sema::TypeRef*> newSema;
+                    for (const auto& [nm, ty] : *bnd) {
+                        if (!ty) continue;
+                        newSubst[nm] = lowerTypeRef(ty);
+                        newSema[nm] = ty;
+                    }
+                    if (!newSubst.empty()) {
+                        genericSubst_ = std::move(newSubst);
+                        genericSubstSemaTy_ = std::move(newSema);
+                    }
+                }
+            }
+        }
+    }
     // per §14.1 / §22.12 (issue #520): a STATIC method on a generic class
     // accessed via explicit receiver type args (`Registry<int>.Make(7)`) has no
     // instance receiver to derive the substitution from — the `!isStaticMethod`

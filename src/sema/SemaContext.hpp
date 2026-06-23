@@ -260,6 +260,23 @@ public:
         return it == importedConstValues_.end() ? nullptr : &it->second;
     }
 
+    // §26.5 (#714): store/retrieve the free-type-variable binding that was
+    // inferred when a generic extension method matched via ancestor lookup.
+    // `e` is the MemberAccessExpr node of the member access (the `.MyCount`
+    // in `xs.MyCount()`).  Each entry is a list of (paramName, concreteTypeRef)
+    // pairs, e.g. [("T", TypeRef*{int})].  The list is consumed by typeCall
+    // (return-type substitution) and by codegen (genericSubst_ setup).
+    void setExprExtBinding(
+        const ast::Expr* e,
+        std::vector<std::pair<std::string, TypeRef*>> binding) {
+        exprExtBindings_[e] = std::move(binding);
+    }
+    const std::vector<std::pair<std::string, TypeRef*>>*
+    exprExtBinding(const ast::Expr& e) const {
+        auto it = exprExtBindings_.find(&e);
+        return it == exprExtBindings_.end() ? nullptr : &it->second;
+    }
+
 private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
@@ -293,6 +310,15 @@ private:
     // Backing storage for synthetic source strings whose string_view fields
     // are referenced by re-parsed AST nodes in importedCtorAst_.
     std::vector<std::string> importedSources_;
+    // §26.5 (#714): per MemberAccessExpr, the free-type-variable → concrete-TypeRef
+    // binding inferred when a generic extension method matched a builtin receiver
+    // through the ancestor chain (e.g. `extension IEnumerable<T>` on `Array<int>`
+    // binds T → int).  Set by ExprTypecheck (lookupExtensionMember/resolveExtension)
+    // and consumed by typeCall (return-type substitution) and codegen
+    // (genericSubst_ setup via exprExtBinding).
+    std::unordered_map<const ast::Expr*,
+                       std::vector<std::pair<std::string, TypeRef*>>>
+        exprExtBindings_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.
