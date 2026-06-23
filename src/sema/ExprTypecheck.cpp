@@ -1895,6 +1895,28 @@ void ExprTC::visitMember(const ast::Member& m) {
             Scope* saveScope = currentScope_;
             if (!currentScope_) currentScope_ = moduleScope_.get();
             visitExpr(*fd->initializer);
+            // §17.7 (#987, mirrors the LocalDecl fix #979): a typeless
+            // `new(args)` shorthand field initializer takes its construction
+            // target from the field's declared type. Record it as the NewExpr's
+            // exprType (codegen's lowerNew and the ownership pass read it) and
+            // validate the constructor arguments — without this the shorthand
+            // new was never typed, codegen skipped construction, and the field
+            // stayed null (SIGSEGV on first access).
+            if (fd->type) {
+                if (auto* shNe = dynamic_cast<const ast::NewExpr*>(
+                        fd->initializer.get())) {
+                    if (!shNe->type) {
+                        if (auto* fty = ctx_.resolvedType(*fd->type)) {
+                            ctx_.setExprType(fd->initializer.get(), fty);
+                            if (fty->kind == TypeRef::Kind::Named &&
+                                fty->declaration &&
+                                fty->declaration->kind ==
+                                    ast::TypeDeclKind::Class)
+                                checkNewExprArgs(*shNe, fty->declaration);
+                        }
+                    }
+                }
+            }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
             // §22.13: a static readonly field may not forward-reference a later

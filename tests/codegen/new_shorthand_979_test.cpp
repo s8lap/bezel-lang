@@ -138,3 +138,31 @@ BEZEL_TEST(new_shorthand_979, wrong_arg_rejected) {
         "  return 0; "
         "end Main; end C;"));
 }
+
+// §17.7 / #987 (follow-up to #979): the shorthand in a FIELD initializer also
+// constructs — a separate code path that still SIGSEGV'd after the LocalDecl fix.
+BEZEL_TEST(new_shorthand_979, field_init_class_constructs) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kConfig +
+        "class Holder public owned cfg: Config := new(verbose := true); "
+        "  public constructor() end constructor; destructor end destructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h: Holder := new Holder(); "
+        "  return (1 if h.cfg.V else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §17.7 / #987: a RECORD shorthand field initializer is a value and constructs
+// (the ownership pass must not reject the value field as an owned obligation).
+BEZEL_TEST(new_shorthand_979, field_init_record_is_value) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pt(x: int, y: int); "
+        "class Holder public p: Pt := new(3, 4); "
+        "  public constructor() end constructor; destructor end destructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h: Holder := new Holder(); "
+        "  return h.p.x + h.p.y; "
+        "end Main; end C;"), 7);
+}
