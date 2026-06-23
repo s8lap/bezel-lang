@@ -6570,24 +6570,24 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     auto* clsId = dynamic_cast<const ast::IdentifierExpr*>(inner->target.get());
     if (!clsId || clsId->name != "Encoding") return nullptr;
 
-    const auto& sg = inner->member;  // "Utf8", "Utf16", "Utf32", or "Ascii"
+    const auto& sg = inner->member;  // "UTF8", "UTF16", "UTF32", or "ASCII"
     const auto& m  = ma->member;     // "GetBytes", "GetString", or "Name"
 
     // Determine runtime function names and whether GetBytes/GetString can fail.
-    // Utf8: lenient decoder (no error); Utf16/Utf32/Ascii: strict, return null.
-    bool canFail = (sg != "Utf8");
+    // UTF8: lenient decoder (no error); UTF16/UTF32/ASCII: strict, return null.
+    bool canFail = (sg != "UTF8");
     std::string getBytesName = "bz_encoding_" +
-        (sg == "Utf8"  ? std::string("utf8")  :
-         sg == "Utf16" ? std::string("utf16") :
-         sg == "Utf32" ? std::string("utf32") :
+        (sg == "UTF8"  ? std::string("utf8")  :
+         sg == "UTF16" ? std::string("utf16") :
+         sg == "UTF32" ? std::string("utf32") :
                          std::string("ascii")) + "_get_bytes";
     std::string getStringName = "bz_encoding_" +
-        (sg == "Utf8"  ? std::string("utf8")  :
-         sg == "Utf16" ? std::string("utf16") :
-         sg == "Utf32" ? std::string("utf32") :
+        (sg == "UTF8"  ? std::string("utf8")  :
+         sg == "UTF16" ? std::string("utf16") :
+         sg == "UTF32" ? std::string("utf32") :
                          std::string("ascii")) + "_get_string";
 
-    if (sg != "Utf8" && sg != "Utf16" && sg != "Utf32" && sg != "Ascii")
+    if (sg != "UTF8" && sg != "UTF16" && sg != "UTF32" && sg != "ASCII")
         return nullptr;
 
     // GetBytes(s): owned Array<byte>.  Returns null on failure for strict

@@ -28,7 +28,7 @@ compiler pipeline from lexer through codegen.
 - Reference-counted runtime-managed types: strings, closures, boxes
 - Standard library: `Array<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`,
   `Queue<T>`, `LinkedList<T>` (and owned variants); `String`, `StringBuilder`;
-  LINQ; `Encoding.Utf8`; `Math`, `Convert`; `DateTime`, `TimeSpan`, `Guid`;
+  LINQ; `Encoding.UTF8`; `Math`, `Convert`; `DateTime`, `TimeSpan`, `Guid`;
   `CancellationToken`, `Task`
 - Async/await end-to-end: cross-thread scheduler, async iterators / `await for`,
   `Task` combinators, `await using`

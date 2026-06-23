@@ -2035,10 +2035,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 inner2->target.get())) {
                         if (encId->name == "Encoding") {
                             const char* nameStr = nullptr;
-                            if (inner2->member == "Utf8")  nameStr = "utf-8";
-                            if (inner2->member == "Utf16") nameStr = "utf-16le";
-                            if (inner2->member == "Utf32") nameStr = "utf-32le";
-                            if (inner2->member == "Ascii") nameStr = "us-ascii";
+                            if (inner2->member == "UTF8")  nameStr = "utf-8";
+                            if (inner2->member == "UTF16") nameStr = "utf-16le";
+                            if (inner2->member == "UTF32") nameStr = "utf-32le";
+                            if (inner2->member == "ASCII") nameStr = "us-ascii";
                             if (nameStr) {
                                 // Emit as a string literal (constant global).
                                 // Wrap in quotes — lowerStringLiteral strips them.

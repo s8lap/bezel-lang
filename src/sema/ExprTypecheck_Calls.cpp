@@ -5238,8 +5238,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (auto* eid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if (eid->name == "Encoding") {
                 const auto& sg = ma.member;
-                if (sg == "Utf8" || sg == "Utf16" || sg == "Utf32" ||
-                    sg == "Ascii") {
+                if (sg == "UTF8" || sg == "UTF16" || sg == "UTF32" ||
+                    sg == "ASCII") {
                     // stdlib §3.2 v0.136: all four singletons now implemented.
                     auto* encTy = ctx_.makeTypeRef();
                     encTy->kind = TypeRef::Kind::Named;
@@ -5248,10 +5248,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 // #984 / stdlib §3.2: any OTHER member of the `Encoding` builtin
-                // is invalid — the only singletons are Utf8/Utf16/Utf32/Ascii.
+                // is invalid — the only singletons are UTF8/UTF16/UTF32/ASCII.
                 // Without this reject, `Encoding.<X>` for an unrecognized X (most
-                // commonly `Encoding.UTF8` — the spec PROSE uses `UTF8` while
-                // §3.2 defines `Utf8`; tracked as a docs inconsistency) was left
+                // commonly `Encoding.Utf8` — the old PascalCase form) was left
                 // untyped, the chained `.GetBytes(...)` had no codegen lowering,
                 // and the result silently miscompiled to garbage (an
                 // uninitialized local → Length 0 / SIGSEGV on index). A clear
@@ -5259,8 +5258,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.diagnostics().report(
                     Severity::Error, ma.span.begin,
                     "`Encoding` has no member `" + std::string(ma.member) +
-                    "` — the encoding singletons are `Utf8`, `Utf16`, `Utf32`, "
-                    "and `Ascii` (stdlib §3.2)");
+                    "` — the encoding singletons are `UTF8`, `UTF16`, `UTF32`, "
+                    "and `ASCII` (stdlib §3.2)");
                 return;
             }
         }
@@ -5288,7 +5287,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.diagnostics().report(
                     Severity::Error, ma.span.begin,
                     "an `Encoding` value is usable only as the immediate "
-                    "receiver of `Encoding.Utf8.GetBytes(...)` / "
+                    "receiver of `Encoding.UTF8.GetBytes(...)` / "
                     "`.GetString(...)` (stdlib §3.2); binding it to a variable "
                     "or using it indirectly is not yet supported");
                 return;

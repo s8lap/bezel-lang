@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.147 — June 2026**
+**Companion to the Bezel Language Specification, v0.148 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -837,23 +837,23 @@ public abstract class Encoding
   public abstract method GetString(bytes: Array<byte>, index: int, count: int): string;
   public abstract readonly property Name: string;
 
-  public static readonly property Utf8: Encoding;
-  public static readonly property Utf16: Encoding;
-  public static readonly property Utf32: Encoding;
-  public static readonly property Ascii: Encoding;
+  public static readonly property UTF8: Encoding;
+  public static readonly property UTF16: Encoding;
+  public static readonly property UTF32: Encoding;
+  public static readonly property ASCII: Encoding;
 end Encoding;
 ```
 
-The static properties (`Utf8`, `Utf16`, `Utf32`, `Ascii`) return singleton instances of implementation-provided concrete subclasses. The concrete subclass types are not part of the public API; callers access them through the `Encoding` base type. The singleton instances are program-lifetime objects with no resources to release; their `Dispose()` is a no-op. They are not marked `static owned` — they are exempt from the ownership-discharge requirement by the same reasoning as non-`owned` static class-typed fields ([§22.13](Bezel_Language_Spec.md#sec-static-initialization-order) of the language spec).
+The static properties (`UTF8`, `UTF16`, `UTF32`, `ASCII`) return singleton instances of implementation-provided concrete subclasses. The concrete subclass types are not part of the public API; callers access them through the `Encoding` base type. The singleton instances are program-lifetime objects with no resources to release; their `Dispose()` is a no-op. They are not marked `static owned` — they are exempt from the ownership-discharge requirement by the same reasoning as non-`owned` static class-typed fields ([§22.13](Bezel_Language_Spec.md#sec-static-initialization-order) of the language spec).
 
 `Encoding` is `abstract` to permit implementation-provided concrete subclasses. User code may subclass `Encoding` for custom encodings; user subclasses are subject to normal class disposal rules (they may have destructors and owned fields).
 
-**Semantics of the standard encodings (specified in v0.136).** All four standard encodings follow one error model: malformed or unrepresentable input is a **defined fault**, never a silent substitution. `GetString` raises `FormatException` when the input bytes are not a well-formed sequence in the encoding; `GetBytes` raises `FormatException` when the string contains a code point the encoding cannot represent (possible only for `Ascii`). No replacement characters are produced. (The lenient decode-with-replacement mode was considered and declined — rationale changelog, v0.136.)
+**Semantics of the standard encodings (specified in v0.136).** All four standard encodings follow one error model: malformed or unrepresentable input is a **defined fault**, never a silent substitution. `GetString` raises `FormatException` when the input bytes are not a well-formed sequence in the encoding; `GetBytes` raises `FormatException` when the string contains a code point the encoding cannot represent (possible only for `ASCII`). No replacement characters are produced. (The lenient decode-with-replacement mode was considered and declined — rationale changelog, v0.136.)
 
-- **`Utf8`** (`Name` = `"utf-8"`): bytes are the UTF-8 form of the string's code points. `GetBytes` never emits a byte-order mark; `GetString` does not treat a leading `EF BB BF` specially (it decodes to U+FEFF). Ill-formed sequences — overlong forms, unpaired-surrogate encodings, truncated tails — raise `FormatException`.
-- **`Utf16`** (`Name` = `"utf-16le"`): little-endian, no BOM emitted. `GetString` requires an even byte count, consumes one leading little-endian BOM (`FF FE`) if present, and raises `FormatException` on an odd count, a big-endian BOM (`FE FF`), or an unpaired surrogate. Big-endian UTF-16 is not provided; a program that needs it byte-swaps explicitly.
-- **`Utf32`** (`Name` = `"utf-32le"`): little-endian, no BOM emitted. `GetString` requires a byte count divisible by four, consumes one leading little-endian BOM if present, and raises `FormatException` on any unit that is not a Unicode scalar value (greater than `U+10FFFF` or in the surrogate range).
-- **`Ascii`** (`Name` = `"us-ascii"`): strict seven-bit. `GetBytes` raises `FormatException` on any code point above `U+007F`; `GetString` raises `FormatException` on any byte above `0x7F`.
+- **`UTF8`** (`Name` = `"utf-8"`): bytes are the UTF-8 form of the string's code points. `GetBytes` never emits a byte-order mark; `GetString` does not treat a leading `EF BB BF` specially (it decodes to U+FEFF). Ill-formed sequences — overlong forms, unpaired-surrogate encodings, truncated tails — raise `FormatException`.
+- **`UTF16`** (`Name` = `"utf-16le"`): little-endian, no BOM emitted. `GetString` requires an even byte count, consumes one leading little-endian BOM (`FF FE`) if present, and raises `FormatException` on an odd count, a big-endian BOM (`FE FF`), or an unpaired surrogate. Big-endian UTF-16 is not provided; a program that needs it byte-swaps explicitly.
+- **`UTF32`** (`Name` = `"utf-32le"`): little-endian, no BOM emitted. `GetString` requires a byte count divisible by four, consumes one leading little-endian BOM if present, and raises `FormatException` on any unit that is not a Unicode scalar value (greater than `U+10FFFF` or in the surrogate range).
+- **`ASCII`** (`Name` = `"us-ascii"`): strict seven-bit. `GetBytes` raises `FormatException` on any code point above `U+007F`; `GetString` raises `FormatException` on any byte above `0x7F`.
 
 The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range.
 

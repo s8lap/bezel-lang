@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.147 — June 2026**
+**Companion to the Bezel Language Specification, v0.148 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6992,6 +6992,30 @@ Stdlib §10.1 (the `FromBytes` prose paragraph). Rationale: this changelog. Vers
 #### Migration
 
 None. The compiler implementation already provides exactly the copy-in-and-append-terminator behaviour (the `bz_cstring_from_bytes` runtime helper added with the CString static-call resolution work, #977): it copies the array's bytes and writes a trailing null. The spec prose is corrected to describe what the implementation does; no conforming program changes meaning, and no compiler change is required by this revision.
+
+---
+
+### v0.148 changelog (v0.147 → v0.148)
+
+v0.148 renames the four `Encoding` singletons from PascalCase (`Utf8`/`Utf16`/`Utf32`/`Ascii`) to all-caps (`UTF8`/`UTF16`/`UTF32`/`ASCII`) to match the spec prose and .NET convention. Owner-directed 2026-06-23; tracked as #988.
+
+#### The defect
+
+Stdlib §3.2 defined the four `Encoding` static properties using PascalCase names (`Utf8`, `Utf16`, `Utf32`, `Ascii`). The language-spec prose, however, consistently uses all-caps forms (`Encoding.UTF8`, `Encoding.UTF16`, etc.) — following the established .NET/C# convention where encoding singletons are `Encoding.UTF8` not `Encoding.Utf8`. This mismatch meant every spec example using `Encoding.UTF8.GetBytes(s)` was syntactically rejected by the compiler with a "has no member" diagnostic (fix #984 made the diagnostic explicit; before that it silently miscompiled). Programmers consulting the spec would write code that the compiler refused.
+
+#### The resolution
+
+The four singleton names are renamed to `UTF8`/`UTF16`/`UTF32`/`ASCII` everywhere: the §3.2 property definitions, the compiler's accepted-name sets in sema (ExprTypecheck_Calls.cpp) and codegen (LlvmBackend_Calls.cpp, LlvmBackend_Exprs.cpp), the diagnostic message, and all tests. The PascalCase forms (`Utf8` etc.) are now unrecognised member names and produce the existing "has no member" diagnostic. The runtime C function names (`bz_encoding_utf8_*`) and the encoding `Name` strings (`"utf-8"`, `"utf-16le"`, `"utf-32le"`, `"us-ascii"`) are unchanged — they are not user-facing Bezel names.
+
+The method/type names that merely contain "Ascii" as a substring — `IsAscii`, `AsAsciiByteSpan`, `TryAsAsciiByteSpan`, `ReadOnlyAsciiByteSpan` — are NOT renamed; they describe ASCII-the-property/type, not the `Encoding.ASCII` singleton, and their PascalCase is correct per Bezel naming conventions.
+
+#### Touched
+
+Stdlib §3.2 (four property declarations and prose). Compiler: sema/ExprTypecheck_Calls.cpp, codegen/LlvmBackend_Calls.cpp, codegen/LlvmBackend_Exprs.cpp. Tests: tests/codegen/encoding_test.cpp (all `Encoding.Utf8/Utf16/Utf32/Ascii` → uppercase; #984 acceptance/rejection tests flipped), tests/codegen/timespan_encoding_525_526_test.cpp. Version headers bumped to v0.148 across the language spec, standard library, and design rationale.
+
+#### Migration
+
+Replace `Encoding.Utf8` with `Encoding.UTF8`, `Encoding.Utf16` with `Encoding.UTF16`, `Encoding.Utf32` with `Encoding.UTF32`, and `Encoding.Ascii` with `Encoding.ASCII` in all Bezel source files. No other changes are needed; method names (`GetBytes`, `GetString`, `Name`) and runtime behavior are unchanged.
 
 ---
 

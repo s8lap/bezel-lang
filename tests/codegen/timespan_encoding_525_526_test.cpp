@@ -1,4 +1,4 @@
-// Tests for #525 and #526 — TimeSpan operator +/- and Encoding.Utf8.GetBytes
+// Tests for #525 and #526 — TimeSpan operator +/- and Encoding.UTF8.GetBytes
 // Count fix.
 //
 // #525: stdlib §2.5 L264–265 declare
@@ -136,7 +136,7 @@ BEZEL_TEST(codegen_timespan_525, control_datetime_subtract_datetime) {
 }
 
 // ---------------------------------------------------------------------------
-// #526 — Encoding.Utf8.GetBytes Count field (stdlib §3.2)
+// #526 — Encoding.UTF8.GetBytes Count field (stdlib §3.2)
 // ---------------------------------------------------------------------------
 
 // stdlib §3.2: GetBytes("Hello").Count == 5 (five ASCII bytes).
@@ -145,21 +145,21 @@ BEZEL_TEST(codegen_timespan_525, control_datetime_subtract_datetime) {
 BEZEL_TEST(codegen_encoding_526, getbytes_count_ascii_hello_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
         "var s := \"Hello\"; "
-        "using var b := Encoding.Utf8.GetBytes(s); "
+        "using var b := Encoding.UTF8.GetBytes(s); "
         "return b.Count; ")), 5);
 }
 
 // stdlib §3.2: GetBytes("").Count == 0 (empty string → zero bytes).
 BEZEL_TEST(codegen_encoding_526, getbytes_count_empty_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var b := Encoding.Utf8.GetBytes(\"\"); "
+        "using var b := Encoding.UTF8.GetBytes(\"\"); "
         "return b.Count; ")), 0);
 }
 
 // stdlib §3.2: GetBytes("A").Count == 1 (single ASCII character).
 BEZEL_TEST(codegen_encoding_526, getbytes_count_single_char_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var b := Encoding.Utf8.GetBytes(\"A\"); "
+        "using var b := Encoding.UTF8.GetBytes(\"A\"); "
         "return b.Count; ")), 1);
 }
 
@@ -168,7 +168,7 @@ BEZEL_TEST(codegen_encoding_526, getbytes_count_single_char_spec_3_2) {
 BEZEL_TEST(codegen_encoding_526, getbytes_count_multibyte_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
         "var s := \"caf\\u00e9\"; "
-        "using var b := Encoding.Utf8.GetBytes(s); "
+        "using var b := Encoding.UTF8.GetBytes(s); "
         "return b.Count; ")), 5);
 }
 
@@ -177,7 +177,7 @@ BEZEL_TEST(codegen_encoding_526, getbytes_count_multibyte_spec_3_2) {
 BEZEL_TEST(codegen_encoding_526, getbytes_count_3byte_codepoint_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
         "var s := \"\\u4e2d\"; "
-        "using var b := Encoding.Utf8.GetBytes(s); "
+        "using var b := Encoding.UTF8.GetBytes(s); "
         "return b.Count; ")), 3);
 }
 
@@ -185,14 +185,14 @@ BEZEL_TEST(codegen_encoding_526, getbytes_count_3byte_codepoint_spec_3_2) {
 BEZEL_TEST(codegen_encoding_526, control_roundtrip_ascii_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
         "var s := \"Hello, World\"; "
-        "using var b := Encoding.Utf8.GetBytes(s); "
-        "using var back: string := Encoding.Utf8.GetString(b); "
+        "using var b := Encoding.UTF8.GetBytes(s); "
+        "using var back: string := Encoding.UTF8.GetString(b); "
         "return (1 if back = s else 0); ")), 1);
 }
 
 // Control: explicit typed annotation (Array<byte>) still resolves Count (§3.2).
 BEZEL_TEST(codegen_encoding_526, control_explicit_type_count_spec_3_2) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var b: Array<byte> := Encoding.Utf8.GetBytes(\"ABCDE\"); "
+        "using var b: Array<byte> := Encoding.UTF8.GetBytes(\"ABCDE\"); "
         "return b.Count; ")), 5);
 }
