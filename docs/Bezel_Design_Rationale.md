@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.145 — June 2026**
+**Companion to the Bezel Language Specification, v0.146 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6946,6 +6946,30 @@ No existing conforming program changes meaning. Amendment 1 is observable only f
 #### Editorial note
 
 Amendment 1's compiler change overturns one pre-existing codegen test (`long_min_value_literal_exact_bits`) that documented the bit-reinterpret reading; that test is rewritten to observe the literal's bits via `BitConverter.Reinterpret` rather than `ulong(longMin)`, per the CLAUDE.md rule that a test misrepresenting the (now-ruled) spec is fixed.
+
+### v0.146 changelog (v0.145 → v0.146)
+
+v0.146 is an errata revision. It corrects three code-example defects in which an example used syntax the spec itself does not admit; the surrounding prose and every normative rule are unchanged, and the compiler already rejected each of these three examples correctly. No conforming program changes meaning. Owner-directed 2026-06-23; the defects were surfaced by a triage of the conformance-example corpus and are tracked as #978.
+
+#### Erratum 1 — §17.7 `new()` shorthand example used `:` for a named argument
+
+The §17.7 field-initializer example read `private _config: Config := new(verbose: true);`, using a colon for the named argument. §22.5 defines named-argument syntax as `name := value` (e.g. `Log(level := "ERROR", message := "Failed")`); the colon form does not parse. Corrected to `new(verbose := true)`.
+
+#### Erratum 2 — §27.3 lambda example bound a reserved keyword
+
+The §27.3 expression-body lambda example read `var double := (x: int) => x * 2;`. `double` is in Appendix B's unconditionally-reserved keyword list (the primitive-type alias) and is not a contextual keyword, so it may not be used as a variable name. The variable is renamed to `twice`.
+
+#### Erratum 3 — stdlib §2.14 serialization example used the removed `<owned T>` form
+
+The stdlib serialization example declared `public owned Lines: OwnedArray<owned LineItem>;`. Per §14.4 the `owned` modifier on a generic type argument was removed in v0.97 in favour of the named `Owned…` collection types; the position now rejects the modifier. Corrected to `OwnedArray<LineItem>` — the `OwnedArray` type already carries the owning semantics, so the example's meaning is unchanged.
+
+#### Touched
+
+Spec §17.7 (one example line), §27.3 (one example line). Stdlib §2.14 (one example line). Rationale: this changelog. Version headers bumped to v0.146 across the language spec, standard library, and design rationale. No compiler change — the compiler already rejects all three forms correctly (each erratum is an example that contradicted a rule the compiler already enforces).
+
+#### Migration
+
+None. No normative rule changed; the corrected examples now compile as the surrounding prose always intended.
 
 ---
 

@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.145 — June 2026**
+**Version 0.146 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2576,7 +2576,7 @@ A field initializer or typed local declaration may use the `new()` shorthand whe
 
 ```bezel
 private _items: Array<int> := new();
-private _config: Config := new(verbose: true);
+private _config: Config := new(verbose := true);
 var xs: Array<int> := new();
 ```
 
@@ -4548,7 +4548,7 @@ The parentheses around the function type are required before `?`. Without them, 
 
 Expression body:
 ```bezel
-var double := (x: int) => x * 2;
+var twice := (x: int) => x * 2;
 var greet := (name: string) => $"Hello, {name}!";
 ```
 
