@@ -170,6 +170,29 @@ BEZEL_TEST(codegen_encoding, utf8_getbytes_ascii_length_spec_3_2) {
         "end Main; end C;", 5);
 }
 
+// #984 / §3.2: an INVALID Encoding singleton name (e.g. `Encoding.UTF8` — the
+// spec prose uses `UTF8` but §3.2 defines `Utf8`) must be rejected with a clear
+// diagnostic, not left untyped to silently miscompile (the chained
+// `.GetBytes(...)` had no codegen lowering → uninitialized local → Length 0 /
+// SIGSEGV on index).
+BEZEL_TEST(codegen_encoding, invalid_singleton_name_rejected_984) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C public static method Main(): int "
+        "  var b: Array<byte> := Encoding.UTF8.GetBytes(\"hi\"); "
+        "  return b.Length; "
+        "end Main; end C;"));
+}
+
+// #984: the valid `Encoding.Utf8` form is unaffected — the reject must not be
+// over-broad (guards against rejecting a legitimate singleton).
+BEZEL_TEST(codegen_encoding, valid_singleton_name_accepted_984) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf8.GetBytes(\"hi\"); "
+        "  return b.Length; "
+        "end Main; end C;", 2);
+}
+
 // §3.2: the byte at index 0 of GetBytes("Hello") is the ASCII code of 'H' (72).
 BEZEL_TEST(codegen_encoding, utf8_getbytes_ascii_byte_value_spec_3_2) {
     expectValueAndLeakFree(

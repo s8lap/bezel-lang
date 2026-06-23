@@ -5247,6 +5247,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, encTy);
                     return;
                 }
+                // #984 / stdlib §3.2: any OTHER member of the `Encoding` builtin
+                // is invalid — the only singletons are Utf8/Utf16/Utf32/Ascii.
+                // Without this reject, `Encoding.<X>` for an unrecognized X (most
+                // commonly `Encoding.UTF8` — the spec PROSE uses `UTF8` while
+                // §3.2 defines `Utf8`; tracked as a docs inconsistency) was left
+                // untyped, the chained `.GetBytes(...)` had no codegen lowering,
+                // and the result silently miscompiled to garbage (an
+                // uninitialized local → Length 0 / SIGSEGV on index). A clear
+                // diagnostic is the sound outcome.
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "`Encoding` has no member `" + std::string(ma.member) +
+                    "` — the encoding singletons are `Utf8`, `Utf16`, `Utf32`, "
+                    "and `Ascii` (stdlib §3.2)");
+                return;
             }
         }
         // The `Encoding` singleton is reachable ONLY through the direct
