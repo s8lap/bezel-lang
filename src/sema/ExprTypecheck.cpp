@@ -89,24 +89,16 @@ void ExprTC::run(const ast::SourceFile& src) {
 // ownership checker treats them as non-owned (no §28.3 disposal obligation).
 // All other builtins (CancellationTokenSource, Encoding, …) keep the default
 // isValueBuiltin=false and remain owned/reference-typed.
+//
+// issue #922: delegates to SemaContext::builtinClassSym so the TypeResolution
+// annotation pass and the ExprTypecheck pass share the SAME TypeSymbol pointer
+// for each builtin name, enabling pointer-equality guards (e.g. isRangeType,
+// the Range index-check in ExprTypecheck_Exprs.cpp).
 TypeSymbol* ExprTC::builtinClassSym(std::string_view name) {
-    auto key = std::string(name);
-    auto it = builtinClassCache_.find(key);
-    if (it != builtinClassCache_.end()) return it->second;
-    auto* ts = ctx_.makeSymbol<TypeSymbol>();
-    ts->kind = ast::TypeDeclKind::Class;
-    ts->name = name;
-    ts->decl = nullptr;
-    // per §2.5 / §2.6 / §6.1 / §28 (issue #434): scalar/struct value types
-    // have no heap allocation and no disposal obligation.
-    // §9.8: Range<T> is a compiler-intrinsic record (value type); include it
-    // so that ownership checks do not require a disposal path for Range locals.
-    if (name == "DateTime" || name == "TimeSpan" ||
-        name == "Guid"     || name == "CancellationToken" ||
-        name == "Range") {
-        ts->isValueBuiltin = true;
-    }
-    builtinClassCache_[key] = ts;
+    // Use the shared SemaContext cache; keep the per-ExprTC builtinClassCache_
+    // as a fast forwarding layer (both caches are pointer-stable).
+    auto* ts = ctx_.builtinClassSym(name);
+    builtinClassCache_[std::string(name)] = ts;
     return ts;
 }
 

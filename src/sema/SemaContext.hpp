@@ -260,6 +260,18 @@ public:
         return it == importedConstValues_.end() ? nullptr : &it->second;
     }
 
+    // §9.8 / §2.3 / issue #922: allocate-and-cache a compiler-intrinsic
+    // TypeSymbol for a builtin class name (e.g. "Range", "DateTime",
+    // "TimeSpan").  The SAME pointer is returned on every call with the same
+    // name so `declaration == ctx_.builtinClassSym("Range")` pointer-equality
+    // checks (e.g. in ExprTypecheck_Exprs.cpp and isRangeType) work correctly
+    // across both the TypeResolution pass (annotation path) and the
+    // ExprTypecheck pass (inferred-form path).  isValueBuiltin is set for the
+    // same names that ExprTC::builtinClassSym historically marked (DateTime,
+    // TimeSpan, Guid, CancellationToken, Range — all are stack-allocated value
+    // types with no disposal obligation per §28).
+    TypeSymbol* builtinClassSym(std::string_view name);
+
     // §26.5 (#714): store/retrieve the free-type-variable binding that was
     // inferred when a generic extension method matched via ancestor lookup.
     // `e` is the MemberAccessExpr node of the member access (the `.MyCount`
@@ -319,6 +331,11 @@ private:
     std::unordered_map<const ast::Expr*,
                        std::vector<std::pair<std::string, TypeRef*>>>
         exprExtBindings_;
+    // §9.8 / issue #922: shared cache for compiler-intrinsic TypeSymbol stubs
+    // allocated by builtinClassSym().  Shared so the annotation-resolution pass
+    // (TypeResolution) and the typecheck pass (ExprTypecheck) return the SAME
+    // pointer for the same builtin name, enabling pointer-equality guards.
+    std::unordered_map<std::string, TypeSymbol*> builtinClassCache_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.
@@ -336,6 +353,28 @@ inline TypeRef* SemaContext::primitiveTypeRef(PrimitiveType p, bool nullable) {
     ref->nullable = nullable;
     primitiveCache_.emplace(key, ref);
     return ref;
+}
+
+// §9.8 / issue #922: return (and cache) a compiler-intrinsic TypeSymbol for
+// a builtin class name.  isValueBuiltin is set for the scalar/struct value
+// types that carry no disposal obligation (§28): DateTime, TimeSpan, Guid,
+// CancellationToken, and Range (§9.8 — a pair of integer bounds, stack-
+// allocated).  All other names default to isValueBuiltin=false.
+inline TypeSymbol* SemaContext::builtinClassSym(std::string_view name) {
+    auto key = std::string(name);
+    auto it = builtinClassCache_.find(key);
+    if (it != builtinClassCache_.end()) return it->second;
+    auto* ts = makeSymbol<TypeSymbol>();
+    ts->kind = ast::TypeDeclKind::Class;
+    ts->name = name;
+    ts->decl = nullptr;
+    if (name == "DateTime" || name == "TimeSpan" ||
+        name == "Guid"     || name == "CancellationToken" ||
+        name == "Range") {
+        ts->isValueBuiltin = true;
+    }
+    builtinClassCache_[key] = ts;
+    return ts;
 }
 
 } // namespace bezel::sema

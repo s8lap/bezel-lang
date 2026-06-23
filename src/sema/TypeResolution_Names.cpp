@@ -112,6 +112,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // Both are generic compiler-intrinsic classes; T is restricted by the compiler
     // (see ExprTypecheck_Exprs.cpp).
     if (n == "Atomic" || n == "AtomicInteger") return 1;
+    // §16.5 / issue #922: Range<T> is a compiler-intrinsic record (§9.8).
+    // `var r: Range<int> := 1..5` is normative syntax (§16.5); arity 1 so
+    // the explicit annotation resolves.  The resolved TypeRef receives
+    // declaration = ctx_.builtinClassSym("Range") below (same pointer as the
+    // inferred form) so isRangeType / .Start/.End / for-in codegen recognise
+    // it identically to the inferred `1..5` form.
+    if (n == "Range") return 1;
     // issue #545: Buffer<T> — fixed-capacity compiler-intrinsic primitive (arity 1).
     // T restricted to value-type primitives (int/byte/short/long/double/decimal/
     // char/bool) in this revision; class-element Buffer is the §5.20 design pass.
@@ -779,6 +786,18 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             std::string(first.substr(5)) + "<\xE2\x80\xA6>` "
                             "instead.");
                     }
+                }
+                // §16.5 / issue #922: Range<T> is a compiler-intrinsic record.
+                // An explicit annotation `Range<int>` must resolve to the SAME
+                // TypeRef shape as the inferred form `var r := 1..5` — both
+                // must have declaration = ctx_.builtinClassSym("Range") so that
+                // isRangeType() / .Start/.End member access / for-in-over-Range
+                // codegen in LlvmBackend_Stmts.cpp recognise annotated Ranges
+                // identically to inferred ones.  SemaContext::builtinClassSym
+                // caches the pointer so this and ExprTC::builtinClassSym return
+                // the same object, preserving pointer-equality guards.
+                if (first == "Range") {
+                    ref.declaration = ctx_.builtinClassSym("Range");
                 }
                 return;
             }
