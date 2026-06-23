@@ -4126,6 +4126,33 @@ void ExprTC::checkImportedNewExprArgs(
         //   exported and successfully re-parsed → cs->decl is set; the inline-ctor
         //   codegen path (inlineCtorBody) emits the body with genericSubst_ active.
         // Still-gated: explicit ctor present but cs->decl is null (body not loaded).
+
+        // §14 / §12 (#711): INTERIM GATE — imported generic class with a GENERIC
+        // BASE CLASS (e.g. `Box<T> : Container<T>` both in an imported module).
+        // The codegen path for Foundation C (inlineCtorBody) re-emits the base
+        // class template constructor symbol (`bz$Container$ctor`) importer-side,
+        // colliding at link with the exporter's copy.  The collision turns the
+        // cryptic link error into a clean §14 compile-time diagnostic.
+        // The full fix (importer-side per-instantiation base-ctor monomorphization)
+        // is tracked under #428/#711 and is not yet implemented.
+        for (const TypeSymbol* b : t->baseTypes) {
+            if (b->kind == ast::TypeDeclKind::Class &&
+                !b->genericParams.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    std::string("constructing an imported generic class (`new ") +
+                        std::string(t->name) +
+                        "<...>`) whose generic base class (`" +
+                        std::string(b->name) +
+                        "<...>`) also lives in an imported module is not yet "
+                        "supported (\xC2\xA7""14/\xC2\xA7""12, #711): the base "
+                        "constructor would be re-emitted importer-side and collide "
+                        "at link; importer-side per-instantiation base-ctor "
+                        "monomorphization is the full fix (#428/#711)");
+                return;
+            }
+        }
+
         bool noExplicitCtor = true;
         const ConstructorSymbol* explicitCs = nullptr;
         for (const Symbol* m : t->members) {

@@ -3635,4 +3635,60 @@ BEZEL_TEST(cross_module_import, imported_generic_direct_field_accepted_783) {
     BEZEL_EXPECT_TRUE(!r->hadErrors);  // direct field read is specialized
 }
 
+// === #711 — interim §14 gate: imported generic class with a generic base ===
+//
+// Constructing an imported generic class whose generic BASE CLASS also lives in
+// an imported module is not yet supported (#428/#711): the Foundation C path
+// (inlineCtorBody) re-emits the base class template constructor symbol
+// importer-side, colliding at link with the exporter's copy.  The gate turns
+// the cryptic link error into a clean §14/§12 compile-time diagnostic.
+//
+// The FULL FIX (importer-side per-instantiation base-ctor monomorphization) is
+// tracked under #428/#711.
+
+// (25) §14 / §12 (#711): imported generic class Box<T> : Container<T> — both in
+// module A — is REJECTED with a clean §14 diagnostic when constructed importer-
+// side.  The sema-level check fires before any codegen / link step.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_with_generic_base_rejected_spec_14_12_711) {
+    ModuleMetadata dep = buildMetaFor(
+        "module A; "
+        "public class Container<T> "
+        "  public item: T; "
+        "  public constructor(v: T) item := v; end constructor; "
+        "end Container; "
+        "public class Box<T> : Container<T> "
+        "  public constructor(v: T) base(v); end constructor; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module M; import A; "
+        "class C public static method Main(): int "
+        "  using var b := new Box<string>(\"hi\"); return b.item.Length; "
+        "end Main; end C;");
+    // §14/#711 gate: imported generic class with generic base → clean §14 error.
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// (26) §14 (#711 no false positive): an imported generic class with NO generic
+// base is NOT gated — the §711 predicate does not fire.  Wrapper<T> has no base
+// class, so `new Wrapper<int>(9)` at the sema level is accepted clean.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_no_generic_base_accepted_spec_14_711) {
+    ModuleMetadata dep = buildMetaFor(
+        "module A2; "
+        "public class Wrapper<T> "
+        "  public v: T; "
+        "  public constructor(x: T) v := x; end constructor; "
+        "end Wrapper;");
+    auto r = runImporter(
+        dep,
+        "module M; import A2; "
+        "class C public static method Main(): int "
+        "  using var w := new Wrapper<int>(9); return w.v; "
+        "end Main; end C;");
+    // No generic base → §711 gate does NOT fire; sema accepts.
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
 }  // namespace bezel::module
