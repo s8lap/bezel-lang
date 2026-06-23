@@ -10065,6 +10065,165 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
 }
 
 
+// #999 / §15.4: materialize a collection literal in CALL-ARGUMENT position into
+// a fresh owned heap collection of the parameter's target type. §15.4 admits a
+// collection literal "via the parameter type of a method call", so `foo([1,2,3])`
+// where foo's parameter is Array<int> must CONSTRUCT the collection from the
+// literal — it is not a general expression value (lowerExpr returns null for a
+// CollectionLiteralExpr), so the local-decl / return / field-init paths each
+// materialize it via a dedicated path; the call-argument path had none, so the
+// literal lowered to null/garbage (an empty collection for ordinary methods; a
+// dereferenced garbage pointer → crash for the byte-array FFI factories).
+//
+// This is the single entry the argument path uses. It reuses the EXACT same
+// construction machinery the local-decl / field-init paths use (no per-element
+// reimplementation): the dictionary literal form routes to
+// materializeHeapDictLiteral; every sequence form (Array/OwnedArray, Set/OwnedSet,
+// Stack/Queue and owned, LinkedList/OwnedLinkedList) routes to
+// materializeHeapCollectionLiteral (which itself dispatches Set and LinkedList).
+// Returns a `ptr` to the constructed heap collection, or null when `collTy` is
+// not a recognised heap-collection target (caller declines without miscompiling).
+llvm::Value* Emitter::materializeCollectionLiteralForArg(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
+    if (!cl || !collTy) return nullptr;
+    // Dictionary literal `[k: v, …]` (or empty `[]` with a dict target).
+    if (cl->isDict || isDictTypeName(collTy))
+        return materializeHeapDictLiteral(cl, collTy);
+    // Every sequence-literal form (Array/OwnedArray/Set/OwnedSet/Stack/Queue and
+    // owned forms, LinkedList/OwnedLinkedList). materializeHeapCollectionLiteral
+    // routes Set→materializeHeapSetLiteral and LinkedList internally.
+    return materializeHeapCollectionLiteral(cl, collTy);
+}
+
+
+// #999 / stdlib §10: build (once) a concrete `Array<byte>` sema::TypeRef for the
+// byte-array FFI factory arguments (RawBytes.From / CString.FromBytes). Shaped
+// exactly like makeConcreteCollectionResult's Array<byte> (Named, no declaration,
+// a static "Array" astNode, genericArgs[0] = byte) so materializeHeapCollection-
+// Literal's name/element-size/element-coercion logic produces the same bz_array_t
+// a `using var b: Array<byte> := […]` would.
+const sema::TypeRef* Emitter::builtinByteArrayTypeRef() {
+    static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Array");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    auto* tr = ctx_.makeTypeRef();
+    tr->kind = sema::TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->astNode = kArrayAstNode;
+    tr->genericArgs.push_back(
+        ctx_.primitiveTypeRef(sema::PrimitiveType::Byte, /*nullable=*/false));
+    return tr;
+}
+
+
+// #999 / stdlib §10 / §15.4: lower the single `Array<byte>` BORROW argument of a
+// byte-array FFI factory (RawBytes.From / CString.FromBytes). These intrinsic
+// sites have a dedicated call-lowering path (not buildOrderedArgs) that lowered
+// the argument via lowerExpr — which returns null for a CollectionLiteralExpr, so
+// `RawBytes.From([10,20])` dereferenced a garbage pointer and crashed (#999). The
+// factory copies the bytes (stdlib §10: independent buffer) and only borrows the
+// source, so materialize the literal into an owned Array<byte> temporary and
+// register its scope-end disposal (disposed exactly once on the normal AND unwind
+// paths). A non-literal argument lowers exactly as before.
+llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&argExpr)) {
+        const sema::TypeRef* byteArr = builtinByteArrayTypeRef();
+        llvm::Value* coll = materializeCollectionLiteralForArg(cl, byteArr);
+        if (!coll) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(coll->getType());
+        builder_.CreateStore(coll, slot);
+        if (!disposeStack_.empty())
+            disposeStack_.back().push_back(
+                buildCollectionTempDisposal(slot, byteArr));
+        return coll;
+    }
+    return lowerExpr(argExpr);
+}
+
+
+// #999 / §15.4 / §28.3: build the scope-end Disposal entry for an owned temporary
+// heap collection materialized for a BORROW call-argument. The temp is an owned
+// local: the callee borrows it for the call duration, then it is disposed exactly
+// once at scope exit on the normal AND unwind paths (disposeStack_ fires on both).
+// The selection mirrors the `using var` collection / linked-list / dict
+// registration in lowerLocalDecl (LlvmBackend_Setup.cpp ~6281–6430): the right
+// runtime free (bz_array_free / bz_llist_free / bz_dict_free) and the right
+// per-element disposer (class/interface owning thunk, owning Shared/Weak release,
+// or a borrowing-string +1 release). `slot` is an alloca holding the collection
+// pointer. NOT called for an `owned` parameter — ownership transfers into the
+// callee, so the caller registers no disposal (§28.3).
+Emitter::Disposal Emitter::buildCollectionTempDisposal(
+        llvm::Value* slot, const sema::TypeRef* collTy) {
+    auto* alloca = llvm::cast<llvm::AllocaInst>(slot);
+    bool isOwning =
+        collTy->astNode && collTy->astNode->name &&
+        !collTy->astNode->name->parts.empty() &&
+        collTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+    auto isStrElem = [&](const sema::TypeRef* el, bool owning) {
+        if (!el || el->nullable) return false;
+        ElementPolicy p = elementPolicyFor(el, owning);
+        return p.cat == ElementPolicy::Category::RuntimeManaged &&
+               el->kind == sema::TypeRef::Kind::Primitive &&
+               el->primitive == sema::PrimitiveType::String;
+    };
+
+    // LinkedList / OwnedLinkedList → bz_llist_free.
+    if (isLinkedListTypeName(collTy)) {
+        Disposal d{alloca, nullptr};
+        d.linkedList = true;
+        const sema::TypeRef* el =
+            (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+        d.collectionElemDisposer = elementPolicyFor(el, isOwning).disposerThunk;
+        if (!d.collectionElemDisposer && isStrElem(el, /*owning=*/false))
+            d.collectionElemDisposer = stringElementReleaseThunk();
+        return d;
+    }
+
+    // Dictionary / OwnedDictionary → bz_dict_free.
+    if (isDictTypeName(collTy)) {
+        Disposal d{alloca, nullptr};
+        d.dict = true;
+        const sema::TypeRef* vTy =
+            (collTy->genericArgs.size() > 1) ? collTy->genericArgs[1] : nullptr;
+        d.dictValueDisposer = elementPolicyFor(vTy, isOwning).disposerThunk;
+        if (!d.dictValueDisposer)
+            d.dictValueDisposer = dictValueBoxFreer(collTy);
+        if (!d.dictValueDisposer && !isOwning && isStrElem(vTy, /*owning=*/false))
+            d.dictValueDisposer = stringElementReleaseThunk();
+        return d;
+    }
+
+    // Set<string> is dict-backed (bz_dict_t*) — its elements are KEYS, released
+    // via the dict-key path, not bz_array_free (mirrors lowerLocalDecl ~6327).
+    const sema::TypeRef* el =
+        (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+    bool isSetName =
+        collTy->astNode && collTy->astNode->name &&
+        !collTy->astNode->name->parts.empty() &&
+        collTy->astNode->name->parts[0] == "Set";
+    if (isSetName && isStrElem(el, /*owning=*/false)) {
+        Disposal d{alloca, nullptr};
+        d.dict = true;
+        d.dictStringKeys = true;
+        return d;
+    }
+
+    // Array-backed: Array/OwnedArray/Set/OwnedSet/Stack/Queue and owned forms
+    // → bz_array_free with the per-element disposer.
+    Disposal d{alloca, nullptr};
+    d.collection = true;
+    d.collectionElemDisposer = elementPolicyFor(el, isOwning).disposerThunk;
+    if (!d.collectionElemDisposer && isStrElem(el, /*owning=*/false))
+        d.collectionElemDisposer = stringElementReleaseThunk();
+    return d;
+}
+
+
 // #559 / stdlib §4.10: materialize a Set<T>/OwnedSet<T> sequence literal
 // `[e1, e2, …]` into a freshly-allocated Set<T>.
 //

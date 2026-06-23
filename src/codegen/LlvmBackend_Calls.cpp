@@ -4545,7 +4545,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // We copy the byte-array data into a fresh malloc'd buffer with a
         // trailing null so the returned CString is independently owned.
         if (m == "FromBytes" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            llvm::Value* arr =
+                lowerByteArrayFactoryArg(*call.args[0].value);
             if (!arr) return nullptr;
             // Use bz_encoding_utf8_get_bytes' inverse: load the raw data pointer
             // (field 0 of bz_array_t is the elem_count, field 1 is the elements
@@ -4575,7 +4576,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // array's data as an independently-owned heap buffer. Uses bz_rawbytes_from
         // which malloc-copies the array contents (no null-termination assumed).
         if (m == "From" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            llvm::Value* arr =
+                lowerByteArrayFactoryArg(*call.args[0].value);
             if (!arr) return nullptr;
             auto* fn = declareC("bz_rawbytes_from", ptrTy(), {ptrTy()});
             return builder_.CreateCall(fn, {arr}, "rawbytes.from");

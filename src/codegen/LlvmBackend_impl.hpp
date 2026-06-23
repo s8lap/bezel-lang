@@ -5007,6 +5007,48 @@ private:
     llvm::Value* materializeHeapDictLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy);
 
+    // #999 / §15.4: materialize a collection literal `[…]` against ANY heap
+    // collection target type (Array/OwnedArray/Set/OwnedSet/Stack/Queue and their
+    // owned forms, LinkedList/OwnedLinkedList, Dictionary/OwnedDictionary). This
+    // is the single entry the call-argument path uses: it dispatches the dict
+    // literal form to materializeHeapDictLiteral and every sequence form to
+    // materializeHeapCollectionLiteral (which itself routes Set/LinkedList).
+    // Returns a `ptr` to the freshly-built heap collection, or null when `collTy`
+    // is not a recognised heap-collection target (caller then declines).
+    llvm::Value* materializeCollectionLiteralForArg(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy);
+
+    // #999 / stdlib §10: a synthesized, concrete `Array<byte>` sema::TypeRef for
+    // the byte-array FFI factory arguments (RawBytes.From / CString.FromBytes,
+    // both taking a BORROW `Array<byte>`). Those intrinsic call sites have no
+    // MethodDecl params and sema does not set the literal argument's target type,
+    // so the materialization needs this explicit target. Shaped exactly like the
+    // Array<byte> TypeRef makeConcreteCollectionResult builds (Named, no
+    // declaration, a static "Array" astNode, genericArgs[0] = byte).
+    const sema::TypeRef* builtinByteArrayTypeRef();
+
+    // #999 / stdlib §10 / §15.4: lower the single `Array<byte>` BORROW argument
+    // of a byte-array FFI factory (RawBytes.From / CString.FromBytes). When the
+    // argument is a collection literal `[…]`, materialize it into an owned
+    // Array<byte> temporary (the literal is not a general expression value) and
+    // register its scope-end disposal (the factory only borrows the bytes — it
+    // copies them — so the caller owns and disposes the temp exactly once on the
+    // normal AND unwind paths). For any other argument expression (a named local,
+    // a method result, …) this is exactly lowerExpr.
+    llvm::Value* lowerByteArrayFactoryArg(const ast::Expr& argExpr);
+
+    // #999 / §15.4 / §28.3: build the scope-end Disposal entry for an owned
+    // temporary heap collection materialized for a BORROW call-argument (the temp
+    // is an owned local; the callee borrows it for the call duration; it must be
+    // disposed exactly once at scope exit, on the normal AND unwind paths). The
+    // entry mirrors the `using var` collection/linked-list/dict registration in
+    // lowerLocalDecl, selecting the right runtime free + per-element disposer for
+    // `collTy`. `slot` is an alloca holding the collection pointer. Not called for
+    // an `owned` parameter (ownership transfers into the callee — no caller
+    // disposal).
+    Disposal buildCollectionTempDisposal(llvm::Value* slot,
+                                         const sema::TypeRef* collTy);
+
     // #559 / stdlib §4.10: materialize a Set<T>/OwnedSet<T> sequence literal
     // `[e1, e2, …]` into a freshly-allocated Set backed by bz_dict_alloc_generic,
     // reusing the SAME allocation and per-element insertion as the

@@ -3066,6 +3066,37 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         if (isByRefMod(params[idx].modifier)) {
             llvm::Type* et = nullptr;
             v = lvalueAddr(*a.value, et);
+        } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                       a.value.get())) {
+            // #999 / §15.4: a collection literal passed inline as a call argument.
+            // §15.4 admits a collection literal "via the parameter type of a
+            // method call", so this is normative syntax that must CONSTRUCT the
+            // collection — a CollectionLiteralExpr is not a general expression
+            // value (lowerExpr returns null for it), and the call-argument path
+            // had no dedicated materialization, so the literal previously lowered
+            // to null/garbage (an empty collection for ordinary methods; a
+            // dereferenced garbage pointer → crash for the byte-array FFI
+            // factories). Materialize it into an owned temporary of the
+            // parameter's target type via the SAME construction machinery the
+            // local-decl / field-init paths use, then dispose the temp per the
+            // parameter's mode (§28.3): an `owned` parameter takes ownership
+            // (no caller disposal); a borrow parameter borrows it for the call
+            // duration, so the temp is an owned local disposed exactly once at
+            // scope exit (on the normal AND unwind paths via disposeStack_).
+            const sema::TypeRef* pt =
+                params[idx].type ? ctx_.resolvedType(*params[idx].type) : nullptr;
+            llvm::Value* coll =
+                pt ? materializeCollectionLiteralForArg(cl, pt) : nullptr;
+            if (!coll) return false;  // unrecognised target — decline cleanly
+            // Spill the collection pointer to a slot (the disposal entry frees
+            // through the alloca, mirroring a `using var` local's slot).
+            llvm::AllocaInst* slot = entryAlloca(coll->getType());
+            builder_.CreateStore(coll, slot);
+            v = coll;
+            bool ownedParam = (params[idx].modifier == "owned");
+            if (!ownedParam && !disposeStack_.empty())
+                disposeStack_.back().push_back(
+                    buildCollectionTempDisposal(slot, pt));
         } else {
             // When the argument is a lambda and the formal parameter has a
             // function type, inform lowerLambda of the expected param types
