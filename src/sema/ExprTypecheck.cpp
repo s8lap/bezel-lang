@@ -2325,6 +2325,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // the const is in scope (member/module consts were folded at
                 // type resolution; locals were not yet bound there).
                 foldLocalConstArraySize(lsym->declType);
+                // §17.7 (#979): a typeless `new(args)` shorthand initializer
+                // takes its construction target from the declared type. The
+                // NewExpr typing in visitExpr only runs when `new Type` is
+                // explicit, so for the shorthand the node was left untyped,
+                // codegen's lowerNew skipped construction, and the uninitialized
+                // local was dereferenced (SIGSEGV). Record the declared type as
+                // the NewExpr's exprType (lowerNew reads it as the construction
+                // target) and validate the constructor arguments against the
+                // target's constructor exactly as the explicit path does.
+                if (lsym->declType && ld->initializer) {
+                    if (auto* shNe = dynamic_cast<const ast::NewExpr*>(
+                            ld->initializer.get())) {
+                        if (!shNe->type) {
+                            ctx_.setExprType(ld->initializer.get(),
+                                             lsym->declType);
+                            if (lsym->declType->kind == TypeRef::Kind::Named &&
+                                lsym->declType->declaration &&
+                                lsym->declType->declaration->kind ==
+                                    ast::TypeDeclKind::Class)
+                                checkNewExprArgs(
+                                    *shNe, lsym->declType->declaration);
+                        }
+                    }
+                }
                 // §15.4 / §15.1 (sweep #11): an inline-array literal initializer
                 // must have EXACTLY N elements — "The list must contain exactly
                 // N elements; mismatch is a compile error" (§15.4). Too few left

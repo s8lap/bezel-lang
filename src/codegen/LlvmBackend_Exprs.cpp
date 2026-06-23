@@ -7024,9 +7024,21 @@ void Emitter::prePopulateBasePositionalFields(
 
 
 llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
-    if (!ne.type) return nullptr;
-    sema::TypeRef* rt = ctx_.resolvedType(*ne.type);
+    // §17.7 `new(args)` shorthand: there is no explicit `ne.type` — the target
+    // type is inferred from context (the LHS annotation / assignment target) and
+    // recorded by sema as the NewExpr's own exprType. Derive the construction
+    // target from that exprType. Without this the construction was skipped and
+    // the local was never initialized; a later read of the uninitialized slot
+    // dereferenced garbage → SIGSEGV (issue #979).
+    sema::TypeRef* rt = ne.type
+        ? ctx_.resolvedType(*ne.type)
+        : const_cast<sema::TypeRef*>(ctx_.exprType(ne));
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    // The ast::Type name node used for the builtin-exception / collection
+    // dispatch below: the explicit type node when present, else the inferred
+    // target's node (a shorthand targeting a builtin collection, e.g.
+    // `var x: Array<int> := new()`).
+    const ast::Type* tnode = ne.type ? ne.type.get() : rt->astNode;
     // per §14.2: `new T()` inside a generic body. T is a type parameter (its
     // TypeRef has no declaration); resolve it to the concrete sema TypeRef of
     // the active monomorphization so construction dispatches to the substituted
@@ -7053,8 +7065,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // have no user TypeSymbol (rt->declaration == null) but do have a
         // built-in vtable from setupBuiltinExceptions. Construct a 16-byte
         // object — [vtable_ptr, message_ptr] — so that e.Message works.
-        if (ne.type->name && !ne.type->name->parts.empty()) {
-            std::string n(ne.type->name->parts.back());
+        if (tnode && tnode->name && !tnode->name->parts.empty()) {
+            std::string n(tnode->name->parts.back());
             auto vit = builtinVtable_.find(n);
             if (vit != builtinVtable_.end()) {
                 // 16 bytes: slot0=vtable, slot1=message string ptr
@@ -7075,8 +7087,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             }
         }
         // §3: stdlib collection types — allocate via runtime.
-        if (ne.type->name && !ne.type->name->parts.empty()) {
-            std::string_view colName = ne.type->name->parts[0];
+        if (tnode && tnode->name && !tnode->name->parts.empty()) {
+            std::string_view colName = tnode->name->parts[0];
             // Determine element size from the first generic arg (if present).
             // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
             // For int → 4, long → 8, double → 8, bool → 1, etc.
@@ -7420,7 +7432,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "Atomic" || colName == "AtomicInteger") {
                 // Determine cell_size from the type argument T.
                 int cellSize = 4;  // default: int/uint
-                const sema::TypeRef* newTR = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+                const sema::TypeRef* newTR = rt;
                 if (newTR && !newTR->genericArgs.empty() && newTR->genericArgs[0]) {
                     const sema::TypeRef* tArg = newTR->genericArgs[0];
                     if (tArg->kind == sema::TypeRef::Kind::Primitive) {
@@ -7477,8 +7489,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "Buffer") {
                 // Determine elem_size from T.
                 int64_t eSize = 8;  // default (double / long)
-                const sema::TypeRef* newTR =
-                    ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+                const sema::TypeRef* newTR = rt;
                 if (newTR && !newTR->genericArgs.empty() && newTR->genericArgs[0]) {
                     const sema::TypeRef* tArg = newTR->genericArgs[0];
                     llvm::Type* et = lowerTypeRef(tArg);

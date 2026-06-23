@@ -1016,8 +1016,13 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // fields), so `new Record(...)` yields a plain value, not an owned
     // resource. (Enums and other value kinds likewise.)
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-        if (ne->type) {
-            if (auto* rt = ctx_.resolvedType(*ne->type)) {
+        {  // §17.7 (#979): a `new(args)` shorthand has a null `ne->type`; sema
+           // recorded the construction target as the NewExpr's exprType. Use it
+           // so a shorthand `new Record(...)` (value type) is classified
+           // Borrowed (no obligation), not wrongly Owned — which would reject
+           // the value local as an undisposed owned resource (§28.3).
+            if (const sema::TypeRef* rt =
+                    ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e)) {
                 if (rt->kind == sema::TypeRef::Kind::Named &&
                     rt->declaration &&
                     (rt->declaration->kind != ast::TypeDeclKind::Class &&
