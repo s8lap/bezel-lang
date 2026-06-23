@@ -2097,6 +2097,10 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     st->state = OwnershipState::Disposed;
     st->explicitlyDisposed = true;
     st->explicitDisposeLoc = loc;
+    // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
+    // check skips a parameter the body explicitly disposes on some path.
+    for (auto& [s, stt] : states_)
+        if (s->name == name) { everDischarged_.insert(s); break; }
 }
 
 void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc) {
@@ -2128,6 +2132,10 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     st->state = OwnershipState::MovedFrom;
+    // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
+    // check skips a parameter the body moves out on some path.
+    for (auto& [s, stt] : states_)
+        if (s->name == name) { everDischarged_.insert(s); break; }
 }
 
 // §28.8.1, #897 #898: the field analogue of markMovedByName. Mirrors the

@@ -108,6 +108,20 @@ private:
     // check so a `move this.f` whose taken value is otherwise discharged is not
     // spuriously rejected. // per §28.8.1
     bool isDestructor_ = false;
+    // §29.3 / §29.8 (#945): true when this method's body uses `yield` (it is an
+    // iterator method). A SYNC iterator (sawYield_ && !isAsync_) whose `owned`
+    // parameter is never moved out gets §29.8 state-machine auto-dispose instead
+    // of the §28.3 normal-exit drop reject. Set at the start of run().
+    bool sawYield_ = false;
+    // §29.8 (#945): symbols (params or locals) discharged — moved-from or
+    // disposed — on AT LEAST ONE path during the dataflow. Recorded by
+    // markMovedByName / markDisposedByName. Used by the end-of-method check to
+    // distinguish an iterator's owned parameter that is NEVER discharged (safe to
+    // auto-dispose unconditionally) from one discharged on some path (kept as a
+    // reject — the state machine cannot statically know whether the body moved it
+    // out, so auto-disposing would risk a double-free). Monotone (grows only), so
+    // it is fixpoint-safe across the dataflow's block re-evaluations.
+    std::unordered_set<sema::Symbol*> everDischarged_;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed

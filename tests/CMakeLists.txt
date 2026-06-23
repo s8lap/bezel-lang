@@ -685,6 +685,7 @@ set(BEZEL_TEST_SOURCES
     codegen/owning_span_779_test.cpp
     codegen/span_type_annotation_959_test.cpp
     codegen/string_span_883_test.cpp
+    codegen/iterator_owned_param_945_test.cpp
     codegen/file_io_644_test.cpp
     codegen/diagnostics_646_test.cpp
     codegen/decimal_integration_664_666_test.cpp

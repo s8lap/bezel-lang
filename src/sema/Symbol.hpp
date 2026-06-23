@@ -217,6 +217,14 @@ struct ParameterSymbol : Symbol {
     // Preferred over `declType` (which is null in that case) by identifier
     // resolution. Null otherwise.
     TypeRef* resolvedDeclType = nullptr;
+    // §29.8 (#945): set by the ownership pass on an `owned` parameter of a SYNC
+    // iterator method whose body never moves the parameter out. The iterator's
+    // state machine takes ownership at construction and disposes the parameter
+    // at iterator-Dispose (after the body's `using var` / `finally` cleanups,
+    // reverse declaration order). Codegen (emitIteratorMethod's Dispose) reads
+    // this flag to emit that disposal. Owned params the body discharges are
+    // never flagged, so there is no double-free.
+    bool iteratorAutoDispose = false;
 };
 
 // A.3 ExtensionDecl — collected at module level. Its target type is

@@ -583,6 +583,40 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
+        // §29.8 (#945): dispose each `owned` parameter the body never moved out,
+        // in REVERSE declaration order (mirroring §28.4's destructor rule), AFTER
+        // the body's `using var` / `finally` cleanups and before the frame is
+        // freed. The capture field still holds the original object (captures are
+        // spilled once at construction and never re-spilled on suspend), and sema
+        // (Ownership.cpp) flagged ONLY params it proved are never discharged by
+        // the body — so each is disposed exactly once (no double-free, no leak).
+        // Runs on every iterator-Dispose: normal exhaustion (state -1), early
+        // break / abandonment (a suspend state), and never-iterated.
+        auto disposeOwnedParams = [&]() {
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps || !ps->iteratorAutoDispose) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                llvm::Value* obj = builder_.CreateLoad(ptrTy(), fptr, "itp.obj");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()), "itp.isnull");
+                auto* dispBB =
+                    llvm::BasicBlock::Create(llvm_, "itp.dispose", disposeFn);
+                auto* contBB =
+                    llvm::BasicBlock::Create(llvm_, "itp.cont", disposeFn);
+                builder_.CreateCondBr(isNull, contBB, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(obj);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
+        };
+
         // If no yield was ever inside a try/finally AND no `using var` was active
         // at any yield (#821), emit a simple free + return.
         if (smIterFinallyAtState_.empty() && smIterDisposalsAtState_.empty()) {
@@ -591,6 +625,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            disposeOwnedParams();      // §29.8 (#945)
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
@@ -648,6 +683,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
 
             builder_.SetInsertPoint(doneBB);
+            disposeOwnedParams();      // §29.8 (#945): after the finally chains
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();

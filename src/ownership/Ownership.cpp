@@ -20,11 +20,42 @@ namespace bezel::ownership {
 // file holds the statement/flow-walking definitions plus the public
 // checkOwnership entry point and its supporting free functions.
 
+namespace {
+// §29.3 (#945): does this statement list use `yield` (making the method an
+// iterator)? Recurses into control-flow block bodies (if/elif/else, while, for,
+// do, try body — §29.6 forbids yield in catch/finally). Mirrors
+// ExprTC::stmtsContainYield.
+bool bodyContainsYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) {
+        if (!s) continue;
+        if (dynamic_cast<const ast::YieldStmt*>(s.get())) return true;
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
+            if (bodyContainsYield(fs->body)) return true;
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get()))
+            if (bodyContainsYield(ws->body)) return true;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+            if (bodyContainsYield(ifs->ifBranch.body)) return true;
+            for (const auto& el : ifs->elifBranches)
+                if (bodyContainsYield(el.body)) return true;
+            if (ifs->hasElse && bodyContainsYield(ifs->elseBody)) return true;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get()))
+            if (bodyContainsYield(db->body)) return true;
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(s.get()))
+            if (bodyContainsYield(trys->body)) return true;
+    }
+    return false;
+}
+}  // namespace
+
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
          bool isDestructor) {
     isAsync_ = isAsync;
     isDestructor_ = isDestructor;
+    // §29.3 / §29.8 (#945): classify iterator methods up-front so the end-of-
+    // method check can apply the state-machine auto-dispose rule to owned params.
+    sawYield_ = bodyContainsYield(body);
     // Issue #392 / §31.1: collect this method's catch-bound exception
     // variables before the dataflow runs. Each is a borrow of the in-flight
     // exception whose lifetime is its arm body; the escape machinery consults
@@ -86,6 +117,24 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // normal-exit edge.
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
+            // §29.8 (#945): a SYNC iterator method's `owned` parameter that the
+            // body never moves out is disposed by the state machine at iterator-
+            // Dispose. Suppress the §28.3 normal-exit drop reject and flag the
+            // parameter for codegen disposal (emitIteratorMethod's Dispose). A
+            // param discharged on SOME path is in everDischarged_ → kept as a
+            // reject (the state machine can't statically tell it was moved out, so
+            // auto-disposing would risk a double-free). Async iterators and owned
+            // LOCALS keep the reject — their state-machine disposal is not yet
+            // wired (tracked separately).
+            if (sawYield_ && !isAsync_) {
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                    if (ps->modifier == "owned" &&
+                        everDischarged_.count(sym) == 0) {
+                        ps->iteratorAutoDispose = true;
+                        continue;
+                    }
+                }
+            }
             ctx_.diagnostics().report(
                 Severity::Error,
                 st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -857,6 +906,21 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) handleReturn(*rs->value);
+        return;
+    }
+    // §29.6 / §29.8 (#945): walk a `yield return EXPR` operand through the shared
+    // arg walker so any owned discharge INSIDE the operand is recorded. Without
+    // this the CFG treated yield as an opaque straight-line statement and never
+    // walked its operand — so `yield return Consume(c)` (Consume(owned x) consumes
+    // the owned param `c`) left `c` un-marked, the iterator owned-param auto-
+    // dispose (run() end-of-method check) then wrongly flagged it, and codegen
+    // disposed it again at iterator-Dispose: a double-free. handleDischarge marks
+    // an owned argument moved inside a call but treats a BARE yielded identifier /
+    // member-access as a read (not a discharge), so `yield return c` and
+    // `yield return c.V` keep `c` Owned and are correctly auto-disposed. A
+    // `yield break` (null value) carries nothing to walk.
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) handleDischarge(*ys->value);
         return;
     }
     // §31.1 / §28.8 (issue #406): the operand of a `throw` is an ordinary
