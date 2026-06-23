@@ -2363,9 +2363,58 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     if (!ms || !ms->parent || !currentThis_) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
     if (idxIt == fieldIndex_.end()) return nullptr;  // static field
+    // §12 / §14 (#989): an INHERITED field declared on a generic base (ms->parent
+    // has generic params) accessed via bare identifier inside a derived-class
+    // method (implicit `this.field`). classStruct(ms->parent) with no active
+    // genericSubst_ uses the T→i32 placeholder layout, causing a type mismatch
+    // between the GEP element type and the field's concrete type (IR_FAIL for
+    // string/bool return; SIGSEGV for class-pointer field; wrong value for int).
+    // Install the ancestor generic substitution from the enclosing class (looked
+    // up via currentFn_/methodFns_) before calling classStruct, then restore —
+    // exactly mirroring the qualified fieldAddr path at LlvmBackend_Layout.cpp
+    // around line 2720.
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    if (!ms->parent->genericParams.empty()) {
+        // Recover the enclosing class: reverse-look up currentFn_ in methodFns_,
+        // then try currentSpecMethodSymbol_ (for specialised bodies).
+        const sema::TypeSymbol* enclosingCls = nullptr;
+        if (currentFn_) {
+            for (const auto& [sym, fn] : methodFns_)
+                if (fn == currentFn_ && sym->parent) {
+                    enclosingCls = sym->parent;
+                    break;
+                }
+        }
+        if (!enclosingCls && currentSpecMethodSymbol_ &&
+            currentSpecMethodSymbol_->parent)
+            enclosingCls = currentSpecMethodSymbol_->parent;
+        if (enclosingCls && enclosingCls != ms->parent) {
+            // Build a synthetic TypeRef for the enclosing class (concrete,
+            // no generic args of its own) and walk the base chain to bind
+            // ms->parent's generic params to their concrete types.
+            sema::TypeRef synth;
+            synth.kind = sema::TypeRef::Kind::Named;
+            synth.declaration = const_cast<sema::TypeSymbol*>(enclosingCls);
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(&synth, ms->parent, ancSubst,
+                                            ancSema)) {
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+            }
+        }
+    }
+    if (idxIt == fieldIndex_.end()) {
+        classStruct(ms->parent);
+        idxIt = fieldIndex_.find(ms);
+    }
     llvm::StructType* st = classStruct(ms->parent);
     elemTy = st->getElementType(idxIt->second);
-    return builder_.CreateStructGEP(st, currentThis_, idxIt->second);
+    llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idxIt->second);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    return addr;
 }
 
 

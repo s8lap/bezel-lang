@@ -4513,7 +4513,7 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
 TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
                                       const ast::Expr* target,
                                       TypeSymbol* parent) {
-    if (!declared || !target || !parent) return declared;
+    if (!declared || !parent) return declared;
     if (parent->genericParams.empty()) return declared;
     // Substitution applies both to a bare type-parameter reference (`v: T`)
     // and to a constructed type that *embeds* a parent type parameter
@@ -4531,9 +4531,12 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     // Find the receiver's resolved TypeRef (carries the concrete generic args).
     // Prefer the target's exprType; fall back to a local/parameter's declared
     // type when the target itself was not given an exprType.
-    TypeRef* recvTy = ctx_.exprType(*target);
-    if (!recvTy || recvTy->declaration != parent ||
-        recvTy->genericArgs.empty()) {
+    // #989: target may be null when this is called for a bare-identifier field
+    // reference (implicit `this.field`); in that case skip the target-dependent
+    // paths and go straight to the derived/currentType_ fallback below.
+    TypeRef* recvTy = target ? ctx_.exprType(*target) : nullptr;
+    if (target && (!recvTy || recvTy->declaration != parent ||
+        recvTy->genericArgs.empty())) {
         Symbol* sym = ctx_.exprSymbol(*target);
         if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
             if (loc->declType && loc->declType->declaration == parent &&
@@ -4563,12 +4566,19 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     // must still substitute the base's type params. Seed the base-chain walk from
     // the ENCLOSING type (currentType_) in that case; otherwise from the derived
     // receiver's declaration (the #722 path).
+    // #989: a null `target` means an implicit `this.field` bare-identifier access
+    // inside a method body — use currentType_ exactly as the `this`/`base`
+    // keyword paths above do.
     TypeSymbol* derived = (recvTy && recvTy->declaration) ? recvTy->declaration
                                                           : nullptr;
     if (!derived) {
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target))
+        if (!target) {
+            // bare-identifier field — treat as implicit `this`
+            if (currentType_) derived = currentType_;
+        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
             if ((id->name == "this" || id->name == "base") && currentType_)
                 derived = currentType_;
+        }
     }
     if (derived && derived != parent) {
         for (std::size_t bi = 0; bi < derived->baseTypes.size(); ++bi) {

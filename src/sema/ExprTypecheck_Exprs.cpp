@@ -288,11 +288,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // Implicit `this.<field>` form: bare identifier
                 // resolving to a class field. Same field-type rule
                 // as MemberAccessExpr below.
+                // §14 / §12 (#989): when the field is INHERITED from a generic
+                // base (fs->parent has generic params), call substituteMemberType
+                // with a null target (= implicit `this`) so the base's T-arg is
+                // resolved from currentType_'s base-chain — exactly as the
+                // MemberAccessExpr path does for explicit `this.field` access.
                 if (auto* fd =
                         dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
                     if (fd->type) {
                         if (auto* rt = ctx_.resolvedType(*fd->type)) {
-                            ctx_.setExprType(&e, rt);
+                            ctx_.setExprType(
+                                &e, substituteMemberType(rt, nullptr,
+                                                         fs->parent));
                         }
                     }
                 } else if (fs->posParam && fs->posParam->type) {
@@ -305,7 +312,8 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // Codegen's fieldAddr then finds no symbol → returns nullptr
                     // → the method body emits `ret i32 0` (wrong result).
                     if (auto* rt = ctx_.resolvedType(*fs->posParam->type)) {
-                        ctx_.setExprType(&e, rt);
+                        ctx_.setExprType(
+                            &e, substituteMemberType(rt, nullptr, fs->parent));
                     }
                 }
             } else if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {

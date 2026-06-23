@@ -159,3 +159,89 @@ BEZEL_TEST(generic_concrete_return_817, concrete_derived_transitive_base_902) {
         "  using var b := new Leaf(99); return b.Get(); "  // 99
         "end Main; end C;"), 99);
 }
+
+// ── §14 / §12 issue #989: BARE-IDENTIFIER access of an INHERITED GENERIC field ─
+// A concrete non-generic subclass of a generic base must substitute the base's
+// T-arg for an inherited field accessed via bare identifier (implicit this.field)
+// inside a subclass method body.  Without the fix the sema path typed the field
+// as `?` (symptom D — false-reject of `val + val`) and the codegen path used
+// the i32 placeholder layout (symptom A — IR_FAIL on string return; symptom B/C
+// — SIGSEGV / wrong-value for a class-pointer field).
+
+// Symptom A: inherited generic string field returned via bare identifier (`val`)
+// — previously IR_FAIL (`ret i32 / ptr`). Expected exit = 5 (length of "hello").
+BEZEL_TEST(generic_concrete_return_817, inherited_generic_string_field_bare_id_989) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder<T> public val: T; "
+        "  public constructor(v: T) val := v; end constructor; end Holder; "
+        "class StrHolder : Holder<string> "
+        "  public constructor(v: string) base(v); end constructor; "
+        "  public method Get(): string => val; "  // bare 'val' — §14/§12 #989
+        "end StrHolder; "
+        "class C public static method Main(): int "
+        "  using var h := new StrHolder(\"hello\"); return h.Get().Length; "
+        "end Main; end C;"), 5);
+}
+
+// Symptom B/C: inherited generic class field accessed via bare identifier
+// — previously SIGSEGV (i32 loaded as ptr) / wrong-value 0. Expected exit = 42.
+BEZEL_TEST(generic_concrete_return_817, inherited_generic_class_field_bare_id_989) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box public n: int; "
+        "  public constructor(x: int) n := x; end constructor; "
+        "  destructor end destructor; end Box; "
+        "class Wrapper<T> public owned val: T?; "
+        "  public constructor(owned v: T) val := v; end constructor; "
+        "  destructor end destructor; end Wrapper; "
+        "class BoxWrapper : Wrapper<Box> "
+        "  public constructor(owned v: Box) base(move v); end constructor; "
+        "  destructor end destructor; "
+        "  public method GetN(): int => val!.n; "  // bare 'val' — §14/§12 #989
+        "end BoxWrapper; "
+        "class C public static method Main(): int "
+        "  using var w := new BoxWrapper(new Box(42)); return w.GetN(); "
+        "end Main; end C;"), 42);
+}
+
+// Symptom D: bare-identifier inherited generic int field used in an expression
+// — previously sema typed it as `?`, rejecting `val + val` with
+// "operator `+` not defined for type `?`". Expected exit = 42 (21 + 21).
+BEZEL_TEST(generic_concrete_return_817, inherited_generic_int_field_operator_989) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> public val: T; "
+        "  public constructor(v: T) val := v; end constructor; "
+        "  destructor end destructor; end Box; "
+        "class IntBox : Box<int> "
+        "  public constructor(v: int) base(v); end constructor; "
+        "  destructor end destructor; "
+        "  public method Double(): int => val + val; "  // bare 'val' — §14/§12 #989
+        "end IntBox; "
+        "class C public static method Main(): int "
+        "  using var b := new IntBox(21); return b.Double(); "
+        "end Main; end C;"), 42);
+}
+
+// Dispose-exactly-once: an owned inherited generic field (T=class with destructor)
+// is disposed exactly once when the containing CellHolder goes out of scope.
+// A counter incremented on construction and decremented on destruction must end
+// at 0 after the `using var` scope closes (no leak, no double-free).
+BEZEL_TEST(generic_concrete_return_817, inherited_owned_generic_field_dispose_once_989) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Cell public static n: int; "
+        "  public constructor() Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+        "class Holder<T> public owned val: T?; "
+        "  public constructor(owned v: T) val := v; end constructor; "
+        "  destructor end destructor; end Holder; "
+        "class CellHolder : Holder<Cell> "
+        "  public constructor(owned v: Cell) base(move v); end constructor; "
+        "  destructor end destructor; end CellHolder; "
+        "class C public static method Main(): int "
+        "  do using var h := new CellHolder(new Cell()); end; "
+        "  return Cell.n; "  // 0: disposed exactly once
+        "end Main; end C;"), 0);
+}
