@@ -984,6 +984,66 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "(n)` from its underlying integer, not with `new` "
                         "(§5.4/§10)");
                 }
+                // §14.1 (#992): `new T()` where T is a generic type parameter
+                // requires `where T: new()` on the enclosing generic declaration.
+                // Without that constraint the body type-checks under the weakest
+                // assumption its constraints establish, and construction cannot
+                // be assumed available.  `where T: class`, `where T: value`, a
+                // type-bound, or no constraint at all are NOT sufficient.
+                // Detection: a generic type parameter resolves to a Named TypeRef
+                // with declaration==nullptr; we then verify the name matches one
+                // of the enclosing method or class generic params and that at
+                // least one `new` constraint item is listed for it.
+                if (rt->kind == TypeRef::Kind::Named &&
+                    rt->declaration == nullptr &&
+                    ne->type && ne->type->name &&
+                    !ne->type->name->parts.empty()) {
+                    std::string_view paramName = ne->type->name->parts.front();
+                    // Determine whether paramName is a generic type parameter
+                    // in the enclosing method or class, and whether a `new()`
+                    // constraint is present for it.
+                    bool isTypeParam = false;
+                    bool hasNewConstraint = false;
+                    auto checkGPs =
+                        [&](const std::vector<ast::GenericParam>& gps,
+                            const std::vector<ast::GenericConstraint>& gcs) {
+                        for (const auto& gp : gps)
+                            if (gp.name == paramName) { isTypeParam = true; break; }
+                        if (!isTypeParam) return;
+                        for (const auto& gc : gcs) {
+                            if (gc.typeParam != paramName) continue;
+                            for (const auto& item : gc.items)
+                                if (item.kind == "new") { hasNewConstraint = true; return; }
+                        }
+                    };
+                    bool isMethodParam = false;
+                    if (currentMethodDecl_ &&
+                        !currentMethodDecl_->genericParams.empty()) {
+                        for (const auto& gp : currentMethodDecl_->genericParams)
+                            if (gp.name == paramName) { isMethodParam = true; break; }
+                        if (isMethodParam)
+                            checkGPs(currentMethodDecl_->genericParams,
+                                     currentMethodDecl_->genericConstraints);
+                    }
+                    if (!isMethodParam && currentType_ && currentType_->decl)
+                        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                currentType_->decl))
+                            if (!td->genericParams.empty())
+                                checkGPs(td->genericParams,
+                                         td->genericConstraints);
+                    if (isTypeParam && !hasNewConstraint) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne->span.begin,
+                            "`new " + std::string(paramName) + "()` requires "
+                            "the type parameter `" + std::string(paramName) +
+                            "` to be constrained `where " +
+                            std::string(paramName) + ": new()` — the body "
+                            "type-checks under the weakest assumption its "
+                            "constraints establish, and construction is not "
+                            "guaranteed without the `new()` constraint (§14.1, "
+                            "#992)");
+                    }
+                }
                 // per §15.4 / §22.7 (#599): a collection literal `[..]`
                 // in a `new` argument position is a compile error when the
                 // constructor parameter is not a collection type.  The

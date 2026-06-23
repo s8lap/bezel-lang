@@ -30,10 +30,11 @@ const char* kCell =
 }  // namespace
 
 // The verified repro: a single `using var x := Make()` disposes x.
+// §14.1 (#992): `new T()` requires `where T: new()` — added to G<T>.
 BEZEL_TEST(generic_using_var_owned_return, owned_t_return_disposed) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
-        "class G<T> "
+        "class G<T> where T: new() "
         "  public constructor() end constructor; "
         "  public method Make(): owned T return new T(); end Make; "
         "  public method MakeAndDiscard() using var x := Make(); end MakeAndDiscard; "
@@ -46,10 +47,11 @@ BEZEL_TEST(generic_using_var_owned_return, owned_t_return_disposed) {
 }
 
 // Multiple owned-returns in one scope all dispose (no leak, no double-free).
+// §14.1 (#992): `new T()` requires `where T: new()` — added to G<T>.
 BEZEL_TEST(generic_using_var_owned_return, multiple_owned_returns) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
-        "class G<T> "
+        "class G<T> where T: new() "
         "  public constructor() end constructor; "
         "  public method Make(): owned T return new T(); end Make; "
         "  public method Loop() using var a := Make(); using var b := Make(); end Loop; "
