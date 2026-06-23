@@ -4364,6 +4364,37 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // stdlib §10.3 / fix #985: RawBytes.CopyTo(destination: Array<byte>,
+    // destOffset: int). The receiver is a RawBytes ({ ptr, len } struct);
+    // bz_rawbytes_copyto memcpy's `len` bytes into the destination array at
+    // destOffset (bounds-clamped). Returns unit. (.Length and .Pointer are
+    // property reads handled in LlvmBackend_Exprs.cpp; CopyTo is the only
+    // instance method.)
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isRaw = recvTy &&
+            recvTy->kind == sema::TypeRef::Kind::Named &&
+            recvTy->declaration && recvTy->declaration->name == "RawBytes";
+        if (isRaw && ma->member == "CopyTo" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* rb = lowerExpr(*ma->target);
+            if (!rb) return nullptr;
+            llvm::Value* dest = lowerExpr(*call.args[0].value);
+            if (!dest) return nullptr;
+            llvm::Value* off = lowerExpr(*call.args[1].value);
+            if (!off) return nullptr;
+            // §10.3: destOffset is `int` (i32) — widen to the i64 runtime param.
+            if (off->getType()->isIntegerTy() &&
+                off->getType()->getIntegerBitWidth() < 64)
+                off = builder_.CreateSExt(off, i64(), "raw.off64");
+            auto* fn = declareC("bz_rawbytes_copyto",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {rb, dest, off});
+            return llvm::ConstantInt::get(i32(), 0);  // unit
+        }
+    }
+
     // stdlib §2.6: Guid instance methods — handled before the IdentifierExpr
     // guard below because the receiver may be a chained expression (e.g.
     // Guid.Empty.ToString()) whose target is not a bare identifier.
@@ -8295,12 +8326,35 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                    pt->name->parts.size() == 1 &&
                    pt->name->parts.front() == "CString";
         };
+        // fix #985: a `RawBytes` extern parameter (§32.5) receives the raw byte
+        // buffer (void*), not the { ptr, len } struct that is RawBytes' runtime
+        // value. When a RawBytes argument is passed here, extract rb->ptr via
+        // bz_rawbytes_ptr so the C side sees the buffer pointer (as it did under
+        // the prior bare-buffer rep).
+        auto rawbytesParamAt = [&](std::size_t i) -> bool {
+            if (!ed || i >= ed->params.size()) return false;
+            const ast::Type* pt = ed->params[i].type.get();
+            return pt && pt->kind == ast::TypeKind::Named && pt->name &&
+                   pt->name->parts.size() == 1 &&
+                   pt->name->parts.front() == "RawBytes";
+        };
         std::vector<llvm::Value*> args;
         std::size_t idx = 0;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
+            // fix #985: marshal a RawBytes argument to its underlying buffer
+            // pointer (rb->ptr) for a RawBytes-typed extern parameter (§32.5).
+            if (rawbytesParamAt(idx)) {
+                const sema::TypeRef* at = ctx_.exprType(*a.value);
+                bool isRaw = at && at->kind == sema::TypeRef::Kind::Named &&
+                    at->declaration && at->declaration->name == "RawBytes";
+                if (isRaw) {
+                    auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
+                    v = builder_.CreateCall(fn, {v}, "raw.arg.ptr");
+                }
+            }
             // Marshal a Bezel `string` argument into a CString parameter
             // (§32.5 / §32.6). Branch on the string's runtime byte width:
             // width==1 → raw data pointer (already null-terminated UTF-8);

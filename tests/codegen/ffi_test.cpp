@@ -385,3 +385,69 @@ BEZEL_TEST(codegen_ffi_types, wstring_length_property_983) {
         "  return w.Length; "
         "end Main; end C;"), 2);
 }
+
+// fix #985 / stdlib §10.3: RawBytes is a pointer-and-length pair. With the
+// { ptr, len } representation, RawBytes.Length reads the stored byte count.
+// Before the fix the bare-buffer rep dropped the length and .Length was 0.
+BEZEL_TEST(codegen_ffi_types, rawbytes_length_property_985) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b: Array<byte> := [10, 20, 30, 40]; "
+        "  using var rb := RawBytes.From(b); "
+        "  return rb.Length; "
+        "end Main; end C;"), 4);
+}
+
+// fix #985 / stdlib §10.3: RawBytes.From of a 0-length Array<byte> has Length 0
+// (the struct is still allocated; the buffer is empty). The malloc(0) edge.
+BEZEL_TEST(codegen_ffi_types, rawbytes_empty_length_985) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b: Array<byte> := []; "
+        "  using var rb := RawBytes.From(b); "
+        "  return rb.Length; "
+        "end Main; end C;"), 0);
+}
+
+// fix #985 / stdlib §10.3: RawBytes.CopyTo(destination, destOffset) copies the
+// stored bytes into the destination array. Round-trip: From a known array, copy
+// back into a fresh array, sum the bytes (5+6+7+8 = 26) to prove every byte
+// landed. Before the fix CopyTo was unbacked and copied nothing.
+BEZEL_TEST(codegen_ffi_types, rawbytes_copyto_roundtrip_985) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var src: Array<byte> := [5, 6, 7, 8]; "
+        "  using var rb := RawBytes.From(src); "
+        "  var dst: Array<byte> := [0, 0, 0, 0]; "
+        "  rb.CopyTo(dst, 0); "
+        "  return dst[0] + dst[1] + dst[2] + dst[3]; "
+        "end Main; end C;"), 26);
+}
+
+// fix #985 / stdlib §10.3: RawBytes.CopyTo honors destOffset — copy [9, 9] into
+// a fresh [0,0,0,0] at offset 1 yields [0, 9, 9, 0]; reading dst[1] proves the
+// offset placement (and dst[0] stays untouched at 0).
+BEZEL_TEST(codegen_ffi_types, rawbytes_copyto_offset_985) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var src: Array<byte> := [9, 9]; "
+        "  using var rb := RawBytes.From(src); "
+        "  var dst: Array<byte> := [0, 0, 0, 0]; "
+        "  rb.CopyTo(dst, 1); "
+        "  return dst[0] * 100 + dst[1]; "
+        "end Main; end C;"), 9);
+}
+
+// fix #985 / stdlib §10.3: RawBytes.Pointer exposes the underlying buffer as an
+// IntPtr. For a non-empty RawBytes the buffer is non-null; cast to long and
+// compare against 0 to observe it (returns 1 when non-null).
+BEZEL_TEST(codegen_ffi_types, rawbytes_pointer_nonnull_985) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b: Array<byte> := [1, 2, 3]; "
+        "  using var rb := RawBytes.From(b); "
+        "  var p: IntPtr := rb.Pointer; "
+        "  if long(p) <> 0 then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}

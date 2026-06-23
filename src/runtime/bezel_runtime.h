@@ -1007,9 +1007,23 @@ void* bz_string_to_utf16z(const void* str);
 // null-terminated uint16_t buffer, excluding the terminating zero unit.
 int64_t bz_wstrlen(const void* wstr);
 
-// stdlib §10.3 / fix #977: RawBytes.From(buffer: Array<byte>) — copies the
-// byte array into a fresh malloc'd buffer (no null terminator). Caller frees.
+// stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copies
+// the byte array into a fresh malloc'd buffer and wraps it with its length in a
+// { ptr, len } heap struct so RawBytes is a backed pointer-and-length pair.
+// Released via bz_rawbytes_free (frees the buffer, then the struct).
 void* bz_rawbytes_from(const void* arr);
+
+// stdlib §10.3 / fix #985: RawBytes accessors over the { ptr, len } struct.
+// Length — the byte count; Pointer — the buffer address (codegen wraps as
+// IntPtr); CopyTo — memcpy `len` bytes into destination at destOffset
+// (clamped to the destination's bounds). All null-guarded.
+int64_t bz_rawbytes_length(const void* rb);
+void*   bz_rawbytes_ptr(const void* rb);
+void    bz_rawbytes_copyto(const void* rb, void* dest, int64_t destOffset);
+
+// stdlib §10.3 / fix #985: dispose a RawBytes — free the owned buffer, then the
+// struct. Idempotent on null. Distinct from the single free() of CString/WString.
+void    bz_rawbytes_free(void* rb);
 
 // ---------------------------------------------------------------------------
 // Encoding (stdlib §3.2) — UTF-8 concrete encoding only (Utf16/Utf32/Ascii are

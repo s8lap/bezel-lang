@@ -747,6 +747,13 @@ private:
         // recognised by the result type's builtinTypeName ("CString"/"WString"/
         // "RawBytes") in lowerLocalDecl.
         bool ffiBuffer = false;
+        // stdlib §10.3 / fix #985: a `using var` bound to a RawBytes. Unlike
+        // CString/WString (bare malloc'd buffers freed with a single free()),
+        // RawBytes is a two-level allocation — a { ptr, len } struct whose `ptr`
+        // owns a separate byte buffer. Disposal must free BOTH the buffer and the
+        // struct exactly once via bz_rawbytes_free. Set together with ffiBuffer
+        // so the disposal path (emitDisposals) can pick the RawBytes free helper.
+        bool rawBytes = false;
         // §29.7 (#623): an iterator enumerator (IEnumerable<T> state machine)
         // whose Dispose is at vtable slot 1 (iterator vtable format:
         // [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current) — NOT slot 2 (class

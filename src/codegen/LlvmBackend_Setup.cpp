@@ -5930,15 +5930,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // static factories; extern-returning CString? lives a different path.
     {
         bool isFfiBuf = false;
+        bool isRawBytes = false;   // fix #985: RawBytes needs the two-level free
         if (!isFfiBuf && ld->initializer) {
             if (auto* rt = ctx_.exprType(*ld->initializer)) {
                 std::string_view n = builtinTypeName(rt);
                 isFfiBuf = (n == "CString" || n == "WString" || n == "RawBytes");
+                isRawBytes = (n == "RawBytes");
             }
         }
         if (isFfiBuf) {
             Disposal d{it->second, nullptr};
             d.ffiBuffer = true;
+            // fix #985: a RawBytes is a { ptr, len } struct — free both the
+            // owned buffer and the struct (bz_rawbytes_free), not a single
+            // free() of a bare buffer (CString/WString).
+            d.rawBytes = isRawBytes;
             disposeStack_.back().push_back(d);
             return;
         }
@@ -11008,12 +11014,15 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
-        // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: a `using var` CString,
-        // WString, or RawBytes buffer. All three are produced by static From /
-        // FromBytes factories that allocate with malloc (bz_string_to_utf8z,
-        // bz_string_to_utf16z, bz_rawbytes_from). Disposal is a null-guarded
-        // plain free() — the CString destructor contract (stdlib §10.1) says
-        // "releases the underlying buffer when this CString allocated it".
+        // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977 / #985: a `using var`
+        // CString, WString, or RawBytes. All are produced by static From /
+        // FromBytes factories. CString/WString are bare malloc'd buffers
+        // (bz_string_to_utf8z / bz_string_to_utf16z) released by a single
+        // null-guarded free(). RawBytes (fix #985) is a TWO-LEVEL allocation —
+        // a { ptr, len } struct whose `ptr` owns a separate byte buffer — so it
+        // is released via bz_rawbytes_free, which frees the buffer THEN the
+        // struct, exactly once. The disposal contract (stdlib §10.x destructor)
+        // says "releases the underlying buffer when this instance allocated it".
         if (it->ffiBuffer) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
@@ -11024,7 +11033,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB = llvm::BasicBlock::Create(llvm_, "ffibuf.cont",  currentFn_);
             builder_.CreateCondBr(isNull, contBB, frBB);
             builder_.SetInsertPoint(frBB);
-            builder_.CreateCall(freeFn(), {fbuf});
+            if (it->rawBytes) {
+                // fix #985: free the owned buffer AND the { ptr, len } struct.
+                auto* fn = declareC("bz_rawbytes_free",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {fbuf});
+            } else {
+                builder_.CreateCall(freeFn(), {fbuf});
+            }
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

@@ -330,6 +330,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nullable_enum_test.cpp
     codegen/nullable_record_test.cpp
     codegen/ffi_test.cpp
+    codegen/rawbytes_disposal_test.cpp
     codegen/case_expr_test.cpp
     codegen/record_pattern_constants_615_test.cpp
     codegen/var_destructure_577_test.cpp

@@ -2306,33 +2306,56 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // bz_wstrlen, excluding the terminating zero unit (§10.2). Both are builtin
     // FFI-boundary types whose TypeRef declaration is the builtin class symbol.
     // Before this, a member read fell through every handler and `Length` was 0.
-    // (RawBytes.Length is NOT handled here: bz_rawbytes_from returns a bare byte
-    // buffer with no stored length, so RawBytes.Length needs a representation
-    // change — tracked separately.)
+    // fix #985: RawBytes.Length now reads the `len` field of the { ptr, len }
+    // struct (bz_rawbytes_length) — the prior bare-buffer rep dropped the length.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Length") {
             auto* tt = ctx_.exprType(*ma->target);
-            // A CString/WString TypeRef is a Named type whose declaration is the
-            // builtin class symbol (set in ExprTypecheck_Calls.cpp for the From/
-            // FromBytes factories), so match on the declaration's name.
+            // A CString/WString/RawBytes TypeRef is a Named type whose declaration
+            // is the builtin class symbol (set in ExprTypecheck_Calls.cpp for the
+            // From/FromBytes factories), so match on the declaration's name.
             bool isCStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
                 tt->declaration && tt->declaration->name == "CString";
             bool isWStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
                 tt->declaration && tt->declaration->name == "WString";
-            if (isCStr || isWStr) {
-                bool isW = isWStr;
+            bool isRaw = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                tt->declaration && tt->declaration->name == "RawBytes";
+            if (isCStr || isWStr || isRaw) {
                 llvm::Value* buf = lowerExpr(*ma->target);
                 if (!buf) return nullptr;
                 llvm::Value* len;
-                if (isW) {
+                if (isRaw) {
+                    // §10.3: Length is the explicit `len` field of the struct.
+                    auto* fn = declareC("bz_rawbytes_length", i64(), {ptrTy()});
+                    len = builder_.CreateCall(fn, {buf}, "raw.len");
+                } else if (isWStr) {
                     auto* fn = declareC("bz_wstrlen", i64(), {ptrTy()});
                     len = builder_.CreateCall(fn, {buf}, "wstr.len");
                 } else {
                     auto* fn = declareC("strlen", i64(), {ptrTy()});
                     len = builder_.CreateCall(fn, {buf}, "cstr.len");
                 }
-                // §10.1/§10.2: Length is `int` (i32) — truncate the size_t count.
+                // §10.1/§10.2/§10.3: Length is `int` (i32) — truncate the count.
                 return builder_.CreateTrunc(len, i32(), "ffi.len.i32");
+            }
+        }
+    }
+    // stdlib §10.3 / fix #985: RawBytes.Pointer — the underlying buffer address
+    // as an IntPtr (i64 on the host). Reads the `ptr` field of the { ptr, len }
+    // struct (bz_rawbytes_ptr) and converts it to a pointer-sized integer, which
+    // is the codegen representation of IntPtr (§32.7). Valid until disposal.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "Pointer") {
+            auto* tt = ctx_.exprType(*ma->target);
+            bool isRaw = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                tt->declaration && tt->declaration->name == "RawBytes";
+            if (isRaw) {
+                llvm::Value* rb = lowerExpr(*ma->target);
+                if (!rb) return nullptr;
+                auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
+                llvm::Value* p = builder_.CreateCall(fn, {rb}, "raw.ptr");
+                // §32.7: IntPtr is a pointer-sized integer (i64 host).
+                return builder_.CreatePtrToInt(p, i64(), "raw.ptr.i");
             }
         }
     }

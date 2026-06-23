@@ -6444,20 +6444,86 @@ extern "C" int64_t bz_wstrlen(const void* wstrp) {
 }
 
 // ---------------------------------------------------------------------------
-// stdlib §10.3 / fix #977: RawBytes.From(buffer: Array<byte>)
-// Copies the byte array's contents into a fresh independently-owned malloc'd
-// buffer. Unlike CString.FromBytes there is no null terminator — the length
-// is encoded in the Array<byte>'s count field, and the returned void* is
-// purely a byte buffer. The returned pointer is owned by the caller (free()).
+// stdlib §10.3 / fix #985: RawBytes is a pointer-and-length pair. The runtime
+// representation is a small heap struct { void* ptr; int64_t len } so that
+// .Length, .Pointer, and .CopyTo are backed (issue #985: the prior rep was a
+// bare byte buffer that dropped the length). The byte buffer (`ptr`) is an
+// independently-owned malloc'd copy of the source array's bytes; `len` is the
+// source array's count. Disposal frees BOTH the buffer and the struct exactly
+// once via bz_rawbytes_free (the `ffiBuffer` disposal path is split so that
+// CString/WString stay a single free of their bare buffer, but RawBytes frees
+// its two-level allocation — see LlvmBackend_Setup.cpp).
+struct bz_rawbytes_t {
+    void*   ptr;   // owned byte buffer (malloc); null only for a 0-length empty
+    int64_t len;   // byte count
+};
+
+// stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copy the
+// byte array's contents into a fresh independently-owned malloc'd buffer and
+// wrap it with its length in a heap struct. Unlike CString.FromBytes there is
+// no null terminator — the length is carried explicitly in the struct's `len`
+// field. The returned struct (and its buffer) are owned by the caller, released
+// via bz_rawbytes_free. Mutations to the source array after construction do not
+// affect the RawBytes (§10.3): the bytes are copied here.
 extern "C" void* bz_rawbytes_from(const void* arrp) {
-    if (!arrp) return malloc(0);   // zero-byte allocation; not null, but empty
+    auto* rb = (bz_rawbytes_t*)malloc(sizeof(bz_rawbytes_t));
+    if (!rb) return nullptr;
+    rb->ptr = nullptr;
+    rb->len = 0;
+    if (!arrp) return rb;          // empty RawBytes (len 0, no buffer)
     const auto* arr = (const bz_array_t*)arrp;
     int64_t n = arr->count;
-    if (n <= 0) return malloc(0);
+    if (n <= 0) return rb;         // empty: len 0, ptr null (no malloc(0))
     void* out = malloc((size_t)n);
-    if (!out) return nullptr;
+    if (!out) { rb->len = n; return rb; }  // OOM: report length, null buffer
     if (arr->data) memcpy(out, arr->data, (size_t)n);
-    return out;
+    rb->ptr = out;
+    rb->len = n;
+    return rb;
+}
+
+// stdlib §10.3 / fix #985: RawBytes.Length — the byte count carried in the
+// struct. Null-guarded (a disposed/zeroed slot reads as length 0).
+extern "C" int64_t bz_rawbytes_length(const void* rbp) {
+    if (!rbp) return 0;
+    return ((const bz_rawbytes_t*)rbp)->len;
+}
+
+// stdlib §10.3 / fix #985: RawBytes.Pointer — the underlying byte buffer
+// address as a raw pointer (codegen wraps it as an IntPtr). Valid until the
+// RawBytes is disposed (§10.3). Null-guarded.
+extern "C" void* bz_rawbytes_ptr(const void* rbp) {
+    if (!rbp) return nullptr;
+    return ((const bz_rawbytes_t*)rbp)->ptr;
+}
+
+// stdlib §10.3 / fix #985: RawBytes.CopyTo(destination: Array<byte>, destOffset)
+// — copy `len` bytes from the RawBytes buffer into `destination` starting at
+// `destOffset`. Bounds are checked against the destination's count; an
+// out-of-range copy is clamped to the available space (no overrun). A null or
+// empty RawBytes copies nothing.
+extern "C" void bz_rawbytes_copyto(const void* rbp, void* destp,
+                                   int64_t destOffset) {
+    if (!rbp || !destp) return;
+    const auto* rb = (const bz_rawbytes_t*)rbp;
+    if (rb->len <= 0 || !rb->ptr) return;
+    auto* dest = (bz_array_t*)destp;
+    if (!dest->data || destOffset < 0) return;
+    int64_t avail = dest->count - destOffset;
+    if (avail <= 0) return;
+    int64_t n = rb->len < avail ? rb->len : avail;
+    memcpy((char*)dest->data + destOffset, rb->ptr, (size_t)n);
+}
+
+// stdlib §10.3 / fix #985: dispose a RawBytes — free the owned byte buffer,
+// then the struct itself. Exactly-once: the disposal path null-guards the slot
+// before calling this, and idempotent on a null argument. Distinct from the
+// single free() used for CString/WString (which are bare buffers).
+extern "C" void bz_rawbytes_free(void* rbp) {
+    if (!rbp) return;
+    auto* rb = (bz_rawbytes_t*)rbp;
+    free(rb->ptr);
+    free(rb);
 }
 
 // ---------------------------------------------------------------------------

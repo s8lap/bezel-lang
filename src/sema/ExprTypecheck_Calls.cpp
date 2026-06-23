@@ -5820,6 +5820,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return;
             }
         }
+        // stdlib §10.3 / fix #985: RawBytes readonly properties. Length: int and
+        // Pointer: IntPtr. The RawBytes TypeRef carries declaration =
+        // builtinClassSym("RawBytes") (set by the RawBytes.From factory typing),
+        // so the ordinary member-lookup path never types these (no user TypeDecl).
+        // Without typing them here, the access fell through untyped and a
+        // `var p: IntPtr := rb.Pointer` would not see the IntPtr type.
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            bool isRaw = tt && tt->kind == TypeRef::Kind::Named &&
+                tt->declaration && tt->declaration->name == "RawBytes";
+            if (isRaw && ma.member == "Length") {
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                return;
+            }
+            if (isRaw && ma.member == "Pointer") {
+                // IntPtr: a Named type resolved by name (no user TypeDecl); codegen
+                // lowers it to a pointer-sized integer (§32.7).
+                auto* ip = ctx_.makeTypeRef();
+                ip->kind = TypeRef::Kind::Named;
+                auto* ann = new ast::Type();
+                ann->kind = ast::TypeKind::Named;
+                auto* nm = new ast::QualifiedName();
+                nm->parts.push_back("IntPtr");
+                ann->name.reset(nm);
+                ip->astNode = ann;
+                ctx_.setExprType(&ma, ip);
+                return;
+            }
+        }
         // §6.4 / issue #647: Atomic<T> and AtomicInteger<T> property accesses.
         // The `Value` property getter returns T (genericArgs[0]).  The ordinary
         // member-lookup path never finds it (no user TypeDecl for Atomic<T>).
