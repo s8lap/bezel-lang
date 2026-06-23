@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.146 — June 2026**
+**Companion to the Bezel Language Specification, v0.147 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3728,7 +3728,7 @@ end CString;
 
 `CString.From(s)` allocates a fresh, owned `CString` whose contents are the UTF-8 encoding of `s` followed by a single null byte. The caller owns the result; when disposed, the underlying buffer is released.
 
-`CString.FromBytes(bytes)` wraps an existing byte array; the bytes must already be null-terminated, and the caller is responsible for ensuring valid UTF-8.
+`CString.FromBytes(bytes)` **copies** the bytes of `bytes` into a fresh, owned buffer and appends a null terminator; the source array is unaffected and the result's buffer is independent of it (the same copy-in semantics as `RawBytes.From` in [§10.3](#sec-rawbytes), and as the borrow parameter `bytes: Array<byte>` requires — a borrowed argument cannot be retained past the call). The caller is responsible for ensuring the bytes are valid UTF-8 and contain no interior null byte; an interior null, by C-string convention, terminates the string early when the buffer is read as a `char*`. Unlike `From(string)` — which encodes a Bezel string's code points — `FromBytes` takes the bytes verbatim, so it is the path for already-encoded or possibly-ill-formed UTF-8 obtained from I/O or another source.
 
 A `CString` returned from a native function is wrapped without copying; the Bezel side must understand the native API's ownership contract (see language spec [§32.6](Bezel_Language_Spec.md#sec-string-marshalling)). Disposing such a `CString` calls the native deallocator only when constructed via `CString.From` or `FromBytes`. For native-allocated strings, the FFI declaration's documentation must specify how the native allocation should be released; this is beyond the scope of `CString` itself.
 

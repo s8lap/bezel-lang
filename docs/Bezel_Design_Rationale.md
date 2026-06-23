@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.146 — June 2026**
+**Companion to the Bezel Language Specification, v0.147 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6970,6 +6970,28 @@ Spec §17.7 (one example line), §27.3 (one example line). Stdlib §2.14 (one ex
 #### Migration
 
 None. No normative rule changed; the corrected examples now compile as the surrounding prose always intended.
+
+---
+
+### v0.147 changelog (v0.146 → v0.147)
+
+v0.147 resolves a standard-library specification ambiguity in stdlib §10.1 (`CString.FromBytes`). It pins a previously-contradictory contract to match both the method's own signature and the compiler's existing behaviour; no language rule changes. Owner-directed 2026-06-23; tracked as #982.
+
+#### The defect
+
+Stdlib §10.1 described `CString.FromBytes(bytes: Array<byte>)` as one that "**wraps** an existing byte array; the bytes must already be null-terminated." Two problems: (1) "wraps" implies the result aliases the caller's array, but the parameter `bytes: Array<byte>` carries **no `owned` modifier**, so it is a borrow — and a method may not retain a borrowed value past the call. The signature therefore *requires* a copy, contradicting "wraps." (2) Requiring the caller to pre-null-terminate is gratuitous: `From(string)` appends the terminator itself, and an FFI `char*` cannot carry an interior null anyway.
+
+#### The resolution (copy-in)
+
+`FromBytes` **copies** the source bytes into a fresh, owned buffer and **appends** the null terminator; the source array is unaffected and the buffer is independent. This matches the sibling `RawBytes.From` (§10.3), which already specifies copy-in over the same borrow signature, and it keeps `CString` to a single internal representation (it always owns a freshly-allocated, null-terminated buffer, so its destructor is uniform). The zero-copy alternative was declined: Bezel already serves zero-copy byte access through the span / `OwnedBuffer` family (§4.13–4.16) and `RawBytes.Pointer`, so a "move/adopt" `FromBytes` would be a redundant second way to do it and would force `CString` to carry two internal representations; if such a path is ever wanted it belongs on a separate `owned OwnedBuffer<byte>`-adopting factory, not on `FromBytes`.
+
+#### Touched
+
+Stdlib §10.1 (the `FromBytes` prose paragraph). Rationale: this changelog. Version headers bumped to v0.147 across the language spec, standard library, and design rationale.
+
+#### Migration
+
+None. The compiler implementation already provides exactly the copy-in-and-append-terminator behaviour (the `bz_cstring_from_bytes` runtime helper added with the CString static-call resolution work, #977): it copies the array's bytes and writes a trailing null. The spec prose is corrected to describe what the implementation does; no conforming program changes meaning, and no compiler change is required by this revision.
 
 ---
 
