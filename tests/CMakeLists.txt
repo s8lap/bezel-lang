@@ -463,6 +463,7 @@ set(BEZEL_TEST_SOURCES
     codegen/ctor_args_test.cpp
     codegen/static_ctor_test.cpp
     codegen/static_init_exception_529_test.cpp
+    codegen/static_init_main_owner_917_test.cpp
     codegen/static_field_init_order_582_test.cpp
     codegen/operator_test.cpp
     codegen/operator_increment_498_test.cpp

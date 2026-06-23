@@ -3858,11 +3858,20 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #720 / §22.13: a static method call triggers its declaring type's lazy
     // initialization before the body runs ("once initialization begins for a
     // type, all of its static fields are initialized before any of its methods
-    // can run"). No-op for a type without lazy static state. Skipped for Main —
-    // its own class initializes lazily via the accesses in its body; forcing it
-    // at program start would prevent an own-class static-init failure from being
-    // caught inside Main's body.
-    if (isStaticMethod(ms) && !isMain(ms))
+    // can run"). No-op for a type without lazy static state.
+    // #917 / #918: this fires for Main too. Invoking the entry point IS the
+    // first use of its declaring class, so §22.13 requires that class's static
+    // fields to be initialized before Main's body runs — otherwise a static
+    // field initializer with observable side effects (e.g. `static w := new
+    // Widget()` whose ctor mutates another type's static state, or a `static
+    // owned` field) never runs unless Main's body happens to read that class's
+    // own static state. Placed at Main's body entry: an own-class static-init
+    // failure wraps as TypeInitializationException and routes through Main's
+    // normal unwind chain to bz_unhandled_exception, which is the spec-correct
+    // outcome for an unhandled static-init failure at the entry point. (The
+    // prior "skip Main so its body can catch its own init failure" behaviour
+    // itself violated §22.13, since init must complete before the body runs.)
+    if (isStaticMethod(ms))
         emitEnsureStaticInit(ms->parent);
 
     bool terminated = false;
