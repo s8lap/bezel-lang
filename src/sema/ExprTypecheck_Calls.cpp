@@ -2536,6 +2536,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // No type annotation needed; untyped is correct for void calls.
                     // (Debug.Assert and Debug.WriteLine both return unit.)
 
+                    // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: FFI-boundary
+                    // class static factory methods. CString/WString/RawBytes each
+                    // expose `From` (and CString additionally `FromBytes`) returning
+                    // an owned handle lowered by codegen to ptrTy() (char* / wchar_t*
+                    // / void*). The TypeRef shape mirrors builtinClassSym("Stopwatch")
+                    // so that lowerLocalDecl's `ffiBuffer` disposal path (which calls
+                    // free() at scope end) can identify the result via builtinTypeName.
+                    if (colName == "CString") {
+                        if (m == "From" || m == "FromBytes") {
+                            auto* cstrTy = ctx_.makeTypeRef();
+                            cstrTy->kind = TypeRef::Kind::Named;
+                            cstrTy->declaration = builtinClassSym("CString");
+                            ctx_.setExprType(&ce, cstrTy);
+                        }
+                    }
+                    if (colName == "WString") {
+                        if (m == "From") {
+                            auto* wstrTy = ctx_.makeTypeRef();
+                            wstrTy->kind = TypeRef::Kind::Named;
+                            wstrTy->declaration = builtinClassSym("WString");
+                            ctx_.setExprType(&ce, wstrTy);
+                        }
+                    }
+                    if (colName == "RawBytes") {
+                        if (m == "From") {
+                            auto* rbTy = ctx_.makeTypeRef();
+                            rbTy->kind = TypeRef::Kind::Named;
+                            rbTy->declaration = builtinClassSym("RawBytes");
+                            ctx_.setExprType(&ce, rbTy);
+                        }
+                    }
+
                     // §6.1 / §30.8: CancellationToken instance method return types.
                     // ThrowIfCancellationRequested() → unit (void); Register(cb) →
                     // owned Subscription (leave untyped — Register is deferred).

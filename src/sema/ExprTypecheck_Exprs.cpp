@@ -396,7 +396,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    // §8.2 / issue #646: Debug — static class for Assert/WriteLine.
                    // Recognized here so Debug.Assert(…) and Debug.WriteLine(…)
                    // resolve as calls on a known-class receiver.
-                   id->name == "Debug") {
+                   id->name == "Debug" ||
+                   // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString, WString,
+                   // RawBytes are FFI-boundary classes with static factory methods
+                   // (CString.From(s), WString.From(s), RawBytes.From(buffer)).
+                   // They resolve as builtin class receivers so member access on
+                   // the type name (CString.From) is accepted in expression position.
+                   id->name == "CString" ||
+                   id->name == "WString" ||
+                   id->name == "RawBytes") {
             // §2.3: these System classes are auto-imported and always
             // available without an explicit import. Give them a synthetic
             // TypeSymbol (null decl) so member access can proceed; the

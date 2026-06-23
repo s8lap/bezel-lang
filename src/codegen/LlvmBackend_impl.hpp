@@ -738,6 +738,15 @@ private:
         // No user TypeSymbol; recognised by the builtin type name "Buffer" in
         // lowerLocalDecl.
         bool buffer = false;
+        // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: a `using var` bound to a
+        // CString, WString, or RawBytes produced by a static From/FromBytes
+        // factory. The factory allocates a fresh malloc'd buffer (bz_string_to_utf8z
+        // for CString, bz_string_to_utf16z for WString, memdup for RawBytes). At
+        // scope end the buffer is released via plain free() — the same allocator
+        // used by those runtime helpers. Null-guarded. No user TypeSymbol;
+        // recognised by the result type's builtinTypeName ("CString"/"WString"/
+        // "RawBytes") in lowerLocalDecl.
+        bool ffiBuffer = false;
         // §29.7 (#623): an iterator enumerator (IEnumerable<T> state machine)
         // whose Dispose is at vtable slot 1 (iterator vtable format:
         // [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current) — NOT slot 2 (class

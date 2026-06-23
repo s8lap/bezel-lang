@@ -6367,6 +6367,88 @@ extern "C" char* bz_string_to_utf8z(const void* strp) {
 }
 
 // ---------------------------------------------------------------------------
+// stdlib §10.1 / §32.6 / fix #977: CString.FromBytes(bytes: Array<byte>)
+// Copies the byte-array's contents into a fresh malloc'd buffer and
+// appends a null terminator. The caller is responsible for the bytes being
+// valid (null-terminated, valid UTF-8 per §10.1). The returned char* is
+// owned by the caller and must be released via free().
+extern "C" char* bz_cstring_from_bytes(const void* arrp) {
+    if (!arrp) {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    const auto* arr = (const bz_array_t*)arrp;
+    int64_t n = arr->count;
+    if (n < 0) n = 0;
+    // elem_size must be 1 (Array<byte>); copy n bytes + NUL.
+    char* out = (char*)malloc((size_t)n + 1);
+    if (!out) return nullptr;
+    if (n > 0 && arr->data) memcpy(out, arr->data, (size_t)n);
+    out[n] = '\0';
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// stdlib §10.2 / §32.6 / fix #977: WString.From(s: string)
+// Produces a fresh malloc'd null-terminated UTF-16LE wchar_t* buffer from a
+// Bezel string. Each Bezel code point is encoded as one UTF-16 code unit for
+// BMP points (U+0000..U+D7FF, U+E000..U+FFFF) or as a surrogate pair for
+// code points above U+FFFF. The trailing null is two zero bytes (one wchar_t).
+// On platforms where wchar_t is 4 bytes (Linux) we use uint16_t for the
+// individual code units and cast, keeping a portable 2-byte-per-code-unit
+// encoding. The returned pointer is owned by the caller (free()).
+extern "C" void* bz_string_to_utf16z(const void* strp) {
+    if (!strp) {
+        // Empty WString: two zero bytes (one null wchar_t).
+        uint16_t* empty = (uint16_t*)malloc(sizeof(uint16_t));
+        if (empty) empty[0] = 0;
+        return empty;
+    }
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len;
+    if (n < 0) n = 0;
+    // Worst case: every code point above U+FFFF needs a surrogate pair (2 units).
+    size_t cap = ((size_t)n * 2 + 1) * sizeof(uint16_t);
+    uint16_t* out = (uint16_t*)malloc(cap);
+    if (!out) return nullptr;
+    size_t off = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        if (s->width == 1)      cp = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) cp = ((const uint16_t*)s->data)[i];
+        else                    cp = ((const uint32_t*)s->data)[i];
+        if (cp < 0x10000) {
+            out[off++] = (uint16_t)cp;
+        } else {
+            // Surrogate pair per UTF-16.
+            cp -= 0x10000;
+            out[off++] = (uint16_t)(0xD800 | (cp >> 10));
+            out[off++] = (uint16_t)(0xDC00 | (cp & 0x3FF));
+        }
+    }
+    out[off] = 0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// stdlib §10.3 / fix #977: RawBytes.From(buffer: Array<byte>)
+// Copies the byte array's contents into a fresh independently-owned malloc'd
+// buffer. Unlike CString.FromBytes there is no null terminator — the length
+// is encoded in the Array<byte>'s count field, and the returned void* is
+// purely a byte buffer. The returned pointer is owned by the caller (free()).
+extern "C" void* bz_rawbytes_from(const void* arrp) {
+    if (!arrp) return malloc(0);   // zero-byte allocation; not null, but empty
+    const auto* arr = (const bz_array_t*)arrp;
+    int64_t n = arr->count;
+    if (n <= 0) return malloc(0);
+    void* out = malloc((size_t)n);
+    if (!out) return nullptr;
+    if (arr->data) memcpy(out, arr->data, (size_t)n);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Encoding (stdlib §3.2). The abstract `Encoding` base declares
 // `GetBytes(s): owned Array<byte>` and `GetString(bytes[, index, count]): string`.
 // This runtime implements the UTF-8 concrete encoding (`Encoding.Utf8`), which is

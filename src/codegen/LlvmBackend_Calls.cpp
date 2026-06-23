@@ -4401,6 +4401,64 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     const auto cls = id->name;
     const auto& m = ma->member;
 
+    // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes
+    // static factory methods. Each allocates a fresh malloc'd buffer and returns
+    // it as a ptrTy() (the codegen representation of CString/WString/RawBytes).
+    // At scope-end the buffer is freed by the `ffiBuffer` disposal path (free()).
+    if (cls == "CString") {
+        // CString.From(s: string): owned CString — null-terminated UTF-8 buffer
+        // from a Bezel string. Reuses bz_string_to_utf8z, which allocates with
+        // malloc and always produces a null-terminated UTF-8 byte sequence, exactly
+        // the contract CString.From defines (stdlib §10.1).
+        if (m == "From" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* fn = declareC("bz_string_to_utf8z", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {s}, "cstr.from");
+        }
+        // CString.FromBytes(bytes: Array<byte>): owned CString — wraps an
+        // existing null-terminated byte array. The stdlib notes the caller is
+        // responsible for ensuring the bytes are already null-terminated (§10.1).
+        // We copy the byte-array data into a fresh malloc'd buffer with a
+        // trailing null so the returned CString is independently owned.
+        if (m == "FromBytes" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            // Use bz_encoding_utf8_get_bytes' inverse: load the raw data pointer
+            // (field 0 of bz_array_t is the elem_count, field 1 is the elements
+            // pointer — same layout as struct { i64 count, i64 elem_size, ptr data }).
+            // bz_array_t layout: [i64 count][i64 elem_size][ptr data]
+            // We call a new runtime helper bz_cstring_from_bytes that copies
+            // the array data + null-terminates it. For now lower to the direct
+            // data-pointer path: load elem ptr (GEP index 2 of the i64/i64/ptr
+            // struct) and duplicate it via strndup-style malloc + memcpy + null.
+            // Simpler: declare bz_cstring_from_bytes and call it.
+            auto* fn = declareC("bz_cstring_from_bytes", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {arr}, "cstr.frombytes");
+        }
+    }
+    if (cls == "WString") {
+        // WString.From(s: string): owned WString — null-terminated UTF-16 buffer
+        // from a Bezel string. Uses bz_string_to_utf16z (allocates with malloc).
+        if (m == "From" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* fn = declareC("bz_string_to_utf16z", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {s}, "wstr.from");
+        }
+    }
+    if (cls == "RawBytes") {
+        // RawBytes.From(buffer: Array<byte>): owned RawBytes — copy of the byte
+        // array's data as an independently-owned heap buffer. Uses bz_rawbytes_from
+        // which malloc-copies the array contents (no null-termination assumed).
+        if (m == "From" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* fn = declareC("bz_rawbytes_from", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {arr}, "rawbytes.from");
+        }
+    }
+
     // §2.3 Environment class methods.
     if (cls == "Environment") {
         // Environment.Exit(code: int) — terminate the process.

@@ -995,6 +995,18 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
 // NULL for a non-NULL input (an empty/allocation-failure case yields "").
 char* bz_string_to_utf8z(const void* str);
 
+// stdlib §10.1 / fix #977: CString.FromBytes(bytes: Array<byte>) — copies the
+// byte array into a fresh malloc'd null-terminated buffer. Caller frees.
+char* bz_cstring_from_bytes(const void* arr);
+
+// stdlib §10.2 / fix #977: WString.From(s: string) — encodes the Bezel string
+// as a null-terminated UTF-16LE buffer of uint16_t code units. Caller frees.
+void* bz_string_to_utf16z(const void* str);
+
+// stdlib §10.3 / fix #977: RawBytes.From(buffer: Array<byte>) — copies the
+// byte array into a fresh malloc'd buffer (no null terminator). Caller frees.
+void* bz_rawbytes_from(const void* arr);
+
 // ---------------------------------------------------------------------------
 // Encoding (stdlib §3.2) — UTF-8 concrete encoding only (Utf16/Utf32/Ascii are
 // deferred; their GetBytes/GetString semantics are not pinned down by §3.2).

@@ -5920,6 +5920,29 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: a `using var` bound to a
+    // CString, WString, or RawBytes produced by a static From/FromBytes factory.
+    // All three are malloc'd buffers; disposal is a plain free() (null-guarded).
+    // Recognised by the initializer's sema exprType having builtinTypeName equal
+    // to "CString", "WString", or "RawBytes" (set by the ExprTypecheck fix above).
+    // No explicit type annotation pattern is needed — the only way to produce an
+    // owned CString/WString/RawBytes without an extern return type is via these
+    // static factories; extern-returning CString? lives a different path.
+    {
+        bool isFfiBuf = false;
+        if (!isFfiBuf && ld->initializer) {
+            if (auto* rt = ctx_.exprType(*ld->initializer)) {
+                std::string_view n = builtinTypeName(rt);
+                isFfiBuf = (n == "CString" || n == "WString" || n == "RawBytes");
+            }
+        }
+        if (isFfiBuf) {
+            Disposal d{it->second, nullptr};
+            d.ffiBuffer = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource — a
     // builtin owned class with no user TypeSymbol, disposed via bz_cts_dispose
     // (idempotent: cancels surviving token observers, then frees the source).
@@ -10981,6 +11004,27 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_buffer_free",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {buf});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: a `using var` CString,
+        // WString, or RawBytes buffer. All three are produced by static From /
+        // FromBytes factories that allocate with malloc (bz_string_to_utf8z,
+        // bz_string_to_utf16z, bz_rawbytes_from). Disposal is a null-guarded
+        // plain free() — the CString destructor contract (stdlib §10.1) says
+        // "releases the underlying buffer when this CString allocated it".
+        if (it->ffiBuffer) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* fbuf = builder_.CreateLoad(ptrTy(), addr, "ffibuf.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                fbuf, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "ffibuf.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "ffibuf.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            builder_.CreateCall(freeFn(), {fbuf});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

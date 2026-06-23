@@ -216,6 +216,68 @@ BEZEL_TEST(codegen_ffi_types, cstring_nonascii_puts_utf8_bytes_32_6) {
     BEZEL_EXPECT_EQ(out, expected);
 }
 
+// ---------------------------------------------------------------------------
+// fix #977 / stdlib §10.1 / §32.6: CString.From(s: string) — static factory.
+// CString in expression position (bareword as static-call receiver) was
+// previously rejected with "unresolved identifier `CString`" even though the
+// type resolver accepted `CString` in type-annotation position. These tests
+// verify that the sema fix lets the receiver resolve and that codegen lowers
+// CString.From via bz_string_to_utf8z, producing a correctly sized null-
+// terminated UTF-8 buffer. Each `using var` binding is disposed (freed) at
+// scope end.
+// ---------------------------------------------------------------------------
+
+// §10.1 / §32.6 / fix #977: CString.From("hello") produces a 5-byte buffer;
+// strlen returns 5. Verifies sema resolution and codegen lowering end-to-end.
+BEZEL_TEST(codegen_ffi_types, cstring_from_strlen_10_1_977) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  using var cs := CString.From(\"hello\"); "
+        "  return strlen(cs); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+// §10.1 / fix #977: CString.From in a loop — disposal (free) fires 100×
+// without corruption. Returns 0 if total length is correct (11 × 100 = 1100;
+// capped to byte range: 1100 mod 256 = 76).
+BEZEL_TEST(codegen_ffi_types, cstring_from_loop_disposal_10_1_977) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 100 do "
+        "    using var cs := CString.From(\"hello world\"); "
+        "    total := total + strlen(cs); "
+        "    i := i + 1; "
+        "  end; "
+        "  if total = 1100 then return 76; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    // 1100 mod 256 = 76 (runJit returns raw i32 < 256 exit code from Main).
+    BEZEL_EXPECT_EQ(r.exitCode, 76);
+}
+
+// §10.1 / fix #977: CString.From with a non-ASCII string (width-2). The
+// produced CString must be re-encoded UTF-8, not raw wide data. "AĀB" is
+// 3 code points but 4 UTF-8 bytes (Ā = U+0100 → 0xC4 0x80).
+BEZEL_TEST(codegen_ffi_types, cstring_from_nonascii_10_1_977) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  using var cs := CString.From(\"A\\u0100B\"); "
+        "  return strlen(cs); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);
+}
+
 // §2.3: Console is always available; Write/WriteLine are intrinsics lowered
 // via POSIX write(2). These tests use compileAndCapture to observe stdout.
 
