@@ -525,6 +525,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_477_test.cpp
     codegen/event_479_test.cpp
     codegen/event_leak_480_test.cpp
+    codegen/event_subscription_closure_841_test.cpp  # §24/§27.5 #841: release handler closure env on sub dispose
     codegen/cancellation_token_test.cpp
     codegen/mutex_lock_647_test.cpp             # §6.2 Mutex + Lock, issue #647
     codegen/semaphore_647_test.cpp              # §6.3 Semaphore + SemaphoreToken, issue #647
