@@ -156,3 +156,97 @@ BEZEL_TEST(sema_da, ref_arg_unassigned_still_diagnoses_spec_22_3) {
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ---- fix #925: callee-side out-parameter definite-assignment (§22.3) -------
+
+// §22.3 / #925: a callee that never assigns its out-parameter on any exit path
+// must be rejected with a compile error naming the unassigned param.
+BEZEL_TEST(sema_da, callee_out_never_assigned_rejects_spec_22_3_925) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method NeverAssigns(out x: int) "
+        "    // x never assigned "
+        "  end NeverAssigns; "
+        "  public static method Main(): int "
+        "    var v: int := 42; "
+        "    C.NeverAssigns(out v); "
+        "    return v; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §22.3 / #925: a callee that assigns the out-param only in the `if` branch
+// (no `else`) fails the §22.3 check — the path where the condition is false
+// exits without assigning.
+BEZEL_TEST(sema_da, callee_out_partial_if_no_else_rejects_spec_22_3_925) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method MaybeAssign(cond: bool, out x: int) "
+        "    if cond then x := 7; end; "
+        "    // x not assigned on the !cond fall-through path "
+        "  end MaybeAssign; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §22.3 / #925: a callee that returns early (before assigning the out-param)
+// fails the check — the early return is an exit path where x is unassigned.
+BEZEL_TEST(sema_da, callee_out_early_return_before_assign_rejects_spec_22_3_925) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method EarlyReturn(cond: bool, out x: int) "
+        "    if cond then return; end; "   // x not assigned at this return
+        "    x := 7; "
+        "  end EarlyReturn; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §22.3 / #925: a callee that assigns the out-param on every path compiles
+// cleanly — no error, and the callee-assigned value is observable.
+BEZEL_TEST(sema_da, callee_out_assigns_all_paths_is_clean_spec_22_3_925) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method GetIt(out x: int) x := 7; end GetIt; "
+        "  public static method Main(): int "
+        "    var v: int := 0; "
+        "    C.GetIt(out v); "
+        "    return v; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §22.3 / #925: assigning the out-param in BOTH branches of an if/else before
+// fall-off satisfies the check.
+BEZEL_TEST(sema_da, callee_out_if_else_both_assign_is_clean_spec_22_3_925) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Choose(cond: bool, out x: int) "
+        "    if cond then x := 1; else x := 2; end; "
+        "  end Choose; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §22.3 / #925: a `ref` parameter that the callee reads but does not
+// re-assign must still compile cleanly — `ref` starts assigned (the caller
+// passes an initialised lvalue), so no out-param check applies.
+BEZEL_TEST(sema_da, callee_ref_param_not_reassigned_is_clean_spec_22_3_925) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method ReadOnly(ref n: int): int return n; end ReadOnly; "
+        "  public static method Main(): int "
+        "    var v: int := 42; "
+        "    return C.ReadOnly(ref v); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

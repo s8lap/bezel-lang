@@ -19,8 +19,12 @@ namespace {
 // Names enter the set when:
 //   * a LocalDecl with an initializer is processed,
 //   * an AssignmentStmt sets a previously-declared local,
-//   * an out-parameter is bound (slice DA1 doesn't model out-args yet),
+//   * an out-argument is passed to a call (§22.3 — definitely-assigned after),
 //   * a `for` loop's iteration variable is introduced.
+//
+// Out-parameters of the current method are seeded into declared_ (not
+// assigned_) so they start unassigned. They must be assigned on every
+// exit path (§22.3 callee-side check — fix #925).
 //
 // Reads consult the set; an IdentifierExpr that names a local declared
 // in the current scope set (or any nested scope along the walk) but
@@ -29,13 +33,41 @@ class MethodDA {
 public:
     explicit MethodDA(SemaContext& ctx) : ctx_(ctx) {}
 
-    // Run the walker. `paramSyms` (when provided) lists the method's
-    // params — they're treated as definitely-assigned at entry (the
-    // caller bound them).
+    // Run the walker. `params` lists the method's parameters. By-value
+    // and `ref` params are definitely-assigned on entry (the caller
+    // bound them). `out` params are NOT assigned on entry — the callee
+    // must assign them on every exit path (§22.3); they are seeded into
+    // `declared_` (so reads are tracked) but not into `assigned_`.
+    void run(const std::vector<ast::Param>& params,
+             const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        // Seed out-params as declared-but-unassigned.
+        for (const auto& p : params) {
+            if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
+                p.modifier.rfind("out var", 0) != 0) {
+                // "out" or "out owned" — callee must assign. "out var"
+                // is a caller-side inline-decl modifier, not a callee
+                // param mode, so it's excluded here (no method body uses
+                // "out var" as a param modifier; the check is belt-and-
+                // suspenders).
+                outParams_.insert(p.name);
+                declared_.insert(p.name);
+                // Intentionally NOT inserted into assigned_ — starts unassigned.
+            }
+        }
+        for (const auto& s : body) {
+            if (s) visitStmt(*s);
+        }
+        // §22.3 fall-off check: if control can reach the end of the method
+        // without a return/throw, every out-param must be assigned.
+        if (!terminated_) checkOutParams(/*span=*/nullptr);
+    }
+
+    // No-param overload for destructors (which have no params).
     void run(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
         for (const auto& s : body) {
             if (s) visitStmt(*s);
         }
+        // No out-params to check.
     }
 
 private:
@@ -46,6 +78,14 @@ private:
     // is a diagnostic.
     std::unordered_set<std::string_view> declared_;
     std::unordered_set<std::string_view> assigned_;
+    // out-parameter names that must be assigned on every exit path (§22.3).
+    std::unordered_set<std::string_view> outParams_;
+    // terminated_ = true when the current path ends unconditionally via
+    // return/throw — used to suppress the fall-off out-param check on
+    // unreachable tails (conservative: only set for top-level or all-
+    // branch termination; partial-branch termination leaves it false so
+    // the fall-off check runs on the live path).
+    bool terminated_ = false;
 
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
@@ -102,10 +142,16 @@ private:
         }
         if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (rs->value) visitExpr(*rs->value);
+            // §22.3: every out-param must be assigned at each return.
+            checkOutParams(&rs->span.begin);
+            terminated_ = true;
             return;
         }
         if (auto* tr = dynamic_cast<const ast::ThrowStmt*>(&s)) {
             if (tr->value) visitExpr(*tr->value);
+            // A throw is an exit path; per §22.3 out-params need not be
+            // assigned before a throw (the callee did not return normally).
+            terminated_ = true;
             return;
         }
         if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
@@ -113,29 +159,38 @@ private:
             // the intersection becomes the new assigned set.
             if (ifs->ifBranch.condition) visitExpr(*ifs->ifBranch.condition);
             auto entry = assigned_;
+            bool entryTerminated = terminated_;
+            terminated_ = false;
             for (const auto& bs : ifs->ifBranch.body) {
                 if (bs) visitStmt(*bs);
             }
             std::vector<std::unordered_set<std::string_view>> branchOuts;
             branchOuts.push_back(std::move(assigned_));
+            std::vector<bool> branchTerminated;
+            branchTerminated.push_back(terminated_);
             for (const auto& el : ifs->elifBranches) {
                 assigned_ = entry;
+                terminated_ = false;
                 if (el.condition) visitExpr(*el.condition);
                 for (const auto& bs : el.body) {
                     if (bs) visitStmt(*bs);
                 }
                 branchOuts.push_back(std::move(assigned_));
+                branchTerminated.push_back(terminated_);
             }
             if (ifs->hasElse) {
                 assigned_ = entry;
+                terminated_ = false;
                 for (const auto& bs : ifs->elseBody) {
                     if (bs) visitStmt(*bs);
                 }
                 branchOuts.push_back(std::move(assigned_));
+                branchTerminated.push_back(terminated_);
             } else {
                 branchOuts.push_back(entry);  // no-else fall-through
+                branchTerminated.push_back(false); // no-else = path live
             }
-            // Intersect.
+            // Intersect assigned sets.
             auto out = branchOuts.front();
             for (std::size_t i = 1; i < branchOuts.size(); ++i) {
                 std::unordered_set<std::string_view> tmp;
@@ -145,6 +200,12 @@ private:
                 out = std::move(tmp);
             }
             assigned_ = std::move(out);
+            // Post-if path is terminated only if all branches terminated.
+            bool allTerminated = true;
+            for (bool t : branchTerminated) {
+                if (!t) { allTerminated = false; break; }
+            }
+            terminated_ = entryTerminated || allTerminated;
             return;
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -153,16 +214,21 @@ private:
             // assignments inside don't propagate to post-loop. Walk to
             // diagnose reads but restore the entry set afterwards.
             auto entry = assigned_;
+            bool entryTerminated = terminated_;
+            terminated_ = false;
             for (const auto& bs : ws->body) {
                 if (bs) visitStmt(*bs);
             }
             assigned_ = std::move(entry);
+            terminated_ = entryTerminated; // loop may not execute
             return;
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
             if (fs->iterable) visitExpr(*fs->iterable);
             if (fs->withExpr) visitExpr(*fs->withExpr);
             auto entry = assigned_;
+            bool entryTerminated = terminated_;
+            terminated_ = false;
             if (!fs->varName.empty()) {
                 declared_.insert(fs->varName);
                 assigned_.insert(fs->varName);
@@ -171,10 +237,12 @@ private:
                 if (bs) visitStmt(*bs);
             }
             assigned_ = std::move(entry);
+            terminated_ = entryTerminated; // loop may not execute
             return;
         }
         if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-            // `do ... end` is a single straight-line block.
+            // `do ... end` is a single straight-line block; terminated_
+            // propagates naturally (a throw/return inside terminates the path).
             for (const auto& bs : dob->body) {
                 if (bs) visitStmt(*bs);
             }
@@ -182,6 +250,8 @@ private:
         }
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
             auto entry = assigned_;
+            bool entryTerminated = terminated_;
+            terminated_ = false;
             for (const auto& bs : ts->body) {
                 if (bs) visitStmt(*bs);
             }
@@ -189,10 +259,14 @@ private:
             // the post-try set; catch arms each start from entry.
             std::vector<std::unordered_set<std::string_view>> outs;
             outs.push_back(std::move(assigned_));
+            std::vector<bool> armTerminated;
+            armTerminated.push_back(terminated_);
             for (const auto& arm : ts->catches) {
                 assigned_ = entry;
+                terminated_ = false;
                 if (arm.body) visitStmt(*arm.body);
                 outs.push_back(std::move(assigned_));
+                armTerminated.push_back(terminated_);
             }
             auto post = outs.front();
             for (std::size_t i = 1; i < outs.size(); ++i) {
@@ -203,6 +277,12 @@ private:
                 post = std::move(tmp);
             }
             assigned_ = std::move(post);
+            // Post-try path is terminated only if all arms terminated.
+            bool allTerminated = true;
+            for (bool t : armTerminated) {
+                if (!t) { allTerminated = false; break; }
+            }
+            terminated_ = entryTerminated || allTerminated;
             for (const auto& bs : ts->finallyBody) {
                 if (bs) visitStmt(*bs);
             }
@@ -338,6 +418,24 @@ private:
         visitExpr(*a.value);
     }
 
+    // §22.3: check that every out-parameter is in assigned_ at the current
+    // program point. Reports an error for each unassigned one. `loc` is the
+    // source location to attach the diagnostic (null → no location).
+    void checkOutParams(const SourceLocation* loc) {
+        for (auto name : outParams_) {
+            if (!assigned_.count(name)) {
+                SourceLocation sl;
+                if (loc) sl = *loc;
+                ctx_.diagnostics().report(
+                    Severity::Error, sl,
+                    std::string("out parameter `") + std::string(name) +
+                    "` is not definitely assigned on every exit path "
+                    "(§22.3 — the callee must assign every `out` parameter "
+                    "before returning)");
+            }
+        }
+    }
+
     void checkRead(const ast::IdentifierExpr& id) {
         if (id.name == "this" || id.name == "base") return;
         // Only flag locals declared in this method that haven't been
@@ -357,18 +455,18 @@ void checkMember(const ast::Member& m, SemaContext& ctx) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodDA da(ctx);
-            da.run(md->stmts);
+            da.run(md->params, md->stmts);
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodDA da(ctx);
-        da.run(cd->body);
+        da.run(cd->params, cd->body);
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodDA da(ctx);
-        da.run(dd->body);
+        da.run(dd->body);  // destructors have no params
     } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             MethodDA da(ctx);
-            da.run(od->stmts);
+            da.run(od->params, od->stmts);
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
