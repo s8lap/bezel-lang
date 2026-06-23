@@ -7989,7 +7989,35 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
         }
         if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
             auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-            if (!ld) return nullptr;
+            if (!ld) {
+                // #963 / §28.11 / §29.2: a for-loop variable of an
+                // `OwnedEnumerable<T>` loop (`for var x in Gen()`) is a
+                // LocalSymbol whose decl is the ForStmt (sema sets `lsym->decl =
+                // fs`), not a LocalDecl. Each yielded element is OWNED by the
+                // loop variable — the iterator transfers ownership on yield and
+                // does not re-dispose an already-yielded element — so this
+                // scope's slot (locals_[&fs]) is the sole reclaim path. Without
+                // this, an explicit `x.Dispose()` ran the destructor but never
+                // reclaimed the element block (a normal-path leak). Reclaiming +
+                // nulling here frees it exactly once. A BORROW loop (over an
+                // Array<T> / IEnumerable<T> the collection still owns) is NOT an
+                // OwnedEnumerable, so its loop variable is correctly excluded.
+                if (auto* fs = dynamic_cast<const ast::ForStmt*>(loc->decl)) {
+                    const sema::TypeRef* itTy =
+                        fs->iterable ? ctx_.exprType(*fs->iterable) : nullptr;
+                    std::string_view inm;
+                    if (itTy && itTy->kind == sema::TypeRef::Kind::Named) {
+                        if (itTy->astNode && itTy->astNode->name &&
+                            !itTy->astNode->name->parts.empty())
+                            inm = itTy->astNode->name->parts[0];
+                        else if (!itTy->importedName.empty())
+                            inm = itTy->importedName;
+                    }
+                    if (inm == "OwnedEnumerable")
+                        return lvalueAddr(receiver, slotTy);
+                }
+                return nullptr;
+            }
             // A `using var` local is owned by this scope (§28.10). A plain `var`
             // owned local (init `new C(...)` or an `owned T` return) is owned by
             // structure — exactly the §28.3 unwind-disposal eligibility. Either
