@@ -9664,6 +9664,30 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // never collide (a const member's last name part is not a type name).
         if (llvm::Value* cv = constValueForPatternName(np->name.get())) {
             if (!isStr) cv = reconcile(cv, scrut->getType());
+            // §19 (#964): a named-const pattern whose type is incompatible with
+            // the scrutinee (e.g. a `string` const vs an `int` scrutinee) would
+            // emit an `ICmp`/content-compare over mismatched LLVM types — a hard
+            // abort (ICmpInst::AssertOK). `reconcile` bridges only int/fp widths;
+            // a residual ptr-vs-scalar, i1-vs-wider-int, or fp-vs-int mismatch is
+            // a §19 type error. (Sema rejects the literal-ConstantPattern form up
+            // front; a NamedPattern's const type is not resolved in sema, so this
+            // is the backstop.) Report it cleanly and never-match rather than
+            // crash.
+            llvm::Type* st = scrut->getType();
+            llvm::Type* ct = cv->getType();
+            bool incompatible =
+                st != ct &&
+                (st->isPointerTy() != ct->isPointerTy() ||
+                 st->isIntegerTy(1) != ct->isIntegerTy(1) ||
+                 st->isFloatingPointTy() != ct->isFloatingPointTy());
+            if (incompatible) {
+                ctx_.diagnostics().report(
+                    Severity::Error, np->span.begin,
+                    "case pattern constant type is not compatible with the "
+                    "scrutinee type (\xC2\xA7""19) — a `case` constant must be "
+                    "comparable to the scrutinee");
+                return builder_.getInt1(false);
+            }
             return emitEquals(scrut, cv, isStr);
         }
         // §19.3/§19.5: type-test pattern on a class/interface scrutinee.
