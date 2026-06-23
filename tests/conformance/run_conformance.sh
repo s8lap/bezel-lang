@@ -32,6 +32,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CASES_DIR="$SCRIPT_DIR/cases"
 MANIFEST="$SCRIPT_DIR/manifest.tsv"
+# Shared illustrative-type stubs, prepended (at module scope) to any case whose
+# manifest `notes` field is `preamble` so fragments that reference undefined
+# illustrative helper types (Connection, Point, …) compile against a common stub
+# set instead of failing on "unresolved type name".
+PREAMBLE_FILE="$SCRIPT_DIR/preamble.bzl"
 
 TMPDIR_RUN="$(mktemp -d /tmp/conf_run.XXXXXX)"
 trap 'rm -rf "$TMPDIR_RUN"' EXIT
@@ -167,6 +172,7 @@ run_case() {
     local section="$3"
     local class="$4"
     local expectation="$5"
+    local notes="${6:-}"
 
     local src_file="$CASES_DIR/${case_id}.bzl"
     if [[ ! -f "$src_file" ]]; then
@@ -186,6 +192,22 @@ run_case() {
     wrap_output="$(wrap_fragment "$case_id" "$src_file" 2>/dev/null)"
     wrap_mode="$(echo "$wrap_output" | head -1)"
     wrap_file="$(echo "$wrap_output" | tail -1)"
+
+    # ---- PREAMBLE SPLICE ----
+    # For a `preamble` case, insert the shared illustrative stubs at module scope
+    # (right after the `module …;` line the wrapper emitted) so the fragment's
+    # references to Connection/Point/… resolve against a common stub set.
+    if [[ "$notes" == "preamble" && -f "$PREAMBLE_FILE" ]]; then
+        awk -v pf="$PREAMBLE_FILE" '
+            !spliced && /^[[:space:]]*module[[:space:]]/ {
+                print
+                while ((getline line < pf) > 0) print line
+                spliced = 1
+                next
+            }
+            { print }
+        ' "$wrap_file" > "$wrap_file.pre" && mv "$wrap_file.pre" "$wrap_file"
+    fi
 
     # ---- COMPILE ----
     local compile_rc
@@ -345,7 +367,7 @@ while IFS=$'\t' read -r case_id doc section class expectation notes; do
         continue
     fi
 
-    run_case "$case_id" "$doc" "$section" "$class" "$expectation"
+    run_case "$case_id" "$doc" "$section" "$class" "$expectation" "$notes"
 
 done < "$MANIFEST"
 
