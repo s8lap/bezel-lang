@@ -249,7 +249,7 @@ spec_0246	spec	307-Async-iterators	skip	n/a	skip:signature
 spec_0247	spec	307-Async-iterators	skip	n/a	skip:syntax-snippet
 spec_0248	spec	Cancellation-in-await-for	skip	n/a	skip:syntax-snippet
 spec_0249	spec	Async-iteration-with-owned-yields	skip	n/a	blocked-on-#645
-spec_0250	spec	308-Cancellation	skip	n/a	blocked-on-#974
+spec_0250	spec	308-Cancellation	skip	n/a	skip:signature-listing
 spec_0251	spec	309-Exception-handling-in-async-methods	skip	n/a	skip:syntax-snippet
 spec_0252	spec	309-Exception-handling-in-async-methods	skip	n/a	skip:syntax-snippet
 spec_0253	spec	TaskCompletionSourceT-for-non-class-T	skip	n/a	skip:signature
