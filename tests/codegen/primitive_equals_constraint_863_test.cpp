@@ -59,3 +59,48 @@ BEZEL_TEST(primitive_equals_constraint_863, compareto_still_dispatches) {
         "  return U.Cmp(3, 9); "  // 3 < 9 → 1
         "end Main; end C;"), 1);
 }
+
+// #863 part 2 — the record/class half: dispatch through the BUILTIN
+// IComparable<T>/IEquatable<T> constraint to a USER record's / class's own
+// method (the case the part-1 test comment noted was tracked separately). Both
+// halves now dispatch to the concrete implementation rather than returning 0.
+
+// A user RECORD that implements IComparable<Score> — CompareGeneric calls
+// `a.CompareTo(b)` through the `where T: IComparable<T>` constraint (§14.2).
+// Score(7).CompareTo(Score(42)) = 7 - 42 = -35 < 0 → 1 (was 0 / miscompiled).
+BEZEL_TEST(primitive_equals_constraint_863, record_compareto_via_constraint) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Score(val: int) : IComparable<Score> "
+        "  public method CompareTo(other: Score): int => val - other.val; "
+        "end Score; "
+        "static class U "
+        "  public static method Cmp<T>(a: T, b: T): int where T: IComparable<T> "
+        "    return (1 if a.CompareTo(b) < 0 else 0); end Cmp; "
+        "end U; "
+        "class C public static method Main(): int "
+        "  return U.Cmp(new Score(7), new Score(42)); "  // -35 < 0 → 1
+        "end Main; end C;"), 1);
+}
+
+// A user CLASS that implements IEquatable<Pt> — AreEqual calls `a.Equals(b)`
+// through the `where T: IEquatable<T>` constraint (§14.2). Verifies real
+// dispatch in BOTH directions (equal → 1, unequal → 0), not a constant.
+BEZEL_TEST(primitive_equals_constraint_863, user_class_equals_via_constraint) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Pt : IEquatable<Pt> "
+        "  public x: int; "
+        "  public constructor(v: int) x := v; end constructor; "
+        "  public method Equals(other: Pt): bool => x = other.x; "
+        "end Pt; "
+        "static class U "
+        "  public static method Eq<T>(a: T, b: T): int where T: IEquatable<T> "
+        "    return (1 if a.Equals(b) else 0); end Eq; "
+        "end U; "
+        "class C public static method Main(): int "
+        "  using var p1 := new Pt(9); using var p2 := new Pt(9); "
+        "  using var p3 := new Pt(4); "
+        "  return U.Eq(p1, p2) * 10 + U.Eq(p1, p3); "  // equal*10 + unequal = 10
+        "end Main; end C;"), 10);
+}
