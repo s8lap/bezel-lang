@@ -3219,6 +3219,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     "auto-properties, or public fields (§9.5, #876)");
                 continue;
             }
+            // §13.1 (#934): enforce member visibility on `with` targets.
+            // A private property/field is inaccessible from outside the
+            // declaring type — the same rule that governs ordinary member
+            // access (checkMemberVisibility). Without this check a `with`
+            // expression silently bypassed visibility for private backing
+            // storage (BAD_ACCEPT).
+            if (auto* msym = dynamic_cast<MemberSymbol*>(mem))
+                checkMemberVisibility(msym, ia.name, valLoc);
             if (dynamic_cast<MethodSymbol*>(mem) ||
                 dynamic_cast<ConstructorSymbol*>(mem) ||
                 dynamic_cast<DestructorSymbol*>(mem)) {
