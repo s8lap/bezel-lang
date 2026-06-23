@@ -2298,6 +2298,44 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // stdlib §10.1 / §10.2 / fix #983: CString.Length / WString.Length property
+    // reads. A CString is a bare null-terminated char* (bz_string_to_utf8z /
+    // bz_cstring_from_bytes); its Length is strlen, the byte count excluding the
+    // terminator (§10.1). A WString is a bare null-terminated uint16_t*
+    // (bz_string_to_utf16z); its Length is the UTF-16 code-unit count via
+    // bz_wstrlen, excluding the terminating zero unit (§10.2). Both are builtin
+    // FFI-boundary types whose TypeRef declaration is the builtin class symbol.
+    // Before this, a member read fell through every handler and `Length` was 0.
+    // (RawBytes.Length is NOT handled here: bz_rawbytes_from returns a bare byte
+    // buffer with no stored length, so RawBytes.Length needs a representation
+    // change — tracked separately.)
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "Length") {
+            auto* tt = ctx_.exprType(*ma->target);
+            // A CString/WString TypeRef is a Named type whose declaration is the
+            // builtin class symbol (set in ExprTypecheck_Calls.cpp for the From/
+            // FromBytes factories), so match on the declaration's name.
+            bool isCStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                tt->declaration && tt->declaration->name == "CString";
+            bool isWStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                tt->declaration && tt->declaration->name == "WString";
+            if (isCStr || isWStr) {
+                bool isW = isWStr;
+                llvm::Value* buf = lowerExpr(*ma->target);
+                if (!buf) return nullptr;
+                llvm::Value* len;
+                if (isW) {
+                    auto* fn = declareC("bz_wstrlen", i64(), {ptrTy()});
+                    len = builder_.CreateCall(fn, {buf}, "wstr.len");
+                } else {
+                    auto* fn = declareC("strlen", i64(), {ptrTy()});
+                    len = builder_.CreateCall(fn, {buf}, "cstr.len");
+                }
+                // §10.1/§10.2: Length is `int` (i32) — truncate the size_t count.
+                return builder_.CreateTrunc(len, i32(), "ffi.len.i32");
+            }
+        }
+    }
     // fix #667 / §30.15 / stdlib §6.9: Channel<T>.IsClosed and Channel<T>.Count
     // as property reads (MemberAccessExpr without parens). These are "readonly
     // property" in the stdlib, so the parser generates a MemberAccessExpr (not

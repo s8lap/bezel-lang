@@ -6431,6 +6431,18 @@ extern "C" void* bz_string_to_utf16z(const void* strp) {
     return out;
 }
 
+// stdlib §10.2 / fix #983: WString.Length — the number of UTF-16 code units in a
+// null-terminated uint16_t buffer, excluding the terminating zero unit. (strlen
+// cannot be used: UTF-16 of an ASCII code point has a high zero byte, so a
+// byte-wise scan would stop early.)
+extern "C" int64_t bz_wstrlen(const void* wstrp) {
+    if (!wstrp) return 0;
+    const uint16_t* p = (const uint16_t*)wstrp;
+    int64_t n = 0;
+    while (p[n] != 0) ++n;
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // stdlib §10.3 / fix #977: RawBytes.From(buffer: Array<byte>)
 // Copies the byte array's contents into a fresh independently-owned malloc'd

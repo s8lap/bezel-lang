@@ -353,3 +353,35 @@ BEZEL_TEST(codegen_math, min_max) {
         "  return Math.Min(3, 7) + Math.Max(3, 7); "
         "end Main; end C;"), 10);
 }
+
+// fix #983 / stdlib §10.1: CString.Length is strlen of the underlying buffer
+// (byte count excluding the terminator), not a constant 0. Before the fix the
+// member read fell through every handler and evaluated to 0.
+BEZEL_TEST(codegen_ffi_types, cstring_length_property_983) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var cs := CString.From(\"hello\"); "
+        "  return cs.Length; "
+        "end Main; end C;"), 5);
+}
+
+// fix #983 / stdlib §10.1: Length of a FromBytes-constructed CString — the bytes
+// are copied and a terminator appended, so Length is the content length.
+BEZEL_TEST(codegen_ffi_types, cstring_frombytes_length_983) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b: Array<byte> := [104, 105]; "
+        "  using var cs := CString.FromBytes(b); "
+        "  return cs.Length; "
+        "end Main; end C;"), 2);
+}
+
+// fix #983 / stdlib §10.2: WString.Length is the UTF-16 code-unit count via
+// bz_wstrlen (strlen would stop at the high zero byte of an ASCII unit).
+BEZEL_TEST(codegen_ffi_types, wstring_length_property_983) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var w := WString.From(\"hi\"); "
+        "  return w.Length; "
+        "end Main; end C;"), 2);
+}

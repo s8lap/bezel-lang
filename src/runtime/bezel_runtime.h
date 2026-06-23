@@ -1003,6 +1003,10 @@ char* bz_cstring_from_bytes(const void* arr);
 // as a null-terminated UTF-16LE buffer of uint16_t code units. Caller frees.
 void* bz_string_to_utf16z(const void* str);
 
+// stdlib §10.2 / fix #983: WString.Length — count of UTF-16 code units in a
+// null-terminated uint16_t buffer, excluding the terminating zero unit.
+int64_t bz_wstrlen(const void* wstr);
+
 // stdlib §10.3 / fix #977: RawBytes.From(buffer: Array<byte>) — copies the
 // byte array into a fresh malloc'd buffer (no null terminator). Caller frees.
 void* bz_rawbytes_from(const void* arr);
