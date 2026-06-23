@@ -10129,7 +10129,10 @@ const sema::TypeRef* Emitter::builtinByteArrayTypeRef() {
 // factory copies the bytes (stdlib §10: independent buffer) and only borrows the
 // source, so materialize the literal into an owned Array<byte> temporary and
 // register its scope-end disposal (disposed exactly once on the normal AND unwind
-// paths). A non-literal argument lowers exactly as before.
+// paths). A non-literal argument: lower via lowerExpr and — for a plain `var`
+// (non-using) local — register its scope-end collection disposal exactly once
+// (#998 / §28.3), since the non-using lowerStmt path calls only
+// registerUnwindOwnedLocal, which skips collection types.
 llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&argExpr)) {
         const sema::TypeRef* byteArr = builtinByteArrayTypeRef();
@@ -10141,6 +10144,54 @@ llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
             disposeStack_.back().push_back(
                 buildCollectionTempDisposal(slot, byteArr));
         return coll;
+    }
+    // #998 / §28.3: when the argument is a plain `var` (non-using) local of
+    // collection type (e.g. `var b: Array<byte>`), no scope-end disposal is
+    // registered at declaration time — the non-using lowerStmt path calls only
+    // registerUnwindOwnedLocal, which skips collections (§28.3 line 4910 covers
+    // class instances, not collection builtins). Register the caller's array for
+    // scope-end disposal here, on the NORMAL AND UNWIND paths, so the factory
+    // merely borrows the bytes while the caller disposes exactly once at scope end.
+    //
+    // Guards:
+    //   isUsing — a `using var b` already has disposal from registerUsingDisposal;
+    //             skip to prevent double-free.
+    //   alreadyReg — if the same local is passed to multiple FFI calls in the same
+    //             scope (e.g. RawBytes.From(b); RawBytes.From(b)), only register
+    //             disposal once to prevent double-free at scope exit.
+    //   scope depth — register in the scope where the local was declared
+    //             (declScopeDepth_), not necessarily the innermost scope; this is
+    //             correct whether the call is in the same or a nested scope.
+    if (!disposeStack_.empty()) {
+        if (sema::Symbol* rawSym = ctx_.exprSymbol(argExpr)) {
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(rawSym)) {
+                if (!loc->isUsing && loc->decl) {
+                    auto slotIt = locals_.find(loc->decl);
+                    if (slotIt != locals_.end()) {
+                        llvm::AllocaInst* argSlot = slotIt->second;
+                        // Determine the scope in which this local was declared.
+                        std::size_t depth = disposeStack_.size() - 1;
+                        auto dd = declScopeDepth_.find(loc->decl);
+                        if (dd != declScopeDepth_.end() && dd->second >= 1 &&
+                                dd->second - 1 < disposeStack_.size())
+                            depth = dd->second - 1;
+                        // Check if already registered (guard against double-registration).
+                        bool alreadyReg = false;
+                        for (const auto& d : disposeStack_[depth])
+                            if (d.slot == argSlot &&
+                                    (d.collection || d.dict || d.linkedList)) {
+                                alreadyReg = true;
+                                break;
+                            }
+                        if (!alreadyReg) {
+                            const sema::TypeRef* byteArr = builtinByteArrayTypeRef();
+                            disposeStack_[depth].push_back(
+                                buildCollectionTempDisposal(argSlot, byteArr));
+                        }
+                    }
+                }
+            }
+        }
     }
     return lowerExpr(argExpr);
 }

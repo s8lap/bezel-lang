@@ -1,4 +1,6 @@
-// Codegen + runtime — RawBytes disposal (issue #985, stdlib §10.3).
+// Codegen + runtime — RawBytes disposal (issue #985, stdlib §10.3) and
+// source Array<byte> disposal on the builtin byte-FFI factory call path
+// (issue #998, §28.3).
 //
 // fix #985 gave RawBytes a { ptr, len } representation: RawBytes.From allocates
 // a small heap struct whose `ptr` field owns a separate malloc'd byte buffer.
@@ -16,18 +18,20 @@
 // routes RawBytes through bz_rawbytes_free while keeping CString/WString on the
 // single free(); this test verifies RawBytes disposes both allocations once.
 //
-// NOTE on the orthogonal Array<byte> leak (issues #998 / #999): an Array<byte>
-// literal local passed to a builtin FFI factory (RawBytes.From / CString.From-
-// Bytes) is currently not disposed by its owner — a PRE-EXISTING ownership gap
-// on the builtin-factory call path that affects CString.FromBytes identically
-// and is unrelated to the RawBytes representation. The RawBytes struct + buffer
-// ARE freed exactly once (no bz_rawbytes_* allocation appears in any leak
-// report). Because that orthogonal array leak would trip detect_leaks=1, these
-// tests use the no-CORRUPTION posture (detect_leaks=0): they catch the thing
-// #985 must never regress — a double-free / use-after-free of the RawBytes
-// struct or its buffer — while tolerating the orthogonal array leak. The
-// value-correctness leg (compileAndRun, distinct exit codes) additionally
-// proves the buffer is intact (not freed early) at the point of use.
+// fix #998 / §28.3: a plain `var b: Array<byte>` (non-using) passed as a borrow
+// to RawBytes.From(b) or CString.FromBytes(b) was never disposed at scope end.
+// The lowerByteArrayFactoryArg helper now registers `b` for scope-end collection
+// disposal when the argument is a plain var local (isUsing=false), using the same
+// buildCollectionTempDisposal machinery as the collection-literal path. Guards
+// prevent double-registration when the same local appears in multiple FFI calls
+// within the same scope, or when it is already a `using var` with disposal
+// registered via registerUsingDisposal.
+//
+// NOTE on kCopyToRoundTrip: the `var dst` array passed to rb.CopyTo(dst, 0) is
+// NOT a FFI-factory argument and is not covered by the #998 fix — that disposal
+// gap is tracked separately. kCopyToRoundTrip keeps detect_leaks=0 (the existing
+// #985 posture) to allow the dst leak while still catching double-free / UAF of
+// the RawBytes struct or its buffer.
 
 #include <cstdio>
 #include <cstdlib>
@@ -149,6 +153,70 @@ void expectValueAndNoCorruption(const std::string& source, int expectedExitCode)
     BEZEL_EXPECT_EQ(asan, 0);     // 0 == no double-free / UAF
 }
 
+// #998 / §28.3: run under ASan with leak detection ON (detect_leaks=1). Returns:
+//   0  — ran clean: no leak, no double-free, no UAF.
+//  99  — ASan / LSan reported an error.
+//  -1  — toolchain unavailable / build step failed: SKIP.
+int runUnderLeakSanitizer(const std::string& source) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_998rb_lsan_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+
+    {
+        bezel::DiagnosticEngine diags;
+        bezel::Lexer lexer(source, diags);
+        bezel::Parser parser(lexer, diags);
+        auto unit = parser.parseCompilationUnit();
+        if (!unit) return -1;
+        bezel::sema::SemaContext ctx(diags);
+        bezel::sema::collectSymbols(*unit, ctx);
+        bezel::sema::resolveTypes(*unit, ctx);
+        bezel::sema::typecheckExpressions(*unit, ctx);
+        bezel::sema::checkDefiniteAssignment(*unit, ctx);
+        bezel::ownership::checkOwnership(*unit, ctx);
+        if (diags.hasErrors()) return -1;
+        llvm::LLVMContext llvmCtx;
+        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+        if (!module) return -1;
+        std::string err;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    }
+
+    auto cleanup = [&] {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+    };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+
+    std::string runCmd =
+        "ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0 " + exe +
+        " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (status == -1) return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 99;
+    return 0;
+}
+
+// #998 / §28.3: assert value-correctness AND leak-freedom (detect_leaks=1).
+// The source Array<byte> must be freed exactly once at scope end (no leak, no
+// double-free). Callers must ensure ALL heap locals in the probe are disposed —
+// only use this where every non-using Array<byte> is a FFI-factory argument.
+void expectValueAndLeakFree(const std::string& source, int expectedExitCode) {
+    BEZEL_EXPECT_EQ(compileAndRun(source), expectedExitCode);
+    int lsan = runUnderLeakSanitizer(source);
+    if (lsan == -1) return;        // toolchain unavailable: skip the LSan leg
+    BEZEL_EXPECT_EQ(lsan, 0);      // 0 == no leak, no double-free, no UAF
+}
+
 // stdlib §10.3 / fix #985: a single `using var` RawBytes — the struct and its
 // buffer are both freed via bz_rawbytes_free at scope end, exactly once.
 const char* kSingleRawBytes =
@@ -204,6 +272,66 @@ const char* kCopyToRoundTrip =
     "  return dst[0] + dst[1] + dst[2] + dst[3]; "
     "end Main; end C;";
 
+// ── #998 / §28.3: source Array<byte> disposal regression tests ───────────────
+//
+// Each probe uses a plain `var b: Array<byte>` (non-using) as the source array
+// so that fix #998 is the SOLE mechanism disposing it. Every other heap local
+// is either a `using var` or disposed explicitly, ensuring the only possible
+// leak under LSan is the source array — so detect_leaks=1 proves disposal is
+// exactly-once (not zero, not two).
+
+// #998 / §28.3: plain `var` source array passed to RawBytes.From — leak-free.
+// Pre-fix: bz_array_alloc of b leaked (32B struct + 16B buffer). Post-fix: the
+// lowerByteArrayFactoryArg helper registers b's slot for scope-end bz_array_free
+// on the normal AND unwind paths.
+const char* k998RawBytesVarSource =
+    "module M; class C public static method Main(): int "
+    "  var b: Array<byte> := [10, 20, 30]; "
+    "  using var rb := RawBytes.From(b); "
+    "  return rb.Length; "
+    "end Main; end C;";
+
+// #998 / §28.3: plain `var` source array passed to CString.FromBytes — leak-free.
+// CString.FromBytes shares the same lowerByteArrayFactoryArg codepath as
+// RawBytes.From, so the fix covers it identically.
+const char* k998CStringFromBytesVarSource =
+    "module M; class C public static method Main(): int "
+    "  var b: Array<byte> := [65, 66, 67, 0]; "
+    "  using var cs := CString.FromBytes(b); "
+    "  return cs.Length; "
+    "end Main; end C;";
+
+// #998 / §28.3: same local passed to two RawBytes.From calls in one scope —
+// no double-free (the alreadyReg guard prevents a second disposal entry).
+const char* k998MultipleFFICallsSameLocal =
+    "module M; class C public static method Main(): int "
+    "  var b: Array<byte> := [1, 2, 3]; "
+    "  using var rb1 := RawBytes.From(b); "
+    "  using var rb2 := RawBytes.From(b); "
+    "  return rb1.Length + rb2.Length; "
+    "end Main; end C;";
+
+// #998 / §28.3: `using var b` form — disposal already registered via
+// registerUsingDisposal; the isUsing guard in lowerByteArrayFactoryArg must NOT
+// add a second disposal entry (no double-free).
+const char* k998UsingVarSourceNoDoubleFree =
+    "module M; class C public static method Main(): int "
+    "  using var b: Array<byte> := [10, 20, 30]; "
+    "  using var rb := RawBytes.From(b); "
+    "  return rb.Length; "
+    "end Main; end C;";
+
+// #998 / §28.3: two distinct source arrays, each passed to RawBytes.From —
+// both disposed exactly once (two separate disposal entries).
+const char* k998TwoDistinctSources =
+    "module M; class C public static method Main(): int "
+    "  var b: Array<byte> := [1, 2, 3]; "
+    "  var c: Array<byte> := [4, 5]; "
+    "  using var rb1 := RawBytes.From(b); "
+    "  using var rb2 := RawBytes.From(c); "
+    "  return rb1.Length + rb2.Length; "
+    "end Main; end C;";
+
 } // namespace
 
 // stdlib §10.3 / fix #985: a single RawBytes disposes both allocations once.
@@ -229,4 +357,34 @@ BEZEL_TEST(rawbytes_disposal, empty_dispose_once_985) {
 // stdlib §10.3 / fix #985: CopyTo reads a live buffer; disposal stays once.
 BEZEL_TEST(rawbytes_disposal, copyto_then_dispose_once_985) {
     expectValueAndNoCorruption(kCopyToRoundTrip, 26);
+}
+
+// fix #998 / §28.3: plain `var` source Array<byte> is disposed exactly once at
+// scope end when passed to RawBytes.From (no leak of the bz_array_t + buffer).
+BEZEL_TEST(rawbytes_disposal, var_source_rawbytes_leak_free_998) {
+    expectValueAndLeakFree(k998RawBytesVarSource, 3);
+}
+
+// fix #998 / §28.3: plain `var` source Array<byte> is disposed exactly once at
+// scope end when passed to CString.FromBytes (covers the CString factory path).
+BEZEL_TEST(rawbytes_disposal, var_source_cstring_frombytes_leak_free_998) {
+    expectValueAndLeakFree(k998CStringFromBytesVarSource, 3);
+}
+
+// fix #998 / §28.3: same local passed to multiple FFI calls — alreadyReg guard
+// prevents double disposal; no double-free under ASan (detect_leaks=1).
+BEZEL_TEST(rawbytes_disposal, multiple_ffi_calls_same_local_no_double_free_998) {
+    expectValueAndLeakFree(k998MultipleFFICallsSameLocal, 6);
+}
+
+// fix #998 / §28.3: `using var b` form — isUsing guard prevents adding a second
+// disposal entry on top of registerUsingDisposal's; no double-free.
+BEZEL_TEST(rawbytes_disposal, using_var_source_no_double_free_998) {
+    expectValueAndLeakFree(k998UsingVarSourceNoDoubleFree, 3);
+}
+
+// fix #998 / §28.3: two distinct plain `var` source arrays — each gets its own
+// disposal entry; both freed exactly once (no leak, no double-free).
+BEZEL_TEST(rawbytes_disposal, two_distinct_sources_leak_free_998) {
+    expectValueAndLeakFree(k998TwoDistinctSources, 5);
 }
