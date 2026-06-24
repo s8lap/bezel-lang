@@ -5767,7 +5767,9 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     const sema::TypeRef* tr = nullptr;
     if (ld->type) tr = ctx_.resolvedType(*ld->type);
     if (!tr) tr = ctx_.exprType(*ld->initializer);
-    if (!tr || tr->kind != sema::TypeRef::Kind::Named || tr->declaration)
+    if (!tr || tr->kind != sema::TypeRef::Kind::Named)
+        return false;
+    if (tr->declaration)
         return false;
     std::string_view name;
     if (tr->astNode && tr->astNode->name && !tr->astNode->name->parts.empty())
@@ -5805,9 +5807,9 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
             wrappedHere = initIsArray || initTR->declaration != nullptr;
         }
     }
-    bool ownsSource = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
-                      dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
-                      wrappedHere;
+    bool isCall = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) != nullptr;
+    bool isNew = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) != nullptr;
+    bool ownsSource = isCall || isNew || wrappedHere;
     if (!ownsSource) return false;
 
     // The source value is the IEnumerABLE: dispose it once at scope end (the
