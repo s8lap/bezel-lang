@@ -5839,12 +5839,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (!ld->isAwaitUsing && ld->initializer) {
         const sema::TypeRef* lt = ld->type ? ctx_.resolvedType(*ld->type)
                                            : ctx_.exprType(*ld->initializer);
+        // issue #1002 / §29.11: also match a `using var e := arr.GetEnumerator()`
+        // whose value is the builtin IEnumerator<T>/OwnedEnumerator<T> sentinel
+        // (an iterator-vtable enumerator, slot-1 Dispose). Without this the
+        // enumerator struct leaks at scope end (the generic dispose paths below
+        // do not recognise the declaration-less iterator type). Its slot-1
+        // Dispose frees only the wrapper struct (it borrows the array), so this
+        // is exactly-once and never double-frees the separately owned array.
         bool isSyncIterEnum =
             lt && lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
             lt->astNode && lt->astNode->name &&
             !lt->astNode->name->parts.empty() &&
             (lt->astNode->name->parts[0] == "IEnumerable" ||
-             lt->astNode->name->parts[0] == "OwnedEnumerable");
+             lt->astNode->name->parts[0] == "OwnedEnumerable" ||
+             lt->astNode->name->parts[0] == "IEnumerator" ||
+             lt->astNode->name->parts[0] == "OwnedEnumerator");
         if (isSyncIterEnum) {
             const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
             bool wrappedHere = initTR && initTR->kind == sema::TypeRef::Kind::Named &&

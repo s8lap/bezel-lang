@@ -2263,6 +2263,41 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // .Next / .Previous: LinkedListNode<T>? — same.
                         // No call-expression methods on the node type per §4.6.
                     }
+                    // issue #1002 / §29.3 / stdlib §4.4/§4.12: a borrowing
+                    // collection's `GetEnumerator()` returns `owned
+                    // IEnumerator<T>` (declared on IEnumerable<T>, which Array<T>
+                    // and OwnedArray<T> implement). Type the result as the
+                    // *builtin* IEnumerator<T> sentinel (a Named TypeRef with no
+                    // declaration, astNode name = "IEnumerator", genericArgs =
+                    // [T]) so the manual-protocol typing for the #494 fix fires:
+                    // MoveNext() is then typed bool (not the i32 default → no
+                    // `br i32` IR_FAIL) and `e.Current` is typed T. Codegen
+                    // lowers the call by wrapping the array as the §29.11 (#943)
+                    // iterator-vtable enumerator, whose slots 1/2/3 are
+                    // Dispose/MoveNext/Current — exactly what the #494 dispatch
+                    // and the slot-1 using-var disposal expect. Iterating
+                    // OwnedArray<T> through IEnumerable<T> is borrowing (§4.3:
+                    // shared read-only interfaces yield borrows), so Current is
+                    // non-destructive here.
+                    if ((colName == "Array" || colName == "OwnedArray") &&
+                        m == "GetEnumerator" && ce.args.empty() &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        static const ast::Type* kIEnumeratorNode =
+                            []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("IEnumerator");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kIEnumeratorNode;
+                        tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                        ctx_.setExprType(&ce, tr);
+                    }
                     // issue #494 / §29.2 / §29.3: builtin IEnumerator<T> /
                     // OwnedEnumerator<T> call-expression methods.
                     //   MoveNext(): bool — advances the iterator (vtable slot 2)

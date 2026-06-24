@@ -9204,6 +9204,64 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // issue #1002 / §29.3 / §29.11 / stdlib §4.4/§4.12: explicit
+        // `arr.GetEnumerator()` on a builtin Array<T>/OwnedArray<T> receiver.
+        // The stdlib types this `owned IEnumerator<T>`, and sema now types the
+        // result as the builtin IEnumerator<T> sentinel (so #494 MoveNext/Current
+        // typing fires). Lower it to a concrete iterator-vtable enumerator by
+        // reusing the #943 array-wrapper machinery: wrap the array as the
+        // IEnumerable vtable object ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,
+        // [4]=GetEnumerator) then call slot 4 to hand back a FRESH, INDEPENDENT
+        // cursor enumerator (positioned before the first element). The returned
+        // enumerator's slot-1 Dispose frees only the small wrapper struct — it
+        // BORROWS the array (`arr`), never freeing it — so a separate `using var
+        // arr` is disposed exactly once, on its own, with no double-free (§28.2).
+        // A `using var e := arr.GetEnumerator()` is disposed via the iterator
+        // slot-1 path registered in registerUsingDisposal (§29.7/§29.11).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "GetEnumerator" && ma->target &&
+                    call.args.empty()) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                std::string_view rbn = builtinTypeName(recvTy);
+                if ((rbn == "Array" || rbn == "OwnedArray") && recvTy &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                    llvm::Value* arr = lowerExpr(*ma->target);
+                    if (arr && arr->getType()->isPointerTy()) {
+                        // Wrap as the §29.11 iterator-vtable IEnumerable object.
+                        llvm::Value* iter = wrapArrayAsIEnumerable(arr, recvTy);
+                        if (iter && iter->getType()->isPointerTy()) {
+                            // slot 4: fresh independent cursor enumerator (#943).
+                            llvm::Value* vt =
+                                builder_.CreateLoad(ptrTy(), iter);
+                            llvm::Value* geSlot = builder_.CreateGEP(
+                                ptrTy(), vt, {builder_.getInt32(4)});
+                            llvm::Value* geFn =
+                                builder_.CreateLoad(ptrTy(), geSlot);
+                            auto* geTy = llvm::FunctionType::get(
+                                ptrTy(), {ptrTy()}, false);
+                            llvm::Value* en = builder_.CreateCall(
+                                geTy, geFn, {iter}, "arr.getenum");
+                            // The wrapper IEnumerable object `iter` itself is a
+                            // throwaway: slot-4 produced an independent clone, so
+                            // free the wrapper struct (its Dispose is a plain
+                            // free() of the borrow-holding struct; the array is
+                            // untouched). Keeps the heap clean with no leak.
+                            llvm::Value* iterVt =
+                                builder_.CreateLoad(ptrTy(), iter);
+                            llvm::Value* dSlot = builder_.CreateGEP(
+                                ptrTy(), iterVt, {builder_.getInt32(1)});
+                            llvm::Value* dFn =
+                                builder_.CreateLoad(ptrTy(), dSlot);
+                            auto* dTy = llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+                            builder_.CreateCall(dTy, dFn, {iter});
+                            return en;
+                        }
+                    }
+                }
+            }
+        }
         // issue #494 / §29.2 / §29.3: explicit `e.MoveNext()` call where `e` is
         // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol for MoveNext). The iterator state
@@ -9313,6 +9371,44 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "Dispose" && ma->target) {
+                // issue #1002 / §29.3 / §29.7: explicit `e.Dispose()` where `e`
+                // is the builtin IEnumerator<T> / OwnedEnumerator<T> sentinel (a
+                // GetEnumerator result, or a yield-method enumerator). It has no
+                // sema TypeDecl, so the generic Dispose dispatch below would not
+                // recognise it and the enumerator struct/frame would leak. Its
+                // vtable is the iterator format [0]=td,[1]=Dispose,[2]=MoveNext,
+                // [3]=Current — dispatch slot 1 (which for the array-wrapper clone
+                // is a plain free() of the borrow-holding struct, leaving the
+                // borrowed array intact, and for a yield enumerator runs the
+                // state machine's pending finally then frees the frame). Null the
+                // receiver slot afterward so a subsequent using/scope-exit
+                // disposal of the same slot is a no-op (§28.2 exactly-once).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    std::string_view ebn = builtinTypeName(recvTy);
+                    if (ebn == "IEnumerator" || ebn == "OwnedEnumerator") {
+                        llvm::Value* obj = lowerExpr(*ma->target);
+                        if (obj && obj->getType()->isPointerTy()) {
+                            llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+                            llvm::Value* dSlot = builder_.CreateGEP(
+                                ptrTy(), vt, {builder_.getInt32(1)});
+                            llvm::Value* dFn =
+                                builder_.CreateLoad(ptrTy(), dSlot);
+                            auto* dTy = llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+                            builder_.CreateCall(dTy, dFn, {obj});
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
                 // per §6.8 / #652: Domain instance Dispose() — release the
                 // bz_domain_t ref acquired by bz_domain_alloc. Calls
                 // bz_domain_dispose(dom) which calls domain_release().

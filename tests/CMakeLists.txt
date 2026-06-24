@@ -715,6 +715,11 @@ set(BEZEL_TEST_SOURCES
     #     IEnumerable<T> (interface-typed local / yield-method result) — eliminates
     #     the silent garbage miscompile and enables Where/Select for-in (§5/§29.11) ---
     codegen/ienumerable_vtable_linq_995_test.cpp
+    # --- fix #1002: manual enumerator protocol on Array<T>/OwnedArray<T>
+    #     GetEnumerator() — IEnumerator<T> typing + iterator-vtable lowering
+    #     (§29.3/§29.11, stdlib §4.4/§4.12); enumerator borrows the array,
+    #     disposed exactly once (§28.2) ---
+    codegen/array_getenumerator_1002_test.cpp
     # --- end #972 ---
     codegen/case_pattern_type_compat_964_test.cpp
     codegen/file_io_644_test.cpp
