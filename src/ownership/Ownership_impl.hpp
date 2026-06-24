@@ -269,6 +269,22 @@ private:
     // unaffected. Fires from handleReturn; a no-op for non-owning return types.
     void checkBorrowReturnedThroughOwningType(const ast::Expr& e);
 
+    // §28.6 (#1005): reject returning an OWNED FIELD's `move`d value through a
+    // method return type that is NOT declared `owned`. The leak is the `move`
+    // form: `move this.f` / `move f` transfers the owned field's value out
+    // (§28.8.1), nulling the field, so the moved value escapes a non-`owned`
+    // (borrow) return with no owner. A BARE read (`return this.f;` / `=> f;`) is
+    // NOT flagged: per §28.6's "Methods returning `this`" rule a non-`owned`
+    // class return type yields a legal BORROW of the field (the field's owner —
+    // the receiver's destructor — still disposes it; the owning-collection
+    // `return _transactions` leak is the separate #1007 case). An `owned` return
+    // type is the legal transfer and is exempt. Scoped to owned FIELD `move`s
+    // only; owned-LOCAL returns (`var r := new T(); return r;`) are a separate
+    // concern (#1006a) and are NOT handled here. Fires from handleReturn (block
+    // bodies) and runExprBodyOwningReturnCheck (`=>` expression bodies).
+    // // per §28.6
+    void checkOwnedFieldReturn(const ast::Expr& e);
+
     // §28.3 / §5.11 (#1007): the name-head of an owning-collection / owning-
     // wrapper type (the set whose value the caller must discharge). True for
     // `OwnedArray`/`OwnedDictionary`/…/`Shared`/`Weak`/`OwnedTask`/etc.

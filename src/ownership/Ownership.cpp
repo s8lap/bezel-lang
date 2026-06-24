@@ -220,6 +220,10 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         }
     }
     checkBorrowReturnedThroughOwningType(exprBody);
+    // §28.6 (#1005): the `=>` expression-body sibling of the handleReturn call —
+    // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
+    // legal). // per §28.6
+    checkOwnedFieldReturn(exprBody);
 }
 
 namespace {
@@ -1416,6 +1420,12 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // handleDischarge, so the (rejected) returned local is examined in its borrow
     // state. A no-op for non-owning return types. // per §28.3, §28.6, §5.11
     checkBorrowReturnedThroughOwningType(e);
+    // §28.6 (#1005): reject returning an owned field's `move`d value
+    // (`move this.f` / `move f`) through a non-`owned` return type — the moved
+    // field value escapes with no owner (leak). A bare field read is a legal
+    // borrow and is not flagged. Exempt when the return type is `owned` (the
+    // legal transfer). // per §28.6
+    checkOwnedFieldReturn(e);
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement
@@ -1541,6 +1551,60 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         "it, double-freeing the borrow's actual owner (§28.3 / §5.11); return a "
         "freshly-produced or `move`d owned value, declare the return type "
         "`owned`, or use a borrowing return type");
+}
+
+// §28.6 (#1005): "An owned field's value may not be returned from a method
+// unless the return type is also declared `owned`" (Bezel_Language_Spec.md
+// L5066; canonical error at L5071, `return _transactions; // ERROR: cannot
+// leak owned field`). The leak is the `move` form:
+//
+//   `move this.f` / `move f` — `move` reads the owned field's *value* as an
+//   owned value (§28.8.1, "the only way to read an owned field's value as an
+//   owned value") and nulls the field, so the enclosing object's destructor
+//   disposes nothing. Returned through a NON-`owned` (borrow) return type, the
+//   moved value escapes the body with no owner — a leak (the #1005 repro
+//   `Take(): Cell? => move v;`).
+//
+// SCOPED TO THE `move` FORM. A BARE read of an owned field (`return this.f;` /
+// `=> f;`) is NOT caught here: per §28.6's "Methods returning `this`" rule a
+// method with a non-`owned` class return type returns a BORROW of the field —
+// "a reference whose lifetime is bounded by the receiver's lifetime" — which the
+// caller may not assign to an owned field or return as owned, and which the
+// field's owner (the receiver's destructor) still disposes. That is a legal,
+// double-free-free borrow return (codified by the cross-module `t3` canary
+// `GetConn(): Connection => Conn`, which returns 55 ASan-clean). The §28.6
+// example's `return _transactions` leak is the OWNING-COLLECTION case (the field
+// type is an owning collection / wrapper), already rejected at
+// checkBorrowReturnedThroughOwningType (#1007); a bare class-type field read is
+// a borrow, not a leak. So only the `move` form — which actually transfers the
+// value out — is the §28.6 violation handled here.
+//
+// An `owned` return type is the explicit, legal ownership-transfer form (§28.8)
+// and is exempt. Scoped to owned FIELD `move`s only: an owned LOCAL return
+// (`var r := new T(); return r;`) is a separate concern (#1006a, with
+// materializer-interaction risk) and is deliberately NOT handled here — `move`
+// of a local resolves to a LocalSymbol, not a FieldSymbol, so it does not match.
+// // per §28.6
+void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
+    // An `owned` return type is the explicit, legal transfer — exempt.
+    if (returnOwned_) return;
+    // Require the `move` form: `move this.f` / `move f` is a UnaryExpr("move").
+    // A bare field read (no `move`) is a legal borrow return (see above) and is
+    // intentionally not flagged.
+    auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+    if (!un || un->op != "move" || !un->operand) return;
+    // The moved operand must be a read of an `owned` FIELD of the enclosing
+    // class. `exprIsOwnedFieldRead` resolves a MemberAccess `obj.f` or a bare
+    // identifier `f` (implicit `this.f`) to its FieldSymbol and checks the
+    // `owned` modifier; a method-scope local/parameter is not a FieldSymbol, so
+    // `move localOwned` (the #1006a concern) does not match. // per §28.6
+    if (!exprIsOwnedFieldRead(*un->operand)) return;
+    report(
+        Severity::Error, e.span.begin,
+        "cannot return an owned field's `move`d value through a non-`owned` "
+        "return (§28.6); `move` transfers the field's value out, leaving it with "
+        "no owner — declare the return type `owned` (e.g. `: owned T`) to "
+        "transfer ownership to the caller");
 }
 
 namespace {
