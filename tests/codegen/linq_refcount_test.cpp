@@ -710,3 +710,167 @@ const char* kUsingVarToArrayUntouched =
 BEZEL_TEST(linq_refcount, using_var_toarray_not_double_freed_1003) {
     expectValueAndLeakFree(kUsingVarToArrayUntouched, 6);
 }
+
+// #1004 / stdlib §5 / §3 / §28: the copy-forms `.Sorted()` / `.Reversed()`
+// shallow-copy their INPUT array into a fresh result; when that input is itself
+// a fresh, ownerless materializer temporary (`X.ToArray()` / `X.Sorted()` /
+// `X.Reversed()` with no `var`/`using` binding) the input is consumed only as
+// the copy source and was NEVER freed → it leaked (64B: the 32B backing header
+// + 32B data block, allocated by bz_lazy_to_array / bz_array_copy). The fix
+// frees the input after the copy, gated strictly on the receiver expression
+// being a fresh ownerless materializer CALL (isFreshOwnerlessArrayMaterializerExpr)
+// — so a named-local / field / param / `move` / `new` receiver (a borrowed or
+// owned-elsewhere array) is never freed, no UAF and no double-free. The four
+// leak cases are LSan-clean only with BOTH the #1003 result-reclaim and this
+// #1004 input-reclaim; the three soundness cases prove a non-temporary receiver
+// is not double-freed.
+//
+// ASan (detect_leaks=1), before -> after this fix, native repro:
+//   Where().ToArray().Sorted():     64B leaked / 2 allocs (bz_lazy_to_array) -> 0
+//   Where().ToArray().Reversed():   64B leaked / 2 allocs -> 0
+//   ToArray().Sorted().Reversed():  leaked (two intermediate temps) -> 0
+//   ToArray().Sorted(comparer):     64B leaked -> 0
+//   string Where().ToArray().Sorted(): backing + per-elem +1 leaked -> 0
+//   named-local input (t.Sorted()): clean -> clean, no double-free (t is #1003-freed)
+//   plain receiver (s.Sorted()):    clean -> clean, no UAF/double-free
+//   using var = ToArray().Sorted(): clean -> clean, no double-free
+
+// `X.Where(..).ToArray().Sorted()` — the ToArray temp is freed after Sorted's
+// copy. Sorted of [3,1,2] is [1,2,3]; Length 3. Returns 3.
+const char* kChainToArraySorted =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := s.Where((n) => n > 0).ToArray().Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, chain_toarray_sorted_input_leak_free_1004) {
+    expectValueAndLeakFree(kChainToArraySorted, 3);
+}
+
+// `X.Where(..).ToArray().Reversed()` — the ToArray temp is freed after the
+// Reversed copy. Returns 3.
+const char* kChainToArrayReversed =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := s.Where((n) => n > 0).ToArray().Reversed(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, chain_toarray_reversed_input_leak_free_1004) {
+    expectValueAndLeakFree(kChainToArrayReversed, 3);
+}
+
+// `X.ToArray().Sorted().Reversed()` — TWO intermediate ownerless temps (the
+// ToArray result feeding Sorted, the Sorted result feeding Reversed). Each is
+// freed exactly once. Sorted([3,1,2])=[1,2,3] reversed = [3,2,1]; Length 3.
+// Returns 3.
+const char* kChainDoubleSortedReversed =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := s.ToArray().Sorted().Reversed(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, chain_double_sorted_reversed_input_leak_free_1004) {
+    expectValueAndLeakFree(kChainDoubleSortedReversed, 3);
+}
+
+// `X.ToArray().Sorted(comparer)` — the comparer copy-form also frees its fresh
+// ToArray input (after the closure release). Returns 3.
+const char* kChainToArraySortedComparer =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := s.ToArray().Sorted((x, y) => x - y); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, chain_toarray_sorted_comparer_input_leak_free_1004) {
+    expectValueAndLeakFree(kChainToArraySortedComparer, 3);
+}
+
+// `Array<string>` chain — the ToArray temp co-owns a +1 per string element
+// (bz_array_retain_strings); the #1004 input free must release them
+// symmetrically (string-release element disposer), so both the 32B backing AND
+// the per-element +1 are reclaimed. Returns 3.
+const char* kChainToArraySortedString =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<string>(); "
+    "    s.Add(\"banana\"); s.Add(\"apple\"); s.Add(\"cherry\"); "
+    "    var a := s.Where((x) => x.Length > 0).ToArray().Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, chain_toarray_sorted_string_input_leak_free_1004) {
+    expectValueAndLeakFree(kChainToArraySortedString, 3);
+}
+
+// SOUNDNESS: a NAMED-local input (`var t := …ToArray(); var a := t.Sorted();`).
+// The receiver of `.Sorted()` is the identifier `t`, NOT a materializer CallExpr,
+// so the #1004 input-free does NOT fire — `t` is owned by its own scope and is
+// freed exactly once by the #1003 reclaim. Must be LSan-clean with NO
+// double-free. Returns 3.
+const char* kNamedLocalInputSorted =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var t := s.Where((n) => n > 0).ToArray(); "
+    "    var a := t.Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, named_local_input_sorted_no_double_free_1004) {
+    expectValueAndLeakFree(kNamedLocalInputSorted, 3);
+}
+
+// SOUNDNESS: a plain NAMED Array<T> receiver (`var a := s.Sorted();` where `s`
+// is the using-var Array local). The receiver is the identifier `s`, not a
+// materializer call → the #1004 input-free does NOT fire, so `s` (still owned by
+// its `using var`) is never freed here — no UAF, no double-free. Returns 3.
+const char* kPlainNamedReceiverSorted =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := s.Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, plain_named_receiver_sorted_no_double_free_1004) {
+    expectValueAndLeakFree(kPlainNamedReceiverSorted, 3);
+}
+
+// SOUNDNESS: a `using var` bound to a chain (`using var a := X.ToArray().Sorted()`).
+// The `.ToArray()` INPUT to Sorted is still a fresh ownerless temp → freed by
+// #1004; the Sorted RESULT is disposed once via registerUsingDisposal (not the
+// #1004 path). No double-free of either. Returns 3.
+const char* kUsingVarChainSorted =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    using var a := s.ToArray().Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, using_var_chain_sorted_no_double_free_1004) {
+    expectValueAndLeakFree(kUsingVarChainSorted, 3);
+}

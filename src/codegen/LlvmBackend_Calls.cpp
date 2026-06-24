@@ -819,6 +819,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             {lazyTempArr, llvm::ConstantPointerNull::get(ptrTy())});
     };
 
+    // #1004 / stdlib §5 / §3 / §28: free the INPUT array of a copy-form
+    // (`.Sorted()`/`.Reversed()`) when the receiver expression (`ma->target`)
+    // is itself a fresh, ownerless materializer temporary (`X.ToArray()` /
+    // `X.Sorted()` / `X.Reversed()`) — that intermediate array is consumed only
+    // as the copy source and otherwise unreferenced, so it must be reclaimed
+    // after the copy or it leaks. Gated strictly on the receiver being a fresh
+    // ownerless materializer CALL (isFreshOwnerlessArrayMaterializerExpr), so a
+    // named-local / field / param / `move` / `new` receiver (a borrowed or
+    // owned-elsewhere array) is NEVER freed here → no UAF, no double-free. The
+    // backing is freed via bz_array_free; the per-element disposer matches what
+    // ToArray/Sorted/Reversed retained: the string-release thunk for the
+    // `Array<string>` co-owned +1 (released symmetrically — else the +1 leaks),
+    // null for value/class element borrows. Call AFTER the copy is built and
+    // (for the comparer form) BEFORE any closure release, mirroring the copy's
+    // own retain. Idempotent guards mean a non-materializer receiver is a no-op.
+    auto freeFreshInputTemp = [&]() {
+        if (lazyTempArr) return;  // the lazy-terminal path frees via freeLazyTemp
+        if (!isFreshOwnerlessArrayMaterializerExpr(ma->target.get())) return;
+        // Per-element disposer: release the `Array<string>` co-owned +1 that the
+        // materializer (ToArray/Sorted/Reversed) added; null for value/class.
+        llvm::Value* elemDisp = llvm::ConstantPointerNull::get(ptrTy());
+        const sema::TypeRef* el = (recvTy && !recvTy->genericArgs.empty())
+            ? recvTy->genericArgs[0] : nullptr;
+        if (el && !el->nullable &&
+                el->kind == sema::TypeRef::Kind::Primitive &&
+                el->primitive == sema::PrimitiveType::String) {
+            ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
+            if (ep.cat == ElementPolicy::Category::RuntimeManaged)
+                elemDisp = stringElementReleaseThunk();
+        }
+        auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, elemDisp});
+    };
+
     // -----------------------------------------------------------------------
     // Array / Stack / Queue / Set / LinkedList methods
     // -----------------------------------------------------------------------
@@ -2522,6 +2557,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            freeFreshInputTemp();  // #1004: reclaim a fresh ownerless input temp
             return copy;
         }
 
@@ -2585,6 +2621,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* sortFn2 = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
                                      {ptrTy(), i64(), ptrTy()});
             builder_.CreateCall(sortFn2, {copy, builder_.getInt64(esz), cmpFn2});
+            freeFreshInputTemp();  // #1004: reclaim a fresh ownerless input temp
             return copy;
         }
 
@@ -2658,6 +2695,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(sortClFn2, {copy, builder_.getInt64(esz), closure, tramp2});
             // Release inline-lambda closure after the sort completes (#422).
             if (argIsInlineLambda(0)) emitClosureRelease(closure);
+            freeFreshInputTemp();  // #1004: reclaim a fresh ownerless input temp
             return copy;
         }
 

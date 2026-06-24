@@ -4703,6 +4703,18 @@ private:
     // free is derived via elementPolicyFor (null for value/class borrows; the
     // string-release thunk for `Array<string>` whose ToArray retained a +1/elem).
     bool isFreshBorrowingArrayMaterializerLocal(const ast::LocalDecl* ld) const;
+    // #1004: true if `e` is an EXPRESSION codegen lowers to a FRESH, OWNERLESS
+    // borrowing `Array<T>` temporary — a fresh-array materializer CALL
+    // (`recv.ToArray()`/`recv.Sorted(...)`/`recv.Reversed()`) whose result no
+    // named local/field/param owns. Used at the copy-form `.Sorted()`/
+    // `.Reversed()` lowering to decide whether the RECEIVER (input) array is a
+    // disposable temporary that must be `bz_array_free`d after the copy (else it
+    // leaks — #1004). Intentionally narrow: only a whitelisted materializer
+    // CallExpr matches, so an identifier/field/param/`move`/`new` receiver (a
+    // borrowed or otherwise-owned array) is never matched and never freed → no
+    // UAF, no double-free. The `Array<string>` +1/element co-ownership is
+    // released by passing the string-release thunk to the free.
+    bool isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const;
     // True if `init` is a codegen-internal +1 string producer: a string `+`
     // BinaryExpr or an InterpolatedStringExpr. These are lowered to a fresh
     // malloc'd rc=1 header that codegen fully controls — so binding the result

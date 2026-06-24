@@ -8912,6 +8912,51 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
 }
 
 
+// #1004 / stdlib §5 / §3 / §28: is `e` an EXPRESSION codegen lowers to a FRESH,
+// OWNERLESS `Array<T>` temporary — i.e. a fresh-array materializer call
+// (`recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`) whose result is
+// a `bz_array_t` no named local/field/param owns? These three stdlib builtins
+// always return a fresh borrowing `Array<T>` (codegen allocates it via
+// `bz_lazy_to_array` / `bz_array_copy`); when such a call appears as the
+// RECEIVER of a copy-form `.Sorted()`/`.Reversed()`, its result is consumed
+// only as the copy source and is otherwise unreferenced, so the input must be
+// reclaimed after the copy (else it leaks — issue #1004).
+//   Soundness — this is intentionally NARROW (a CallExpr to a whitelisted
+//   materializer is the ONLY shape recognised), so a receiver that is NOT a
+//   fresh ownerless temporary is never freed:
+//     * a named-local / field / param identifier receiver (`t.Sorted()`,
+//       `myArr.Sorted()`) is an IdentifierExpr/MemberAccessExpr, NOT a CallExpr
+//       → not matched → not freed (would be a UAF/double-free; `t` is freed by
+//       its own owner / #1003);
+//     * a `move`/alias/`new Array<T>(...)` receiver is likewise not a
+//       materializer CallExpr → not matched;
+//     * the result type is required to be a builtin borrowing `Array` (name-head
+//       exactly "Array", declaration-less) — excluding Owned* families and any
+//       user type with a same-named method.
+//   When matched, the input array carries no disposal obligation on its
+//   ELEMENTS except the `Array<string>` co-owned +1 (ToArray/Sorted/Reversed all
+//   `bz_array_retain_strings` their result); the caller passes the matching
+//   per-element disposer (the string-release thunk for `Array<string>`, null
+//   otherwise) to `bz_array_free`, releasing that +1 symmetrically.
+bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
+    if (!e) return false;
+    // Result type must be a builtin borrowing `Array<T>` (name-head "Array",
+    // declaration-less) — not Owned*, not a dict-/llist-backed family.
+    const sema::TypeRef* rt = ctx_.exprType(*e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Array") return false;
+    // The expression itself must be a fresh-array MATERIALIZER call:
+    // `recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`.
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma) return false;
+    std::string_view mm = ma->member;
+    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed";
+}
+
+
 // #1003 / stdlib §5 / §28: compute borrowingArrayFreeEligible_ for a block body.
 // Mirrors collectStringReleaseEligible: find every plain `var` borrowing-Array
 // local bound to a fresh materializer, then run the conservative (type-agnostic)
