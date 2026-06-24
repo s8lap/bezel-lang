@@ -5481,6 +5481,37 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                  builder_.getInt64(sz)},
                 "task.from_result");
         }
+        // stdlib §6.7 (line 2993) / §30.5 Pattern B:
+        // Task.FromOwnedResult<T>(owned value: T): OwnedTask<T> where T: class.
+        // Build an already-completed OWNED task carrying the owned class-pointer
+        // result. The value is a ptr (a class object handle); store it into a
+        // stack slot and complete the task with sizeof(void*) bytes — the same
+        // already-done task primitive FromResult uses, but the stored result is
+        // the heap-object pointer the awaiter takes ownership of (Pattern B).
+        // The ownership pass treats `await OwnedTask<T>` as the consume point that
+        // disposes the awaited task and transfers the owned T to the awaiter, so
+        // the value here is NOT released at the call site (it flows into the task
+        // and out through the await). Without this arm the call produced no value
+        // and the OwnedTask<T> local was codegen'd with i32 storage → the await's
+        // bz_task_is_done(i32 …) IR mismatch (#939) / runtime crash (#940).
+        if (m == "FromOwnedResult" && !call.args.empty() &&
+            call.args[0].value) {
+            llvm::Value* val = lowerExpr(*call.args[0].value);
+            if (!val) return nullptr;
+            // The owned value is a class object pointer; store it at pointer
+            // width so the awaiter reads back the same handle.
+            llvm::AllocaInst* slot = builder_.CreateAlloca(ptrTy(), nullptr,
+                                                           "from_owned.slot");
+            builder_.CreateStore(val, slot);
+            int64_t sz = static_cast<int64_t>(
+                module_->getDataLayout().getTypeAllocSize(ptrTy()));
+            auto* fromResultFn = declareC("bz_task_from_result",
+                                          ptrTy(), {ptrTy(), i64()});
+            return builder_.CreateCall(fromResultFn,
+                {builder_.CreateBitCast(slot, ptrTy()),
+                 builder_.getInt64(sz)},
+                "task.from_owned_result");
+        }
         // stdlib §6.7 (line 2986) / §30.10 (#738): Task.FromException<T>(exc):
         // Task<T> — an already-FAULTED task carrying the exception object.
         // Awaiting it re-raises the original exception (the await machinery reads

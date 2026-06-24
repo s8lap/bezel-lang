@@ -577,6 +577,7 @@ set(BEZEL_TEST_SOURCES
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp
+    codegen/async_from_owned_result_939_940_test.cpp
     codegen/using_var_operator_owned_911_test.cpp
     codegen/operator_chain_temp_dispose_912_test.cpp
     codegen/operator_owned_temp_operand_965_test.cpp

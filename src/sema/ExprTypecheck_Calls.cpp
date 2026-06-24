@@ -2640,6 +2640,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tt->astNode = ann;
                         return tt;
                     };
+                    // Helper: build a bare `OwnedTask` TypeRef (astNode name=
+                    // "OwnedTask", no generic args). Mirrors makeTaskTypeRef for
+                    // the §30.5 Pattern B owned-result form so the result lowers
+                    // to a ptr task handle (LlvmBackend_Layout lowerTypeRef).
+                    auto makeOwnedTaskTypeRef = [&]() -> TypeRef* {
+                        auto* tt = ctx_.makeTypeRef();
+                        tt->kind = TypeRef::Kind::Named;
+                        tt->nullable = false;
+                        auto* ann = new ast::Type();
+                        ann->kind = ast::TypeKind::Named;
+                        auto* nm = new ast::QualifiedName();
+                        nm->parts.push_back("OwnedTask");
+                        ann->name.reset(nm);
+                        tt->astNode = ann;
+                        return tt;
+                    };
                     if (colName == "Task") {
                         // `Task.Delay(...)` returns a (non-generic) `Task` — a
                         // genuinely-incomplete task the awaiter suspends on. The
@@ -2659,6 +2675,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
                             auto* tt = makeTaskTypeRef();
                             if (argTy) tt->genericArgs.push_back(argTy);
+                            ctx_.setExprType(&ce, tt);
+                        }
+                        // stdlib §6.7 (line 2993) / §30.5 Pattern B:
+                        // Task.FromOwnedResult<T>(owned value: T): OwnedTask<T>
+                        // where T: class. Returns an already-completed OWNED task
+                        // carrying the owned value; awaiting it (Pattern B)
+                        // transfers ownership of the value to the awaiter. The
+                        // result element T is the explicit method type arg (the
+                        // argument's static type otherwise). Without this arm the
+                        // call had NO expr type, so a `using var task :=
+                        // Task.FromOwnedResult<Cell>(...)` local fell to the i32
+                        // placeholder storage → bz_task_is_done(i32) IR_FAIL (#939)
+                        // / runtime crash (#940).
+                        if (m == "FromOwnedResult" && !ce.args.empty() &&
+                            ce.args[0].value) {
+                            auto* tt = makeOwnedTaskTypeRef();
+                            TypeRef* T = nullptr;
+                            if (!ma->typeArgs.empty() && ma->typeArgs[0])
+                                T = ctx_.resolvedType(*ma->typeArgs[0]);
+                            if (!T) T = ctx_.exprType(*ce.args[0].value);
+                            if (T) tt->genericArgs.push_back(T);
                             ctx_.setExprType(&ce, tt);
                         }
                         // stdlib §6.7 (line 2986-2987): Task.FromException<T>(exc):
