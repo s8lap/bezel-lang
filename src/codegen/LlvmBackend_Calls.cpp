@@ -8129,6 +8129,23 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
     // with a following auto-dispose). See the helper's declaration for the cases.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&receiver)) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
+        // #991 / §28.5 / §28.7: a bare-identifier reference to an `owned`
+        // reference FIELD (`_v?.Dispose()` / `_v.Dispose()` inside a method,
+        // the implicit-`this` form of `this._v?.Dispose()`).  The explicit
+        // `this._v` MemberAccessExpr form is handled below; the bare-identifier
+        // form resolves to a FieldSymbol but is neither a ParameterSymbol nor a
+        // LocalSymbol, so it fell through to dispatch-only — the destructor ran
+        // but the field's 16-byte block LEAKED (the §28.7 programmer-disposes-
+        // first pattern `_v?.Dispose(); _v := b;` then lost the old pointer).
+        // Reclaim + null the field here (mirroring the MemberAccessExpr branch):
+        // the §28.4-step-2 owned-field auto-dispose null-guards its reload, so a
+        // following auto-dispose finds null and skips — free happens exactly
+        // once.  A non-owned (borrow) field returns null (its real owner frees).
+        if (auto* ffs = dynamic_cast<sema::FieldSymbol*>(sym)) {
+            if (isOwnedReferenceField(ffs))
+                return lvalueAddr(receiver, slotTy);
+            return nullptr;
+        }
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             // §28.8: an `owned` parameter carries the disposal obligation. (A
             // `ref`/`out`/borrow parameter does not — disposing it would free a
@@ -11338,6 +11355,40 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             recvTy0->declaration &&
             (recvTy0->declaration->kind == ast::TypeDeclKind::Class ||
              recvTy0->declaration->kind == ast::TypeDeclKind::Interface);
+        // #991 / §28.5 / §14.2: the receiver may be a bare generic type
+        // PARAMETER (`_v?.Dispose()` where `_v: T?` / `T`, T constrained
+        // `where T: class`).  A type-parameter ref has a null `declaration`
+        // and a single-part Named name, so the class/interface test above
+        // misses it and `?.Dispose()` silently emitted nothing — the field's
+        // referent leaked (its destructor never ran).  A generic class's
+        // method body is lowered ONCE, type-erased (no active substitution),
+        // so resolve the parameter to its concrete type when a substitution
+        // is active, else accept the bare parameter: the field's runtime value
+        // is a class pointer regardless, the `?.` null-guard is the dispose's
+        // own non-null guard, and the `recvD` pointer-type check below rejects
+        // any value-typed nullable receiver (which lowers to a struct, never a
+        // pointer) — so this never mis-dispatches Dispose on a non-reference.
+        bool recvIsTypeParam =
+            !recvIsClassOrIface && recvTy0 &&
+            recvTy0->kind == sema::TypeRef::Kind::Named &&
+            recvTy0->declaration == nullptr && recvTy0->astNode &&
+            recvTy0->astNode->name &&
+            recvTy0->astNode->name->parts.size() == 1;
+        if (recvIsTypeParam) {
+            // When a substitution is active, only treat it as disposable if the
+            // concrete bound type is a class/interface (a value-typed binding
+            // must not dispatch a vtable Dispose); without a substitution the
+            // pointer-type guard below is the safety net.
+            const sema::TypeRef* concr = resolveTypeParamRef(recvTy0);
+            recvIsClassOrIface =
+                (concr == recvTy0)   // unresolved: accept here (pointer-guarded)
+                    ? true
+                    : (concr && concr->kind == sema::TypeRef::Kind::Named &&
+                       concr->declaration &&
+                       (concr->declaration->kind == ast::TypeDeclKind::Class ||
+                        concr->declaration->kind ==
+                            ast::TypeDeclKind::Interface));
+        }
         if (recvIsClassOrIface) {
             llvm::Value* recvD = lowerExpr(*nm.target);
             if (!recvD || !recvD->getType()->isPointerTy()) return nullptr;

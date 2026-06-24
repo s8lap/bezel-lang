@@ -330,6 +330,99 @@ const char* kNullableOwnedTypeParamField =
     "  end Main; "
     "end C;";
 
+// #991 / §28.5 / §28.10 / §14.2 — CASE A: `using var x := item` whose
+// initializer is a plain identifier reference to an `owned T` PARAMETER (T a
+// generic type parameter, `where T: class`). The bare-identifier source has a
+// type-parameter type whose declaration is null, so before the fix it fell
+// through every using-var disposal-registration path and the using var was
+// never disposed (the inner Res leaked, count stayed 0). The non-generic
+// equivalent (`item: Res`) was disposed; this brings the generic case to
+// parity. Ownership transferred from `item` to `x` (the source param's own
+// unwind disposal is suppressed), so disposing `x` discharges the value
+// exactly once → count 1, LSan-clean (no leak, no double-free).
+const char* kUsingVarOfOwnedTypeParamParam =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Util "
+    "  public static method Use<T>(owned item: T): int where T: class "
+    "    using var x := item; "                 // plain-id init of an owned-T param
+    "    return 0; "
+    "  end Use; "
+    "end Util; "
+    "class C "
+    "  public static method Main(): int "
+    "    var r := Util.Use<Res>(new Res()); "
+    "    return Res.count; "                     // 1: x disposed exactly once
+    "  end Main; "
+    "end C;";
+
+// #991 / §28.5 / §28.7 / §14.2 — CASE B: an `owned T?` field reassigned via a
+// method that disposes the old value first (`_v?.Dispose(); _v := b;`, the
+// §28.7 programmer-disposes-before-reassign discipline). Before the fix, the
+// bare-identifier `_v?.Dispose()` on a generic `T?` field did nothing (the
+// null-cond Dispose path required a concrete class/interface declaration, which
+// a type parameter lacks), so the OLD Res's destructor never ran — and even the
+// non-generic form leaked the old Res's heap block (the bare-identifier field
+// receiver was not recognized as a reclaim-and-null site). After the fix both
+// the destructor runs and the block is reclaimed exactly once for the old Res
+// (by the explicit Dispose) and for the new Res (by the scope-end specialized
+// disposer of W<Res>) → count 2, LSan-clean (no leak, NO double-free).
+const char* kReassignedOwnedTypeParamFieldDisposedOnce =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class W<T> where T: class "
+    "  public owned _v: T?; "
+    "  public constructor(owned a: T) _v := a; end constructor; "
+    "  destructor end destructor; "
+    "  public method Swap(owned b: T) _v?.Dispose(); _v := b; end Swap; "
+    "end W; "
+    "class C "
+    "  public static method Main(): int "
+    "    do "
+    "      using var w := new W<Res>(new Res()); "
+    "      w.Swap(new Res()); "                  // old Res disposed, new Res stored
+    "    end; "
+    "    return Res.count; "                     // 2: old (Swap) + new (disposer)
+    "  end Main; "
+    "end C;";
+
+// #991 / §28.7: TWO swaps in a row on a generic owned `T?` field. Each Swap
+// disposes the value it displaces (the prior new value) exactly once via the
+// explicit `_v?.Dispose()`; the scope-end specialized disposer disposes the
+// final value. Three Res constructed, three disposed → count 3, LSan-clean (no
+// leak, no double-free across the dispose/reassign chain).
+const char* kTwoSwapsOwnedTypeParamField =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class W<T> where T: class "
+    "  public owned _v: T?; "
+    "  public constructor(owned a: T) _v := a; end constructor; "
+    "  destructor end destructor; "
+    "  public method Swap(owned b: T) _v?.Dispose(); _v := b; end Swap; "
+    "end W; "
+    "class C "
+    "  public static method Main(): int "
+    "    do "
+    "      using var w := new W<Res>(new Res()); "
+    "      w.Swap(new Res()); "
+    "      w.Swap(new Res()); "
+    "    end; "
+    "    return Res.count; "                     // 3: all three disposed once
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- Tests ---------------------------------------------------------------
@@ -376,4 +469,32 @@ BEZEL_TEST(codegen_generic_owned_field, nullable_owned_type_param_field_28_5) {
     // nullable flag composes with the per-instantiation type-parameter
     // classification → count 1, LSan-clean.
     expectValueAndLeakFree(kNullableOwnedTypeParamField, 1);
+}
+
+BEZEL_TEST(codegen_generic_owned_field, using_var_of_owned_type_param_param_991) {
+    // #991 CASE A / §28.5 / §28.10 / §14.2: `using var x := item` where `item`
+    // is an `owned T` parameter (T a generic type parameter) registers x's
+    // scope-end disposal — the inner Res is disposed exactly once (count 1),
+    // LSan-clean. Leaked (count 0) before the fix; the non-generic equivalent
+    // already disposed, so this is the generic-context parity fix.
+    expectValueAndLeakFree(kUsingVarOfOwnedTypeParamParam, 1);
+}
+
+BEZEL_TEST(codegen_generic_owned_field, reassigned_owned_type_param_field_disposed_once_991) {
+    // #991 CASE B / §28.5 / §28.7 / §14.2: an `owned T?` field reassigned via
+    // `_v?.Dispose(); _v := b;` disposes the OLD value (explicit Dispose) and
+    // the NEW value (scope-end specialized disposer) each EXACTLY ONCE → count 2,
+    // LSan-clean. Before the fix the bare-identifier `_v?.Dispose()` on a generic
+    // T? field was a no-op (old Res never destructed → count 1) and the old block
+    // leaked; the fix dispatches the destructor AND reclaims the displaced block
+    // once, with no double-free.
+    expectValueAndLeakFree(kReassignedOwnedTypeParamFieldDisposedOnce, 2);
+}
+
+BEZEL_TEST(codegen_generic_owned_field, two_swaps_owned_type_param_field_991) {
+    // #991 CASE B (chained) / §28.7: two `Swap`s in a row — each displaced value
+    // disposed once by its explicit `_v?.Dispose()`, the final value by the
+    // scope-end disposer → all three Res disposed exactly once (count 3),
+    // LSan-clean (no leak, no double-free across the dispose/reassign chain).
+    expectValueAndLeakFree(kTwoSwapsOwnedTypeParamField, 3);
 }

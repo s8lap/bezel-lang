@@ -10657,6 +10657,29 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
         if (auto* rt = ctx_.exprType(*ld->initializer)) {
             if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration)
                 return rt->declaration;
+            // #991 / §28.5 / §14.2: `using var x := item` where `item` is an
+            // `owned T` PARAMETER (or local) whose type is a generic type
+            // PARAMETER — `rt->declaration` is null (T is not a real user
+            // type) and the name is single-part.  The non-generic equivalent
+            // (`item: Cell`) resolves to a concrete declaration above and is
+            // disposed; the generic case fell through every disposal-
+            // registration path and leaked (x never disposed, the #572 fix
+            // only covered the `move item` initializer).  A generic method /
+            // class body is lowered per-instantiation, so the active
+            // substitution resolves T to its concrete class — register a
+            // static disposal on that class.  Ownership transferred from the
+            // source to x (the UnwindIneligibleWalker marks the consumed
+            // source ineligible for its own unwind disposal), so disposing x
+            // alone discharges the value exactly once (no double-free).
+            if (rt->kind == sema::TypeRef::Kind::Named &&
+                rt->declaration == nullptr) {
+                const sema::TypeRef* concr = resolveTypeParamRef(rt);
+                if (concr && concr != rt &&
+                    concr->kind == sema::TypeRef::Kind::Named &&
+                    concr->declaration &&
+                    concr->declaration->kind == ast::TypeDeclKind::Class)
+                    return concr->declaration;
+            }
         }
     }
     return nullptr;
