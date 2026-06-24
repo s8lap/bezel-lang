@@ -6700,13 +6700,36 @@ namespace {
 // disposed). `mark(node)` records the ineligible key (a LocalDecl node for a
 // local, the ParameterSymbol for a parameter).
 
-// §28.3 (#900): an `out` / `out var` / `out owned` argument is an OUTPUT — the
-// callee WRITES the local (an `out owned` recipient receives OWNERSHIP and must
-// be unwind-disposed), it does not consume it. So such an argument must NOT taint
-// the local as unwind-ineligible. `ref` is conservatively left consuming (the
-// callee may move out through it).
+// §28.3 (#900): an `out` / `out var` / `out using var` / `out owned` argument is
+// an OUTPUT — the callee WRITES the local (an `out owned` recipient receives
+// OWNERSHIP and must be unwind-disposed), it does not consume it. So such an
+// argument must NOT taint the local as unwind-ineligible. `ref` is conservatively
+// left consuming (the callee may move out through it).
 inline bool isOutArg(std::string_view m) {
-    return m == "out" || m == "out var" || m == "out owned";
+    return m == "out" || m == "out var" || m == "out using var" ||
+           m == "out owned";
+}
+
+// §28.3 (#994): the callee's parameter list backing a CallExpr/NullCondCallExpr,
+// recovered from the resolved callee symbol — a MethodSymbol (ordinary method,
+// free function, extension method, or operator), a ConstructorSymbol, or an
+// ExternDeclSymbol. The receiver of an instance/extension call is the member-
+// access target (walked separately as a borrow) and is NOT in this list, so the
+// AST argument list aligns one-to-one with these ParameterSymbols by position.
+// Returns nullptr when the callee cannot be resolved to a parameter list (a
+// callee through a function-typed local/field, a generic/builtin intrinsic, an
+// imported symbol without params, etc.) — the caller then conservatively treats
+// every argument as consuming (a sound over-approximation: at worst a leak on the
+// unwind path, never a double-free).
+inline const std::vector<sema::Symbol*>* calleeParamList(
+        const sema::SemaContext& ctx, const ast::Expr* callee) {
+    if (!callee) return nullptr;
+    sema::Symbol* s = ctx.exprSymbol(*callee);
+    if (!s) return nullptr;
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(s)) return &ms->params;
+    if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(s)) return &cs->params;
+    if (auto* es = dynamic_cast<sema::ExternDeclSymbol*>(s)) return &es->params;
+    return nullptr;
 }
 
 struct UnwindIneligibleWalker {
@@ -6722,6 +6745,65 @@ struct UnwindIneligibleWalker {
             if (loc->decl) out.insert(static_cast<const void*>(loc->decl));
         } else if (dynamic_cast<sema::ParameterSymbol*>(s)) {
             out.insert(static_cast<const void*>(s));
+        }
+    }
+
+    // §28.3 (#994): walk a call's arguments, taking the callee's parameter modes
+    // into account. An argument is CONSUMING (taints its local as unwind-
+    // ineligible) only when ownership actually leaves the caller:
+    //   - an explicit `owned` argument modifier (caller-stated transfer), or
+    //   - the callee's parameter is `owned` / `out owned` (the callee takes over
+    //     the disposal obligation), or
+    //   - the callee's parameter is `ref` (the callee may move out through it —
+    //     conservatively consuming), or
+    //   - the callee parameter list is unavailable / the argument cannot be
+    //     mapped (default to consuming — sound over-approximation).
+    // A plain BORROW argument (callee param has no modifier) RETAINS the caller's
+    // ownership (§28, line ~4899: a read in a non-`owned` argument position
+    // borrows; `x` keeps ownership), so it is NOT consuming and the owned
+    // local/param must remain eligible for unwind disposal. `out`/`out var`
+    // arguments are outputs, never consuming (isOutArg). Previously every non-out
+    // argument was treated as consuming, which dropped a borrow-passed owned
+    // param from the unwind set → leak on a later throw.
+    void walkCallArgs(const ast::Expr* callee,
+                      const std::vector<ast::CallArgument>& args) {
+        const std::vector<sema::Symbol*>* params = calleeParamList(ctx, callee);
+        std::size_t pos = 0;
+        for (const auto& a : args) {
+            std::size_t positionalIdx = a.name.empty() ? pos++ : 0;
+            // Resolve the parameter the argument binds to (positional or named).
+            std::size_t pidx = params ? params->size() : 0;
+            if (params) {
+                if (a.name.empty()) {
+                    pidx = positionalIdx;
+                } else {
+                    for (std::size_t j = 0; j < params->size(); ++j)
+                        if ((*params)[j] && (*params)[j]->name == a.name) {
+                            pidx = j;
+                            break;
+                        }
+                }
+            }
+            bool mapped = params && pidx < params->size();
+            std::string_view pm;
+            if (mapped)
+                if (auto* ps =
+                        dynamic_cast<sema::ParameterSymbol*>((*params)[pidx]))
+                    pm = ps->modifier;
+
+            bool consuming;
+            if (isOutArg(a.modifier)) {
+                consuming = false;  // output, not consumed
+            } else if (a.modifier == "owned") {
+                consuming = true;   // explicit caller-side transfer
+            } else if (!mapped) {
+                consuming = true;   // unknown callee/unmappable arg → conservative
+            } else {
+                // Borrow param (no modifier) RETAINS caller ownership ⇒ not
+                // consuming; `owned`/`out owned`/`ref` transfer ⇒ consuming.
+                consuming = (pm == "owned" || pm == "out owned" || pm == "ref");
+            }
+            expr(a.value.get(), consuming);
         }
     }
 
@@ -6772,8 +6854,9 @@ struct UnwindIneligibleWalker {
             } else {
                 expr(c->callee.get(), /*consuming=*/false);
             }
-            for (auto& a : c->args)
-                expr(a.value.get(), /*consuming=*/!isOutArg(a.modifier));
+            // §28.3 (#994): a borrow argument retains the caller's ownership; only
+            // an `owned`/`ref` parameter (or explicit `owned` arg) transfers.
+            walkCallArgs(c->callee.get(), c->args);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
@@ -6786,8 +6869,8 @@ struct UnwindIneligibleWalker {
             } else {
                 expr(c->callee.get(), /*consuming=*/false);
             }
-            for (auto& a : c->args)
-                expr(a.value.get(), /*consuming=*/!isOutArg(a.modifier));
+            // §28.3 (#994): borrow arguments retain ownership (see walkCallArgs).
+            walkCallArgs(c->callee.get(), c->args);
             return;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
