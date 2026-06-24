@@ -4669,6 +4669,40 @@ private:
     // Compute stringReleaseEligible_ for a block body (see the .cpp).
     void collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // #1003 / stdlib §5 / §28 (trivial-dispose borrowing collections): the set
+    // of plain `var` LocalDecl nodes that bind a FRESHLY-MATERIALIZED borrowing
+    // array-backed collection (`Array<T>`/`Stack<T>`/`Queue<T>`) produced by a
+    // LINQ/copy materializer call (`ToArray`/`Sorted`/`Reversed`) and proven by
+    // the conservative escape walk never to escape their scope. Per §28, a
+    // borrowing `Array<T>` is trivial-dispose: its backing must be reclaimed at
+    // scope end (running NO user code — elements are borrows), but the sema/
+    // ownership pass classifies the local as carrying no disposal obligation, so
+    // codegen is solely responsible for the implicit reclaim. Membership arms a
+    // scope-end bz_array_free of the single producer reference (the only one — the
+    // local is non-escaping). Absence ⇒ the array leaks (the prior, safe
+    // behavior). Reuses the StringEscapeWalker (type-agnostic — it tracks only
+    // the target LocalDecl identifier), so a returned/moved/aliased/captured
+    // local is excluded → never a UAF, never a double-free.
+    std::unordered_set<const void*> borrowingArrayFreeEligible_;
+    // The function for which borrowingArrayFreeEligible_ was computed (mirrors
+    // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
+    // inherits no eligibility, so its array locals just leak (never double-freed).
+    llvm::Function* borrowingArrayFreeEligibleFn_ = nullptr;
+    // Compute borrowingArrayFreeEligible_ for a block body (see the .cpp).
+    void collectBorrowingArrayFreeEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // #1003: true if `ld` binds a plain `var` whose resolved type is a borrowing
+    // bz_array_t-backed collection (`Array`/`Stack`/`Queue`, NOT an `Owned*`
+    // family, NOT dict-backed Dictionary/Set/LinkedList) AND whose initializer is
+    // a fresh-array materializer CALL (`ToArray`/`Sorted`/`Reversed`). These are
+    // the exact shapes codegen lowers to a fresh `bz_array_t` the local solely
+    // owns. A `new Array<T>(...)` initializer is excluded (a NewExpr carries a
+    // sema disposal obligation → rejected as a plain undisposed `var`, never
+    // reaching this discardable path). The per-element disposer for the scope-end
+    // free is derived via elementPolicyFor (null for value/class borrows; the
+    // string-release thunk for `Array<string>` whose ToArray retained a +1/elem).
+    bool isFreshBorrowingArrayMaterializerLocal(const ast::LocalDecl* ld) const;
     // True if `init` is a codegen-internal +1 string producer: a string `+`
     // BinaryExpr or an InterpolatedStringExpr. These are lowered to a fresh
     // malloc'd rc=1 header that codegen fully controls — so binding the result

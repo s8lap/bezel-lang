@@ -3714,6 +3714,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // end (mirrors collectUnwindIneligible; consulted in lowerLocalDecl).
     stringReleaseEligible_.clear();
     stringReleaseEligibleFn_ = fn;
+    // #1003 / stdlib §5 / §28: which plain `var` borrowing-Array locals bound to a
+    // fresh materializer (ToArray/Sorted/Reversed) may have their backing reclaimed
+    // at scope end (mirrors stringReleaseEligible_; consulted in lowerLocalDecl).
+    borrowingArrayFreeEligible_.clear();
+    borrowingArrayFreeEligibleFn_ = fn;
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -3737,6 +3742,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectUnwindIneligible(*ci.stmts);
         collectMoveOnlyArrayTransferred(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
+        collectBorrowingArrayFreeEligible(*ci.stmts);  // #1003
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
         collectBoxCaptureLocals(*ci.stmts);
@@ -5744,6 +5750,48 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.boxRelease = true;
+        disposeStack_.back().push_back(d);
+    }
+    // #1003 / stdlib §5 / §28: if this `var` borrowing-`Array<T>` local was bound
+    // to a fresh materializer (ToArray/Sorted/Reversed) and the escape walk proved
+    // it never escapes its scope, register a scope-end bz_array_free of its single
+    // producer reference (the array `v` just stored). The slot holds exactly that
+    // one reference — the local is the sole owner of the fresh backing — so the
+    // free runs exactly once per scope exit (on BOTH the normal and unwind path;
+    // a given exit goes one way only) with no UAF (no escaping alias exists) and
+    // no double-free (a `using var`/returned/moved/aliased local is excluded). The
+    // backing is freed via the existing `collection` Disposal (bz_array_free); the
+    // per-element disposer is null for value/class element borrows (only the
+    // backing is reclaimed, §28.11) and the string-release thunk for
+    // `Array<string>` (whose ToArray retained a +1/element — released symmetrically
+    // here, no leak). Gated on currentFn_ matching the analyzed function (a lambda/
+    // thunk body lowered mid-function is not analyzed → its array locals just leak,
+    // never double-freed). A `using var` never reaches here — it is in neither
+    // eligibility set and its disposal comes from registerUsingDisposal.
+    if (v && currentFn_ == borrowingArrayFreeEligibleFn_ &&
+        borrowingArrayFreeEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.collection = true;
+        // Derive the per-element disposer from the collection's element type —
+        // null for a borrowing value/class element (only the backing is freed),
+        // the string-release thunk for the `Array<string>` co-owned-+1 case.
+        // Mirror the using-var collection path (LlvmBackend_Setup.cpp ~6477).
+        const sema::TypeRef* rt = nullptr;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode)) {
+            if (ld->type) rt = ctx_.resolvedType(*ld->type);
+            if (!rt && ld->initializer) rt = ctx_.exprType(*ld->initializer);
+        }
+        const sema::TypeRef* el =
+            (rt && !rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+        ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
+        d.collectionElemDisposer = ep.disposerThunk;
+        if (!d.collectionElemDisposer &&
+                ep.cat == ElementPolicy::Category::RuntimeManaged && el &&
+                el->kind == sema::TypeRef::Kind::Primitive &&
+                el->primitive == sema::PrimitiveType::String && !el->nullable) {
+            d.collectionElemDisposer = stringElementReleaseThunk();
+        }
         disposeStack_.back().push_back(d);
     }
 }
@@ -8816,6 +8864,103 @@ void Emitter::collectStringReleaseEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
+    }
+}
+
+
+// #1003 / stdlib §5 / §28: is `ld` a plain `var` binding a FRESHLY-MATERIALIZED
+// borrowing `Array<T>` from a LINQ/copy materializer call (`ToArray` / `Sorted`
+// / `Reversed`)? These are the exact shapes codegen lowers to a fresh
+// `bz_array_t` whose single reference the local solely owns. Per §28 a borrowing
+// `Array<T>` is trivial-dispose — its backing must be reclaimed at scope end but
+// the sema/ownership pass imposes no disposal obligation (the result is "Borrowed"
+// — name-head "Array", not "OwnedArray", and the materializer has no `owned`-
+// returning user MethodDecl), so codegen alone must emit the implicit reclaim.
+//   Excluded by construction (so the producer/consumer balance stays inside
+//   codegen, never a UAF on a borrowed/aliased value):
+//     * a `using var` (already disposed via registerUsingDisposal's collection
+//       path — would double-free);
+//     * a `new Array<T>(...)` (a NewExpr carries a sema obligation → rejected as
+//       an undisposed plain `var`, never reaches this discardable path);
+//     * an identifier/member/`move` alias (`var b := a;`) — not a fresh producer;
+//     * a non-materializer call (a method returning a BORROWED field-array) —
+//       freeing it would be a UAF, so only the whitelisted fresh-producers count;
+//     * any result type other than the borrowing `Array<T>` (Owned*, Set/
+//       Dictionary/LinkedList are dict-/llist-backed and freed differently).
+bool Emitter::isFreshBorrowingArrayMaterializerLocal(
+        const ast::LocalDecl* ld) const {
+    if (!ld || ld->isUsing || !ld->initializer) return false;
+    // The result type must be a borrowing `Array<T>` (name-head exactly "Array").
+    // ToArray/Sorted/Reversed all return `Array<T>`; restrict to that to avoid the
+    // dict-backed (Set) / llist-backed (LinkedList) / owning (OwnedArray) families.
+    const sema::TypeRef* rt = nullptr;
+    if (ld->type) rt = ctx_.resolvedType(*ld->type);
+    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Array") return false;
+    // The initializer must be a fresh-array MATERIALIZER call: `recv.ToArray()`,
+    // `recv.Sorted(...)`, or `recv.Reversed()` — a CallExpr whose callee is a
+    // member access naming one of those methods. (These are stdlib builtins with
+    // no resolved user MethodSymbol; recognized structurally by member name.)
+    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma) return false;
+    std::string_view mm = ma->member;
+    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed";
+}
+
+
+// #1003 / stdlib §5 / §28: compute borrowingArrayFreeEligible_ for a block body.
+// Mirrors collectStringReleaseEligible: find every plain `var` borrowing-Array
+// local bound to a fresh materializer, then run the conservative (type-agnostic)
+// StringEscapeWalker over the whole body; a local the walk proves NEVER escapes
+// is eligible for a scope-end bz_array_free of its single producer reference. The
+// walk over-approximates escape: a `return a;` / `move a` / owned-arg / store-to-
+// field / alias-binding / lambda-capture all taint the local → excluded → no
+// reclaim (a leak, the safe direction). Only a local whose every use is a borrow-
+// position read (`a.Length`, `a[i]`, `for var x in a`, a method/property receiver)
+// stays eligible — for those, the local is provably the sole owner of the backing,
+// so freeing it once at scope end is free of UAF and of double-free.
+void Emitter::collectBorrowingArrayFreeEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    borrowingArrayFreeEligible_.clear();
+    std::vector<const ast::LocalDecl*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (isFreshBorrowingArrayMaterializerLocal(ld))
+                candidates.push_back(ld);
+        }
+        // Recurse into nested blocks (mirrors collectStringReleaseEligible).
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    for (const ast::LocalDecl* ld : candidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            borrowingArrayFreeEligible_.insert(static_cast<const void*>(ld));
     }
 }
 

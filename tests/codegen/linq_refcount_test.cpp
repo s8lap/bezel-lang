@@ -582,3 +582,131 @@ const char* kLazyUnionToArrayChurn =
 BEZEL_TEST(linq_refcount, lazy_union_toarray_leak_free_spec_5) {
     expectValueAndLeakFree(kLazyUnionToArrayChurn, 0);
 }
+
+// =====================================================================
+// #1003 / stdlib §5 / §28: a PLAIN `var` (not `using var`) holding a
+// FRESHLY-MATERIALIZED borrowing Array<T> from `.ToArray()` is trivial-
+// dispose (§28 — borrowing collection, elements are borrows) and carries no
+// sema disposal obligation, so it is accepted undisposed; codegen must reclaim
+// its backing at scope end. Before the fix the implicit reclaim was NEVER
+// emitted, so EVERY such inferred-Array local leaked its 32-byte backing — the
+// leak was only masked for a SINGLE local at function top by LeakSanitizer stack
+// residue, surfacing whenever two such locals (or one plus a for-in) shared the
+// scope. These tests bind multiple plain-`var` ToArray locals (and the for-in
+// mix) and require LSan-clean — exactly the issue's two-ToArray and ToArray-plus-
+// for-in repros. The escape walk keeps a returned/aliased/captured local out of
+// the reclaim set, so the `using var` and explicit-return paths are untouched.
+
+// Two plain `var` ToArray locals in one scope (the issue's primary repro).
+// Before: 64 bytes leaked in 2 allocations; after: LSan-clean. Returns 6.
+const char* kPlainTwoToArray =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var src := new Array<int>(); "
+    "    src.Add(1); src.Add(2); src.Add(3); "
+    "    var a1 := src.Where((n) => n > 0).ToArray(); "
+    "    var a2 := src.Where((n) => n > 0).ToArray(); "
+    "    return a1.Length + a2.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, plain_var_two_toarray_locals_leak_free_1003) {
+    expectValueAndLeakFree(kPlainTwoToArray, 6);
+}
+
+// Three plain `var` ToArray locals — confirms the per-local reclaim scales (each
+// freed exactly once, no double-free). Returns 9.
+const char* kPlainThreeToArray =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var src := new Array<int>(); "
+    "    src.Add(1); src.Add(2); src.Add(3); "
+    "    var a1 := src.Where((n) => n > 0).ToArray(); "
+    "    var a2 := src.Where((n) => n > 0).ToArray(); "
+    "    var a3 := src.Where((n) => n > 0).ToArray(); "
+    "    return a1.Length + a2.Length + a3.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, plain_var_three_toarray_locals_leak_free_1003) {
+    expectValueAndLeakFree(kPlainThreeToArray, 9);
+}
+
+// A plain `var` ToArray local in a scope that ALSO has a for-in loop (the issue's
+// second repro — the for-in's disposal previously displaced the ToArray reclaim).
+// Returns 9 (a.Length 3 + sum 1+2+3 = 6).
+const char* kPlainToArrayPlusForIn =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var src := new Array<int>(); "
+    "    src.Add(1); src.Add(2); src.Add(3); "
+    "    var a := src.Where((n) => n > 0).ToArray(); "
+    "    var total := 0; "
+    "    for var x in src do total := total + x; end; "
+    "    return a.Length + total; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, plain_var_toarray_plus_forin_leak_free_1003) {
+    expectValueAndLeakFree(kPlainToArrayPlusForIn, 9);
+}
+
+// Two plain `var` ToArray locals of Array<string> — the materialized array
+// co-owns a +1 per string element (bz_array_retain_strings); the scope-end
+// reclaim must release them symmetrically (string-release element disposer),
+// so the test is both backing-leak-free AND element-+1-leak-free. Returns 4.
+const char* kPlainTwoToArrayString =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var src := new Array<string>(); "
+    "    src.Add(\"aa\"); src.Add(\"bbb\"); "
+    "    var a := src.Where((s) => s.Length > 0).ToArray(); "
+    "    var b := src.Where((s) => s.Length > 0).ToArray(); "
+    "    return a.Length + b.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, plain_var_two_toarray_string_leak_free_1003) {
+    expectValueAndLeakFree(kPlainTwoToArrayString, 4);
+}
+
+// SOUNDNESS: a `var a := …ToArray(); return a;` RETURNS the local — ownership
+// leaves the scope, so the escape walk must EXCLUDE it from the scope-end reclaim
+// (else a use-after-return / double-free in the caller). The caller binds it with
+// `using var` and disposes it once. Must be LSan-clean (no leak, no UAF/DF).
+// Returns 3.
+const char* kReturnedToArrayLocal =
+    "module M; class C "
+    "  public static method MakeArr(): Array<int> "
+    "    using var src := new Array<int>(); "
+    "    src.Add(1); src.Add(2); src.Add(3); "
+    "    var a := src.Where((n) => n > 0).ToArray(); "
+    "    return a; "
+    "  end MakeArr; "
+    "  public static method Main(): int "
+    "    using var r := C.MakeArr(); "
+    "    return r.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, returned_toarray_local_no_double_free_1003) {
+    expectValueAndLeakFree(kReturnedToArrayLocal, 3);
+}
+
+// SOUNDNESS: an explicit `using var a := …ToArray()` must NOT be double-freed by
+// the new plain-`var` reclaim path (it is in neither eligibility set; its single
+// disposal comes from registerUsingDisposal). Two of them — LSan-clean. Ret 6.
+const char* kUsingVarToArrayUntouched =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var src := new Array<int>(); "
+    "    src.Add(1); src.Add(2); src.Add(3); "
+    "    using var a := src.Where((n) => n > 0).ToArray(); "
+    "    using var b := src.Where((n) => n > 0).ToArray(); "
+    "    return a.Length + b.Length; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, using_var_toarray_not_double_freed_1003) {
+    expectValueAndLeakFree(kUsingVarToArrayUntouched, 6);
+}
