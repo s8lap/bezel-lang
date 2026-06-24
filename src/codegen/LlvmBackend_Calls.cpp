@@ -10042,16 +10042,30 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 !recvTy->genericArgs.empty()) {
                 auto* td = dynamic_cast<const ast::TypeDecl*>(
                     ms->parent->decl);
-                if (td && td->genericParams.size() ==
-                          recvTy->genericArgs.size()) {
+                // §14.1 / #783: an IMPORTED generic class has no ast::TypeDecl
+                // (ms->parent->decl is null) but DOES carry sema-level
+                // genericParams (reconstructed by the loader). Take the type
+                // parameter NAMES from the AST decl when present, else from the
+                // imported TypeSymbol's genericParams, so the per-instantiation
+                // substitution installs for a cross-module receiver too.
+                std::vector<std::string_view> gpNames;
+                if (td) {
+                    for (const auto& gp : td->genericParams)
+                        gpNames.push_back(gp.name);
+                } else {
+                    for (sema::Symbol* gp : ms->parent->genericParams)
+                        if (gp) gpNames.push_back(gp->name);
+                }
+                if (gpNames.size() == recvTy->genericArgs.size() &&
+                    !gpNames.empty()) {
                     // Resolve generic args using the OUTER substitution so
                     // that `Pair<T>` in `Pair<string>` context resolves T→ptr.
                     std::unordered_map<std::string_view, llvm::Type*> newSubst;
                     std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
                     for (std::size_t gi = 0;
-                         gi < td->genericParams.size(); ++gi) {
+                         gi < gpNames.size(); ++gi) {
                         llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
-                        std::string_view pname = td->genericParams[gi].name;
+                        std::string_view pname = gpNames[gi];
                         newSubst[pname] = concrTy;
                         newSema[pname] = recvTy->genericArgs[gi];
                     }
@@ -10628,6 +10642,34 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         emitPendingCheck();  // CG20: a callee may have thrown
+        return r;
+    }
+
+    // §14.1 / §2.5 / #783: an IMPORTED generic-class method has no compiled
+    // function in methodFns_ (its body lives in the defining module, compiled
+    // against the i32 placeholder). When a per-instantiation substitution is
+    // active and the loader has attached the re-parsed body (ms->decl is now a
+    // live ast::MethodDecl — schema v5 methodBodyText), monomorphize the body
+    // importer-side under the concrete genericSubst_, exactly as the local
+    // generic-method path does. This is the cross-module complement that lifts
+    // the #783 sema gate for the shapes whose body could be reconstructed; a
+    // method whose body was not exported (abstract, no span, parse/sema failure)
+    // has no ast::MethodDecl, falls through, and stays gated.
+    if (!genericSubst_.empty() && ctx_.isImported(ms) && ms->parent &&
+        !ms->parent->genericParams.empty() &&
+        dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        llvm::Value* r = emitInlineGenericMethod(ms, args);
+        emitPendingCheck();
+        // HARD route: never fall through to methodFns_ for an imported generic
+        // method. The only entry there is the EXTERNAL declaration of the
+        // defining module's i32-PLACEHOLDER template (`bz$<Class>$<M>`); calling
+        // it with concrete `ptr`/struct args for a non-int instantiation would
+        // pass/return at the wrong width — a silent miscompile. The inline
+        // monomorphization is the only correct lowering; return its result
+        // (null → the caller emits the same safe stub as any unlowered call,
+        // never a wrong-typed call to the template). The §14.1/#783 sema gate
+        // already rejects shapes whose body could not be reconstructed (decl
+        // null), so reaching here means the body IS available.
         return r;
     }
 

@@ -1051,6 +1051,204 @@ static bool parseAndAttachDtorBody(
     return true;
 }
 
+// §14.1 / #783: build a synthetic class source for re-parsing ONE imported
+// generic method's body.  All fields are declared (so field references resolve),
+// every OTHER method is emitted as a signature-only stub (so self-calls resolve),
+// and `target`'s full declaration text is emitted verbatim in place of its stub.
+// The returned source is identical in shape to buildSyntheticClassSource so the
+// remap discipline (field/param/self-method) carries over unchanged.
+static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
+                                              const MetaMember& target) {
+    std::string src = "module _783_reparsed_method_;\n";
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " class ";
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none")
+                src += td.genericParams[i].variance + " ";
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    src += "\n";
+    // Fields (needed so implicit field references resolve).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    // Methods: the target carries its real body; every other method is a stub.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        if (mm.isOperator) continue;
+        if (&mm == &target) {
+            src += "  " + target.methodBodyText + "\n";
+        } else {
+            std::string stub = buildMethodStub(mm);
+            if (!stub.empty()) src += stub + "\n";
+        }
+    }
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+// §14.1 / #783: parse `target.methodBodyText` for an imported generic class
+// method, run the three sema passes in a FRESH SemaContext, remap the body's
+// exprSymbols (field / param / self-method) into mainCtx keyed on the re-parsed
+// expression pointers, and attach the re-parsed ast::MethodDecl to the imported
+// MethodSymbol's `decl` slot.  After this, codegen's emitInlineGenericMethod /
+// buildSpecializedMethodFn can monomorphize the body per instantiation with
+// genericSubst_ active (exactly the local-generic-method path), so e.g.
+// `Box<string>.Get()` returns the field at the correct `ptr` offset instead of
+// the i32-placeholder offset.  Returns false (leaving decl untouched) on any
+// parse/sema failure, so the §14.1/#783 sema gate stays in force for that shape.
+static bool parseAndAttachMethodBody(
+    const MetaTypeDecl& td,
+    const MetaMember& target,
+    sema::MethodSymbol* importedMs,
+    const sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    std::string source = buildSyntheticMethodSource(td, target);
+
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) return false;
+
+    // §14.1 / #783: the fresh context AND its diagnostics must OUTLIVE this
+    // function — codegen monomorphizes the body per instantiation and queries
+    // resolvedType/exprType on the body's nodes, whose TypeRefs live in the fresh
+    // context's arena. Heap-allocate both and (on success) hand them to mainCtx
+    // so they stay alive through codegen. SemaContext holds a DiagnosticEngine&,
+    // so the engine is owned first and outlives the context (declared first here,
+    // captured in the keep-alive lambda below in reverse-destruction order).
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::typecheckExpressions(*sf, freshCtx);
+    // §14.1 / #783 SOUNDNESS GATE: unlike the ctor-body path (which tolerates
+    // benign sema errors because a ctor body is field assignments whose types
+    // come from the remapped field symbols), a METHOD body's RESULT can be a
+    // computed value, and the synthetic class contains ONLY this type's own
+    // fields/params/methods — NOT its sibling types, module functions, or other
+    // imports. A body that references any of those fails to resolve in the fresh
+    // context and the unresolved call is silently DROPPED at codegen → a wrong
+    // value (e.g. `var x := Helper.Compute(); return x;` returns 0, not 99). So
+    // require a fully clean typecheck: any error means the body uses something
+    // the importer-side reconstruction cannot faithfully reproduce → do NOT
+    // attach the decl, leaving the §14.1/#783 sema gate in force (a clean reject,
+    // never a wrong value). Bodies that touch only own members (the common case:
+    // field reads, self-calls, params, control flow over them) sema-clean and
+    // monomorphize correctly.
+    if (semaDiag->hasErrors()) return false;
+
+    // Locate the fresh TypeSymbol and the fresh target MethodSymbol (by signature
+    // key — the SAME key the importedMethods remap uses, so the right overload is
+    // selected).
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) { freshType = ts; break; }
+        }
+    }
+    if (!freshType) return false;
+
+    const std::string targetKey = metaMemberSigKey(target.name, target.params);
+    sema::MethodSymbol* freshMs = nullptr;
+    for (sema::Symbol* m : freshType->members) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+        if (ms && !ms->isOperator &&
+            freshMethodSigKey(ms) == targetKey) { freshMs = ms; break; }
+    }
+    if (!freshMs) return false;
+
+    auto* parsedMd = dynamic_cast<const ast::MethodDecl*>(freshMs->decl);
+    if (!parsedMd) return false;
+
+    // Field remap map.
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
+            importedFields[m->name] = m;
+    }
+
+    // Self-method remap map (signature-keyed, as in the ctor path).
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator)
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+        }
+    }
+
+    // Param remap: the target method's own parameters (by position).
+    const std::vector<sema::Symbol*>& importedParams = importedMs->params;
+
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            for (std::size_t pi = 0; pi < freshMs->params.size(); ++pi) {
+                if (freshMs->params[pi] == freshSym &&
+                    pi < importedParams.size()) {
+                    mainCtx.setExprSymbol(expr, importedParams[pi]);
+                    break;
+                }
+            }
+        } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            auto it = importedMethods.find(freshMethodSigKey(fms));
+            if (it != importedMethods.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        }
+    }
+
+    // §14.1 / #783: copy the body's resolved-type and expr-type entries from the
+    // fresh context into mainCtx, so codegen's per-instantiation monomorphization
+    // (buildSpecializedMethodFn's return-type lowering, ReturnStmt boxing, and
+    // every sub-expression's type query) finds them. The TypeRef* values point
+    // into the fresh context's arena, kept alive below. The AST-node KEYS are the
+    // re-parsed nodes, kept alive via ownImportedAst. Only nodes that belong to
+    // the re-parsed body matter; copying the whole map is harmless because the
+    // keys are unique to the fresh AST (no collision with mainCtx's own nodes).
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+
+    // Attach the parsed MethodDecl to the imported MethodSymbol and keep the
+    // backing source + AST alive (string_view fields point into them), plus the
+    // fresh context + diagnostics that own the copied TypeRefs.
+    importedMs->decl = parsedMd;
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    // Keep the fresh context + diagnostics alive. importedAuxiliary_ destroys in
+    // REVERSE insertion order, and SemaContext holds a DiagnosticEngine&, so push
+    // the engine FIRST (destroyed last) and the context SECOND (destroyed first) —
+    // context-then-engine, never a dangling reference.
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 }  // namespace
 
 bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
@@ -1145,6 +1343,40 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
             if (importedCs) {
                 parseAndAttachCtorBody(td, mm.ctorBodyText, importedCs, *t, ctx);
             }
+        }
+
+        // §14.1 / #783: method bodies — find each Method member with a non-empty
+        // methodBodyText and attach the re-parsed ast::MethodDecl to the matching
+        // imported MethodSymbol, so codegen can monomorphize it per instantiation
+        // (the cross-module complement of the local generic-method path).
+        for (const MetaMember& mm : td.members) {
+            if (mm.kind != MetaMemberKind::Method || mm.methodBodyText.empty())
+                continue;
+            // Match by full parameter-type signature (the §22.6 overload set may
+            // share a name; arity-only matching attaches the wrong body).
+            sema::MethodSymbol* importedMs = nullptr;
+            {
+                const std::string mmSig = metaMemberSigKey("", mm.params);
+                for (sema::Symbol* m : t->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                    if (!ms || ms->isOperator) continue;
+                    if (std::string(ms->name) != mm.name) continue;
+                    if (ms->params.size() != mm.params.size()) continue;
+                    std::string msSig = "(";
+                    for (std::size_t pi = 0; pi < ms->params.size(); ++pi) {
+                        if (pi) msSig += ',';
+                        const auto* ps =
+                            dynamic_cast<const sema::ParameterSymbol*>(
+                                ms->params[pi]);
+                        msSig += typeRefSigText(
+                            ps ? ps->resolvedDeclType : nullptr);
+                    }
+                    msSig += ')';
+                    if (msSig == mmSig) { importedMs = ms; break; }
+                }
+            }
+            if (importedMs)
+                parseAndAttachMethodBody(td, mm, importedMs, *t, ctx);
         }
 
         // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.

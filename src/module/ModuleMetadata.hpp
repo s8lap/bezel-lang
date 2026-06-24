@@ -95,6 +95,18 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 //     destructor has a non-empty body, the FULL destructor-declaration source
 //     text. A trailing REC_STRING appended to TYPE_BLOCK after the members.
 //     v4 readers tolerate it via finishBlock.
+//   - MetaMember::methodBodyText (§14.1/#783, additive within v5): for a Method
+//     member of a GENERIC class, the FULL method-declaration source text. A
+//     SECOND trailing REC_STRING in MEMBER_BLOCK after valueText (methods carry
+//     no const value, so valueText is the empty first string) — exactly the
+//     shape ctorBodyText uses for Constructor members. It is ADDITIVE: it is
+//     emitted ONLY for generic-class methods with a span-extractable body, so a
+//     module with no generic methods produces byte-identical metadata to before;
+//     a reader predating this field ignores the extra string for Method members
+//     (it does not capture a second trailing string for Method kind), and a v4
+//     reader rejects a v5 blob via the version check. No bump is required (the
+//     rule: a bump is reserved for a change that makes an old reader MISINTERPRET
+//     an existing field — this only ADDS a trailing record that old readers skip).
 inline constexpr std::uint32_t kSchemaVersion = 5;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
@@ -258,6 +270,25 @@ struct MetaMember {
     // Empty for non-generic types (they use the external bz$T$ctor ABI) and for
     // any constructor whose body was absent or could not be extracted.
     std::string ctorBodyText;         // §14/#662c: ctor source text for generics
+
+    // §14.1 / §2.5 (#783, schema v5 additive): for a Method member belonging to
+    // a GENERIC class, the FULL method-declaration source text (from the
+    // visibility/modifier prefix through the terminating `;`). Emitted as a
+    // trailing REC_STRING in MEMBER_BLOCK after valueText (methods have no const
+    // value, so valueText is the empty first trailing string and methodBodyText
+    // is the second — symmetric to ctorBodyText for Constructors). The importer
+    // re-parses this to obtain a live ast::MethodDecl and attaches it to the
+    // reconstructed MethodSymbol so the per-instantiation generic-method body
+    // (emitInlineGenericMethod / buildSpecializedMethodFn) can be monomorphized
+    // importer-side under the concrete genericSubst_ — the method body was
+    // compiled in the defining module against the i32 placeholder layout, so a
+    // reference-type instantiation (`Box<string>.Get()`) would otherwise return
+    // the field at the wrong offset (a silent wrong value; see the #783 sema
+    // gate). Empty for non-generic types, for abstract/operator methods, and for
+    // any method whose body could not be span-extracted (degenerate). The extra
+    // trailing string is additive: a current reader ignores it for Method
+    // members (caps[1] is null), and a v4 reader rejects a v5 blob outright.
+    std::string methodBodyText;       // §14.1/#783: method source text for generics
 
     // Method / Constructor / Indexer:
     std::vector<MetaGenericParam> genericParams; // §14 (methods only)

@@ -773,6 +773,16 @@ void Emitter::declareFunctions() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ms = dynamic_cast<sema::MethodSymbol*>(sym.get());
         if (!ms) continue;
+        // §14.1 / §2.5 / #783: an IMPORTED method must NOT be emitted as a
+        // defined function here. Its template body lives (compiled) in the
+        // defining module — emitting `bz$<Class>$<M>` again would multiply-define
+        // that symbol at link time. Generic-class imported methods now carry a
+        // re-parsed ast::MethodDecl (schema v5 methodBodyText) so callableInfo
+        // succeeds, but that decl is for PER-INSTANTIATION inline monomorphization
+        // at the call site (emitInlineGenericMethod), not for a standalone
+        // definition. Skip every imported method (matching the pre-#783 behaviour,
+        // which relied on callableInfo failing for the no-decl case).
+        if (ctx_.isImported(ms)) continue;
         CallableInfo ci;
         if (!callableInfo(ms, ci) ||
             ci.bodyKind == ast::MethodBodyKind::Abstract)
@@ -3574,6 +3584,15 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
 
 
 void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
+    // §2.5 / §14.1 / #783: an IMPORTED method's `methodFns_` entry is an EXTERNAL
+    // declaration (the exporter holds the compiled body); never emit a body for
+    // it here — doing so would multiply-define `bz$<Class>$<M>` at link time.
+    // This previously held implicitly because callableInfo failed for imported
+    // methods (no AST decl); a generic-class imported method now carries a
+    // re-parsed ast::MethodDecl for per-instantiation inline monomorphization
+    // (#783, schema v5 methodBodyText), so the guard must be explicit — mirrors
+    // the disposer loop's `ctx_.isImported` skip.
+    if (ctx_.isImported(ms)) return;
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return;
 

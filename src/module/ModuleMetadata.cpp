@@ -133,6 +133,10 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
     // §14 / #662c (schema v5): ctor body source text for generic classes.
     hashStr(h, m.ctorBodyText);
+    // §14.1 / #783 (schema v5 additive): method body source text for generic
+    // classes — part of the cross-module interface (a body change must mark
+    // dependents stale, since the importer monomorphizes it per instantiation).
+    hashStr(h, m.methodBodyText);
     // §11.3 (issue #502): hash nested type when present.
     hashBool(h, m.nestedType != nullptr);
     if (m.nestedType) hashTypeDecl(h, *m.nestedType);
@@ -224,7 +228,7 @@ bool MetaParam::operator==(const MetaParam& o) const {
 MetaMember::MetaMember(const MetaMember& o)
     : kind(o.kind), name(o.name), visibility(o.visibility),
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
-      ctorBodyText(o.ctorBodyText),
+      ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -236,7 +240,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
     if (this != &o) {
         kind = o.kind; name = o.name; visibility = o.visibility;
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
-        ctorBodyText = o.ctorBodyText;
+        ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -257,6 +261,7 @@ bool MetaMember::operator==(const MetaMember& o) const {
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
+           methodBodyText == o.methodBodyText &&
            nestedEq;
 }
 
@@ -385,6 +390,13 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // length REC_STRING) so readMemberBody can capture it predictably.
     if (m.kind == MetaMemberKind::Constructor)
         emitString(w, m.ctorBodyText);
+    // §14.1 / #783 (schema v5 additive): for a Method member of a generic class,
+    // a second trailing REC_STRING carries the method body source text. Emitted
+    // ONLY when non-empty so a module with no generic methods produces
+    // byte-identical metadata (a reader predating this field ignores it for
+    // Method members; a v4 reader rejects v5 outright).
+    if (m.kind == MetaMemberKind::Method && !m.methodBodyText.empty())
+        emitString(w, m.methodBodyText);
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -833,6 +845,10 @@ bool readMemberBody(Reader& r, MetaMember& m) {
         std::string* caps[2] = { &m.valueText, nullptr };
         if (m.kind == MetaMemberKind::Constructor)
             caps[1] = &m.ctorBodyText;
+        // §14.1 / #783: a Method member's second trailing REC_STRING (when
+        // present) is the generic method body source text.
+        else if (m.kind == MetaMemberKind::Method)
+            caps[1] = &m.methodBodyText;
         int capIdx = 0;
         while (true) {
             unsigned id = 0;

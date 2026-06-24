@@ -112,6 +112,19 @@ public:
     const std::unordered_map<const ast::Expr*, Symbol*>& allExprSymbols() const {
         return exprSymbols_;
     }
+    // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
+    // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
+    // from the fresh context into the main context, so codegen's per-instantiation
+    // monomorphization (which queries resolvedType/exprType on the body's nodes)
+    // sees them. The TypeRef* values stay valid because the fresh context is kept
+    // alive alongside the re-parsed AST (ownImportedSemaContext).
+    const std::unordered_map<const ast::Type*, TypeRef*>& allResolvedTypes()
+        const {
+        return resolvedTypes_;
+    }
+    const std::unordered_map<const ast::Expr*, TypeRef*>& allExprTypes() const {
+        return exprTypes_;
+    }
 
     // A small primitive-type cache: looking up the same primitive shape
     // (Int, Bool, String, …) should return the same TypeRef so equality
@@ -187,6 +200,17 @@ public:
     // AssignmentStmt::op, etc.) remain valid for the lifetime of this context.
     void ownImportedSource(std::string src) {
         importedSources_.push_back(std::move(src));
+    }
+
+    // §14.1 / #783: keep an arbitrary heap object (the fresh SemaContext +
+    // DiagnosticEngine used to re-parse and type-resolve an imported generic
+    // method body) alive for the lifetime of this context. The body's
+    // resolved/expr TypeRefs (copied into resolvedTypes_/exprTypes_ via
+    // setResolvedType/setExprType) point into the fresh context's TypeRef arena,
+    // so the fresh context must outlive codegen. Type-erased via shared_ptr<void>
+    // so SemaContext need not be a complete type at the member declaration.
+    void ownImportedAuxiliary(std::shared_ptr<void> obj) {
+        importedAuxiliary_.push_back(std::move(obj));
     }
 
     // The exported types of a loaded module, or null if the module was never
@@ -322,6 +346,10 @@ private:
     // Backing storage for synthetic source strings whose string_view fields
     // are referenced by re-parsed AST nodes in importedCtorAst_.
     std::vector<std::string> importedSources_;
+    // §14.1 / #783: type-erased heap objects kept alive for this context's
+    // lifetime (the fresh SemaContext + DiagnosticEngine that own a re-parsed
+    // generic method body's resolved/expr TypeRefs).
+    std::vector<std::shared_ptr<void>> importedAuxiliary_;
     // §26.5 (#714): per MemberAccessExpr, the free-type-variable → concrete-TypeRef
     // binding inferred when a generic extension method matched a builtin receiver
     // through the ancestor chain (e.g. `extension IEnumerable<T>` on `Array<int>`

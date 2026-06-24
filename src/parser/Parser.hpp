@@ -83,8 +83,13 @@ private:
     // different grammar than class Member — no visibility, signature only.
     std::unique_ptr<ast::Member> parseInterfaceMember();
     // Caller has already consumed the `method` keyword.
+    // #783: `memberStart` is the location of the member's first token (so the
+    // builder can slice the full method-declaration text for cross-module
+    // generic-method body export); the span is stamped here because only this
+    // function knows where the body terminates.
     std::unique_ptr<ast::MethodDecl> parseMethodDeclBody(
-        ast::Visibility visibility, std::vector<std::string_view> modifiers);
+        ast::Visibility visibility, std::vector<std::string_view> modifiers,
+        SourceLocation memberStart = {});
     // Caller has already consumed `method operator`.
     std::unique_ptr<ast::Member> parseOperatorDeclBody(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);

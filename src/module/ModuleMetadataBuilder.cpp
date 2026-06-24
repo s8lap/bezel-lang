@@ -375,6 +375,21 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 meth->genericParams, md->genericConstraints, ctx);
             out.params = convertParams(meth->params, ctx);
             fillParamDefaults(out.params, md->params);
+            // §14.1 / #783: for a GENERIC class, export the full method
+            // declaration source text (extracted via the AST span stamped by
+            // parseMethodDeclBody) so the importer can re-parse and monomorphize
+            // it per instantiation with genericSubst_ active — the same
+            // mechanism ctorBodyText uses for constructors. Only block/expression
+            // bodies have a span (abstract methods have no body to inline; an
+            // operator goes down the OperatorDecl arm). Skip when the span is
+            // absent/degenerate (the importer then keeps the §14.1/#783 gate).
+            if (isGenericType && !source.empty() &&
+                md->span.begin.offset < md->span.end.offset &&
+                md->span.end.offset <= source.size()) {
+                out.methodBodyText = std::string(
+                    source.substr(md->span.begin.offset,
+                                  md->span.end.offset - md->span.begin.offset));
+            }
         } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(m.decl)) {
             // §25 operator overload.
             out.type = convertAstType(od->returnType.get(), ctx);

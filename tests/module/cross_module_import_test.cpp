@@ -3555,12 +3555,18 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 6);
 }
 
-// partial #783 / §14.1: calling a method whose RETURN TYPE references the class's
-// generic parameter, on an imported generic class instantiated with a REFERENCE
-// type argument, is not yet monomorphized importer-side — the body runs against
-// the placeholder layout and returns a silently wrong value. Sema now rejects it
-// with a clean diagnostic instead of miscompiling.
-BEZEL_TEST(cross_module_import, imported_generic_T_method_reftype_rejected_783) {
+// #783 / §14.1 (now IMPLEMENTED — was previously decline-with-reasons): calling a
+// method whose RETURN TYPE references the class's generic parameter, on an imported
+// generic class instantiated with a REFERENCE type argument, IS now monomorphized
+// importer-side. The exporter carries the method body source text (schema v5
+// methodBodyText); the loader re-parses + type-resolves it and attaches a live
+// ast::MethodDecl, and codegen monomorphizes the body per instantiation. So the
+// importer type-checks CLEAN (no diagnostic) and `Box<string>.Get()` returns the
+// field at the correct `ptr` offset — verified end-to-end (value == 5) by
+// tests/module/xmod_generic_method_783_test.cpp T1. (This test formerly asserted
+// the SOUND GATE that declined this shape; the gate is lifted now that the real
+// fix lands. Shapes whose body cannot be reconstructed still gate — see T5 there.)
+BEZEL_TEST(cross_module_import, imported_generic_T_method_reftype_accepted_783) {
     ModuleMetadata dep = buildMetaFor(
         "module Lib2; "
         "public class Box<T> "
@@ -3574,7 +3580,7 @@ BEZEL_TEST(cross_module_import, imported_generic_T_method_reftype_rejected_783) 
         "  using var b := new Box<string>(); b.v := \"hello\"; "
         "  return b.Get().Length; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r->hadErrors);  // #783: T-returning method on Box<string>
+    BEZEL_EXPECT_TRUE(!r->hadErrors);  // #783: now monomorphized, no gate
 }
 
 // #783 (no false positive): the SAME method on an `int` instantiation matches the

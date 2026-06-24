@@ -997,7 +997,8 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             return parseOperatorDeclBody(visibility, std::move(modifiers));
         }
         return std::unique_ptr<ast::Member>(
-            parseMethodDeclBody(visibility, std::move(modifiers)).release());
+            parseMethodDeclBody(visibility, std::move(modifiers),
+                                memberStart).release());
     }
     if (isKeyword("constructor")) {
         // Static constructor form has no visibility per A.4; instance form
@@ -1535,12 +1536,25 @@ void Parser::parsePolymorphicMember(ast::TypeDecl& decl) {
 
 
 std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
-    ast::Visibility visibility, std::vector<std::string_view> modifiers) {
+    ast::Visibility visibility, std::vector<std::string_view> modifiers,
+    SourceLocation memberStart) {
     // Caller has already consumed the `method` keyword. We pick up at the
     // method name.
     auto m = std::make_unique<ast::MethodDecl>();
     m->visibility = visibility;
     m->modifiers = std::move(modifiers);
+    // #783 / §14.1: stamp the full-declaration span (first member token through
+    // the terminating `;`) so the builder can slice the method source text for
+    // cross-module generic-method body export, the same way the ctor/dtor paths
+    // do (#662c). `methodEnd` is captured just before the terminating `;` is
+    // consumed in each body form; it is one past that `;`. Left at default
+    // (line 0) on a hard parse error, so the builder skips export (degenerate).
+    SourceLocation methodEnd{};
+    auto captureEnd = [&]() {
+        methodEnd = current_.location;
+        methodEnd.offset +=
+            static_cast<std::uint32_t>(current_.text.size());
+    };
 
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
@@ -1577,12 +1591,16 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
     if (consumePunctuator("=>")) {
         m->bodyKind = ast::MethodBodyKind::Expression;
         m->exprBody = parseExpression();
+        captureEnd();  // #783: the `;` terminating the expression body
         if (!consumePunctuator(";")) {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "expected ';' after expression-body method");
+            methodEnd = {};  // span unreliable on error
         }
-    } else if (consumePunctuator(";")) {
+    } else if (isPunctuator(";")) {
+        captureEnd();  // #783: the `;` terminating an abstract method
+        advance();
         m->bodyKind = ast::MethodBodyKind::Abstract;
     } else {
         // Block body (A.4 MethodBody form 2): `Statement* "end" Identifier? ";"`.
@@ -1610,10 +1628,17 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
             }
             advance();
         }
+        captureEnd();  // #783: the `;` terminating a block-body method
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end'");
+            methodEnd = {};  // span unreliable on error
         }
+    }
+    // #783: stamp the full-declaration span when both ends are known.
+    if (memberStart.line != 0 && methodEnd.line != 0) {
+        m->span.begin = memberStart;
+        m->span.end   = methodEnd;
     }
     return m;
 }
