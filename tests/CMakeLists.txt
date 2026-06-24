@@ -824,6 +824,7 @@ set(BEZEL_TEST_SOURCES
     ownership/exception_discharge_test.cpp
     ownership/owned_field_da_test.cpp
     ownership/owned_return_test.cpp
+    ownership/borrow_return_owning_type_1007_test.cpp
     ownership/call_arg_move_test.cpp
     ownership/assignment_consumes_test.cpp
     ownership/cfg_dataflow_test.cpp

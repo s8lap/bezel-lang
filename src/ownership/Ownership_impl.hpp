@@ -91,7 +91,19 @@ public:
     // byte-for-byte unchanged. // per §30.5, §30.1
     void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
              const std::vector<sema::Symbol*>* paramSyms = nullptr,
-             bool isAsync = false, bool isDestructor = false);
+             bool isAsync = false, bool isDestructor = false,
+             const ast::Type* returnType = nullptr, bool returnOwned = false);
+
+    // §28.3 / §5.11 (#1007): apply ONLY the borrow-returned-through-owning-type
+    // check to an expression-bodied method `M(): T => exprBody` (which the full
+    // block dataflow above is not run on). Seeds the parameters so a borrowed
+    // param is classified correctly, then runs `checkBorrowReturnedThroughOwning
+    // Type(exprBody)` — nothing else, so no unrelated diagnostics are introduced
+    // on expression bodies. // per §28.3, §5.11
+    void runExprBodyOwningReturnCheck(
+        const ast::Expr& exprBody,
+        const std::vector<sema::Symbol*>* paramSyms,
+        const ast::Type* returnType, bool returnOwned);
 
 private:
     sema::SemaContext& ctx_;
@@ -108,6 +120,18 @@ private:
     // check so a `move this.f` whose taken value is otherwise discharged is not
     // spuriously rejected. // per §28.8.1
     bool isDestructor_ = false;
+    // §28.3 / §28.6 / §5.11 (#1007): the enclosing method's DECLARED return type
+    // and whether it was declared `owned`. An owning-collection / owning-wrapper
+    // return type (`OwnedArray<T>`, `OwnedTask<T>`, `Shared<T>`, …) names ELEMENT
+    // ownership (§5.11); the CONTAINER-ownership axis is the separate `owned`
+    // qualifier. A method declared `: OwnedArray<T>` (no `owned`) that hands back
+    // a BORROW (a non-owned param, a borrowed local, a plain field read) launders
+    // that borrow into a value the caller tracks as owned — a double-free. The
+    // return check (handleReturn) consults these to reject that case. Null/false
+    // for constructors, destructors, operators, lambdas, and non-owning returns.
+    // // per §28.3, §28.6, §5.11
+    const ast::Type* returnType_ = nullptr;
+    bool returnOwned_ = false;
     // §29.3 / §29.8 (#945): true when this method's body uses `yield` (it is an
     // iterator method). A SYNC iterator (sawYield_ && !isAsync_) whose `owned`
     // parameter is never moved out gets §29.8 state-machine auto-dispose instead
@@ -233,6 +257,22 @@ private:
     void handleAssignment(const ast::AssignmentStmt& as);
 
     void handleReturn(const ast::Expr& e);
+
+    // §28.3 / §28.6 / §5.11 (#1007): reject returning a BORROW through an
+    // owning-collection / owning-wrapper return type (`OwnedArray<T>`,
+    // `OwnedTask<T>`, `Shared<T>`, …) declared WITHOUT `owned`. Such a return
+    // type names element ownership, not container ownership: a method that hands
+    // back a borrowed value (a non-owned param, a borrowed local, a plain field
+    // read) launders it into a value the caller tracks as owned — a double-free
+    // (#1007). A fresh producer (`new`, `move`, a call returning owned, an owned
+    // local/param being transferred out) is Owned, not a borrow, and is
+    // unaffected. Fires from handleReturn; a no-op for non-owning return types.
+    void checkBorrowReturnedThroughOwningType(const ast::Expr& e);
+
+    // §28.3 / §5.11 (#1007): the name-head of an owning-collection / owning-
+    // wrapper type (the set whose value the caller must discharge). True for
+    // `OwnedArray`/`OwnedDictionary`/…/`Shared`/`Weak`/`OwnedTask`/etc.
+    static bool isOwningTypeNameHead(std::string_view head);
 
     // A returned value is only a *borrow* of its local root when it has
     // reference type; a value-typed projection (e.g. `r.V` where V is an

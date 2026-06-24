@@ -50,9 +50,11 @@ bool bodyContainsYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
-         bool isDestructor) {
+         bool isDestructor, const ast::Type* returnType, bool returnOwned) {
     isAsync_ = isAsync;
     isDestructor_ = isDestructor;
+    returnType_ = returnType;
+    returnOwned_ = returnOwned;
     // §29.3 / §29.8 (#945): classify iterator methods up-front so the end-of-
     // method check can apply the state-machine auto-dispose rule to owned params.
     sawYield_ = bodyContainsYield(body);
@@ -193,6 +195,31 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     if (isAsync_) {
         checkAwaitSites(body);
     }
+}
+
+void MethodOwnership::runExprBodyOwningReturnCheck(
+        const ast::Expr& exprBody,
+        const std::vector<sema::Symbol*>* paramSyms,
+        const ast::Type* returnType, bool returnOwned) {
+    returnType_ = returnType;
+    returnOwned_ = returnOwned;
+    // Seed `owned` / `out owned` parameters as Owned locals (as run() does) so
+    // returning an owned param is classified as an owned transfer, not a borrow.
+    // Non-owned params stay out of `states_`; the ParameterSymbol branch in
+    // ownedArgSourceIsBorrow classifies them as borrows by modifier. // per §28.8
+    if (paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps) continue;
+            if (ps->modifier == "owned" || ps->modifier == "out owned") {
+                LocalOwnership lo;
+                lo.state = OwnershipState::Owned;
+                lo.obligationOrigin = ps->decl;
+                states_[sym] = lo;
+            }
+        }
+    }
+    checkBorrowReturnedThroughOwningType(exprBody);
 }
 
 namespace {
@@ -1382,6 +1409,13 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // same use-after-free hazard as the throw case above. // per §31.1
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
         checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
+    // §28.3 / §28.6 / §5.11 (#1007): reject laundering a borrow into an owned
+    // alias through an owning-collection / owning-wrapper return type. Run BEFORE
+    // the bare-identifier discharge fast-path below (which returns early for a
+    // bare `return x;` and so would otherwise hide this case) and before
+    // handleDischarge, so the (rejected) returned local is examined in its borrow
+    // state. A no-op for non-owning return types. // per §28.3, §28.6, §5.11
+    checkBorrowReturnedThroughOwningType(e);
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement
@@ -1424,6 +1458,91 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     handleDischarge(e);
 }
 
+// §28.3 / §5.11 (#1007): the owning-collection / owning-wrapper type heads. A
+// return type whose name-head is one of these denotes ELEMENT ownership (the
+// `Owned*` type), not CONTAINER ownership (the separate `owned` qualifier,
+// §5.11). The set mirrors the `producerState` owned-returning-call fallback so
+// the two stay aligned. // per §28.3, §5.11
+bool MethodOwnership::isOwningTypeNameHead(std::string_view head) {
+    return head == "Shared"          || head == "Weak"            ||
+           head == "ChannelSender"    || head == "OwnedTask"       ||
+           head == "OwnedArray"       || head == "OwnedDictionary" ||
+           head == "OwnedSet"         || head == "OwnedStack"      ||
+           head == "OwnedQueue"       || head == "OwnedLinkedList" ||
+           head == "OwnedEnumerable"  ||
+           head == "CancellationTokenSource";
+}
+
+// §28.3 / §28.6 / §5.11 (#1007): a method declared `: OwnedArray<T>` (or any
+// owning-collection / owning-wrapper return type) WITHOUT the `owned` qualifier
+// hands the caller a value the caller tracks as OWNED — the caller must
+// discharge it (a `using var` binding disposes it; a plain `var` errors if it
+// is dropped). If the returned expression is a BORROW (a non-`owned` parameter,
+// a borrowed local, or a plain field read), that borrow is laundered into a
+// second owner: both the original owner and the caller dispose the same value,
+// a double-free (#1007). The element-ownership the `OwnedArray` type name
+// denotes (§5.11) is a SEPARATE axis from the container ownership the `owned`
+// qualifier governs — so a bare (non-`owned`) owning-collection return that
+// returns a borrow must be rejected, exactly as a borrowed `Array<T>` return is
+// rejected by the §28.3 borrow-lifetime rule. A genuine owned producer (`new`,
+// `move`, a call returning owned, an owned local/param transferred out) is NOT
+// a borrow (ownedArgSourceIsBorrow returns false) and still compiles; an `owned`
+// return type also exempts the method (the container-ownership transfer is then
+// explicit). This is the definition-site rejection that closes the laundering
+// hole. // per §28.3, §28.6, §5.11
+void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
+    // Only owning-collection / owning-wrapper return types declared WITHOUT
+    // `owned` are at risk; everything else keeps its existing behaviour.
+    if (returnOwned_) return;
+    if (!returnType_ || returnType_->kind != ast::TypeKind::Named ||
+        !returnType_->name || returnType_->name->parts.empty())
+        return;
+    if (!isOwningTypeNameHead(returnType_->name->parts.front())) return;
+    // Reuse the §28.8 owned-sink borrow classifier: it returns true for the
+    // borrow forms (borrowed param, borrowed local, `this`, caught-exception
+    // borrow) and false for every genuine owned producer (`new`, `move`, owned-
+    // returning call, owned local/param). The caller's owned binding IS an owned
+    // sink, so the same hazard applies on return. Its one gap here is the
+    // isBorrowableType TYPE-GATE on field/index reads: the owning-collection
+    // builtins (OwnedArray, …) carry no `declaration`, so isBorrowableType
+    // reports them non-borrowable and the classifier skips a plain field/index
+    // read of one. That gate exists to exclude VALUE-typed copies — irrelevant
+    // here, since the return type is itself a reference owning collection. So
+    // supplement the classifier: a bare (non-`move`) field read or index read of
+    // the owning return type is a borrow too (its source — `this`/`obj`/the
+    // collection — still owns the value). `move this.f` / `move coll[i]` are
+    // UnaryExprs, not Member/Index exprs, so the legal owned producers are not
+    // caught here. // per §28.3, §28.8.1, §5.11
+    bool isBorrow = ownedArgSourceIsBorrow(e);
+    if (!isBorrow) {
+        // A plain `obj.f` / `this.f` field read of the owning type.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma)))
+                isBorrow = true;
+        }
+        // A bare identifier resolving to a field of the declaring class
+        // (implicit `this.f`).
+        else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*id)))
+                isBorrow = true;
+        }
+        // A bare (non-`move`) indexer read `coll[i]` of the owning type.
+        else if (dynamic_cast<const ast::IndexExpr*>(&e)) {
+            isBorrow = true;
+        }
+    }
+    if (!isBorrow) return;
+    report(
+        Severity::Error, e.span.begin,
+        std::string("a borrow may not be returned through the owning-type "
+                    "return `") +
+        std::string(returnType_->name->parts.front()) +
+        "<…>` — the caller would track the returned value as owned and dispose "
+        "it, double-freeing the borrow's actual owner (§28.3 / §5.11); return a "
+        "freshly-produced or `move`d owned value, declare the return type "
+        "`owned`, or use a borrowing return type");
+}
+
 namespace {
 
 // Top-level walker — visits every method/ctor body in the source.
@@ -1459,7 +1578,24 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
-            mo.run(md->stmts, paramSymsOf(m, ctx), methodIsAsync(*md));
+            mo.run(md->stmts, paramSymsOf(m, ctx), methodIsAsync(*md),
+                   /*isDestructor=*/false, md->returnType.get(),
+                   md->returnOwned);
+        } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
+                   md->exprBody) {
+            // §28.3 / §5.11 (#1007): an expression-bodied method `M(): T => E`
+            // is exactly `return E` for ownership purposes — but the full block
+            // dataflow is not run on it. Run the narrow borrow-returned-through-
+            // owning-type check so `Identity(a): OwnedArray<T> => a` (the #1007
+            // double-free) is rejected at its definition site, the same as the
+            // block-body `return a;` form. Seed the params so a borrowed param /
+            // owned param is classified correctly, then apply only this check
+            // (not the full handleReturn, which would introduce unrelated new
+            // diagnostics on expression bodies). // per §28.3, §5.11
+            MethodOwnership mo(ctx);
+            mo.runExprBodyOwningReturnCheck(
+                *md->exprBody, paramSymsOf(m, ctx),
+                md->returnType.get(), md->returnOwned);
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
