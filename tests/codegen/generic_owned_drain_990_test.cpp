@@ -1,0 +1,266 @@
+// Codegen — GENERIC owning-collection .Drain() (#990).
+//
+// stdlib §4.5/§4.7/§4.11 / §14.2: `for var item in coll.Drain()` over an owning
+// sequence collection (OwnedArray/Stack/Queue/LinkedList) inside a GENERIC class
+// `Wrapper<T> where T: class`, where the element type is the unresolved type
+// parameter `T`.
+//
+// Before the fix the generic case (T an unresolved class type parameter) was a
+// two-fold defect:
+//   1. lowerOwnedSeqDrainFor lowered the bare `T` to the i32 placeholder, so the
+//      drain loop's element-slot store bitcast the popped `ptr` to i32 — malformed
+//      IR (IR verification failed, compile rc=1).
+//   2. A naive "force ptr" band-aid made it compile but never disposed the drained
+//      elements (classOfLocal cannot resolve T to a concrete class in the generic
+//      TEMPLATE body, so the static-disposal path missed it) — a silent leak.
+//
+// The fix resolves the element type through the per-instantiation substitution
+// (falling back to a class pointer for the owning-collection invariant `T: class`)
+// AND routes `using var _ := item` for a drained owning-collection element to the
+// dynamic (vtable-slot-2) dispose, so each drained element disposes EXACTLY ONCE.
+//
+// These tests instantiate Wrapper<R> with a destructor-counter class R and assert
+// the post-drain count is exactly the number of drained elements (every element
+// disposed once, none leaked, none double-freed), plus ASan leak/double-free
+// checks for all four owning collections.
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <sys/wait.h>
+
+#include "codegen/LlvmBackend.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/codegen_support.hpp"
+#include "support/Diagnostic.hpp"
+#include "test_harness.hpp"
+#include "native_test_harness.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+
+using bezel::test::runJit;
+
+namespace {
+
+namespace fs = std::filesystem;
+
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// LSan/ASan helper — compile → object → link with ASan runtime → run.
+// Returns 0 (clean), 1 (sanitizer fired), -1 (toolchain missing).
+int runUnderASan(const std::string& source) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_990_asan_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+
+    {
+        bezel::DiagnosticEngine diags;
+        bezel::Lexer lexer(source, diags);
+        bezel::Parser parser(lexer, diags);
+        auto unit = parser.parseCompilationUnit();
+        if (!unit) return -1;
+        bezel::sema::SemaContext ctx(diags);
+        bezel::sema::collectSymbols(*unit, ctx);
+        bezel::sema::resolveTypes(*unit, ctx);
+        bezel::sema::typecheckExpressions(*unit, ctx);
+        bezel::sema::checkDefiniteAssignment(*unit, ctx);
+        bezel::ownership::checkOwnership(*unit, ctx);
+        if (diags.hasErrors()) return -1;
+        llvm::LLVMContext llvmCtx;
+        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+        if (!module) return -1;
+        std::string err;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    }
+
+    auto cleanup = [&] {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+    };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    std::string runCmd =
+        std::string("ASAN_OPTIONS=detect_leaks=1:exitcode=99 ") + exe +
+        " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (status == -1) return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
+    return 0;
+}
+
+// Build a program with a destructor-counter class R and a generic Wrapper<T>
+// holding an owning collection `coll` of type `collType<T>`.  `addCall` is the
+// method used to insert (Add / AddLast / Push / Enqueue).  DrainAll() drains via
+// `using var _ := item`.  Main instantiates Wrapper<R>, adds two elements, drains,
+// disposes the wrapper, and returns R._n (== 0 when both drained elements were
+// disposed exactly once).
+std::string makeGenericProgram(const std::string& collType,
+                               const std::string& addCall) {
+    return
+        "module M; "
+        "class R "
+        "  public static _n: int := 0; "
+        "  public constructor() _n := _n + 1; end constructor; "
+        "  destructor _n := _n - 1; end destructor; "
+        "end R; "
+        "class Wrapper<T> where T: class "
+        "  public owned _items: " + collType + "<T>; "
+        "  public constructor() _items := new " + collType + "<T>(); end constructor; "
+        "  destructor end destructor; "
+        "  public method Add(owned c: T) _items." + addCall + "(c); end Add; "
+        "  public method DrainAll() "
+        "    for var item in _items.Drain() do using var _ := item; end; "
+        "  end DrainAll; "
+        "end Wrapper; "
+        "class C public static method Main(): int "
+        "  var w := new Wrapper<R>(); "
+        "  w.Add(new R()); "
+        "  w.Add(new R()); "
+        "  w.DrainAll(); "
+        "  using var _ := w; "
+        "  return R._n; "  // 0 when both drained elements disposed exactly once
+        "end Main; end C;";
+}
+
+}  // namespace
+
+// ===========================================================================
+// §4.5 / §14.2 / #990: generic OwnedArray<T>.Drain() — compile + dispose-once
+// ===========================================================================
+
+// The element type T is an unresolved class type parameter; the drain compiles
+// (no IR_FAIL) and disposes each drained element exactly once (R._n == 0).
+BEZEL_TEST(generic_owned_drain_990, ownedarray_generic_drain_disposes_once_spec_4_5) {
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedArray", "Add")), 0);
+}
+
+// §4.11 / §14.2: generic OwnedStack<T>.Drain().
+BEZEL_TEST(generic_owned_drain_990, ownedstack_generic_drain_disposes_once_spec_4_11) {
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedStack", "Push")), 0);
+}
+
+// §4.11 / §14.2: generic OwnedQueue<T>.Drain().
+BEZEL_TEST(generic_owned_drain_990, ownedqueue_generic_drain_disposes_once_spec_4_11) {
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedQueue", "Enqueue")), 0);
+}
+
+// §4.7 / §14.2: generic OwnedLinkedList<T>.Drain() (AddLast inserts).
+BEZEL_TEST(generic_owned_drain_990, ownedlinkedlist_generic_drain_disposes_once_spec_4_7) {
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedLinkedList", "AddLast")), 0);
+}
+
+// ===========================================================================
+// §4.5 / §14.2 / #990: the drained element's value is usable in the loop body
+// (the popped pointer is a real class object, not an i32-bitcast garbage value).
+// ===========================================================================
+
+// Sum the drained elements' stored values inside the generic drain body — proves
+// the loop variable holds a live class object (front-to-back drain of [10,20,30]).
+BEZEL_TEST(generic_owned_drain_990, generic_drain_element_value_usable_spec_4_5) {
+    auto r = runJit(
+        "module M; "
+        "sealed class Val "
+        "  public N: int := 0; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "end Val; "
+        "class Bag<T> where T: class "
+        "  public owned _items: OwnedArray<T>; "
+        "  public constructor() _items := new OwnedArray<T>(); end constructor; "
+        "  destructor end destructor; "
+        "  public method Add(owned c: T) _items.Add(c); end Add; "
+        "end Bag; "
+        "class C public static method Main(): int "
+        "  using var b := new Bag<Val>(); "
+        "  b.Add(new Val(10)); "
+        "  b.Add(new Val(20)); "
+        "  b.Add(new Val(30)); "
+        "  var sum := 0; "
+        "  for var item in b._items.Drain() do "
+        "    using var it := item; "
+        "    sum := sum + it.N; "
+        "  end; "
+        "  return sum; "  // 60
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 60);
+}
+
+// ===========================================================================
+// §4.5 / §14.2 / #990: a NON-generic instantiation of the same Wrapper still
+// disposes once (no regression of the concrete path).
+// ===========================================================================
+
+BEZEL_TEST(generic_owned_drain_990, nongeneric_ownedarray_drain_disposes_once_spec_4_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class R "
+        "  public static _n: int := 0; "
+        "  public constructor() _n := _n + 1; end constructor; "
+        "  destructor _n := _n - 1; end destructor; "
+        "end R; "
+        "class Wrapper "
+        "  public owned _items: OwnedArray<R>; "
+        "  public constructor() _items := new OwnedArray<R>(); end constructor; "
+        "  destructor end destructor; "
+        "  public method Add(owned c: R) _items.Add(c); end Add; "
+        "  public method DrainAll() "
+        "    for var item in _items.Drain() do using var _ := item; end; "
+        "  end DrainAll; "
+        "end Wrapper; "
+        "class C public static method Main(): int "
+        "  var w := new Wrapper(); "
+        "  w.Add(new R()); "
+        "  w.Add(new R()); "
+        "  w.DrainAll(); "
+        "  using var _ := w; "
+        "  return R._n; "  // 0
+        "end Main; end C;"), 0);
+}
+
+// ===========================================================================
+// §4.5 / §14.2 / #990: ASan — generic drain has NO leak / double-free / UAF.
+// ===========================================================================
+
+BEZEL_TEST(generic_owned_drain_990, asan_ownedarray_generic_drain_no_leak) {
+    int asan = runUnderASan(makeGenericProgram("OwnedArray", "Add"));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+BEZEL_TEST(generic_owned_drain_990, asan_ownedstack_generic_drain_no_leak) {
+    int asan = runUnderASan(makeGenericProgram("OwnedStack", "Push"));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+BEZEL_TEST(generic_owned_drain_990, asan_ownedqueue_generic_drain_no_leak) {
+    int asan = runUnderASan(makeGenericProgram("OwnedQueue", "Enqueue"));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+BEZEL_TEST(generic_owned_drain_990, asan_ownedlinkedlist_generic_drain_no_leak) {
+    int asan = runUnderASan(makeGenericProgram("OwnedLinkedList", "AddLast"));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}

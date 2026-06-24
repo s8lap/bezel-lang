@@ -4983,6 +4983,17 @@ private:
     // state — see emittingDisposerBody_).
     bool usingVarIsMovedClassObject(const ast::LocalDecl* ld);
 
+    // #990 / §4.5 / §14.2: `using var _ := item` where `item` is the loop
+    // variable of a `for var item in coll.Drain()` loop over an owning sequence
+    // collection (OwnedArray/Stack/Queue/LinkedList).  A drained owning-collection
+    // element is, by the stdlib type definitions, a class object with a vtable —
+    // even when its static type is an unresolved generic class type parameter `T`
+    // in the generic TEMPLATE body (classOfLocal cannot recover a concrete class
+    // there, so the static-disposal path misses it).  Dispose it dynamically
+    // through its own vtable (idempotent + reclaim + null, §28.2/#380) so each
+    // drained element disposes exactly once.
+    bool usingVarIsDrainedOwningElement(const ast::LocalDecl* ld);
+
     // #362 / stdlib §4.5: the resolved collection TypeRef of a local (declared
     // type, then `new` initializer type, then inferred initializer type), or
     // null if the local is not a heap collection.

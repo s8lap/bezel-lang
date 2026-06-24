@@ -3215,7 +3215,26 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     if (!collObj) return false;
 
     // The element type is always a class pointer (ptrTy()) for owned collections.
-    llvm::Type* elemLlvm = lowerTypeRef(elemTy);
+    // #990 / §4.5 / §14.2: in a GENERIC collection (`OwnedArray<T>` with T an
+    // unresolved class type parameter) `elemTy` is the bare param `T`.  When this
+    // method is lowered as the generic TEMPLATE body (no active substitution),
+    // lowerTypeRef(T) returns the i32 placeholder, so the element-slot store below
+    // bitcast the popped `ptr` to i32 — malformed IR (IR_FAIL).  Resolve `T`
+    // through the active per-instantiation substitution first; if it stays an
+    // unresolved param, the owning collection's element is a class object by the
+    // stdlib invariant (only classes are owned elements — `where T: class`), so
+    // lower it as a class pointer (ptrTy()).  The store path below uses `rawPtr`
+    // directly when elemLlvm == ptrTy(), so no bitcast is emitted.
+    const sema::TypeRef* resolvedElemTy = resolveTypeParamRef(elemTy);
+    llvm::Type* elemLlvm;
+    if (resolvedElemTy && resolvedElemTy != elemTy)
+        elemLlvm = lowerTypeRef(resolvedElemTy);
+    else if (elemTy->kind == sema::TypeRef::Kind::Named &&
+             elemTy->declaration == nullptr)
+        // Unresolved bare type parameter for an owning collection: a class ptr.
+        elemLlvm = ptrTy();
+    else
+        elemLlvm = lowerTypeRef(elemTy);
     if (!elemLlvm) return false;
 
     // Alloca for the loop variable (holds the popped owned pointer).

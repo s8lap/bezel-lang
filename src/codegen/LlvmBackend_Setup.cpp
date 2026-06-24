@@ -6516,6 +6516,19 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back(d);
         return;
     }
+    // #990 / §4.5 / §14.2: `using var _ := item` where `item` is the loop var of
+    // a `for var item in coll.Drain()` over an owning sequence collection whose
+    // element type is an unresolved generic class type parameter `T`.  In the
+    // generic TEMPLATE body classOfLocal cannot resolve T to a concrete class, so
+    // the static-disposal branch above missed it; dispose the drained class
+    // element dynamically through its own vtable (exactly once).  Concrete
+    // (non-generic) drains resolved to a class above and never reach here.
+    if (usingVarIsDrainedOwningElement(ld)) {
+        Disposal d{it->second, nullptr};
+        d.dynamicDispose = true;
+        disposeStack_.back().push_back(d);
+        return;
+    }
     // #383 / §28: a `using var` owning a class/interface object whose concrete
     // class classOfLocal does not capture — an interface-typed slot, or a call
     // returning `owned T` (NOT a borrow return, per §28.10). Dispose via the
@@ -9900,6 +9913,44 @@ bool Emitter::usingVarIsMovedClassObject(const ast::LocalDecl* ld) {
             return isClassOrInterfaceRef(it->second);
     }
     return false;
+}
+
+
+bool Emitter::usingVarIsDrainedOwningElement(const ast::LocalDecl* ld) {
+    // #990 / §4.5 / §14.2: `using var _ := item` where `item` is the loop
+    // variable of `for var item in coll.Drain()` over an OWNING sequence
+    // collection (OwnedArray/Stack/Queue/LinkedList).  Such an element is a class
+    // object with a vtable by the stdlib invariant (owning collections hold only
+    // class elements).  In the GENERIC TEMPLATE body the element's static type is
+    // the unresolved type parameter `T` (declaration == null, genericSubstSemaTy_
+    // empty), so classOfLocal cannot recover a concrete class and the static-
+    // disposal path misses it — the drained element would leak.  Recognise this
+    // shape and route it to the dynamic (vtable-slot-2) dispose so it discharges
+    // exactly once.  The concrete (non-generic) case is already handled by
+    // classOfLocal returning the element's declaration before this is reached.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get());
+    if (!id) return false;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc) return false;
+    auto* fs = dynamic_cast<const ast::ForStmt*>(loc->decl);
+    if (!fs || !fs->iterable) return false;
+    // The iterable must be a `.Drain()` call on one of the four owning sequence
+    // collections (the same shape lowerOwnedSeqDrainFor accepts).  Excludes the
+    // OwnedDictionary drain (its loop var is a DrainedEntry, handled separately)
+    // and the borrowing collections (which yield borrows, not owned elements).
+    auto* ce = dynamic_cast<const ast::CallExpr*>(fs->iterable.get());
+    if (!ce) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || ma->member != "Drain" || !ma->target) return false;
+    const sema::TypeRef* ct = ctx_.exprType(*ma->target);
+    if (!ct || ct->kind != sema::TypeRef::Kind::Named) return false;
+    std::string_view cn;
+    if (ct->astNode && ct->astNode->name && !ct->astNode->name->parts.empty())
+        cn = ct->astNode->name->parts[0];
+    else if (!ct->importedName.empty())
+        cn = ct->importedName;
+    return cn == "OwnedArray" || cn == "OwnedStack" ||
+           cn == "OwnedQueue" || cn == "OwnedLinkedList";
 }
 
 
