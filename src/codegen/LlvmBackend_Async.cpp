@@ -1454,6 +1454,8 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         finallyBodyStack_.clear();
         smIterFinallyAtState_.clear();
         smIterDisposalsAtState_.clear();  // #821 (async)
+        smIterEnumFramesAtState_.clear();  // §29.7 (#944): no stale entries
+        smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
@@ -1674,6 +1676,8 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         smIterFinallyAtState_.clear();
         smIterDisposalsAtState_.clear();  // #821
+        smIterEnumFramesAtState_.clear();  // §29.7 (#944)
+        smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         finallyBodyStack_.clear();
     }
 }

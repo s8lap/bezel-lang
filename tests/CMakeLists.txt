@@ -702,6 +702,9 @@ set(BEZEL_TEST_SOURCES
     codegen/iterator_owned_param_945_test.cpp
     # --- fix #943: re-enumeration of a yield-method IEnumerable<T> (§29.11) ---
     codegen/iterator_reenum_943_test.cpp
+    # --- fix #944: nested-iterator suspension disposal — inner enumerator/source
+    #     disposed when the outer iterator is abandoned mid-inner-for-in (§29.7) ---
+    codegen/iterator_nested_suspend_dispose_944_test.cpp
     # --- fix #1001: owned-param disposal for named-local IEnumerable<T> source (§29.8/§29.11) ---
     codegen/iterator_owned_param_named_local_1001_test.cpp
     # --- fix #972: user IEnumerable<T> enumerator dispose at normal exit ---

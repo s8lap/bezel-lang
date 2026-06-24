@@ -898,6 +898,27 @@ private:
         std::vector<std::pair<const ast::Node*, Disposal>>>
         smIterDisposalsAtState_;
 
+    // §29.7 (#944): per-yield-state → the frame field indices holding live
+    // iterator-format enumerator/source frames (a for-in's GetEnumerator clone
+    // and, for a loop-owned CallExpr/NewExpr iterable, its source IEnumERABLE)
+    // active at that yield. Unlike a `using var` (a named LocalDecl restored via
+    // localFields/locals_), these implicit for-in resources have no decl node, so
+    // they are tracked by FRAME FIELD INDEX directly: the yield snapshot records
+    // the index of each such resource live in the surrounding scope, and the
+    // iterator Dispose (for a suspend state in this map) GEPs the field, loads the
+    // frame ptr, null-guards, and disposes it via iterator-vtable slot 1 (then
+    // nulls the field). This disposes the inner enumerator/source EXACTLY when the
+    // enclosing iterator is abandoned while suspended inside the loop — the loop's
+    // own scope-exit / break disposal handles every other exit (never both,
+    // discriminated by the suspend state). Outermost-first; Dispose runs reverse.
+    std::unordered_map<unsigned, std::vector<unsigned>> smIterEnumFramesAtState_;
+    // §29.7 (#944): maps an iterator-format enumerator/source disposal slot
+    // (an `iterEnumDispose` Disposal's alloca) → its frame field index, for the
+    // for-in resources wired to a dedicated frame field in the current iterator
+    // body. The yield snapshot consults this to record live frames in
+    // smIterEnumFramesAtState_. Reset per iterator body.
+    std::unordered_map<llvm::AllocaInst*, unsigned> smIterEnumFrameSlot_;
+
     // CG20: exception handling (explicit-unwinding model). A module-level
     // global holds the in-flight exception (null when none). A `throw` and
     // any call that leaves the global non-null branch to the current
@@ -3911,6 +3932,16 @@ private:
         unsigned currentValField = 0;
         // Maps a body-local AST node → its frame field index.
         std::unordered_map<const ast::Node*, unsigned> localFields;
+        // §29.7 (#944): for each for-in whose lowering creates an iterator-format
+        // enumerator over a LOOP-OWNED source temporary (a CallExpr/NewExpr
+        // iterable, e.g. `P.Inner()`), the frame field holding that source's
+        // IEnumERABLE, keyed on the iterable expression node. The ENUMERATOR (the
+        // GetEnumerator clone) round-trips via localFields[iterable]; this extra
+        // field round-trips the SOURCE so the enclosing iterator's Dispose can
+        // dispose it too when abandoned mid-loop (else the source frame leaks).
+        // Absent when the source is a named local/param (disposed at its own
+        // scope end via the using/local machinery, not loop-owned).
+        std::unordered_map<const ast::Node*, unsigned> forInSrcFields;
     };
 
     // Pre-scan a method body to collect all LocalDecl/ForStmt nodes and their
@@ -3920,6 +3951,21 @@ private:
     void collectSuspendLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+
+    // §29.7 (#944): true when `fs` is a for-in whose lowering creates an
+    // implicit iterator-format enumerator (Dispose at vtable slot 1) — i.e. the
+    // builtin-enumerable vtable path of lowerIEnumerableBuiltinFor (a CallExpr /
+    // NewExpr iterable, or a pure-`IEnumerable<T>` param/local). That enumerator
+    // is an owned resource scoped to the loop body, just like a `using var`. When
+    // the for-in is inside a yielding iterator AND its body itself suspends, the
+    // enumerator must round-trip through a DEDICATED frame field (so the enclosing
+    // iterator's Dispose can restore and dispose it if it is abandoned while
+    // suspended inside the loop, §29.7) — keyed on `fs.iterable.get()`. This
+    // predicate is the single source of truth shared by collectSuspendLocals
+    // (which reserves the field) and lowerIEnumerableBuiltinFor (which wires the
+    // enumerator slot to it and registers the suspension disposal). It mirrors the
+    // `isArrayBacked == false` decision in lowerIEnumerableBuiltinFor exactly.
+    bool forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs);
 
     // Build the kind-agnostic frame layout for a state machine: compute the
     // captures (this + params), the suspend-live body locals, assemble the
@@ -4246,6 +4292,11 @@ private:
     unsigned smNextSuspendState_ = 0;
     // Maps LocalDecl/ForStmt AST node → frame field index for suspend-locals.
     std::unordered_map<const ast::Node*, unsigned> smLocalFields_;
+    // §29.7 (#944): maps a for-in iterable node → the frame field holding its
+    // loop-owned SOURCE IEnumERABLE (the enumerator clone is in smLocalFields_).
+    // Published alongside smLocalFields_; consumed by lowerIEnumerableBuiltinFor
+    // (wires the source slot to the field) and the iterator Dispose body.
+    std::unordered_map<const ast::Node*, unsigned> smForInSrcFields_;
     // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
     std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
     // ---- Yield-specific live state (used only when smKind_ == Yield) ----

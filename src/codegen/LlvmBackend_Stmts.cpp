@@ -1345,9 +1345,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // disposes using-var only). Outermost-first; Dispose runs in reverse.
             {
                 std::vector<std::pair<const ast::Node*, Disposal>> active;
+                // §29.7 (#944): for-in implicit enumerator/source frames active
+                // here (iterEnumDispose disposals wired to a frame field). They
+                // have no decl node, so they are tracked by FRAME FIELD INDEX in a
+                // parallel map; Dispose GEPs the field and disposes via slot 1.
+                std::vector<unsigned> activeFrames;
                 for (const auto& level : disposeStack_) {
                     for (const Disposal& d : level) {
                         if (d.caughtException || d.unwindOnly) continue;
+                        if (d.iterEnumDispose) {
+                            auto* a = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                                d.slot);
+                            auto fit = a ? smIterEnumFrameSlot_.find(a)
+                                         : smIterEnumFrameSlot_.end();
+                            if (a && fit != smIterEnumFrameSlot_.end()) {
+                                activeFrames.push_back(fit->second);
+                                continue;  // tracked by field, not by node
+                            }
+                            // An iterEnumDispose with no frame field (e.g. a
+                            // for-in not inside this suspending iterator body)
+                            // cannot be live across this yield — skip.
+                            continue;
+                        }
                         const ast::Node* node = nullptr;
                         for (const auto& [n, s] : locals_)
                             if (s == d.slot) { node = n; break; }
@@ -1356,6 +1375,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 if (!active.empty())
                     smIterDisposalsAtState_[nextState] = std::move(active);
+                if (!activeFrames.empty())
+                    smIterEnumFramesAtState_[nextState] = std::move(activeFrames);
             }
             builder_.CreateStore(builder_.getInt32((int)nextState), smStateGEP_);
             if (isAsyncYield) {
@@ -3676,6 +3697,32 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumObj, enumSlot);
 
+    // §29.7 (#944): when this for-in is inside a yielding iterator, the
+    // enumerator is an owned resource scoped to the loop body — like a `using
+    // var`. If the enclosing iterator is abandoned (Dispose) while suspended at a
+    // yield INSIDE this loop, the enumerator is still live and the state-machine
+    // Dispose must dispose it (§29.7: "Dispose on every using var active at the
+    // point of suspension"). To make it reachable from the Dispose function —
+    // which does not re-lower the loop body — it round-trips through a DEDICATED
+    // frame field (reserved by collectSuspendLocals, keyed on the iterable node),
+    // NOT only the alloca-keyed spill area Dispose cannot reach. Wire the
+    // enumerator alloca to that field (smAllocaToField_ → the per-yield spill
+    // saves/restores it) and record slot→field in smIterEnumFrameSlot_ so the
+    // yield snapshot logs this frame in smIterEnumFramesAtState_ for every suspend
+    // state inside the loop. The for-in's OWN loop-exit disposal (emitDisposals at
+    // endBB) and break/return paths dispose it on a normal exit; the state-machine
+    // Dispose disposes it ONLY when suspended inside the loop — exactly once on
+    // every exit (discriminated by the suspend state).
+    bool enumHasFrameField = false;
+    if (smStateStruct_ && smSelf_) {
+        auto fit = smLocalFields_.find(fs.iterable.get());
+        if (fit != smLocalFields_.end()) {
+            smAllocaToField_[enumSlot] = fit->second;
+            smIterEnumFrameSlot_[enumSlot] = fit->second;
+            enumHasFrameField = true;
+        }
+    }
+
     // §29.7 (#623): register the enumerator for disposal on all exit paths
     // (break / return / exception / normal exhaustion).  Use a dedicated scope
     // around the loop so emitLoopDisposals(outerDepth) on `break` disposes it.
@@ -3703,6 +3750,21 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         Disposal ds{srcSlot, nullptr};
         ds.iterEnumDispose = true;
         disposeStack_.back().push_back(ds);
+        // §29.7 (#944): the loop-owned source IEnumERABLE is a second implicit
+        // frame live across a suspend inside the loop (independent of the
+        // enumerator clone, §29.11). Wire it to its dedicated frame field
+        // (forInSrcFields, reserved by collectSuspendLocals) so the enclosing
+        // iterator's Dispose disposes it too when abandoned mid-loop — else the
+        // source frame leaks even though its using-vars were freed via the
+        // enumerator's Dispose. A named-local source is NOT wired here: it is
+        // disposed at its own scope end via the using/local machinery.
+        if (enumHasFrameField) {
+            auto sit = smForInSrcFields_.find(fs.iterable.get());
+            if (sit != smForInSrcFields_.end()) {
+                smAllocaToField_[srcSlot] = sit->second;
+                smIterEnumFrameSlot_[srcSlot] = sit->second;
+            }
+        }
     }
 
     // Use vtable-based MoveNext (slot 2) and Current (slot 3).
@@ -3712,7 +3774,17 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
 
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
-    registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
+    // §29.7 (#944): when the enumerator round-trips through its OWN dedicated
+    // frame field (enumHasFrameField — wired into smAllocaToField_ above so the
+    // per-yield spill saves/restores it and Dispose can reach it), it must NOT
+    // also be registered in the alloca-keyed spill area — that would create two
+    // independent round-trip mechanisms for the same slot (the spill-area copy
+    // would shadow the frame-field copy the Dispose path reads). The loop var is
+    // unaffected and keeps the spill-area round-trip.
+    if (enumHasFrameField)
+        registerForLoopSpillSlots(fs, {varSlot});            // #747 R42
+    else
+        registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
 
     // §28.3 / §29.2 (#895): for an `OwnedEnumerable<T>` the loop variable OWNS
     // each yielded element — sema requires it to be discharged on a normal body

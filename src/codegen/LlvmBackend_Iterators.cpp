@@ -15,6 +15,60 @@ namespace bezel::codegen {
 // top of those helpers. No behavior changes for iterators.
 // ===========================================================================
 
+bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
+    // §29.7 (#944): mirror lowerIEnumerableBuiltinFor's family check + the
+    // `isArrayBacked == false` decision so collectSuspendLocals reserves a frame
+    // field for EXACTLY the for-ins whose lowering creates an iterator-format
+    // enumerator (Dispose at vtable slot 1). Any divergence would leave the
+    // wired-in enumerator slot pointing at a missing / mismatched field.
+    if (!fs.iterable) return false;
+    auto* iterTy = ctx_.exprType(*fs.iterable);
+    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
+    if (iterTy->declaration) return false;  // user class → lowerIEnumerableFor
+    std::string_view n;
+    if (iterTy->astNode && iterTy->astNode->name &&
+        !iterTy->astNode->name->parts.empty()) {
+        n = iterTy->astNode->name->parts[0];
+    } else if (!iterTy->importedName.empty()) {
+        n = iterTy->importedName;
+    } else {
+        return false;
+    }
+    if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
+        n != "ICollection" && n != "IList" && n != "OwnedEnumerable")
+        return false;
+    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
+
+    // isArrayBacked == false ⇒ vtable-backed enumerator (the slot-1-Dispose
+    // enumerator). Matches lowerIEnumerableBuiltinFor's protocol heuristic.
+    if (dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) return true;
+    if (dynamic_cast<const ast::NewExpr*>(fs.iterable.get())) return true;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        auto checkNamed = [&](sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration;
+        };
+        auto checkPureIEnumerable = [&](sema::TypeRef* rt) -> bool {
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+            if (rt->declaration) return false;
+            if (!rt->astNode || !rt->astNode->name ||
+                rt->astNode->name->parts.empty())
+                return false;
+            return rt->astNode->name->parts[0] == "IEnumerable";
+        };
+        if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (par->declType) {
+                auto* rt = ctx_.resolvedType(*par->declType);
+                if (checkNamed(rt) || checkPureIEnumerable(rt)) return true;
+            }
+        } else if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            if (checkNamed(loc->declType) || checkPureIEnumerable(loc->declType))
+                return true;
+        }
+    }
+    return false;
+}
+
 void Emitter::collectSuspendLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
@@ -60,6 +114,29 @@ void Emitter::collectSuspendLocals(
                             ty = lowerTypeRef(it->genericArgs[0]);
                 }
                 out.push_back({fs, ty});
+            }
+            // §29.7 (#944): a for-in whose lowering creates an iterator-format
+            // enumerator (Dispose at vtable slot 1) needs that enumerator — and,
+            // when the iterable is a loop-owned temporary (a CallExpr/NewExpr like
+            // `P.Inner()`), its SOURCE IEnumerABLE too — to round-trip through
+            // DEDICATED frame fields, so the enclosing iterator's Dispose can
+            // restore and dispose them when abandoned while suspended INSIDE the
+            // loop. Both are independent heap frames (§29.11) live and owned by the
+            // loop at such a suspend point; the enclosing Dispose must dispose BOTH
+            // (else the abandoned source frame leaks even after its using-vars were
+            // freed via the enumerator's Dispose). Two ptr fields are pushed for
+            // the iterable node: the FIRST occurrence becomes localFields[iterable]
+            // (the ENUMERATOR / GetEnumerator clone) and the SECOND becomes
+            // forInSrcFields[iterable] (the loop-owned SOURCE IEnumERABLE).
+            // buildStateMachineFrame resolves the duplicate key — the first
+            // occurrence fills localFields, the second fills forInSrcFields (so
+            // localFields is NOT overwritten). The array protocol has no enumerator
+            // and the user-class path (lowerIEnumerableFor) disposes through its
+            // own class vtable — neither reserves here. (See
+            // forInBuiltinEnumeratorNeedsFrameSlot.)
+            if (forInBuiltinEnumeratorNeedsFrameSlot(*fs)) {
+                out.push_back({fs->iterable.get(), ptrTy()});  // enumerator
+                out.push_back({fs->iterable.get(), ptrTy()});  // source (+1)
             }
             collectSuspendLocals(fs->body, out);
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
@@ -150,9 +227,19 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
     frame.stateField = 1;
     frame.captureStart = 2;
 
-    // Build mapping from AST nodes to struct field indices.
-    for (unsigned li = 0; li < frame.bodyLocals.size(); ++li)
-        frame.localFields[frame.bodyLocals[li].first] = frame.localStart + li;
+    // Build mapping from AST nodes to struct field indices. §29.7 (#944): a
+    // for-in iterable node may appear TWICE (enumerator + loop-owned source). The
+    // FIRST occurrence fills localFields (the enumerator); a SECOND occurrence of
+    // the same node fills forInSrcFields (the source) WITHOUT overwriting
+    // localFields. Every other node is unique.
+    for (unsigned li = 0; li < frame.bodyLocals.size(); ++li) {
+        const ast::Node* node = frame.bodyLocals[li].first;
+        unsigned fieldIdx = frame.localStart + li;
+        if (frame.localFields.count(node))
+            frame.forInSrcFields[node] = fieldIdx;   // second push → source
+        else
+            frame.localFields[node] = fieldIdx;      // first push → enumerator
+    }
 
     return frame;
 }
@@ -230,6 +317,7 @@ std::vector<llvm::BasicBlock*> Emitter::emitResumeDispatch(
     smDoneBB_ = doneBB;
     smNextSuspendState_ = 0;
     smLocalFields_ = frame.localFields;
+    smForInSrcFields_ = frame.forInSrcFields;  // §29.7 (#944)
 
     return stateBBs;
 }
@@ -544,6 +632,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         finallyBodyStack_.clear();
         smIterFinallyAtState_.clear();
         smIterDisposalsAtState_.clear();  // #821
+        smIterEnumFramesAtState_.clear();  // §29.7 (#944)
+        smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
@@ -616,6 +706,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smStateStruct_ = nullptr;
         smSelf_ = nullptr;
         smLocalFields_.clear();
+        smForInSrcFields_.clear();  // §29.7 (#944)
         smAllocaToField_.clear();
     }
 
@@ -707,8 +798,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         };
 
         // If no yield was ever inside a try/finally AND no `using var` was active
-        // at any yield (#821), emit a simple free + return.
-        if (smIterFinallyAtState_.empty() && smIterDisposalsAtState_.empty()) {
+        // at any yield (#821) AND no for-in enumerator/source frame was live at a
+        // yield (#944), emit a simple free + return.
+        if (smIterFinallyAtState_.empty() && smIterDisposalsAtState_.empty() &&
+            smIterEnumFramesAtState_.empty()) {
             // Mark done so a second Dispose is a no-op (not strictly necessary
             // when there are no finally chains, but keeps the contract clean).
             llvm::Value* stateGEP2 =
@@ -728,11 +821,12 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
             // Mark done immediately so re-entrant Dispose is a no-op.
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
-            // The union of states that have a finally chain and/or active
-            // using-var disposals (#821).
+            // The union of states that have a finally chain, active using-var
+            // disposals (#821), and/or live for-in enumerator/source frames (#944).
             std::set<unsigned> states;
             for (auto& kv : smIterFinallyAtState_) states.insert(kv.first);
             for (auto& kv : smIterDisposalsAtState_) states.insert(kv.first);
+            for (auto& kv : smIterEnumFramesAtState_) states.insert(kv.first);
             auto* sw = builder_.CreateSwitch(curState, doneBB,
                                              (unsigned)states.size());
 
@@ -755,6 +849,49 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                         d.slot = lit->second;
                         std::vector<Disposal> one{d};
                         emitDisposals(one);
+                    }
+                }
+                // §29.7 (#944): dispose the for-in implicit enumerator/source
+                // frames live at this yield, innermost-first (recorded
+                // outermost-first). Each is a frame ptr in a dedicated frame
+                // field; GEP it, load, null-guard, dispatch the iterator-vtable
+                // slot-1 Dispose (which recursively disposes the inner iterator's
+                // own active using-vars + frees its frame), then null the field so
+                // a re-entrant Dispose is a no-op. This is the SOLE disposal of
+                // these frames on the abandon-mid-loop path (the loop's own
+                // scope-exit/break disposal never ran — we suspended out of the
+                // body), so exactly once.
+                auto eit = smIterEnumFramesAtState_.find(stateIdx);
+                if (eit != smIterEnumFramesAtState_.end()) {
+                    for (auto rfit = eit->second.rbegin();
+                         rfit != eit->second.rend(); ++rfit) {
+                        unsigned fieldIdx = *rfit;
+                        llvm::Value* fptr = builder_.CreateStructGEP(
+                            stateStructTy, self, fieldIdx);
+                        llvm::Value* obj =
+                            builder_.CreateLoad(ptrTy(), fptr, "fie.obj");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            obj, llvm::ConstantPointerNull::get(ptrTy()),
+                            "fie.isnull");
+                        auto* dispBB = llvm::BasicBlock::Create(
+                            llvm_, "fie.dispose", targetFn);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "fie.cont", targetFn);
+                        builder_.CreateCondBr(isNull, contBB, dispBB);
+                        builder_.SetInsertPoint(dispBB);
+                        // Iterator-vtable slot 1 = Dispose.
+                        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+                        llvm::Value* dispSlot = builder_.CreateGEP(
+                            ptrTy(), vt, {builder_.getInt32(1)});
+                        llvm::Value* dispFnPtr =
+                            builder_.CreateLoad(ptrTy(), dispSlot);
+                        auto* dispTy = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+                        builder_.CreateCall(dispTy, dispFnPtr, {obj});
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
                     }
                 }
                 // Run finally bodies innermost-first (chain is outermost-first,
@@ -789,6 +926,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // Clear the per-iterator finally / disposal tracking.
     smIterFinallyAtState_.clear();
     smIterDisposalsAtState_.clear();  // #821
+    smIterEnumFramesAtState_.clear();  // §29.7 (#944)
+    smIterEnumFrameSlot_.clear();      // §29.7 (#944)
     finallyBodyStack_.clear();
 }
 
