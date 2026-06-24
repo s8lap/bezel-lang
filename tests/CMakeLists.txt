@@ -700,6 +700,8 @@ set(BEZEL_TEST_SOURCES
     codegen/span_type_annotation_959_test.cpp
     codegen/string_span_883_test.cpp
     codegen/iterator_owned_param_945_test.cpp
+    # --- fix #943: re-enumeration of a yield-method IEnumerable<T> (§29.11) ---
+    codegen/iterator_reenum_943_test.cpp
     # --- fix #972: user IEnumerable<T> enumerator dispose at normal exit ---
     codegen/user_ienumerable_dispose_972_test.cpp
     # --- end #972 ---

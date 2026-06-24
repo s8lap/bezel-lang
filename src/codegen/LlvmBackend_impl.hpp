@@ -4579,6 +4579,17 @@ private:
     // value-typed local). Returns false for any non-(inline-owned-array) local.
     bool registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld);
 
+    // §29.11 (#943): if `ld` is a plain (non-`using`) `var` whose value is a
+    // vtable-backed re-iterable IEnumerable<T>/OwnedEnumerable<T> (the result of
+    // a yield iterator method, or an array/user-class wrapped into one), register
+    // a scope-end disposal of that source via the iterator-format slot-1 Dispose
+    // (iterEnumDispose) and return true. The for-in loop over such a source clones
+    // a fresh enumerator per iteration and leaves the source alive (so a second
+    // loop replays), so the SOURCE itself must be disposed once at scope end here.
+    // Returns false for any other local (the caller falls through to the normal
+    // using/task/unwind registration chain).
+    bool registerIterableSourceDisposal(const ast::LocalDecl* ld);
+
     // §28.11 / #889: the set of LocalDecl nodes that RECEIVED ownership of a
     // moved-out owned element via an `out owned` argument (e.g.
     // `s.TryPop(out owned item)`). The element is written into the local's slot

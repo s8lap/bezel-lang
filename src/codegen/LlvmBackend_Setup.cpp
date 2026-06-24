@@ -5749,10 +5749,122 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
 }
 
 
+bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
+    // §29.11 (#943): only a plain `var` (using-vars are handled by
+    // registerUsingDisposal) initialised from an expression.
+    if (!ld || ld->isUsing || !ld->initializer || disposeStack_.empty())
+        return false;
+    auto it = locals_.find(ld);
+    if (it == locals_.end()) return false;
+
+    // The local's effective type: the explicit annotation if present, else the
+    // initializer's inferred type. A re-iterable, vtable-backed source has a
+    // declaration-less Named type whose name is exactly "IEnumerable" or
+    // "OwnedEnumerable" — the only declaration-less iteration types the for-in
+    // builtin path drives through the iterator vtable (slot-1 Dispose). Richer
+    // interfaces (IList/IReadOnlyList/...) keep the array-backed protocol and are
+    // not vtable objects, so they are excluded by the exact name match.
+    const sema::TypeRef* tr = nullptr;
+    if (ld->type) tr = ctx_.resolvedType(*ld->type);
+    if (!tr) tr = ctx_.exprType(*ld->initializer);
+    if (!tr || tr->kind != sema::TypeRef::Kind::Named || tr->declaration)
+        return false;
+    std::string_view name;
+    if (tr->astNode && tr->astNode->name && !tr->astNode->name->parts.empty())
+        name = tr->astNode->name->parts[0];
+    else if (!tr->importedName.empty())
+        name = tr->importedName;
+    if (name != "IEnumerable" && name != "OwnedEnumerable")
+        return false;
+
+    // Only the local that OWNS the freshly produced source object is disposed
+    // here. The owning initializer is a producer expression: a CallExpr (a yield
+    // iterator method, `P.Seq()`), a NewExpr (a user class wrapped into the
+    // IEnumerable form), or an identifier/member whose value is WRAPPED at this
+    // decl site (`var seq: IEnumerable<int> := someArray;` — wrapArrayAs/
+    // wrapUserClassAsIEnumerable allocate a fresh wrapper struct that this local
+    // owns). A bare identifier/member initializer whose value is ALREADY an
+    // IEnumerable (`var b := a;`) is an ALIAS — the aliased local already owns and
+    // disposes the object, so registering disposal here too would double-free.
+    bool wrappedHere = false;
+    if (ld->type && ld->initializer) {
+        const sema::TypeRef* declTR = ctx_.resolvedType(*ld->type);
+        const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
+        bool declIsPureIEnum = declTR && declTR->kind == sema::TypeRef::Kind::Named &&
+            !declTR->declaration && declTR->astNode && declTR->astNode->name &&
+            !declTR->astNode->name->parts.empty() &&
+            declTR->astNode->name->parts[0] == "IEnumerable";
+        if (declIsPureIEnum && initTR &&
+            initTR->kind == sema::TypeRef::Kind::Named) {
+            bool initIsArray = initTR->astNode && initTR->astNode->name &&
+                !initTR->astNode->name->parts.empty() &&
+                initTR->astNode->name->parts[0] == "Array";
+            // A user-class (declaration-carrying) init is wrapped (line 5413), as
+            // is an Array init (line 5410). A declaration-less IEnumerable init is
+            // NOT wrapped — it is a pre-existing IEnumerable value (an alias).
+            wrappedHere = initIsArray || initTR->declaration != nullptr;
+        }
+    }
+    bool ownsSource = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
+                      dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
+                      wrappedHere;
+    if (!ownsSource) return false;
+
+    // The source value is the IEnumerABLE: dispose it once at scope end (the
+    // for-in clones a fresh enumerator per loop and never disposes the source).
+    Disposal d{it->second, nullptr};
+    d.iterEnumDispose = true;
+    disposeStack_.back().push_back(d);
+    return true;
+}
+
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
     if (it == locals_.end()) return;
+
+    // §29.11 (#943): a sync `using var source := P.Seq();` whose value is a
+    // vtable-backed re-iterable IEnumerable<T>/OwnedEnumerable<T> (yield-iterator
+    // result, or an array/user-class wrapped into one) is disposed via the
+    // iterator-format slot-1 Dispose (iterEnumDispose) — the for-in clones a fresh
+    // enumerator per loop and never disposes the named source. Without this the
+    // source frame leaks (the generic dispose paths below do not recognise the
+    // declaration-less iterator type). Mirrors the IAsyncEnumerator using-var
+    // handling in the await-using branch below. Only fires for the owning
+    // initializer kinds (a CallExpr/NewExpr producer, or an init wrapped at the
+    // decl site) — a bare alias (`using var b := a;`) is excluded so the aliased
+    // owner remains the sole disposer.
+    if (!ld->isAwaitUsing && ld->initializer) {
+        const sema::TypeRef* lt = ld->type ? ctx_.resolvedType(*ld->type)
+                                           : ctx_.exprType(*ld->initializer);
+        bool isSyncIterEnum =
+            lt && lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
+            lt->astNode && lt->astNode->name &&
+            !lt->astNode->name->parts.empty() &&
+            (lt->astNode->name->parts[0] == "IEnumerable" ||
+             lt->astNode->name->parts[0] == "OwnedEnumerable");
+        if (isSyncIterEnum) {
+            const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
+            bool wrappedHere = initTR && initTR->kind == sema::TypeRef::Kind::Named &&
+                ((initTR->astNode && initTR->astNode->name &&
+                  !initTR->astNode->name->parts.empty() &&
+                  initTR->astNode->name->parts[0] == "Array") ||
+                 initTR->declaration != nullptr);
+            bool ownsSource =
+                dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
+                dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
+                wrappedHere;
+            if (ownsSource) {
+                Disposal d{it->second, nullptr};
+                d.iterEnumDispose = true;
+                disposeStack_.back().push_back(d);
+                return;
+            }
+            // A bare-alias using-var of an iterator source: do not register a
+            // second disposal (the aliased owner disposes it once). Fall through.
+            return;
+        }
+    }
 
     // §28.12 / §30: `await using var` — the resource implements IAsyncDisposable.
     // On the normal-exit path: call DisposeAsync() directly, await the returned

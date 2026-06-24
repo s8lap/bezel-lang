@@ -394,28 +394,73 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
 
-    // --- Vtable global for this iterator's IEnumerator<T> impl ---
-    // Layout: [ptr vtable (self-ptr for td), ptr Dispose, ptr MoveNext, ptr get$Current]
-    // We reuse the td format with a synthetic descriptor.
-    // For simplicity, just make a constant array with 4 pointers.
-    const unsigned VT_SIZE = 4;
-    std::vector<llvm::Constant*> vtElems(VT_SIZE, llvm::ConstantPointerNull::get(ptrTy()));
-    // Slot 0: type descriptor (point to itself as a sentinel)
+    // §29.11 (#943): a re-iterable IEnumerable<T> iterator must hand out a FRESH,
+    // INDEPENDENT enumerator on every GetEnumerator() call so a second `for` loop
+    // over the same source replays from the start instead of dereferencing the
+    // already-exhausted-and-freed first enumerator (a use-after-free SIGSEGV).
+    // The value the factory returns (`P.Seq()`) is the IEnumerABLE; for-in calls
+    // GetEnumerator (vtable slot 4) to obtain an independent IEnumerATOR which it
+    // alone advances and disposes, leaving the source untouched (the source is
+    // disposed once at its own scope end). The enumerator is a CLONE of the source
+    // struct (a fresh calloc copy with state reset to 0); the clone carries a
+    // distinct vtable whose Dispose (`cloneDisposeFn`) frees the clone WITHOUT
+    // running the §29.8 owned-parameter auto-dispose — the owned parameters belong
+    // to the IEnumerable (source) and are disposed exactly once when IT is
+    // disposed, not once per enumerator (which would multi-free).
+    //
+    // The clone slot is emitted uniformly for every sync yield iterator. Whether
+    // it is exercised is decided by the return type: an IEnumerable<T> iterator is
+    // re-iterable (the for-in clones a fresh enumerator per GetEnumerator), while
+    // an IEnumerator<T> iterator is single-use (the call returns the enumerator
+    // directly, §29.3) and for-in over a bare IEnumerator<T> source is not
+    // supported — so the clone slot is only ever reached for the IEnumerable form.
+    //
+    // The clone's Dispose: same finally/spill cleanup as disposeFn but WITHOUT
+    // owned-parameter auto-dispose (the clone borrows the captures; only the
+    // source owns them). Declared now, filled alongside disposeFn below.
+    auto* cloneDisposeFn = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+        llvm::Function::InternalLinkage, prefix + "CloneDispose", module_.get());
+
+    // GetEnumerator(ptr self) -> ptr: clone the state struct (fresh enumerator).
+    auto* getEnumFn = llvm::Function::Create(
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        llvm::Function::InternalLinkage, prefix + "GetEnumerator", module_.get());
+
+    // --- Vtable globals for this iterator's IEnumerator<T> impl ---
+    // Layout: [0]=td(self-ptr), [1]=Dispose, [2]=MoveNext, [3]=Current,
+    //         [4]=GetEnumerator (§29.11 #943).
+    // Two vtables: the SOURCE (IEnumerable) uses disposeFn (full, owned-param-
+    // disposing); a CLONE (the per-loop enumerator) uses cloneDisposeFn.
+    const unsigned VT_SIZE = 5;
     auto* vtGVType = llvm::ArrayType::get(ptrTy(), VT_SIZE);
+    std::vector<llvm::Constant*> vtElems(VT_SIZE,
+        llvm::ConstantPointerNull::get(ptrTy()));
     auto* vtGV = new llvm::GlobalVariable(*module_, vtGVType, true,
         llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(vtGVType, vtElems),
         prefix + "vtable");
-    // Fill: [0]=self-ptr, [1]=Dispose, [2]=MoveNext, [3]=Current
+    auto* cloneVtGV = new llvm::GlobalVariable(*module_, vtGVType, true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtGVType, vtElems),
+        prefix + "clonevtable");
+    // Source vtable: full Dispose.
     vtElems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
     vtElems[1] = disposeFn;
     vtElems[2] = moveNextFn;
     vtElems[3] = currentFn;
+    vtElems[4] = getEnumFn;
     vtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
+    // Clone vtable: clone-Dispose (no owned-param auto-dispose).
+    vtElems[0] = llvm::ConstantExpr::getPointerCast(cloneVtGV, ptrTy());
+    vtElems[1] = cloneDisposeFn;
+    cloneVtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
 
     // --- GetEnumerator (= the original method body): alloc + fill struct ---
-    // fn is the already-declared function for this method.
-    // We reuse its parameter list but change its body.
+    // fn is the already-declared function for this method. The value it returns
+    // is the IEnumerABLE (re-iterable) — for-in clones a fresh enumerator from it
+    // via getEnumFn (slot 4). For a single-use IEnumerator<T> iterator the same
+    // struct IS the enumerator (the consumer drives it directly).
     {
         currentFn_ = fn;
         currentThis_ = nullptr;
@@ -442,6 +487,39 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         emitFrameCaptureStores(frame, st);
         // Return the state struct (as ptr)
         builder_.CreateRet(st);
+    }
+
+    // --- GetEnumerator(ptr self) -> ptr: clone a fresh enumerator (§29.11 #943) ---
+    // Independence: a new calloc'd struct is a byte copy of the source (captures
+    // intact so the body sees `this`/params), with state/current_val/spill reset
+    // to the start, and the CLONE vtable installed (so the clone's Dispose frees
+    // the clone without re-disposing the source's owned parameters). The source
+    // struct itself is never advanced by enumeration — each `for` loop clones,
+    // drives, and disposes its own enumerator, so N loops replay N times.
+    {
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", getEnumFn);
+        llvm::IRBuilder<> gb(entry);
+        llvm::Value* self = &*getEnumFn->arg_begin();
+        uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stateStructTy);
+        auto* callocFn3 = declareC("calloc", ptrTy(), {i64(), i64()});
+        llvm::Value* clone = gb.CreateCall(callocFn3,
+            {gb.getInt64(1), gb.getInt64(stSz)}, "iter.clone");
+        // memcpy(clone, self, stSz): copy vtable + state + captures + locals.
+        auto* memcpyFn = declareC("memcpy", ptrTy(),
+            {ptrTy(), ptrTy(), i64()});
+        gb.CreateCall(memcpyFn, {clone, self, gb.getInt64(stSz)});
+        // Reset to the start state: state = 0, current_val = 0, spill ptr = null.
+        gb.CreateStore(gb.getInt32(0),
+            gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
+        gb.CreateStore(llvm::Constant::getNullValue(elemTy),
+            gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
+        // Install the clone vtable so disposing the enumerator frees it without
+        // touching the source's owned parameters.
+        gb.CreateStore(cloneVtGV,
+            gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
+        gb.CreateRet(clone);
     }
 
     // --- Current: load current_val from struct ---
@@ -546,8 +624,15 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // If the iterator was suspended inside a try/finally, run the finally
     // chains (innermost first) before freeing the frame.  A second Dispose
     // (state == -1) is a no-op per §29.7.
-    {
-        currentFn_ = disposeFn;
+    //
+    // §29.11 (#943): emitted TWICE — once as `disposeFn` (the SOURCE/IEnumerable
+    // Dispose, which runs §29.8 owned-parameter auto-dispose) and once as
+    // `cloneDisposeFn` (a per-loop enumerator Dispose, which skips owned-param
+    // auto-dispose because the clone borrows the captures from the source). The
+    // bodies are otherwise identical (same finally chains, same spill free, same
+    // state guard). Parameterised by `targetFn` and `disposeOwned`.
+    auto emitDisposeBody = [&](llvm::Function* targetFn, bool disposeOwned) {
+        currentFn_ = targetFn;
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
@@ -555,10 +640,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
 
-        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", targetFn);
         builder_.SetInsertPoint(entry);
 
-        llvm::Value* self = &*disposeFn->arg_begin();
+        llvm::Value* self = &*targetFn->arg_begin();
         // #747: emitFreeSpillArea reads the frame's spill-ptr field; set the
         // frame context it needs. free(null) is a no-op for an iterator that
         // never spilled, so this is safe for every sync iterator.
@@ -592,7 +677,11 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // the body — so each is disposed exactly once (no double-free, no leak).
         // Runs on every iterator-Dispose: normal exhaustion (state -1), early
         // break / abandonment (a suspend state), and never-iterated.
+        // §29.11 (#943): SKIPPED for `cloneDisposeFn` (disposeOwned=false) — a
+        // per-loop enumerator does not own the captures; the source disposes them
+        // once at its own scope end. Disposing them here too would multi-free.
         auto disposeOwnedParams = [&]() {
+            if (!disposeOwned) return;
             for (std::size_t i = frame.captures.size(); i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
@@ -604,9 +693,9 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 llvm::Value* isNull = builder_.CreateICmpEQ(
                     obj, llvm::ConstantPointerNull::get(ptrTy()), "itp.isnull");
                 auto* dispBB =
-                    llvm::BasicBlock::Create(llvm_, "itp.dispose", disposeFn);
+                    llvm::BasicBlock::Create(llvm_, "itp.dispose", targetFn);
                 auto* contBB =
-                    llvm::BasicBlock::Create(llvm_, "itp.cont", disposeFn);
+                    llvm::BasicBlock::Create(llvm_, "itp.cont", targetFn);
                 builder_.CreateCondBr(isNull, contBB, dispBB);
                 builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(obj);
@@ -633,7 +722,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // Build a switch on the current state.  State == -1 or 0: already
             // done or never suspended inside a try — just free.  State N: run
             // the finally chain recorded for that state, then free.
-            auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", disposeFn);
+            auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", targetFn);
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
@@ -649,7 +738,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
             for (unsigned stateIdx : states) {
                 auto* chainBB = llvm::BasicBlock::Create(
-                    llvm_, "dsp.s" + std::to_string(stateIdx), disposeFn);
+                    llvm_, "dsp.s" + std::to_string(stateIdx), targetFn);
                 sw->addCase(builder_.getInt32((int)stateIdx), chainBB);
                 builder_.SetInsertPoint(chainBB);
                 // #821 / §29.7: dispose the `using var` resources active at this
@@ -688,12 +777,19 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
         }
+    };
 
-        // Clear the per-iterator finally / disposal tracking.
-        smIterFinallyAtState_.clear();
-        smIterDisposalsAtState_.clear();  // #821
-        finallyBodyStack_.clear();
-    }
+    // §29.11 (#943): the source/IEnumerable Dispose disposes owned params; the
+    // clone/enumerator Dispose does not. For a single-use IEnumerator<T> iterator
+    // there is no separate clone, but emitting cloneDisposeFn is harmless (it is
+    // never reached) and keeps the vtable layout uniform.
+    emitDisposeBody(disposeFn, /*disposeOwned=*/true);
+    emitDisposeBody(cloneDisposeFn, /*disposeOwned=*/false);
+
+    // Clear the per-iterator finally / disposal tracking.
+    smIterFinallyAtState_.clear();
+    smIterDisposalsAtState_.clear();  // #821
+    finallyBodyStack_.clear();
 }
 
 

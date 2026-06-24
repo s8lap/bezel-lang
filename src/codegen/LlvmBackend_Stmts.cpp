@@ -22,6 +22,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // When handled, bypass the using/task/unwind chain (none applies to a
         // move-only value-typed local).
         if (registerInlineOwnedArrayDisposal(ld)) return false;
+        // §29.11 (#943): a plain `var` holding a vtable-backed re-iterable
+        // IEnumerable<T>/OwnedEnumerable<T> source (a yield-iterator result, or an
+        // array/user-class wrapped into one) is disposed once at scope end — the
+        // for-in over it clones a fresh enumerator per loop and leaves the source
+        // alive so a second loop replays. Checked before the unwind-owned path
+        // (these declaration-less iterator types have no owned-class destructor).
+        if (registerIterableSourceDisposal(ld)) return false;
         if (ld->isUsing) registerUsingDisposal(ld);
         // #445 / §30.5: a plain `var` task-typed local is freed at scope end via
         // bz_task_fire_and_forget — the same disposal a `using var` task gets.
@@ -3638,7 +3645,34 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         return true;
     }
 
-    // Store the enumerator in a slot.
+    // §29.11 (#943): obtain a FRESH, INDEPENDENT enumerator from the source by
+    // calling GetEnumerator() (vtable slot 4) — the source value (e.g. the
+    // `IEnumerable<int>` produced by a yield method) is the IEnumerABLE, not the
+    // enumerator. The loop advances and disposes ITS OWN enumerator; the source is
+    // left untouched so a second `for` loop over the same value replays from the
+    // start instead of dereferencing the exhausted-and-freed first enumerator (the
+    // use-after-free SIGSEGV this fix targets). Every sync IEnumerable vtable
+    // producer (yield iterator, array wrapper, user-class wrapper) now carries a
+    // GetEnumerator at slot 4 that returns a distinct fresh enumerator, so this
+    // slot-4 read is always in-bounds and always yields an independent enumerator.
+    //
+    // Source ownership: the source value (the IEnumerABLE) is disposed exactly
+    // once at its own lifetime end — at scope end for a named local/param
+    // (registered in lowerLocalDecl, §29.11), or here as a one-shot temporary when
+    // the for-in iterates a freshly produced value (a CallExpr/NewExpr result with
+    // no owning binding). The per-loop enumerator is always disposed below.
+    auto* srcSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(enumObj, srcSlot);
+    {
+        llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), enumObj);
+        llvm::Value* geSlotPtr =
+            builder_.CreateGEP(ptrTy(), srcVt, {builder_.getInt32(4)});
+        llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+        auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        enumObj = builder_.CreateCall(geTy, geFnPtr, {enumObj}, "ib.getenum");
+    }
+
+    // Store the (fresh) enumerator in a slot.
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumObj, enumSlot);
 
@@ -3653,6 +3687,22 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         Disposal d{enumSlot, nullptr};
         d.iterEnumDispose = true;
         disposeStack_.back().push_back(d);
+    }
+    // §29.11 (#943): a freshly produced source value with no owning binding (a
+    // CallExpr/NewExpr temporary, e.g. `for var x in P.Seq() do`) is owned by this
+    // loop — dispose it once when the loop ends, alongside the enumerator. A named
+    // local/param source (an IdentifierExpr) is disposed at its own scope end, so
+    // it is NOT disposed here (that would double-free).
+    bool sourceIsNamedLocal = false;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        sourceIsNamedLocal = dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr;
+    }
+    if (!sourceIsNamedLocal) {
+        Disposal ds{srcSlot, nullptr};
+        ds.iterEnumDispose = true;
+        disposeStack_.back().push_back(ds);
     }
 
     // Use vtable-based MoveNext (slot 2) and Current (slot 3).

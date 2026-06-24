@@ -2725,16 +2725,52 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
             b.CreateRet(b.CreateLoad(elemTy, ep));
         });
 
-    // Build the vtable (4-pointer constant).
+    // §29.11 (#943): GetEnumerator(self) → a FRESH independent enumerator over the
+    // same array, positioned before the first element (idx = -1). The borrowed
+    // `arr` pointer is shared (not owned by the enumerator struct), so cloning is a
+    // plain struct copy with the cursor reset — a second `for` loop over the same
+    // IEnumerable<T> value replays from the start (§29.11) instead of reusing the
+    // exhausted cursor. Both source and clone Dispose are a single free() of their
+    // own struct; the array itself is unaffected.
+    auto* geFn = getOrCreate(prefix + "GetEnumerator",
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+            auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocC = module_->getOrInsertFunction("calloc", callocFT).getCallee();
+            llvm::Value* clone = b.CreateCall(callocFT, callocC,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+            // Copy vtable (slot 0, ptr), arr (slot 1, ptr), esz (slot 3, i64);
+            // reset idx (slot 2) to -1 (before-first).
+            llvm::Value* vt = b.CreateLoad(ptrTy(),
+                b.CreateStructGEP(stTy, self, 0));
+            b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+            llvm::Value* arrCp = b.CreateLoad(ptrTy(),
+                b.CreateStructGEP(stTy, self, 1));
+            b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+            llvm::Value* eszCp = b.CreateLoad(i64(),
+                b.CreateStructGEP(stTy, self, 3));
+            b.CreateStore(eszCp, b.CreateStructGEP(stTy, clone, 3));
+            b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                b.CreateStructGEP(stTy, clone, 2));
+            b.CreateRet(clone);
+        });
+
+    // Build the vtable (§29.11 #943: 5 slots — slot 4 = GetEnumerator/clone).
     std::string vtName = prefix + "vtable";
     auto* vtGV = module_->getGlobalVariable(vtName);
     if (!vtGV) {
-        auto* vtTy = llvm::ArrayType::get(ptrTy(), 4);
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
             llvm::ConstantPointerNull::get(ptrTy()), // slot 0: self-ptr (filled below)
             dispFn,
             mnFn,
-            curFn
+            curFn,
+            geFn
         };
         vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
             llvm::GlobalValue::InternalLinkage,
@@ -2936,7 +2972,22 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     std::string stName = "userenumenum." + key;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
-        stTy = llvm::StructType::create(llvm_, {ptrTy(), ptrTy()}, stName);
+        // §29.11 (#943): { ptr vtable, ptr enumerator, ptr source } — the source
+        // object is retained so GetEnumerator (slot 4) can re-run the source's own
+        // GetEnumerator() to hand out an independent enumerator on re-iteration.
+        stTy = llvm::StructType::create(llvm_, {ptrTy(), ptrTy(), ptrTy()}, stName);
+
+    // Resolve the source class's GetEnumerator LLVM function so the clone can call
+    // it directly with the retained source as `this`. If unavailable, the clone
+    // falls back to returning a fresh wrapper around the SAME inner enumerator —
+    // which is still a distinct struct (so for-in's enumerator disposal stays
+    // independent of the source's own scope-end disposal), preserving soundness
+    // even when true re-iteration cannot be realized.
+    llvm::Function* srcGetEnumFn = nullptr;
+    {
+        auto geIt = methodFns_.find(getEnumSym);
+        if (geIt != methodFns_.end()) srcGetEnumFn = geIt->second;
+    }
 
     std::string prefix = "bz$userenumenum$" + key + "$";
     auto getOrCreate = [&](const std::string& name, llvm::FunctionType* ft,
@@ -3005,16 +3056,52 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             b.CreateRet(r);
         });
 
-    // 8. Build vtable global.
+    // §29.11 (#943): GetEnumerator(self) → a FRESH independent wrapper enumerator.
+    // Re-run the source class's GetEnumerator() on the retained source object to
+    // obtain a brand-new inner enumerator positioned before the first element, and
+    // wrap it in a fresh struct. A second `for` loop over the same IEnumerable<T>
+    // value therefore replays from the start. The source is disposed once at its
+    // own scope end; each loop disposes only its own wrapper+inner enumerator.
+    llvm::Function* wrapGetEnumFn = getOrCreate(prefix + "GetEnumerator",
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+            auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocC = module_->getOrInsertFunction("calloc", callocFT).getCallee();
+            llvm::Value* clone = b.CreateCall(callocFT, callocC,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+            // Copy vtable (slot 0) and source object (slot 2).
+            llvm::Value* vt = b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+            b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+            llvm::Value* srcObj = b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 2));
+            b.CreateStore(srcObj, b.CreateStructGEP(stTy, clone, 2));
+            // Fresh inner enumerator: call the source's GetEnumerator(srcObj).
+            llvm::Value* innerEnum;
+            if (srcGetEnumFn)
+                innerEnum = b.CreateCall(srcGetEnumFn->getFunctionType(),
+                                         srcGetEnumFn, {srcObj});
+            else  // fallback: reuse the existing inner enumerator (still distinct
+                  // wrapper struct → disposal stays independent of the source).
+                innerEnum = b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+            b.CreateStore(innerEnum, b.CreateStructGEP(stTy, clone, 1));
+            b.CreateRet(clone);
+        });
+
+    // 8. Build vtable global (§29.11 #943: 5 slots — slot 4 = GetEnumerator).
     std::string vtName = prefix + "vtable";
     auto* vtGV = module_->getGlobalVariable(vtName);
     if (!vtGV) {
-        auto* vtTy = llvm::ArrayType::get(ptrTy(), 4);
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
             llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: filled below
             wrapDisposeFn,
             wrapMoveNextFn,
-            wrapCurrentFn
+            wrapCurrentFn,
+            wrapGetEnumFn
         };
         vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
             llvm::GlobalValue::InternalLinkage,
@@ -3028,13 +3115,14 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     llvm::Value* enumPtr = emitMethodCall(getEnumSym, geArgs, /*baseQualified=*/false);
     if (!enumPtr) return src;
 
-    // 10. Allocate wrapper struct and fill fields.
+    // 10. Allocate wrapper struct and fill fields (vtable, enumerator, source).
     uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
     auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
     llvm::Value* wrap = builder_.CreateCall(callocFn2,
         {builder_.getInt64(1), builder_.getInt64(stSz)}, "userenumenum");
     builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, wrap, 0));
     builder_.CreateStore(enumPtr, builder_.CreateStructGEP(stTy, wrap, 1));
+    builder_.CreateStore(src, builder_.CreateStructGEP(stTy, wrap, 2));
     return wrap;
 }
 
