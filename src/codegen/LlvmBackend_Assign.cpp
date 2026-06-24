@@ -3048,6 +3048,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // the caller can recover each argument's signedness for numeric widening.
     std::vector<const ast::Expr*> orderedExprs(params.size(), nullptr);
     std::size_t pos = 0;
+    // §28.3 (#993): an OWNED class temporary produced by a `new` argument (e.g.
+    // `new Cell()` in `C.Use(new Cell(), C.Throw())`) is evaluated EAGERLY, in
+    // source order, before the call runs. If a LATER argument's evaluation throws
+    // (propagates), control leaves the argument list WITHOUT invoking the callee,
+    // so any already-evaluated owned temporary in an earlier slot is orphaned and
+    // — having no owning local/field/slot and no disposal registration — leaks.
+    // The spec's exception-path discharge (§28.3 line 4968; the same principle the
+    // object-initializer and collection-literal rules cite at lines 3829/2166)
+    // requires that already-evaluated owned temporary to be auto-disposed as the
+    // exception unwinds. We register each such temporary as an `unwindOnly`
+    // disposal in the CURRENT scope (the disposeStack_ scope a later argument's
+    // emitPendingCheck unwinds through), then DISCHARGE exactly those entries —
+    // tracked by their spill slots in `argTempSlots` — once every argument is
+    // evaluated and the call is about to run. The `unwindOnly` flag means these
+    // entries fire ONLY on the exception edge (never on normal exit), and the
+    // discharge removes them before the call, so the callee's normal-path ownership
+    // of the transferred temporary is never double-disposed (dispose-exactly-once,
+    // §28.3). The discharge erases ONLY these tracked entries — other disposals
+    // pushed onto the same scope during argument evaluation (notably the borrow
+    // collection-literal-arg temp at the top of this loop, which must SURVIVE the
+    // call to be disposed at the enclosing scope's end) are left intact.
+    std::vector<llvm::AllocaInst*> argTempSlots;
     for (const auto& a : args) {
         if (!a.value) return false;
         std::size_t idx = params.size();
@@ -3176,6 +3198,49 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         }
         ordered[idx] = v;
         orderedExprs[idx] = a.value.get();
+        // §28.3 (#993): if THIS argument hands an owned class temporary to the
+        // call, register a transient unwind-only disposal so a LATER argument that
+        // throws disposes this orphaned temporary. Two forms produce such a
+        // temporary whose ONLY remaining owner is the in-flight call:
+        //   (a) `new T(...)` — a sourceless owned heap instance (§28.8); nothing
+        //       else owns or disposes it.
+        //   (b) `move x` / `move x.f` — the source local/field is moved-from, so
+        //       its own scope-end / owned-field disposal is suppressed (the move
+        //       lowering nulls a using-var / owned-field slot, and the
+        //       UnwindIneligibleWalker marks a moved-from plain `var`/param
+        //       unwind-ineligible). The moved-out value then lives only in this
+        //       argument slot with no disposal registration.
+        // In both cases this is the SOLE site that disposes the value on the unwind
+        // edge (no double-free); on the normal path the entry is discharged below
+        // before the call consumes the value. Restricted to a CLASS static type (a
+        // heap instance with a disposal obligation) and a non-null pointer value —
+        // a record/value-type, a move-only inline array, or a null literal is not a
+        // heap-owned class instance and is excluded.
+        const ast::Expr* av = a.value.get();
+        bool isOwnedTempArg = false;
+        if (dynamic_cast<const ast::NewExpr*>(av)) {
+            isOwnedTempArg = true;
+        } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(av)) {
+            // `move x` / `move x.f` of an owned reference (not a value-type move).
+            if (un->op == "move") isOwnedTempArg = true;
+        }
+        if (isOwnedTempArg && !disposeStack_.empty() &&
+            v->getType()->isPointerTy() &&
+            !llvm::isa<llvm::ConstantPointerNull>(v)) {
+            const sema::TypeRef* at = ctx_.exprType(*av);
+            bool isClassInstance = at &&
+                at->kind == sema::TypeRef::Kind::Named && at->declaration &&
+                at->declaration->kind == ast::TypeDeclKind::Class;
+            if (isClassInstance) {
+                llvm::AllocaInst* tslot = entryAlloca(v->getType());
+                builder_.CreateStore(v, tslot);
+                Disposal d{tslot, nullptr};
+                d.unwindOnly = true;       // fire ONLY on the exception edge
+                d.dynamicDispose = false;  // unwindOnly path uses dynamic dispatch
+                disposeStack_.back().push_back(d);
+                argTempSlots.push_back(tslot);
+            }
+        }
     }
     // §22.5: a default-value expression may reference an EARLIER parameter
     // (e.g. `M(a, b := a + 1)`). At the call site the earlier parameters are
@@ -3227,6 +3292,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         }
         out.push_back(ordered[j]);
         if (outExprs) outExprs->push_back(orderedExprs[j]);
+    }
+    // §28.3 (#993): all arguments (and any default-value expressions) evaluated
+    // successfully — the call is about to run and will take ownership of any
+    // transferred owned temporaries on the normal path. Discharge the transient
+    // unwind-only disposals registered for owned `new`/`move` argument temporaries
+    // by erasing exactly those entries (matched by their spill slots), so the
+    // normal path never double-disposes them. They were `unwindOnly`, so they never
+    // fire on a normal exit; a later argument (or default) that threw already
+    // unwound through them. Other disposals pushed during argument evaluation (e.g.
+    // a borrow collection-literal-arg temp) are NOT removed — they must survive the
+    // call and dispose at the enclosing scope's end.
+    if (!argTempSlots.empty() && !disposeStack_.empty()) {
+        auto& scope = disposeStack_.back();
+        scope.erase(
+            std::remove_if(scope.begin(), scope.end(),
+                           [&](const Disposal& d) {
+                               return d.unwindOnly &&
+                                      std::find(argTempSlots.begin(),
+                                                argTempSlots.end(),
+                                                d.slot) != argTempSlots.end();
+                           }),
+            scope.end());
     }
     return true;
 }

@@ -293,6 +293,7 @@ set(BEZEL_TEST_SOURCES
     codegen/encoding_test.cpp
     codegen/closure_refcount_test.cpp
     codegen/owned_param_borrow_arg_unwind_994_test.cpp
+    codegen/owned_arg_temp_unwind_993_test.cpp
     codegen/env_disposer_672_test.cpp
     codegen/capture_retain_429_test.cpp
     codegen/boxed_cell_free_429_test.cpp
