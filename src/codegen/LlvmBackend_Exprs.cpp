@@ -2469,6 +2469,62 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // §30.3 (#941): `t.Result` — the synchronous escape hatch on a Task<T>
+    // receiver (the readonly property; a builtin class with no MethodSymbol).
+    // This is the SYNCHRONOUS read used from non-async code (e.g. inside a
+    // plain `method Main()`): it blocks the calling thread until the task
+    // completes (bz_task_await_sync — the same blocking primitive Wait() uses),
+    // then loads the result buffer by value at the Task<T> element type. It
+    // must NOT route through emitAwaitSuspend, which builds state-machine
+    // suspend/resume blocks valid only inside an async resume function.
+    // Spec §30.3: "Reading Result on a faulted task re-raises the exception" —
+    // we re-raise the ORIGINAL exception object (bz_task_error_obj) through the
+    // ordinary synchronous-throw machinery (emitThrowValue), so an enclosing
+    // try/catch sees the real exception type and the function's unwind boundary
+    // propagates it otherwise. OwnedTask<T> does not expose Result (rejected in
+    // sema), so this only fires for Task<T>.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "Result") {
+            auto* tt = ctx_.exprType(*ma->target);
+            if (isTaskTypeName(tt) && tt->kind == sema::TypeRef::Kind::Named &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                llvm::Value* task = lowerExpr(*ma->target);
+                if (task && task->getType()->isPointerTy()) {
+                    llvm::Type* resTy = lowerTypeRef(tt->genericArgs[0]);
+                    // Block until complete; bz_task_await_sync returns a pointer
+                    // to the result buffer (already-done → returns immediately).
+                    auto* awaitFn =
+                        declareC("bz_task_await_sync", ptrTy(), {ptrTy()});
+                    llvm::Value* resPtr = builder_.CreateCall(
+                        awaitFn, {task}, "result.ptr");
+                    // §30.3 / §30.9: a faulted task re-raises its exception.
+                    auto* isErrFn =
+                        declareC("bz_task_is_error", i1(), {ptrTy()});
+                    llvm::Value* faulted = builder_.CreateCall(
+                        isErrFn, {task}, "result.faulted");
+                    auto* faultBB = llvm::BasicBlock::Create(
+                        llvm_, "result.fault", currentFn_);
+                    auto* okBB = llvm::BasicBlock::Create(
+                        llvm_, "result.ok", currentFn_);
+                    builder_.CreateCondBr(faulted, faultBB, okBB);
+                    builder_.SetInsertPoint(faultBB);
+                    auto* errObjFn =
+                        declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+                    llvm::Value* excObj = builder_.CreateCall(
+                        errObjFn, {task}, "result.errobj");
+                    // Re-raise the original exception object through the
+                    // synchronous-throw path (stores bz$exc, runs unwind
+                    // disposals, branches to the unwind boundary).
+                    emitThrowValue(excObj, nullptr);
+                    builder_.SetInsertPoint(okBB);
+                    // Load the result by value (the task's buffer lives until
+                    // the task is disposed by its binder; the value is copied
+                    // out here).
+                    return builder_.CreateLoad(resTy, resPtr, "result.value");
+                }
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.

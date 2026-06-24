@@ -9172,6 +9172,31 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // §30.3 (#941): `t.Wait()` — the synchronous escape hatch on a Task /
+        // Task<T> / OwnedTask<T> receiver (a builtin class with no MethodSymbol,
+        // so this call would otherwise fall through and be silently dropped,
+        // leaving statements after `await Task.Delay(N)` un-run). Wait() blocks
+        // the calling thread until the task completes (its continuation, run on
+        // a pool worker, sets the post-await state); bz_task_await_sync is the
+        // same blocking primitive the async-Main wrapper uses (§30.13). The
+        // result buffer pointer is discarded — Wait() returns unit. A faulted
+        // task is NOT re-raised here (spec §30.3 attributes re-raise to reading
+        // `Result`, not `Wait()`); the fault surfaces when the result is read.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "Wait" && ma->target && call.args.empty()) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                if (isTaskTypeName(recvTy)) {
+                    llvm::Value* task = lowerExpr(*ma->target);
+                    if (task && task->getType()->isPointerTy()) {
+                        auto* awaitFn = declareC("bz_task_await_sync", ptrTy(),
+                                                 {ptrTy()});
+                        builder_.CreateCall(awaitFn, {task}, "task.wait");
+                        return nullptr;  // unit result
+                    }
+                }
+            }
+        }
         // issue #494 / §29.2 / §29.3: explicit `e.MoveNext()` call where `e` is
         // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol for MoveNext). The iterator state
