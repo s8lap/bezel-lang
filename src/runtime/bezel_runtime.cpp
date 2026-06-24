@@ -4444,6 +4444,15 @@ struct bz_lazy_t {
     // Built from the `sorted` (other_dict) when `up` is exhausted.
     void**  other_keys;   // malloc'd array of element pointers for UNION phase 1
     int64_t other_n;      // count of other_keys
+    // issue #995 / stdlib §5: ARRAY-kind ownership. A normal `bz_lazy_from_array`
+    // BORROWS its array (the array is owned by the Array<T> local and freed
+    // elsewhere — own_arr == 0). When the array is a FRESH temporary the lazy
+    // source owns — e.g. materialized from a vtable-backed IEnumerable<T> via
+    // bz_lazy_from_owned_array — own_arr == 1, so bz_lazy_dispose frees it (with a
+    // null disposer: the snapshot borrows its elements, it owns no element). This
+    // makes the materialize-then-enumerate bridge leak-free for both the terminal
+    // (bz_lazy_to_array) and the operator-chain (Where/Select/…) consumers.
+    int32_t own_arr;
 };
 
 // Advance the upstream enumerator and return a pointer to its current element,
@@ -4490,6 +4499,12 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
         for (int64_t i = 0; i < e->other_n; i++) free(e->other_keys[i]);
         free(e->other_keys);
     }
+    // issue #995 / stdlib §5: free a fresh temporary ARRAY this lazy source OWNS
+    // (own_arr set by bz_lazy_from_owned_array — e.g. a snapshot materialized from
+    // a vtable-backed IEnumerable<T>). A borrowed array (own_arr == 0, the normal
+    // bz_lazy_from_array path) is left untouched. The snapshot owns no elements, so
+    // the disposer is null (no element disposal) — sound, no double-free.
+    if (e->own_arr && e->arr) bz_array_free(e->arr, nullptr);
     // #422 / §28.9 / §28.3: release the operator's closure ONLY when it was an
     // inline lambda we own (own_closure set by codegen). The closure BORROWS its
     // captures, so this frees only the cell + env, never a capture — sound, no
@@ -4523,6 +4538,20 @@ static bz_lazy_t* bz_lazy_new(int32_t kind, int64_t esz) {
 extern "C" void* bz_lazy_from_array(void* arr, int64_t esz) {
     auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
     e->arr = arr;
+    return e;
+}
+
+// issue #995 / stdlib §5 / §29.11: wrap a FRESH temporary array as a lazy ARRAY
+// source that OWNS the array (own_arr := 1 → bz_lazy_dispose frees it with a null
+// disposer, the snapshot owning no element). Used by the vtable-backed
+// IEnumerable<T> bridge (materializeVtableIEnumerableToArray): the source object's
+// elements are snapshotted into a fresh array by driving the iterator vtable once,
+// and that array has no other owner — so it is freed when the lazy pipeline (a
+// terminal's bz_lazy_to_array drain, or a Where/Select/… for-in) disposes.
+extern "C" void* bz_lazy_from_owned_array(void* arr, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
+    e->arr = arr;
+    e->own_arr = 1;
     return e;
 }
 

@@ -1768,6 +1768,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                     else if (m == "Average")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                    // issue #995 / stdlib §5: a DEFERRED LINQ operator
+                    // (Where/Select/Take/Skip/Distinct/OrderBy/Concat/…) on a
+                    // vtable-backed `IEnumerable<T>` receiver (interface-typed
+                    // local/param, or a yield-method result) returns a lazy
+                    // IEnumerable<U> — exactly as on a concrete collection or the
+                    // lazy sentinel. Without typing it here the `Where(...)` call
+                    // was left untyped, so the result was not the lazy sentinel and
+                    // `lowerLazyLinqFor` / the LINQ-operator codegen rejected it
+                    // (the #995 `for var x in seq.Where(...)` NYI / Where garbage).
+                    // typeLinqOperator types Where/Select/… as makeLazyEnumerable;
+                    // codegen's materialize-then-run path (lowerToLazyEnumerator's
+                    // vtable bridge) drives the iterator vtable once into an
+                    // Array<T> that the lazy operator then enumerates.
+                    else if (typeLinqOperator(srcElem2)) { /* typed */ }
                 }
                 // stdlib §3.2: a method call on an `Encoding` receiver
                 // (`Encoding.Utf8.GetBytes(s)` / `.GetString(b[,i,c])` / `.Name`).

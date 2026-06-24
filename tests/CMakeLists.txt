@@ -711,6 +711,10 @@ set(BEZEL_TEST_SOURCES
     codegen/iterator_owned_param_named_local_1001_test.cpp
     # --- fix #972: user IEnumerable<T> enumerator dispose at normal exit ---
     codegen/user_ienumerable_dispose_972_test.cpp
+    # --- fix #995: LINQ terminals/operators + for-in over a vtable-backed
+    #     IEnumerable<T> (interface-typed local / yield-method result) — eliminates
+    #     the silent garbage miscompile and enables Where/Select for-in (§5/§29.11) ---
+    codegen/ienumerable_vtable_linq_995_test.cpp
     # --- end #972 ---
     codegen/case_pattern_type_compat_964_test.cpp
     codegen/file_io_644_test.cpp

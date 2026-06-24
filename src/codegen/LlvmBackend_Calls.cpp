@@ -717,8 +717,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "ForEach" || m == "Contains" || m == "IndexOf" ||
         // stdlib §5 *OrNull variants (lazy source → materialize, then check):
         m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
+    // issue #995 / stdlib §5 / §29.11: a vtable-backed IEnumerable<T> receiver
+    // (interface-typed local/param, or a yield-method result) is materialized via
+    // lowerToLazyEnumerator (driving the iterator vtable once into an Array<T>),
+    // the same materialize-then-run path lazy/LinkedList/Range receivers use. This
+    // eliminates the #995 silent miscompile where Count/Sum/Any/First/… returned
+    // garbage on such a receiver.
+    bool vtIEnum = isVtableBackedIEnumerableType(recvTy);
     bool lazyTerminal =
-        (lazyRecv || isLinkedList || isRangeRecv) && isArrTerminal;
+        (lazyRecv || isLinkedList || isRangeRecv || vtIEnum) && isArrTerminal;
 
     // fix #853 / stdlib §4.1–§4.3: a built-in collection member invoked through a
     // POLYMORPHIC collection interface (IReadOnlyCollection<T> / ICollection<T> /
@@ -11673,6 +11680,37 @@ bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
            !rt->astNode && !rt->genericArgs.empty() && rt->importedName.empty();
 }
 
+// issue #995 / stdlib §5 / §29: a VTABLE-BACKED `IEnumerable<T>` receiver — an
+// interface-typed local/param/field (`var e: IEnumerable<int> := …`) or a
+// yield-method result bound to such a type. Unlike the lazy-LINQ sentinel
+// (isLazyEnumerableType: declaration-less, NO astNode, NO importedName), this
+// type carries the interface name in an astNode (local annotation) or in
+// importedName (cross-module). Its runtime value is the iterator-vtable object
+// ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,[4]=GetEnumerator — §29.11),
+// NOT a bz_lazy_t* or a bz_array_t*. LINQ terminals/operators and the lazy
+// for-in were built only for the lazy sentinel, so such a receiver silently
+// fell through to a wrong path and returned garbage (the #995 miscompile).
+// Recognise it here so lowerToLazyEnumerator can materialize it into a concrete
+// Array<T> (driving the vtable protocol once) and the rest of the lazy
+// machinery composes uniformly. EXCLUDES the array/llist/dict/set/range/lazy
+// cases (those carry a declaration or take a dedicated wrap path) and the
+// richer list interfaces (IReadOnlyList/IList — array-backed, indexer-bearing,
+// NOT vtable objects) and the polymorphic collection interfaces
+// (IReadOnlyCollection/ICollection/IOwnedCollection — diagnosed, #853).
+bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+    // Must carry a name source other than the lazy sentinel's empty shape.
+    std::string_view n = builtinTypeName(rt);
+    if (n.empty()) return false;
+    // Only the pure iteration interfaces the for-in builtin path drives through
+    // the iterator vtable (slot-1 Dispose, slot-4 GetEnumerator). These are
+    // implemented uniformly by the yield-iterator / array-wrapper / user-class
+    // -wrapper producers (§29.11), so the vtable read is always in-bounds.
+    return n == "IEnumerable" || n == "OwnedEnumerable";
+}
+
 // issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
 // pointer `uint64_t(const void* key)`. The runtime stores raw record bytes; we
 // reinterpret the byte pointer as a record-struct pointer, load the value, and
@@ -12256,6 +12294,140 @@ llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
     return groups;
 }
 
+// issue #995 / stdlib §5 / §29.11: materialize a VTABLE-BACKED `IEnumerable<T>`
+// receiver (interface-typed local/param, or a yield-method result) into a fresh
+// owned `Array<T>` (a bz_array_t* of element bytes) by driving the iterator
+// vtable protocol ONCE in IR. The vtable layout is
+// [0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,[4]=GetEnumerator (§29.11).
+//
+// Protocol (mirrors lowerIEnumerableBuiltinFor's vtable branch):
+//   1. GetEnumerator (slot 4) on the source → a FRESH, INDEPENDENT enumerator.
+//   2. Loop: MoveNext (slot 2) → i1; while true, Current (slot 3) → element BY
+//      VALUE in its natural LLVM type; append the element's bytes to the array.
+//   3. Dispose (slot 1) the enumerator exactly once after the drain.
+//
+// Disposal is exactly-once and leak-free:
+//   - The per-consumption ENUMERATOR (the GetEnumerator clone) is disposed here.
+//   - The SOURCE IEnumERABLE is NOT disposed here when it is a named
+//     local/param/field — that value is disposed at its own scope end
+//     (registerIterableSourceDisposal / registerUsingDisposal, §29.11). It IS
+//     disposed here when it is a freshly produced temporary (a CallExpr/NewExpr
+//     result with no owning binding, e.g. `P.Seq().Count()`) — nobody else owns
+//     it. This mirrors lowerIEnumerableBuiltinFor's `sourceIsNamedLocal` rule,
+//     so there is no double-free and no leak.
+//
+// The resulting Array<T> is a borrowing snapshot of the enumerated bytes (it
+// owns no elements). The caller wraps it via bz_lazy_from_owned_array, so the
+// lazy pipeline's dispose (a terminal's bz_lazy_to_array drain, or a
+// Where/Select/… for-in) frees the array exactly once with a null disposer
+// (leak-free, no double-free). Returns the array pointer, or null if the
+// receiver is not a vtable-backed IEnumerable.
+llvm::Value* Emitter::materializeVtableIEnumerableToArray(
+    const ast::Expr& recvExpr, sema::TypeRef*& elemRef) {
+    auto* recvTy = ctx_.exprType(recvExpr);
+    if (!isVtableBackedIEnumerableType(recvTy)) return nullptr;
+    elemRef = recvTy->genericArgs[0];
+    llvm::Type* elemTy = lowerTypeRef(elemRef);
+    if (!elemTy) return nullptr;
+
+    llvm::Value* srcObj = lowerExpr(recvExpr);
+    if (!srcObj) return nullptr;
+
+    // Element byte size for the array (mirrors lazyElemSize / collectionElemSize).
+    const llvm::DataLayout& dl = module_->getDataLayout();
+    int64_t esz = 8;
+    if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
+    else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
+    else if (elemTy->isIntegerTy(16)) esz = 2;
+    else if (elemTy->isStructTy()) esz = (int64_t)dl.getTypeAllocSize(elemTy);
+
+    // 1. GetEnumerator (slot 4): a fresh, independent enumerator over the source.
+    llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), srcObj);
+    llvm::Value* geSlotPtr =
+        builder_.CreateGEP(ptrTy(), srcVt, {builder_.getInt32(4)});
+    llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+    auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* en = builder_.CreateCall(geTy, geFnPtr, {srcObj}, "mat.getenum");
+
+    // Allocate the result array (esz-byte elements).
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(8)}, "mat.arr");
+
+    auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), ptrTy(), i64()});
+    auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+    auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+
+    // 2. Drain loop: while MoveNext(en) { append Current(en) to arr }.
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "mat.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mat.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mat.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* vt = builder_.CreateLoad(ptrTy(), en);
+    llvm::Value* mnSlot = builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(2)});
+    llvm::Value* mnFn = builder_.CreateLoad(ptrTy(), mnSlot);
+    llvm::Value* moved = builder_.CreateCall(moveNextTy, mnFn, {en}, "mat.moved");
+    // §29.2/§31 (#630): MoveNext runs the iterator body; an exception thrown
+    // there sets bz$exc and returns false. Surface it (the standard post-call
+    // gate) instead of silently ending the drain. The enumerator/source are not
+    // yet registered on the disposeStack_ here, but emitPendingCheck unwinds to
+    // the enclosing handler; the small temporary leak on a thrown exception is
+    // acceptable (no double-free) and matches the lazy-terminal materialize path.
+    emitPendingCheck();
+    builder_.CreateCondBr(moved, bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), en);
+    llvm::Value* curSlot = builder_.CreateGEP(ptrTy(), vt2, {builder_.getInt32(3)});
+    llvm::Value* curFn = builder_.CreateLoad(ptrTy(), curSlot);
+    llvm::Value* curVal = builder_.CreateCall(currentTy, curFn, {en}, "mat.cur");
+    // Spill the by-value element to a stack slot and append its bytes.
+    auto* elemSlot = entryAlloca(elemTy);
+    builder_.CreateStore(curVal, elemSlot);
+    builder_.CreateCall(addFn, {arr, elemSlot, builder_.getInt64(esz)});
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    // 3. Dispose the enumerator exactly once (slot 1 — iterator format, not the
+    //    class vtable's slot 2). Runs the state machine's pending finally blocks
+    //    (state → -1) and frees the frame.
+    {
+        llvm::Value* dvt = builder_.CreateLoad(ptrTy(), en);
+        llvm::Value* dSlot =
+            builder_.CreateGEP(ptrTy(), dvt, {builder_.getInt32(1)});
+        llvm::Value* dFn = builder_.CreateLoad(ptrTy(), dSlot);
+        auto* dispTy =
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+        builder_.CreateCall(dispTy, dFn, {en});
+    }
+    // Dispose the SOURCE too when it is a freshly produced temporary (no owning
+    // binding) — a named local/param/field source is disposed at its own scope
+    // end, so disposing here would double-free.
+    bool sourceIsNamed = false;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&recvExpr)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        sourceIsNamed = dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                        dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr;
+    } else if (dynamic_cast<const ast::MemberAccessExpr*>(&recvExpr)) {
+        // A field/property read (`this.seq`, `obj.seq`) is owned by the object,
+        // not this expression — do not dispose it here.
+        sourceIsNamed = true;
+    }
+    if (!sourceIsNamed) {
+        llvm::Value* svt = builder_.CreateLoad(ptrTy(), srcObj);
+        llvm::Value* sSlot =
+            builder_.CreateGEP(ptrTy(), svt, {builder_.getInt32(1)});
+        llvm::Value* sFn = builder_.CreateLoad(ptrTy(), sSlot);
+        auto* dispTy =
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+        builder_.CreateCall(dispTy, sFn, {srcObj});
+    }
+    return arr;
+}
+
 llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                             sema::TypeRef*& elemRef) {
     auto* recvTy = ctx_.exprType(recvExpr);
@@ -12276,6 +12448,28 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
         return builder_.CreateCall(wrapFn, {groups, builder_.getInt64(esz)},
                                    "lazy.groupby");
+    }
+    // issue #995 / stdlib §5 / §29.11: a VTABLE-BACKED `IEnumerable<T>` receiver
+    // (interface-typed local/param/field, or a yield-method result) carries the
+    // iterator-vtable object, not a bz_array_t*/bz_lazy_t*. Drive its vtable
+    // protocol once to materialize the elements into a fresh Array<T> (disposing
+    // the per-consumption enumerator, and the source iff it is a temporary), then
+    // wrap that array as a lazy ARRAY source so every lazy consumer composes
+    // uniformly. Without this the receiver fell through to bz_lazy_from_array over
+    // the raw vtable object pointer → garbage (the #995 silent miscompile).
+    if (isVtableBackedIEnumerableType(recvTy)) {
+        llvm::Value* matArr =
+            materializeVtableIEnumerableToArray(recvExpr, elemRef);
+        if (!matArr) return nullptr;
+        llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
+        int64_t esz = lazyElemSize(et, module_->getDataLayout());
+        // The materialized array is a fresh temporary with no other owner — wrap
+        // it as an OWNING lazy ARRAY source so bz_lazy_dispose frees it (leak-free
+        // for both the terminal drain and the Where/Select/… for-in consumers).
+        auto* wrapFn =
+            declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(wrapFn, {matArr, builder_.getInt64(esz)},
+                                   "lazy.ienum");
     }
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
@@ -12376,7 +12570,13 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     bool rangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                      recvTy->declaration &&
                      recvTy->declaration->name == "Range";
-    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv) return nullptr;
+    // issue #995 / stdlib §5 / §29.11: a vtable-backed IEnumerable<T> receiver
+    // (interface-typed local/param, or a yield-method result) — lowerToLazy-
+    // Enumerator materializes it into an Array<T> via the iterator vtable, so the
+    // LINQ operators (Where/Select/Take/…) can enumerate it. Without this they
+    // silently fell through (the #995 Where/Select garbage/NYI).
+    bool vtRecv = isVtableBackedIEnumerableType(recvTy);
+    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv) return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
     auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {

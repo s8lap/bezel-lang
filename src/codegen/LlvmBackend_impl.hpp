@@ -5843,6 +5843,26 @@ private:
     // the type carried by a lazy LINQ operator result?
     static bool isLazyEnumerableType(const sema::TypeRef* rt);
 
+    // issue #995 / stdlib §5 / §29.11: is `rt` a VTABLE-BACKED IEnumerable<T> /
+    // OwnedEnumerable<T> — an interface-typed local/param/field or a yield-method
+    // result whose runtime value is the iterator-vtable object (not a bz_lazy_t*
+    // / bz_array_t*)? Unlike the lazy sentinel (isLazyEnumerableType) it carries
+    // the interface name in an astNode or importedName. Such a receiver is
+    // materialized into an Array<T> via materializeVtableIEnumerableToArray so the
+    // LINQ operators/terminals and for-in compose uniformly (was the #995
+    // miscompile/NYI).
+    bool isVtableBackedIEnumerableType(const sema::TypeRef* rt);
+
+    // issue #995 / stdlib §5 / §29.11: materialize a vtable-backed IEnumerable<T>
+    // receiver into a fresh owned Array<T> (a bz_array_t* of element bytes) by
+    // driving its iterator-vtable protocol once (GetEnumerator/MoveNext/Current/
+    // Dispose). Disposes the per-consumption enumerator, and the source iff it is
+    // a temporary (a named local/param/field source is disposed at its own scope
+    // end). `elemRef` receives the element TypeRef. Returns the array, or null if
+    // the receiver is not vtable-backed.
+    llvm::Value* materializeVtableIEnumerableToArray(const ast::Expr& recvExpr,
+                                                     sema::TypeRef*& elemRef);
+
     // stdlib §5: lower a deferred LINQ operator call (Where/Select/Take/Skip/
     // Distinct/OrderBy[Descending]) or ToArray. Operators return a lazy
     // enumerator (bz_lazy_*); ToArray materializes it. The receiver may be a
