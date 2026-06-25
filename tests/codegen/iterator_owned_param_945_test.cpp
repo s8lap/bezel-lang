@@ -190,6 +190,52 @@ BEZEL_TEST(iterator_owned_param_945, conditional_discharge_still_rejected) {
         "  public static method Main(): int return 0; end Main; end P;"), true);
 }
 
+// §29.8 (#973b): an ASYNC iterator's never-discharged `owned` param is no longer
+// rejected — it is auto-disposed by the async-iterator Dispose (emitFreeAndReturn,
+// on every Dispose path). Accept-check (ownership half): the program compiles.
+BEZEL_TEST(iterator_owned_param_945, async_iterator_owned_param_accepted_973b) {
+    BEZEL_EXPECT_FALSE(rejectedAtCompile(
+        std::string("module M; ") + kCell +
+        "class P "
+        "  public static async method UseCell(owned c: Cell): IAsyncEnumerable<int> "
+        "    yield return c.V; yield return c.V + 1; "
+        "  end UseCell; "
+        "  public static async method Main(): Task<int> "
+        "    await for var x in UseCell(new Cell()) do end; "
+        "    return 0; "
+        "  end Main; end P;"));
+}
+
+// §29.8 (#973b): runtime — the async-iterator owned param is disposed EXACTLY once
+// (Cell.n returns to 0). No-await iterator body so the JIT test is timer-free.
+BEZEL_TEST(iterator_owned_param_945, async_iterator_owned_param_disposed_once_973b) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class P "
+        "  public static async method UseCell(owned c: Cell): IAsyncEnumerable<int> "
+        "    yield return c.V; yield return c.V + 1; "
+        "  end UseCell; "
+        "  public static async method Main(): Task<int> "
+        "    await for var x in UseCell(new Cell()) do end; "
+        "    return Cell.n; "  // 0 — c disposed exactly once at iterator Dispose
+        "  end Main; end P;"), 0);
+}
+
+// §29.8 (#973b): the consumer BREAKS before exhaustion — the async iterator's
+// owned param is still disposed exactly once on the abandonment Dispose path.
+BEZEL_TEST(iterator_owned_param_945, async_iterator_owned_param_disposed_on_break_973b) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class P "
+        "  public static async method UseCell(owned c: Cell): IAsyncEnumerable<int> "
+        "    yield return c.V; yield return c.V + 1; "
+        "  end UseCell; "
+        "  public static async method Main(): Task<int> "
+        "    await for var x in UseCell(new Cell()) do break; end; "
+        "    return Cell.n; "  // 0 — disposed once even on early abandonment
+        "  end Main; end P;"), 0);
+}
+
 // §29.6 / §29.8 (#945, adversarial-review Finding 1): the owned param is
 // consumed INSIDE a yield operand — `yield return Consume(c)` where Consume
 // takes and disposes it. The discharge must be recorded (visitStmt's YieldStmt

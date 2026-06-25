@@ -133,16 +133,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     scanReassignStmts(body, ctx_, reassignedLocals);
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
-            // §29.8 (#945): a SYNC iterator method's `owned` parameter that the
+            // §29.8 (#945, #973b): an iterator method's `owned` parameter that the
             // body never moves out is disposed by the state machine at iterator-
             // Dispose. Suppress the §28.3 normal-exit drop reject and flag the
-            // parameter for codegen disposal (emitIteratorMethod's Dispose). A
-            // param discharged on SOME path is in everDischarged_ → kept as a
-            // reject (the state machine can't statically tell it was moved out, so
-            // auto-disposing would risk a double-free). Async iterators and owned
-            // LOCALS keep the reject — their state-machine disposal is not yet
-            // wired (tracked separately).
-            if (sawYield_ && !isAsync_) {
+            // parameter for codegen disposal — emitIteratorMethod's Dispose for a
+            // SYNC iterator (#945), or emitAsyncIteratorMethod's Dispose for an
+            // ASYNC iterator (#973b: emitFreeAndReturn disposes it before freeing
+            // the frame, on every Dispose path, null-guarded + nulled). A param
+            // discharged on SOME path is in everDischarged_ → kept as a reject (the
+            // state machine can't statically tell it was moved out, so auto-
+            // disposing would risk a double-free; #973a covers that conditional
+            // case via a runtime moved-from flag). Owned LOCALS in an iterator keep
+            // the reject (their frame-disposal is a separate piece).
+            if (sawYield_) {
                 if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
                     if (ps->modifier == "owned" &&
                         everDischarged_.count(sym) == 0) {

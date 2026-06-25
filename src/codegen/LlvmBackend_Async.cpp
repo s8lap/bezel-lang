@@ -1605,6 +1605,39 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
         auto emitFreeAndReturn = [&]() {
+            // §29.8 (#973b): dispose never-discharged `owned` parameters captured
+            // in the frame BEFORE freeing it — the async analogue of the sync
+            // iterator's disposeOwnedParams (LlvmBackend_Iterators.cpp). Runs on
+            // EVERY Dispose path (both call sites funnel here), AFTER any finally
+            // chains, reverse capture order. Null-guarded and the field is nulled
+            // after disposal so a re-entrant Dispose (or a param already moved out
+            // and nulled) never double-frees. Only params flagged
+            // iteratorAutoDispose (never discharged on any path, set in
+            // Ownership.cpp) are disposed; a conditionally-discharged param stays a
+            // reject (#973a).
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps || !ps->iteratorAutoDispose) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                llvm::Value* obj =
+                    builder_.CreateLoad(ptrTy(), fptr, "aitp.obj");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()), "aitp.isnull");
+                auto* dispBB =
+                    llvm::BasicBlock::Create(llvm_, "aitp.dispose", disposeFn);
+                auto* contBB =
+                    llvm::BasicBlock::Create(llvm_, "aitp.cont", disposeFn);
+                builder_.CreateCondBr(isNull, contBB, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(obj);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
             // Free the spill area first (null-safe: free(null) is a no-op).
             llvm::Value* spillField2 =
                 builder_.CreateStructGEP(stateStructTy, self, SPILL_PTR_FIELD);
