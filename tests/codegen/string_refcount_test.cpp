@@ -296,11 +296,13 @@ const char* kConcatRoundTrip =
     "  end Main; "
     "end C;";
 
-// §4.6: Split round-trip — the runtime allocates one string per part (each rc=1)
-// inside the returned Array<string>. Iterating the array sums lengths. The array
-// and its element strings are conservatively leaked here (collection-held
-// strings are deferred in this increment), so this is a value + no-corruption
-// test, not an LSan-clean one. "a,bb,ccc" -> 1+2+3 = 6.
+// §4.6 / #1027: Split round-trip — the runtime allocates one string per part
+// (each rc=1) inside the returned `owned Array<string>`. Iterating the array
+// sums lengths. The fresh array backing + its element strings used to be
+// conservatively leaked (collection-held, deferred); #1027 reclaims a plain
+// `var parts := s.Split(...)` at scope end (bz_array_free + the Array<string>
+// string-release disposer) exactly once, so this is now LSan-clean.
+// "a,bb,ccc" -> 1+2+3 = 6.
 const char* kSplitRoundTrip =
     "module M; class C "
     "  public static method Main(): int "
@@ -315,11 +317,10 @@ const char* kSplitRoundTrip =
     "  end Main; "
     "end C;";
 
-// §9.6 Split(char): the char overload allocates one part string per segment
-// (rc=1), like the string overload. Same conservative-leak status: the array and
-// its element strings are collection-held and deferred — value + no-corruption,
-// NOT LSan-clean. "a,bb,ccc".Split(',') -> 1+2+3 = 6. The cardinal point: the
-// fresh part allocations are not corrupted / double-freed.
+// §9.6 / #1027 Split(char): the char overload allocates one part string per
+// segment (rc=1), like the string overload. #1027 reclaims the plain-`var`
+// result exactly once at scope end, so this is now LSan-clean (was a deferred
+// conservative-leak). "a,bb,ccc".Split(',') -> 1+2+3 = 6.
 const char* kSplitCharRoundTrip =
     "module M; class C "
     "  public static method Main(): int "
@@ -537,12 +538,29 @@ BEZEL_TEST(codegen_string_refcount_422, field_stored_string_no_uaf_28_9) {
 }
 
 BEZEL_TEST(codegen_string_refcount_422, split_round_trip_no_uaf_4_6) {
-    expectValueAndNoCorruption(kSplitRoundTrip, 6);
+    // #1027: a plain `var parts := s.Split(...)` is now reclaimed at scope end
+    // (backing + each substring released exactly once) — strengthened from
+    // no-corruption to LSan-clean.
+    expectValueAndLeakFree(kSplitRoundTrip, 6);
 }
 
 BEZEL_TEST(codegen_string_refcount_422, split_char_round_trip_no_uaf_9_6) {
-    // §9.6 Split(char): per-part allocations intact, no corruption/double-free.
-    expectValueAndNoCorruption(kSplitCharRoundTrip, 6);
+    // §9.6 / #1027 Split(char): per-part allocations released exactly once at
+    // scope end — LSan-clean (was a deferred conservative-leak).
+    expectValueAndLeakFree(kSplitCharRoundTrip, 6);
+}
+
+// #1027: the discard form `s.Split(',').Length` (the fresh owned Array<string>
+// consumed as a receiver, then dropped) is reclaimed exactly once via the
+// ownerless-materializer temp path — was a leak. Returns the part count (3).
+const char* kSplitDiscardLength =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    return \"a,bb,ccc\".Split(',').Length; "   // 3
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_string_refcount_1027, split_discard_length_reclaimed) {
+    expectValueAndLeakFree(kSplitDiscardLength, 3);
 }
 
 BEZEL_TEST(codegen_string_refcount_422, repeat_static_used_no_uaf_9_6) {

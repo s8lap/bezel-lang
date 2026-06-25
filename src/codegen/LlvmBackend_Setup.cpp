@@ -9019,7 +9019,19 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma) return false;
     std::string_view mm = ma->member;
-    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed";
+    // #1027 / stdlib §9.6: `string.Split(...)` returns a fresh `owned Array<string>`
+    // whose substrings are created at rc=1 (the array is their sole owner). A plain
+    // `var parts := s.Split(...)` was neither flagged for the §28.3 affine auto-drop
+    // nor reclaimed here, so the backing + every substring leaked. It is recognized
+    // alongside the ToArray/Sorted/Reversed materializers: the scope-end reclaim
+    // (bz_array_free with the Array<string> string-release per-element disposer,
+    // selected above by element type) frees the backing AND releases each substring
+    // exactly once — the same disposal the `using var` form already performs, so
+    // plain `var` and `using var` reach parity. No double-free: the substrings are
+    // freshly created (no source alias retains them, unlike ToArray's +1 co-owned
+    // borrow), so the single release frees each exactly once.
+    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
+           mm == "Split";
 }
 
 
@@ -9058,13 +9070,19 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
         return false;
     if (builtinTypeName(rt) != "Array") return false;
     // The expression itself must be a fresh-array MATERIALIZER call:
-    // `recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`.
+    // `recv.ToArray()`, `recv.Sorted(...)`, `recv.Reversed()`, or `s.Split(...)`.
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma) return false;
     std::string_view mm = ma->member;
-    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed";
+    // #1027: `s.Split(...)` is a fresh `owned Array<string>` materializer too — a
+    // bare `s.Split(...).Length` (the result consumed as a receiver, then dropped)
+    // leaked its backing + substrings without this. Reclaimed exactly once via
+    // bz_array_free with the Array<string> string-release disposer (selected by
+    // element type at the call site), mirroring the ToArray/Sorted/Reversed temps.
+    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
+           mm == "Split";
 }
 
 
