@@ -3649,6 +3649,32 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ys->value) visitExpr(*ys->value);
     } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (is->target) visitExpr(*is->target);
+        // fix #913 / §28.10 / §17.6: `c++` / `c--` desugars to
+        // `c := T.operator++(c)` — a reassignment. A `using var` local is
+        // implicitly non-reassignable, so an increment/decrement on it is a
+        // compile error just like a direct `c := …` (mirrors the AssignmentStmt
+        // check above). Without this it was silently accepted and, for an owned
+        // class operand whose `operator ++` returns a NEW instance, leaked the
+        // previous value (§28.7). (The plain-`var`/field forms of #913 — where the
+        // ownership pass does not yet model `c++` as a reassignment — remain.)
+        if (is->target) {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                    is->target.get())) {
+                if (id->name != "_") {
+                    if (auto* loc = dynamic_cast<LocalSymbol*>(
+                            ctx_.exprSymbol(*is->target))) {
+                        if (loc->isUsing)
+                            ctx_.diagnostics().report(
+                                Severity::Error, is->target->span.begin,
+                                std::string("cannot increment/decrement "
+                                "`using var` local `") + std::string(id->name) +
+                                "` — `using var` is implicitly non-reassignable "
+                                "and `" + std::string(is->op) +
+                                "` reassigns it (§28.10 / §17.6)");
+                    }
+                }
+            }
+        }
     } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         if (cs->scrutinee) visitExpr(*cs->scrutinee);
         validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)

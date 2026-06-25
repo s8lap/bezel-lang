@@ -96,3 +96,28 @@ BEZEL_TEST(using_var_reassign_830, discard_assignment_not_flagged) {
         "end Main; end C;"));
     BEZEL_EXPECT_FALSE(hasUsingVarReassignError(r));
 }
+
+// fix #913 / §28.10 / §17.6: `c++` / `c--` desugars to `c := T.operator++(c)` —
+// a reassignment — so it is rejected on a non-reassignable `using var` local, the
+// same as a direct `:=`. Before the fix it was silently accepted and (for an
+// owned-class operand whose `operator ++` returns a new instance) leaked the
+// previous value (§28.7).
+BEZEL_TEST(using_var_reassign_830, using_var_increment_rejected_913) {
+    auto r = parseAndCheckOwnership(mod(
+        "class C public static method Main(): int "
+        "  using var x := 3; x++; return x; "
+        "end Main; end C;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasUsingVarReassignError(r));
+}
+
+// A plain `var` increment is NOT flagged by the §28.10 rule. (The plain-`var` /
+// field drop case of #913 — where the ownership pass does not yet model `c++` as
+// a reassignment — is a separate piece and remains open.)
+BEZEL_TEST(using_var_reassign_830, plain_var_increment_not_flagged_913) {
+    auto r = parseAndCheckOwnership(mod(
+        "class C public static method Main(): int "
+        "  var x := 3; x++; return x; "
+        "end Main; end C;"));
+    BEZEL_EXPECT_FALSE(hasUsingVarReassignError(r));
+}
