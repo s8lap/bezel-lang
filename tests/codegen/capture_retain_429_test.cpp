@@ -507,3 +507,45 @@ BEZEL_TEST(capture_retain_429, spec_27_5_28_9_mixed_capture_loop_lsan_clean) {
 BEZEL_TEST(capture_retain_429, spec_28_9_string_capture_discarded_lsan_clean) {
     expectValueAndNoCorruption(kStringCaptureDiscarded, 0);
 }
+
+// ===========================================================================
+// Shape 9 (#672): the SAME +1-producer string captured by TWO (then THREE)
+// lambdas. §27.5 / §28.9: both lambdas share ONE boxed cell; EACH lambda's
+// envdtor releases the cell's string at last-drop, but the suppressed scope-end
+// release covers only ONE reference. So the FIRST capture transfers that single
+// suppressed release; every ADDITIONAL (alreadyBoxed) capture must mint an
+// independent +1 retain (mirroring the box additional-capture retain). Before
+// the fix, two envdtor releases against one reference = over-release →
+// heap-use-after-free (ASan exit 99 ≠ expected). After, N captures balance
+// exactly: 1 (suppressed) + (N-1) retains = N refs = N releases.
+// s := "he"+"llo" (len 5): two → 5 + (5+1) = 11; three → 5 + 6 + 7 = 18.
+// ===========================================================================
+const char* kStringTwoLambdaCapture =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var s: string := \"he\" + \"llo\"; "
+    "    var f: () -> int := () => s.Length; "
+    "    var g: () -> int := () => s.Length + 1; "
+    "    return f() + g(); "
+    "  end Main; "
+    "end C;";
+
+const char* kStringThreeLambdaCapture =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var s: string := \"he\" + \"llo\"; "
+    "    var f: () -> int := () => s.Length; "
+    "    var g: () -> int := () => s.Length + 1; "
+    "    var h: () -> int := () => s.Length + 2; "
+    "    return f() + g() + h(); "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(capture_retain_429, spec_27_5_28_9_672_string_two_lambda_capture_no_uaf) {
+    // Before #672's additional-capture retain this was a heap-use-after-free.
+    expectValueAndNoCorruption(kStringTwoLambdaCapture, 11);
+}
+
+BEZEL_TEST(capture_retain_429, spec_27_5_28_9_672_string_three_lambda_capture_no_uaf) {
+    expectValueAndNoCorruption(kStringThreeLambdaCapture, 18);
+}

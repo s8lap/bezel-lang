@@ -6274,6 +6274,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 emitBoxRetain(box);
             }
         }
+        // §27.5 / §28.9 / #672: string and closure (function-typed) captures need
+        // the SAME additional-capture retain as boxes (above). Each capturing env's
+        // envdtor releases the captured string/closure unconditionally on the sema
+        // type, while the suppressed scope-end release covers only ONE reference. So
+        // the FIRST capture transfers that single suppressed release; every
+        // ADDITIONAL (alreadyBoxed) capture must mint an independent +1 here — else
+        // two closures capturing one string both release the shared cell's string →
+        // over-release / heap-use-after-free (#672). N captures ⇒ 1 (suppressed
+        // producer) + (N-1) retains = N references = N envdtor releases → 0 after the
+        // last env dies. Exclude guarded boxing (loop-iteration cell reuse) for the
+        // same reason the box branch does (conservative leak, never over-release).
+        if (alreadyBoxed && !wasGuardedLocal) {
+            if (isStringTypeRefNonNull(ce.semaTy)) {
+                llvm::Value* str =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "str.recap");
+                emitStringRetain(str);
+            } else if (ce.semaTy &&
+                       ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* cl =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "cl.recap");
+                emitClosureRetain(cl);
+            }
+        }
         // #694: free the 8-byte capture cell in the envdtor when this local is
         // captured by exactly ONE env (singleCaptureLocals_) and THIS lambda
         // DEFINITELY escapes (definitelyEscapingLambdas_ — directly returned). The
