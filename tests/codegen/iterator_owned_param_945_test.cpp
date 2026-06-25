@@ -226,16 +226,20 @@ BEZEL_TEST(iterator_owned_param_945, bare_owned_param_yielded_disposed_once) {
         "  end Main; end P;"), 0);
 }
 
-// Regression: a NON-iterator method (no yield) with an undischarged owned param
-// is STILL rejected — the fix is scoped to iterator methods only.
-BEZEL_TEST(iterator_owned_param_945, non_iterator_owned_param_still_rejected) {
-    BEZEL_EXPECT_EQ(rejectedAtCompile(
-        "module M; "
-        "class Cell public constructor() end constructor; "
-        "  destructor end destructor; end Cell; "
+// §28.3 v0.152 (#1008 Part B, owned-parameter auto-drop): a NON-iterator method
+// with an undischarged owned param is no longer rejected — it auto-drops the
+// param at method end (disposed EXACTLY once; Cell.n returns to 0), the same
+// implicit disposal the iterator state machine performs at iterator-Dispose.
+// (Pre-v0.152 this was a hard §28.3 reject; the #945 accept was iterator-scoped.)
+BEZEL_TEST(iterator_owned_param_945, non_iterator_owned_param_auto_dropped) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
         "class P "
         "  public static method UseCell(owned c: Cell): int "
         "    return 1; "
         "  end UseCell; "
-        "  public static method Main(): int return 0; end Main; end P;"), true);
+        "  public static method Main(): int "
+        "    var k := UseCell(new Cell()); "
+        "    return Cell.n; "  // 0 — auto-dropped exactly once
+        "  end Main; end P;"), 0);
 }

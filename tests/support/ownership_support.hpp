@@ -33,7 +33,9 @@ inline bool hasAutoDropWarning(const OwnershipResult& r,
                                const std::string& name = "") {
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity != Severity::Warning) continue;
-        if (d.message.find("implicitly disposed at the end of its scope") ==
+        // Matches both the local ("end of its scope") and parameter ("end of
+        // the method") auto-drop warnings (§28.3 v0.150/v0.152).
+        if (d.message.find("is implicitly disposed at the end of") ==
             std::string::npos)
             continue;
         if (name.empty() ||

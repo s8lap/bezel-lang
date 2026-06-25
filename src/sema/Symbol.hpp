@@ -225,6 +225,14 @@ struct ParameterSymbol : Symbol {
     // this flag to emit that disposal. Owned params the body discharges are
     // never flagged, so there is no double-free.
     bool iteratorAutoDispose = false;
+    // §28.3 v0.150/v0.152 (#1008 Part B, affine auto-drop extended to params):
+    // set by the ownership pass on an `owned` parameter of a SYNCHRONOUS, non-
+    // iterator, non-destructor method that is never discharged on any path
+    // (everDischarged == 0) and never reassigned/out-overwritten — a never-moved
+    // genuine owner. Codegen (registerUnwindOwnedParam) disposes it at method
+    // end on BOTH the normal and unwind edges (dynamicDispose), the same as a
+    // dropped owned local. A param discharged on some path is not flagged.
+    bool autoDropAtScopeEnd = false;
 };
 
 // A.3 ExtensionDecl — collected at module level. Its target type is

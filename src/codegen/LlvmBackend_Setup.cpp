@@ -6855,7 +6855,19 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
     if (!isClassOrInterfaceRef(rt)) return;
     Disposal d{slot, nullptr};
-    d.unwindOnly = true;
+    if (ps->autoDropAtScopeEnd) {
+        // §28.3 v0.152 (#1008 Part B): the ownership pass flagged this dropped
+        // owned parameter for affine auto-drop — dispose it at method end on
+        // BOTH the normal and unwind edges (the null-guarded dynamic dispatch a
+        // dropped owned local gets, dynamicDispose). It is a never-moved owner
+        // (everDischarged == 0, never reassigned), so the slot holds a live value
+        // at method end and is disposed exactly once.
+        d.dynamicDispose = true;
+    } else {
+        // Otherwise an `owned` parameter is auto-disposed only on the exception-
+        // unwind path (the param is discharged on the normal path).
+        d.unwindOnly = true;
+    }
     disposeStack_.front().push_back(d);
 }
 

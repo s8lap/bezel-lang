@@ -177,15 +177,16 @@ BEZEL_TEST(own_exc_disch, enclosing_owned_caught_discharged_after_no_leak_28_3) 
 
 // ---- §28.3 scoping: owned PARAMETER and exception paths -----------------
 
-BEZEL_TEST(own_exc_disch, owned_param_caught_undischarged_leaks_28_6) {
-    // An owned parameter's scope is the method body, which encloses the try.
-    // When the catch handles the exception, the parameter is NOT auto-
-    // disposed (its scope does not unwind), and it is never discharged →
-    // leak.
+BEZEL_TEST(own_exc_disch, owned_param_caught_undischarged_auto_drops_28_3) {
+    // §28.3 v0.152: an owned parameter's scope is the method body, which encloses
+    // the try. The catch handles the exception, so the method exits NORMALLY — the
+    // parameter auto-drops at method-scope end on the normal-exit edge (must-use
+    // warning), no error. (Pre-v0.152 this was an undischarged-param leak/reject.)
     auto r = parseAndCheckOwnership(wrapParam(
         "owned p: T",
         "try this.Risky(); catch var e: Error => this.Done(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "p"));
 }
 
 BEZEL_TEST(own_exc_disch, owned_param_naked_throw_no_leak_28_3) {

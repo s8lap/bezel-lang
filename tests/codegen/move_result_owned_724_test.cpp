@@ -121,3 +121,19 @@ BEZEL_TEST(move_result_owned_724, use_after_move_var_binding_rejected) {
         "  return 0; "
         "end Main; end C;"));
 }
+
+// §28.3 v0.152 (#1008 Part B, owned-parameter auto-drop): a dropped `owned`
+// parameter is disposed EXACTLY ONCE at method end. `rclass`'s destructor bumps
+// R.n, so R.n == 1 proves the auto-drop ran once — not zero (a leak) and not
+// twice (a double-free with the caller's moved-out value). The caller `move`s
+// the value in and so does not dispose it.
+BEZEL_TEST(move_result_owned_724, owned_param_auto_drop_disposes_once) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M; ") + rclass +
+        "class C "
+        "  public static method Take(owned r: R): int return 0; end Take; "
+        "  public static method Main(): int "
+        "    var x := new R(); var k := C.Take(move x); "  // auto-dropped in Take
+        "    return R.n; "                                  // 1 — disposed once
+        "  end Main; end C;"), 1);
+}

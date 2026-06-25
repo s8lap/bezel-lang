@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.151 — June 2026**
+**Companion to the Bezel Language Specification, v0.152 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7112,6 +7112,28 @@ Language spec: §28.6 (bare owned-field read = borrow; transfer requires `owned`
 Mostly source-compatible, with one deliberate tightening to flag for review. A method that returns a bare owning-collection field through a non-`owned` return (rejected today by #1007) will compile once Part C lands. A method that *transfers* a field out still requires `owned` (unchanged). Callers of a borrowed owning collection that attempt `Dispose`/`Drain`/mutation get a new, precise compile error rather than a latent double-free.
 
 The tightening: because the caller's classifier cannot see the callee's body, a non-`owned` owning-collection return must mean *one* thing, and v0.151 makes it mean **borrow**. The consequence is that a method returning a *freshly-produced* owning value through a non-`owned` return — `Make(): OwnedArray<T> => new OwnedArray<T>(...)`, which compiles under v0.150 because the caller's name-head heuristic rescues it as owned — must declare `owned OwnedArray<T>` under v0.151. This is a source-breaking change for that pattern (the diagnostic ships with a clear fix-it), and it is the price of distinguishing borrow-returns from owned-returns by signature alone. The alternative — having the caller inspect the callee body / module metadata to decide owned-vs-borrow per call — avoids the tightening at the cost of substantially more machinery; it remains available as a non-breaking future widening should the source-break prove too costly. **v0.151 adopts the tightening.**
+
+---
+
+### v0.152 changelog (v0.151 → v0.152)
+
+v0.152 extends the v0.150 affine auto-drop ([§28.3](Bezel_Language_Spec.md#sec-owned-local-discharge-requirement)) from owned *locals* to `owned` *parameters* on the normal-exit edge — completing the affine model. The third half of the #1008 ergonomics pass's Part B.
+
+#### The gap
+
+v0.150 made an undischarged owned *local* auto-drop at scope end (with a must-use warning) instead of being a hard error. The same edge for an `owned` *parameter* was left as an error: a method that accepted ownership of a parameter and neither moved, returned, disposed, nor reassigned it was rejected. This was an inconsistency — the *exception* edge has always disposed live owned parameters (the §28.3 exception-path discharge names "owned locals and owned parameters"), so only the *normal* edge treated a parameter differently from a local.
+
+#### The resolution
+
+A synchronous, non-iterator, non-destructor method's `owned` parameter that reaches the method's normal exit still owned and is never discharged on any path — and is never reassigned or `out`-overwritten — is disposed implicitly at method end, on both the normal and exception edges, with the must-use warning. The gating is identical to the local case (`everDischarged == 0`, not reassigned, never-moved owner — so the disposal is exactly-once), and reuses the same null-guarded dynamic-dispatch disposal (codegen `dynamicDispose`). Owned parameters of *iterators* are disposed by the state machine (the §29.8 `iteratorAutoDispose` path, unchanged); owned parameters of *async* methods remain a deferred piece.
+
+#### Touched
+
+Language spec: §28.3 (the auto-drop and must-use-warning paragraphs now name `owned` parameters). Compiler: the ownership pass (flag a dropped owned parameter for auto-drop, `ParameterSymbol::autoDropAtScopeEnd`) and codegen (`registerUnwindOwnedParam` registers the flagged parameter for normal+unwind disposal via `dynamicDispose` rather than unwind-only). Version headers bumped to v0.152.
+
+#### Migration
+
+Source-compatible in the safe direction: a method that previously failed to compile because it dropped an `owned` parameter now compiles, the parameter auto-dropping at method end (with the lint). Nothing that compiled under v0.151 stops compiling.
 
 ---
 

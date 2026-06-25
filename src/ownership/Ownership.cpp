@@ -164,8 +164,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // move legal, e.g. `new T(move n, n)`), so the join retains Owned and
             // auto-disposing would double-free the moved/disposed path. That case
             // keeps the equalize-the-branches error below (§5.6 lattice rule).
-            // Owned PARAMETERS dropped on normal exit are not yet auto-dropped
-            // here (tracked separately); they keep the error. // per §28.3, §5.6
+            // An `owned` PARAMETER dropped on normal exit auto-drops too (the
+            // ParameterSymbol branch below, §28.3 v0.152). // per §28.3, §5.6
             //
             // GATED to synchronous, non-iterator bodies. In an `async` method an
             // owned local that crosses an await is a suspend-local disposed by
@@ -193,6 +193,31 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             "(§28.3 auto-drop); declare it `using var` to make "
                             "the scope-bound disposal explicit, or `move` / "
                             "`return` / `.Dispose()` / `_ := …` to discharge it");
+                        continue;
+                    }
+                } else if (auto* ps =
+                               dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                    // §28.3 v0.152 (#1008 Part B, extended to parameters): an
+                    // `owned` parameter the method neither moves/returns/disposes
+                    // nor reassigns is a never-moved genuine owner — auto-dropped
+                    // at method end (the same implicit disposal the exception edge
+                    // already performs on owned parameters), with the must-use
+                    // warning. (A SYNC iterator's owned param was handled above
+                    // via iteratorAutoDispose; this is the ordinary synchronous
+                    // non-iterator method.) Only an `owned` parameter carries a
+                    // disposal obligation; a borrow parameter is never Owned here.
+                    if (ps->modifier == "owned") {
+                        ps->autoDropAtScopeEnd = true;
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned parameter `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed at the end of the method "
+                            "(§28.3 auto-drop); `move` / `return` / `.Dispose()` "
+                            "it, or rebind it with `using var`, to discharge it "
+                            "explicitly");
                         continue;
                     }
                 }
