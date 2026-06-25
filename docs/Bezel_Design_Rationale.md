@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.150 — June 2026**
+**Companion to the Bezel Language Specification, v0.151 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7075,11 +7075,11 @@ Why affine over strict-linear: v0.149 had already made unnamed temporaries affin
 
 #### The resolution — materializer uniformity (Part A)
 
-The standard-library materializers already return `owned` (`ToArray(): owned Array<T>`, `Sorted`, `Reversed`, `ToSet`, `ToDictionary` — owning the *container*, borrowing the elements, [§5.11](#sec-owning-collections)). v0.150 clarifies ([§28.3 unbound temporaries](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)) that an unbound materializer result in a chain (`xs.Where(p).ToArray().Length`) is reclaimed by the *general* end-of-statement rule — the single `owned` return qualifier is the signal, not a special-cased list of method names. The implementation drops the `ToArray`/`Sorted`/`Reversed` name whitelist accordingly and extends reclaim to owned `Set`/`Dictionary` temporaries (closing a latent leak where `xs.ToSet().Count()` left the set backing unreclaimed).
+The standard-library materializers already return `owned` (`ToArray(): owned Array<T>`, `Sorted`, `Reversed`, `ToSet`, `ToDictionary` — owning the *container*, borrowing the elements, [§5.11](#sec-owning-collections)). v0.150 clarifies ([§28.3 unbound temporaries](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)) that an unbound materializer result in a chain (`xs.Where(p).ToArray().Length`) is reclaimed by the *general* end-of-statement rule — the single `owned` return qualifier is the signal, not a special-cased list of method names. (Implementation note: the existing array-materializer reclaim already covers this for `ToArray`/`Sorted`/`Reversed`; collapsing its name-keyed predicate into the `owned`-keyed one is a behavior-preserving cleanup deferred as optional, and the `Set`/`Dictionary` materializers cannot currently produce an unbound temporary to reclaim because `ToSet`/`ToDictionary` themselves throw at runtime — a separate functional defect, #1010.)
 
 #### Touched
 
-Language spec: §28.3 (auto-drop + must-use warning rewrite of the owned-local discharge requirement; the unbound-temporary note generalized to all `owned` producers); §17.13 (discard of an owned class / interface / move-only value becomes a legal end-of-statement disposal; only `Task`/`Task<T>` remain restricted); Appendix C.3 (discharge and discard invariants updated); the §28.8 / §28.9 / §28.3-join echoes of the old discharge-error rule. Guide 1 framing updated to "affine." Compiler (subsequent PRs, tracked in #1008): the ownership pass (replace the normal-exit discharge error with scope-end disposal registration + the must-use warning) and codegen (apply the exception-edge disposal to the normal edge; unify the materializer reclaim on the `owned` signal; extend to Set/Dictionary). Version headers bumped to v0.150 across the language spec, standard library, and design rationale.
+Language spec: §28.3 (auto-drop + must-use warning rewrite of the owned-local discharge requirement; the unbound-temporary note generalized to all `owned` producers); §17.13 (discard of an owned class / interface / move-only value becomes a legal end-of-statement disposal; only `Task`/`Task<T>` remain restricted); Appendix C.3 (discharge and discard invariants updated); the §28.8 / §28.9 / §28.3-join echoes of the old discharge-error rule. Guide 1 framing updated to "affine." Compiler (Part B, landed): the ownership pass (replace the normal-exit discharge error with scope-end disposal registration + the must-use warning) and codegen (apply the exception-edge disposal to the normal edge). The materializer-reclaim unification (Part A) is deferred as optional cleanup; see #1010 for the `ToSet`/`ToDictionary` runtime defect. Version headers bumped to v0.150 across the language spec, standard library, and design rationale.
 
 #### Migration
 
@@ -7088,6 +7088,28 @@ Source-compatible in the safe direction: every program that compiled under v0.14
 #### Deferred (Part C → v0.151)
 
 Returning a *borrowed* owning-collection value remains rejected (#1007). Lifting that requires (1) caller-side reclassification of a non-`owned` owning-collection return with a borrow source as a borrow, (2) relaxing §28.6 so a bare owned-**field** read through a non-`owned` return is a legal receiver-borrow — which also reconciles a §28.6 spec-vs-impl asymmetry (a bare *class*-field read is already a legal borrow in the implementation, while §28.6's text and example call it an error), and (3) a capability restriction forbidding ownership-transferring / disposing operations (`Dispose`/`Drain`/`Pop*`/owning `Add`/indexer-set/`Remove*`/`Clear`) on a borrowed owning container. A mis-step re-introduces the #1007 double-free, so Part C lands as its own revision.
+
+---
+
+### v0.151 changelog (v0.150 → v0.151)
+
+v0.151 is the **specification** for #1008 Part C — returning a *borrowed* owning collection. It reconciles a §28.6 spec-vs-impl asymmetry and defines the borrowed-owning-container capability restriction. The implementation is a separate, double-free-sensitive change (it reworks the caller-side owned-vs-borrow classification) and follows as a tracked PR; until it lands, the compiler keeps the conservative #1007 rejection (spec-ahead-of-implementation, as v0.150 preceded the Part B implementation).
+
+#### The reconciliation
+
+The producers table ([§28.3](Bezel_Language_Spec.md#sec-producers)) has always classified a non-`owned` reference return as a **borrow**. §28.6's prose, however, said flatly that "an owned field's value may not be returned unless the return type is `owned`" and its example called `return _transactions;` an error — even though the Part B / #1005 implementation already treats a bare owned *class*-field read through a non-`owned` return as a legal receiver-borrow (the `GetConn(): Connection => _conn` canary). The owning-collection case was rejected outright by #1007 because the caller's classifier conflates the `Owned*` type *name* with container ownership (a load-bearing name-head heuristic in `producerState`, needed because builtin owned-returning methods like `Shared.Clone` carry no `returnOwned` declaration). v0.151 makes the prose match the model: the bare-field-read borrow is legal and uniform across class and owning-collection fields; only a `move` or a fresh value transfers ownership and requires `owned`.
+
+#### The capability restriction (new normative rule)
+
+A *borrow* of an owning collection grants **read access only** ([§28.6](Bezel_Language_Spec.md#sec-borrowed-owning-collections)): `Dispose`, `Drain`, `Pop*`/`Dequeue`, the owning `Add`, the ownership-taking indexer-set, `Insert`, `Remove*`, and `Clear` are rejected on a borrow; indexer-get, `Count`/`Length`, `Contains`, iteration, the borrowing LINQ queries, and `ToArray`/`Sorted`/`Reversed` are permitted. This is what makes the borrow-return safe: the borrower cannot dispose a container it does not own, nor transfer elements out of it (which would change what the real owner disposes). The owned form keeps its full API. A new reference kind was **not** introduced — "borrowed owning collection" is the ordinary borrow state applied to an owning type, with a per-method availability check, mirroring how indexer reads on owning collections already dispense element borrows.
+
+#### Touched
+
+Language spec: §28.6 (bare owned-field read = borrow; transfer requires `owned`; the new *Borrowed owning collections* capability subsection), §28.3 (the owning-type borrow-return clause generalized to the ordinary borrow-return rules), Appendix C.3 (the two invariants updated). Implementation (tracked follow-up): `producerState` owned-vs-borrow reclassification for non-`owned` owning-collection returns, narrowing the #1007 definition-site rejection to borrowed locals/parameters, caller-side borrow-lifetime tracking of the result, and the borrowed-collection capability check. Version headers bumped to v0.151 across all three documents.
+
+#### Migration
+
+Source-compatible: a method that today returns a bare owning-collection field through a non-`owned` return (rejected by #1007) will compile once Part C lands; nothing that compiles under v0.150 stops compiling. A method that *transfers* a field out still requires `owned` (unchanged). Callers of a borrowed owning collection that attempt `Dispose`/`Drain`/mutation get a new, precise compile error rather than a latent double-free.
 
 ---
 

@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.150 — June 2026**
+**Version 0.151 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -4949,7 +4949,7 @@ A borrowed value's lifetime is the lifetime of its *source*. The compiler enforc
 
 - A borrowed local may not be returned from a method whose return type is `owned`.
 - A borrowed local may not be returned from a method at all unless the return type is the same kind of borrow with a clearly-defined source (in this version, that means: receiver-borrows from extension methods, value-typed returns, and runtime-managed returns).
-- A borrow may not be returned from a method through an **owning-collection or owning-wrapper return type** (`OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedLinkedList<T>`, `OwnedTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) declared without the `owned` qualifier. The caller of such a method tracks the result as an owned value and discharges it (the `Owned*` type name denotes *element* ownership, [§5.11](Bezel_Design_Rationale.md#sec-owning-collections); a method returning such a type without a borrow source produces a value the caller takes ownership of). Returning a borrow through it would make the caller a second owner of the borrow's source, disposing it twice. Return a freshly-produced (owned) value, declare the return type `owned`, or use a borrowing (non-owning) return type.
+- A method's return type that names an **owning-collection or owning-wrapper type** (`OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedLinkedList<T>`, `OwnedTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) follows the *same* owned-vs-borrow rule as any other reference return (the *Producers* table above): declared `owned`, the caller takes ownership; declared **without** `owned`, the result is a **borrow** with a documented source (the `Owned*` type name denotes *element* ownership, orthogonal to the container ownership the `owned` qualifier governs — [§5.11](Bezel_Design_Rationale.md#sec-owning-collections)). The borrow-return restrictions then apply unchanged: a bare owning-collection *field* read may be returned (its source is the receiver, [§28.6](#sec-leak-prevention)); a borrowed *local* or *parameter* with no source that outlives the call may **not** be returned; a `move`d field or a freshly-produced owning value must be returned through an `owned` return type. A borrow returned this way carries the read-only capability restriction of [§28.6](#sec-borrowed-owning-collections) — the caller may not dispose, drain, or mutate it.
 - A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference; the lifetime relationship is the programmer's obligation, checked at each assignment site (a borrowed local fails the check, a constructor-parameter borrow whose source outlives the object passes).
 - A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted.
 - The same capture-and-escape rule applies to **method references** ([§27.6](#sec-method-references)) that bind an instance receiver: `obj.Method` produces a function value whose captured environment includes `obj`. If `obj` is a borrow, the resulting function value is subject to the closure-escape rules above as if `obj` had been captured by an explicit lambda. The function value's runtime-managed status ([§28.9](#sec-runtime-managed-types)) governs the *function value's own* lifetime; it does not relax the lifetime constraints on borrows captured by the function value.
@@ -5082,16 +5082,39 @@ A class with only owned-bearing fields (`owned` class/interface fields and/or ow
 
 The compiler enforces:
 
-- An owned field's value may not be returned from a method unless the return type is also declared `owned` (see [§28.8](#sec-ownership-transfer)).
+- A *bare read* of an owned field may be returned through a **non-`owned`** return type as a **borrow** of the field — its source is the receiver, exactly as for `return this` (*Methods returning `this`* below). The caller receives a borrow it may not dispose, may not store in an `owned` location, and may not use past the receiver's lifetime; the field's owner (the receiver's destructor) still disposes it. This is leak-free and double-free-free, and applies uniformly to a class-typed owned field and to an owning-collection field (`owned _items: OwnedArray<T>`).
+- **Transferring** an owned field's value out — `move`-ing it ([§28.8.1](#sec-the-move-expression)), or returning it through an `owned` return type — is the only way to hand the caller ownership, and a `move`d owned field returned through a non-`owned` return is an **error** (the moved value would escape with no owner). A freshly-produced owning value (`return new OwnedArray<T>(...)`) returned through a non-`owned` return is likewise an error unless the return type is `owned`.
 - An owned field's value may not be assigned to a non-owned field of any other class.
 
 ```bezel
-public method GetTransactions(): Array<Transaction>
-  return _transactions;          // ERROR: cannot leak owned field
+public method GetTransactions(): OwnedArray<Transaction>
+  return _transactions;     // OK (v0.151): borrows the field — the caller may
+                            //   read/iterate it but not dispose or drain it.
 end GetTransactions;
+
+public method TakeTransactions(): owned OwnedArray<Transaction>
+  return move _transactions;  // transfer: the field is left moved-from and must
+                              //   be restored before the method returns.
+end TakeTransactions;
+
+public method LeakTransactions(): OwnedArray<Transaction>
+  return move _transactions;  // ERROR: a `move`d field through a non-`owned`
+                              //   return escapes with no owner.
+end LeakTransactions;
 ```
 
 Passing an owned field as an argument is permitted; the callee borrows for the duration of the call and may not store the reference in a long-lived location.
+
+<a id="sec-borrowed-owning-collections"></a>
+#### Borrowed owning collections
+
+A borrow of an owning collection — produced by returning a bare owning-collection field (above), or by any borrow-producing read of one — grants **read access only**. The operations that transfer element ownership out of the collection or dispose the collection or its elements are **not** available on a borrow, because the borrower is not the container's owner and must not change which elements the real owner will dispose:
+
+- `Dispose()` (the borrower does not own the container);
+- `Drain()`, `Pop*` / `Dequeue` and the other ownership-transferring reads ([§28.11](#sec-collections-do-not-own-elements));
+- the owning `Add`, the ownership-taking indexer-set, `Insert`, `Remove*`, `Clear` (these dispose or replace existing elements).
+
+The operations that **are** available on a borrowed owning collection are the non-mutating, non-transferring reads: indexer-get (which borrows an element), `Count` / `Length`, `Contains`, iteration (each element borrowed), the borrowing LINQ queries, and the fresh-copy materializers `ToArray` / `Sorted` / `Reversed` (which read without mutating). Invoking a forbidden operation on a borrowed owning collection is a compile error naming the operation and the borrow. An *owned* owning collection (a `using var`, an owned field accessed by its owner, a `move`d value) retains its full API.
 
 <a id="sec-methods-returning-this"></a>
 #### Methods returning `this`
@@ -8169,10 +8192,11 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `Dispose()` is generated for every non-static class.
 - The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls execute disposal exactly once ([§28.2](#sec-the-idisposable-contract)).
 - Owned fields are restricted to class-typed fields (not `string`, not value types).
-- Owned values may not escape: returning an owned field requires an `owned` return type; assigning an owned value to a non-owned field of another object is rejected.
+- Owned values may not escape: *transferring* an owned field out (a `move`, or a fresh owning value) requires an `owned` return type; a bare owned-field read may be returned through a non-`owned` return as a borrow of the receiver ([§28.6](#sec-leak-prevention)); assigning an owned value to a non-owned field of another object is rejected.
 - A `new` expression's result, and any owned local, is disposed exactly once on every path: it either reaches an owned location / explicit `Dispose()` / `move` / return, or is **auto-dropped at scope end** ([§28.3](#sec-owned-local-discharge-requirement)). An implicit auto-drop of a plain-`var` owned local raises a **must-use warning** (not an error); the warning is suppressed by `using var`, explicit disposal, discard, move, or return. Discard `_ := …` of an owned class or move-only value is permitted (disposes at end of statement). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
 - A static method returning a class type without `owned` and without an identifiable borrow source produces an owned value; the same discharge rules as `new` apply ([§28.3](#sec-local-variables-ownership-and-borrows)).
-- A borrow may not be returned through an owning-collection or owning-wrapper return type (`OwnedArray<T>`, `Shared<T>`, etc.) declared without `owned`; the caller would track the result as owned and dispose a value it does not own ([§28.3](#sec-local-variables-ownership-and-borrows) borrow-lifetime rules). The `Owned*` name denotes element ownership, not container ownership.
+- An owning-collection or owning-wrapper return type (`OwnedArray<T>`, `Shared<T>`, etc.) declared without `owned` produces a **borrow** (the `Owned*` name denotes element ownership, orthogonal to the `owned` container qualifier); the general borrow-return rules apply — a bare owning-collection *field* read is returnable (source: receiver), a borrowed local/parameter with no outliving source is not, and a `move`d field or fresh owning value requires an `owned` return ([§28.3](#sec-local-variables-ownership-and-borrows), [§28.6](#sec-leak-prevention)).
+- A *borrowed* owning collection grants read access only: `Dispose`, `Drain`, `Pop*`/`Dequeue`, the owning `Add`, the ownership-taking indexer-set, `Insert`, `Remove*`, and `Clear` are compile errors on a borrow; indexer-get, `Count`/`Length`, `Contains`, iteration, the borrowing LINQ queries, and `ToArray`/`Sorted`/`Reversed` are permitted ([§28.6](#sec-borrowed-owning-collections)).
 - An unbound owned temporary — the result of an `owned`-returning producer that is not bound, `move`d, returned, or transferred, used only by borrowing operations within its expression — is disposed exactly once at the end of that full expression, after its uses complete ([§28.3](#sec-unbound-owned-temporaries)).
 - `using var` variables may not be reassigned.
 - Records may not have `owned` fields, may not have inline-array fields with the `owned` slot marker, may not have destructors, may not implement `IDisposable`.
