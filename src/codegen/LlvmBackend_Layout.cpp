@@ -175,9 +175,19 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
     if (op == "&") return builder_.CreateAnd(l, r);
     if (op == "|") return builder_.CreateOr(l, r);
     if (op == "^") return builder_.CreateXor(l, r);
-    if (op == "<<") return builder_.CreateShl(l, r);
-    if (op == ">>")
-        return uns ? builder_.CreateLShr(l, r) : builder_.CreateAShr(l, r);
+    // §6.5 (#1041): the shift count is reduced modulo the operand's bit width —
+    // exactly as the non-compound `<<`/`>>` path does (LlvmBackend_Exprs.cpp).
+    // LLVM shl/lshr/ashr with a count >= the bit width produces poison, so
+    // without this mask `x <<= 40` (i32) emitted `shl x, 40` and yielded a wrong
+    // value (the non-compound `x << 40` correctly gave `x << 8`). Mask to
+    // [0, bitwidth-1] before the shift.
+    if (op == "<<" || op == ">>") {
+        unsigned bits = l->getType()->getIntegerBitWidth();
+        llvm::Value* cnt = builder_.CreateAnd(
+            r, llvm::ConstantInt::get(r->getType(), bits - 1), "shcnt");
+        if (op == "<<") return builder_.CreateShl(l, cnt);
+        return uns ? builder_.CreateLShr(l, cnt) : builder_.CreateAShr(l, cnt);
+    }
     return nullptr;
 }
 

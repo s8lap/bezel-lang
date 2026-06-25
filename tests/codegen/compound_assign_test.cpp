@@ -81,3 +81,27 @@ BEZEL_TEST(codegen_cg31, compound_on_instance_field) {
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 42);
 }
+
+// #1041 / §6.5: the compound shift assignments `<<=` / `>>=` must reduce the
+// shift count modulo the operand's bit width, exactly as the non-compound
+// `<<` / `>>` do (L538). Before the fix, emitCompoundOp emitted a raw
+// `shl`/`lshr`/`ashr` with the unmasked count, so `x <<= 40` on an i32
+// produced poison (a wrong value) while `x << 40` correctly gave `x << 8`.
+BEZEL_TEST(codegen_1041_compound_shift, shl_count_reduced_mod_width) {
+    // 40 mod 32 = 8 → 1 << 8 = 256.
+    BEZEL_EXPECT_EQ(run("var x: int := 1; x <<= 40; return x;"), 256);
+}
+BEZEL_TEST(codegen_1041_compound_shift, shr_count_reduced_mod_width) {
+    // 40 mod 32 = 8 → 256 >> 8 = 1.
+    BEZEL_EXPECT_EQ(run("var x: int := 256; x >>= 40; return x;"), 1);
+}
+BEZEL_TEST(codegen_1041_compound_shift, shl_variable_count_reduced) {
+    BEZEL_EXPECT_EQ(run("var x: int := 1; var y: int := 40; x <<= y; return x;"), 256);
+}
+BEZEL_TEST(codegen_1041_compound_shift, long_count_reduced_mod_64) {
+    // long is 64-bit: 65 mod 64 = 1 → 1 << 1 = 2 (confirms per-type width).
+    BEZEL_EXPECT_EQ(run("var x: long := 1; x <<= 65; return int(x);"), 2);
+}
+BEZEL_TEST(codegen_1041_compound_shift, ordinary_shift_still_correct) {
+    BEZEL_EXPECT_EQ(run("var x: int := 1; x <<= 4; return x;"), 16);
+}
