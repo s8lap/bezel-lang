@@ -3311,6 +3311,21 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(av)) {
             // `move x` / `move x.f` of an owned reference (not a value-type move).
             if (un->op == "move") isOwnedTempArg = true;
+        } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(av)) {
+            // #1019: an owned-returning operator result (`a + b` with
+            // `operator +(...): owned Cell`) is a fresh owned class temporary too.
+            if (auto* sym = ctx_.exprSymbol(*be))
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+                    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
+                        if (od->returnOwned) isOwnedTempArg = true;
+        } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(av)) {
+            // #1019: a call to a user method declared `owned`-return produces a
+            // fresh owned class temporary (`f(Make())` with `Make(): owned Cell`).
+            if (ce->callee)
+                if (auto* sym = ctx_.exprSymbol(*ce->callee))
+                    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+                        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                            if (md->returnOwned) isOwnedTempArg = true;
         }
         if (isOwnedTempArg && !disposeStack_.empty() &&
             v->getType()->isPointerTy() &&
@@ -3323,10 +3338,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 llvm::AllocaInst* tslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, tslot);
                 Disposal d{tslot, nullptr};
-                d.unwindOnly = true;       // fire ONLY on the exception edge
-                d.dynamicDispose = false;  // unwindOnly path uses dynamic dispatch
-                disposeStack_.back().push_back(d);
-                argTempSlots.push_back(tslot);
+                if (params[idx].modifier == "owned") {
+                    // #993: an `owned` parameter takes ownership on the normal
+                    // path, so this entry is unwind-ONLY (fires only if a LATER
+                    // argument throws) and is DISCHARGED below before the call —
+                    // the callee then disposes it (dispose-exactly-once).
+                    d.unwindOnly = true;
+                    d.dynamicDispose = false;
+                    disposeStack_.back().push_back(d);
+                    argTempSlots.push_back(tslot);
+                } else {
+                    // #1019: a BORROW parameter does NOT take ownership — the fresh
+                    // owned temporary is borrowed for the call duration and must be
+                    // disposed at scope end on BOTH the normal and unwind edges. It
+                    // is NOT added to argTempSlots, so the pre-call discharge leaves
+                    // it intact; dynamicDispose dispatches Dispose+reclaim through
+                    // the object's own vtable, null-guarded. Only a FRESH producer
+                    // (new / move / owned operator / owned call) reaches here — a
+                    // bound-local / field / param borrow argument is not one of
+                    // these shapes, so it is never disposed (no double-free / UAF).
+                    d.dynamicDispose = true;
+                    disposeStack_.back().push_back(d);
+                }
             }
         }
     }

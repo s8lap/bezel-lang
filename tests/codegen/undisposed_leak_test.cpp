@@ -700,3 +700,70 @@ BEZEL_TEST(undisposed_leak, operator_owned_chained_result_auto_dropped_965) {
     int lsan = runUnderLeakSanitizer(src);
     if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
 }
+
+// §28.3 (#1019): a fresh owned CLASS temporary passed to a BORROW parameter is
+// borrowed for the call duration and must be disposed at scope end (normal AND
+// unwind). Before the fix the #993 arg-temp discharge erased the disposal
+// assuming the callee took ownership — true only for an `owned` parameter; a
+// borrow parameter does not, so the temp leaked on the normal path.
+namespace {
+const char* kArgCell =
+    "class Cell public static n: int := 0; public V: int := 7; "
+    "  public constructor() Cell.n:=Cell.n+1; end constructor; "
+    "  destructor Cell.n:=Cell.n-1; end destructor; "
+    "  public static method operator +(a: Cell, b: Cell): owned Cell => new Cell(); "
+    "  public static method Make(): owned Cell => new Cell(); "
+    "end Cell; "
+    "class P "
+    "  public static method Use(c: Cell): int return 0; end Use; "       // BORROW
+    "  public static method Take(owned c: Cell): int c.Dispose(); return 0; end Take; "
+    "end P; ";
+}  // namespace
+
+// `P.Use(new Cell())` — fresh `new` temp to a borrow param: disposed once.
+BEZEL_TEST(undisposed_leak, fresh_new_arg_to_borrow_param_disposed_1019) {
+    std::string src = std::string("module M; ") + kArgCell +
+        "class C public static method Main(): int "
+        "  do var k := P.Use(new Cell()); end; return Cell.n; "  // 0
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 0);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// `P.Use(a + b)` (owned operator result) and `P.Use(Cell.Make())` (owned call)
+// as borrow args are likewise disposed once.
+BEZEL_TEST(undisposed_leak, fresh_operator_and_call_args_to_borrow_param_disposed_1019) {
+    std::string src = std::string("module M; ") + kArgCell +
+        "class C public static method Main(): int "
+        "  do using var a := new Cell(); using var b := new Cell(); "
+        "     var k := P.Use(a + b); var m := P.Use(Cell.Make()); end; "
+        "  return Cell.n; "                                       // 0
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 0);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// SOUNDNESS controls — no double-free:
+//   * an `owned` parameter takes ownership (callee disposes); the caller does NOT
+//     also dispose the temp.
+//   * a BOUND-local borrow argument (`P.Use(x)`) is not a fresh producer, so it is
+//     never disposed by the arg path — its own `using var` disposes it once.
+BEZEL_TEST(undisposed_leak, owned_param_and_bound_local_args_no_double_free_1019) {
+    std::string srcOwned = std::string("module M; ") + kArgCell +
+        "class C public static method Main(): int "
+        "  do var k := P.Take(new Cell()); end; return Cell.n; "  // 0 — callee disposes
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(srcOwned), 0);
+    int l1 = runUnderLeakSanitizer(srcOwned);
+    if (l1 >= 0) BEZEL_EXPECT_EQ(l1, 0);
+
+    std::string srcBound = std::string("module M; ") + kArgCell +
+        "class C public static method Main(): int "
+        "  do using var x := new Cell(); var k := P.Use(x); end; return Cell.n; "  // 0
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(srcBound), 0);
+    int l2 = runUnderLeakSanitizer(srcBound);
+    if (l2 >= 0) BEZEL_EXPECT_EQ(l2, 0);
+}
