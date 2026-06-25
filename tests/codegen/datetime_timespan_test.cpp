@@ -355,3 +355,43 @@ BEZEL_TEST(codegen_datetime_2_5, maxvalue_greater_than_minvalue) {
         "if maxv > minv then return 1; end; "
         "return 0; ")), 1);
 }
+
+// ===========================================================================
+// #1026 / §2.5: a CHAINED-receiver DateTime instance method — calling the method
+// directly on a non-identifier receiver (here a `new DateTime(...)` NewExpr, or
+// any property/call result) rather than binding it to a local first.
+//
+// Root cause: tryLowerBuiltinClassCall (LlvmBackend_Calls.cpp) returned early at
+// the static-call guard `if (!id) return nullptr` (which required an
+// IdentifierExpr receiver to key the static `cls`-named handlers) BEFORE the
+// DateTime instance handlers. A chained receiver is a MemberAccessExpr / NewExpr,
+// so the instance call lowered to a no-op / wrong value (AddDays not applied).
+// Fix: the guard no longer returns early — it gives the static handlers an empty
+// `cls` (matching no class) for a non-identifier receiver so they fall through to
+// the instance handlers. Same root cause as #1025 (cancellation).
+// ===========================================================================
+
+// #1026: chained `new DateTime(2024,3,15).AddDays(2).Day` == 17 (Mar 15 + 2).
+// Before the fix this returned a wrong value (AddDays dropped on the chained
+// NewExpr receiver). The bound form `var dt := …; dt.AddDays(2)` already worked.
+BEZEL_TEST(codegen_datetime_1026, chained_new_add_days_applied) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15).AddDays(2); "
+        "return d.Day; ")), 17);
+}
+
+// #1026: chained AddMonths on a NewExpr receiver — Mar + 2 months = May (5).
+BEZEL_TEST(codegen_datetime_1026, chained_new_add_months_applied) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15).AddMonths(2); "
+        "return d.Month; ")), 5);
+}
+
+// #1026 control: the bound form still produces the same result (regression guard
+// that the guard change did not perturb the identifier-receiver path).
+BEZEL_TEST(codegen_datetime_1026, bound_add_days_unchanged) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var dt := new DateTime(2024, 3, 15); "
+        "var d := dt.AddDays(2); "
+        "return d.Day; ")), 17);
+}

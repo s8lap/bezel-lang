@@ -4714,8 +4714,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     }
 
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id) return nullptr;
-    const auto cls = id->name;
+    // #1026: do NOT return early when the receiver is not a bare identifier. The
+    // static-call (cls-keyed) handlers below — CString.From, Math.Sqrt,
+    // Convert.*, Environment.*, etc. — need an identifier-named class, but the
+    // INSTANCE-method handlers further down (Stopwatch, DateTime, ...) dispatch
+    // on the receiver's exprType and accept ANY receiver expression. A chained
+    // receiver like `DateTime.UnixEpoch.AddDays(2)` is a MemberAccessExpr, not an
+    // IdentifierExpr, so the old `if (!id) return nullptr` made every chained
+    // instance call silently lower to a no-op (the receiver was not even
+    // evaluated — wrong values, e.g. AddDays not applied). Instead, give the
+    // static handlers an EMPTY `cls` (which matches no class name) when the
+    // receiver is non-identifier so they all fall through to the instance
+    // handlers. (No code after this point dereferences `id` except `cls`.)
+    const std::string_view cls = id ? id->name : std::string_view{};
     const auto& m = ma->member;
 
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes
