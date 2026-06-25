@@ -693,3 +693,72 @@ const char* kEscapingFieldReassignedNotFreed =
 BEZEL_TEST(codegen_env_disposer_672, escaping_field_reassigned_no_corruption_694) {
     expectValueAndNoCorruption(kEscapingFieldReassignedNotFreed, 5);
 }
+
+// #1017 / §27.5: an owned / `using var` local captured by ≥2 non-escaping
+// closures that BOTH capture it. Each closure boxes the local into the SAME
+// shared heap cell (boxLocalSlot reuses it for the 2nd capture). The plain
+// boxedCellFree is suppressed by the hasOwnerDisposal guard (the local's own
+// using-var disposal reads the object THROUGH the cell, and LIFO order would
+// free the cell first → UAF), so before the fix the 8-byte cell LEAKED (masked
+// by LSan reachability in some shapes; the method-scope shape below reports it).
+// The fix registers a DEFERRED cell-free in the owner's scope that runs AFTER
+// the owner disposal and every capturing closure release — freeing the cell
+// exactly once. Value: box.V == 5 (Add(2) then Add(3)); LSan clean (no leak, no
+// double-free of the shared cell). Load-bearing on the LSan leg.
+const char* kTwoClosuresShareUsingVarCell_1017 =
+    "module M; "
+    "class Box public V: int := 0; "
+    "  public method Add(x: int): int V := V + x; return V; end Add; "
+    "end Box; "
+    "class C public static method Main(): int "
+    "  using var box := new Box(); "
+    "  var f1: (int) -> int := (x) => box.Add(x); "
+    "  var f2: (int) -> int := (x) => box.Add(x); "
+    "  var a := f1(2); var b := f2(3); "
+    "  return box.V; "   // 5
+    "end Main; end C;";
+BEZEL_TEST(codegen_env_disposer_672, two_closures_share_using_var_cell_freed_1017) {
+    expectValueAndLeakFree(kTwoClosuresShareUsingVarCell_1017, 5);
+}
+
+// #1017 control: the SAME shape with a `do … end` block around the captured
+// `using var` (owner disposal in an inner scope). The deferred cell-free must be
+// registered in the OWNER's scope (#966) and fire after the owner disposal —
+// value correct, LSan clean, no double-free across the inner-block exit.
+const char* kTwoClosuresShareCellInnerScope_1017 =
+    "module M; "
+    "class Box public V: int := 0; "
+    "  public method Add(x: int): int V := V + x; return V; end Add; "
+    "end Box; "
+    "class C public static method Main(): int "
+    "  var r: int := 0; "
+    "  do "
+    "    using var box := new Box(); "
+    "    var f1: (int) -> int := (x) => box.Add(x); "
+    "    var f2: (int) -> int := (x) => box.Add(x); "
+    "    var a := f1(2); var b := f2(3); "
+    "    r := box.V; "
+    "  end; "
+    "  return r; "   // 5
+    "end Main; end C;";
+BEZEL_TEST(codegen_env_disposer_672, two_closures_share_cell_inner_scope_freed_1017) {
+    expectValueAndLeakFree(kTwoClosuresShareCellInnerScope_1017, 5);
+}
+
+// #1017 control: a SINGLE closure capturing a `using var` local — the cell was
+// already freed before the fix (regression guard that the deferred path did not
+// perturb the single-capture case). Value correct, LSan clean.
+const char* kSingleClosureUsingVarCell_1017 =
+    "module M; "
+    "class Box public V: int := 0; "
+    "  public method Add(x: int): int V := V + x; return V; end Add; "
+    "end Box; "
+    "class C public static method Main(): int "
+    "  using var box := new Box(); "
+    "  var f1: (int) -> int := (x) => box.Add(x); "
+    "  var a := f1(2); "
+    "  return box.V; "   // 2
+    "end Main; end C;";
+BEZEL_TEST(codegen_env_disposer_672, single_closure_using_var_cell_freed_1017) {
+    expectValueAndLeakFree(kSingleClosureUsingVarCell_1017, 2);
+}

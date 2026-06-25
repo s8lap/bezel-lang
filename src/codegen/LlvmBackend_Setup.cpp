@@ -5672,8 +5672,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // SIGSEGV on `do var g := () => r.V; end; return r.V;`). Search EVERY
             // live scope, not just the innermost one.
             bool hasOwnerDisposal = false;
-            for (const auto& scope : disposeStack_) {
-                for (const auto& existing : scope) {
+            std::size_t ownerScopeIdx = 0;
+            for (std::size_t si = 0; si < disposeStack_.size(); ++si) {
+                for (const auto& existing : disposeStack_[si]) {
                     if (existing.slot != ce.newSlot) continue;
                     // These flags indicate disposals that do NOT read through the
                     // cell (they just release a runtime-managed value stored in
@@ -5681,16 +5682,46 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // cell pointer). All other disposals use boxedStorage(slot)
                     // which dereferences the cell — unsafe to free beforehand.
                     if (existing.stringRelease || existing.closureRelease ||
-                        existing.boxRelease    || existing.boxedCellFree)
+                        existing.boxRelease    || existing.boxedCellFree ||
+                        existing.boxedCellFreeDeferred)
                         continue;
                     // This existing disposal READS THROUGH the cell; freeing the
                     // cell via boxedCellFree would be a UAF.
                     hasOwnerDisposal = true;
+                    ownerScopeIdx = si;
                     break;
                 }
                 if (hasOwnerDisposal) break;
             }
-            if (hasOwnerDisposal) continue;  // leave cell alive for owner disposal
+            if (hasOwnerDisposal) {
+                // #1017: the plain boxedCellFree is unsafe (the owner disposal in
+                // disposeStack_[ownerScopeIdx] reads the object through the cell,
+                // and LIFO order would free it first → UAF). Instead register a
+                // DEFERRED cell-free in the OWNER's scope — emitDisposals frees it
+                // in a second pass, AFTER every main-loop disposal in that scope
+                // (so after the owner reads through it and every capturing env is
+                // released). Without this the cell leaked (8 bytes). Only for a
+                // plain cell (no inline-array elements — that path stays the
+                // documented #747/#782 skip). Dedup: a second closure capturing the
+                // same local hits this branch too, but its cell is alreadyBoxed so
+                // it is never in lastLambdaCapturedCells_; still guard against a
+                // duplicate deferred entry on the same slot in the owner scope.
+                if (ce.inlineArrayN == 0) {
+                    bool alreadyDeferred = false;
+                    for (const auto& existing : disposeStack_[ownerScopeIdx])
+                        if (existing.slot == ce.newSlot &&
+                            existing.boxedCellFreeDeferred) {
+                            alreadyDeferred = true;
+                            break;
+                        }
+                    if (!alreadyDeferred) {
+                        Disposal dcd{ce.newSlot, nullptr};
+                        dcd.boxedCellFreeDeferred = true;
+                        disposeStack_[ownerScopeIdx].push_back(dcd);
+                    }
+                }
+                continue;  // leave cell alive for owner disposal (freed deferred)
+            }
             // §27.5 / §28.9 (#969): even a VALUE-typed captured local (which has
             // no reads-through-cell disposal, so the guard above misses it) is
             // read through the cell after the inner block exits when it was
@@ -11447,6 +11478,10 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCall(freeFn(), {cell});
             continue;
         }
+        // #1017: a DEFERRED boxed-cell free is handled in the SECOND pass below
+        // (after every main-loop disposal in this scope), not here — the owner
+        // disposal reads the object through the cell and must run first.
+        if (it->boxedCellFreeDeferred) continue;
         // #383 / §31.1: the caught exception object. On a normal handled exit
         // it is freed (destructor + base chain + block, via its vtable); on the
         // unwind path it is SKIPPED — a re-raise/throw leaving the arm keeps it
@@ -12247,6 +12282,25 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
+    }
+    // #1017 SECOND PASS: free any boxed capture cells whose plain boxedCellFree
+    // was suppressed (boxedCellFreeDeferred). This runs AFTER every main-loop
+    // disposal in this scope — including the owner's reads-through-cell disposal
+    // (using var / collection / dict / subscription / ... — it loads the object
+    // THROUGH the cell) and every capturing closure's release — so the cell has
+    // no live reader or env reference left. Freeing here (instead of the
+    // suppressed boxedCellFree, which LIFO order would have fired BEFORE the owner
+    // disposal → UAF) closes the 8-byte capture-cell leak. free(null) is a no-op
+    // (guarded boxing may leave the cell-holder null). Exactly-once: a deferred
+    // entry is registered ONLY where boxedCellFree was suppressed (mutually
+    // exclusive with boxedCellFree) and deduped per slot, so the cell is freed
+    // exactly once across both the normal and the unwind exit (a given exit goes
+    // one way only). Fires on both paths, symmetric with boxedCellFree.
+    for (const auto& d : scope) {
+        if (!d.boxedCellFreeDeferred) continue;
+        llvm::Value* cell =
+            builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
+        builder_.CreateCall(freeFn(), {cell});
     }
 }
 

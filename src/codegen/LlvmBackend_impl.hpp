@@ -778,6 +778,22 @@ private:
         //       free(null) is a no-op per POSIX.
         // Fires on BOTH normal and unwind paths (symmetric with closureRelease).
         bool boxedCellFree = false;
+        // #1017 / §27.5: a boxed capture cell whose plain `boxedCellFree` was
+        // SUPPRESSED by the hasOwnerDisposal guard (an owned / `using var` local
+        // captured by ≥1 non-escaping closure: the local's own scope-end disposal
+        // reads the object THROUGH the cell, so a `boxedCellFree` firing first
+        // would UAF). Freeing the cell was therefore skipped entirely and it
+        // leaked (8 bytes; masked by LSan reachability in some shapes). This
+        // deferred entry is registered in the OWNER's scope (the scope that holds
+        // the reads-through-cell disposal — possibly an ENCLOSING scope, #966) and
+        // is freed in a SECOND pass of emitDisposals, AFTER every main-loop
+        // disposal in that scope has fired — so the owner has already read the
+        // object through the cell and every capturing closure (env) has been
+        // released. Mutually exclusive with `boxedCellFree` (one or the other,
+        // never both → freed exactly once), and gated by cellFreeEligible_ (no
+        // escaping env holds the cell past scope exit → no UAF). `slot` is the
+        // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
+        bool boxedCellFreeDeferred = false;
         // §15.3 / §15.1.1 (#747): a move-only OWNING inline-array local
         // ([N owned]T? / [N owned]T) whose ownership is NOT transferred out of
         // the local anywhere in the body (per the inlineOwnedArrayTransferred_
