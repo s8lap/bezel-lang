@@ -6884,7 +6884,7 @@ None. The §28.3 amendment narrows no program that previously compiled and admit
 
 ### v0.143 changelog (v0.142 → v0.143)
 
-**Clarification — bitwise/shift operators do not lift to `bool?`/`char?` (§7.11).** §7.11's "Arithmetic, bitwise, and shift operators" paragraph listed `&`, `|`, `^`, `<<`, `>>`, `~` among the lifting operators without restating that they apply only to the integer types §6.5 defines them on. Read in isolation, that admitted a lifted `bool? & bool?`, contradicting both §6.5 ("not valid on `bool`, `char`, or floating-point types … Boolean operations use `and`/`or`/`not`") and §7.11's own opening rule that an operator lifts only when its underlying type `T` is "a primitive on which a built-in operator … is defined." The compiler had drifted accordingly — the nullable-lifting path treated `bool?` as an `i1` integer and accepted `bool? & bool?`. §7.11 now states explicitly that the bitwise and shift operators do not lift to `bool?`/`char?`, mirroring the *No three-valued logic* rule already stated for `bool?` `and`/`or`/`not`. Resolves the §6.5-vs-§7.11 reading raised by the R39 sweep (issue #741); owner decision 2026-06-15.
+**Clarification — bitwise/shift operators do not lift to `bool?`/`char?` (§7.11).** §7.11's "Arithmetic, bitwise, and shift operators" paragraph listed `&`, `|`, `^`, `<<`, `>>`, `~` among the lifting operators without restating that they apply only to the integer types §6.5 defines them on. Read in isolation, that admitted a lifted `bool? & bool?`, contradicting both §6.5 ("not valid on `bool`, `char`, or floating-point types … Boolean operations use `and`/`or`/`not`") and §7.11's own opening rule that an operator lifts only when its underlying type `T` is "a primitive on which a built-in operator … is defined." The compiler had drifted accordingly — the nullable-lifting path treated `bool?` as an `i1` integer and accepted `bool? & bool?`. §7.11 now states explicitly that the bitwise and shift operators do not lift to `bool?`/`char?`, mirroring the *No three-valued logic* rule already stated for `bool?` `and`/`or`/`not`. Resolves the §6.5-vs-§7.11 reading raised by the R39 sweep (issue #741).
 
 #### What changed
 - §7.11's bitwise/shift paragraph gains one sentence: an operator lifts only where defined on `T`, so the bitwise and shift operators do not lift to `bool?`/`char?`. No new rule — this restates §6.5 and §7.11's opening sentence in the place a reader of the lift list would look.
@@ -6899,7 +6899,7 @@ A program that applied a bitwise or shift operator to a `bool` or `char` operand
 
 ### v0.144 changelog (v0.143 → v0.144)
 
-**`when` is now a keyword for scrutinee-less condition dispatch; `case` always takes a scrutinee (§19, Appendix A).** Through v0.143 a `case` could be written two ways: with a scrutinee (`case x ...`) or without one, in which case each arm was a full boolean condition. The two readings shared the keyword `case`, and the parser told them apart by *source layout* — whether the first arm started on a line after `case`, or whether an `or`/`and`/`=` appeared before the first `=>`. That made a `case`'s meaning depend on where line breaks fell, and it left a genuine ambiguity unresolved: §19.3 has always listed the leading-open range pattern `..<0` as legal, but in `case x ..<0 => …` the scrutinee parser could not tell `x ..<0` (a range scrutinee) from `x` followed by the pattern `..<0`, so the compiler rejected the very pattern the spec admitted. Issue #744; owner-directed 2026-06-17.
+**`when` is now a keyword for scrutinee-less condition dispatch; `case` always takes a scrutinee (§19, Appendix A).** Through v0.143 a `case` could be written two ways: with a scrutinee (`case x ...`) or without one, in which case each arm was a full boolean condition. The two readings shared the keyword `case`, and the parser told them apart by *source layout* — whether the first arm started on a line after `case`, or whether an `or`/`and`/`=` appeared before the first `=>`. That made a `case`'s meaning depend on where line breaks fell, and it left a genuine ambiguity unresolved: §19.3 has always listed the leading-open range pattern `..<0` as legal, but in `case x ..<0 => …` the scrutinee parser could not tell `x ..<0` (a range scrutinee) from `x` followed by the pattern `..<0`, so the compiler rejected the very pattern the spec admitted. Issue #744.
 
 The fix gives condition dispatch its own keyword. **`when`** (already a reserved word — it introduces a `case`/`catch` arm guard) is now also the scrutinee-less construct: `when Arm ("," Arm)* end`, each arm a boolean condition, first-true wins, valid in both expression and statement position. The construct use and the guard use never collide — the construct `when` heads an expression or statement, the guard `when` follows a pattern inside an arm. With condition dispatch peeled off, **`case` always carries a scrutinee**; a `case` with no scrutinee is now a syntax error. Because the scrutinee is unconditional, the parser parses it above the range precedence level, which makes the leading-open range pattern (`..<0`, `..5`) unambiguous and finally legal.
 
@@ -6919,7 +6919,7 @@ A scrutinee-less `case` (e.g. `case\n  x >= 90 => …\nend`) no longer parses; r
 
 ### v0.145 changelog (v0.144 → v0.145)
 
-v0.145 folds three decided amendments: a cast-semantics clarification paired with a new bit-reinterpretation intrinsic, a LINQ standard-library completion, and a grammar-appendix catch-up. All three are additive or clarifying; none changes the meaning of an existing conforming program except where one previously relied on undefined-by-the-spec behaviour. Owner-directed 2026-06-19.
+v0.145 folds three decided amendments: a cast-semantics clarification paired with a new bit-reinterpretation intrinsic, a LINQ standard-library completion, and a grammar-appendix catch-up. All three are additive or clarifying; none changes the meaning of an existing conforming program except where one previously relied on undefined-by-the-spec behaviour.
 
 #### Amendment 1 — same-width signed↔unsigned casts are checked; `BitConverter.Reinterpret<T>` added (spec §5.2, stdlib §2.12; #753)
 
@@ -6949,7 +6949,7 @@ Amendment 1's compiler change overturns one pre-existing codegen test (`long_min
 
 ### v0.146 changelog (v0.145 → v0.146)
 
-v0.146 is an errata revision. It corrects three code-example defects in which an example used syntax the spec itself does not admit; the surrounding prose and every normative rule are unchanged, and the compiler already rejected each of these three examples correctly. No conforming program changes meaning. Owner-directed 2026-06-23; the defects were surfaced by a triage of the conformance-example corpus and are tracked as #978.
+v0.146 is an errata revision. It corrects three code-example defects in which an example used syntax the spec itself does not admit; the surrounding prose and every normative rule are unchanged, and the compiler already rejected each of these three examples correctly. No conforming program changes meaning. The defects were surfaced by a triage of the conformance-example corpus and are tracked as #978.
 
 #### Erratum 1 — §17.7 `new()` shorthand example used `:` for a named argument
 
@@ -6975,7 +6975,7 @@ None. No normative rule changed; the corrected examples now compile as the surro
 
 ### v0.147 changelog (v0.146 → v0.147)
 
-v0.147 resolves a standard-library specification ambiguity in stdlib §10.1 (`CString.FromBytes`). It pins a previously-contradictory contract to match both the method's own signature and the compiler's existing behaviour; no language rule changes. Owner-directed 2026-06-23; tracked as #982.
+v0.147 resolves a standard-library specification ambiguity in stdlib §10.1 (`CString.FromBytes`). It pins a previously-contradictory contract to match both the method's own signature and the compiler's existing behaviour; no language rule changes. Tracked as #982.
 
 #### The defect
 
@@ -6997,7 +6997,7 @@ None. The compiler implementation already provides exactly the copy-in-and-appen
 
 ### v0.148 changelog (v0.147 → v0.148)
 
-v0.148 renames the four `Encoding` singletons from PascalCase (`Utf8`/`Utf16`/`Utf32`/`Ascii`) to all-caps (`UTF8`/`UTF16`/`UTF32`/`ASCII`) to match the spec prose and .NET convention. Owner-directed 2026-06-23; tracked as #988.
+v0.148 renames the four `Encoding` singletons from PascalCase (`Utf8`/`Utf16`/`Utf32`/`Ascii`) to all-caps (`UTF8`/`UTF16`/`UTF32`/`ASCII`) to match the spec prose and .NET convention. Tracked as #988.
 
 #### The defect
 
@@ -7021,7 +7021,7 @@ Replace `Encoding.Utf8` with `Encoding.UTF8`, `Encoding.Utf16` with `Encoding.UT
 
 ### v0.149 changelog (v0.148 → v0.149)
 
-v0.149 is an ownership-soundness pass that closes three holes in the enforcement of the ownership model for method returns and owned temporaries. Two are enforcement of rules the spec already stated; the third adds one normative rule for unbound owned temporaries. Owner-directed 2026-06-25; tracked as #1007, #1005, #1006.
+v0.149 is an ownership-soundness pass that closes three holes in the enforcement of the ownership model for method returns and owned temporaries. Two are enforcement of rules the spec already stated; the third adds one normative rule for unbound owned temporaries. Tracked as #1007, #1005, #1006.
 
 #### The defects
 
@@ -7057,7 +7057,7 @@ The remaining ergonomic and uniformity questions are tracked separately (#1008):
 
 ### v0.150 changelog (v0.149 → v0.150)
 
-v0.150 is the first half of the #1008 ergonomics pass: it makes the ownership discipline **affine** (auto-drop with a must-use warning) and folds the materializer reclaim into one uniform `owned`-driven rule. Owner-directed 2026-06-25. The borrowed-owning-collection return (Part C of #1008) is soundness-delicate and resolves a separate spec defect, so it lands in its own revision (v0.151).
+v0.150 is the first half of the #1008 ergonomics pass: it makes the ownership discipline **affine** (auto-drop with a must-use warning) and folds the materializer reclaim into one uniform `owned`-driven rule. The borrowed-owning-collection return (Part C of #1008) is soundness-delicate and resolves a separate spec defect, so it lands in its own revision (v0.151).
 
 #### The inconsistency
 
@@ -7111,7 +7111,7 @@ Language spec: §28.6 (bare owned-field read = borrow; transfer requires `owned`
 
 Mostly source-compatible, with one deliberate tightening to flag for review. A method that returns a bare owning-collection field through a non-`owned` return (rejected today by #1007) will compile once Part C lands. A method that *transfers* a field out still requires `owned` (unchanged). Callers of a borrowed owning collection that attempt `Dispose`/`Drain`/mutation get a new, precise compile error rather than a latent double-free.
 
-The tightening: because the caller's classifier cannot see the callee's body, a non-`owned` owning-collection return must mean *one* thing, and v0.151 makes it mean **borrow**. The consequence is that a method returning a *freshly-produced* owning value through a non-`owned` return — `Make(): OwnedArray<T> => new OwnedArray<T>(...)`, which compiles under v0.150 because the caller's name-head heuristic rescues it as owned — must declare `owned OwnedArray<T>` under v0.151. This is a source-breaking change for that pattern (the implementing PR should ship the diagnostic with a clear fix-it), and it is the price of distinguishing borrow-returns from owned-returns by signature alone. The alternative — having the caller inspect the callee body / module metadata to decide owned-vs-borrow per call — avoids the tightening at the cost of substantially more machinery. **This trade-off is a design decision flagged for owner confirmation before the Part C implementation lands.**
+The tightening: because the caller's classifier cannot see the callee's body, a non-`owned` owning-collection return must mean *one* thing, and v0.151 makes it mean **borrow**. The consequence is that a method returning a *freshly-produced* owning value through a non-`owned` return — `Make(): OwnedArray<T> => new OwnedArray<T>(...)`, which compiles under v0.150 because the caller's name-head heuristic rescues it as owned — must declare `owned OwnedArray<T>` under v0.151. This is a source-breaking change for that pattern (the diagnostic ships with a clear fix-it), and it is the price of distinguishing borrow-returns from owned-returns by signature alone. The alternative — having the caller inspect the callee body / module metadata to decide owned-vs-borrow per call — avoids the tightening at the cost of substantially more machinery; it remains available as a non-breaking future widening should the source-break prove too costly. **v0.151 adopts the tightening.**
 
 ---
 
