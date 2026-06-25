@@ -292,6 +292,58 @@ const char* kOperatorResultAutoDrop =
     "  end Main; "
     "end Cell;";
 
+// (g) #1024 / §28.3 / §28.5: an INTERFACE-typed local initialized with a concrete
+// `new Factory()` and disposed via an explicit `f.Dispose()`. classOfLocal returns
+// the declared INTERFACE symbol (kind != Class), so unwindOwnedLocalClass's `new`
+// case (a) missed the concrete class and explicitDisposeOwnedReceiverSlot stayed
+// dispatch-only: the destructor ran once via the vtable (exit 1 with or without the
+// fix) but the 16-byte block LEAKED — only the LSan leg catches it. The concrete-
+// typed equivalent (`var f := new Factory(); f.Dispose()`) reclaims, so this was an
+// interface/concrete parity gap. The fix recovers the concrete class from the
+// NewExpr. Load-bearing on LSan (destructor-count is 1 either way).
+const char* kInterfaceLocalExplicitDispose =
+    "module M; "
+    "interface IThing method Ping(): int; end IThing; "
+    "class Factory : IThing "
+    "  public static _n: int := 0; "
+    "  public method Ping(): int => 9; "
+    "  destructor Factory._n := Factory._n + 1; end destructor; "
+    "end Factory; "
+    "class C public static method Main(): int "
+    "  var f: IThing := new Factory(); "
+    "  var p := f.Ping(); "
+    "  f.Dispose(); "
+    "  return Factory._n; "
+    "end Main; end C;";
+
+// (h) #1024 / §28.3: the same interface-typed local explicitly disposed, then an
+// exception unwinds the scope. The fix newly registers the unwind-only disposal for
+// an interface-typed `new` local (registerUnwindOwnedLocal via unwindOwnedLocalClass),
+// so this guards that the explicit dispose's slot-null makes the unwind disposal a
+// no-op — destructor runs EXACTLY once (exit 1) and NO double-free. Load-bearing on
+// LSan (a missing null-guard would double-free the block on the unwind edge).
+const char* kInterfaceExplicitThenThrow =
+    "module M; "
+    "interface IThing method Ping(): int; end IThing; "
+    "class Factory : IThing "
+    "  public static _n: int := 0; "
+    "  public method Ping(): int => 9; "
+    "  destructor Factory._n := Factory._n + 1; end destructor; "
+    "end Factory; "
+    "class C "
+    "  public static method Boom(): int throw new ArgumentException(\"x\"); end Boom; "
+    "  public static method Main(): int "
+    "    try "
+    "      var f: IThing := new Factory(); "
+    "      f.Dispose(); "
+    "      var z := C.Boom(); "
+    "      return z; "
+    "    catch "
+    "      var e: Exception => return Factory._n; "
+    "    end; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 BEZEL_TEST(codegen_explicit_dispose_reclaim_415, plain_local_explicit_only_freed) {
@@ -338,4 +390,19 @@ BEZEL_TEST(codegen_explicit_dispose_reclaim_1018, operator_result_auto_drop_free
 // Error→Warning downgrade of double-dispose.
 BEZEL_TEST(codegen_explicit_dispose_reclaim_415, double_explicit_dispose_runs_once_no_uaf_28_2) {
     expectDisposedAndLeakFree(kDoubleExplicitDispose, 1);
+}
+
+BEZEL_TEST(codegen_explicit_dispose_reclaim_1024, interface_typed_local_explicit_dispose_freed) {
+    // #1024/§28.3/§28.5: explicit dispose of an INTERFACE-typed local initialized
+    // with a concrete `new Factory()` reclaims the block (before the fix it leaked
+    // — only the LSan leg catches it; the destructor-count is 1 either way). The
+    // concrete-typed equivalent already reclaimed; this closes the parity gap.
+    expectDisposedAndLeakFree(kInterfaceLocalExplicitDispose, 1);
+}
+
+BEZEL_TEST(codegen_explicit_dispose_reclaim_1024, interface_typed_explicit_then_throw_no_double_free) {
+    // #1024/§28.3: the interface-typed local's explicit dispose nulls the slot, so
+    // the newly-registered unwind disposal finds null and skips on the throw edge —
+    // destructor runs exactly once (exit 1), no double-free, LSan clean.
+    expectDisposedAndLeakFree(kInterfaceExplicitThenThrow, 1);
 }

@@ -6755,8 +6755,28 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
         if (cls && cls->kind == ast::TypeDeclKind::Class &&
             disposerFns_.find(cls) != disposerFns_.end())
             return cls;
-        // An interface-/abstract-typed `new` is unusual; fall through.
-        (void)ne;
+        // #1024 / §28.3 / §28.5: an INTERFACE-typed local initialized with a
+        // concrete `new C(...)` — `var f: IThing := new Factory()`. classOfLocal
+        // short-circuits on the declared type and returns the INTERFACE symbol
+        // (kind != Class), so the concrete class above is missed and this local
+        // fell through to the unwind path's no-op AND the explicit-dispose reclaim
+        // gate (explicitDisposeOwnedReceiverSlot). An explicit `f.Dispose()` then
+        // ran the destructor via vtable but never RECLAIMED the block (a normal-
+        // path leak — the concrete-typed `var f := new Factory(); f.Dispose()`
+        // does reclaim, so this was an interface/concrete parity gap). Scope-end
+        // disposal is correct on its own (autoDropAtScopeEnd routes through
+        // registerUsingDisposal). Recover the concrete class from the NewExpr so
+        // the explicit-dispose reclaim+null and the §28.3 unwind disposal both
+        // fire; dispatch through emitDisposeAndReclaim is dynamic regardless, so
+        // returning the concrete class (with a disposer) is sufficient.
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Class &&
+                    disposerFns_.find(rt->declaration) != disposerFns_.end())
+                    return rt->declaration;
+            }
+        }
         return nullptr;
     }
     // (a2) #1018 / #911 / §25: a user-defined binary operator whose `operator OP`
