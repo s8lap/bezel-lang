@@ -553,6 +553,20 @@ void scanReassignStmt(const ast::Stmt& s, sema::SemaContext& ctx,
             if (sema::Symbol* sym = ctx.exprSymbol(*id)) out.insert(sym);
         scanReassignExpr(as->target.get(), ctx, out);
         scanReassignExpr(as->value.get(), ctx, out);
+    } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        // §17.6 / §28.3 (#913): `c++` / `c--` desugars to `c := T.operator++(c)`
+        // — a REASSIGNMENT of the target. For an OWNED class local this drops the
+        // previous owned value, so (exactly like a direct `c := …`) the local must
+        // be excluded from the §28.3 affine auto-drop and explicitly discharged.
+        // Marking the identifier target reassigned here routes `var c := new T();
+        // c++` (no discharge) to the §28.3 drop-reject instead of silently leaking
+        // the old value; a value-type local (int/record — not owned) carries no
+        // obligation, so it is never rejected. (The `using var` form is already
+        // rejected as non-reassignable, §28.10.)
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(is->target.get()))
+            if (sema::Symbol* sym = ctx.exprSymbol(*id)) out.insert(sym);
+        scanReassignExpr(is->target.get(), ctx, out);
     } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         scanReassignExpr(ld->initializer.get(), ctx, out);
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {

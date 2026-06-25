@@ -111,13 +111,53 @@ BEZEL_TEST(using_var_reassign_830, using_var_increment_rejected_913) {
     BEZEL_EXPECT_TRUE(hasUsingVarReassignError(r));
 }
 
-// A plain `var` increment is NOT flagged by the §28.10 rule. (The plain-`var` /
-// field drop case of #913 — where the ownership pass does not yet model `c++` as
-// a reassignment — is a separate piece and remains open.)
+// A plain `var` VALUE increment is NOT flagged by the §28.10 rule, and (since
+// #913's plain-var slice) is NOT §28.3-rejected either — an `int` is not owned.
 BEZEL_TEST(using_var_reassign_830, plain_var_increment_not_flagged_913) {
     auto r = parseAndCheckOwnership(mod(
         "class C public static method Main(): int "
         "  var x := 3; x++; return x; "
         "end Main; end C;"));
     BEZEL_EXPECT_FALSE(hasUsingVarReassignError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// fix #913 (plain-var slice) / §17.6 / §28.3: `var c := new T(); c++` where the
+// owned class operand's `operator ++` returns a NEW owned instance and the local
+// is left undischarged is REJECTED — `c++` is modelled as the reassignment
+// `c := operator++(c)` (it drops the previous owned value), so the local is
+// excluded from the §28.3 affine auto-drop and must be explicitly discharged,
+// exactly as a direct `c := new T()` already is. Before this it silently leaked
+// the old value with no diagnostic.
+BEZEL_TEST(using_var_reassign_830, plain_var_owned_increment_rejected_913) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Counter public Value: int := 0; "
+        "  public constructor(v: int) Value := v; end constructor; "
+        "  destructor Value := 0; end destructor; "
+        "  public static method operator ++(c: Counter): owned Counter => "
+        "    new Counter(c.Value + 1); "
+        "end Counter; "
+        "class C public static method Main(): int "
+        "  var c := new Counter(0); c++; return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// fix #913: the same owned `c++` is ACCEPTED when the local IS discharged
+// (`.Dispose()`), mirroring a discharged direct reassignment — the §28.3 reject
+// is specifically the UNdischarged case.
+BEZEL_TEST(using_var_reassign_830, plain_var_owned_increment_discharged_accepted_913) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Counter public Value: int := 0; "
+        "  public constructor(v: int) Value := v; end constructor; "
+        "  destructor Value := 0; end destructor; "
+        "  public static method operator ++(c: Counter): owned Counter => "
+        "    new Counter(c.Value + 1); "
+        "end Counter; "
+        "class C public static method Main(): int "
+        "  var c := new Counter(0); c++; c.Dispose(); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
