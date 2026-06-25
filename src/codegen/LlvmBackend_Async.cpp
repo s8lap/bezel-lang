@@ -1874,6 +1874,19 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         llvm::Value* excObj =
             builder_.CreateCall(errObjFn, {awaitedTask}, "await.errobj");
         builder_.CreateStore(excObj, emitExcSlot());
+        // §30.4 / §30.9 (#854): for a BOUND task (freeTaskAfter == false — the task
+        // outlives this await and may be awaited AGAIN, §30.4), the re-raised
+        // error_obj is BORROWED from the task; the catch arm that handles it must
+        // NOT reclaim it, or a SECOND `await t` re-reads a freed pointer (SIGSEGV).
+        // Mark it so the caught-exception disposal skips a borrowed object. For an
+        // ANONYMOUS producer (`await Producer()`, freeTaskAfter == true) the task is
+        // single-use and freed just below — keep the current handler-owns behavior
+        // (no mark), so the lone awaiter reclaims error_obj exactly once.
+        if (!freeTaskAfter) {
+            auto* markFn = declareC("bz_mark_exc_borrowed",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(markFn, {excObj});
+        }
         // §30.5: reclaim the awaited task here when it is an anonymous producer
         // result (`await Producer()`) — a single-use task with no other owner.
         // bz_task_free frees the task struct + its result/message buffers but NOT

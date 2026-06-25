@@ -3799,6 +3799,30 @@ void* bz_task_error_obj(void* tp) {
     return ((bz_task_t*)tp)->error_obj;
 }
 
+// §30.4 / §30.9 (#854): borrowed-exception set. When an `await` of a BOUND
+// (multi-awaitable) faulted task re-raises the task's stored error_obj into the
+// in-flight exception slot, the catch arm that handles it must NOT reclaim the
+// object (it is BORROWED from the task, not owned by the awaiter) — otherwise a
+// SECOND `await` of the same faulted task re-reads a freed pointer and crashes.
+// Codegen marks the object borrowed at the await-fault hand-off and the
+// caught-exception disposal skips a borrowed object. A PER-OBJECT set (not a
+// single flag) is required: an arm body may throw/catch a nested NORMAL exception
+// between the mark and the borrowed object's own disposal, so membership must be
+// keyed by the object pointer. Thread-local because the in-flight exception slot
+// (bz_exc) is thread-local (§30.14). Idempotent: mark/unmark of a pointer already
+// in/absent from the set is a no-op.
+static thread_local std::unordered_set<void*> g_borrowed_exc;
+
+extern "C" void bz_mark_exc_borrowed(void* obj) {
+    if (obj) g_borrowed_exc.insert(obj);
+}
+extern "C" int8_t bz_is_exc_borrowed(void* obj) {
+    return (obj && g_borrowed_exc.count(obj)) ? 1 : 0;
+}
+extern "C" void bz_unmark_exc_borrowed(void* obj) {
+    if (obj) g_borrowed_exc.erase(obj);
+}
+
 bool bz_task_is_done(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::lock_guard<std::mutex> lk(task->mtx);

@@ -248,6 +248,42 @@ BEZEL_TEST(task_combinators_6_7, await_owned_array_element_faulted_task_caught_8
         55);
 }
 
+// §30.4 / §30.9 (#854): awaiting the SAME BOUND faulted Task twice (each in its
+// own try/catch) no longer SIGSEGVs. The re-raised error_obj is BORROWED from the
+// task (codegen marks it), so the first catch does NOT reclaim it and the second
+// await re-reads a LIVE object — both arms catch, rc = 44 + 44 = 88 (was crash
+// 139). Value-only: the residual error_obj leak for a multi-awaited bound task is
+// the site-4 follow-up (#854 comment); the crash + the §30.4 multi-await value
+// are the load-bearing fix.
+BEZEL_TEST(task_combinators_6_7, double_await_bound_faulted_task_no_crash_854) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(\"x\"); end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Boom(); "
+        "    var a := 0; var b := 0; "
+        "    try a := await t; catch InvalidOperationException => a := 44; end; "
+        "    try b := await t; catch InvalidOperationException => b := 44; end; "
+        "    return a + b; "
+        "  end Main; end C;"),
+        88);
+}
+
+// §30.4 (#854) regression: double-await of a COMPLETED (non-faulted) bound task
+// still returns the result twice (the borrowed-exc path is fault-only).
+BEZEL_TEST(task_combinators_6_7, double_await_completed_task_ok_854) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Calc(): Task<int> return 7; end Calc; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Calc(); "
+        "    var a := await t; var b := await t; "
+        "    return a + b; "
+        "  end Main; end C;"),
+        14);
+}
+
 // §6.7: Task.WhenAll on an empty array completes immediately.
 // Empty array means no input tasks → no leak concern.
 BEZEL_TEST(task_combinators_6_7, when_all_empty_array) {

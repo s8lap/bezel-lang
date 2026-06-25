@@ -11435,11 +11435,37 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->caughtException) {
             if (isUnwind) continue;
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
-            // §28.2 / #380: dispatch the idempotent Dispose and reclaim the
-            // block once. The caught object is in flight only for this arm and
-            // freed exactly here on a normal handled exit (a re-raise skips it
-            // via the isUnwind branch above).
+            // §30.4 / §30.9 (#854): a task-fault exception re-raised by `await t`
+            // of a BOUND task is BORROWED from the task (codegen marked it via
+            // bz_mark_exc_borrowed) — the awaiter does NOT own it, so a SECOND
+            // `await t` of the same faulted task must still find a LIVE error_obj.
+            // Skip the reclaim + unmark for a borrowed object; a normal (owned)
+            // caught exception is reclaimed as before (§28.2/#380: idempotent
+            // Dispose + base chain + block reclaim). Branch at runtime on the
+            // per-object borrowed-set membership.
+            llvm::Function* fn = builder_.GetInsertBlock()->getParent();
+            auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
+                                          llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+            llvm::Value* bv =
+                builder_.CreateCall(isBorrowedFn, {obj}, "exc.borrowed");
+            llvm::Value* isB = builder_.CreateICmpNE(
+                bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+            auto* borrowBB = llvm::BasicBlock::Create(llvm_, "exc.borrow", fn);
+            auto* ownedBB  = llvm::BasicBlock::Create(llvm_, "exc.owned", fn);
+            auto* contBB   = llvm::BasicBlock::Create(llvm_, "exc.dispcont", fn);
+            builder_.CreateCondBr(isB, borrowBB, ownedBB);
+            // Borrowed: unmark, do NOT reclaim (the task local's scope-end / the
+            // owning awaiter frees error_obj exactly once).
+            builder_.SetInsertPoint(borrowBB);
+            auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(unmarkFn, {obj});
+            builder_.CreateBr(contBB);
+            // Owned: normal reclaim.
+            builder_.SetInsertPoint(ownedBB);
             emitDisposeAndReclaim(obj);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // §15.3 / §15.1.1 (#747): a move-only owning inline-array local. Dispose
@@ -11800,6 +11826,41 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB = llvm::BasicBlock::Create(llvm_, "task.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, fafBB);
             builder_.SetInsertPoint(fafBB);
+            // §30.4 / §30.9 (#854): a BOUND faulted task's error_obj is BORROWED by
+            // any awaiter (the catch arm skips its reclaim, #854 sites 2-3) — or is
+            // unobserved (never awaited) — so the task LOCAL's scope-end is the
+            // single Bezel-level free of error_obj. bz_task_free / fire-and-forget
+            // frees the task struct + its buffers but NOT the Bezel exception object
+            // (only Bezel codegen can run its destructor). Dispose it here when the
+            // task has faulted; unmark first so the borrowed-set never holds a freed
+            // pointer. (A still-running async task is not yet errored here → skipped;
+            // its unobserved-fault error_obj is a separate residual.) A non-faulted
+            // task has a null error_obj → skipped. bz_task_free below ignores
+            // error_obj, so the now-dangling task->error_obj is never re-read.
+            {
+                auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
+                llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "task.err");
+                auto* edBB = llvm::BasicBlock::Create(llvm_, "task.errdisp",
+                                                      currentFn_);
+                auto* eaBB = llvm::BasicBlock::Create(llvm_, "task.errcont",
+                                                      currentFn_);
+                builder_.CreateCondBr(err, edBB, eaBB);
+                builder_.SetInsertPoint(edBB);
+                auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+                llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "task.errobj");
+                llvm::Value* eoNull = builder_.CreateICmpEQ(
+                    eo, llvm::ConstantPointerNull::get(ptrTy()));
+                auto* doBB = llvm::BasicBlock::Create(llvm_, "task.eodisp",
+                                                      currentFn_);
+                builder_.CreateCondBr(eoNull, eaBB, doBB);
+                builder_.SetInsertPoint(doBB);
+                auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
+                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(unmarkFn, {eo});
+                emitDisposeAndReclaim(eo);
+                builder_.CreateBr(eaBB);
+                builder_.SetInsertPoint(eaBB);
+            }
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {t});
