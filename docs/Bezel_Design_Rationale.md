@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.149 — June 2026**
+**Companion to the Bezel Language Specification, v0.150 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7052,6 +7052,42 @@ A program that relied on any of the three unsound behaviors is rewritten locally
 #### Deferred
 
 The remaining ergonomic and uniformity questions are tracked separately (#1008): folding the v0.148 materializer carve-out (`ToArray` / `Sorted` / `Reversed`, typed non-`owned` with a compiler-internal reclaim) into the uniform `owned` rule, and the affine-auto-drop-versus-linear decision for a discarded owned value. Returning a *borrowed* owning-collection value (full two-axis container-ownership tracking, as opposed to the #1007 rejection) is likewise deferred. These are expressiveness / ergonomics changes, not soundness; the v0.149 pass leaves the model sound (no leaks, no double-frees) under the existing linear discipline.
+
+---
+
+### v0.150 changelog (v0.149 → v0.150)
+
+v0.150 is the first half of the #1008 ergonomics pass: it makes the ownership discipline **affine** (auto-drop with a must-use warning) and folds the materializer reclaim into one uniform `owned`-driven rule. Owner-directed 2026-06-25. The borrowed-owning-collection return (Part C of #1008) is soundness-delicate and resolves a separate spec defect, so it lands in its own revision (v0.151).
+
+#### The inconsistency
+
+v0.149 made an *unbound owned temporary* auto-dispose at end of expression ([§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)) while a *named* owned local dropped on a normal-exit path remained a hard compile error. Naming a value therefore changed whether the program compiled — `new Foo().Use()` was fine but `var a := new Foo(); a.Use();` was an error — a refactoring hazard, and an asymmetry the language did not actually intend. (The asymmetry already showed through the seams: §17.13's move-only-inline-array discard remedy spoke of `var name := …` "auto-dispose at scope end," while the class case in the same section called the same drop an error.)
+
+#### The resolution — affine auto-drop (Part B / "B4")
+
+The model is now uniformly **affine**, matching Rust/C++ RAII rather than Austral-style strict linearity:
+
+- **Auto-drop** ([§28.3 owned-local discharge](Bezel_Language_Spec.md#sec-owned-local-discharge-requirement)). An owned local that reaches a normal-exit scope end still-owned (not moved) is disposed implicitly there — the *same* mechanism the exception-path discharge already applied to the unwinding edge, now applied to the normal edge too. The move analysis leaves a transferred value moved-from, so the scope-end disposal skips it; exactly-once on every path is preserved. This *reuses existing machinery*: the implementation is "apply the exception-edge disposal to the fall-through edge," not a new analysis.
+- **Must-use warning.** A plain-`var` implicit drop raises a *warning* (not an error), surfacing a possibly-unintended drop; suppressed by `using var` (the explicit scope-bound, non-movable form), explicit `Dispose()`/discard, or move/return. The two keywords keep distinct intent: `using var` = scope-pinned, no warning; plain `var` = movable, warned if implicitly dropped. The warning is a lint over an already-sound program.
+- **Discard becomes a disposal form** ([§17.13](Bezel_Language_Spec.md#sec-the-discard-_)). `_ := <owned class / interface / move-only value>` is now legal and disposes at end of statement — the discard *is* an unbound owned temporary. This is the "dispose this owned result now" form (`_ := set.Remove(x);`). It supersedes the prior blanket discard error for non-trivial-dispose classes; the cross-module hazard that forced the *interface* discard error evaporates because the discard disposes the runtime type (correct for any implementation). `Task`/`Task<T>` discard stays an error (disposing a task abandons a running operation — a semantic, not a leak, reason; use `Task.FireAndForget`).
+
+Why affine over strict-linear: v0.149 had already made unnamed temporaries affine; completing the drift is *more* consistent than the split, removes the refactoring hazard, and unifies discard, unnamed temporaries, and named-local drop under one rule ("disposed exactly once — explicitly or at scope end"). The cost — losing the compile-time "you forgot to discharge" error — is recovered as the must-use *warning*, which nudges toward `using var` without rejecting sound code. This is the same trade Rust makes (auto-drop + an unused-`#[must_use]` lint).
+
+#### The resolution — materializer uniformity (Part A)
+
+The standard-library materializers already return `owned` (`ToArray(): owned Array<T>`, `Sorted`, `Reversed`, `ToSet`, `ToDictionary` — owning the *container*, borrowing the elements, [§5.11](#sec-owning-collections)). v0.150 clarifies ([§28.3 unbound temporaries](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)) that an unbound materializer result in a chain (`xs.Where(p).ToArray().Length`) is reclaimed by the *general* end-of-statement rule — the single `owned` return qualifier is the signal, not a special-cased list of method names. The implementation drops the `ToArray`/`Sorted`/`Reversed` name whitelist accordingly and extends reclaim to owned `Set`/`Dictionary` temporaries (closing a latent leak where `xs.ToSet().Count()` left the set backing unreclaimed).
+
+#### Touched
+
+Language spec: §28.3 (auto-drop + must-use warning rewrite of the owned-local discharge requirement; the unbound-temporary note generalized to all `owned` producers); §17.13 (discard of an owned class / interface / move-only value becomes a legal end-of-statement disposal; only `Task`/`Task<T>` remain restricted); Appendix C.3 (discharge and discard invariants updated); the §28.8 / §28.9 / §28.3-join echoes of the old discharge-error rule. Guide 1 framing updated to "affine." Compiler (subsequent PRs, tracked in #1008): the ownership pass (replace the normal-exit discharge error with scope-end disposal registration + the must-use warning) and codegen (apply the exception-edge disposal to the normal edge; unify the materializer reclaim on the `owned` signal; extend to Set/Dictionary). Version headers bumped to v0.150 across the language spec, standard library, and design rationale.
+
+#### Migration
+
+Source-compatible in the safe direction: every program that compiled under v0.149's stricter rule still compiles, and undischarged plain-`var` owned locals that were errors are now warnings (the value auto-drops). A program may *remove* now-unnecessary `using var` / explicit `Dispose()` where scope-end timing is acceptable, or keep them to silence the must-use warning and pin the intent. `_ := ownedExpr;` is newly available as the immediate-disposal form.
+
+#### Deferred (Part C → v0.151)
+
+Returning a *borrowed* owning-collection value remains rejected (#1007). Lifting that requires (1) caller-side reclassification of a non-`owned` owning-collection return with a borrow source as a borrow, (2) relaxing §28.6 so a bare owned-**field** read through a non-`owned` return is a legal receiver-borrow — which also reconciles a §28.6 spec-vs-impl asymmetry (a bare *class*-field read is already a legal borrow in the implementation, while §28.6's text and example call it an error), and (3) a capability restriction forbidding ownership-transferring / disposing operations (`Dispose`/`Drain`/`Pop*`/owning `Add`/indexer-set/`Remove*`/`Clear`) on a borrowed owning container. A mis-step re-introduces the #1007 double-free, so Part C lands as its own revision.
 
 ---
 

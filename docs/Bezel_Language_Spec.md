@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.149 — June 2026**
+**Version 0.150 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2768,7 +2768,7 @@ The discard statement's legality depends on the static type of `expression`:
 
   Inline arrays without owned slots (`[N]T`, `[N]T?`) are ordinary value types and follow this rule.
 
-- **Move-only inline arrays:** `_ := expression;` where `expression` produces a move-only value (an owning inline array, `[N owned]T?` or `[N owned]T`, [§15.3](#sec-move-only-value-types)) is a compile error. The move-only value has owned slots whose disposal would run silently at the discard site; the rule parallels the non-trivial-dispose class case below. The remedies are to bind the value with `var name := expression;` and use it explicitly (auto-dispose runs at scope end), or to consume the value by an ownership-transferring operation.
+- **Move-only inline arrays:** `_ := expression;` where `expression` produces a move-only value (an owning inline array, `[N owned]T?` or `[N owned]T`, [§15.3](#sec-move-only-value-types)) is **permitted** and disposes the value at the end of the discard statement — the discard is an *unbound owned temporary* ([§28.3](#sec-unbound-owned-temporaries)), reclaimed once the statement completes. Its owned slots are disposed in the usual order. (Before v0.150 this was a compile error; it is now the explicit "dispose this owned result now" form, parallel to the non-trivial-dispose class case below.)
 
 - **Trivial-dispose class types ([§28.9](#sec-runtime-managed-types)):** discard is permitted. The class has a no-op `Dispose()` by definition, so abandoning the value cannot leak a destructor invocation. Memory is reclaimed by an implementation-defined mechanism (see [§28](#sec-resource-management)'s preamble).
 
@@ -2777,17 +2777,16 @@ The discard statement's legality depends on the static type of `expression`:
   _ := new StringBuilder();              // trivial-dispose
   ```
 
-- **Non-trivial-dispose class types:** discard is a **compile error**. The error message identifies the destructor, owned field, or owning-inline-array field that makes the class non-trivial-dispose, and suggests the three legal alternatives:
+- **Non-trivial-dispose class types:** discard is **permitted** and disposes the value at the end of the discard statement. The discard is an *unbound owned temporary* ([§28.3](#sec-unbound-owned-temporaries)): `_ := expression;` evaluates `expression`, runs its `Dispose()` once the statement completes, and reclaims it. This is the explicit "I want this owned result disposed now" form — useful when an `owned`-returning method's result is not needed (`_ := items.ToArray();` disposes the fresh array immediately, rather than holding it to scope end as `using var _ := …` would).
 
-  ```
-  error: cannot discard a value of type FileStream because its destructor
-         performs cleanup. Choose one:
-           - using var _ := expression;        // dispose at scope end
-           - var name := expression; ...; name.Dispose();
-           - (if Task) Task.FireAndForget(expression);
+  ```bezel
+  _ := new FileStream(path);   // OK: opened, then disposed at end of statement
+  _ := items.ToArray();        // OK: the fresh owned array is disposed at end of statement
   ```
 
-- **Interface-typed expressions:** discard is a **compile error**, full stop. The rule is unconditional regardless of whether the interface extends `IDisposable` and regardless of whether any visible implementation is trivial-dispose. The reason: an interface reference may bind to any conforming implementation, and a future implementation added in any module may carry a non-trivial destructor. Permitting discard on interfaces that "happen to be trivial-dispose today" creates source-breaking changes when an implementation upgrade adds a destructor ([§28.9](#sec-runtime-managed-types)'s "Trivial-dispose classification is part of the API surface" subsection already addresses this for class types, but the interface case is worse — implementations live in other modules and may not be visible to the discard site at all). The cheap fix at the discard site is `using var _ := expr;`, which calls `Dispose()` at scope end whether or not the runtime type's `Dispose()` does any work.
+  The difference from `using var _ := expression;` is **disposal timing**, not legality: `_ := …` disposes at end of *statement*; `using var _ := …` disposes at end of *scope*. Both work for any class type. (Before v0.150, discard of a non-trivial-dispose class was a compile error; auto-drop, [§28.3](#sec-owned-local-discharge-requirement), makes the obligation always satisfiable, so the discard simply names the immediate-disposal point.)
+
+- **Interface-typed expressions:** discard is **permitted** and disposes the value at the end of the discard statement, calling `Dispose()` on the *runtime* type (disposal is virtual). Because the discard disposes rather than abandons, the cross-module hazard that made this an error before v0.150 — an interface reference may bind any conforming implementation, and a future implementation in another module may add a non-trivial destructor — no longer applies: whatever the runtime type, `_ := expr;` disposes it correctly. `using var _ := expr;` remains available when end-of-*scope* (rather than end-of-statement) disposal is wanted.
 
 - **`Task` and `Task<T>`:** discard is a compile error (Tasks have a destructor that handles continuation cleanup and exception propagation). Use `Task.FireAndForget(expression)` for supervised fire-and-forget, or `using var _ := expression;` to dispose at scope end. The error message names `Task.FireAndForget` specifically.
 
@@ -2798,33 +2797,37 @@ Task.FireAndForget(DoTelemetryAsync());  // OK — supervised
 using var _ := new FileStream(path);     // OK — disposed at scope end
 ```
 
-The discard form exists to acknowledge a deliberately-unused value, not to escape the disposal contract. The disposal contract is universal: a class instance with a non-trivial `Dispose()` reaches an owned location, becomes the operand of `using var`, or is explicitly disposed.
+The discard form acknowledges a deliberately-unused value *and* discharges its disposal obligation: for an owned class or move-only value, `_ := …` disposes it at end of statement. The disposal contract remains universal — a class instance with a non-trivial `Dispose()` reaches an owned location, becomes the operand of `using var`, is explicitly disposed, is discarded with `_ := …`, or is auto-dropped at scope end ([§28.3](#sec-owned-local-discharge-requirement)) — but no path leaks. The only discards that remain errors are `Task`/`Task<T>` (use `Task.FireAndForget`, since disposing a task abandons a running operation — a semantic, not a leak, concern).
 
 <a id="sec-recap-of-the-difference-between-discard-and-using-var-_"></a>
 #### Recap of the difference between discard and `using var _`
 
 ```bezel
-_ := expression;            // value evaluated and dropped on the floor;
-                            //   only legal for non-disposing types.
+_ := expression;            // value evaluated; if owned, disposed at END OF
+                            //   STATEMENT (an unbound owned temporary). For a
+                            //   value/runtime-managed/trivial type, dropped —
+                            //   the discard only silences the unused-result
+                            //   warning. (Task/Task<T> excepted: use
+                            //   Task.FireAndForget.)
 
 using var _ := expression;  // value bound to an unnamed local that is
-                            //   disposed at scope end; works for any
+                            //   disposed at END OF SCOPE; works for any
                             //   class type.
 ```
 
-When the choice is between "I don't care about the result" and "I want the result disposed at scope end," choose `using var _ := …` for any value that needs disposal; choose `_ := …` only when the type is provably trivial-dispose or a value type and the goal is to silence the unused-result warning.
+The choice between `_ := …` and `using var _ := …` for an owned value is one of **disposal timing**, not legality: `_ := …` disposes immediately (end of statement), `using var _ := …` at end of scope. Use `_ := …` to dispose an owned result you do not need *now*; use `using var _ := …` when the value must outlive the statement but you do not want to name it.
 
 Note the distinction between discarding and binding:
 
 ```bezel
-_ := ComputeResult();             // DISCARD: legal only when ComputeResult's return type
-                                  //   is value-typed, runtime-managed, or trivial-dispose.
+_ := ComputeResult();             // DISCARD: evaluates and (if owned) disposes at end of
+                                  //   statement; for value/trivial types, just drops.
 var _ := ComputeResult();         // BINDING: declares a local variable named "_" and assigns.
-                                  //   The local is subject to normal unused-variable
-                                  //   warnings AND the standard ownership rules — if the
-                                  //   value needs disposal, this form does not satisfy that.
-using var _ := ComputeResult();   // BINDING with disposal at scope end. Works for any
-                                  //   class type, including non-trivial-dispose.
+                                  //   Subject to normal unused-variable warnings; if the value
+                                  //   is owned it auto-drops at scope end (§28.3), with the
+                                  //   plain-var must-use warning.
+using var _ := ComputeResult();   // BINDING with disposal at scope end (no must-use warning).
+                                  //   Works for any class type, including non-trivial-dispose.
 ```
 
 The forms are syntactically distinct. `_ :=` (no `var`) is the discard; `var _ :=` is a binding to a local whose name happens to be `_`; `using var _ :=` is the same binding with the using-var disposal rule. Outside the three discard positions (pattern, out-argument, discard statement), `_` is an ordinary identifier.
@@ -4869,7 +4872,7 @@ else
   x := otherSource.CloneStream();   // returns owned Stream
 end;
 // At the merge, x is owned on both branches.
-// x must reach an owned slot or be disposed before going out of scope.
+// x reaches an owned slot, is disposed, or auto-drops at scope end (§28.3).
 ```
 
 The lattice ordering is direction-correct: `owned` is the *stronger* state (carries an obligation), `borrowed` is the *weaker* state (carries none). The natural meet at a join would be the weaker state, but the language instead rejects the merge when branches disagree — silently demoting an owned obligation to a borrowed state at the join would leak the resource on the owned-branch path. The program must equalize the branches explicitly (the two patterns above).
@@ -4956,7 +4959,7 @@ A borrowed value may be passed as a non-`owned` argument to another call: the ca
 <a id="sec-owned-local-discharge-requirement"></a>
 #### Owned-local discharge requirement
 
-An owned local must reach an owned slot before it goes out of scope, or be explicitly disposed. The slots that count as discharging the obligation:
+An owned local is disposed exactly once on every control-flow path. The program may *discharge* it explicitly; if it does not, the compiler disposes it at the end of its scope. The forms that discharge the obligation explicitly — transferring it elsewhere or disposing it by hand — are:
 
 - Storage in an `owned` field.
 - Return under an `owned` return type.
@@ -4964,9 +4967,13 @@ An owned local must reach an owned slot before it goes out of scope, or be expli
 - Move into another `using var`/owned local that takes over the obligation.
 - An explicit `.Dispose()` call.
 
-The compiler errors when an owned local is dropped from a *normal-exit* control-flow path without reaching one of the above. The error is the same as the [§28.8](#sec-ownership-transfer) rule for raw `new` expressions, generalized.
+**Auto-drop (affine).** When an owned local reaches a *normal-exit* scope end without having reached one of the above, and is not in moved-from state, it is **disposed implicitly at that scope end** — the same implicit disposal that the *Exception-path discharge* below performs on the unwinding edge, now applied to the normal-exit edge as well. Bezel is therefore **affine**: every owned value is disposed exactly once on every path — explicitly where the program discharges it, implicitly at scope end otherwise — and the move analysis ([§28.8.1](#sec-the-move-expression)) leaves a transferred value in moved-from state so the scope-end disposal skips it; nothing is disposed twice. This makes a plain `var` owned local behave, on a path that never moves it out, like a `using var`: the value is reclaimed when its scope ends.
 
-**Exception-path discharge.** Owned locals and owned parameters that are live when an exception propagates out of their enclosing block are disposed implicitly during stack unwinding. The compiler treats every owned local and owned parameter as if it were wrapped in an implicit `try`/`finally` whose `finally` disposes the value if it is still owned (i.e., not already moved-from and not already explicitly disposed). This guarantees that exceptions do not produce leaks even though the user wrote a plain `var` rather than `using var`, or accepted an `owned` parameter rather than re-binding it. The discharge-requirement rule above only constrains *normal* exit: on a normal return or fall-through from the enclosing block, the owned local or parameter must reach a discharge point statically; on exception exits, the implicit auto-dispose runs.
+**Must-use warning.** Because a plain `var` that is implicitly dropped is indistinguishable in *effect* from a `using var`, the compiler emits a **warning** (not an error) at the implicit-drop site of a plain-`var` owned local, to surface a drop that may have been unintended. The warning names the local and lists the explicit alternatives: declare it `using var` (scope-bound disposal — the value may not then be moved out), `move`/return it (transfer the obligation), or dispose it explicitly with `.Dispose()` or discard it with `_ := …` ([§17.13](#sec-the-discard-_)). The warning is **suppressed** when the local is declared `using var` (the scope-bound intent is then explicit), when it is explicitly disposed or discarded, and when it is moved or returned (no implicit drop occurs). The warning is a lint over a sound program — it changes no semantics, only flags the implicit drop — so a project may tune or silence it; the auto-drop runs regardless.
+
+Auto-drop replaces the hard discharge *error* of earlier revisions (through v0.149 a plain `var` dropped on a normal-exit path was a compile error); the obligation is now always satisfied — by the program or by the compiler — and the lint, not an error, marks the implicit case.
+
+**Exception-path discharge.** Owned locals and owned parameters that are live when an exception propagates out of their enclosing block are disposed implicitly during stack unwinding. The compiler treats every owned local and owned parameter as if it were wrapped in an implicit `try`/`finally` whose `finally` disposes the value if it is still owned (i.e., not already moved-from and not already explicitly disposed). This guarantees that exceptions do not produce leaks even though the user wrote a plain `var` rather than `using var`, or accepted an `owned` parameter rather than re-binding it. Both the normal-exit and exception-exit edges now perform the same implicit disposal of a still-owned local or parameter; the only difference is the lint: a plain-`var` implicit drop on the *normal-exit* edge carries the must-use warning above, while the (non-local) exception edge does not. The auto-drop and the exception-path discharge are the same mechanism applied to the two kinds of edge.
 
 This rule is what makes plain `var` owned locals safely usable as accumulators that are eventually moved out by `return` or by an `owned` argument. The intent of a plain `var` is "I will discharge this explicitly somewhere"; the intent of a `using var` is "auto-dispose at scope end, never move out." On exception paths, both behave identically — the value is disposed by the implicit cleanup pass. The distinction matters only on normal-exit paths: `using var` is non-movable; plain `var` is movable but must reach a discharge point.
 
@@ -4988,6 +4995,8 @@ The discharge requirement above governs *named* owned values — locals, fields,
 This is the unnamed-temporary counterpart of the discard contract ([§17.13](#sec-the-discard-_)) and the discharge requirement above: a *named* owned value must reach an owned slot, a `using var`, or an explicit `Dispose()`; an *unnamed* owned temporary — which none of those forms can name — is reclaimed automatically once the expression that produced it is finished with it. A temporary that is instead bound (to a `var`/`using var`), `move`d, returned, or transferred into an owning location is governed by the corresponding transfer or discharge rule and is **not** disposed under this rule (it would otherwise be disposed twice).
 
 For example, in `Folded(src).Sorted()` where `Folded(src): owned Array<T>` and `Sorted` borrows its receiver, the `Folded(src)` temporary is borrowed by `Sorted`, then disposed once the statement completes — exactly once, with no leak and no double-free. Disposal runs *after* the borrowing use, so the receiver is live for the duration of the call.
+
+This rule is uniform across the source of the temporary: it applies identically to a user method declared `owned` and to the standard-library materializers, which are themselves declared `owned` — `ToArray(): owned Array<T>`, `Sorted()`, `Reversed()`, `ToSet(): owned Set<T>`, `ToDictionary(...): owned Dictionary<K, V>` ([§5.11](Bezel_Design_Rationale.md#sec-owning-collections); these own the *container*, borrowing the elements). An unbound materializer result in a chain — `items.Where(p).ToArray().Length`, `xs.ToSet().Count()` — is the same kind of unbound owned temporary and is reclaimed at end-of-statement by the same rule. The `owned` return qualifier is the single signal that drives the reclaim; there is no special-cased list of method names.
 
 <a id="sec-diagnostics"></a>
 #### Diagnostics
@@ -5178,7 +5187,7 @@ end ReplaceAndReturn;
 
 The `move` expression is the only way to read an owned field's value as an owned value; all other reads of an owned field produce a borrow ([§28.3](#sec-local-variables-ownership-and-borrows)). The compiler enforces the field-restoration rule statically: every code path from the move site to the method's exit must reassign the field. See [§28.8.1](#sec-the-move-expression) for the full rule.
 
-A `new` expression produces an owned value. Its result must reach an owned location (`owned` field, `using var`, `owned` parameter, `owned` return) within the same method, or be explicitly disposed before the method returns. The compiler warns when a `new` expression's result is silently discarded.
+A `new` expression produces an owned value. Its result either reaches an owned location (`owned` field, `using var`, `owned` parameter, `owned` return) or is explicitly disposed within the same method, or — if bound to a plain `var` that is neither moved nor disposed — is **auto-dropped at the end of its scope** ([§28.3](#sec-owned-local-discharge-requirement)), with the plain-`var` must-use warning. The obligation is satisfied on every path; the warning, not a hard error, marks an implicit drop.
 
 Implicit boxing ([§8.6](#sec-boxing)) is **not** subject to this rule. When a value type is boxed to be used where `Object` or an interface is expected, the boxed wrapper is a runtime-managed value ([§28.9](#sec-runtime-managed-types)), not an owned `new`-result. The boxing itself is not a `new` expression and produces no disposal obligation; `Console.WriteLine(42)` does not need to discharge anything.
 
@@ -5406,7 +5415,7 @@ The implementation of runtime-managed types' lifecycle (reference counting, regi
 A class whose `Dispose()` is provably a no-op — it has no destructor, no `owned` fields, no fields of owning-inline-array type (`[N owned]T?` or `[N owned]T`, [§15.1.1](#sec-owning-inline-arrays)), and its base class (if any, other than `Object`) is itself trivial-dispose — is a **trivial-dispose class**. Trivial-dispose classes have weaker discharge requirements than other classes:
 
 - A `new` expression of a trivial-dispose class type whose result is not stored in an `owned` location or `using var` does *not* produce the standard ownership-discharge warning. (Earlier revisions emitted an informational warning here; v0.66 drops the warning entirely. There is nothing to discharge.)
-- The discard statement `_ := expr;` ([§17.13](#sec-the-discard-_)) is legal when `expr`'s static type is a trivial-dispose class. It is a compile error for class types that are not trivial-dispose.
+- The discard statement `_ := expr;` ([§17.13](#sec-the-discard-_)) is legal for a trivial-dispose class (the discard is purely cosmetic — there is nothing to dispose). For a non-trivial-dispose class it is also legal as of v0.150, where it disposes the value at end of statement; the difference is only whether the discard does cleanup work.
 - Memory for trivial-dispose instances is reclaimed by an implementation-defined mechanism ([§28](#sec-resource-management)'s preamble) that runs no user code.
 
 `using var` on a trivial-dispose class is permitted and has no observable effect other than scope limitation.
@@ -8161,7 +8170,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls execute disposal exactly once ([§28.2](#sec-the-idisposable-contract)).
 - Owned fields are restricted to class-typed fields (not `string`, not value types).
 - Owned values may not escape: returning an owned field requires an `owned` return type; assigning an owned value to a non-owned field of another object is rejected.
-- A `new` expression's result must reach an owned location or be explicitly disposed within the same method; the compiler warns on silent discard for non-trivial-dispose classes and rejects discard with `_ := …` outright ([§17.13](#sec-the-discard-_)). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
+- A `new` expression's result, and any owned local, is disposed exactly once on every path: it either reaches an owned location / explicit `Dispose()` / `move` / return, or is **auto-dropped at scope end** ([§28.3](#sec-owned-local-discharge-requirement)). An implicit auto-drop of a plain-`var` owned local raises a **must-use warning** (not an error); the warning is suppressed by `using var`, explicit disposal, discard, move, or return. Discard `_ := …` of an owned class or move-only value is permitted (disposes at end of statement). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
 - A static method returning a class type without `owned` and without an identifiable borrow source produces an owned value; the same discharge rules as `new` apply ([§28.3](#sec-local-variables-ownership-and-borrows)).
 - A borrow may not be returned through an owning-collection or owning-wrapper return type (`OwnedArray<T>`, `Shared<T>`, etc.) declared without `owned`; the caller would track the result as owned and dispose a value it does not own ([§28.3](#sec-local-variables-ownership-and-borrows) borrow-lifetime rules). The `Owned*` name denotes element ownership, not container ownership.
 - An unbound owned temporary — the result of an `owned`-returning producer that is not bound, `move`d, returned, or transferred, used only by borrowing operations within its expression — is disposed exactly once at the end of that full expression, after its uses complete ([§28.3](#sec-unbound-owned-temporaries)).
@@ -8171,7 +8180,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A method reference that captures a borrowed receiver is subject to the same closure-escape rules as a lambda capturing a borrow ([§28.3](#sec-local-variables-ownership-and-borrows), [§28.9](#sec-runtime-managed-types)).
 - A borrow-bearing record or a borrow-carrying inline array may be stored in a static field only when every reference-typed field (and every reference-typed slot of every inline-array field) of the value is null (the null-source form, [§9.7](#sec-records-and-disposal)).
 - A trivial-dispose class (no destructor, no `owned` fields, no fields of owning-inline-array type, no non-trivial base) requires no ownership discharge: undischarged `new` expressions are not warned about, and `_ := newTrivialClass();` is permitted ([§28.9](#sec-runtime-managed-types)).
-- A `_ := expression;` discard statement ([§17.13](#sec-the-discard-_)) is rejected for non-trivial-dispose class types, for `Task` and `Task<T>`, and for interface types unconditionally (regardless of whether the interface extends `IDisposable`, since any conforming implementation — including one added later in another module — may carry a non-trivial destructor).
+- A `_ := expression;` discard statement ([§17.13](#sec-the-discard-_)) is permitted for any owned class, interface, or move-only value — it disposes the value at end of statement (calling `Dispose()` on the runtime type, so it is correct for any interface implementation). It is rejected only for `Task` and `Task<T>` (disposing a task abandons a running operation; use `Task.FireAndForget` — a semantic, not a leak, restriction).
 - A class implementing `IAsyncDisposable` without a destructor receives a compiler warning ([§28.12](#sec-asynchronous-disposal)).
 - The `move x.f` expression ([§28.8.1](#sec-the-move-expression)) is permitted only when `f` is an owned instance field; the field is left in moved-from state. Within the surrounding method, every control-flow path from the move site to the method's exit (normal return, throw, fall-through, `yield break`) must execute an assignment `x.f := value;` between the move and the exit — including paths exited by exceptions raised by intervening throwable expressions. Failure to satisfy the rule is a compile error.
 - The `move coll[i]` expression ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)) is permitted only when `coll` is an owned-element collection; the slot is left in moved-from state. The same field-restoration rule applies, with constant indices tracked per-slot and non-constant indices tracked conservatively at the whole-collection level.
