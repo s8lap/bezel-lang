@@ -474,3 +474,35 @@ BEZEL_TEST(codegen_lifted_ops_486, int_eq_both_nonnull_unchanged_spec_8_4) {
     BEZEL_EXPECT_EQ(run(
         "var a: int? := 5; var b: int? := 5; return int(a = b);"), 1);
 }
+
+// #1044 / §5.1 / §7.11: lifted arithmetic and `??` on a SUB-i32 nullable
+// (byte?/sbyte?/short?/ushort?) crashed codegen — the payload (i8/i16) and the
+// int operand/default (i32) mismatched the result struct width (`insertvalue
+// i32 into {i8,i8}`) / the coalesce PHI. `byte? + int` promotes to `int?`
+// (§5.1), and a shift follows the left operand (`byte? << 1` → `byte?`); both
+// now build the right-width result. The null branch still propagates null.
+BEZEL_TEST(codegen_1044_subint_nullable, byte_plus_int_promotes_to_int) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := 3; var r: int? := a + 1; return int(r ?? 0);"), 4);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, byte_coalesce_int_default) {
+    BEZEL_EXPECT_EQ(run("var a: byte? := 3; return int(a ?? 9);"), 3);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, byte_null_coalesce_int_default) {
+    BEZEL_EXPECT_EQ(run("var a: byte? := null; return int(a ?? 9);"), 9);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, byte_shl_follows_left) {
+    BEZEL_EXPECT_EQ(run("var a: byte? := 5; return int((a << 1) ?? 99);"), 10);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, short_mul_via_coalesce) {
+    BEZEL_EXPECT_EQ(run("var a: short? := 3; return int((a * 2) ?? 99);"), 6);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, byte_null_arith_propagates_null) {
+    BEZEL_EXPECT_EQ(run("var a: byte? := null; return int((a + 1) ?? 99);"), 99);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, byte_bitand_via_coalesce) {
+    BEZEL_EXPECT_EQ(run("var a: byte? := 5; return int((a & 3) ?? 99);"), 1);
+}
+BEZEL_TEST(codegen_1044_subint_nullable, long_coalesce_int_default) {
+    BEZEL_EXPECT_EQ(run("var a: long? := null; return int(a ?? 5);"), 5);
+}

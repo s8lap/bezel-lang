@@ -4516,8 +4516,17 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             // The underlying op (including overflow/div-zero checks) must run
             // ONLY in the bothPresent branch (§7.11). Use a conditional branch
             // so the side-effecting checks don't fire on null-by-null-operand paths.
-            // Determine the result sema type (T?) from whichever operand is nullable.
+            // Determine the result sema type (T?). #1044: this is the PROMOTED
+            // nullable type, NOT the bare nullable operand type — `byte? + int`
+            // yields `int?` (§5.1 promotion), so the result struct is {i8, i32},
+            // not the operand's {i8, i8}. Prefer the sema result type (which
+            // carries the promotion); fall back to the nullable operand type when
+            // it is unavailable. Using the operand type built a too-narrow struct
+            // and `insertvalue`d the widened payload → malformed IR.
             const sema::TypeRef* nvTy = lNullable ? lTy : rTy;
+            if (const sema::TypeRef* brt = ctx_.exprType(bin))
+                if (isNullableValueTy(brt))
+                    nvTy = brt;
             // Build the conditional branch.
             auto* entryBB  = builder_.GetInsertBlock();
             auto* opBB     = llvm::BasicBlock::Create(llvm_, "lift.op",  currentFn_);
@@ -4690,6 +4699,20 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                                              : builder_.CreateAShr(lp, cnt);
                     }
                 }
+            }
+            // #1044: the op ran at the widened operand width, but the result
+            // struct's payload is the sema result type's width (the promoted
+            // width for arithmetic — `byte? + int` → `int?`/i32; or the left
+            // operand's width for a shift — `byte? << 1` → `byte?`/i8). Coerce
+            // the integer payload to that width HERE (still inside the op block,
+            // so the value dominates the PHI that consumes it from opEndBB) so
+            // the wrap's `insertvalue` is well-typed and the value is correctly
+            // narrowed where the result is narrower than the computed width.
+            if (payloadResult && payloadResult->getType()->isIntegerTy()) {
+                llvm::Type* wantTy = nullableValueStructTy(nvTy)->getElementType(1);
+                if (wantTy->isIntegerTy() && wantTy != payloadResult->getType())
+                    payloadResult = builder_.CreateIntCast(
+                        payloadResult, wantTy, /*isSigned=*/true);
             }
             auto* opEndBB = builder_.GetInsertBlock();
             builder_.CreateBr(mergeBB);
@@ -5449,6 +5472,18 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 builder_.SetInsertPoint(endBB);
                 diverged_ = false;
                 if (rhsDiv) return primVal;
+                // #1044: the RHS default is lowered at its own natural width
+                // (an `int` literal is i32), so for a nullable payload whose
+                // width differs — a sub-i32 `byte?`/`sbyte?`/`short?`/`ushort?`
+                // (i8/i16), or a wider `long?` (i64) — it mismatches the PHI's
+                // payload type and triggers an LLVM PHINode "operands must be
+                // the same type" assertion (`byte? ?? 9` crashed; `byte? ?? byte(9)`
+                // worked). Coerce the RHS to the payload's integer type.
+                if (primVal->getType()->isIntegerTy() &&
+                    r->getType()->isIntegerTy() &&
+                    primVal->getType() != r->getType())
+                    r = builder_.CreateIntCast(r, primVal->getType(),
+                                               /*isSigned=*/true);
                 auto* phi = builder_.CreatePHI(primVal->getType(), 2);
                 phi->addIncoming(primVal, entryBB);
                 phi->addIncoming(r, rhsEndBB);
