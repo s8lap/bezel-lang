@@ -100,14 +100,17 @@ BEZEL_TEST(move_result_owned_724, using_var_move_result_disposed) {
         "end Main; end C;"), 1);
 }
 
-// #724 F2 (regression pin, already fixed): discarding a freshly-constructed owned
-// value with a destructor is rejected (§17.13).
-BEZEL_TEST(move_result_owned_724, discard_disposable_new_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        "module M; class R destructor end destructor; end R; "
+// §17.13 v0.152 (#1009): discarding a freshly-constructed owned value is now
+// PERMITTED — `_ := new R()` disposes it at end-of-statement (R.n == 1 proves
+// the destructor ran EXACTLY once, not zero=leak/twice=double-free). Pre-v0.150
+// this was a §17.13 reject; auto-drop (§28.3) makes the obligation satisfiable,
+// so the discard simply names the immediate-disposal point.
+BEZEL_TEST(move_result_owned_724, discard_disposable_new_disposed_once) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M; ") + rclass +
         "class C public static method Main(): int "
-        "  _ := new R(); return 0; "    // §17.13 — cannot discard a disposable
-        "end Main; end C;"));
+        "  _ := new R(); return R.n; "    // disposed at end of statement → 1
+        "end Main; end C;"), 1);
 }
 
 // #724 F3 (regression pin, already fixed): a use after `_ := move x` via a `var`

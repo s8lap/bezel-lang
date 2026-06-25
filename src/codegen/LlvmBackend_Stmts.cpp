@@ -1143,7 +1143,34 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return diverged_;  // CG40: a throw-expression terminated the block
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) lowerExpr(*ds->value);
+        if (ds->value) {
+            if (ds->disposeOwnedValue) {
+                // §17.13 / §28.3 v0.150 (#1009): the ownership pass classified
+                // this discard's value as an owned PRODUCER of a user class/
+                // interface — an unbound owned temporary. Dispose it at the end
+                // of the discard statement. Open a one-entry dispose scope so the
+                // disposal fires on BOTH the normal edge (here) and the unwind
+                // edge (if some later cleanup in this statement throws); the
+                // produced value is the sole owner (producerState == Owned), so
+                // it is disposed EXACTLY once (no leak, no double-free). The
+                // dynamicDispose entry dispatches Dispose+reclaim through the
+                // object's own vtable (correct for any runtime class/interface),
+                // null-guarded.
+                disposeStack_.emplace_back();
+                llvm::Value* v = lowerExpr(*ds->value);
+                if (!diverged_ && v) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(v, slot);
+                    Disposal d{slot, nullptr};
+                    d.dynamicDispose = true;
+                    disposeStack_.back().push_back(d);
+                }
+                if (!diverged_) emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
+            } else {
+                lowerExpr(*ds->value);
+            }
+        }
         return diverged_;  // CG40
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {

@@ -233,6 +233,14 @@ struct IncrementStmt : Stmt {
 // IdentifierExpr "_" followed by `:=`.
 struct DiscardStmt : Stmt {
     std::unique_ptr<Expr> value;
+    // §17.13 / §28.3 v0.150 (#1009): set by the ownership pass when `value` is an
+    // owned PRODUCER of a USER class/interface (producerState == Owned) — an
+    // unbound owned temporary that the discard disposes at end-of-statement. A
+    // BORROW discard (field/local read, borrow-returning method) is Borrowed and
+    // left false, so codegen does not dispose it (no double-free). Owning
+    // collections and builtin handles (Task, Subscription, Shared, …) are also
+    // left false — they need their own free paths and are not handled here.
+    bool disposeOwnedValue = false;
 };
 
 // A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.

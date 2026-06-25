@@ -51,6 +51,8 @@
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
@@ -64,6 +66,47 @@ namespace fs = std::filesystem;
 int run(const std::string& program) {
     auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
+}
+
+// JIT a program with the FULL front-end INCLUDING the ownership pass, then run
+// `main` and return its exit code (-999 if it did not compile/run). The shared
+// runJit helper skips ownership::checkOwnership; #1009's discard-of-owned
+// disposal is FLAGGED by that pass (DiscardStmt::disposeOwnedValue), so a value
+// test for it must run the pass (mirrors iterator_owned_param_945's runner).
+int runOwn(const std::string& src) {
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(src, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return -999;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);
+    if (diags.hasErrors()) return -999;
+    bezel::test::ensureNativeTargetInitialized();
+    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+    auto module = bezel::codegen::emitModule(*unit, ctx, *llvmCtx,
+                                             bezel::codegen::CodegenOptions{});
+    if (!module) return -999;
+    auto jitOrErr = llvm::orc::LLJITBuilder().create();
+    if (!jitOrErr) { llvm::consumeError(jitOrErr.takeError()); return -999; }
+    auto jit = std::move(*jitOrErr);
+    if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix())) {
+        jit->getMainJITDylib().addGenerator(std::move(*gen));
+    } else {
+        llvm::consumeError(gen.takeError());
+    }
+    llvm::orc::ThreadSafeModule tsm(std::move(module), std::move(llvmCtx));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+        llvm::consumeError(std::move(err));
+        return -999;
+    }
+    auto sym = jit->lookup("main");
+    if (!sym) { llvm::consumeError(sym.takeError()); return -999; }
+    return sym->toPtr<int (*)()>()();
 }
 
 // LeakSanitizer verification. Lowers `source` to an object file (full front-end
@@ -475,34 +518,98 @@ BEZEL_TEST(codegen_throw_new_from_catch_397, direct_explicit_rethrow_no_double_f
     expectDisposedAndLeakFree(kDirectExplicitRethrow_FreeOnce, 1);
 }
 
-// #724 / §17.13: discarding a NON-trivial-dispose value (`_ := expr;`) is a
-// compile error — it silently abandons the disposal obligation. Previously
-// accepted (a leak). Conservative reject: a class with an explicit destructor
-// in its class chain, or a move-only owning array.
-BEZEL_TEST(undisposed_leak, discard_class_with_destructor_rejected_724) {
-    auto r = runJit(
+// §17.13 v0.152 (#1009): discarding a NON-trivial-dispose value (`_ := expr;`)
+// is now PERMITTED — it disposes the value at end-of-statement (the "unbound
+// owned temporary" form, §28.3). The ownership pass marks an owned-PRODUCER
+// class/interface discard and codegen disposes it via the object's vtable. The
+// static counter _n (dtor +1) returns 1, proving the destructor ran EXACTLY
+// once; ASan confirms no leak and no double-free. (Pre-v0.150 this was a reject.)
+BEZEL_TEST(undisposed_leak, discard_class_with_destructor_disposed_724_1009) {
+    const char* src =
         "module M; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C public static method Main(): int "
         "  _ := new R(); "
-        "  return 0; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+        "  return R._n; "            // 1 — disposed exactly once at statement end
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 1);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
 }
 
-// #724: a derived class inheriting a destructor is also non-trivial-dispose.
-BEZEL_TEST(undisposed_leak, discard_derived_inherits_destructor_rejected_724) {
-    auto r = runJit(
+// §17.13 v0.152 (#1009): a derived class inheriting a destructor is non-trivial-
+// dispose; `_ := new Derived()` disposes via the most-derived vtable dispatch
+// (the base destructor runs), exactly once. ASan clean.
+BEZEL_TEST(undisposed_leak, discard_derived_inherits_destructor_disposed_724_1009) {
+    const char* src =
         "module M; "
-        "class Base public constructor() end constructor; "
-        "  destructor end destructor; end Base; "
+        "class Base public static _n: int := 0; public constructor() end constructor; "
+        "  destructor _n := _n + 1; end destructor; end Base; "
         "class Derived: Base public constructor() base(); end constructor; end Derived; "
         "class C public static method Main(): int "
         "  _ := new Derived(); "
+        "  return Base._n; "         // 1 — disposed once via dynamic dispatch
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 1);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §17.13 v0.152 (#1009): `_ := <call returning owned T>` disposes the result at
+// statement end — the explicit "dispose this owned result now" form. Exactly once.
+BEZEL_TEST(undisposed_leak, discard_owned_returning_call_disposed_1009) {
+    const char* src =
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C "
+        "  public static method Mk(): owned R return new R(); end Mk; "
+        "  public static method Main(): int "
+        "    _ := C.Mk(); "
+        "    return R._n; "          // 1 — disposed exactly once
+        "  end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 1);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §17.13 / §28.8.1 (#1009): `_ := move x` discharges the owned local `x` by
+// disposing the moved value at statement end. `x` is NOT double-freed at scope
+// end (the move leaves it moved-from). Disposed exactly once; ASan clean.
+BEZEL_TEST(undisposed_leak, discard_move_local_disposed_once_1009) {
+    const char* src =
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C public static method Main(): int "
+        "  var x := new R(); "
+        "  _ := move x; "
+        "  return R._n; "            // 1 — disposed once, x not double-freed
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 1);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §17.13 (#1009) SOUNDNESS: discarding a BORROW (`_ := x` where x is an owned
+// local) does NOT dispose at the discard — `x` is the sole owner and disposes
+// the value exactly once at its own scope end. No double-free. The ownership
+// pass classifies the alias read as Borrowed, so the discard is a no-op read.
+BEZEL_TEST(undisposed_leak, discard_owned_local_alias_not_double_freed_1009) {
+    const char* src =
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C public static method Main(): int "
+        "  using var x := new R(); "
+        "  _ := x; "                 // borrow read+discard — NOT disposed here
         "  return 0; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+        "end Main; end C;";
+    // detectLeaks=true: x is disposed exactly once at scope end → no leak; the
+    // borrow discard adds no second disposal → no double-free.
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
 }
 
 // #724: a TRIVIAL-dispose class (no destructor) and a primitive are still
@@ -516,4 +623,20 @@ BEZEL_TEST(undisposed_leak, discard_trivial_class_and_int_allowed_724) {
         "  _ := 42; "
         "  return 0; "
         "end Main; end C;"), 0);
+}
+
+// §17.13 (#1009): a discard of a MOVE-ONLY owning inline array stays a reject —
+// end-of-statement disposal of its owned slots is a deferred follow-up (its
+// slot-disposal codegen differs from the class/interface vtable path).
+BEZEL_TEST(undisposed_leak, discard_move_only_array_still_rejected_1009) {
+    auto r = runJit(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "  destructor end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var a: [2 owned]Cell? := [new Cell(), new Cell()]; "
+        "  _ := a; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }

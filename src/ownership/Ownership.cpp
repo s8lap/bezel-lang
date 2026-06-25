@@ -1136,7 +1136,29 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) handleDischarge(*ds->value);
+        if (ds->value) {
+            handleDischarge(*ds->value);
+            // §17.13 / §28.3 v0.150 (#1009): a discard `_ := <owned producer>` of
+            // a USER class/interface is an *unbound owned temporary* (§28.3) — it
+            // is disposed at end-of-statement. Mark it so codegen emits that
+            // disposal. producerState == Owned is the sound gate: a BORROW (a
+            // field/local read, a borrow-returning collection method, a plain
+            // Task) is Borrowed and left unmarked, so codegen never disposes it
+            // (no double-free). Restricted to a USER class/interface (declaration
+            // is a Class/Interface with a real AST decl, not value-builtin) —
+            // builtin handles (Task, Subscription, Shared, Stopwatch, …) resolve
+            // to a declaration-less / decl-null TypeSymbol and need their own free
+            // paths (deferred); owning collections are Owned* but decl-null too.
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+                        (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                         rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                        !rt->declaration->isValueBuiltin &&
+                        rt->declaration->decl != nullptr)
+                        const_cast<ast::DiscardStmt*>(ds)->disposeOwnedValue = true;
+            }
+        }
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
