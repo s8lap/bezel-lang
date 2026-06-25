@@ -5299,8 +5299,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
-                    if (mbr == "Concat" || mbr == "Join" || mbr == "Empty" ||
-                        mbr == "From" || mbr == "Format" || mbr == "Repeat") {
+                    // #1034: `string.Format` and `string.Concat` are NOT provided
+                    // by the stdlib (§9.6 lists Join/From/Empty/Repeat; composite
+                    // formatting is done with string interpolation `$"{...}"`).
+                    // They were typed `string` here but have no codegen lowering,
+                    // so `string.Format(...)` compiled and CRASHED (SIGSEGV) and
+                    // `string.Concat(...)` returned a garbage empty string. Drop
+                    // them from the accept set so they fall through to the clean
+                    // "type 'string' has no static method 'Format'" §3.4 reject,
+                    // exactly as any other unknown static (`string.Bogus()`).
+                    if (mbr == "Join" || mbr == "Empty" ||
+                        mbr == "From" || mbr == "Repeat") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }

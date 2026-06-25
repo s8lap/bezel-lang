@@ -117,3 +117,25 @@ BEZEL_TEST(sema_unknown_primitive_method_spec3_4, math_abs_is_accepted) {
     auto r = checkBody("var a := Math.Abs(0 - 5); return a;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// #1034 / §3.4 / §9.6: `string.Format` and `string.Concat` are NOT stdlib string
+// statics (use string interpolation `$"{...}"` for composite formatting). They
+// were erroneously typed `string` by sema but have no codegen lowering, so they
+// compiled and then crashed (Format → SIGSEGV) / returned garbage (Concat). They
+// must be rejected like any other unknown static method.
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_format_is_rejected_1034) {
+    auto r = checkBody("var s := string.Format(\"v={0}\", 5); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_concat_is_rejected_1034) {
+    auto r = checkBody("var s := string.Concat(\"a\", \"b\"); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+// #1034 regression: the REAL string statics (§9.6 Join/From/Empty/Repeat) keep
+// working — they must NOT be over-rejected by the Format/Concat removal.
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_empty_and_from_still_accepted_1034) {
+    auto r1 = checkBody("var s := string.Empty; return s.Length;");
+    BEZEL_EXPECT_FALSE(r1.diagnostics.hasErrors());
+    auto r2 = checkBody("var s := string.From('x'); return s.Length;");
+    BEZEL_EXPECT_FALSE(r2.diagnostics.hasErrors());
+}
