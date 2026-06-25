@@ -1299,8 +1299,30 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                 if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
                     auto* md = dynamic_cast<const ast::MethodDecl*>(
                         ms->decl);
-                    if (md && md->returnOwned) {
-                        return OwnershipState::Owned;
+                    if (md) {
+                        if (md->returnOwned) return OwnershipState::Owned;
+                        // §28.6 / §5.11 (#1008 Part C): a USER method returning a
+                        // non-`owned` owning COLLECTION (OwnedArray, …) yields a
+                        // BORROW (the `Owned*` name denotes ELEMENT ownership,
+                        // orthogonal to the container ownership the `owned`
+                        // qualifier governs). Do NOT fall through to the builtin
+                        // name-head fallback below for collections — that would
+                        // classify it Owned. The definition-site check
+                        // checkBorrowReturnedThroughOwningType guarantees such a
+                        // return is a genuine borrow (a bare receiver-field
+                        // read), never a fresh/`move`d/owned value, so this never
+                        // under-disposes an owned result. Owning WRAPPERS
+                        // (OwnedTask, Shared, …) keep consumer-owns semantics —
+                        // they fall through to the name-head fallback (Owned),
+                        // and a borrow through them stays the #1007 reject.
+                        if (const sema::TypeRef* rt = ctx_.exprType(e))
+                            if (rt->kind == sema::TypeRef::Kind::Named &&
+                                rt->astNode && rt->astNode->name &&
+                                !rt->astNode->name->parts.empty() &&
+                                isOwningCollectionNameHead(
+                                    rt->astNode->name->parts.front()))
+                                return OwnershipState::Borrowed;
+                        // Other non-`owned` user returns: fall through.
                     }
                 }
             }
@@ -1666,6 +1688,18 @@ bool MethodOwnership::isOwningTypeNameHead(std::string_view head) {
            head == "CancellationTokenSource";
 }
 
+// §28.6 / §5.11 (#1008 Part C): the owning *collections* — the borrow-return and
+// capability rules of Part C apply to these. The owning *wrappers* (OwnedTask,
+// Shared, Weak, ChannelSender, OwnedEnumerable, CancellationTokenSource) have
+// consumer-owns semantics Part C does not change: a non-`owned` wrapper return
+// stays an owned producer (a borrow through it is the #1007 double-free hazard,
+// still rejected), and the read-only capability restriction does not apply.
+bool MethodOwnership::isOwningCollectionNameHead(std::string_view head) {
+    return head == "OwnedArray"  || head == "OwnedDictionary" ||
+           head == "OwnedSet"    || head == "OwnedStack"      ||
+           head == "OwnedQueue"  || head == "OwnedLinkedList";
+}
+
 // §28.3 / §28.6 / §5.11 (#1007): a method declared `: OwnedArray<T>` (or any
 // owning-collection / owning-wrapper return type) WITHOUT the `owned` qualifier
 // hands the caller a value the caller tracks as OWNED — the caller must
@@ -1690,50 +1724,153 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
     if (!returnType_ || returnType_->kind != ast::TypeKind::Named ||
         !returnType_->name || returnType_->name->parts.empty())
         return;
-    if (!isOwningTypeNameHead(returnType_->name->parts.front())) return;
-    // Reuse the §28.8 owned-sink borrow classifier: it returns true for the
-    // borrow forms (borrowed param, borrowed local, `this`, caught-exception
-    // borrow) and false for every genuine owned producer (`new`, `move`, owned-
-    // returning call, owned local/param). The caller's owned binding IS an owned
-    // sink, so the same hazard applies on return. Its one gap here is the
-    // isBorrowableType TYPE-GATE on field/index reads: the owning-collection
-    // builtins (OwnedArray, …) carry no `declaration`, so isBorrowableType
-    // reports them non-borrowable and the classifier skips a plain field/index
-    // read of one. That gate exists to exclude VALUE-typed copies — irrelevant
-    // here, since the return type is itself a reference owning collection. So
-    // supplement the classifier: a bare (non-`move`) field read or index read of
-    // the owning return type is a borrow too (its source — `this`/`obj`/the
-    // collection — still owns the value). `move this.f` / `move coll[i]` are
-    // UnaryExprs, not Member/Index exprs, so the legal owned producers are not
-    // caught here. // per §28.3, §28.8.1, §5.11
-    bool isBorrow = ownedArgSourceIsBorrow(e);
-    if (!isBorrow) {
-        // A plain `obj.f` / `this.f` field read of the owning type.
-        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-            if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma)))
+    std::string head(returnType_->name->parts.front());
+    if (!isOwningTypeNameHead(head)) return;
+    if (!isOwningCollectionNameHead(head)) {
+        // Owning WRAPPER (OwnedTask, Shared, Weak, ChannelSender,
+        // OwnedEnumerable, CancellationTokenSource): consumer-owns semantics are
+        // unchanged by Part C — a non-`owned` wrapper return is an OWNED producer
+        // (the caller disposes it), and a BORROW returned that way is laundered
+        // into a second owner (the #1007 double-free). Reject the borrow; allow
+        // every genuine owned producer (`new`, `move`, a call returning owned).
+        // This is the pre-Part-C #1007 behaviour, retained for the wrappers.
+        bool isBorrow = ownedArgSourceIsBorrow(e);
+        if (!isBorrow) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma)))
+                    isBorrow = true;
+            } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+                if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*id)))
+                    isBorrow = true;
+            } else if (dynamic_cast<const ast::IndexExpr*>(&e)) {
                 isBorrow = true;
+            }
         }
-        // A bare identifier resolving to a field of the declaring class
-        // (implicit `this.f`).
-        else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*id)))
-                isBorrow = true;
-        }
-        // A bare (non-`move`) indexer read `coll[i]` of the owning type.
-        else if (dynamic_cast<const ast::IndexExpr*>(&e)) {
-            isBorrow = true;
-        }
+        if (!isBorrow) return;
+        report(
+            Severity::Error, e.span.begin,
+            std::string("a borrow may not be returned through the owning-type "
+                        "return `") + head +
+            "<…>` — the caller would track the returned value as owned and "
+            "dispose it, double-freeing the borrow's actual owner (§28.3 / "
+            "§5.11); return a freshly-produced or `move`d owned value, declare "
+            "the return type `owned`, or use a borrowing return type");
+        return;
     }
-    if (!isBorrow) return;
+    // §28.6 / §5.11 (#1008 Part C): a non-`owned` owning-collection return is a
+    // BORROW (the `Owned*` name denotes ELEMENT ownership, orthogonal to the
+    // container ownership the `owned` qualifier governs). The one admissible
+    // borrow form is a bare read of an `owned` owning-collection field of THE
+    // RECEIVER (`this`) — `return this` for a field, source the receiver, which
+    // the caller holds across the call. The borrowed result carries the read-
+    // only capability restriction ([§28.6](#sec-borrowed-owning-collections)) at
+    // its use sites. A field of ANOTHER object (`obj._items`, `local._items`)
+    // has a source that need not outlive the call (a scope-bound local would
+    // dangle — a use-after-free); the borrow-lifetime checker does not catch
+    // this for the owning-collection builtins (no `declaration`), so it is
+    // rejected here. Everything else is rejected below. // per §28.6, §28.3, §5.11
+    if (exprIsOwnedFieldRead(e)) {
+        // Restrict the allowance to a RECEIVER field: a bare identifier
+        // (implicit `this.f`) or an explicit `this.f`.
+        if (dynamic_cast<const ast::IdentifierExpr*>(&e)) return;  // implicit this.f
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+                if (tid->name == "this") return;  // this.f
+        // A field of another object — fall through to the borrow rejection.
+    }
+    // `move field` is the field-TRANSFER form — diagnosed by
+    // checkOwnedFieldReturn (#1005, "declare the return type `owned`"); skip
+    // here to avoid double-reporting it.
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
+        if (un->op == "move") return;
+    // A borrowed PARAMETER or LOCAL, or a field of another object — a borrow
+    // whose source does not outlive the call
+    // (`Identity(a: OwnedArray<T>): OwnedArray<T> => a`, or `return local._items`).
+    if (ownedArgSourceIsBorrow(e) || exprIsOwnedFieldRead(e)) {
+        report(
+            Severity::Error, e.span.begin,
+            std::string("a borrowed `") + head +
+            "<…>` value may not be returned — its source does not outlive the "
+            "call; return a bare owning-collection field of the receiver "
+            "(`this`), or declare the return type `owned` to transfer ownership "
+            "of a freshly-produced value (§28.3 / §28.6 / §5.11)");
+        return;
+    }
+    // Otherwise: a freshly-produced value (`new`, an owned-returning call)
+    // returned through a non-`owned` owning return. #1008 Part C tightening —
+    // the caller cannot distinguish a fresh owned value from a borrow by the
+    // return signature, so a non-`owned` owning-collection return ALWAYS denotes
+    // a borrow; a fresh owning value must be returned `owned` (without it the
+    // caller would treat the fresh value as a borrow and never dispose it — a
+    // leak). // per §28.6, §5.11
     report(
         Severity::Error, e.span.begin,
-        std::string("a borrow may not be returned through the owning-type "
-                    "return `") +
-        std::string(returnType_->name->parts.front()) +
-        "<…>` — the caller would track the returned value as owned and dispose "
-        "it, double-freeing the borrow's actual owner (§28.3 / §5.11); return a "
-        "freshly-produced or `move`d owned value, declare the return type "
-        "`owned`, or use a borrowing return type");
+        std::string("a freshly-produced `") + head +
+        "<…>` value must be returned through an `owned` return type (declare `: "
+        "owned " + head +
+        "<…>`); a non-`owned` owning-collection return is a borrow of a field, "
+        "which the caller may not dispose (§28.6 / §5.11)");
+}
+
+// §28.6 *Borrowed owning collections* (#1008 Part C). A BORROW of an owning
+// collection grants read access only: the ownership-transferring and disposing
+// operations are unavailable, because the borrower is not the container's owner
+// and must not dispose it (a double-free of the owner's container) nor change
+// which elements the owner will dispose. The current scope's OWNED owning
+// collections keep their full API — a `this`-field (the owner managing its own
+// field, §28.7), or a local / parameter currently in the Owned state. // per §28.6
+void MethodOwnership::checkBorrowedOwningCollectionCapability(
+    const ast::MemberAccessExpr& callee) {
+    // The one MEMORY-unsafe operation on a borrowed owning collection is
+    // `Dispose`: it frees the container and cascades to its elements, which the
+    // actual owner ALSO frees at scope/destructor end — a double-free. The
+    // mutation / transfer operations (`Add`, `Drain`, `Pop*`, `Remove*`,
+    // `Clear`, indexer-set) are memory-safe on a borrow — they preserve
+    // dispose-exactly-once (a transferred element is owned by its new holder;
+    // the owner then disposes a smaller/empty container) — and Bezel already
+    // admits them on a borrowed collection (the pass-and-fill `a.Add(...)`
+    // pattern where `a` is a borrowed `OwnedArray<T>` parameter, §28.8). So only
+    // `Dispose` is restricted here; the rest follow normal borrowed-collection
+    // semantics. // per §28.6
+    if (callee.member != "Dispose") return;
+    const ast::Expr* recv = callee.target.get();
+    if (!recv) return;
+    // The receiver must statically be an owning-collection type (OwnedArray, …);
+    // the same operations on a plain Array<T>/List<T> or a borrowed plain class
+    // are unaffected.
+    const sema::TypeRef* rt = ctx_.exprType(*recv);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->astNode ||
+        !rt->astNode->name || rt->astNode->name->parts.empty())
+        return;
+    if (!isOwningCollectionNameHead(rt->astNode->name->parts.front())) return;
+    // Owned by the current scope → full API.
+    sema::Symbol* rsym = ctx_.exprSymbol(*recv);
+    if (dynamic_cast<sema::FieldSymbol*>(rsym)) {
+        // A field accessed through the CURRENT object — bare `_items` (implicit
+        // `this`) or `this._items` — is the owner's own field (§28.7). A field
+        // of ANOTHER object (`obj._items`) is an external borrow → reject.
+        if (dynamic_cast<const ast::IdentifierExpr*>(recv)) return;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(recv))
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+                if (tid->name == "this") return;
+    } else if (rsym) {
+        // An owned LOCAL (`using var` / `var a := new OwnedArray()`) or an
+        // `owned` PARAMETER is in the Owned state in `states_`; a borrowed
+        // local/param (e.g. `var items := h.GetItems()`) is Borrowed → reject.
+        auto it = states_.find(rsym);
+        if (it != states_.end() && it->second.state == OwnershipState::Owned)
+            return;
+    }
+    // else: a call result (`h.GetItems().Drain()`) or other expression — a
+    // borrow with no owner in this scope → reject.
+    report(
+        Severity::Error, callee.span.begin,
+        "cannot call `Dispose` on a borrowed owning collection — its owner "
+        "disposes the container and its elements; disposing it here would "
+        "double-free. The owner (a `using var`, an owned local, or the object "
+        "whose field this is) disposes it (§28.6 Borrowed owning collections).");
 }
 
 // §28.6 (#1005): "An owned field's value may not be returned from a method

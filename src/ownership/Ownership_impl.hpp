@@ -269,6 +269,16 @@ private:
     // unaffected. Fires from handleReturn; a no-op for non-owning return types.
     void checkBorrowReturnedThroughOwningType(const ast::Expr& e);
 
+    // §28.6 *Borrowed owning collections* (#1008 Part C): reject an ownership-
+    // transferring / disposing operation (Dispose / Drain / Pop* / Dequeue /
+    // owning Add / Insert / Remove* / Clear) on a BORROW of an owning collection.
+    // A borrow grants read access only; the owner disposes the container and its
+    // elements, so a borrower's Dispose would double-free it. The current
+    // scope's OWNED owning collections — a `this`-field, or a local/param with
+    // Owned state — keep their full API.
+    void checkBorrowedOwningCollectionCapability(
+        const ast::MemberAccessExpr& callee);
+
     // §28.6 (#1005): reject returning an OWNED FIELD's `move`d value through a
     // method return type that is NOT declared `owned`. The leak is the `move`
     // form: `move this.f` / `move f` transfers the owned field's value out
@@ -289,6 +299,11 @@ private:
     // wrapper type (the set whose value the caller must discharge). True for
     // `OwnedArray`/`OwnedDictionary`/…/`Shared`/`Weak`/`OwnedTask`/etc.
     static bool isOwningTypeNameHead(std::string_view head);
+    // §28.6 / §5.11 (#1008 Part C): the owning COLLECTIONS only (OwnedArray,
+    // OwnedDictionary, OwnedSet, OwnedStack, OwnedQueue, OwnedLinkedList) — the
+    // Part C borrow-return / capability rules apply to these; the owning
+    // wrappers keep their consumer-owns semantics.
+    static bool isOwningCollectionNameHead(std::string_view head);
 
     // A returned value is only a *borrow* of its local root when it has
     // reference type; a value-typed projection (e.g. `r.V` where V is an

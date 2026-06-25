@@ -312,6 +312,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §28.6 *Borrowed owning collections* (#1008 Part C): reject an
+        // ownership-transferring / disposing op (Dispose/Drain/Pop*/Add/…) on a
+        // BORROW of an owning collection (the owner disposes it — a borrower's
+        // call would double-free or steal). The owner's own field / owned local
+        // keeps the full API.
+        if (call->callee)
+            if (auto* fma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call->callee.get()))
+                checkBorrowedOwningCollectionCapability(*fma);
         // §28.2: a further Dispose() call on an already-disposed instance is
         // handled by markDisposedByName (further below), which emits the
         // "already disposed" error.  We must NOT also fire the §28.2

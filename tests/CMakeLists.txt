@@ -416,6 +416,7 @@ set(BEZEL_TEST_SOURCES
     codegen/await_for_frame_dispose_792_test.cpp
     codegen/escaping_member_ref_borrow_791_test.cpp
     codegen/move_result_owned_724_test.cpp
+    codegen/borrowed_owning_return_1008c_test.cpp
     codegen/expr_bodied_async_799_test.cpp
     codegen/async_lambda_infer_block_800_test.cpp
     codegen/case_record_typed_binding_801_test.cpp

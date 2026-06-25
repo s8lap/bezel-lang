@@ -110,23 +110,51 @@ BEZEL_TEST(borrow_return_1007, owned_array_field_read_rejected) {
 
 // --- ACCEPT: genuine owned producers and explicit-`owned` transfers. ---
 
-// A FRESH owning collection returned through `: OwnedArray<Cell>` is a genuine
-// owned producer — the caller's single disposal is correct. Must compile.
-BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_clean) {
+// §28.6 (#1008 Part C tightening): a FRESH owning collection returned through a
+// NON-`owned` return is now REJECTED — the caller cannot distinguish fresh from
+// borrow by the return signature, so a non-`owned` owning-collection return
+// always means borrow; a fresh value must declare `owned`.
+BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_requires_owned) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Make(): OwnedArray<Cell> => new OwnedArray<Cell>(); "
         "end P;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// The same fresh value returned through an `owned` return type is clean — the
+// transfer is explicit and the caller disposes it once.
+BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_owned_clean) {
+    auto r = parseAndCheckOwnership(mod(
+        "class P "
+        "  public static method Make(): owned OwnedArray<Cell> => new OwnedArray<Cell>(); "
+        "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// An OWNED parameter transferred out through the owning type is a real
-// ownership transfer (not a borrow) — must compile.
-BEZEL_TEST(borrow_return_1007, owned_param_transfer_clean) {
+// §28.6 (#1008 Part C): an OWNED value (here an owned parameter) returned through
+// a NON-`owned` owning return is now rejected — under the borrow reading a
+// non-`owned` return never disposes, so returning an owned value that way leaks;
+// declare the return `owned` to transfer.
+BEZEL_TEST(borrow_return_1007, owned_param_through_nonowned_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public static method Pass(owned a: OwnedArray<Cell>): OwnedArray<Cell> "
         "    => a; "
+        "end P;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.6 (#1008 Part C): a bare read of an `owned` owning-collection field of the
+// RECEIVER (`this`) returned through a non-`owned` return is a legal receiver-
+// borrow (the caller may read it but not dispose it; the receiver disposes it).
+BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_allowed) {
+    auto r = parseAndCheckOwnership(mod(
+        "class P "
+        "  public owned _items: OwnedArray<Cell>; "
+        "  public constructor() this._items := new OwnedArray<Cell>(); end constructor; "
+        "  destructor end destructor; "
+        "  public method Get(): OwnedArray<Cell> => this._items; "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
