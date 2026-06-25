@@ -6759,6 +6759,37 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
         (void)ne;
         return nullptr;
     }
+    // (a2) #1018 / #911 / §25: a user-defined binary operator whose `operator OP`
+    // returns `owned T` — `var r := a + b`. The initializer is a BinaryExpr (not a
+    // NewExpr or CallExpr), so (a)/(b) miss it: the operator-result block was
+    // neither reclaimed on an explicit `r.Dispose()` (the #1018 leak — this slot
+    // never reached explicitDisposeOwnedReceiverSlot's reclaim) nor disposed on an
+    // exception unwind. Sema attaches the operator MethodSymbol to the BinaryExpr;
+    // OperatorDecl::returnOwned is the authority that the operator owns its result.
+    // Recognize it here so the operator result behaves exactly like a `new`/owned-
+    // call result for both the explicit-dispose reclaim+null and the §28.3 unwind
+    // disposal — mirroring usingVarOwnsClassObjectDynamically (b0b). The normal-
+    // path affine auto-drop (#965, ld->autoDropAtScopeEnd) is unaffected: it routes
+    // through registerUsingDisposal, and a local that is explicitly discharged is
+    // NOT flagged autoDropAtScopeEnd, so the unwind-only registration added here
+    // does not double with it (the `else if`/`else` in lowerLocalDecl is exclusive).
+    if (dynamic_cast<const ast::BinaryExpr*>(ld->initializer.get())) {
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                ctx_.exprSymbol(*ld->initializer))) {
+            auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
+            const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+            if (od && od->returnOwned &&
+                (isClassOrInterfaceRef(initTy) ||
+                 isClassOrInterfaceRef(resolveTypeParamRef(initTy)))) {
+                if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                    initTy->declaration &&
+                    initTy->declaration->kind == ast::TypeDeclKind::Class)
+                    return initTy->declaration;
+                return reinterpret_cast<const sema::TypeSymbol*>(1);
+            }
+        }
+        return nullptr;
+    }
     // (b) a call returning `owned T` (class/interface). Dispatch is dynamic, so
     // the concrete class is not needed — return a sentinel non-null class when
     // the static type is a class with a disposer, else rely on dynamic dispatch.

@@ -242,6 +242,56 @@ const char* kExplicitLocalBaseChain =
     "  destructor Base._n := Base._n + 1; end destructor; "
     "end Derived;";
 
+// (e) #1018 / §25 / §28.5: a plain `var` owned local bound from an owned-returning
+// binary OPERATOR result (`var r := a + b`), explicitly disposed. The destructor
+// runs once for each of a, b, r (live-count returns to 0). Before #1018 the
+// operator-result BLOCK leaked: explicitDisposeOwnedReceiverSlot did not classify
+// the BinaryExpr-initialized local as reclaimable (unwindOwnedLocalClass only knew
+// `new`/owned-call), so `r.Dispose()` dispatched the destructor but never reclaimed
+// the block. After #1018 the operator result is recognized like a `new`/owned-call
+// result: the explicit dispose reclaims + nulls the slot. Load-bearing on the LSan
+// leg (the destructor-count is 0 with or without the fix; only LSan sees the leak).
+const char* kOperatorResultExplicitDispose =
+    "module M; class Cell "
+    "  public static _n: int := 0; "
+    "  public Value: int; "
+    "  public constructor(v: int) _n := _n + 1; Value := v; end constructor; "
+    "  destructor _n := _n - 1; end destructor; "
+    "  public static method operator +(a: Cell, b: Cell): owned Cell => "
+    "    new Cell(a.Value + b.Value); "
+    "  public static method Main(): int "
+    "    do "
+    "      using var a := new Cell(1); "
+    "      using var b := new Cell(2); "
+    "      var r := a + b; "
+    "      r.Dispose(); "
+    "    end; "
+    "    return _n; "
+    "  end Main; "
+    "end Cell;";
+
+// (f) #965 / §28.3 regression guard: the SAME owned operator result WITHOUT an
+// explicit dispose must still auto-drop at scope end (the affine auto-drop). The
+// #1018 unwind-classifier change must not perturb this path — it stays disposed
+// exactly once (live-count 0, LSan clean).
+const char* kOperatorResultAutoDrop =
+    "module M; class Cell "
+    "  public static _n: int := 0; "
+    "  public Value: int; "
+    "  public constructor(v: int) _n := _n + 1; Value := v; end constructor; "
+    "  destructor _n := _n - 1; end destructor; "
+    "  public static method operator +(a: Cell, b: Cell): owned Cell => "
+    "    new Cell(a.Value + b.Value); "
+    "  public static method Main(): int "
+    "    do "
+    "      using var a := new Cell(1); "
+    "      using var b := new Cell(2); "
+    "      var r := a + b; "
+    "    end; "
+    "    return _n; "
+    "  end Main; "
+    "end Cell;";
+
 }  // namespace
 
 BEZEL_TEST(codegen_explicit_dispose_reclaim_415, plain_local_explicit_only_freed) {
@@ -266,6 +316,20 @@ BEZEL_TEST(codegen_explicit_dispose_reclaim_415, explicit_local_base_chain_freed
     // §28.4: explicit dispose of a derived local runs Derived(+1)+Base(+100)=101
     // and reclaims the (single) block once after the full base chain.
     expectDisposedAndLeakFree(kExplicitLocalBaseChain, 101);
+}
+
+BEZEL_TEST(codegen_explicit_dispose_reclaim_1018, operator_result_explicit_dispose_freed) {
+    // #1018/§25/§28.5: explicit dispose of an owned binary-operator result reclaims
+    // the block (before the fix it leaked — only the LSan leg catches it). All three
+    // (a, b, r) destruct exactly once → live-count 0; LSan: 0 leaked, no double-free.
+    expectDisposedAndLeakFree(kOperatorResultExplicitDispose, 0);
+}
+
+BEZEL_TEST(codegen_explicit_dispose_reclaim_1018, operator_result_auto_drop_freed) {
+    // #965 regression: the owned operator result without an explicit dispose still
+    // auto-drops at scope end (live-count 0, LSan clean) — the #1018 unwind-class
+    // change does not perturb the affine auto-drop path.
+    expectDisposedAndLeakFree(kOperatorResultAutoDrop, 0);
 }
 
 // §28.2: a repeated explicit `x.Dispose(); x.Dispose();` is a no-op on the second
