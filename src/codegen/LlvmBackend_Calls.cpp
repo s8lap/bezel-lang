@@ -7367,6 +7367,39 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return ok;
     }
 
+    // §9.4: bool.Parse(s: string): bool — "true"/"false" case-insensitive.
+    // Same recognition as TryParse, but per the §9.x strict-fault Parse
+    // contract (stdlib: "TryParse returns false in every case where Parse
+    // would raise"), any input other than the two canonical words raises
+    // FormatException rather than yielding a value. Without this handler the
+    // call fell through to the generic `return arg` below and handed the
+    // string pointer back as an i1, emitting malformed IR (`br ptr` — verifier
+    // failure, would crash; an unimplemented-lowering bug, not a reject).
+    if (pt == P::Bool && m == "Parse" && call.args.size() == 1 &&
+        call.args[0].value) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        llvm::Value* strData = loadStringData(strVal);
+        auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
+        llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+        unsigned bid = stringLiteralIdx_++;
+        auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.bp.true." + std::to_string(bid));
+        llvm::Constant* falseStr = llvm::ConstantDataArray::getString(llvm_, "false", true);
+        auto* falseGV = new llvm::GlobalVariable(*module_, falseStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, falseStr, ".bz.bp.false." + std::to_string(bid));
+        llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+            builder_.CreateCall(strcasecmpFn, {strData, trueGV}),
+            builder_.getInt32(0), "bp.isTrue");
+        llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+            builder_.CreateCall(strcasecmpFn, {strData, falseGV}),
+            builder_.getInt32(0), "bp.isFalse");
+        llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "bp.ok");
+        // Neither "true" nor "false" → FormatException (strict-fault Parse).
+        emitGuardThrow(builder_.CreateNot(ok, "bp.bad"), "FormatException");
+        return cmpTrue;
+    }
+
     // int.Parse(s, radix): base-N integer parse (§5.2). The two-argument form
     // reaches this primitive handler via the lowercase keyword receiver; without
     // it the call was dropped and the result read an uninitialized slot

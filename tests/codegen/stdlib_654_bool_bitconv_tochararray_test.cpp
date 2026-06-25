@@ -123,6 +123,53 @@ BEZEL_TEST(codegen_654_bool_tryparse, boolean_tryparse_name_spelling) {
 }
 
 // ===========================================================================
+// bool.Parse(s): bool  (stdlib §9.4) — issue #1035
+//
+// `bool.Parse` is a real stdlib §9.4 static method that sema accepts (typed
+// bool), but it had NO codegen lowering: the call fell through to the generic
+// primitive `Parse` handler's `return arg`, handing the string pointer back as
+// an i1 and emitting malformed IR (`br ptr` — verifier failure / would crash).
+// Per the §9.x strict-fault Parse contract ("TryParse returns false in every
+// case where Parse would raise"), valid "true"/"false" (case-insensitive) yield
+// the bool; anything else raises FormatException.
+// ===========================================================================
+
+// stdlib §9.4: bool.Parse("true") → true.
+BEZEL_TEST(codegen_1035_bool_parse, parse_true) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var b := bool.Parse(\"true\"); return (7 if b else 9); ")), 7);
+}
+
+// stdlib §9.4: bool.Parse("false") → false.
+BEZEL_TEST(codegen_1035_bool_parse, parse_false) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var b := bool.Parse(\"false\"); return (1 if b else 4); ")), 4);
+}
+
+// stdlib §9.4: recognition is case-insensitive ("TRUE" → true).
+BEZEL_TEST(codegen_1035_bool_parse, parse_case_insensitive) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var b := bool.Parse(\"TRUE\"); return (42 if b else 0); ")), 42);
+}
+
+// stdlib §9.4 / §9.x strict-fault: an unrecognised word raises FormatException.
+BEZEL_TEST(codegen_1035_bool_parse, parse_invalid_raises_format_exception) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "try "
+        "  var b := bool.Parse(\"yes\"); "
+        "  return 0; "
+        "catch FormatException => return 1; "
+        "end; "
+        "return 0; ")), 1);
+}
+
+// stdlib §9.4: Boolean.Parse (boxed-type name spelling) also lowers.
+BEZEL_TEST(codegen_1035_bool_parse, boolean_parse_name_spelling) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var b := Boolean.Parse(\"false\"); return (1 if b else 4); ")), 4);
+}
+
+// ===========================================================================
 // Win 2 — BitConverter  (stdlib §2.12)
 // ===========================================================================
 // All four methods are pure bit-reinterpretation (no arithmetic).
