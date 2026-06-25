@@ -1164,3 +1164,29 @@ const char* kToDictBoundCount =
 BEZEL_TEST(linq_refcount, todictionary_count_bound_using_var_no_double_free_1013) {
     expectValueAndLeakFree(kToDictBoundCount, 2);
 }
+
+// #1028: a PLAIN `var d := src.ToDictionary(...)` (not `using var`) holds the sole
+// reference to a fresh `owned Dictionary<K,V>`. Before the fix it was neither
+// flagged for the §28.3 affine auto-drop nor reclaimed by any plain-`var` dict
+// materializer path (the array side had #1003; dicts had none), so the dict struct
+// + entries leaked. The fix adds a dict analog of #1003: the escape walk proves the
+// local never escapes (here only `.Count` is read), so a scope-end bz_dict_free
+// reclaims it exactly once. Value 3; LSan-clean (was a leak). A `using var` (above)
+// stays clean — it is excluded from the eligibility set, so no double-free.
+const char* kToDictPlainVarReclaimed_1028 =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var n: int := 0; "
+    "    do "
+    "      using var src := new OwnedArray<int>(); "
+    "      src.Add(1); src.Add(2); src.Add(3); "
+    "      var d := src.ToDictionary((x: int) => x); "
+    "      n := d.Count; "
+    "    end; "
+    "    return n; "                                   // 3
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, todictionary_plain_var_reclaimed_1028) {
+    expectValueAndLeakFree(kToDictPlainVarReclaimed_1028, 3);
+}

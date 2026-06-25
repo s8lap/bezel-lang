@@ -4705,6 +4705,15 @@ private:
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its array locals just leak (never double-freed).
     llvm::Function* borrowingArrayFreeEligibleFn_ = nullptr;
+    // #1028: the dict analog of borrowingArrayFreeEligible_ — plain `var` locals
+    // bound to a fresh `owned Dictionary<K,V>` materializer (`var d :=
+    // src.ToDictionary(...)`) that the type-agnostic escape walk proves never
+    // escape, so a scope-end bz_dict_free of the single producer reference is
+    // sound (no UAF, no double-free). Populated alongside borrowingArrayFreeEligible_
+    // (same escape walk, separate set because dicts free via bz_dict_free, not
+    // bz_array_free).
+    std::unordered_set<const void*> dictMaterializerFreeEligible_;
+    llvm::Function* dictMaterializerFreeEligibleFn_ = nullptr;
     // Compute borrowingArrayFreeEligible_ for a block body (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);

@@ -3719,6 +3719,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // at scope end (mirrors stringReleaseEligible_; consulted in lowerLocalDecl).
     borrowingArrayFreeEligible_.clear();
     borrowingArrayFreeEligibleFn_ = fn;
+    // #1028: dict-materializer eligibility, populated by the same pass.
+    dictMaterializerFreeEligible_.clear();
+    dictMaterializerFreeEligibleFn_ = fn;
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -5823,6 +5826,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 el->primitive == sema::PrimitiveType::String && !el->nullable) {
             d.collectionElemDisposer = stringElementReleaseThunk();
         }
+        disposeStack_.back().push_back(d);
+    }
+    // #1028: a plain `var d := src.ToDictionary(...)` proven non-escaping holds the
+    // sole reference to a fresh `owned Dictionary<K,V>`. Reclaim it at scope end via
+    // bz_dict_free — the dict-backed analog of the #1003 array reclaim above. Per
+    // stdlib §5 the borrowing chain owns the dict (the table, its key bytes, and the
+    // value-box storage), NOT the value objects, so the per-value disposer is null —
+    // matching the #1013 ownerless-temp dict reclaim (freeUnboundOwnedBorrowingArray
+    // Temp's dict branch). A `using var` is excluded at collection time (its disposal
+    // comes from registerUsingDisposal) so this never doubles with it; the escape
+    // walk excludes any returned/moved/aliased/captured local so the free is
+    // exactly-once (no UAF, no double-free). Gated on currentFn_ matching the
+    // analyzed function (a lambda/thunk body inherits no eligibility → just leaks).
+    if (v && currentFn_ == dictMaterializerFreeEligibleFn_ &&
+        dictMaterializerFreeEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.dict = true;
         disposeStack_.back().push_back(d);
     }
 }
@@ -9229,12 +9250,20 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
 void Emitter::collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     borrowingArrayFreeEligible_.clear();
+    dictMaterializerFreeEligible_.clear();  // #1028
     std::vector<const ast::LocalDecl*> candidates;
+    std::vector<const ast::LocalDecl*> dictCandidates;  // #1028
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             if (isFreshBorrowingArrayMaterializerLocal(ld))
                 candidates.push_back(ld);
+            // #1028: a plain `var d := src.ToDictionary(...)` — a fresh
+            // `owned Dictionary<K,V>` materializer the local solely owns. Excluded:
+            // a `using var` (disposed via registerUsingDisposal → would double-free).
+            else if (ld && !ld->isUsing && ld->initializer &&
+                     isFreshOwnerlessDictMaterializerExpr(ld->initializer.get()))
+                dictCandidates.push_back(ld);
         }
         // Recurse into nested blocks (mirrors collectStringReleaseEligible).
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -9264,6 +9293,15 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             borrowingArrayFreeEligible_.insert(static_cast<const void*>(ld));
+    }
+    // #1028: same conservative type-agnostic escape walk for dict-materializer
+    // locals — a local proven never to escape is the sole owner of the fresh
+    // dict, so a scope-end bz_dict_free runs exactly once (no UAF, no double-free).
+    for (const ast::LocalDecl* ld : dictCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            dictMaterializerFreeEligible_.insert(static_cast<const void*>(ld));
     }
 }
 
