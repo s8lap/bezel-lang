@@ -41,7 +41,60 @@ int run(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
+bool hasSemaError(const std::string& src) {
+    auto r = runJit(src);
+    return !r.ran && r.diagnostics.hasErrors();
+}
+
+std::string mainBody(const std::string& body) {
+    return "module M; class C public static method Main(): int " + body +
+           " end Main; end C;";
+}
+
 }  // namespace
+
+// ===========================================================================
+// #1037 — Math and Convert are distinct classes; cross-class and unknown
+// statics must be REJECTED (§3.4), not silently miscompiled.
+//
+// The sema accept logic used to type the UNION of both classes' methods on
+// either class (one `cls == "Convert" || cls == "Math"` block), and the
+// builtin-class path (null decl) had no fallback "no such member" reject. So
+// `Math.ToInt32(5)` (→45), `Convert.Sqrt(16.0)` (→0) and even `Math.Bogus(5)`
+// (→garbage) compiled and miscompiled. They must now be compile errors.
+// ===========================================================================
+
+// Convert-only method on Math → reject.
+BEZEL_TEST(math_convert_1037, math_toint32_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(mainBody("var x: int := Math.ToInt32(5); return x;")));
+}
+
+// Math-only method on Convert → reject.
+BEZEL_TEST(math_convert_1037, convert_sqrt_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(mainBody("var x: double := Convert.Sqrt(16.0); return int(x);")));
+}
+
+// Fully-unknown static on a builtin class → reject (was an unrejected hole).
+BEZEL_TEST(math_convert_1037, math_unknown_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(mainBody("var x: int := Math.Bogus(5); return x;")));
+}
+BEZEL_TEST(math_convert_1037, convert_unknown_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(mainBody("var x: int := Convert.Bogus(5); return x;")));
+}
+
+// Positive controls — real methods on the right class must STILL work.
+BEZEL_TEST(math_convert_1037, math_sqrt_still_works) {
+    BEZEL_EXPECT_EQ(run(mainBody("var x: double := Math.Sqrt(16.0); return int(x);")), 4);
+}
+BEZEL_TEST(math_convert_1037, math_min_still_works) {
+    BEZEL_EXPECT_EQ(run(mainBody("return Math.Min(3, 8);")), 3);
+}
+BEZEL_TEST(math_convert_1037, math_clamp_still_works) {
+    BEZEL_EXPECT_EQ(run(mainBody("return Math.Clamp(5, 1, 4);")), 4);
+}
+BEZEL_TEST(math_convert_1037, convert_toint32_still_works) {
+    BEZEL_EXPECT_EQ(run(mainBody("var x: int := Convert.ToInt32(7); return x;")), 7);
+}
 
 // --- Math.Pi (stdlib §2.2, "public static const Pi: double := 3.14159...") ---
 // The spec spelling is `Pi`. Returns 1 if Pi is within (3.14, 3.15).

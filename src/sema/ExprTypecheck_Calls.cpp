@@ -6524,16 +6524,44 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (!targetType->decl) {
             std::string_view cls = targetType->name;
             const auto& m = ma.member;
-            // Convert methods (§9 stdlib).
-            if (cls == "Convert" || cls == "Math") {
-                auto setInt = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int)); };
-                auto setLong = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long)); };
-                auto setDbl = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double)); };
-                auto setBool = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool)); };
-                auto setStr = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String)); };
-                if (m=="ToInt32"||m=="Abs"||m=="Sign") setInt();
+            // §2.2 Math / §2.3 Convert static methods.
+            //
+            // #1037: Convert and Math are DISTINCT classes with disjoint method
+            // sets (Convert = value conversions; Math = numeric functions). The
+            // accept logic used to be one `cls == "Convert" || cls == "Math"`
+            // block that typed the UNION on either class, so `Math.ToInt32(5)`
+            // and `Convert.Sqrt(16.0)` were accepted but had no codegen lowering
+            // for that class (Convert's lowering is `cls == "Convert"`, Math's is
+            // `cls == "Math"`) → silent miscompile (45 / 0). And because this
+            // builtin-class path (null `decl`) has no fallback "no such member"
+            // reject, a fully-unknown `Math.Bogus(5)` likewise miscompiled to
+            // garbage. Split per class and reject anything outside each class's
+            // own set with a §3.4 diagnostic — the valid set per class is exactly
+            // the set its codegen handler lowers (LlvmBackend_Calls.cpp).
+            auto setInt = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int)); };
+            auto setLong = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long)); };
+            auto setDbl = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double)); };
+            auto setBool = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool)); };
+            auto setStr = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String)); };
+            auto rejectBuiltinStatic = [&]{
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "'" + std::string(cls) + "' has no static method or property '" +
+                        std::string(m) + "' (§3.4)");
+            };
+            if (cls == "Convert") {
+                if (m=="ToInt32") setInt();
                 else if (m=="ToInt64") setLong();
-                else if (m=="ToDouble"||m=="Sqrt"||m=="Pow"||m=="Log"||m=="Log2"||m=="Log10"||
+                else if (m=="ToDouble") setDbl();
+                else if (m=="ToBoolean") setBool();
+                // §2.3: Convert.TryToInt32(value, out result): bool.
+                else if (m=="TryToInt32") setBool();
+                else if (m=="ToString") setStr();
+                else rejectBuiltinStatic();
+            }
+            else if (cls == "Math") {
+                if (m=="Abs"||m=="Sign") setInt();
+                else if (m=="Sqrt"||m=="Pow"||m=="Log"||m=="Log2"||m=="Log10"||
                          m=="Ceiling"||m=="Floor"||m=="Round"||m=="Truncate"||
                          // §2.2: the spec constants are `Pi`, `E`, `Tau` (the
                          // legacy `PI` spelling is retained for the existing
@@ -6542,11 +6570,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                          m=="Fmod"||m=="IEEERemainder"||m=="Sin"||m=="Cos"||m=="Tan"||
                          m=="Asin"||m=="Acos"||m=="Atan"||m=="Atan2"||m=="Exp"||m=="Hypot"||
                          m=="Sinh"||m=="Cosh"||m=="Tanh") setDbl();
-                // Min/Max/Clamp are overloaded (int or double) — leave untyped.
-                else if (m=="ToBoolean") setBool();
-                // §2.3: Convert.TryToInt32(value, out result): bool.
-                else if (m=="TryToInt32") setBool();
-                else if (m=="ToString") setStr();
+                // Min/Max/Clamp are overloaded (int or double) — valid, but left
+                // untyped here; their result type is refined from the argument in
+                // typeCall (§2.2 polymorphic-return handling).
+                else if (m=="Min"||m=="Max"||m=="Clamp") { /* valid, untyped */ }
+                else rejectBuiltinStatic();
             }
             // Console input methods.
             if (cls == "Console") {
