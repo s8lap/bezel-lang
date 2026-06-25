@@ -6651,6 +6651,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         if (tgt != PrimitiveType::None)
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(tgt));
                     }
+                } else {
+                    // #1038: BitConverter is a pure-static utility class (§2.12)
+                    // with exactly these five methods — the codegen handler
+                    // (LlvmBackend_Calls.cpp `cls == "BitConverter"`) lowers no
+                    // others. Like Math/Convert (#1037), an unknown static
+                    // (`BitConverter.Bogus(1)`) was previously left untyped and
+                    // silently miscompiled to a no-op; reject it with §3.4. Safe
+                    // here because BitConverter has no instances, no sub-objects,
+                    // and no unit-returning members (unlike Console/Random/Guid/
+                    // Decimal, which are instance-bearing or have untyped-unit
+                    // members and need static-vs-instance disambiguation — see
+                    // issue #1038).
+                    rejectBuiltinStatic();
                 }
             }
             // stdlib §9.3 / fix #521: Decimal static member types.

@@ -241,6 +241,22 @@ BEZEL_TEST(codegen_654_bitconverter, double_roundtrip) {
         "return (1 if bits = 4611686018427387904L else 0); ")), 1);
 }
 
+// #1038 / §3.4: BitConverter (§2.12) is a pure-static utility class with
+// exactly five methods; an unknown static was previously left untyped and
+// silently miscompiled to a no-op (the builtin-class path has no fallback
+// reject). It must now be a compile error, like Math/Convert (#1037).
+BEZEL_TEST(codegen_654_bitconverter, unknown_static_rejected_1038) {
+    BEZEL_EXPECT_TRUE(hasSemaError(prog(
+        "var x := BitConverter.Bogus(1); return 0; ")));
+}
+
+// Positive control for the #1038 reject — a real method must STILL type/lower.
+BEZEL_TEST(codegen_654_bitconverter, reinterpret_still_works_1038) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var x: int := BitConverter.Reinterpret<int>(1.0f); "
+        "return (1 if x = 1065353216 else 0); ")), 1);
+}
+
 // ===========================================================================
 // Win 3 — string.ToCharArray(): owned Array<char>  (stdlib §9.6)
 // ===========================================================================
