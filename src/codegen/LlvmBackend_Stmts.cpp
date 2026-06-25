@@ -1168,7 +1168,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!diverged_) emitDisposals(disposeStack_.back());
                 disposeStack_.pop_back();
             } else {
-                lowerExpr(*ds->value);
+                // §17.13 / stdlib §5 / §28 (#1015): a discard of a FRESH-ownerless
+                // collection materializer (`_ := items.ToArray()` / `.Sorted()` /
+                // `.Reversed()` / `.ToDictionary()`) leaks its freshly-allocated
+                // backing — the §28.6/§5.11 two-axis model makes a borrowing
+                // Array/Dictionary a borrow of its ELEMENTS, so producerState
+                // classifies it Borrowed and #1009's class/interface path above
+                // does not fire, yet the BACKING (struct + buffer) is owned by
+                // nothing. Reclaim it at end-of-statement by reusing the
+                // #1004/#1006/#1013 helper, which frees the array/dict struct with
+                // the matching per-element disposer (borrow elements → null, except
+                // the Array<string> co-owned +1) and is a NO-OP for any non-
+                // materializer discard (its narrow guards) → no UAF / double-free.
+                llvm::Value* v = lowerExpr(*ds->value);
+                if (!diverged_ && v)
+                    freeUnboundOwnedBorrowingArrayTemp(
+                        ds->value.get(), v, ctx_.exprType(*ds->value));
             }
         }
         return diverged_;  // CG40

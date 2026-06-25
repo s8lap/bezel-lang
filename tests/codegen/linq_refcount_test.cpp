@@ -711,6 +711,59 @@ BEZEL_TEST(linq_refcount, using_var_toarray_not_double_freed_1003) {
     expectValueAndLeakFree(kUsingVarToArrayUntouched, 6);
 }
 
+// #1015 / §17.13 / stdlib §5 / §28: a DISCARD of a fresh-ownerless collection
+// materializer (`_ := items.ToArray()` / `.Sorted()` / `.Reversed()` /
+// `.ToDictionary()`) frees its freshly-allocated backing at end-of-statement.
+// The §28.6/§5.11 two-axis model makes a borrowing Array/Dictionary a borrow of
+// its ELEMENTS (so producerState is Borrowed and #1009's class/interface discard
+// path never fires), yet the BACKING is owned by nothing — it leaked (96B / 2
+// allocs) before #1015. Reclaimed via the #1004 helper (backing freed, elements
+// borrowed → not disposed; the source OwnedArray<Cell> disposes the Cell once at
+// its using-var end). Cell.n == 1 (Cell still alive, owned by `a`).
+BEZEL_TEST(linq_refcount, discard_toarray_backing_freed_1015) {
+    expectValueAndLeakFree(
+        "module M; "
+        "class Cell public static n: int := 0; "
+        "  public constructor() Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<Cell>(); a.Add(new Cell()); "
+        "  _ := a.ToArray(); "
+        "  return Cell.n; "
+        "end Main; end C;", 1);
+}
+
+// #1015: discarding a fresh `Array<string>` ToArray releases the co-owned string
+// +1 the materializer retained (no leak, no double-free of the shared chars).
+BEZEL_TEST(linq_refcount, discard_toarray_string_leak_free_1015) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); a.Add(\"hi\"); a.Add(\"yo\"); "
+        "  _ := a.ToArray(); "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// #1015: discarding a fresh ToDictionary materializer frees the dict backing
+// (bz_dict_free, not bz_array_free — #1013's dict-backed reclaim path).
+BEZEL_TEST(linq_refcount, discard_todictionary_backing_freed_1015) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+        "  _ := a.ToDictionary((x) => x); "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// #1015 soundness: a discard of a NON-materializer (a trivial value) is a no-op —
+// the helper's narrow guards never free a non-materializer, so no spurious free.
+BEZEL_TEST(linq_refcount, discard_non_materializer_no_spurious_free_1015) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  _ := 5; return 0; "
+        "end Main; end C;", 0);
+}
+
 // #1004 / stdlib §5 / §3 / §28: the copy-forms `.Sorted()` / `.Reversed()`
 // shallow-copy their INPUT array into a fresh result; when that input is itself
 // a fresh, ownerless materializer temporary (`X.ToArray()` / `X.Sorted()` /
