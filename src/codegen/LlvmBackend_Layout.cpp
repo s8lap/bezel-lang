@@ -136,6 +136,20 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         if (op == "/") return builder_.CreateFDiv(l, r);
         return nullptr;
     }
+    // #1042: the compound result has the LHS type, and the checked-arith
+    // intrinsics / shifts below require both operands to share that integer
+    // type. The RHS is lowered at its own natural width (an `int` literal/value
+    // is i32), so a sub-i32 LHS (`byte`/`sbyte`/`short`/`ushort`) gave a width
+    // mismatch — e.g. `byte b += 3` called `llvm.uadd.with.overflow.i8` with an
+    // i32 arg → malformed IR. Coerce the RHS to the LHS integer type so the
+    // operation runs at the LHS width with the correct (LHS-width) overflow
+    // check — exactly how `b++`/`b--` build their `1` operand at the target
+    // width (those already worked; the explicit `b += v` form crashed). A wider
+    // LHS (`long x += short`) already arrives pre-widened (l == r), so this is a
+    // no-op there.
+    if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy() &&
+        l->getType() != r->getType())
+        r = builder_.CreateIntCast(r, l->getType(), /*isSigned=*/!uns);
     if (op == "+")
         return emitCheckedArith(uns ? llvm::Intrinsic::uadd_with_overflow
                                     : llvm::Intrinsic::sadd_with_overflow,

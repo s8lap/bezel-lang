@@ -105,3 +105,42 @@ BEZEL_TEST(codegen_1041_compound_shift, long_count_reduced_mod_64) {
 BEZEL_TEST(codegen_1041_compound_shift, ordinary_shift_still_correct) {
     BEZEL_EXPECT_EQ(run("var x: int := 1; x <<= 4; return x;"), 16);
 }
+
+// #1042: compound arithmetic/bitwise/shift assignment on a sub-i32 integer type
+// (byte/sbyte/short/ushort) crashed codegen — the RHS is lowered at its natural
+// i32 width, so `byte b += 3` called `llvm.uadd.with.overflow.i8` with an i32
+// operand (malformed IR). emitCompoundOp now coerces the RHS to the LHS integer
+// type, so the op runs at the LHS width with the correct overflow check (matching
+// how `b++`/`b--` already worked). In-range RHS values are correct; an LHS-width
+// overflow (200 += 100 = 300 > 255) raises OverflowException as for any byte.
+BEZEL_TEST(codegen_1042_subint_compound, byte_plus_equals) {
+    BEZEL_EXPECT_EQ(run("var b: byte := 5; b += 3; return int(b);"), 8);
+}
+BEZEL_TEST(codegen_1042_subint_compound, byte_minus_equals) {
+    BEZEL_EXPECT_EQ(run("var b: byte := 5; b -= 2; return int(b);"), 3);
+}
+BEZEL_TEST(codegen_1042_subint_compound, byte_times_equals) {
+    BEZEL_EXPECT_EQ(run("var b: byte := 5; b *= 3; return int(b);"), 15);
+}
+BEZEL_TEST(codegen_1042_subint_compound, short_plus_equals) {
+    BEZEL_EXPECT_EQ(run("var s: short := 10; s += 5; return int(s);"), 15);
+}
+BEZEL_TEST(codegen_1042_subint_compound, ushort_plus_equals) {
+    BEZEL_EXPECT_EQ(run("var u: ushort := 100; u += 50; return int(u);"), 150);
+}
+BEZEL_TEST(codegen_1042_subint_compound, byte_bitand_equals) {
+    BEZEL_EXPECT_EQ(run("var b: byte := 5; b &= 3; return int(b);"), 1);
+}
+BEZEL_TEST(codegen_1042_subint_compound, byte_shl_equals) {
+    BEZEL_EXPECT_EQ(run("var b: byte := 5; b <<= 1; return int(b);"), 10);
+}
+// LHS-width overflow (200 + 100 = 300 > byte max) raises OverflowException.
+BEZEL_TEST(codegen_1042_subint_compound, byte_plus_overflow_throws) {
+    auto r = runJit(
+        "module M; class C public static method Main(): int "
+        "  var b: byte := 200; "
+        "  try b += 100; return 0; catch OverflowException => return 1; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}
