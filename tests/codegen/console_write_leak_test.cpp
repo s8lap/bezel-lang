@@ -160,3 +160,45 @@ BEZEL_TEST(codegen_console_leak_421, write_int_literal_no_leak) {
 BEZEL_TEST(codegen_console_leak_421, writeline_in_loop_no_leak) {
     expectRunsAndLeakFree(kWriteLineLoop, 0);
 }
+
+// #1031 / §4.6 / §28.9: Console.WriteLine of a FRESH +1 string (interpolation /
+// string concat / slice / numeric ToString) must release it after the write —
+// Console output is special-lowered and bypasses the normal call-arg disposal, so
+// before the fix the fresh render leaked. A borrow (string local/literal) is NOT a
+// plus-one producer and is correctly left alone (no double-free).
+const char* kWriteLineInterpFresh_1031 =
+    "module M; class C public static method Main(): int "
+    "  var n := 42; Console.WriteLine($\"value is {n}\"); return 0; "
+    "end Main; end C;";
+BEZEL_TEST(codegen_console_leak_1031, writeline_interpolation_released) {
+    expectRunsAndLeakFree(kWriteLineInterpFresh_1031, 0);
+}
+
+const char* kWriteLineConcatFresh_1031 =
+    "module M; class C public static method Main(): int "
+    "  var a := \"x\"; Console.WriteLine(a + \"y\"); return 0; "
+    "end Main; end C;";
+BEZEL_TEST(codegen_console_leak_1031, writeline_concat_released) {
+    expectRunsAndLeakFree(kWriteLineConcatFresh_1031, 0);
+}
+
+// #1031 regression: a STRING-LOCAL borrow arg must NOT be released (no
+// double-free / use-after-free of the shared reference).
+const char* kWriteLineStringLocalBorrow_1031 =
+    "module M; class C public static method Main(): int "
+    "  var s := \"hello\"; Console.WriteLine(s); return 0; "
+    "end Main; end C;";
+BEZEL_TEST(codegen_console_leak_1031, writeline_string_local_borrow_not_released) {
+    expectRunsAndLeakFree(kWriteLineStringLocalBorrow_1031, 0);
+}
+
+// #1031 (loop): a fresh interpolation written each iteration must not leak
+// per-iteration (the unbounded case).
+const char* kWriteLineInterpLoop_1031 =
+    "module M; class C public static method Main(): int "
+    "  var i := 0; while i < 5 do Console.WriteLine($\"i={i}\"); i := i + 1; end; "
+    "  return 0; "
+    "end Main; end C;";
+BEZEL_TEST(codegen_console_leak_1031, writeline_interpolation_loop_no_unbounded_leak) {
+    expectRunsAndLeakFree(kWriteLineInterpLoop_1031, 0);
+}

@@ -327,6 +327,19 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     if (freeTransient) {
         builder_.CreateCall(freeFn(), {loadStringData(strPtr)});
         builder_.CreateCall(freeFn(), {strPtr});
+    } else if (strPtr == arg && call.args[0].value &&
+               isPlusOneStringProducer(call.args[0].value.get())) {
+        // #1031 / §4.6 / §28.9: a fresh +1 STRING argument ($"..." interpolation,
+        // string `+`, a `s[a..b]` slice, or a numeric `.ToString()`) is otherwise
+        // unreferenced after the write — release it (rc-aware) so
+        // `Console.Write/WriteLine($"...")` / `(a + b)` does not leak (it bypasses
+        // the normal call-arg disposal because Console output is special-lowered).
+        // A borrow (string local/field/literal) is NOT a plus-one producer, so it
+        // is not released (no premature free of the shared reference).
+        // emitStringRelease is null/sentinel-safe; gated on `strPtr == arg` so a
+        // converted numeric transient (freed via freeTransient above) is never
+        // double-released here.
+        emitStringRelease(strPtr);
     }
     return true;
 }
