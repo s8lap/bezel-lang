@@ -1739,6 +1739,32 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
             return;
         }
+        // §6 (#1040): `and`/`or`/`not` have boolean-only semantics, so a
+        // NON-bool operand (int/uint/char/string/class/...) is a compile error.
+        // Without this it slipped through here — the result was typed `bool`
+        // below — and crashed codegen, which builds the short-circuit as a PHI
+        // and hit an LLVM PHINode "operands must be the same type" assertion on
+        // the non-bool operand values (`int(u and 255)` / `int(5 and 3)`).
+        // (The nullable-`bool` case is handled above; here a KNOWN type that is
+        // not a `bool` primitive is rejected. Untyped/error operands are left to
+        // their own diagnostics to avoid cascading.) Bitwise integer ops use
+        // `&`/`|`/`^` (§6.5), which are distinct operators.
+        auto isNonBool = [&](const ast::Expr* e) -> bool {
+            if (!e) return false;
+            const TypeRef* t = ctx_.exprType(*e);
+            return t && !(t->kind == TypeRef::Kind::Primitive &&
+                          t->primitive == PrimitiveType::Bool);
+        };
+        if (isNonBool(be.left.get()) || isNonBool(be.right.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) +
+                "` requires `bool` operands (§6: `and`/`or`/`not` have"
+                " boolean-only semantics). Use the bitwise operators"
+                " `&`/`|`/`^` for integer bit operations.");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
     }
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=" || op == "and" || op == "or") {
@@ -2129,6 +2155,20 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                     " `bool?` operand is not permitted — there is no"
                     " three-valued logic. Use `??` to coalesce the `bool?` to"
                     " a `bool` first, or narrow with an explicit null check.");
+            }
+            // §6 (#1040): `not` is boolean-only, so a NON-bool operand
+            // (int/uint/char/...) is a compile error. Without this it slipped
+            // through (result typed `bool` below) and codegen emitted malformed
+            // IR (`not 5` / `not u`). The nullable-`bool` case is handled above;
+            // here a KNOWN non-`bool` primitive/type is rejected. Use the
+            // bitwise complement `~` (§6.5) for an integer bit-flip.
+            else if (ot && !(ot->kind == TypeRef::Kind::Primitive &&
+                             ot->primitive == PrimitiveType::Bool)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ue.span.begin,
+                    "`not` requires a `bool` operand (§6: `and`/`or`/`not` have"
+                    " boolean-only semantics). Use the bitwise complement `~`"
+                    " for an integer bit-flip.");
             }
         }
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));

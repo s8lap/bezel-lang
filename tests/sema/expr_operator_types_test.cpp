@@ -74,6 +74,42 @@ BEZEL_TEST(sema_ops, logical_and_yields_bool) {
     BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Bool);
 }
 
+// #1040 / §6: `and`/`or`/`not` have boolean-only semantics. A NON-bool operand
+// was previously accepted (result typed bool) and CRASHED codegen — the
+// short-circuit PHI hit an LLVM "operands must be same type" assertion
+// (`int(u and 255)`), and `not 5` emitted malformed IR. They must be rejected.
+BEZEL_TEST(sema_ops, and_nonbool_operand_rejected_1040) {
+    auto r = parseSema(
+        "module M; class C public method M(): int "
+        "  var u: uint := 5; return int(u and 255); end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_ops, or_nonbool_operand_rejected_1040) {
+    auto r = parseSema(
+        "module M; class C public method M(): int "
+        "  return int(5 or 3); end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_ops, not_nonbool_operand_rejected_1040) {
+    auto r = parseSema(
+        "module M; class C public method M(): int "
+        "  var u: uint := 5; return (1 if (not u) else 0); end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+// Positive controls — valid bool logical operators must STILL be accepted.
+BEZEL_TEST(sema_ops, and_bool_operands_still_accepted_1040) {
+    auto r = parseSema(
+        "module M; class C public method M(): int "
+        "  var x: int := 5; return (1 if (x > 0 and x < 10) else 0); end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_ops, not_bool_operand_still_accepted_1040) {
+    auto r = parseSema(
+        "module M; class C public method M(): int "
+        "  return (1 if (not true) else 0); end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 BEZEL_TEST(sema_ops, arithmetic_keeps_operand_type) {
     auto r = parseSema(
         "module M; class C public method M() _ := 1 + 2; end M; end C;");
