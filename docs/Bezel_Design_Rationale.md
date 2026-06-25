@@ -7109,7 +7109,9 @@ Language spec: §28.6 (bare owned-field read = borrow; transfer requires `owned`
 
 #### Migration
 
-Source-compatible: a method that today returns a bare owning-collection field through a non-`owned` return (rejected by #1007) will compile once Part C lands; nothing that compiles under v0.150 stops compiling. A method that *transfers* a field out still requires `owned` (unchanged). Callers of a borrowed owning collection that attempt `Dispose`/`Drain`/mutation get a new, precise compile error rather than a latent double-free.
+Mostly source-compatible, with one deliberate tightening to flag for review. A method that returns a bare owning-collection field through a non-`owned` return (rejected today by #1007) will compile once Part C lands. A method that *transfers* a field out still requires `owned` (unchanged). Callers of a borrowed owning collection that attempt `Dispose`/`Drain`/mutation get a new, precise compile error rather than a latent double-free.
+
+The tightening: because the caller's classifier cannot see the callee's body, a non-`owned` owning-collection return must mean *one* thing, and v0.151 makes it mean **borrow**. The consequence is that a method returning a *freshly-produced* owning value through a non-`owned` return — `Make(): OwnedArray<T> => new OwnedArray<T>(...)`, which compiles under v0.150 because the caller's name-head heuristic rescues it as owned — must declare `owned OwnedArray<T>` under v0.151. This is a source-breaking change for that pattern (the implementing PR should ship the diagnostic with a clear fix-it), and it is the price of distinguishing borrow-returns from owned-returns by signature alone. The alternative — having the caller inspect the callee body / module metadata to decide owned-vs-borrow per call — avoids the tightening at the cost of substantially more machinery. **This trade-off is a design decision flagged for owner confirmation before the Part C implementation lands.**
 
 ---
 
