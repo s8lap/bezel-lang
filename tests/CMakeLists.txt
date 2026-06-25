@@ -859,6 +859,23 @@ add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src)
+# Precompiled header: the LLVM (+ a few ubiquitous std) headers dominate the
+# ~209K preprocessed lines every one of the ~770 test TUs re-parses, and they
+# are identical across all of them (one target → one set of flags, so the PCH is
+# always valid). Precompiling them once cuts the per-TU compile by ~40%. Only
+# the HEAVY, STABLE headers are listed — deliberately NOT the bezel sema/codegen
+# headers, which change often: putting a frequently-edited header in the PCH
+# would invalidate it (and force a full test rebuild) on every such edit.
+# NOTE (machine-local, not tracked): ccache needs `sloppiness =
+# pch_defines,time_macros` (~/.config/ccache/ccache.conf) to cache PCH builds —
+# see the build-accelerators note in CLAUDE.md.
+target_precompile_headers(bezel_tests PRIVATE
+    <cstddef> <cstdlib> <functional> <memory>
+    <string> <string_view> <utility> <vector>
+    <llvm/IR/LLVMContext.h>
+    <llvm/IR/Module.h>
+    <llvm/ExecutionEngine/Orc/LLJIT.h>
+    <llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
 target_link_libraries(bezel_tests PRIVATE bezel_core bezel_warnings)
 # Force all bezel_runtime object files into bezel_tests, then export-dynamic
 # so the JIT (DynamicLibrarySearchGenerator::GetForCurrentProcess) can resolve

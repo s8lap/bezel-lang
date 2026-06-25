@@ -100,6 +100,30 @@ checks against `__GNUC__`. The build is expected to be configurable
 with `cmake -DCMAKE_CXX_COMPILER=clang++ ...` or to set the compiler
 explicitly in the root CMakeLists.txt.
 
+### Build & test speed (the build is dominated by the ~770-TU `bezel_tests`)
+
+The configure auto-detects accelerators (CMakeLists.txt): **ccache**, the
+**mold** linker (falls back to lld), **`-gsplit-dwarf`** (debug info out of the
+link), the **shared `libLLVM`** (linked as one `.so`, not static components —
+keeps binaries small and links near-instant; the in-process JIT is unaffected),
+and a **PCH** of the heavy LLVM/std headers for the test target. Build with
+plenty of parallelism — the machine is many-core and each TU peaks well under
+the build cage's memory budget: pass `-j16` (or use `cmake --build --preset
+default`, which sets jobs); the bundled scripts default to `-j16`. A clean build
+is ~2 min and a one-file edit→relink is ~1–2s.
+
+**Run the test suite in parallel**, not as the raw binary — the single binary is
+serial gtest (~4–5 min). Use `tests/run_parallel.sh` (or `cmake --build build
+--target check`): it shards `bezel_tests` across cores (each shard a separate
+JIT process via `BEZEL_SHARD_*`), running the whole suite in ~40s. The full
+*in-process* JIT suite is still the load-bearing correctness check (a disposal
+double-free once surfaced only there, not in per-process ASan).
+
+One machine-local, not-tracked step is required for ccache to cache the PCH'd
+compiles: `~/.config/ccache/ccache.conf` must contain
+`sloppiness = pch_defines,time_macros` (without it every PCH build is a cache
+miss — slower, never incorrect).
+
 ## When in doubt
 
 The project's overall discipline is: ship the part that fits cleanly now, decline-with-reasons the part that fights the foundations, keep adjacent open questions explicitly scoped. If you're not sure whether a given piece of work fits cleanly: stop, open an issue, describe what you're trying to do and what's giving you pause. The project has reached its current state by catching defects early and recording decisions with reasoning. That discipline continues to apply.

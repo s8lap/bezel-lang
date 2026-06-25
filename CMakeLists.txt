@@ -63,8 +63,14 @@ if(BEZEL_CCACHE)
     set(CMAKE_C_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
     message(STATUS "Bezel: using ccache (${BEZEL_CCACHE})")
 endif()
+#    mold is preferred when available (faster than lld on the large test-binary
+#    link and on incremental relinks); lld is the fallback, then the default.
+find_program(BEZEL_MOLD ld.mold)
 find_program(BEZEL_LLD ld.lld)
-if(BEZEL_LLD)
+if(BEZEL_MOLD)
+    add_link_options(-fuse-ld=mold)
+    message(STATUS "Bezel: using mold linker")
+elseif(BEZEL_LLD)
     add_link_options(-fuse-ld=lld)
     message(STATUS "Bezel: using lld linker")
 endif()
@@ -95,11 +101,25 @@ message(STATUS "Bezel: using LLVM ${LLVM_PACKAGE_VERSION} (cmake dir ${LLVM_DIR}
 # Components needed: IR construction (core), the ORC JIT used by codegen tests,
 # and the native target (with its codegen/asm-printer) for JIT execution and
 # eventual object emission.
-llvm_map_components_to_libnames(BEZEL_LLVM_LIBS
-    core orcjit native nativecodegen target codegen mc
-    # object: the cross-module import loader (§2.5, issue #328 inc 3) reads a
-    # dependency's embedded `.bezel.meta` section via the LLVM Object API.
-    object)
+# Prefer the single monolithic shared library (libLLVM-NN.so) over the static
+# component archives when LLVM is built shared (Fedora's llvmNN is): linking one
+# .so instead of pulling+deduping ~hundreds of MB of static archives makes the
+# test/compiler binaries an order of magnitude smaller and the link far faster
+# (and incremental relinks near-instant). The in-process LLJIT is unaffected —
+# codegen and the JIT share the one libLLVM, and the JIT still resolves the
+# Bezel `bz_*` runtime symbols via the test binary's own --whole-archive +
+# --export-dynamic. Falls back to the static components if no shared build.
+if(LLVM_LINK_LLVM_DYLIB OR TARGET LLVM)
+    set(BEZEL_LLVM_LIBS LLVM)
+    message(STATUS "Bezel: linking shared libLLVM (dylib)")
+else()
+    llvm_map_components_to_libnames(BEZEL_LLVM_LIBS
+        core orcjit native nativecodegen target codegen mc
+        # object: the cross-module import loader (§2.5, issue #328 inc 3) reads a
+        # dependency's embedded `.bezel.meta` section via the LLVM Object API.
+        object)
+    message(STATUS "Bezel: linking static LLVM components")
+endif()
 # LLVM_DEFINITIONS is a space-separated flag string (e.g. -D_GNU_SOURCE …);
 # pass it as options, not as compile-definitions (which would re-prefix -D).
 separate_arguments(BEZEL_LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")

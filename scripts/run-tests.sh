@@ -27,7 +27,10 @@
 set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR:-build}"
-JOBS_FLAG="${1:--j4}"
+# Default to -j16 (the build is compile-bound; this machine has many cores and
+# each TU peaks well under the build cage's memory budget). Override by passing
+# a -jN as $1.
+JOBS_FLAG="${1:--j16}"
 
 TEST_BIN="${BUILD_DIR}/tests/bezel_tests"
 
