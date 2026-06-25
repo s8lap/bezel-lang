@@ -2157,11 +2157,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // so codegen routes both through tryLowerArraySpanCall and the
                     // shared isSpanLikeTypeName surface; the owning behaviour is
                     // gated on the "Span" name (isOwningSpanTypeName).
-                    if ((colName == "Array" || colName == "OwnedBuffer") &&
+                    if ((colName == "Array" || colName == "OwnedBuffer" ||
+                         colName == "OwnedArray") &&
                         !recvTy->genericArgs.empty() &&
                         recvTy->genericArgs[0] &&
                         (m == "AsSpan" || m == "AsReadOnlySpan") &&
                         (ce.args.size() <= 2)) {
+                        // §4.5 (#1022): OwnedArray<T> does NOT expose the borrowing
+                        // span views — its elements are uniquely owned, so a span
+                        // (whose `sp[i] := x` would overwrite an owned slot without
+                        // disposal, §28.11) is deliberately not provided. The gate
+                        // previously excluded OwnedArray, but the call then fell
+                        // through and was accepted, and codegen SILENTLY miscompiled
+                        // it to a zeroed span (returns 0 for every index). Reject it
+                        // here; the span return type is still set below so the rest
+                        // of the typecheck is well-formed (the program is rejected
+                        // via the diagnostic).
+                        if (colName == "OwnedArray") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`OwnedArray<T>` does not expose `") +
+                                std::string(m) +
+                                "` — an owning collection's elements are uniquely "
+                                "owned, so a span view (which can overwrite slots) "
+                                "is not provided (§4.5); use a borrowing `Array<T>`,"
+                                " or `Drain` / `PopAt` to transfer ownership out");
+                        }
                         bool owning = (colName == "OwnedBuffer");
                         // Build synthetic span-type TypeRefs. Array → borrowing
                         // ArraySpan/ReadOnlyArraySpan (§4.15); OwnedBuffer → owning

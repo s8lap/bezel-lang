@@ -152,6 +152,44 @@ BEZEL_TEST(array_span_549, asspan_0arg_empty_length_spec_4_15) {
         "end Main; end C;", 0);
 }
 
+// §4.5 (#1022): OwnedArray<T> does NOT expose AsSpan — its elements are uniquely
+// owned, so a span view (writable, can overwrite owned slots) is not provided.
+// Before #1022 this was accepted and codegen SILENTLY miscompiled it to a zeroed
+// span (sp[i] == 0 for every i); now it is a clean compile error.
+BEZEL_TEST(array_span_549, ownedarray_asspan_rejected_1022) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; "
+        "class R end R; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  var sp := a.AsSpan(); "
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.5 (#1022): OwnedArray<T>.AsReadOnlySpan() is likewise rejected.
+BEZEL_TEST(array_span_549, ownedarray_asreadonlyspan_rejected_1022) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; "
+        "class R end R; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  var sp := a.AsReadOnlySpan(); "
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.5 (#1022) regression: the borrowing Array<T>.AsSpan() is UNAFFECTED — it
+// still compiles and indexes correctly (a[1] via the span == 8).
+BEZEL_TEST(array_span_549, array_asspan_index_unaffected_1022) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); a.Add(7); a.Add(8); a.Add(9); "
+        "  var sp := a.AsSpan(); "
+        "  return sp[1]; "  // 8 (was the silent-0 bug only on OwnedArray)
+        "end Main; end C;", 8);
+}
+
 // ===========================================================================
 // §4.15 AsSpan(start, length): partial view.
 // ===========================================================================
