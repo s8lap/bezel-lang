@@ -560,6 +560,7 @@ set(BEZEL_TEST_SOURCES
     codegen/user_indexer_record_test.cpp
     codegen/dict_record_value_indexer_test.cpp
     codegen/dict_record_value_leak_test.cpp
+    codegen/set_dispose_leak_1012_test.cpp           # fix #1012: dict-backed Set<T> freed via bz_dict_free
     codegen/is_narrow_receiver_test.cpp
     codegen/null_narrow_member_test.cpp
     codegen/generic_record_return_test.cpp

@@ -6513,11 +6513,28 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             bool isSetName =
                 collTy->astNode && collTy->astNode->name &&
                 !collTy->astNode->name->parts.empty() &&
-                collTy->astNode->name->parts[0] == "Set";
-            if (isSetName && isStrElem(collTy, /*owning=*/false)) {
+                (collTy->astNode->name->parts[0] == "Set" ||
+                 collTy->astNode->name->parts[0] == "OwnedSet");
+            // #1012 / §4.10: a Set/OwnedSet is DICT-BACKED whenever its element is
+            // generic-dict-eligible (records, non-nullable primitives/enums, and —
+            // for sets — strings; see genericBackingType / lowerNew). Such a Set
+            // MUST be freed via bz_dict_free (the struct AND its entries), not
+            // bz_array_free — the latter leaks the bz_dict struct (#1012: Set<int>
+            // leaked 64 B + entries; only Set<string> was previously intercepted).
+            // String elements are KEYS carrying a co-owned +1, released by
+            // dictStringKeys before the free; value-type/record/enum keys carry no
+            // per-element obligation (null disposer — value types, nothing to
+            // dispose). A class/interface/nullable element is NOT dict-eligible
+            // (genericBackingType returns null) → that Set stays array-backed and
+            // falls through to the bz_array_free path below with its #888 element
+            // disposer, which is correct for that (array-backed) representation.
+            bool setDictBacked = isSetName &&
+                genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
+            if (setDictBacked) {
                 Disposal d{it->second, nullptr};
                 d.dict = true;
-                d.dictStringKeys = true;  // signal pre-free string key release
+                if (isStrElem(collTy, /*owning=*/false))
+                    d.dictStringKeys = true;  // string keys: release +1 before free
                 disposeStack_.back().push_back(d);
                 return;
             }
@@ -10816,18 +10833,26 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
         return d;
     }
 
-    // Set<string> is dict-backed (bz_dict_t*) — its elements are KEYS, released
-    // via the dict-key path, not bz_array_free (mirrors lowerLocalDecl ~6327).
+    // #1012 / §4.10: a dict-backed Set/OwnedSet (a generic-dict-eligible element —
+    // record, non-nullable primitive/enum, or string) frees via bz_dict_free (the
+    // struct AND its entries), not bz_array_free — the latter leaks the bz_dict
+    // struct. String elements are KEYS released via dictStringKeys before the free;
+    // value-type/record/enum keys carry no per-element obligation. A class/
+    // interface/nullable element is NOT dict-eligible (genericBackingType returns
+    // null) → that Set is array-backed and falls through to bz_array_free below.
     const sema::TypeRef* el =
         (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
     bool isSetName =
         collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        collTy->astNode->name->parts[0] == "Set";
-    if (isSetName && isStrElem(el, /*owning=*/false)) {
+        (collTy->astNode->name->parts[0] == "Set" ||
+         collTy->astNode->name->parts[0] == "OwnedSet");
+    bool setDictBacked = isSetName &&
+        genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
+    if (setDictBacked) {
         Disposal d{alloca, nullptr};
         d.dict = true;
-        d.dictStringKeys = true;
+        if (isStrElem(el, /*owning=*/false)) d.dictStringKeys = true;
         return d;
     }
 
