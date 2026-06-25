@@ -202,3 +202,22 @@ const char* kWriteLineInterpLoop_1031 =
 BEZEL_TEST(codegen_console_leak_1031, writeline_interpolation_loop_no_unbounded_leak) {
     expectRunsAndLeakFree(kWriteLineInterpLoop_1031, 0);
 }
+
+// #1032 (sibling of #1031): Debug.WriteLine of a fresh +1 string must release it
+// after the write (Debug output is special-lowered, bypassing the normal call-arg
+// disposal). A string-local borrow must NOT be released (no double-free).
+const char* kDebugWriteLineInterpFresh_1032 =
+    "module M; class C public static method Main(): int "
+    "  var n := 9; Debug.WriteLine($\"d {n}\"); return 0; "
+    "end Main; end C;";
+BEZEL_TEST(codegen_console_leak_1032, debug_writeline_interpolation_released) {
+    expectRunsAndLeakFree(kDebugWriteLineInterpFresh_1032, 0);
+}
+
+const char* kDebugWriteLineStringLocalBorrow_1032 =
+    "module M; class C public static method Main(): int "
+    "  var s := \"msg\"; Debug.WriteLine(s); return 0; "
+    "end Main; end C;";
+BEZEL_TEST(codegen_console_leak_1032, debug_writeline_string_local_borrow_not_released) {
+    expectRunsAndLeakFree(kDebugWriteLineStringLocalBorrow_1032, 0);
+}

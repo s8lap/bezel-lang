@@ -5585,10 +5585,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         if (m == "WriteLine" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* msgPtr = lowerExpr(*call.args[0].value);
+            bool freshStr = msgPtr &&
+                            isPlusOneStringProducer(call.args[0].value.get());
             if (!msgPtr) msgPtr = llvm::ConstantPointerNull::get(ptrTy());
             auto* wlFn = declareC("bz_debug_writeline",
                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(wlFn, {msgPtr});
+            // #1031 (sibling): Debug.WriteLine is special-lowered and bypasses the
+            // normal call-arg disposal, so a fresh +1 string argument ($"..." /
+            // a + b / slice / numeric ToString) is otherwise unreferenced after the
+            // write — release it (rc-aware) so it does not leak. A borrow (string
+            // local/field/literal) is not a plus-one producer → not released.
+            if (freshStr) emitStringRelease(msgPtr);
             return nullptr;
         }
     }
