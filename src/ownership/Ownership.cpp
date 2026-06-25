@@ -1425,6 +1425,31 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             }
         }
     }
+    // #965 / §25 / §28.3: a user-defined BINARY operator overload declared with an
+    // `owned` return (`static method operator +(a, b): owned Cell => new Cell(...)`)
+    // produces a FRESH owned value, exactly like an owned-returning method call.
+    // sema attaches the operator MethodSymbol to the BinaryExpr (§25 typeBinary)
+    // and OperatorDecl::returnOwned is the authority. Without this the operator
+    // result fell through to Borrowed, so `var r := a + b` carried no disposal
+    // obligation: it was neither auto-dropped (§28.3) nor disposed — a silent leak
+    // (#965). Owned only when the result is a disposable class/interface (an
+    // `owned`-returning operator on a value type is impossible — §9.7 forbids
+    // record destructors). The operands stay borrowed, so there is no double-free.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (auto* sym = ctx_.exprSymbol(*be))
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+                if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
+                    if (od->returnOwned)
+                        if (const sema::TypeRef* rt = ctx_.exprType(e))
+                            if (rt->kind == sema::TypeRef::Kind::Named &&
+                                rt->declaration &&
+                                (rt->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 rt->declaration->kind ==
+                                     ast::TypeDeclKind::Interface) &&
+                                !rt->declaration->isValueBuiltin)
+                                return OwnershipState::Owned;
+    }
     // Default: Borrowed.
     return OwnershipState::Borrowed;
 }

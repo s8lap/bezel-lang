@@ -640,3 +640,63 @@ BEZEL_TEST(undisposed_leak, discard_move_only_array_still_rejected_1009) {
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §25 / §28.3 (#965): a user-defined BINARY operator overload declared with an
+// `owned` return produces a FRESH owned value. Bound to a plain `var` (or
+// discarded via `var _ :=`), that operator result is an owned producer that
+// auto-drops at scope end (§28.3 affine auto-drop) — disposed exactly once. Before
+// the producerState fix the operator result classified Borrowed → no auto-drop →
+// the result leaked. Cell.n returns to 0; ASan confirms no leak / no double-free.
+namespace {
+const char* kOpCell =
+    "class Cell public static n: int := 0; public V: int; "
+    "  public constructor(v: int) Cell.n:=Cell.n+1; V:=v; end constructor; "
+    "  destructor Cell.n:=Cell.n-1; end destructor; "
+    "  public static method operator +(a: Cell, b: Cell): owned Cell => "
+    "    new Cell(a.V + b.V); "
+    "end Cell; ";
+}  // namespace
+
+// `var _ := a + b` — the #965 part-2 repro. The owned operator result is
+// auto-dropped (discharged) at scope end; Cell.n returns to 0.
+BEZEL_TEST(undisposed_leak, operator_owned_result_discard_auto_dropped_965) {
+    std::string src = std::string("module M; ") + kOpCell +
+        "class C public static method Main(): int "
+        "  do using var a := new Cell(1); using var b := new Cell(2); "
+        "     var _ := a + b; end; "       // owned operator result auto-dropped
+        "  return Cell.n; "                 // 0 — disposed exactly once
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 0);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// A plain `var r := a + b` that is USED then dropped also auto-drops the owned
+// operator result — and the borrowed operands `a`/`b` are disposed once by their
+// own `using var` (no double-free).
+BEZEL_TEST(undisposed_leak, operator_owned_result_plain_var_auto_dropped_965) {
+    std::string src = std::string("module M; ") + kOpCell +
+        "class C public static method Main(): int "
+        "  do using var a := new Cell(1); using var b := new Cell(2); "
+        "     var r := a + b; var z := r.V; end; "
+        "  return Cell.n; "                 // 0
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 0);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// Chained `var r := a + b + c`: the intermediate `(a+b)` is disposed by the
+// #912 chained-operand path and the final result auto-drops — each disposed
+// exactly once, no double-free.
+BEZEL_TEST(undisposed_leak, operator_owned_chained_result_auto_dropped_965) {
+    std::string src = std::string("module M; ") + kOpCell +
+        "class C public static method Main(): int "
+        "  do using var a := new Cell(1); using var b := new Cell(2); "
+        "     using var c := new Cell(3); var r := a + b + c; var z := r.V; end; "
+        "  return Cell.n; "                 // 0
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 0);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
