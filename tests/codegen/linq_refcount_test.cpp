@@ -1068,3 +1068,46 @@ BEZEL_TEST(linq_refcount, owning_coll_owned_temp_count_unbound_no_double_free_10
     // assert correctness AND no UAF / double-free of the owned Cell elements.
     expectValueAndNoCorruption(kOwningCollOwnedTempCountUnbound, 6);
 }
+
+// #1013 / §28.3 / stdlib §5: an UNBOUND `a.ToDictionary(...)` temporary used as
+// the receiver of `.Count()` is a fresh, ownerless DICT-backed materializer — it
+// must be reclaimed at end-of-statement via bz_dict_free. The #1006b unbound-temp
+// reclaim was array-only (bz_array_free), so the bz_dict struct + its entries
+// leaked (80 bytes). The fix extends the reclaim to dict materializers. The count
+// (2) is read from the dict BEFORE the free; ASan confirms no leak.
+const char* kToDictUnboundCount =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var n: int := 0; "
+    "    do "
+    "      using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+    "      n := a.ToDictionary((x) => x).Count(); "  // unbound dict temp reclaimed
+    "    end; "
+    "    return n; "                                   // 2 — count correct, no leak
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, todictionary_count_unbound_temp_leak_free_1013) {
+    expectValueAndLeakFree(kToDictUnboundCount, 2);
+}
+
+// #1013 SOUNDNESS: a BOUND `using var d := a.ToDictionary(...)` is freed exactly
+// once by its own scope-end disposal — the `d.Count()` receiver is an identifier,
+// NOT a ToDictionary CallExpr, so the unbound-temp reclaim does NOT fire (no
+// double-free). LSan-clean and no double-free.
+const char* kToDictBoundCount =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var n: int := 0; "
+    "    do "
+    "      using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+    "      using var d := a.ToDictionary((x) => x); "
+    "      n := d.Count(); "                           // bound — sole free is d's
+    "    end; "
+    "    return n; "                                   // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, todictionary_count_bound_using_var_no_double_free_1013) {
+    expectValueAndLeakFree(kToDictBoundCount, 2);
+}

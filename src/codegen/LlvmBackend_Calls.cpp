@@ -3692,7 +3692,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Count" && call.args.empty()) {
             auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
             llvm::Value* c = builder_.CreateCall(fn, {recv});
-            return builder_.CreateTrunc(c, i32());
+            llvm::Value* cnt = builder_.CreateTrunc(c, i32());
+            // #1013 / §28.3: reclaim an UNBOUND `a.ToDictionary(...)` temporary at
+            // end-of-statement — the count is read from the dict above FIRST, then
+            // the dict-backed temp is freed via bz_dict_free (inside the helper). A
+            // no-op for a bound/aliased/`move`d receiver (not a ToDictionary
+            // CallExpr) → that dict is freed by its own using-var disposal; no
+            // double-free, no UAF.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+            return cnt;
         }
         // §4.8 / §4.9: .Clear() — empty the table in place (it stays allocated;
         // Count is 0 afterward). The value-disposal obligation mirrors the

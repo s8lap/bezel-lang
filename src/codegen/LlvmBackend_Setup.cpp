@@ -8986,6 +8986,33 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
 }
 
 
+// #1013 / §28.3 / stdlib §5: is `e` a fresh-DICTIONARY materializer call
+// (`recv.ToDictionary(...)`) whose result is a builtin borrowing `Dictionary<K,V>`
+// temporary that no named local/field/param owns? Like the Array materializers
+// above, when such a call appears UNBOUND as the receiver of a chained borrowing
+// operation (`a.ToDictionary(k).Count()`) the intermediate Dictionary is owned by
+// nothing and must be reclaimed at end-of-full-expression, via bz_dict_free (it is
+// dict-backed: a bz_dict_t*, not a bz_array_t*). Scoped to the builtin `Dictionary`
+// name-head (declaration-less) and the `ToDictionary` method, mirroring the Array
+// recognizer's narrowness — a bound/`move`d/aliased receiver is not a `ToDictionary`
+// CallExpr → never matched → never freed (no UAF / double-free; that dict is freed
+// by its own owner / using-var disposal). `ToSet()` is intentionally NOT matched:
+// its temporary is already reclaimed on the existing path, so adding a second free
+// would double-free.
+bool Emitter::isFreshOwnerlessDictMaterializerExpr(const ast::Expr* e) const {
+    if (!e) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Dictionary") return false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma) return false;
+    return ma->member == "ToDictionary";
+}
+
+
 // #1006(b) / §28.3 / §28.8 / stdlib §3 / §5: is `e` a CALL to a USER method whose
 // declared return type carries `owned` (`method M(): owned Array<T>`) and whose
 // RESULT is a builtin borrowing `Array<T>` temporary that no named local/field/
@@ -9054,6 +9081,19 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
         const ast::Expr* recvExpr, llvm::Value* recvVal,
         const sema::TypeRef* recvTy) {
     if (!recvExpr || !recvVal) return;
+    // #1013: a fresh unbound `Dictionary<K,V>` materializer temp (`a.ToDictionary
+    // (k).Count()`) is dict-backed — reclaim it with bz_dict_free (the struct AND
+    // its entries), NOT bz_array_free which would leak the bz_dict struct. The
+    // borrowing chain owns the dict, not its keys/values (stdlib §5), so the
+    // per-value disposer is null: bz_dict_free frees the table, its key bytes, and
+    // the value-box storage (value types carry nothing to dispose).
+    if (isFreshOwnerlessDictMaterializerExpr(recvExpr)) {
+        auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(
+            fn, {recvVal, llvm::ConstantPointerNull::get(ptrTy())});
+        return;
+    }
     if (!isFreshOwnerlessArrayMaterializerExpr(recvExpr) &&
         !isUnboundOwnedBorrowingArrayCallExpr(recvExpr)) return;
     // Per-element disposer: release the `Array<string>` co-owned +1 that the

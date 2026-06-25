@@ -4715,6 +4715,10 @@ private:
     // UAF, no double-free. The `Array<string>` +1/element co-ownership is
     // released by passing the string-release thunk to the free.
     bool isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const;
+    // #1013: true if `e` is a fresh-Dictionary materializer call
+    // (`recv.ToDictionary(...)`) returning a builtin borrowing `Dictionary<K,V>`
+    // temporary — reclaimed at end-of-statement via bz_dict_free.
+    bool isFreshOwnerlessDictMaterializerExpr(const ast::Expr* e) const;
     // #1006(b): true if `e` is a CALL to a USER method declared `owned`-return
     // (`method M(): owned Array<T>`) whose result is a builtin borrowing
     // `Array<T>` temporary — i.e. an unbound, must-consume owned array. Used at
