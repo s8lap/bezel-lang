@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.148 — June 2026**
+**Companion to the Bezel Language Specification, v0.149 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7016,6 +7016,42 @@ Stdlib §3.2 (four property declarations and prose). Compiler: sema/ExprTypechec
 #### Migration
 
 Replace `Encoding.Utf8` with `Encoding.UTF8`, `Encoding.Utf16` with `Encoding.UTF16`, `Encoding.Utf32` with `Encoding.UTF32`, and `Encoding.Ascii` with `Encoding.ASCII` in all Bezel source files. No other changes are needed; method names (`GetBytes`, `GetString`, `Name`) and runtime behavior are unchanged.
+
+---
+
+### v0.149 changelog (v0.148 → v0.149)
+
+v0.149 is an ownership-soundness pass that closes three holes in the enforcement of the ownership model for method returns and owned temporaries. Two are enforcement of rules the spec already stated; the third adds one normative rule for unbound owned temporaries. Owner-directed 2026-06-25; tracked as #1007, #1005, #1006.
+
+#### The defects
+
+Three gaps, all surfaced while clarifying that `OwnedArray<T>` and the other `Owned*` types denote *element* ownership while the `owned` qualifier denotes *container* ownership ([§5.11](#sec-owning-collections)):
+
+1. **Double-free (#1007).** Returning a *borrowed* owning-collection value — `Identity(a: OwnedArray<T>): OwnedArray<T> => a`, where `a` is a non-`owned` (borrowed) parameter — was tracked at the call site as an *owned* result. The caller then disposed it while the borrow's actual owner also disposed it: a double-free. The cause was an implementation shortcut that classified any owning-type return as owned by its type *name*, conflating the element ownership the name denotes with container ownership.
+
+2. **Owned-field leak (#1005).** §28.6's rule — "an owned field's value may not be returned from a method unless the return type is declared `owned`" — was not enforced. `Take(): T? => move v` (the `move` form) compiled and leaked the moved value.
+
+3. **Unbound-temporary leak (#1006b).** An `owned`-typed value produced as an *unbound temporary* and used only by borrowing operations in a chain — `Folded(src).Sorted()` where `Folded(src): owned Array<T>` — was never disposed, leaking. A named result is disposed via `using var`; an *unnamed* temporary has no name to bind, so nothing disposed it.
+
+#### The resolution
+
+1. **#1007** — a borrow may not be returned through an owning-collection / owning-wrapper return type declared without `owned` ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) borrow-lifetime rules); a clean diagnostic replaces the silent double-free. Fresh/owned producers and `owned`-declared returns are unaffected.
+
+2. **#1005** — §28.6's owned-field-return rule is now enforced for the `move`-of-owned-field form. A *bare* owned-field read through a non-`owned` *class* return remains a legal borrow per §28.6's "Methods returning `this`" rule — only the `move` form transfers the value out.
+
+3. **#1006b** — a new rule ([§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries), *Unbound owned temporaries*): an unbound owned temporary used only by borrowing operations is disposed at the end of the full expression, after its uses complete — the unnamed counterpart of the discard contract (§17.13) and the owned-local discharge requirement. Disposed exactly once; the bound / `move`d / transferred cases are excluded.
+
+#### Touched
+
+Language spec: §28.3 (a new borrow-return rule for owning-type returns; a new *Unbound owned temporaries* subsection). Compiler: the ownership pass (src/ownership/Ownership.cpp, Ownership_impl.hpp — the return checks for #1007 and #1005) and codegen (src/codegen/LlvmBackend_Setup.cpp, LlvmBackend_Calls.cpp, LlvmBackend_Exprs.cpp — the unbound-owned-temporary disposal for #1006b, generalizing the v0.148 materializer reclaim along the `owned` axis). Tests: new ownership reject tests (#1007, #1005) and codegen disposal tests (#1006b). Version headers bumped to v0.149 across the language spec, standard library, and design rationale.
+
+#### Migration
+
+A program that relied on any of the three unsound behaviors is rewritten locally: a method that returned a *borrowed* owning-collection value must declare a borrowing (non-owning) return type or return an owned value (#1007); a method that returned a `move`d owned field through a non-`owned` return must declare the return type `owned` (#1005). The unbound-temporary disposal (#1006b) is transparent — affected chains simply stop leaking, with no source change. No change is required of code that already used `owned` returns and `using var` consumers.
+
+#### Deferred
+
+The remaining ergonomic and uniformity questions are tracked separately (#1008): folding the v0.148 materializer carve-out (`ToArray` / `Sorted` / `Reversed`, typed non-`owned` with a compiler-internal reclaim) into the uniform `owned` rule, and the affine-auto-drop-versus-linear decision for a discarded owned value. Returning a *borrowed* owning-collection value (full two-axis container-ownership tracking, as opposed to the #1007 rejection) is likewise deferred. These are expressiveness / ergonomics changes, not soundness; the v0.149 pass leaves the model sound (no leaks, no double-frees) under the existing linear discipline.
 
 ---
 

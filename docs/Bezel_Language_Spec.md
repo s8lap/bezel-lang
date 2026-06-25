@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.148 — June 2026**
+**Version 0.149 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -4946,6 +4946,7 @@ A borrowed value's lifetime is the lifetime of its *source*. The compiler enforc
 
 - A borrowed local may not be returned from a method whose return type is `owned`.
 - A borrowed local may not be returned from a method at all unless the return type is the same kind of borrow with a clearly-defined source (in this version, that means: receiver-borrows from extension methods, value-typed returns, and runtime-managed returns).
+- A borrow may not be returned from a method through an **owning-collection or owning-wrapper return type** (`OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedLinkedList<T>`, `OwnedTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) declared without the `owned` qualifier. The caller of such a method tracks the result as an owned value and discharges it (the `Owned*` type name denotes *element* ownership, [§5.11](Bezel_Design_Rationale.md#sec-owning-collections); a method returning such a type without a borrow source produces a value the caller takes ownership of). Returning a borrow through it would make the caller a second owner of the borrow's source, disposing it twice. Return a freshly-produced (owned) value, declare the return type `owned`, or use a borrowing (non-owning) return type.
 - A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference; the lifetime relationship is the programmer's obligation, checked at each assignment site (a borrowed local fails the check, a constructor-parameter borrow whose source outlives the object passes).
 - A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted.
 - The same capture-and-escape rule applies to **method references** ([§27.6](#sec-method-references)) that bind an instance receiver: `obj.Method` produces a function value whose captured environment includes `obj`. If `obj` is a borrow, the resulting function value is subject to the closure-escape rules above as if `obj` had been captured by an explicit lambda. The function value's runtime-managed status ([§28.9](#sec-runtime-managed-types)) governs the *function value's own* lifetime; it does not relax the lifetime constraints on borrows captured by the function value.
@@ -4978,6 +4979,15 @@ The implicit cleanup does **not** apply to:
 - Value-typed and runtime-managed-typed locals; these have no `Dispose` to call.
 
 A user who wants to perform additional cleanup on the exception path (logging the partial result, performing a partial-state recovery) writes an explicit `try`/`finally` or `try`/`catch`/`throw` around the relevant operations. The implicit auto-dispose composes with explicit `finally` blocks: the explicit `finally` runs first (with the local still in scope), then the implicit auto-dispose runs as the scope unwinds further.
+
+<a id="sec-unbound-owned-temporaries"></a>
+#### Unbound owned temporaries
+
+The discharge requirement above governs *named* owned values — locals, fields, and parameters. An owned value may also be produced as an **unbound temporary**: the result of an `owned`-returning call (or other owned producer) that is not bound to any name, not `move`d, and not returned, but used only by *borrowing* operations within the expression — as the receiver of a further call, as a non-`owned` argument, or as a member or index access. Such a temporary is disposed at the **end of the full expression** in which it is produced, after every use of it within that expression has completed.
+
+This is the unnamed-temporary counterpart of the discard contract ([§17.13](#sec-the-discard-_)) and the discharge requirement above: a *named* owned value must reach an owned slot, a `using var`, or an explicit `Dispose()`; an *unnamed* owned temporary — which none of those forms can name — is reclaimed automatically once the expression that produced it is finished with it. A temporary that is instead bound (to a `var`/`using var`), `move`d, returned, or transferred into an owning location is governed by the corresponding transfer or discharge rule and is **not** disposed under this rule (it would otherwise be disposed twice).
+
+For example, in `Folded(src).Sorted()` where `Folded(src): owned Array<T>` and `Sorted` borrows its receiver, the `Folded(src)` temporary is borrowed by `Sorted`, then disposed once the statement completes — exactly once, with no leak and no double-free. Disposal runs *after* the borrowing use, so the receiver is live for the duration of the call.
 
 <a id="sec-diagnostics"></a>
 #### Diagnostics
@@ -8153,6 +8163,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Owned values may not escape: returning an owned field requires an `owned` return type; assigning an owned value to a non-owned field of another object is rejected.
 - A `new` expression's result must reach an owned location or be explicitly disposed within the same method; the compiler warns on silent discard for non-trivial-dispose classes and rejects discard with `_ := …` outright ([§17.13](#sec-the-discard-_)). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
 - A static method returning a class type without `owned` and without an identifiable borrow source produces an owned value; the same discharge rules as `new` apply ([§28.3](#sec-local-variables-ownership-and-borrows)).
+- A borrow may not be returned through an owning-collection or owning-wrapper return type (`OwnedArray<T>`, `Shared<T>`, etc.) declared without `owned`; the caller would track the result as owned and dispose a value it does not own ([§28.3](#sec-local-variables-ownership-and-borrows) borrow-lifetime rules). The `Owned*` name denotes element ownership, not container ownership.
+- An unbound owned temporary — the result of an `owned`-returning producer that is not bound, `move`d, returned, or transferred, used only by borrowing operations within its expression — is disposed exactly once at the end of that full expression, after its uses complete ([§28.3](#sec-unbound-owned-temporaries)).
 - `using var` variables may not be reassigned.
 - Records may not have `owned` fields, may not have inline-array fields with the `owned` slot marker, may not have destructors, may not implement `IDisposable`.
 - At a control-flow merge point, a variable that was owned on one branch and borrowed on the other is rejected ([§28.3](#sec-local-variables-ownership-and-borrows)). The two branches must be equalized before the merge.
