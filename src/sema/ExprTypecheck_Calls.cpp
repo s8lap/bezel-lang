@@ -5274,12 +5274,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 // char static classification methods → bool.
+                // #1036: `IsSymbol` is NOT one of them — stdlib §9.5 lists only
+                // IsDigit/IsLetter/IsLetterOrDigit/IsWhiteSpace/IsUpper/IsLower/
+                // IsControl/IsPunctuation. It was accepted here (typed bool) but
+                // has no codegen lowering in the char-classification map
+                // (LlvmBackend_Calls.cpp:6950-6957), so `char.IsSymbol(c)`
+                // silently returned a constant false for every input ('+', '$',
+                // '=' all → false) — an invented-API accept-trap (CLAUDE.md §2).
+                // Dropped from the set so it falls through to the §3.4 "char has
+                // no static method 'IsSymbol'" reject, like any other unknown.
                 if (pt == PrimitiveType::Char) {
                     if (mbr == "IsDigit" || mbr == "IsLetter" ||
                         mbr == "IsLetterOrDigit" || mbr == "IsWhiteSpace" ||
                         mbr == "IsUpper" || mbr == "IsLower" ||
                         mbr == "IsControl" ||
-                        mbr == "IsPunctuation" || mbr == "IsSymbol") {
+                        mbr == "IsPunctuation") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }

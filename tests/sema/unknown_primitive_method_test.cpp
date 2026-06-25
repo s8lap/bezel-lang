@@ -51,6 +51,16 @@ BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_bogus_is_rejected) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
+// #1036 / §3.4 / stdlib §9.5: `char.IsSymbol` is NOT a stdlib char
+// classification method (the set is IsDigit/IsLetter/IsLetterOrDigit/
+// IsWhiteSpace/IsUpper/IsLower/IsControl/IsPunctuation). It was wrongly
+// accepted (typed bool) but had no codegen lowering, so it silently returned
+// a constant false for every input. Must now reject like any unknown static.
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_issymbol_is_rejected_1036) {
+    auto r = checkBody("var b := char.IsSymbol('+'); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
 // §3.4 / stdlib §5.2: int has no static method `Frobnicate`.
 BEZEL_TEST(sema_unknown_primitive_method_spec3_4, int_frobnicate_is_rejected) {
     auto r = checkBody("var x := int.Frobnicate(42); return 0;");
@@ -89,6 +99,14 @@ BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_toupper_is_accepted) {
 // §3.4 / stdlib §9.5: char.ToString(c: char): string — recognized.
 BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_tostring_is_accepted) {
     auto r = checkBody("var s := char.ToString('z'); return 0;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// #1036 / §3.4 / stdlib §9.5: char.IsPunctuation — the real neighbour of the
+// dropped IsSymbol — must STILL be accepted (positive control for the #1036
+// drop, guarding against an over-broad edit).
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_ispunctuation_still_accepted_1036) {
+    auto r = checkBody("var b := char.IsPunctuation('.'); return 0;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
