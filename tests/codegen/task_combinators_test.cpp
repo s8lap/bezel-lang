@@ -206,6 +206,48 @@ BEZEL_TEST(task_combinators_6_7, when_all_already_complete) {
         5);
 }
 
+// §30.9 / §30.4 (#855): a fault inside a task passed to Task.WhenAll IS caught by
+// a try/catch around `await Task.WhenAll(...)` — the WhenAll await re-raises the
+// aggregate's exception into the awaiting frame's active catch. The tasks are held
+// by an OWNING OwnedArray<Task> (the correct idiom: a borrowing Array<Task> does
+// not own the tasks, so storing fresh producers there leaks them and their
+// unobserved fault surfaces as unhandled — the #1020 footgun, NOT an async-routing
+// bug). Verified: the original #855 repro used a borrowing `Array<Task>`; with an
+// owning collection both the WhenAll await and a direct element await catch (rc=55).
+// Value-only (correctness): the faulted-task error-object disposal interaction with
+// the catch arm is tracked by #854 (the double-await/error_obj reclaim lane).
+BEZEL_TEST(task_combinators_6_7, when_all_owned_array_faulted_task_caught_855) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task "
+        "    throw new InvalidOperationException(\"f\"); end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new OwnedArray<Task>(); "
+        "    tasks.Add(Boom()); "
+        "    var x := 0; "
+        "    try await Task.WhenAll(tasks); catch Exception => x := 55; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        55);
+}
+
+// §30.9 / §30.4 (#855): awaiting an owning-collection element that faulted is also
+// caught (the same correct await-re-raise routing, independent of WhenAll).
+BEZEL_TEST(task_combinators_6_7, await_owned_array_element_faulted_task_caught_855) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task "
+        "    throw new InvalidOperationException(\"f\"); end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new OwnedArray<Task>(); "
+        "    tasks.Add(Boom()); "
+        "    var x := 0; "
+        "    try await tasks[0]; catch Exception => x := 55; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        55);
+}
+
 // §6.7: Task.WhenAll on an empty array completes immediately.
 // Empty array means no input tasks → no leak concern.
 BEZEL_TEST(task_combinators_6_7, when_all_empty_array) {
