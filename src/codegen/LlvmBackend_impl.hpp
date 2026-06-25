@@ -4715,6 +4715,31 @@ private:
     // UAF, no double-free. The `Array<string>` +1/element co-ownership is
     // released by passing the string-release thunk to the free.
     bool isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const;
+    // #1006(b): true if `e` is a CALL to a USER method declared `owned`-return
+    // (`method M(): owned Array<T>`) whose result is a builtin borrowing
+    // `Array<T>` temporary — i.e. an unbound, must-consume owned array. Used at
+    // the copy-form `.Sorted()`/`.Reversed()` lowering (alongside the #1004
+    // materializer check) so that an UNBOUND owned-returning call used as the
+    // chained RECEIVER is `bz_array_free`d after the copy (else it leaks —
+    // #1006b). Generalizes #1004 along the `owned` axis: the producing method's
+    // `owned` return marker — not a builtin name whitelist — is the authority that
+    // the call owns its result. A bound (`using var`/`var`), `move`d, returned, or
+    // owned-arg receiver is never a chained-receiver CallExpr here, so it is never
+    // matched → no UAF, no double-free. Borrowing-array element semantics (stdlib
+    // §3/§5) mean the per-element disposer is null (string-release for
+    // `Array<string>`), identical to #1004.
+    bool isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const;
+    // #1006(b) / #1004: emit the end-of-full-expression bz_array_free of an
+    // UNBOUND fresh borrowing-`Array<T>` temporary `recvVal` (a #1004 materializer
+    // call OR a #1006b `owned`-returning user-method call given by `recvExpr`),
+    // with the borrowing-snapshot element disposer (null / string-release). A
+    // no-op for any other receiver shape. The caller must have fully read its
+    // result from `recvVal` first (the backing is released here). Shared by the
+    // chained-method-receiver sites and the `.Length`/`.Count` borrow-position
+    // property read.
+    void freeUnboundOwnedBorrowingArrayTemp(const ast::Expr* recvExpr,
+                                            llvm::Value* recvVal,
+                                            const sema::TypeRef* recvTy);
     // True if `init` is a codegen-internal +1 string producer: a string `+`
     // BinaryExpr or an InterpolatedStringExpr. These are lowered to a fresh
     // malloc'd rc=1 header that codegen fully controls — so binding the result

@@ -8957,6 +8957,95 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
 }
 
 
+// #1006(b) / §28.3 / §28.8 / stdlib §3 / §5: is `e` a CALL to a USER method whose
+// declared return type carries `owned` (`method M(): owned Array<T>`) and whose
+// RESULT is a builtin borrowing `Array<T>` temporary that no named local/field/
+// param owns? Such a call produces a fresh, must-consume (affine, §28.3) owned
+// array; when it appears UNBOUND as the receiver of a chained borrowing operation
+// (`P.Fold(s).Sorted()`), nothing else takes ownership of the intermediate, so it
+// must be reclaimed at end-of-full-expression or it leaks (#1006b). This is the
+// generalization of #1004's name-whitelisted materializer free along the `owned`
+// axis: instead of matching the builtin ToArray/Sorted/Reversed name-head, we
+// recognise the producing method's `owned` return marker (the authority that the
+// call OWNS its result and the caller must dispose it).
+//   Soundness — kept exactly as narrow as #1004, distinguishing transfer from
+//   the borrowing chained-receiver use:
+//     * the result type must be a builtin borrowing `Array<T>` (name-head exactly
+//       "Array", declaration-less) — NOT an Owned* / Set / Dictionary / LinkedList
+//       family, whose backing is freed differently and whose elements are owned
+//       (an owning collection would need an element cascade, not a backing free);
+//     * the EXPRESSION must be a CallExpr to a MethodSymbol whose ast::MethodDecl
+//       has `returnOwned` — a named-local / field / param / `move` / alias / `new`
+//       receiver is NOT a CallExpr (or its callee is not an owned-returning method)
+//       → never matched → never freed (no UAF / double-free; that array is freed
+//       by its own owner / using-var disposal);
+//     * because this only ever fires for a receiver CallExpr evaluated INLINE as a
+//       chained operation's receiver, the temporary is genuinely unbound — a
+//       `using var f := P.Fold(s); f.Sorted()` reads `f` via an IdentifierExpr
+//       receiver (not a CallExpr) and is NOT matched (so the using-var disposal is
+//       the sole free — no double-free).
+//   Per stdlib §3/§5 ("the result is a borrowing array … the caller is responsible
+//   for disposing the array itself, not its elements") the per-element disposer is
+//   exactly #1004's: null for value/class borrows, the string-release thunk for an
+//   `Array<string>` whose materializer retained a +1/element.
+bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
+    if (!e) return false;
+    // Result type must be a builtin borrowing `Array<T>` (name-head "Array",
+    // declaration-less) — not Owned*, not a dict-/llist-backed family.
+    const sema::TypeRef* rt = ctx_.exprType(*e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Array") return false;
+    // The expression must be a CALL whose resolved callee is a user MethodSymbol
+    // declared with an `owned` return (the authority that the call owns its
+    // result). The callee symbol is keyed on the CallExpr's `callee` node.
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
+    if (!ms) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    return md && md->returnOwned;
+}
+
+
+// #1006(b) / #1004 / §28.3 / stdlib §3 / §5: if `recvExpr` is an UNBOUND fresh
+// borrowing-`Array<T>` temporary — either a builtin materializer call
+// (`X.ToArray()`/`X.Sorted()`/`X.Reversed()`, #1004) OR an `owned`-returning user
+// method call (`P.Fold(s)` with `Fold(): owned Array<T>`, #1006b) — emit the
+// end-of-full-expression `bz_array_free` of its backing `recvVal`, with the
+// per-element disposer the borrowing snapshot requires (null for value/class
+// borrows; the string-release thunk for an `Array<string>` whose materializer
+// retained a +1/element). A no-op for any other receiver shape, so a bound /
+// `move`d / returned / owned-arg / aliased receiver is never freed → no UAF, no
+// double-free. The single place this free logic lives, shared by the chained-
+// method-receiver sites (`freeFreshInputTemp`) and the `.Length`/`.Count` borrow-
+// position property read; the CALLER must already have fully read the result it
+// derives from `recvVal` BEFORE calling this (the backing is released here).
+void Emitter::freeUnboundOwnedBorrowingArrayTemp(
+        const ast::Expr* recvExpr, llvm::Value* recvVal,
+        const sema::TypeRef* recvTy) {
+    if (!recvExpr || !recvVal) return;
+    if (!isFreshOwnerlessArrayMaterializerExpr(recvExpr) &&
+        !isUnboundOwnedBorrowingArrayCallExpr(recvExpr)) return;
+    // Per-element disposer: release the `Array<string>` co-owned +1 that the
+    // materializer/snapshot added; null for value/class element borrows (stdlib
+    // §3/§5: the caller owns the array, not its elements).
+    llvm::Value* elemDisp = llvm::ConstantPointerNull::get(ptrTy());
+    const sema::TypeRef* el = (recvTy && !recvTy->genericArgs.empty())
+        ? recvTy->genericArgs[0] : nullptr;
+    if (el && !el->nullable &&
+            el->kind == sema::TypeRef::Kind::Primitive &&
+            el->primitive == sema::PrimitiveType::String) {
+        ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
+        if (ep.cat == ElementPolicy::Category::RuntimeManaged)
+            elemDisp = stringElementReleaseThunk();
+    }
+    auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {recvVal, elemDisp});
+}
+
+
 // #1003 / stdlib §5 / §28: compute borrowingArrayFreeEligible_ for a block body.
 // Mirrors collectStringReleaseEligible: find every plain `var` borrowing-Array
 // local bound to a fresh materializer, then run the conservative (type-agnostic)

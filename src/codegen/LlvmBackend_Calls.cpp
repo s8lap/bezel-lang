@@ -836,22 +836,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // own retain. Idempotent guards mean a non-materializer receiver is a no-op.
     auto freeFreshInputTemp = [&]() {
         if (lazyTempArr) return;  // the lazy-terminal path frees via freeLazyTemp
-        if (!isFreshOwnerlessArrayMaterializerExpr(ma->target.get())) return;
-        // Per-element disposer: release the `Array<string>` co-owned +1 that the
-        // materializer (ToArray/Sorted/Reversed) added; null for value/class.
-        llvm::Value* elemDisp = llvm::ConstantPointerNull::get(ptrTy());
-        const sema::TypeRef* el = (recvTy && !recvTy->genericArgs.empty())
-            ? recvTy->genericArgs[0] : nullptr;
-        if (el && !el->nullable &&
-                el->kind == sema::TypeRef::Kind::Primitive &&
-                el->primitive == sema::PrimitiveType::String) {
-            ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
-            if (ep.cat == ElementPolicy::Category::RuntimeManaged)
-                elemDisp = stringElementReleaseThunk();
-        }
-        auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {recv, elemDisp});
+        // #1004: a builtin fresh-array materializer receiver (ToArray/Sorted/
+        // Reversed). #1006(b): generalized along the `owned` axis — an UNBOUND
+        // `owned`-returning USER method call used as the chained receiver (e.g.
+        // `P.Fold(s).Sorted()` where `Fold(): owned Array<int>`). Both produce a
+        // fresh borrowing `Array<T>` no name owns; freeing the backing here (with
+        // the same null/string-release element disposer) reclaims the intermediate
+        // at end-of-full-expression. A bound/`move`d/returned/owned-arg receiver is
+        // not a chained-receiver CallExpr of this shape → not freed → no UAF.
+        freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
     };
 
     // -----------------------------------------------------------------------
@@ -1273,6 +1266,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* len64 = builder_.CreateCall(fn, {recv});
             llvm::Value* len32 = builder_.CreateTrunc(len64, i32(), "arr.len");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            // #1006(b): the scalar length is fully read above, so an UNBOUND owned
+            // borrowing-array receiver (`P.Fold(s).Length`) can be reclaimed now —
+            // a borrow-position member access leaving the temporary otherwise
+            // unreferenced. No-op unless the receiver is exactly that shape.
+            freeFreshInputTemp();
             return len32;
         }
         // per §5 LINQ: .Sum(fn: (T)->int): int  /  .Sum(): int (for Array<int>)

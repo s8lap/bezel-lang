@@ -1891,6 +1891,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 std::string_view n = tt->astNode->name->parts[0];
                 if (n == "StringBuilder") return false;  // has own handler
                 if (n == "Buffer") return false;          // issue #545: own handler
+                // #1006(b): an array-backed collection (`Array<T>` etc.) has its
+                // own `.Length` handler below (bz_array_len) that also reclaims an
+                // UNBOUND owned borrowing-array receiver (`P.Fold(s).Length`). Do
+                // NOT intercept it here — the string fallback's loadStringLen would
+                // read the array header's field[0] by layout coincidence and skip
+                // the reclaim, leaking the temporary (the value is right by luck
+                // but the temp leaks). Route to the dedicated array path instead.
+                if (isCollectionTypeName(tt)) return false;
                 return true;
             };
             if (ma->member == "Length" && isStringFallbackTarget() &&
@@ -2643,7 +2651,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         ? declareC("bz_dict_count", i64(), {ptrTy()})
                         : declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len64 = builder_.CreateCall(fn, {obj});
-                    return builder_.CreateTrunc(len64, i32(), "col.len");
+                    llvm::Value* col = builder_.CreateTrunc(len64, i32(),
+                                                            "col.len");
+                    // #1006(b): a `.Length`/`.Count` PROPERTY read is a borrow
+                    // position — the scalar count is fully computed above, so an
+                    // UNBOUND owned borrowing-array receiver (`P.Fold(s).Length`)
+                    // leaves the temporary otherwise unreferenced and is reclaimed
+                    // here. No-op unless the receiver is exactly that shape (a
+                    // bound/`move`d/aliased receiver is never matched → no UAF).
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), obj, tt);
+                    return col;
                 }
             }
             // fix #853 / stdlib §4.1–§4.3: `.Count` on a LIST-INTERFACE receiver

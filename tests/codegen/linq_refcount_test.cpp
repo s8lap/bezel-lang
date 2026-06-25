@@ -874,3 +874,197 @@ const char* kUsingVarChainSorted =
 BEZEL_TEST(linq_refcount, using_var_chain_sorted_no_double_free_1004) {
     expectValueAndLeakFree(kUsingVarChainSorted, 3);
 }
+
+// ===========================================================================
+// #1006(b) / §28.3 / §28.8 / stdlib §3 / §5: dispose an UNBOUND `owned`-typed
+// temporary at end-of-full-expression. Generalizes #1004's name-whitelisted
+// input-free along the `owned` axis: an `owned`-RETURNING user method
+// (`Fold(): owned Array<int>`) whose result is a builtin borrowing `Array<T>`,
+// used UNBOUND only by a borrowing operation (a chained method receiver, a
+// `.Length`/`.Count` property/method read), is reclaimed once after that use —
+// it was never freed before, so it leaked (64B: backing header + data block).
+// The fix gates strictly on the receiver being an `owned`-returning CALL whose
+// result is a borrowing `Array<T>` (isUnboundOwnedBorrowingArrayCallExpr), so a
+// BOUND (`using var`/`var`), `move`d, returned, owned-arg, or OWNING-collection
+// (`OwnedArray<T>`) result is never freed here — no UAF, no double-free.
+//
+// ASan (detect_leaks=1), before -> after, native repro:
+//   P.Fold(s).Sorted():    64B leaked / 2 allocs (the owned Fold temp) -> 0
+//   P.Fold(s).Reversed():  64B leaked -> 0
+//   P.Fold(s).Length:      64B leaked -> 0  (property read; routes to bz_array_len)
+//   owned Array<Cell> chain: backing freed once, Cell elements BORROWED (net
+//                            Cell.n == 0) -> 0, no double-free of the Cells
+//   using var f := P.Fold(s); f.Sorted():  clean -> clean, NO double-free
+//   P.Build().Count (owned OwnedArray<Cell>): NOT freed here (owning family) ->
+//                            no double-free of owned Cell elements
+
+// The confirmed #1006b repro: `P.Fold(s).Sorted()` where `Fold` returns
+// `owned Array<int>`. The Fold temp is freed after Sorted's copy. Fold of
+// [3,1,2] keeps the positives (all 3), Sorted has Length 3. Returns 3.
+const char* kOwnedFoldSorted =
+    "module M; class P "
+    "  public static method Fold(src: Array<int>): owned Array<int> "
+    "    => src.Where((n) => n > 0).ToArray(); "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := P.Fold(s).Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owned_fold_temp_sorted_chain_leak_free_1006b) {
+    expectValueAndLeakFree(kOwnedFoldSorted, 3);
+}
+
+// `P.Fold(s).Reversed()` — the owned Fold temp is freed after the Reversed copy.
+// Returns 3.
+const char* kOwnedFoldReversed =
+    "module M; class P "
+    "  public static method Fold(src: Array<int>): owned Array<int> "
+    "    => src.Where((n) => n > 0).ToArray(); "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var a := P.Fold(s).Reversed(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owned_fold_temp_reversed_chain_leak_free_1006b) {
+    expectValueAndLeakFree(kOwnedFoldReversed, 3);
+}
+
+// `P.Fold(s).Length` — a `.Length` PROPERTY read is a borrow position; the owned
+// Fold temp is reclaimed after the count is loaded. (Routes through the dedicated
+// bz_array_len path, not the string-fallback that previously leaked it.)
+// Returns 3.
+const char* kOwnedFoldLength =
+    "module M; class P "
+    "  public static method Fold(src: Array<int>): owned Array<int> "
+    "    => src.Where((n) => n > 0).ToArray(); "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var n := P.Fold(s).Length; "
+    "    return n; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owned_fold_temp_length_property_leak_free_1006b) {
+    expectValueAndLeakFree(kOwnedFoldLength, 3);
+}
+
+// `P.Fold(s).Count()` — the LINQ `.Count()` method form (an array terminal) is
+// also a borrow position; the owned Fold temp is freed after the count. Returns 3.
+const char* kOwnedFoldCountMethod =
+    "module M; class P "
+    "  public static method Fold(src: Array<int>): owned Array<int> "
+    "    => src.Where((n) => n > 0).ToArray(); "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    var n := P.Fold(s).Count(); "
+    "    return n; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owned_fold_temp_count_method_leak_free_1006b) {
+    expectValueAndLeakFree(kOwnedFoldCountMethod, 3);
+}
+
+// OWNED ELEMENTS: an `owned Array<Cell>` borrowing snapshot (its elements are
+// borrowed from an OwnedArray<Cell> that uniquely owns them) used as a chained
+// `.Reversed()` receiver. The snapshot backing is freed once; the borrowing
+// element disposer is NULL (stdlib §3/§5: the caller owns the array, not its
+// elements), so the Cells are NOT cascade-disposed here and are freed exactly
+// once when `owners` is disposed — net Cell.n == 0, no double-free. Cell.n is
+// observed AFTER both using-var scopes close (in Main, post-Run). Run returns the
+// reversed snapshot Length (3); Main returns 3 + net Cell.n (0) = 3.
+const char* kOwnedElemFoldReversed =
+    "module M; "
+    "class Cell "
+    "  public static n: int := 0; "
+    "  public V: int := 0; "
+    "  public constructor(v: int) Cell.n := Cell.n + 1; this.V := v; end constructor; "
+    "  destructor Cell.n := Cell.n - 1; end destructor; "
+    "end Cell; "
+    "class P "
+    "  public static method Fold(src: Array<Cell>): owned Array<Cell> "
+    "    => src.Where((c) => c.V > 0).ToArray(); "
+    "  public static method Run(): int "
+    "    using var owners := new OwnedArray<Cell>(); "
+    "    owners.Add(new Cell(3)); owners.Add(new Cell(1)); owners.Add(new Cell(2)); "
+    "    using var view := new Array<Cell>(); "
+    "    view.Add(owners.Get(0)); view.Add(owners.Get(1)); view.Add(owners.Get(2)); "
+    "    using var rev := P.Fold(view).Reversed(); "
+    "    return rev.Length; "
+    "  end Run; "
+    "  public static method Main(): int "
+    "    var v := P.Run(); "
+    "    return v + Cell.n; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owned_elem_fold_temp_reversed_dispose_once_1006b) {
+    expectValueAndLeakFree(kOwnedElemFoldReversed, 3);
+}
+
+// SOUNDNESS: the owned Fold result BOUND to a `using var`, then `f.Sorted()`.
+// The receiver of `.Sorted()` is the identifier `f` (NOT an owned-returning
+// CallExpr), so the #1006b end-of-expression free does NOT fire — `f` is disposed
+// exactly once by its using-var. Must be LSan-clean with NO double-free.
+// Returns 3.
+const char* kOwnedFoldBoundUsingVar =
+    "module M; class P "
+    "  public static method Fold(src: Array<int>): owned Array<int> "
+    "    => src.Where((n) => n > 0).ToArray(); "
+    "  public static method Main(): int "
+    "    using var s := new Array<int>(); "
+    "    s.Add(3); s.Add(1); s.Add(2); "
+    "    using var f := P.Fold(s); "
+    "    var a := f.Sorted(); "
+    "    return a.Length; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owned_fold_bound_using_var_no_double_free_1006b) {
+    expectValueAndLeakFree(kOwnedFoldBoundUsingVar, 3);
+}
+
+// SOUNDNESS: an OWNING-collection owned result (`Build(): owned OwnedArray<Cell>`)
+// chained as `.Count` UNBOUND. The #1006b free is gated to the BORROWING `Array`
+// name-head, so an `OwnedArray<T>` temp is NEVER freed here — freeing it (with an
+// element cascade) would double-free the uniquely-owned Cell elements. This
+// proves no double-free / UAF on the owning family (a leak of the owning temp is
+// the safe, deferred direction — leak-not-dangle, §28.7). Count is 3; the Cells
+// are not disposed (Cell.n stays 3), so Main returns 3 + 3 = 6.
+const char* kOwningCollOwnedTempCountUnbound =
+    "module M; "
+    "class Cell "
+    "  public static n: int := 0; "
+    "  public V: int := 0; "
+    "  public constructor(v: int) Cell.n := Cell.n + 1; this.V := v; end constructor; "
+    "  destructor Cell.n := Cell.n - 1; end destructor; "
+    "end Cell; "
+    "class P "
+    "  public static method Build(): owned OwnedArray<Cell> "
+    "    var r := new OwnedArray<Cell>(); "
+    "    r.Add(new Cell(3)); r.Add(new Cell(1)); r.Add(new Cell(2)); "
+    "    return r; "
+    "  end Build; "
+    "  public static method Run(): int "
+    "    var c := P.Build().Count; "
+    "    return c; "
+    "  end Run; "
+    "  public static method Main(): int "
+    "    var v := P.Run(); "
+    "    return v + Cell.n; "
+    "  end Main; "
+    "end P;";
+
+BEZEL_TEST(linq_refcount, owning_coll_owned_temp_count_unbound_no_double_free_1006b) {
+    // No leak leg here (the owning temp leak is the deliberate deferred direction);
+    // assert correctness AND no UAF / double-free of the owned Cell elements.
+    expectValueAndNoCorruption(kOwningCollOwnedTempCountUnbound, 6);
+}
