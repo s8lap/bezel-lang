@@ -34,6 +34,16 @@ bool hasDiscardLeakError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// #1014: the §17.13 task-discard error is recognized by its Task.FireAndForget
+// direction ("abandons a running operation" + names FireAndForget).
+bool hasTaskDiscardError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("abandons a running") != std::string::npos &&
+            d.message.find("FireAndForget") != std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // §21.9: `new T();` where T is non-trivial-dispose (a destructor) — hard error.
@@ -164,4 +174,83 @@ BEZEL_TEST(owned_discard_743, subscribe_explicit_dispose_ok_949) {
         "  return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
+// §17.13 / §30.10 (#1014): discarding a `Task` / `Task<T>` / `OwnedTask<T>` is a
+// compile error directing the caller to `Task.FireAndForget` — disposing a task
+// abandons a running operation. `await`ing a task (its result type) and trivial
+// values are unaffected.
+// ===========================================================================
+
+// REJECT: `_ := <Task<T>>` discard of an async call result.
+BEZEL_TEST(owned_discard_743, task_generic_discard_is_error_1014) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task<int> return 0; end Work; "
+        "  public static method Main(): int "
+        "    _ := Work(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasTaskDiscardError(r));
+}
+
+// REJECT: `_ := <Task>` discard of a void async call (plain Task, no result).
+BEZEL_TEST(owned_discard_743, task_void_discard_is_error_1014) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task return; end Work; "
+        "  public static method Main(): int "
+        "    _ := Work(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasTaskDiscardError(r));
+}
+
+// REJECT: `_ := <OwnedTask<T>>` discard (Pattern B; still a task, FireAndForget).
+BEZEL_TEST(owned_discard_743, owned_task_discard_is_error_1014) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class R public _h: int := 0; destructor _h := 1; end destructor; end R; "
+        "class C "
+        "  public static async method Make(): OwnedTask<R> return new R(); end Make; "
+        "  public static method Main(): int "
+        "    _ := Make(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasTaskDiscardError(r));
+}
+
+// ACCEPT: `_ := await <Task<T>>` — await yields the RESULT type (`int`), not a
+// task; discarding a trivial result is fine and must NOT trip the task reject.
+BEZEL_TEST(owned_discard_743, awaited_task_result_discard_ok_1014) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task<int> return 0; end Work; "
+        "  public static async method Caller(): Task "
+        "    _ := await Work(); "
+        "    return; "
+        "  end Caller; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasTaskDiscardError(r));
+}
+
+// ACCEPT: a trivial-value discard is unaffected by the task reject.
+BEZEL_TEST(owned_discard_743, trivial_discard_not_task_error_1014) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C public static method Main(): int "
+        "  _ := 5; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasTaskDiscardError(r));
 }

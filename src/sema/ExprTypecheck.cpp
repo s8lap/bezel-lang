@@ -3308,6 +3308,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         //     #949); the result is untyped, so it is recognized structurally.
         if (ds->value) {
             const TypeRef* t = ctx_.exprType(*ds->value);
+            // §17.13 / §30.10 (#1014): discarding a `Task`/`Task<T>`/`OwnedTask<T>`
+            // is a compile error — disposing a task abandons a running operation
+            // (a semantic, not a leak, concern), so the discard must direct the
+            // caller to `Task.FireAndForget` (the error names it specifically).
+            // `await`ing a task yields its RESULT type (not Task-shaped), so
+            // `_ := await t;` is unaffected; `Task.FireAndForget(...)` returns Unit
+            // so its own discard stays legal. Reported before the generic reject so
+            // the message is task-specific.
+            if (isTaskShapedRef(t)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ds->value->span.begin,
+                    "cannot discard a `Task` — disposing it abandons a running "
+                    "operation; use `Task.FireAndForget(expr)` for supervised "
+                    "fire-and-forget, or `using var _ := expr;` to dispose it at "
+                    "scope end (§17.13 / §30.10)");
+            }
             bool reject = isEventSubscribeDrop(ds->value.get());
             if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
                 reject = true;
