@@ -210,3 +210,52 @@ BEZEL_TEST(cts_withcancelafter_token_typed_463,
         "return 0; ")),
         1);
 }
+
+// ===========================================================================
+// #1025 / §6.1: a CHAINED-receiver cancellation instance call — calling the
+// method directly on `source.Token` (a MemberAccessExpr, not a bound
+// identifier) rather than `var t := source.Token; t.M()`.
+//
+// Root cause: tryLowerBuiltinClassCall returned early at `if (!id) return
+// nullptr` (the static-call guard requiring an IdentifierExpr receiver) BEFORE
+// reaching the CancellationToken/CancellationTokenSource instance handlers, so
+// the chained form silently lowered to a no-op — `cts.Token.ThrowIfCancellation
+// Requested()` never threw on a cancelled token (a silent correctness hole).
+// Fix: the instance handlers moved before that guard (they dispatch on the
+// receiver's exprType, accepting any receiver expression).
+// ===========================================================================
+
+// #1025: chained ThrowIfCancellationRequested() on a CANCELLED token throws
+// OperationCanceledException — before the fix it silently did nothing (returned
+// the no-throw path). Mirrors throw_if_cancelled_throws_oce_after_cancel but
+// WITHOUT binding the token to a local first.
+BEZEL_TEST(codegen_cancellation_1025, chained_throw_if_cancelled_throws_after_cancel) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var cts := new CancellationTokenSource(); "
+        "cts.Cancel(); "
+        "try "
+        "  cts.Token.ThrowIfCancellationRequested(); "
+        "  return 0; "
+        "catch OperationCanceledException => return 42; "
+        "end; "
+        "return 0; ")), 42);
+}
+
+// #1025: chained ThrowIfCancellationRequested() on a NOT-cancelled token is a
+// no-op (the receiver is evaluated for effect but nothing is thrown).
+BEZEL_TEST(codegen_cancellation_1025, chained_throw_if_cancelled_noop_when_not_cancelled) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var cts := new CancellationTokenSource(); "
+        "cts.Token.ThrowIfCancellationRequested(); "
+        "return 7; ")), 7);
+}
+
+// #1025: chained IsCancellationRequested property read on `cts.Token` after
+// Cancel() — control that the instance-handler move preserves the property path.
+BEZEL_TEST(codegen_cancellation_1025, chained_token_is_cancellation_requested_after_cancel) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var cts := new CancellationTokenSource(); "
+        "cts.Cancel(); "
+        "if cts.Token.IsCancellationRequested then return 1; end; "
+        "return 0; ")), 1);
+}

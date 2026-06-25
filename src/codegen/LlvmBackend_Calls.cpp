@@ -4595,6 +4595,124 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // §6.1 / §30.8: CancellationTokenSource instance methods and properties.
+    // The receiver's exprType name-part is "CancellationTokenSource".
+    // #1025: placed BEFORE the `if (!id) return nullptr` guard below — the
+    // receiver of an instance call can be ANY expression (e.g. a chained
+    // `source.Token` is a MemberAccessExpr, not an IdentifierExpr), and these
+    // handlers dispatch on the receiver's exprType, not on an identifier name.
+    // (Sibling instance handlers — Decimal/Guid/Shared/Weak above — are likewise
+    // before the guard. The static-call handlers below DO need `id` for the
+    // type-name receiver, which is why the guard stays where it is.)
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isCTS = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    builtinTypeName(recvTy) == "CancellationTokenSource";
+                if (isCTS) {
+                    llvm::Value* cts = lowerExpr(*ma2->target);
+                    if (!cts) return nullptr;
+                    const auto& mname = ma2->member;
+                    // §6.1: Token property — returns the CancellationToken handle.
+                    if (mname == "Token" && call.args.empty()) {
+                        auto* fn = declareC("bz_cts_token", ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {cts}, "cts.token");
+                    }
+                    // §6.1: IsCancellationRequested property (convenience mirror).
+                    if (mname == "IsCancellationRequested" && call.args.empty()) {
+                        auto* fn = declareC("bz_cts_is_cancelled", i32(), {ptrTy()});
+                        llvm::Value* flag = builder_.CreateCall(fn, {cts}, "cts.iscancelled");
+                        return builder_.CreateICmpNE(flag, builder_.getInt32(0), "cts.icr");
+                    }
+                    // §6.1: Cancel() — sets the cancellation flag.
+                    if (mname == "Cancel" && call.args.empty()) {
+                        auto* fn = declareC("bz_cts_cancel",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {cts});
+                        return nullptr;  // unit
+                    }
+                    // §6.1: CancelAfter / WithCancelAfter — deferred (needs timer).
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §6.1 / §30.8: CancellationToken instance methods and properties.
+    // The receiver's exprType name-part is "CancellationToken".
+    // CancellationToken.None is handled in tryLowerStaticCall (member of type name).
+    // #1025: also before the `if (!id)` guard — `source.Token.ThrowIfCancellation
+    // Requested()` chains a MemberAccessExpr receiver and must reach this handler.
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isCT = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    builtinTypeName(recvTy) == "CancellationToken";
+                if (isCT) {
+                    llvm::Value* tok = lowerExpr(*ma2->target);
+                    const auto& mname = ma2->member;
+                    // §6.1: IsCancellationRequested property.
+                    if (mname == "IsCancellationRequested" && call.args.empty()) {
+                        if (!tok) return builder_.getFalse();
+                        auto* fn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
+                        llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.iscancelled");
+                        return builder_.CreateICmpNE(flag, builder_.getInt32(0), "ct.icr");
+                    }
+                    // §6.1: ThrowIfCancellationRequested() — if cancelled, construct
+                    // and throw an OperationCanceledException.  We call the runtime
+                    // predicate (bz_ctoken_throw_if_cancelled → i32) and then emit a
+                    // conditional block that, on true, executes the exception throw.
+                    // This mirrors the index-out-of-range guard (tryLowerIndexExpr).
+                    if (mname == "ThrowIfCancellationRequested" && call.args.empty()) {
+                        if (!tok) return nullptr;  // None — never cancels, no-op
+                        auto* fn = declareC("bz_ctoken_throw_if_cancelled",
+                                            i32(), {ptrTy()});
+                        llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.tfcr");
+                        llvm::Value* isCancelled =
+                            builder_.CreateICmpNE(flag, builder_.getInt32(0));
+                        auto* throwBB  = llvm::BasicBlock::Create(llvm_, "ct.throw",
+                                                                   currentFn_);
+                        auto* resumeBB = llvm::BasicBlock::Create(llvm_, "ct.resume",
+                                                                   currentFn_);
+                        builder_.CreateCondBr(isCancelled, throwBB, resumeBB);
+
+                        // throwBB: construct OperationCanceledException and throw.
+                        // emitThrowValue terminates the block (branches to unwindBB),
+                        // so no explicit terminator is needed for throwBB afterward.
+                        builder_.SetInsertPoint(throwBB);
+                        {
+                            auto vit = builtinVtable_.find("OperationCanceledException");
+                            if (vit != builtinVtable_.end()) {
+                                llvm::Value* obj = builder_.CreateCall(
+                                    callocFn(),
+                                    {builder_.getInt64(1), builder_.getInt64(16)},
+                                    "oce.obj");
+                                builder_.CreateStore(vit->second, obj);
+                                emitThrowValue(obj);
+                                // emitThrowValue ends with CreateBr(unwindBB)
+                                // — throwBB is now terminated.
+                            } else {
+                                // Fallback: branch to resumeBB (no vtable available).
+                                builder_.CreateBr(resumeBB);
+                            }
+                        }
+
+                        builder_.SetInsertPoint(resumeBB);
+                        return nullptr;  // unit
+                    }
+                    // §6.1: Register(cb) — deferred.  Needs closure-list infra
+                    // (a per-source list of registered lambdas fired on Cancel()).
+                    // Report: not implemented.
+                }
+            }
+        }
+    }
+
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     if (!id) return nullptr;
     const auto cls = id->name;
@@ -6468,114 +6586,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // §6.1 / §30.8: CancellationTokenSource instance methods and properties.
-    // The receiver's exprType name-part is "CancellationTokenSource".
-    // ---------------------------------------------------------------------------
-    {
-        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
-            if (ma2->target) {
-                auto* recvTy = ctx_.exprType(*ma2->target);
-                bool isCTS = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
-                    builtinTypeName(recvTy) == "CancellationTokenSource";
-                if (isCTS) {
-                    llvm::Value* cts = lowerExpr(*ma2->target);
-                    if (!cts) return nullptr;
-                    const auto& mname = ma2->member;
-                    // §6.1: Token property — returns the CancellationToken handle.
-                    if (mname == "Token" && call.args.empty()) {
-                        auto* fn = declareC("bz_cts_token", ptrTy(), {ptrTy()});
-                        return builder_.CreateCall(fn, {cts}, "cts.token");
-                    }
-                    // §6.1: IsCancellationRequested property (convenience mirror).
-                    if (mname == "IsCancellationRequested" && call.args.empty()) {
-                        auto* fn = declareC("bz_cts_is_cancelled", i32(), {ptrTy()});
-                        llvm::Value* flag = builder_.CreateCall(fn, {cts}, "cts.iscancelled");
-                        return builder_.CreateICmpNE(flag, builder_.getInt32(0), "cts.icr");
-                    }
-                    // §6.1: Cancel() — sets the cancellation flag.
-                    if (mname == "Cancel" && call.args.empty()) {
-                        auto* fn = declareC("bz_cts_cancel",
-                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                        builder_.CreateCall(fn, {cts});
-                        return nullptr;  // unit
-                    }
-                    // §6.1: CancelAfter / WithCancelAfter — deferred (needs timer).
-                }
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // §6.1 / §30.8: CancellationToken instance methods and properties.
-    // The receiver's exprType name-part is "CancellationToken".
-    // CancellationToken.None is handled in tryLowerStaticCall (member of type name).
-    // ---------------------------------------------------------------------------
-    {
-        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
-            if (ma2->target) {
-                auto* recvTy = ctx_.exprType(*ma2->target);
-                bool isCT = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
-                    builtinTypeName(recvTy) == "CancellationToken";
-                if (isCT) {
-                    llvm::Value* tok = lowerExpr(*ma2->target);
-                    const auto& mname = ma2->member;
-                    // §6.1: IsCancellationRequested property.
-                    if (mname == "IsCancellationRequested" && call.args.empty()) {
-                        if (!tok) return builder_.getFalse();
-                        auto* fn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
-                        llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.iscancelled");
-                        return builder_.CreateICmpNE(flag, builder_.getInt32(0), "ct.icr");
-                    }
-                    // §6.1: ThrowIfCancellationRequested() — if cancelled, construct
-                    // and throw an OperationCanceledException.  We call the runtime
-                    // predicate (bz_ctoken_throw_if_cancelled → i32) and then emit a
-                    // conditional block that, on true, executes the exception throw.
-                    // This mirrors the index-out-of-range guard (tryLowerIndexExpr).
-                    if (mname == "ThrowIfCancellationRequested" && call.args.empty()) {
-                        if (!tok) return nullptr;  // None — never cancels, no-op
-                        auto* fn = declareC("bz_ctoken_throw_if_cancelled",
-                                            i32(), {ptrTy()});
-                        llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.tfcr");
-                        llvm::Value* isCancelled =
-                            builder_.CreateICmpNE(flag, builder_.getInt32(0));
-                        auto* throwBB  = llvm::BasicBlock::Create(llvm_, "ct.throw",
-                                                                   currentFn_);
-                        auto* resumeBB = llvm::BasicBlock::Create(llvm_, "ct.resume",
-                                                                   currentFn_);
-                        builder_.CreateCondBr(isCancelled, throwBB, resumeBB);
-
-                        // throwBB: construct OperationCanceledException and throw.
-                        // emitThrowValue terminates the block (branches to unwindBB),
-                        // so no explicit terminator is needed for throwBB afterward.
-                        builder_.SetInsertPoint(throwBB);
-                        {
-                            auto vit = builtinVtable_.find("OperationCanceledException");
-                            if (vit != builtinVtable_.end()) {
-                                llvm::Value* obj = builder_.CreateCall(
-                                    callocFn(),
-                                    {builder_.getInt64(1), builder_.getInt64(16)},
-                                    "oce.obj");
-                                builder_.CreateStore(vit->second, obj);
-                                emitThrowValue(obj);
-                                // emitThrowValue ends with CreateBr(unwindBB)
-                                // — throwBB is now terminated.
-                            } else {
-                                // Fallback: branch to resumeBB (no vtable available).
-                                builder_.CreateBr(resumeBB);
-                            }
-                        }
-
-                        builder_.SetInsertPoint(resumeBB);
-                        return nullptr;  // unit
-                    }
-                    // §6.1: Register(cb) — deferred.  Needs closure-list infra
-                    // (a per-source list of registered lambdas fired on Cancel()).
-                    // Report: not implemented.
-                }
-            }
-        }
-    }
+    // #1025: the CancellationTokenSource / CancellationToken instance-method and
+    // property handlers were MOVED to before the `if (!id) return nullptr` guard
+    // above — they accept ANY receiver expression (a chained `cts.Token` is a
+    // MemberAccessExpr, not an IdentifierExpr), and the guard was making the
+    // chained form (`cts.Token.ThrowIfCancellationRequested()`) silently no-op.
 
     // ---------------------------------------------------------------------------
     // §2.5: DateTime instance methods — receiver is a DateTime (i64 ticks).
