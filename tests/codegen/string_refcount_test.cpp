@@ -627,3 +627,53 @@ BEZEL_TEST(codegen_string_refcount_422, chained_concat_result_reused_clean_no_ua
     // early would reintroduce the FINDING [1] UAF. LSan-clean (no leak, no DF).
     expectValueAndLeakFree(kChainedConcatResultReused, 0);
 }
+
+// #1030 / §18.5 / §4.6 / §28.9: string interpolation must release the FRESH render
+// of each non-string part. `$"{a}"` (a:int) renders via emitPrimitiveToString → a
+// +1 string the concat borrows; before the fix it was never released and leaked
+// (unbounded in a loop). The fix releases pv after the concat iff pv != srcEv (the
+// fresh render), skipping the string-part borrow (pv == srcEv).
+const char* kInterpIntPartReleased_1030 =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var a: int := 3; var b: int := 4; "
+    "    var s: string := $\"{a}+{b}={a + b}\"; "   // "3+4=7"
+    "    return s.Length; "                          // 5
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_string_refcount_1030, interp_nonstring_parts_released) {
+    expectValueAndLeakFree(kInterpIntPartReleased_1030, 5);
+}
+
+// #1030 (loop): interpolation rendering a non-string part inside a loop must not
+// leak per-iteration (the unbounded case). 5 iterations of "item {i}" (6 chars).
+const char* kInterpLoopReleased_1030 =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var total: int := 0; var i: int := 0; "
+    "    while i < 5 do "
+    "      var s: string := $\"item {i}\"; "
+    "      total := total + s.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    return total; "                             // 6*5 = 30
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_string_refcount_1030, interp_nonstring_in_loop_no_unbounded_leak) {
+    expectValueAndLeakFree(kInterpLoopReleased_1030, 30);
+}
+
+// #1030 regression: a STRING part is a borrow (pv == srcEv) and must NOT be
+// released — `$"hi {name}"` stays LSan-clean (no double-free / use-after-free of
+// the borrowed local). "hi world" = 8 chars.
+const char* kInterpStringPartBorrow_1030 =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var name: string := \"world\"; "
+    "    var s: string := $\"hi {name}\"; "
+    "    return s.Length; "                          // 8
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_string_refcount_1030, interp_string_part_borrow_not_released) {
+    expectValueAndLeakFree(kInterpStringPartBorrow_1030, 8);
+}

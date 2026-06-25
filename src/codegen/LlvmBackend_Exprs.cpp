@@ -104,13 +104,25 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // follows normal placement/escape rules). The part value `pv` is NOT
         // released here: it may be a borrow (a string-typed part is a shared
         // reference to a named local/field per §28.9).
-        auto appendPart = [&](llvm::Value* pv) {
+        // #1030 / §4.6 / §28.9: `srcEv` is the lowered part expression (null for a
+        // literal part). A non-string part is rendered via emitPrimitiveToString /
+        // emitValueToString / ToString, producing a FRESH +1 string distinct from
+        // `srcEv`; the concat borrows it (copies the bytes), so it must be released
+        // after — else `$"{n}"` (and every non-string interpolation) leaks the
+        // rendered intermediate. A STRING-typed part is a BORROW (the renderer
+        // returns the lowered value unchanged, `pv == srcEv` — a shared reference to
+        // a named local/field, §28.9) and must NOT be released. A literal / "null"
+        // sentinel has a sentinel rc, so the release is a harmless no-op. The rule
+        // `pv != srcEv` distinguishes the fresh-render case from the borrow case.
+        auto appendPart = [&](llvm::Value* pv, llvm::Value* srcEv) {
             llvm::Value* prev = acc;
             acc = emitStringConcat(acc, pv);
             emitStringRelease(prev);
+            if (pv != srcEv) emitStringRelease(pv);
         };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
+            llvm::Value* ev = nullptr;  // #1030: lowered part expr (borrow check)
             if (!part.literal.empty()) {
                 // Literal part: process escape sequences (e.g. \n → newline,
                 // \t → tab) that were stored as raw chars by splitInterpolation.
@@ -152,7 +164,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             } else if (part.expr) {
                 // Expression part: lower the expression, then convert to
                 // string. If a format spec is present (§18.5), apply it.
-                llvm::Value* ev = lowerExpr(*part.expr);
+                ev = lowerExpr(*part.expr);
                 if (!ev) continue;
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
@@ -190,12 +202,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         auto* phi = builder_.CreatePHI(ptrTy(), 2);
                         phi->addIncoming(vStr, valEnd);
                         phi->addIncoming(nStr, nullEnd);
-                        appendPart(phi);
+                        appendPart(phi, ev);
                         continue;
                     }
                     pv = emitWithFormatSpec(ev, part.formatSpec, frt);
                     if (pv) {
-                        appendPart(pv);
+                        appendPart(pv, ev);
                         continue;
                     }
                 }
@@ -365,7 +377,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                 }
             }
-            if (pv) appendPart(pv);
+            if (pv) appendPart(pv, ev);
         }
         return acc;
     }
