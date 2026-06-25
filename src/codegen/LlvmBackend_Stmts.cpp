@@ -52,9 +52,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // returns null for task types — so this is a no-op; called for safety).
             registerUnwindOwnedLocal(ld);
         }
-        // §28.3 (line 4910): a plain `var` owned local is auto-disposed only on
-        // the exception-unwind path (an `unwindOnly` Disposal); normal exit
-        // requires it to reach a discharge point (sema-enforced).
+        // §28.3 v0.150 (#1008 Part B): a plain `var` owned local the ownership
+        // pass flagged for affine auto-drop (Owned at a normal-exit scope end,
+        // never discharged on any path) is disposed at scope end on BOTH the
+        // normal and unwind edges — the same scope-end disposal a `using var`
+        // gets (registerUsingDisposal handles every kind: class, OwnedArray /
+        // OwnedDictionary collections, etc.). The flag is only set for a never-
+        // moved owner, so the slot is always live at scope end and the disposal
+        // is exactly-once. registerUnwindOwnedLocal (the unwind-only path) does
+        // NOT cover collections, hence routing the flagged local through the
+        // full using-disposal dispatcher.
+        else if (ld->autoDropAtScopeEnd) registerUsingDisposal(ld);
+        // §28.3: a plain `var` owned local NOT flagged for auto-drop (it is
+        // discharged on some path) is auto-disposed only on the exception-
+        // unwind path (an `unwindOnly` Disposal); its normal-exit discharge is
+        // sema-enforced.
         else registerUnwindOwnedLocal(ld);
         return false;
     }

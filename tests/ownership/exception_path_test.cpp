@@ -32,10 +32,13 @@ BEZEL_TEST(own_exc, body_ending_in_throw_skips_undischarged_check) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// §28.3 v0.150 (#1008 Part B): a body that ends normally with an undischarged
+// plain-`var` owned local auto-drops it at scope end (must-use warning), no error.
 BEZEL_TEST(own_exc, body_ending_normally_still_diagnoses) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T();"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_exc, throw_in_middle_auto_disposes_x_on_only_reachable_path) {

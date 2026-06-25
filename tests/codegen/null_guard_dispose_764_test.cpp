@@ -107,16 +107,21 @@ BEZEL_TEST(null_guard_dispose_764, guard_when_null_at_runtime) {
         "end Main; end C;"), 0);
 }
 
-// §28.3 SOUNDNESS: a null-guard whose then-branch never disposes still leaks
-// (x may be non-null and undisposed) — the relaxation alone discharges nothing.
-BEZEL_TEST(null_guard_dispose_764, null_guard_without_dispose_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §28.3 v0.150 (#1008 Part B): a null-guard whose then-branch never disposes no
+// longer leaks — the undischarged plain-`var` `x` AUTO-DROPS at scope end
+// (must-use warning), disposing the owned (non-null) value exactly once. The
+// owned local is placed in an inner `do` block so the auto-drop runs before
+// `Widget._n` is read (Widget._n becomes 1; null-guarded disposal is exactly-once).
+BEZEL_TEST(null_guard_dispose_764, null_guard_without_dispose_auto_dropped) {
+    BEZEL_EXPECT_EQ(compileAndRun(
         std::string(widget) +
         "class C public static method Main(): int "
-        "  var x := Widget.MaybeNew(true); "
-        "  if x <> null then Widget._n := Widget._n + 0; end; "  // no dispose
-        "  return Widget._n; "
-        "end Main; end C;"));
+        "  do "
+        "    var x := Widget.MaybeNew(true); "
+        "    if x <> null then Widget._n := Widget._n + 0; end; "  // no dispose
+        "  end; "                                                  // x auto-drops
+        "  return Widget._n; "                                     // 1
+        "end Main; end C;"), 1);
 }
 
 // §28.3 SOUNDNESS: a null branch that re-acquires ownership leaves x owned after

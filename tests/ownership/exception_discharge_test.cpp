@@ -114,23 +114,27 @@ BEZEL_TEST(own_exc_disch, throwable_call_mid_try_then_dispose_no_leak_28_3) {
 // ---- §28.6: owned in a try, undischarged on the NORMAL exit → leak -------
 
 BEZEL_TEST(own_exc_disch, owned_in_try_undischarged_normal_path_leaks_28_6) {
-    // `x` is acquired in the try body and the body can exit normally (after
-    // `Risky()`) without discharging `x`. §28.3's exception-path discharge
-    // covers only the throw edge; the normal-exit edge still requires an
-    // explicit discharge, which is missing → leak.
+    // §28.3 v0.150 (#1008 Part B): `x` is acquired in the try body and exits
+    // normally undischarged. The throw edge already auto-disposed it; v0.150
+    // applies the SAME implicit disposal to the normal-exit edge (auto-drop),
+    // with the must-use warning — no leak, no error (verified ASan-clean on both
+    // the normal and exception paths).
     auto r = parseAndCheckOwnership(wrap(
         "try var x := new T(); this.Risky(); "
         "catch var e: Error => this.Done(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_exc_disch, owned_in_try_finally_undischarged_normal_leaks_28_6) {
-    // try…finally form (no catch): same as above — the finally runs on both
-    // paths, but it does not discharge `x`, and the normal-exit path leaks.
+    // §28.3 v0.150: try…finally form — `x` auto-drops at the try-body scope end
+    // on the normal-exit edge (after the finally), with the must-use warning;
+    // no error. The auto-drop composes with the explicit `finally`.
     auto r = parseAndCheckOwnership(wrap(
         "try var x := new T(); this.Risky(); "
         "finally this.Done(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 // ---- §28.3 scoping: a catch re-acquires; discharge happens after --------
@@ -151,15 +155,14 @@ BEZEL_TEST(own_exc_disch, catch_reowns_then_discharged_after_no_leak_28_3) {
 //      when an in-method catch handles the exception.
 
 BEZEL_TEST(own_exc_disch, enclosing_owned_caught_undischarged_leaks_28_6) {
-    // `x` is declared in the method scope, BEFORE the try. When the try's
-    // catch handles the exception, the exception does not propagate out of
-    // the method, so `x`'s scope does not unwind and `x` is NOT auto-
-    // disposed. It is never discharged → leak. (Contrast with a try-body
-    // local, which the unwind does dispose.)
+    // §28.3 v0.150: `x` is declared in the method scope BEFORE the try. The catch
+    // handles the exception, so the method exits NORMALLY — `x` auto-drops at
+    // method-scope end on the normal-exit edge (must-use warning), no error.
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); "
         "try this.Risky(); catch var e: Error => this.Done(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_exc_disch, enclosing_owned_caught_discharged_after_no_leak_28_3) {
@@ -223,12 +226,13 @@ BEZEL_TEST(own_exc_disch, loop_in_try_dispose_each_iter_no_leak_28_3) {
 }
 
 BEZEL_TEST(own_exc_disch, loop_in_try_undischarged_each_iter_leaks_28_6) {
-    // Same loop but the owned local is never discharged on the per-iteration
-    // normal-exit edge → leak. (The exception edge auto-disposes, but the
-    // normal fall-through to the next iteration does not.)
+    // §28.3 v0.150: the loop-body owned local auto-drops at the end of each
+    // iteration's scope (must-use warning), on both the per-iteration normal
+    // edge and the exception edge — no error, no leak (ASan-verified per-iter).
     auto r = parseAndCheckOwnership(wrap(
         "try while this.Cond() do "
         "  var x := new T(); this.Risky(); "
         "end; catch var e: Error => this.Done(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }

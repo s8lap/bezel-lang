@@ -37,7 +37,9 @@ std::string wrap(const std::string& body) {
 BEZEL_TEST(own_cfg, do_end_owned_undischarged_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
         "do var x := new Stream(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150 (#1008 Part B): `x` auto-drops at the do-block scope end.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_cfg, do_end_owned_discharged_clean) {
@@ -94,5 +96,7 @@ BEZEL_TEST(own_cfg, if_else_owned_both_then_dispose_clean) {
 BEZEL_TEST(own_cfg, for_body_owned_undischarged_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
         "for var it in items do var x := new Stream(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150: a fresh owned local in a for-body auto-drops each iteration.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }

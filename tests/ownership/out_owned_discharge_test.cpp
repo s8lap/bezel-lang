@@ -100,7 +100,11 @@ BEZEL_TEST(out_owned, unmoved_owned_local_still_diagnosed) {
         "  var x := new R(); "
         "  o := new R(); "
         "end Make;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150 (#1008 Part B): the unmoved plain-`var` local `x` auto-drops
+    // at scope end (must-use warning); the `out owned` param `o` is written and
+    // transferred to the caller. No error.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 // §28.3 double-ownership: moving an owned local into the `out owned`

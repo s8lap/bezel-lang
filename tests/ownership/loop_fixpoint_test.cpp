@@ -83,7 +83,10 @@ BEZEL_TEST(own_loopfix, preassigned_then_loop_reassign_read_clean_28_3) {
 BEZEL_TEST(own_loopfix, owned_acquired_in_loop_undischarged_diagnosed_28_6) {
     auto r = parseAndCheckOwnership(wrap(
         "while cond do var x := new Stream(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150 (#1008 Part B): a fresh owned local acquired each iteration
+    // auto-drops at the loop-body scope end each iteration (must-use warning).
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 // §28.3: acquiring and disposing the owned value on every iteration is
@@ -116,7 +119,10 @@ BEZEL_TEST(own_loopfix, owned_moved_out_each_iter_clean_28_3) {
 BEZEL_TEST(own_loopfix, preloop_owned_untouched_leaks_28_6) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); while cond do end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150: a pre-loop owned local untouched by the loop auto-drops at
+    // method-scope end (must-use warning), no error.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 // --- Nested loops -------------------------------------------------------
@@ -139,7 +145,10 @@ BEZEL_TEST(own_loopfix, nested_loops_inner_undischarged_diagnosed_28_6) {
         "while cond do "
         "  while cond do var x := new Stream(); end; "
         "end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150: the inner-loop fresh owned local auto-drops at the inner
+    // loop-body scope end each iteration (must-use warning), no error.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 // §28.3: a local assigned only in the inner loop body is uninitialised on

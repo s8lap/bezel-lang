@@ -62,16 +62,17 @@ const char* rclass =
     "  destructor R.n := R.n + 1; end destructor; end R; ";
 }  // namespace
 
-// #724 F1: `var s := move x` with `s` never discharged is now an owned local —
-// rejected as an undischarged owned value (§28.3), not silently leaked.
-BEZEL_TEST(move_result_owned_724, undischarged_move_result_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// #724 F1 / §28.3 v0.150 (#1008 Part B): `var s := move x` makes `s` an owned
+// local. Left undischarged it now AUTO-DROPS at scope end (must-use warning) —
+// the moved value is disposed exactly once (R.n becomes 1), not leaked and not
+// double-freed. (Pre-v0.150 this was a hard discharge error.)
+BEZEL_TEST(move_result_owned_724, undischarged_move_result_auto_dropped) {
+    BEZEL_EXPECT_EQ(compileAndRun(
         std::string("module M; ") + rclass +
         "class C public static method Main(): int "
-        "  var x := new R(); "
-        "  var s := move x; "          // s is owned, never discharged → error
-        "  return 0; "
-        "end Main; end C;"));
+        "  do var x := new R(); var s := move x; end; "  // s auto-drops here
+        "  return R.n; "                                  // 1 — disposed once
+        "end Main; end C;"), 1);
 }
 
 // #724 F1: the move result is owned, so discharging it by RETURN is accepted.

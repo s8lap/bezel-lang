@@ -46,6 +46,13 @@ bool bodyContainsYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     }
     return false;
 }
+
+// §28.3 v0.150 (#1008 Part B): forward declaration — collect every local that
+// is reassigned or `out`-overwritten anywhere in the body (excluded from affine
+// auto-drop). Definition lives below with the other body walkers.
+void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                       sema::SemaContext& ctx,
+                       std::unordered_set<const sema::Symbol*>& out);
 }  // namespace
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
@@ -117,6 +124,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // ultimately at the function exit — sees it Disposed, not Owned. Hence
     // the check here fires only for locals that survive Owned to a
     // normal-exit edge.
+    //
+    // §28.3 v0.150 (#1008 Part B): the set of locals reassigned or out-
+    // overwritten anywhere in the body — excluded from affine auto-drop below
+    // (auto-drop disposes only the final slot value; an overwritten local would
+    // leak its earlier value).
+    std::unordered_set<const sema::Symbol*> reassignedLocals;
+    scanReassignStmts(body, ctx_, reassignedLocals);
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
             // §29.8 (#945): a SYNC iterator method's `owned` parameter that the
@@ -133,6 +147,52 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (ps->modifier == "owned" &&
                         everDischarged_.count(sym) == 0) {
                         ps->iteratorAutoDispose = true;
+                        continue;
+                    }
+                }
+            }
+            // §28.3 v0.150 (#1008 Part B): affine auto-drop. A plain `var` owned
+            // LOCAL that is never discharged on ANY path (everDischarged == 0)
+            // is, on every path reaching this exit, a never-moved genuine owner:
+            // its slot holds a live value and is never transferred out. Disposing
+            // it implicitly at scope end is therefore exactly-once-safe. Flag the
+            // LocalDecl so codegen routes it through registerUsingDisposal (the
+            // same scope-end disposal a `using var` gets) and emit a *warning*,
+            // not an error — the must-use lint. A local discharged on SOME path
+            // (everDischarged > 0 — a conditional move/dispose) is NOT auto-
+            // dropped: plain `var`s are not nulled on move (to keep borrow-after-
+            // move legal, e.g. `new T(move n, n)`), so the join retains Owned and
+            // auto-disposing would double-free the moved/disposed path. That case
+            // keeps the equalize-the-branches error below (§5.6 lattice rule).
+            // Owned PARAMETERS dropped on normal exit are not yet auto-dropped
+            // here (tracked separately); they keep the error. // per §28.3, §5.6
+            //
+            // GATED to synchronous, non-iterator bodies. In an `async` method an
+            // owned local that crosses an await is a suspend-local disposed by
+            // the state machine on the §30.5 completion edges; in an iterator
+            // (`sawYield_`) an owned local is captured into the iterator frame
+            // and disposed at iterator-Dispose. Routing either through the
+            // scope-end using-disposal would double-dispose. Those bodies keep
+            // the discharge error (auto-drop for them is a separate piece). The
+            // synchronous-body auto-drop below uses the same everDischarged == 0
+            // never-moved invariant as the sync-iterator-param case above.
+            if (!isAsync_ && !sawYield_ && !isDestructor_ &&
+                everDischarged_.count(sym) == 0 &&
+                reassignedLocals.count(sym) == 0) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                    if (auto* ld =
+                            dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                        const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned value in `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed at the end of its scope "
+                            "(§28.3 auto-drop); declare it `using var` to make "
+                            "the scope-bound disposal explicit, or `move` / "
+                            "`return` / `.Dispose()` / `_ := …` to discharge it");
                         continue;
                     }
                 }
@@ -381,6 +441,129 @@ void collectLocalDecls(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     for (const auto& s : body) {
         if (s) collectLocalDeclsStmt(*s, out);
     }
+}
+
+// §28.3 v0.150 (#1008 Part B, affine auto-drop): collect every LocalSymbol that
+// can receive an owned value MORE THAN ONCE over its lifetime — an assignment
+// target (`x := …`) or an `out`-argument (`f(out x)` / `out owned`). Affine
+// auto-drop disposes only a local's FINAL slot value at scope end; a local that
+// is reassigned or out-overwritten while owned would leak its earlier value(s),
+// which auto-drop cannot see. Such locals are excluded from auto-drop and keep
+// the conservative §28.3 discharge error. A single-assignment owning local
+// (`var x := new T();`, never written again) is not collected and is eligible.
+void scanReassignExpr(const ast::Expr* e, sema::SemaContext& ctx,
+                      std::unordered_set<const sema::Symbol*>& out);
+
+void scanReassignArgs(const std::vector<ast::CallArgument>& args,
+                      sema::SemaContext& ctx,
+                      std::unordered_set<const sema::Symbol*>& out) {
+    for (const auto& a : args) {
+        if (a.value &&
+            a.modifier.find("out") != std::string_view::npos) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                if (sema::Symbol* s = ctx.exprSymbol(*id)) out.insert(s);
+        }
+        if (a.value) scanReassignExpr(a.value.get(), ctx, out);
+    }
+}
+
+void scanReassignExpr(const ast::Expr* e, sema::SemaContext& ctx,
+                      std::unordered_set<const sema::Symbol*>& out) {
+    if (!e) return;
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+        scanReassignExpr(c->callee.get(), ctx, out);
+        scanReassignArgs(c->args, ctx, out);
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        scanReassignExpr(nc->callee.get(), ctx, out);
+        scanReassignArgs(nc->args, ctx, out);
+    } else if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+        scanReassignArgs(n->args, ctx, out);
+    } else if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        scanReassignExpr(m->target.get(), ctx, out);
+    } else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        scanReassignExpr(ncm->target.get(), ctx, out);
+    } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        scanReassignExpr(ix->target.get(), ctx, out);
+        scanReassignArgs(ix->indices, ctx, out);
+    } else if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        scanReassignExpr(b->left.get(), ctx, out);
+        scanReassignExpr(b->right.get(), ctx, out);
+    } else if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        scanReassignExpr(u->operand.get(), ctx, out);
+    } else if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        scanReassignExpr(p->operand.get(), ctx, out);
+    } else if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        scanReassignExpr(t->operand.get(), ctx, out);
+    } else if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        scanReassignExpr(co->thenValue.get(), ctx, out);
+        scanReassignExpr(co->condition.get(), ctx, out);
+        scanReassignExpr(co->elseValue.get(), ctx, out);
+    } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        scanReassignExpr(th->operand.get(), ctx, out);
+    } else if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+        scanReassignExpr(r->lo.get(), ctx, out);
+        scanReassignExpr(r->hi.get(), ctx, out);
+        scanReassignExpr(r->step.get(), ctx, out);
+    } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& el : cl->elements) scanReassignExpr(el.get(), ctx, out);
+        for (const auto& k : cl->keys) scanReassignExpr(k.get(), ctx, out);
+    }
+    // InterpolatedString / WithExpr / LambdaExpr: an `out`-arg essentially never
+    // appears there, and a lambda body carries its own ownership scope.
+}
+
+void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                       sema::SemaContext& ctx,
+                       std::unordered_set<const sema::Symbol*>& out);
+
+void scanReassignStmt(const ast::Stmt& s, sema::SemaContext& ctx,
+                      std::unordered_set<const sema::Symbol*>& out) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+            if (sema::Symbol* sym = ctx.exprSymbol(*id)) out.insert(sym);
+        scanReassignExpr(as->target.get(), ctx, out);
+        scanReassignExpr(as->value.get(), ctx, out);
+    } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        scanReassignExpr(ld->initializer.get(), ctx, out);
+    } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        scanReassignExpr(es->expr.get(), ctx, out);
+    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        scanReassignExpr(rs->value.get(), ctx, out);
+    } else if (auto* ths = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        scanReassignExpr(ths->value.get(), ctx, out);
+    } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        scanReassignExpr(ds->value.get(), ctx, out);
+    } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        scanReassignExpr(ifs->ifBranch.condition.get(), ctx, out);
+        scanReassignStmts(ifs->ifBranch.body, ctx, out);
+        for (const auto& el : ifs->elifBranches) {
+            scanReassignExpr(el.condition.get(), ctx, out);
+            scanReassignStmts(el.body, ctx, out);
+        }
+        scanReassignStmts(ifs->elseBody, ctx, out);
+    } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        scanReassignExpr(ws->condition.get(), ctx, out);
+        scanReassignStmts(ws->body, ctx, out);
+    } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        scanReassignExpr(fs->iterable.get(), ctx, out);
+        scanReassignExpr(fs->withExpr.get(), ctx, out);
+        scanReassignStmts(fs->body, ctx, out);
+    } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        scanReassignStmts(dob->body, ctx, out);
+    } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        scanReassignStmts(ts->body, ctx, out);
+        for (const auto& arm : ts->catches)
+            if (arm.body) scanReassignStmt(*arm.body, ctx, out);
+        scanReassignStmts(ts->finallyBody, ctx, out);
+    }
+}
+
+void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                       sema::SemaContext& ctx,
+                       std::unordered_set<const sema::Symbol*>& out) {
+    for (const auto& s : body) if (s) scanReassignStmt(*s, ctx, out);
 }
 
 // §28.3 "Exception-path discharge": when control transfers along an

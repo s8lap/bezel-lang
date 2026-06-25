@@ -126,6 +126,14 @@ struct Stmt : Node {};
 struct LocalDecl : Stmt {
     bool isUsing = false;       // `using var` (sync) OR `await using var`
     bool isAwaitUsing = false;  // `await using var` form (implies isUsing)
+    // §28.3 v0.150 (#1008 Part B, affine auto-drop): set by the ownership pass
+    // on a plain `var` owned local that reaches a normal-exit scope end still
+    // owned and is never discharged on ANY path (so it is a never-moved genuine
+    // owner — safe to dispose unconditionally). Codegen routes it through
+    // registerUsingDisposal (the same scope-end disposal a `using var` gets)
+    // instead of the unwind-only path. A conditionally-discharged local is NOT
+    // flagged (auto-disposing its moved/disposed path would double-free).
+    bool autoDropAtScopeEnd = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`

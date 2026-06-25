@@ -28,7 +28,10 @@ BEZEL_TEST(own_return, owned_return_into_plain_var_undischarged_diagnoses) {
         "    var x := this.Make(); "
         "  end M; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150 (#1008 Part B): the owned-returned value bound to a plain
+    // `var` and left undischarged auto-drops at scope end (must-use warning).
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_return, owned_return_into_using_var_clean) {
@@ -64,7 +67,10 @@ BEZEL_TEST(own_return, owned_return_dispatched_on_param) {
         "    var x := src.Read(); "
         "  end M; "
         "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §28.3 v0.150: owned-returned value into a plain `var`, undischarged →
+    // auto-drop at scope end (must-use warning), no error.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_return, owned_return_explicit_dispose_clean) {
