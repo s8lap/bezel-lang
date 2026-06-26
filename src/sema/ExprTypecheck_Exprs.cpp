@@ -2733,30 +2733,56 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             PrimitiveType savedNewHint = currentLiteralWideningHint_;
             currentLiteralWideningHint_ = PrimitiveType::None;
             {
-                const ast::Type* paramTy = nullptr;
+                PrimitiveType hintPrim = PrimitiveType::None;
+                auto primOf = [&](const ast::Type* ty) {
+                    if (ty)
+                        if (auto* prt = ctx_.resolvedType(*ty))
+                            if (prt->kind == TypeRef::Kind::Primitive)
+                                hintPrim = prt->primitive;
+                };
                 if (ctorDecl && posn < ctorDecl->params.size() &&
-                    ctorDecl->params[posn].type)
-                    paramTy = ctorDecl->params[posn].type.get();
-                else if (ne->type) {
+                    ctorDecl->params[posn].type) {
+                    primOf(ctorDecl->params[posn].type.get());
+                } else if (ne->type) {
                     if (auto* rt = ctx_.resolvedType(*ne->type))
                         if (rt->kind == TypeRef::Kind::Named && rt->declaration)
                             if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                                     rt->declaration->decl))
                                 if (td->hasPositionalFields &&
                                     posn < td->positionalFields.size() &&
-                                    td->positionalFields[posn].type)
-                                    paramTy =
+                                    td->positionalFields[posn].type) {
+                                    const ast::Type* ft =
                                         td->positionalFields[posn].type.get();
+                                    // #1052: a generic positional-record field
+                                    // whose declared type is a bare type
+                                    // parameter (`Box<T>(V: T)`) — resolve T to
+                                    // the concrete generic argument of THIS
+                                    // instantiation (`Box<uint>` → uint) so the
+                                    // literal widens to it.
+                                    bool subst = false;
+                                    if (ft->name && ft->name->parts.size() == 1 &&
+                                        !td->genericParams.empty()) {
+                                        for (std::size_t k = 0;
+                                             k < td->genericParams.size(); ++k)
+                                            if (td->genericParams[k].name ==
+                                                    ft->name->parts[0]) {
+                                                if (k < rt->genericArgs.size() &&
+                                                    rt->genericArgs[k] &&
+                                                    rt->genericArgs[k]->kind ==
+                                                        TypeRef::Kind::Primitive)
+                                                    hintPrim =
+                                                        rt->genericArgs[k]->primitive;
+                                                subst = true;
+                                                break;
+                                            }
+                                    }
+                                    if (!subst) primOf(ft);
+                                }
                 }
-                if (paramTy) {
-                    if (auto* prt = ctx_.resolvedType(*paramTy)) {
-                        if (prt->kind == TypeRef::Kind::Primitive &&
-                            (prt->primitive == PrimitiveType::Long ||
-                             prt->primitive == PrimitiveType::ULong ||
-                             prt->primitive == PrimitiveType::UInt))
-                            currentLiteralWideningHint_ = prt->primitive;
-                    }
-                }
+                if (hintPrim == PrimitiveType::Long ||
+                    hintPrim == PrimitiveType::ULong ||
+                    hintPrim == PrimitiveType::UInt)
+                    currentLiteralWideningHint_ = hintPrim;
             }
             if (a.value) visitExpr(*a.value);
             currentLiteralWideningHint_ = savedNewHint;

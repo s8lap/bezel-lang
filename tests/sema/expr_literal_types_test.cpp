@@ -225,3 +225,24 @@ BEZEL_TEST(sema_expr_lit, literal_too_large_for_int_param_still_rejected_1051) {
         "module M; class C public static method Id(x: int): int return x; end Id; "
         "public static method Main(): int return Id(5000000000); end Main; end C;"));
 }
+
+// #1052 / §5.1: a generic positional-record field declared as a bare type
+// parameter (`Box<T>(V: T)`) target-types a large integer literal to the
+// CONCRETE generic argument of the instantiation — `new Box<uint>(4000000000)`
+// widens to uint rather than rejecting. A `Box<int>` instantiation still
+// rejects a literal > int.MaxValue.
+BEZEL_TEST(sema_expr_lit, literal_widens_to_generic_record_uint_arg_1052) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; record Box<T>(V: T); class C public static method Main(): int "
+        "var b := new Box<uint>(4000000000); return (1 if (b.V > 1000) else 0); end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_widens_to_generic_record_long_arg_1052) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; record Box<T>(V: T); class C public static method Main(): int "
+        "var b := new Box<long>(5000000000); return (1 if (b.V > 1000) else 0); end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_too_large_for_generic_int_arg_rejected_1052) {
+    BEZEL_EXPECT_TRUE(semaHasErrors(
+        "module M; record Box<T>(V: T); class C public static method Main(): int "
+        "var b := new Box<int>(5000000000); return int(b.V); end Main; end C;"));
+}
