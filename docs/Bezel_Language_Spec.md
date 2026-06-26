@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.152 — June 2026**
+**Version 0.153 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -975,6 +975,7 @@ A record type is a **borrow-bearing record** — a derived type property ([§3.6
 Reference-typed fields whose types are runtime-managed (`string`, function types, boxed value types) do not make the record borrow-bearing because runtime-managed values have unbounded lifetime by construction; the same is true of inline-array fields whose element type is a runtime-managed reference type. Values of a borrow-bearing record are subject to the borrow lifetime rules of [§28.3](#sec-local-variables-ownership-and-borrows). In particular:
 
 - A borrow-bearing record value may not outlive the source of any borrow it contains. For inline-array-field borrows, this applies element-wise: every slot's source must outlive the record.
+- A borrow-bearing record may not be **constructed from a temporary** bound to one of its borrow-carrying fields. A construction argument that is a temporary — a collection or array literal, or a fresh call result that is not bound to a named location — has a lifetime that ends at the construction expression, so the record would immediately outlive that borrow's source (a dangling borrow). For example, `new Bag([10, 20, 30])` where `record Bag(Items: Array<int>)` borrows the array literal is rejected; bind the source to a named local (`var xs := [10, 20, 30]; var b := new Bag(xs);`) whose scope outlives `b`, and pass that.
 - A borrow-bearing record may not be stored in a static field of any type, *except* when every reference-typed field (and every reference-typed slot of every inline-array field) of the value is `null` (the **null-source** form). A static field of borrow-bearing record type may hold a value whose borrow-carrying components are all null; the type's accessors must handle this state explicitly. This exception exists to allow standard library "sentinel" values like `CancellationToken.None`, whose semantics are defined by the absence of a source rather than by holding one.
 - A borrow-bearing record may not be returned from a method whose return-type rules cannot establish a sufficient lifetime for every borrow the record carries.
 - A borrow-bearing record may not be captured by a closure that escapes its source's scope.
@@ -5085,6 +5086,8 @@ The compiler enforces:
 - A *bare read* of an owned field may be returned through a **non-`owned`** return type as a **borrow** of the field — its source is the receiver, exactly as for `return this` (*Methods returning `this`* below). The caller receives a borrow it may not dispose, may not store in an `owned` location, and may not use past the receiver's lifetime; the field's owner (the receiver's destructor) still disposes it. This is leak-free and double-free-free, and applies uniformly to a class-typed owned field and to an owning-collection field (`owned _items: OwnedArray<T>`).
 - **Transferring** an owned field's value out — `move`-ing it ([§28.8.1](#sec-the-move-expression)), or returning it through an `owned` return type — is the only way to hand the caller ownership, and a `move`d owned field returned through a non-`owned` return is an **error** (the moved value would escape with no owner). A freshly-produced owning value (`return new OwnedArray<T>(...)`) returned through a non-`owned` return is likewise an error unless the return type is `owned`.
 - An owned field's value may not be assigned to a non-owned field of any other class.
+- A **freshly-produced owned value** — a `new` expression, a call returning `owned T`, a `move` expression, or an owned operator result — stored into a non-`owned` (borrow) field is an **error**: the field does not own its referent, so the fresh value would be left with no owner and leak. Declare the field `owned` (the containing object then disposes it, [§28.5](#sec-owned-fields)), or hand the value to a method that takes it `owned`. This is the storing-side counterpart of the non-`owned`-return rule above: a fresh owned value may not escape into any non-owning location.
+- A **property or indexer getter** may not return a freshly-produced owned value. A getter is a borrow-producing position — properties and indexers do not carry `owned` ([§23](#sec-properties-and-indexers); the `owned` modifier applies only to fields), so its return is always a borrow — and a fresh owned value returned through it would escape with no owner and leak. Expose the factory as a **method returning `owned T`** instead, which can hand the caller ownership.
 
 ```bezel
 public method GetTransactions(): OwnedArray<Transaction>
@@ -5101,6 +5104,21 @@ public method LeakTransactions(): OwnedArray<Transaction>
   return move _transactions;  // ERROR: a `move`d field through a non-`owned`
                               //   return escapes with no owner.
 end LeakTransactions;
+```
+
+The same no-escape principle governs storing into a field and returning from a getter:
+
+```bezel
+class Handle
+  private _c: Cell;            // borrow field (no `owned`)
+  public constructor()
+    _c := new Cell();          // ERROR: a fresh owned value stored into a
+  end constructor;             //   non-`owned` field has no owner — declare `owned _c`.
+
+  public property Item: Cell
+    get => new Cell();         // ERROR: a getter may not return a fresh owned
+  end Item;                    //   value — use `method MakeItem(): owned Cell`.
+end Handle;
 ```
 
 Passing an owned field as an argument is permitted; the callee borrows for the duration of the call and may not store the reference in a long-lived location.

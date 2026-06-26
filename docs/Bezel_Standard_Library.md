@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.152 — June 2026**
+**Companion to the Bezel Language Specification, v0.153 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1066,7 +1066,7 @@ The two owning-collection interfaces. They extend the borrowing read-only interf
 
 The mutating methods take `owned` parameters where appropriate: `Add` and `Insert` take ownership of the new element; the indexer setter takes ownership and disposes the previous slot value. Read-side methods (`Contains`, the indexer getter, iteration through the read-only-collection ancestor) produce borrows.
 
-The `where T: class` constraint expresses that owning collections only make sense for class-typed elements. Value types and runtime-managed types (`string`, boxed values, function values) have no disposal obligation; storing them in an "owning" collection would carry no semantic content. The constraint is enforced at instantiation: `OwnedArray<int>`, `OwnedArray<string>`, `OwnedArray<MyRecord>` are all compile errors.
+The `where T: class` constraint expresses that owning collections are primarily meaningful for class-typed elements, which carry a disposal obligation. The constraint admits more than the implementation enforces, and the language spec ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)) narrows it precisely: the owning collection types **reject only the runtime-managed reference element types** — `string` and function values — which are reclaimed automatically and have no disposal obligation, so owning them would be actively wrong. Value-typed elements are **admitted**: `OwnedArray<int>` and `OwnedArray<MyRecord>` compile (the element carries no disposal obligation, so the collection's `Dispose` just frees its backing — degenerate but harmless), while `OwnedArray<string>` and an owning collection of a function type are compile errors at the instantiation site. Code that wants a borrowing collection uses the unprefixed name (`Array<…>`) instead.
 
 <a id="sec-borrowing-and-owning-collections-relate-via-iiterator-interfaces"></a>
 <a id="sec-how-the-borrowing-and-owning-hierarchies-relate"></a>

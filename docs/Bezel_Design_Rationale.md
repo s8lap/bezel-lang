@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.152 — June 2026**
+**Companion to the Bezel Language Specification, v0.153 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7134,6 +7134,30 @@ Language spec: §28.3 (the auto-drop and must-use-warning paragraphs now name `o
 #### Migration
 
 Source-compatible in the safe direction: a method that previously failed to compile because it dropped an `owned` parameter now compiles, the parameter auto-dropping at method end (with the lint). Nothing that compiled under v0.151 stops compiling.
+
+---
+
+### v0.153 changelog (v0.152 → v0.153)
+
+v0.153 closes three ownership-escape gaps surfaced by the implementation sweeps, and corrects one stdlib-doc overstatement. It is a *diagnostic-completeness* revision: it rejects programs that silently leaked or dangled, rather than adding any capability.
+
+#### The gaps
+
+- **Fresh owned value escaping into a non-owning channel (#1020, #926).** §28.6 already made it an error for a freshly-produced owning value to be *returned* through a non-`owned` return type. But the same value stored *into* a non-`owned` (borrow) field, or *returned from a property/indexer getter*, was silently accepted — and leaked, because the destination does not own it and nothing else does. These are the storing-side and getter-side analogues of a rule that already existed for returns.
+- **Borrow-bearing record constructed from a temporary (#1066).** §9.7 already stated that a borrow-bearing record value "may not outlive the source of any borrow it contains." A construction argument that is a temporary — a collection/array literal or an unbound fresh call result — has a lifetime that ends at the construction expression, so the record outlives it the instant it is built. This case was accepted and produced a dangling borrow (a crash or a zero-length read).
+- **Stdlib overstatement (#1023).** The standard-library text claimed `OwnedArray<int>`/`OwnedArray<MyRecord>` were compile errors. The language spec §14.4 and the implementation (#761) admit value-typed elements (degenerate but harmless — no disposal obligation) and reject only the runtime-managed reference types (`string`, function values). The doc, not the rule, was wrong.
+
+#### The resolution
+
+The §28.6 leak-prevention list gains two enforced bullets: a fresh owned value (a `new`, a call returning `owned T`, a `move`, or an owned operator result) stored into a non-`owned` field is an error directing the author to declare the field `owned`; and a property/indexer getter may not return a fresh owned value, directing the author to a method returning `owned T` (getters cannot carry `owned`, so their result is always a borrow). §9.7 gains an explicit construction-from-temporary bullet specializing the existing borrow-lifetime rule, with the `new Bag([…])` example and the bind-to-a-named-local fix. The standard-library passage is rewritten to match §14.4. No spec capability changes; the accepted set narrows to exclude the three leaking/dangling forms.
+
+#### Touched
+
+Language spec: §28.6 (two leak-prevention bullets + the field-store / getter example); §9.7 (the construction-from-temporary bullet). Standard library: the owning-collection element-constraint paragraph. Compiler (implementation, following this revision): the ownership pass rejects fresh-owned-into-non-`owned`-field (#1020) and fresh-owned-from-a-getter (#926), and rejects constructing a borrow-bearing record from a temporary (#1066). Version headers bumped to v0.153.
+
+#### Migration
+
+Source-breaking only for code that already leaked or dangled. A program that stored a `new`/owned-returning value into a borrow field, returned a fresh owned value from a getter, or constructed a borrow-bearing record from a temporary literal now gets a clear diagnostic with the fix (declare the field `owned`; use a method returning `owned T`; bind the source to a named local). Every such program was already a leak or a dangling borrow at runtime; nothing sound stops compiling.
 
 ---
 
