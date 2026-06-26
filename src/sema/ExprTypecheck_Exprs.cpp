@@ -1959,7 +1959,27 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 TypeRef* res = ctx_.makeTypeRef();
                 res->kind = TypeRef::Kind::Primitive;
                 res->primitive = resultPrim;
-                res->nullable = true;   // §7.11: lifted result is T?
+                // §7.11 / §7.4 / §12.7 (#914): the lifted result is `T?` UNLESS
+                // every nullable operand is a simple variable proved non-null by
+                // null-flow narrowing (`nullNarrowed_`) — then both payloads are
+                // definitely present, so the result is the non-nullable `T`. (A
+                // non-nullable operand is trivially present.) Codegen still emits
+                // the lifted {flag,value} value; the non-nullable-target coercion
+                // sites unwrap it (#914 unwrapNarrowedNullable), and its flag is
+                // 1 for a narrowed operand, so the extracted value is correct.
+                auto narrowedPresent = [&](const ast::Expr* e,
+                                           const TypeRef* t) -> bool {
+                    if (!t || t->kind != TypeRef::Kind::Primitive ||
+                        !t->nullable)
+                        return true;   // non-nullable operand: present
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+                        if (Symbol* s = ctx_.exprSymbol(*id))
+                            return nullNarrowed_.count(s) > 0;
+                    return false;
+                };
+                bool bothPresent = narrowedPresent(be.left.get(), lt) &&
+                                   narrowedPresent(be.right.get(), rt);
+                res->nullable = !bothPresent;   // §7.11: lifted result is T?
                 ctx_.setExprType(&be, res);
                 return;
             }

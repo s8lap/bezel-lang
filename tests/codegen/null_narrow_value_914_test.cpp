@@ -122,3 +122,40 @@ BEZEL_TEST(null_narrow_value_914, reassign_null_clears_narrowing) {
         "if n is not null then n := null; "
         "  if n is null then return 7; end; return 1; end; return 0;"), 7);
 }
+
+// §7.11 / §7.4 (#914): ARITHMETIC on a narrowed value-nullable is NOT lifted —
+// both payloads are definitely present, so `n + 1` is `int`, not `int?`, and is
+// assignable to / returnable as a non-nullable target.
+BEZEL_TEST(null_narrow_value_914, arithmetic_narrowed_operand) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: int? := 100; "
+        "if n is not null then var x: int := n + 1; return x; end; return 0;"),
+        101);
+}
+BEZEL_TEST(null_narrow_value_914, arithmetic_two_narrowed_operands) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: int? := 10; var m: int? := 5; "
+        "if n is not null then if m is not null then return n + m; end; end; "
+        "return 0;"), 15);
+}
+BEZEL_TEST(null_narrow_value_914, arithmetic_return_narrowed) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: int? := 21; if n is null then return 0; end; return n * 2;"), 42);
+}
+
+// CONTROL: a narrowed operand combined with a GENUINELY-nullable operand keeps
+// the lifted `T?` result — assigning that to a non-nullable target rejects.
+BEZEL_TEST(null_narrow_value_914, arithmetic_mixed_with_nullable_stays_lifted) {
+    BEZEL_EXPECT_TRUE(rejected(
+        "var n: int? := 100; var k: int? := null; "
+        "if n is not null then var x: int := n + k; return x; end; return 0;"));
+}
+
+// CONTROL: a narrowed arithmetic result is still assignable to a NULLABLE
+// target (stays/​re-wraps as T?), unaffected.
+BEZEL_TEST(null_narrow_value_914, arithmetic_narrowed_to_nullable_target) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: int? := 100; "
+        "if n is not null then var y: int? := n + 1; "
+        "  return (y! if y is not null else 0); end; return 0;"), 101);
+}
