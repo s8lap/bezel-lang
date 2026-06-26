@@ -159,3 +159,48 @@ BEZEL_TEST(null_narrow_value_914, arithmetic_narrowed_to_nullable_target) {
         "if n is not null then var y: int? := n + 1; "
         "  return (y! if y is not null else 0); end; return 0;"), 101);
 }
+
+// §10 / §7.4 (#914): a narrowed `enum?` is a value-type nullable laid out as the
+// same {flag, value} struct — it narrows to the non-nullable enum in assignment
+// and return (Color.Green == 1, Color.Blue == 2).
+BEZEL_TEST(null_narrow_value_914, enum_nullable_narrowed_assign) {
+    auto r = runJit(
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := Color.Green; "
+        "  if c is not null then var v: Color := c; return int(v); end; "
+        "  return 9; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+BEZEL_TEST(null_narrow_value_914, enum_nullable_narrowed_return) {
+    auto r = runJit(
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := Color.Blue; if c is null then return 0; end; "
+        "  return int(c); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 2);
+}
+
+// §9 / §7.4 (#914): a narrowed `record?` narrows to the non-nullable record.
+BEZEL_TEST(null_narrow_value_914, record_nullable_narrowed_assign) {
+    auto r = runJit(
+        "module M; record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p: Pt? := new Pt(7, 3); "
+        "  if p is not null then var q: Pt := p; return q.X; end; "
+        "  return 9; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// CONTROL: a genuinely-nullable enum? → non-nullable enum still rejects.
+BEZEL_TEST(null_narrow_value_914, enum_genuinely_nullable_rejected) {
+    auto r = runJit(
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := null; var v: Color := c; return int(v); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+}

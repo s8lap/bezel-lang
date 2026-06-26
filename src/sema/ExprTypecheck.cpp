@@ -805,14 +805,32 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     // preserved, so null-comparisons / `is` tests on the variable are unaffected
     // — that is the soundness boundary). Codegen unwraps the tagged-optional slot
     // at the non-nullable-target coercion sites (local-init / assignment-store /
-    // return). Restricted to a PRIMITIVE nullable identifier in nullNarrowed_.
-    if (fromExpr && from->nullable && from->kind == TypeRef::Kind::Primitive &&
-        !to->nullable) {
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fromExpr)) {
-            if (Symbol* s = ctx_.exprSymbol(*id))
-                if (nullNarrowed_.count(s))
-                    from = ctx_.primitiveTypeRef(from->primitive,
-                                                 /*nullable=*/false);
+    // return). Restricted to a VALUE-TYPE nullable identifier in nullNarrowed_:
+    // a primitive, an ENUM, or a RECORD — all laid out as the {flag, value}
+    // tagged-optional struct that `unwrapNarrowedNullable` extracts. A class /
+    // interface nullable (a bare pointer, not a struct) is EXCLUDED here — its
+    // narrowing rides the ownership flow, not this coercion.
+    if (fromExpr && from->nullable && !to->nullable) {
+        bool valueNullable =
+            from->kind == TypeRef::Kind::Primitive ||
+            (from->kind == TypeRef::Kind::Named && from->declaration &&
+             (from->declaration->kind == ast::TypeDeclKind::Enum ||
+              from->declaration->kind == ast::TypeDeclKind::Record));
+        if (valueNullable) {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fromExpr)) {
+                if (Symbol* s = ctx_.exprSymbol(*id))
+                    if (nullNarrowed_.count(s)) {
+                        if (from->kind == TypeRef::Kind::Primitive) {
+                            from = ctx_.primitiveTypeRef(from->primitive,
+                                                         /*nullable=*/false);
+                        } else {
+                            TypeRef* nn = ctx_.makeTypeRef();
+                            *nn = *from;
+                            nn->nullable = false;
+                            from = nn;
+                        }
+                    }
+            }
         }
     }
     // `Object` (the root) accepts anything — never flag.
