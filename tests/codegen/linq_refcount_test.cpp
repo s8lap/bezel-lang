@@ -1212,3 +1212,39 @@ const char* kToDictPropertyDiscardReclaimed_1028 =
 BEZEL_TEST(linq_refcount, todictionary_property_discard_reclaimed_1028) {
     expectValueAndLeakFree(kToDictPropertyDiscardReclaimed_1028, 3);
 }
+
+// #1055: a fresh `owned` collection materializer iterated DIRECTLY as a for-in
+// source is reclaimed at the loop exit (reached by normal completion AND
+// `break`). Before the fix the iterable backing (+ owned string elements for
+// Split) leaked. The reclaim is a no-op for a bound / aliased iterable.
+
+// string.Split() → Array<string>, iterated directly. Sum of substring lengths
+// (1+2+3) = 6. The array backing + 3 strings are reclaimed at the loop exit.
+BEZEL_TEST(linq_refcount, for_in_split_array_materializer_reclaimed_1055) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  var s := \"a,bb,ccc\"; var total := 0; "
+        "  for var p in s.Split(',') do total := total + p.Length; end; "
+        "  return total; end Main; end C;", 6);
+}
+
+// Same, exited via `break` after 2 iterations — the array is still reclaimed
+// once at the shared loop exit (no leak, no double-free).
+BEZEL_TEST(linq_refcount, for_in_split_array_materializer_break_reclaimed_1055) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  var s := \"a,bb,ccc\"; var n := 0; "
+        "  for var p in s.Split(',') do n := n + 1; if n = 2 then break; end; end; "
+        "  return n; end Main; end C;", 2);
+}
+
+// ToDictionary() → Dictionary, iterated directly. Sum of values (1+2+3) = 6.
+// The dict struct + entries are reclaimed at the loop exit.
+BEZEL_TEST(linq_refcount, for_in_todictionary_materializer_reclaimed_1055) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var src := new OwnedArray<int>(); "
+        "  src.Add(1); src.Add(2); src.Add(3); var sum := 0; "
+        "  for var e in src.ToDictionary((x: int) => x) do sum := sum + e.Value; end; "
+        "  return sum; end Main; end C;", 6);
+}

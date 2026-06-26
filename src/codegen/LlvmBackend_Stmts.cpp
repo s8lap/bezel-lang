@@ -2553,6 +2553,16 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             builder_.CreateStore(builder_.CreateAdd(idxR3, builder_.getInt64(1)), idxSlotR);
             builder_.CreateBr(condBBR);
             builder_.SetInsertPoint(endBBR);
+            // #1055: a fresh `owned` Array materializer iterated directly as the
+            // for-in source (`for var p in s.Split(',') do … end`) is owned by
+            // nothing and leaks. Reclaim it here at the loop exit, which both
+            // normal completion and `break` reach (a `return` inside the body
+            // diverges before this point — the source leaks, the safe direction).
+            // No-op unless the iterable is exactly a fresh ownerless array
+            // materializer (its narrow guards) — a bound / `move`d / aliased
+            // iterable is never matched, so no UAF / double-free; the iteration
+            // variable is a borrow, so the elements are reclaimed exactly once.
+            freeUnboundOwnedBorrowingArrayTemp(fs.iterable.get(), arrObj, iterTy);
             return true;
         }
     }
@@ -3188,6 +3198,16 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     if (isStringKey)
         builder_.CreateCall(freeFn, {lensArr});
     builder_.CreateCall(freeFn, {valsArr});
+    // #1055: a fresh `owned Dictionary` materializer iterated directly as the
+    // for-in source (`for var e in src.ToDictionary(k) do … end`) is owned by
+    // nothing and leaks. Reclaim it here at the loop exit, which both normal
+    // completion and `break` reach (a `return` in the body diverges before this
+    // — leaks, the safe direction). No-op unless the iterable is exactly a fresh
+    // ownerless dict materializer (its narrow guard) — a bound / `move`d /
+    // aliased dict is never matched, so no UAF / double-free. The temp key/value
+    // extraction arrays are freed above first; this frees the dict itself.
+    freeUnboundOwnedBorrowingArrayTemp(fs.iterable.get(), dictObj,
+                                       ctx_.exprType(*fs.iterable));
     return true;
 }
 
