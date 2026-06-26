@@ -422,6 +422,15 @@ private:
     // wording). // per §28.11, §28.3
     bool targetIsOwningInlineArraySlot(const ast::Expr& target) const;
 
+    // #1020 / §28.6 (v0.153): true when `target` resolves to a NON-`owned` field
+    // (a FieldSymbol without the `owned` modifier) — a BORROW field that does not
+    // own its referent. Used by handleAssignment to reject a freshly-produced
+    // owned value (producerState == Owned) stored into it: the field is not an
+    // owner, so the fresh value would leak. A bare borrow read of a parameter or
+    // local (producerState == Borrowed) is the legitimate back-reference store and
+    // is not flagged. The `owned`-field case is handled by targetIsOwnedField.
+    bool targetIsNonOwnedField(const ast::Expr& target) const;
+
     // §28.3 / §28.5 / §28.8 (issue #402): handle an assignment whose LHS is an
     // `owned` field. An owned field may only receive an OWNED value (§28.3
     // producers: `new`, `move`, an owned-returning call, a consumed `owned`

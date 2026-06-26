@@ -231,13 +231,22 @@ BEZEL_TEST(xmod_generic_method_783, t2_box_class_get_second_reftype_14_1) {
     BEZEL_EXPECT_TRUE(compileToObj783(aSrc.path, aObj.path));
     if (!std::ifstream(aObj.path).good()) return;
 
+    // #1020 / §28.6 (v0.153): a fresh `new Widget(99)` stored into the non-`owned`
+    // generic field `v` would leak. Hold the Widget in an owned `using var` and
+    // store a BORROW of it (a back-reference param) — the box borrows it for its
+    // lifetime; the path still exercises the cross-module generic field write +
+    // `Get()` read of a second reference type.
     std::string bSrc =
         "module App; import Lib783B; "
         "public class C "
-        "  public static method Main(): int "
-        "    using var b := new Box<Widget>(); "
-        "    b.v := new Widget(99); "
+        "  public static method UseBox(w: Widget): int "
+        "    var b := new Box<Widget>(); "
+        "    b.v := w; "
         "    return b.Get().Size; "  // 99
+        "  end UseBox; "
+        "  public static method Main(): int "
+        "    using var w := new Widget(99); "
+        "    return UseBox(w); "
         "  end Main; "
         "end C;";
     TempFile783 bSrcFile((dir / (stem + "_b.bzl")).string());

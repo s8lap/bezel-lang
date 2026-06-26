@@ -178,7 +178,9 @@ BEZEL_TEST(own_field_da, owned_field_assigned_bare_implicit_this_ok) {
 BEZEL_TEST(own_field_da, nonnull_field_assigned_bare_implicit_this_ok) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
-        "  public _t: T;"
+        "  public owned _t: T;"  // owned: a fresh `new T()` into a non-`owned`
+                                 // field would leak (#1020 / §28.6 v0.153); the
+                                 // DA intent (bare-implicit-this init) is unchanged.
         "  public constructor() "
         "    _t := new T(); "
         "  end constructor; "

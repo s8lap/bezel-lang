@@ -61,7 +61,8 @@ std::string wrap(const std::string& method) {
         "end R; "
         "record Holder(Ref: R); "
         "class Box "
-        "  public Ref: R := null; "
+        "  public Ref: R := null; "         // non-`owned` (borrow) field — escape target
+        "  public owned Owned: R? := null; " // owned field for the clean owned-store controls
         "end Box; "
         "class C ") + method + " end C;";
 }
@@ -133,12 +134,13 @@ BEZEL_TEST(own_field_store_escape, store_holder_record_borrowing_using_var_into_
 
 // CONTROL (§28.8): assigning an owned local into an OWNED field by `move` is a
 // transfer, not a borrow store. The field takes over the obligation; no borrow
-// escapes. `box.Ref := move r;` is legal.
+// escapes. `box.Owned := move r;` is legal. (Targets the `owned` field — a
+// `move` into a non-`owned` field would leak, #1020 / §28.6 v0.153.)
 BEZEL_TEST(own_field_store_escape, store_move_of_owned_local_into_field_clean_28_8) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Give(box: Box) "
         "  var r := new R(); "
-        "  box.Ref := move r; "
+        "  box.Owned := move r; "
         "end Give;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -171,13 +173,14 @@ BEZEL_TEST(own_field_store_escape, store_value_projection_into_field_clean_28_3)
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL (§28.7): storing a freshly-`new`'d owned value into an owned field is
-// the canonical owned-field assignment — `box.Ref := new R();` is legal (the
-// field takes the obligation; the `new` result has no scope-bound source).
+// CONTROL (§28.7): storing a freshly-`new`'d owned value into an OWNED field is
+// the canonical owned-field assignment — `box.Owned := new R();` is legal (the
+// field takes the obligation; the `new` result has no scope-bound source). The
+// same store into a non-`owned` field would leak (#1020 / §28.6 v0.153).
 BEZEL_TEST(own_field_store_escape, store_new_into_field_clean_28_7) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Init(box: Box) "
-        "  box.Ref := new R(); "
+        "  box.Owned := new R(); "
         "end Init;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

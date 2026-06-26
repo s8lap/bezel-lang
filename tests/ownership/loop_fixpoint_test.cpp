@@ -35,7 +35,10 @@ std::string wrap(const std::string& body,
         "  public Inner: Stream := null; "
         "end Stream; "
         "class C "
-        "  public source: Stream := null; "
+        "  public owned source: Stream := new Stream(); "  // owned (the comment's
+                  // intent): `move this.source` / reassign-with-`new` are owned-field
+                  // mechanics; a non-`owned` field would leak the `new Stream()` (#1020)
+
         "  public method ") + sig + " " + body + " end; "
         "end C;";
 }

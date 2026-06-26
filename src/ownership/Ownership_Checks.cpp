@@ -2573,6 +2573,20 @@ bool MethodOwnership::targetIsOwnedField(const ast::Expr& target) const {
     return exprIsOwnedFieldRead(target);
 }
 
+// #1020 / §28.6 (v0.153): a non-`owned` (borrow) field target. See the header.
+bool MethodOwnership::targetIsNonOwnedField(const ast::Expr& target) const {
+    // Only a member access `obj.f` or a bare identifier resolving to a field
+    // (implicit `this`) names a field; sema attaches the FieldSymbol to it.
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(&target) &&
+        !dynamic_cast<const ast::IdentifierExpr*>(&target))
+        return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(target));
+    if (!fs) return false;
+    for (std::string_view m : fs->modifiers)
+        if (m == "owned") return false;  // owned field → §28.5 path, not here
+    return true;
+}
+
 // §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
 // the contract.
 bool MethodOwnership::targetIsOwningInlineArraySlot(

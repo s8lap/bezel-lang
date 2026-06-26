@@ -1610,6 +1610,32 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         // no diagnostic is duplicated. // per §28.11, §28.3
         handleOwnedFieldAssignment(as, flagged386,
                                    /*intoOwningArraySlot=*/true);
+    } else if (!flagged386 && targetIsNonOwnedField(*as.target) &&
+               producerState(*as.value) == OwnershipState::Owned) {
+        // #1020 / §28.6 (v0.153): a freshly-produced owned value — a `new`, an
+        // owned-returning call, a `move`, or an owned operator result
+        // (producerState == Owned) — stored into a non-`owned` (borrow) field
+        // has no owner and leaks: the field does not own its referent. The
+        // storing-side counterpart of the non-`owned`-return rule (§28.6). A
+        // bare borrow read of a parameter/local (the legitimate back-reference
+        // store) is producerState == Borrowed and is correctly not flagged.
+        // `flagged386` guards against double-reporting a borrow-of-owned-local
+        // store that checkBorrowStoreEscape already flagged. // per §28.6
+        std::string fieldName;
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(as.target.get()))
+            fieldName = std::string(ma->member);
+        else if (auto* id =
+                     dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
+            fieldName = std::string(id->name);
+        report(Severity::Error, as.value->span.begin,
+               std::string("a freshly-produced owned value cannot be stored "
+                           "into the non-`owned` field") +
+                   (fieldName.empty() ? std::string()
+                                      : " `" + fieldName + "`") +
+                   " — the field does not own it, so the value would leak; "
+                   "declare the field `owned` (§28.5), or hand it to a method "
+                   "that takes it `owned` (§28.6)");
     }
     // §28.11 (#395): an owning-collection `set(owned)` indexer assignment
     // `coll[i] := value` requires `value` to be owned — "Indexer set
