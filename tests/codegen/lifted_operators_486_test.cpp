@@ -506,3 +506,32 @@ BEZEL_TEST(codegen_1044_subint_nullable, byte_bitand_via_coalesce) {
 BEZEL_TEST(codegen_1044_subint_nullable, long_coalesce_int_default) {
     BEZEL_EXPECT_EQ(run("var a: long? := null; return int(a ?? 5);"), 5);
 }
+
+// #1044 (completion) / #1046: the `??` payload coercion for a nullable value
+// type must happen in the rhs block (before the merge), or a VARIABLE default
+// (`x ?? v`) emits an instruction that does not dominate the PHI edge — only a
+// constant default (a folded ConstantExpr) survived the earlier endBB
+// placement. Also covers `decimal? ?? <int>` (§5.1 int→decimal widening of the
+// default), which previously mixed a %bz.decimal payload with an i32 PHI value.
+BEZEL_TEST(codegen_1046_coalesce, byte_coalesce_variable_int_default) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := 3; var d: int := 9; return int(a ?? d);"), 3);
+}
+BEZEL_TEST(codegen_1046_coalesce, byte_null_coalesce_variable_int_default) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := null; var d: int := 9; return int(a ?? d);"), 9);
+}
+BEZEL_TEST(codegen_1046_coalesce, byte_coalesce_computed_int_default) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := 3; var x: int := 4; return int(a ?? (x + 5));"), 3);
+}
+BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_int_default_present) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := 5; return int(a ?? 9);"), 5);
+}
+BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_int_default_null) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := null; return int(a ?? 9);"), 9);
+}
+BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_variable_int_default_null) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: decimal? := null; var d: int := 7; return int(a ?? d);"), 7);
+}

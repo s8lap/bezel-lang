@@ -5467,23 +5467,40 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 llvm::Value* r = lowerExpr(*bin.right);
                 bool rhsDiv = diverged_;
                 if (!r) return nullptr;
+                // #1044 / #1046: coerce the RHS default to the nullable payload
+                // type HERE — in rhsBB, BEFORE the branch to endBB — so the
+                // coerced value dominates the PHI edge. (Doing it at endBB worked
+                // only for a CONSTANT default, which folds to a ConstantExpr with
+                // no instruction; a VARIABLE default `x ?? v` emitted a real
+                // instruction in endBB that did not dominate rhsEndBB → an LLVM
+                // "instruction does not dominate all uses" verifier failure.) The
+                // RHS is lowered at its own natural width/type:
+                //  - integer payload of a different width (sub-i32 `byte?`/...,
+                //    or wider `long?`): int-cast the RHS to the payload width.
+                //  - decimal payload (`decimal? ?? <int>`): widen the int RHS to a
+                //    decimal struct (§5.1 int→decimal) — without this the PHI
+                //    mixed a %bz.decimal payload with an i32 default and asserted.
+                if (!rhsDiv && r->getType()->isIntegerTy()) {
+                    if (primVal->getType()->isIntegerTy() &&
+                        primVal->getType() != r->getType()) {
+                        r = builder_.CreateIntCast(r, primVal->getType(),
+                                                   /*isSigned=*/true);
+                    } else if (primVal->getType() == decimalStructType()) {
+                        const sema::TypeRef* rt = ctx_.exprType(*bin.right);
+                        sema::PrimitiveType rp =
+                            (rt && rt->kind == sema::TypeRef::Kind::Primitive)
+                                ? rt->primitive : sema::PrimitiveType::Int;
+                        llvm::AllocaInst* dslot = entryAlloca(decimalStructType());
+                        emitIntToDecimal(r, rp, dslot);
+                        r = builder_.CreateLoad(decimalStructType(), dslot,
+                                                "coal.dec.rhs");
+                    }
+                }
                 llvm::BasicBlock* rhsEndBB = nullptr;
                 if (!rhsDiv) { rhsEndBB = builder_.GetInsertBlock(); builder_.CreateBr(endBB); }
                 builder_.SetInsertPoint(endBB);
                 diverged_ = false;
                 if (rhsDiv) return primVal;
-                // #1044: the RHS default is lowered at its own natural width
-                // (an `int` literal is i32), so for a nullable payload whose
-                // width differs — a sub-i32 `byte?`/`sbyte?`/`short?`/`ushort?`
-                // (i8/i16), or a wider `long?` (i64) — it mismatches the PHI's
-                // payload type and triggers an LLVM PHINode "operands must be
-                // the same type" assertion (`byte? ?? 9` crashed; `byte? ?? byte(9)`
-                // worked). Coerce the RHS to the payload's integer type.
-                if (primVal->getType()->isIntegerTy() &&
-                    r->getType()->isIntegerTy() &&
-                    primVal->getType() != r->getType())
-                    r = builder_.CreateIntCast(r, primVal->getType(),
-                                               /*isSigned=*/true);
                 auto* phi = builder_.CreatePHI(primVal->getType(), 2);
                 phi->addIncoming(primVal, entryBB);
                 phi->addIncoming(r, rhsEndBB);
