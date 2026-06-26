@@ -144,3 +144,38 @@ BEZEL_TEST(codegen_1042_subint_compound, byte_plus_overflow_throws) {
         "end Main; end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #1043 / §6.1: an arithmetic compound assignment on a sub-i32 integer is
+// `b = subInt(b OP v)` with CHECKED narrowing — an out-of-range result raises
+// OverflowException. #1042 truncated the RHS to the LHS width first, so an
+// out-of-range RHS gave a wrong value (`byte 5 += 300` returned 49). It now
+// computes at i32 and narrow-checks the result, throwing on overflow.
+namespace {
+// Returns 1 if the body raises OverflowException, 0 otherwise (or -999 on
+// front-end failure).
+int throwsOverflow(const std::string& stmt) {
+    auto r = bezel::test::runJit(
+        std::string("module M; class C public static method Main(): int "
+                    "  try ") + stmt +
+        " return 0; catch OverflowException => return 1; end; return 0; "
+        "end Main; end C;");
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+BEZEL_TEST(codegen_1043_subint_overflow, byte_plus_out_of_range_literal_throws) {
+    BEZEL_EXPECT_EQ(throwsOverflow("var b: byte := 5; b += 300;"), 1);
+}
+BEZEL_TEST(codegen_1043_subint_overflow, byte_plus_sum_overflow_throws) {
+    BEZEL_EXPECT_EQ(throwsOverflow("var b: byte := 200; b += 100;"), 1);
+}
+BEZEL_TEST(codegen_1043_subint_overflow, byte_times_overflow_throws) {
+    BEZEL_EXPECT_EQ(throwsOverflow("var b: byte := 5; b *= 100;"), 1);
+}
+// In-range arithmetic does NOT throw and is correct.
+BEZEL_TEST(codegen_1043_subint_overflow, byte_in_range_no_throw) {
+    BEZEL_EXPECT_EQ(run("var b: byte := 5; b += 250; return int(b);"), 255);
+}
+BEZEL_TEST(codegen_1043_subint_overflow, byte_div_large_divisor_no_throw) {
+    // 10 / 100 = 0 — a large divisor must NOT spuriously raise.
+    BEZEL_EXPECT_EQ(run("var b: byte := 10; b /= 100; return int(b);"), 0);
+}

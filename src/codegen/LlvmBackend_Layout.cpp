@@ -136,6 +136,36 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         if (op == "/") return builder_.CreateFDiv(l, r);
         return nullptr;
     }
+    // #1043: an ARITHMETIC compound assignment on a SUB-i32 integer LHS
+    // (`byte`/`sbyte`/`short`/`ushort`) is `b = subInt(b OP v)` with CHECKED
+    // narrowing (§6.1). #1042 truncated the RHS to the LHS width and ran the op
+    // there, which was correct for an in-range RHS but WRONG for an out-of-range
+    // one: `byte 5 += 300` truncated 300→44 and yielded 49 instead of raising
+    // OverflowException. Compute at the promoted width (i32) — reusing the i32
+    // checked-arith via recursion — then narrow-CHECK the result back to the LHS
+    // type so any out-of-range sum/difference/product/quotient throws. Bitwise
+    // and shift ops stay on the LHS-width path below: they cannot overflow the
+    // LHS width (`&`/`|`/`^` keep operand bits; `<<`/`>>` mask the count, #1041).
+    if (l->getType()->isIntegerTy() && !l->getType()->isIntegerTy(1) &&
+        l->getType()->getIntegerBitWidth() < 32 &&
+        (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod")) {
+        llvm::Type* dstTy = l->getType();
+        auto toI32 = [&](llvm::Value* v) -> llvm::Value* {
+            if (v->getType()->isIntegerTy(32)) return v;
+            return uns ? builder_.CreateZExt(v, i32())
+                       : builder_.CreateSExt(v, i32());
+        };
+        llvm::Value* wide = emitCompoundOp(op, toI32(l), toI32(r),
+                                           /*fp=*/false, uns);
+        if (!wide) return nullptr;
+        // §5.2 checked narrowing: trunc, extend back with the result's
+        // signedness, compare to the i32 value — a mismatch means out of range.
+        llvm::Value* trunc = builder_.CreateTrunc(wide, dstTy);
+        llvm::Value* back = uns ? builder_.CreateZExt(trunc, i32())
+                                : builder_.CreateSExt(trunc, i32());
+        emitGuardThrow(builder_.CreateICmpNE(back, wide), "OverflowException");
+        return trunc;
+    }
     // #1042: the compound result has the LHS type, and the checked-arith
     // intrinsics / shifts below require both operands to share that integer
     // type. The RHS is lowered at its own natural width (an `int` literal/value
