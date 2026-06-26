@@ -1409,14 +1409,19 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (rt->kind == sema::TypeRef::Kind::Primitive ||
                 isNullableRecordTy(rt) ||
                 (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
-                 rt->declaration->kind == ast::TypeDeclKind::Record)) {
-                // §8.6 / §17.4 (issue #416): a value primitive or record unboxes
-                // to a non-null T? on a compatible cast, a null T? otherwise. The
-                // result is the tagged {hasValue, payload} struct: hasValue=1 +
-                // the loaded payload on success, the zero struct on failure. For
-                // a record the payload is the bare record struct; for a primitive
-                // it is the scalar. `rt` is the (non-nullable) target type, so
-                // build the nullable form's tagged struct.
+                 (rt->declaration->kind == ast::TypeDeclKind::Record ||
+                  rt->declaration->kind == ast::TypeDeclKind::Enum))) {
+                // §8.6 / §17.4 (issue #416, enum #1072): a value primitive,
+                // record, or ENUM unboxes to a non-null T? on a compatible cast,
+                // a null T? otherwise. The result is the tagged {hasValue,
+                // payload} struct: hasValue=1 + the loaded payload on success, the
+                // zero struct on failure. For a record the payload is the bare
+                // record struct; for a primitive/enum it is the scalar (the enum's
+                // underlying integer, §10.3). `rt` is the (non-nullable) target
+                // type, so build the nullable form's tagged struct — without this
+                // an `enum?` from `as` was a bare value, and the downstream
+                // `int(enum?)` / `<> null` / `!` GEP'd its tag on a non-struct
+                // (#1072 LLVM checkGEPType assertion).
                 sema::TypeRef tmp = *rt;
                 tmp.nullable = true;
                 auto* nst = nullableValueStructTy(&tmp);

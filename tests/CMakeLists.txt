@@ -397,6 +397,7 @@ set(BEZEL_TEST_SOURCES
     codegen/string_compound_concat_857_test.cpp
     codegen/float_to_int_truncation_858_test.cpp
     codegen/enum_cast_range_859_test.cpp
+    codegen/enum_as_cast_1072_test.cpp
     codegen/nested_catch_rethrow_866_test.cpp
     codegen/out_owned_writeback_889_test.cpp   # fix #889: §28.11 Try*(out owned)/out using var writeback — write the moved-out owned element back + dispose exactly once
     codegen/out_using_var_elem_type_890_test.cpp  # fix #890: §28.11 derive element type for out using var from owning-collection Try* receivers
