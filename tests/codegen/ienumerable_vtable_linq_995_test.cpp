@@ -256,3 +256,55 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "    return Cell.n; "
         "  end Main; end C;"), 0);
 }
+
+// #1068: the #1067 fix extends to every DENSE bz_array_t-backed collection —
+// Stack/OwnedStack, Queue/OwnedQueue, OwnedBuffer (the set lowerArrayFor iterates
+// directly). Each, passed as an IEnumerable<T> parameter and iterated, must work
+// (each previously SIGSEGV'd). Set/OwnedSet and LinkedList are NOT array-dense
+// and stay out (#1069).
+namespace {
+std::string ifaceParamSum(const std::string& collDecl) {
+    return
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Item>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var c: " + collDecl + " := [new Item(3), new Item(4)]; "
+        "    return Sum(c); "
+        "  end Main; end C;";
+}
+}  // namespace
+
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_param_1068) {
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedStack<Item>")), 7);
+}
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_queue_as_ienumerable_param_1068) {
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedQueue<Item>")), 7);
+}
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_buffer_as_ienumerable_param_1068) {
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedBuffer<Item>")), 7);
+}
+BEZEL_TEST(ienumerable_vtable_linq_995, borrowing_stack_as_ienumerable_param_1068) {
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("Stack<Item>")), 7);
+}
+
+// #1068 disposal: an OwnedStack iterated through IEnumerable (twice) still
+// disposes its owned elements exactly once (the wrapper shares the collection).
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_disposed_once_1068) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Cell public static n: int := 0; public V: int := 0; "
+        "  public constructor(v: int) this.V := v; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Cell>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    do using var c: OwnedStack<Cell> := [new Cell(3), new Cell(4)]; "
+        "       var t: int := Sum(c); var u: int := Sum(c); end; "
+        "    return Cell.n; "
+        "  end Main; end C;"), 0);
+}

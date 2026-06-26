@@ -3261,23 +3261,32 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 formalTy->astNode && formalTy->astNode->name &&
                 !formalTy->astNode->name->parts.empty() &&
                 formalTy->astNode->name->parts[0] == "IEnumerable") {
-                // Check if the ACTUAL argument type is an array-backed
-                // collection (`Array<T>` or `OwnedArray<T>`). #1067: an
-                // OwnedArray shares the bz_array_t runtime layout (and the same
-                // bz_array_len/bz_array_ptr_at access wrapArrayAsIEnumerable
-                // uses), so it must be wrapped here too — without it the callee
+                // Check if the ACTUAL argument type is a DENSE bz_array_t-backed
+                // collection whose index-order walk (bz_array_len /
+                // bz_array_ptr_at, used by wrapArrayAsIEnumerable) matches its
+                // iteration — exactly the set lowerArrayFor iterates directly:
+                // Array, OwnedArray, OwnedBuffer, Stack/OwnedStack, Queue/
+                // OwnedQueue. #1067 / #1068: without wrapping, the callee
                 // iterating the IEnumerable<T> parameter interprets the
                 // bz_array_t layout as a vtable-backed object and calls a null
-                // slot (SIGSEGV). The wrapper SHARES the array (does not own it),
-                // so no ownership transfers and the OwnedArray still disposes its
-                // elements at its binder's scope end — no double-free.
+                // slot (SIGSEGV). The wrapper SHARES the collection (its
+                // GetEnumerator clones over a borrowed pointer — no ownership
+                // transfer), so an owning collection still disposes its elements
+                // exactly once at its binder's scope end (no double-free).
+                // EXCLUDED: Set/OwnedSet (bz_array_t "collection" but the dense
+                // walk does not yield its logical elements — its for-in codegen
+                // is itself unimplemented, #1069) and LinkedList/OwnedLinkedList
+                // (node-based bz_llist, not array-backed, #1068-followup).
                 sema::TypeRef* actualTy = ctx_.exprType(*a.value);
-                bool actualIsArray = actualTy &&
-                    actualTy->kind == sema::TypeRef::Kind::Named &&
+                std::string_view an;
+                if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
                     actualTy->astNode && actualTy->astNode->name &&
-                    !actualTy->astNode->name->parts.empty() &&
-                    (actualTy->astNode->name->parts[0] == "Array" ||
-                     actualTy->astNode->name->parts[0] == "OwnedArray");
+                    !actualTy->astNode->name->parts.empty())
+                    an = actualTy->astNode->name->parts[0];
+                bool actualIsArray =
+                    (an == "Array" || an == "OwnedArray" || an == "OwnedBuffer" ||
+                     an == "Stack" || an == "OwnedStack" ||
+                     an == "Queue" || an == "OwnedQueue");
                 if (actualIsArray) {
                     v = wrapArrayAsIEnumerable(v, formalTy);
                 }
