@@ -1776,6 +1776,20 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
             if (ps->modifier == "out" || ps->modifier == "ref" ||
                 ps->modifier == "out owned")
                 dest = Dest::OutParam;
+        } else if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+            // §28.3 (#1082): a BARE field name — an implicit `this._field`
+            // instance field, or an unqualified static field — is a field
+            // write, exactly like the qualified `this.f` / `obj.f` / `C.f`
+            // MemberAccessExpr form above. The field's object (or the static
+            // storage) outlives this method scope, so storing a borrow of a
+            // scope-bound owned local in it is the same §28.3 lifetime
+            // violation. Without this the bare form silently escaped the check
+            // — a use-after-free of the disposed local (the qualified form was
+            // correctly rejected, the unqualified one was not). The owned-field
+            // move-on-read skip below (targetIsOwnedField) already recognises a
+            // bare-identifier owned field, so a legal `_ownedField := r` is
+            // still admitted.
+            dest = Dest::Field;
         } else if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
             // §28.3 / §28.9 (#861): the target is a plain LOCAL. Assigning a
             // closure that captures an owned scope-bound local to a local in an
