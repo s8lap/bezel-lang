@@ -754,6 +754,21 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             !ix->indices.empty() && ix->indices[0].value &&
                             dynamic_cast<const ast::RangeExpr*>(
                                 ix->indices[0].value.get()) != nullptr;
+                        // §15.6 (#1079): also a Range-typed VALUE — `var r := 0..2;
+                        // arr[r]` — not a syntactic range literal. Mirrors the
+                        // string-slice path above. Without this `arr[r]` was typed
+                        // as the element T (not Array<T>), so `.Count` read garbage
+                        // and `for var x in arr[r]` found no collection-typed
+                        // iterable ("codegen for this for statement" reject). The
+                        // codegen indexer-get already lowers a Range-variable
+                        // subscript via bz_array_slice; only the type was missing.
+                        if (!isRangeIdx && !ix->indices.empty() &&
+                            ix->indices[0].value) {
+                            if (auto* it = ctx_.exprType(*ix->indices[0].value))
+                                if (it->kind == TypeRef::Kind::Named &&
+                                    it->declaration == builtinClassSym("Range"))
+                                    isRangeIdx = true;
+                        }
                         // §15.6 (#746 R41-E): range slicing produces a NEW Array<T>
                         // of copied references; it is admitted only on Array<T>.
                         // "Slicing is not admitted on OwnedArray<T>" — the
