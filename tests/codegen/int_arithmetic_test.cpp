@@ -104,3 +104,35 @@ BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: uint := 5; return (1 if (u > 1000) else 0);"), 0);
 }
+
+// #1050 / §5.1: the LIFTED (nullable) relational comparison had the same
+// unsigned-vs-non-negative-constant signedness bug as #1049 (the non-nullable
+// site) — `uint? 3e9 > 1000` was signed-compared and returned false. (Observed
+// through a `bool?` local, which correctly wraps the lifted i1 result; the
+// inline `(cmp) ?? false` form is a separate consumption bug, #1045.)
+BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_high_bit_gt_literal) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: uint? := 3000000000; var r: bool? := u > 1000; "
+        "return (1 if (r ?? false) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1050_lifted_unsigned_compare, ulong_nullable_high_bit_gt_literal) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: ulong? := 18000000000000000000; var r: bool? := u > 1000; "
+        "return (1 if (r ?? false) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_lt_literal_false) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: uint? := 3000000000; var r: bool? := u < 1000; "
+        "return (1 if (r ?? false) else 0);"), 0);
+}
+// No-regression: signed nullable and null propagation unchanged.
+BEZEL_TEST(codegen_1050_lifted_unsigned_compare, int_nullable_signed_compare_unchanged) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var i: int? := 0 - 5; var r: bool? := i < 1000; "
+        "return (1 if (r ?? false) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_propagates) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: uint? := null; var r: bool? := u > 1000; "
+        "return (1 if (r ?? false) else 0);"), 0);
+}

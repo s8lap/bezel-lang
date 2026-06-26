@@ -4492,6 +4492,20 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                     : builder_.CreateSExt(rp, lp->getType());
                     }
                     bool uns = isUnsignedBinOperand(bin);
+                    // #1049 (lifted): mirror the non-nullable comparison — an
+                    // unsigned operand vs a non-negative constant compares
+                    // UNSIGNED (§5.1), so a lifted `uint? > 1000` is not wrongly
+                    // signed-compared once the unsigned value's high bit is set.
+                    if (!uns) {
+                        bool lU = bin.left  && isUnsignedTargetExpr(*bin.left);
+                        bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
+                        auto nonNegConst = [](llvm::Value* v) {
+                            auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v);
+                            return ci && !ci->isNegative();
+                        };
+                        if ((lU && nonNegConst(rp)) || (rU && nonNegConst(lp)))
+                            uns = true;
+                    }
                     if      (op == "<")  cmp = uns ? builder_.CreateICmpULT(lp, rp, "lift.cmp")
                                                    : builder_.CreateICmpSLT(lp, rp, "lift.cmp");
                     else if (op == "<=") cmp = uns ? builder_.CreateICmpULE(lp, rp, "lift.cmp")
