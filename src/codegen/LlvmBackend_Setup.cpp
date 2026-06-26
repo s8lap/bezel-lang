@@ -5295,6 +5295,10 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
     if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
     else {
         llvm::Type* retTy = fn->getReturnType();
+        // #914: returning a narrowed value-nullable (sema proved it non-null) as
+        // a non-nullable return type — unwrap the {flag, value} struct to its
+        // value (the inverse of the non-nullable→nullable wrap below).
+        v = unwrapNarrowedNullable(v, retTy);
         // CG-nullable: coerce plain primitive to nullable-prim struct
         // when the function's return type is {i1, primType}.
         if (v && v->getType() != retTy &&
@@ -5508,6 +5512,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         }
     }
     llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
+    // #914: a narrowed value-nullable initializer (sema accepted the assignment
+    // because null-flow proved it non-null) lowered to the {flag, value} struct,
+    // but the local is declared NON-nullable — unwrap to its value.
+    if (v && declaredTy) v = unwrapNarrowedNullable(v, declaredTy);
     // §5.1: when the local is declared with an explicit wider numeric type
     // and the initializer lowered to a narrower numeric LLVM type (e.g.
     // `var d: double := n;` with `n: int`), materialize the implicit widening

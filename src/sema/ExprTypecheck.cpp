@@ -796,6 +796,25 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                              SourceLocation loc, const std::string& what,
                              const ast::Expr* fromExpr) {
     if (!from || !to) return;
+    // §7.4 / §12.7 (#914): a value-type (primitive) nullable simple variable
+    // proved non-null by null-flow narrowing (`if x is null then return; end`,
+    // `is not null`, else-of-`is null`, or initialization with a non-null value)
+    // is non-nullable in value position — so it is assignable to / returnable as
+    // a non-nullable target. Treat the narrowed `from` as non-nullable for this
+    // check WITHOUT rewriting its exprType (the declared {flag,value} layout is
+    // preserved, so null-comparisons / `is` tests on the variable are unaffected
+    // — that is the soundness boundary). Codegen unwraps the tagged-optional slot
+    // at the non-nullable-target coercion sites (local-init / assignment-store /
+    // return). Restricted to a PRIMITIVE nullable identifier in nullNarrowed_.
+    if (fromExpr && from->nullable && from->kind == TypeRef::Kind::Primitive &&
+        !to->nullable) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fromExpr)) {
+            if (Symbol* s = ctx_.exprSymbol(*id))
+                if (nullNarrowed_.count(s))
+                    from = ctx_.primitiveTypeRef(from->primitive,
+                                                 /*nullable=*/false);
+        }
+    }
     // `Object` (the root) accepts anything — never flag.
     if (to->kind == TypeRef::Kind::Primitive &&
         to->primitive == PrimitiveType::Object) {

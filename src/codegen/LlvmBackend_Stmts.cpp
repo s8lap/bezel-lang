@@ -402,6 +402,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // has an owned-class-local Disposal entry → no double-free).
                     disposeDisplacedOwnedClassLocal(as->target.get(), addr,
                                                     elemTy, rhs);
+                    // #914: a narrowed value-nullable RHS (sema proved non-null)
+                    // assigned to a non-nullable target — unwrap the {flag,value}
+                    // struct to its value. No-op for a nullable target (elemTy is
+                    // the struct, not its value element).
+                    rhs = unwrapNarrowedNullable(rhs, elemTy);
                     builder_.CreateStore(rhs, addr);
                     // §27.5 / #673: guarded-boxed (non-for-var) locals keep the
                     // original pre-boxing alloca in sync so pre-emitted code that

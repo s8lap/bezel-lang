@@ -2237,6 +2237,25 @@ private:
         return builder_.CreateExtractValue(nv, {1u}, "nv.val");
     }
 
+    // #914 / §7.4 / §12.7: a value-type (primitive) nullable local that sema
+    // proved non-null by null-flow narrowing is assignable to / returnable as a
+    // non-nullable target (sema kept its declared {flag,value} layout but
+    // accepted the coercion). When `v` is exactly that tagged-optional struct
+    // and `targetTy` is its non-nullable value element, extract the value;
+    // otherwise return `v` unchanged. Fires ONLY for an accepted narrowed read
+    // (a genuinely-nullable source is rejected by sema; a force-unwrap is
+    // already an extracted scalar), so it never strips a value that should stay
+    // nullable.
+    llvm::Value* unwrapNarrowedNullable(llvm::Value* v, llvm::Type* targetTy) {
+        if (!v || !targetTy) return v;
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(v->getType()))
+            if (st->getNumElements() == 2 &&
+                st->getElementType(0) == nullablePrimHasValTy() &&
+                st->getElementType(1) == targetTy)
+                return nullablePrimValue(v);
+        return v;
+    }
+
     llvm::Type* lowerTypeRef(const sema::TypeRef* rt);
 
     // fix #568 / §14.1 / §7.1: coerce a ReturnStmt value `v` to the function's
