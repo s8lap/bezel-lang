@@ -215,3 +215,44 @@ BEZEL_TEST(ienumerable_vtable_linq_995, reenumeration_replays) {
         "    return a * 10 + b; "  // 3,3 → 33
         "  end Main; end P;"), 33);
 }
+
+// #1067: an OwnedArray<T> passed as an IEnumerable<T> PARAMETER and iterated
+// through the interface (`for var a in xs`) must work. Pre-fix it SIGSEGV'd: the
+// call-site argument coercion (LlvmBackend_Assign.cpp) wrapped only `Array<T>`,
+// so the OwnedArray's bz_array_t layout was passed raw and the callee's vtable
+// dispatch called a null GetEnumerator slot. OwnedArray shares the bz_array_t
+// layout, so wrapArrayAsIEnumerable applies the same way; `Array<T>` (already
+// covered) and direct OwnedArray iteration are unaffected.
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_array_as_ienumerable_param_1067) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Item>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var items: OwnedArray<Item> := [new Item(3), new Item(4)]; "
+        "    return Sum(items); "
+        "  end Main; end C;"), 7);
+}
+
+// #1067 disposal: the IEnumerable wrapper SHARES the array (does not own it), so
+// after iterating-as-IEnumerable (twice) and disposing the OwnedArray, its owned
+// elements are disposed EXACTLY once (Cell.n net 0 — no leak, no double-free).
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_array_as_ienumerable_param_disposed_once_1067) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Cell public static n: int := 0; public V: int := 0; "
+        "  public constructor(v: int) this.V := v; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Cell>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    do using var items: OwnedArray<Cell> := [new Cell(3), new Cell(4)]; "
+        "       var t: int := Sum(items); var u: int := Sum(items); end; "
+        "    return Cell.n; "
+        "  end Main; end C;"), 0);
+}
