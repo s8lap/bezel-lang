@@ -2625,6 +2625,99 @@ void MethodOwnership::scanGetterReturns(
     for (const auto& s : stmts) scanGetterReturnsStmt(s.get());
 }
 
+// #1066 / §9.7 (v0.153): a borrow-carrying field type. Used ONLY by
+// checkRecordFromTemporary (isBorrowBearingRecord keeps its own predicate, so
+// the #360 return-escape behaviour is unchanged). Unlike that predicate, this
+// one also recognizes the BUILTIN heap reference types (Array<T>,
+// Dictionary<K,V>, … — which carry no user TypeDecl, so declaration is null) as
+// borrow-carrying; the §9.7 repro `record Bag(Items: Array<int>)` is exactly
+// such a field.
+bool MethodOwnership::fieldTypeIsBorrowCarrying(const sema::TypeRef* ft) const {
+    if (!ft) return false;
+    switch (ft->kind) {
+        case sema::TypeRef::Kind::Named: {
+            if (ft->declaration) {
+                if (ft->declaration->isValueBuiltin) return false;
+                if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                    ft->declaration->kind == ast::TypeDeclKind::Interface)
+                    return true;
+                if (ft->declaration->kind == ast::TypeDeclKind::Record)
+                    return isBorrowBearingRecord(ft);  // transitive
+                return false;  // enum
+            }
+            // Builtin generic with no user TypeDecl: a heap reference collection
+            // carries a borrow. The value-type builtins (DateTime / TimeSpan /
+            // Guid / CancellationToken) and `string` are not heap collections and
+            // are excluded by name.
+            if (ft->astNode && ft->astNode->name &&
+                !ft->astNode->name->parts.empty()) {
+                std::string_view h = ft->astNode->name->parts.back();
+                if (h == "Array" || h == "OwnedArray" || h == "Dictionary" ||
+                    h == "OwnedDictionary" || h == "List" || h == "LinkedList" ||
+                    h == "OwnedLinkedList" || h == "Set" || h == "OwnedSet" ||
+                    h == "Stack" || h == "OwnedStack" || h == "Queue" ||
+                    h == "OwnedQueue" || h == "OwnedBuffer")
+                    return true;
+            }
+            return false;
+        }
+        case sema::TypeRef::Kind::InlineArray:
+            return ft->arrayElement && !ft->arrayOwned &&
+                   isBorrowableType(ft->arrayElement);
+        case sema::TypeRef::Kind::Primitive:
+            return false;  // string / Object / numeric — not a borrow source
+        default:
+            return false;  // Unit, Function, enum, Error
+    }
+}
+
+// #1066 / §9.7 (v0.153): a temporary (non-place) expression. See header.
+bool MethodOwnership::exprIsTemporary(const ast::Expr& e) const {
+    // A "place" — a named local/parameter/field, a field/property access, or an
+    // index slot — has storage that can outlive the construction. Anything else
+    // (a literal, a `new`, a call result, an operator result) is a temporary
+    // whose lifetime ends at the enclosing expression.
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e)) return false;
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&e)) return false;
+    if (dynamic_cast<const ast::IndexExpr*>(&e)) return false;
+    return true;
+}
+
+// #1066 / §9.7 (v0.153): reject `new Record(<temporary>)` binding a temporary to
+// a borrow-carrying field. See header.
+void MethodOwnership::checkRecordFromTemporary(const ast::NewExpr& ne) {
+    const sema::TypeRef* rt =
+        ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    const auto* decl =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!decl || decl->kind != ast::TypeDeclKind::Record) return;
+    // Positional records (§9.1): argument i binds to positional field i.
+    const auto& fields = decl->positionalFields;
+    for (std::size_t i = 0; i < ne.args.size() && i < fields.size(); ++i) {
+        const ast::Param& f = fields[i];
+        if (!f.type) continue;
+        if (!fieldTypeIsBorrowCarrying(ctx_.resolvedType(*f.type))) continue;
+        const ast::Expr* arg = ne.args[i].value.get();
+        if (!arg || !exprIsTemporary(*arg)) continue;
+        // §9.7 null-source form: a `null` argument stores no borrow (the field
+        // is null), so it is not a dangling borrow and is explicitly permitted.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;
+        report(
+            Severity::Error, ne.span.begin,
+            std::string("a borrow-bearing record may not be constructed from a "
+                        "temporary bound to its borrow-carrying field `") +
+            std::string(f.name) +
+            "` — the temporary's lifetime ends at this construction "
+            "expression, so the record would immediately outlive that borrow's "
+            "source (a dangling borrow); bind the source to a named local whose "
+            "scope outlives the record and pass that (§9.7 / §28.3 borrow-"
+            "lifetime rule)");
+        return;  // one diagnostic per construction is enough
+    }
+}
+
 // §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
 // the contract.
 bool MethodOwnership::targetIsOwningInlineArraySlot(

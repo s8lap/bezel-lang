@@ -1472,6 +1472,14 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
 }
 
 void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
+    // #1066 / §9.7 (v0.153): `var b := new Bag([…])` from a temporary is a
+    // dangling borrow. Checked before the lsym early-return so it runs for a
+    // value-typed (record) binding too, matching the handleReturn/handleAssignment
+    // hooks for the other binding contexts.
+    if (ld.initializer)
+        if (const auto* ne =
+                dynamic_cast<const ast::NewExpr*>(ld.initializer.get()))
+            checkRecordFromTemporary(*ne);
     // Find the LocalSymbol that ExprTypecheck created for this decl.
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
@@ -1576,6 +1584,10 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
     recordMovesIn(*as.value);
+    // #1066 / §9.7 (v0.153): `x := new Bag([…])` / `this.f := new Bag([…])`
+    // from a temporary is a dangling borrow.
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(as.value.get()))
+        checkRecordFromTemporary(*ne);
     // §28.3 (#386 cases 1+2): storing a borrow of an owned scope-bound local
     // into a field of an object, or writing it through an out/ref parameter,
     // lets the borrow outlive the local (use-after-dispose). Run AFTER
@@ -1726,6 +1738,10 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // they only diagnose. The discharge handling below is unchanged.
     checkClosureEscapesOnReturn(e);       // D1: §28.9 closure capture escape
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
+    // #1066 / §9.7 (v0.153): `return new Bag([…])` from a temporary is a
+    // dangling borrow exactly as a local-decl initializer is.
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
+        checkRecordFromTemporary(*ne);
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
     checkCatchBorrowEscapesOnReturn(e);   // §31.1 caught-exception escape
     // §31.1 (issue #430): `return new Wrap(ex)` where Wrap's ctor stores

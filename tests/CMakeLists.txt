@@ -849,6 +849,7 @@ set(BEZEL_TEST_SOURCES
     ownership/owned_field_assign_test.cpp
     ownership/fresh_owned_into_borrow_field_1020_test.cpp
     ownership/getter_returns_fresh_owned_926_test.cpp
+    ownership/record_from_temporary_1066_test.cpp
     ownership/catch_owned_sink_test.cpp
     ownership/throw_owned_arg_test.cpp
     ownership/catch_borrow_escaping_via_ctor_test.cpp

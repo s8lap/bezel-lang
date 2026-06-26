@@ -117,6 +117,25 @@ public:
     void scanGetterReturns(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     void scanGetterReturnsStmt(const ast::Stmt* s);
 
+    // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
+    // constructed from a TEMPORARY bound to one of its borrow-carrying fields —
+    // the temporary's lifetime ends at the construction expression, so the record
+    // immediately outlives that borrow's source (a dangling borrow). Reject at
+    // `new Record(...)` when the record is borrow-bearing and a positional arg
+    // bound to a borrow-carrying field is a temporary (not a named place). Keeps
+    // long-lived-borrow construction (`var xs := […]; new Bag(xs)`) legal.
+    void checkRecordFromTemporary(const ast::NewExpr& ne);
+    // True when `ft` is a borrow-carrying field type (a class/interface
+    // reference — including the BUILTIN heap collections Array/Dictionary/… that
+    // carry no user TypeDecl — an inline array of references, or a transitively
+    // borrow-bearing record). Used by checkRecordFromTemporary; intentionally
+    // distinct from isBorrowBearingRecord's own predicate (which is left
+    // unchanged, so the #360 return-escape behaviour does not shift).
+    bool fieldTypeIsBorrowCarrying(const sema::TypeRef* ft) const;
+    // True when `e` is a temporary (not a named place — identifier / member
+    // access / index slot — whose storage can outlive the construction).
+    bool exprIsTemporary(const ast::Expr& e) const;
+
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
