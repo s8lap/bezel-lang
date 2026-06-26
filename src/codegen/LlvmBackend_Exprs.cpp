@@ -322,7 +322,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 std::vector<llvm::Value*> args{ev};
                                 pv = emitMethodCall(toStr, args, false);
                             } else {
-                                pv = ev;  // string — use as-is
+                                // §8.5 (#1077): a class/interface with NO explicit
+                                // ToString override interpolates as its type name
+                                // (the §8.5 default), NOT the raw pointer.
+                                // emitValueToString handles the Named class/iface
+                                // case — the same path an Object-typed interpolation
+                                // already uses. Previously this treated the class
+                                // pointer as a bz_string*, so `$"{obj}"` produced an
+                                // empty / garbage string.
+                                pv = emitValueToString(ev, rt);
                             }
                         } else {
                             pv = ev;  // string or unknown ptr — use as-is

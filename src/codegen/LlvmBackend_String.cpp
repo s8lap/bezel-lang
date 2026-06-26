@@ -2212,6 +2212,17 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             return lowerStringLiteral(
                 std::string("\"") + std::string(ts->name) + "\"", false);
         }
+        if (ts->kind == ast::TypeDeclKind::Interface &&
+            val->getType()->isPointerTy()) {
+            // §8.5 (#1077): an interface-typed value is a vtable-bearing object;
+            // format by the DYNAMIC ToString (the runtime override if any, else
+            // the runtime type name) via the universal object dispatch — the
+            // same path an Object-typed value uses. Without this branch an
+            // interface value fell to the fallback below and was mis-rendered as
+            // a raw bz_string (`$"{ishape}"` → "").
+            if (llvm::Value* r = lowerObjectToString(val)) return r;
+            return lowerStringLiteral("\"\"", false);
+        }
     }
     // Fallback: format by the LLVM shape (string ptr → identity; integer → int).
     if (val->getType()->isPointerTy()) return val;            // assume bz_string
