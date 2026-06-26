@@ -5569,7 +5569,15 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 return phi;
             }
         }
-        return nullptr;  // other non-ptr — cannot coalesce
+        // #1045: a non-pointer, non-nullable-value LHS — `nonNullable ?? rhs`.
+        // The left operand can never be null (a value type that is not the
+        // {tag,payload} nullable form, e.g. a lifted relational result which is
+        // a definite `bool` per §7.11 "false when either operand is null"), so
+        // the result is always the left operand and the rhs is dead. Returning
+        // it (rather than nullptr) fixes `(int? < 5) ?? false`, which lowered the
+        // whole `??` to null → false. The rhs is intentionally NOT lowered here
+        // (correct short-circuit: a non-null left never evaluates the default).
+        return l;
     }
     auto* entryBB = builder_.GetInsertBlock();
     auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coalesce.rhs", currentFn_);

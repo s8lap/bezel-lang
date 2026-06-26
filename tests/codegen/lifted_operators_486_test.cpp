@@ -560,3 +560,28 @@ BEZEL_TEST(codegen_1047_decimal_nullable, decimal_nullable_both_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "var a: decimal? := 5; var b: decimal? := 3; return int((a + b) ?? 99);"), 8);
 }
+
+// #1045 / §7.11 / §17.1: a lifted relational comparison is a definite `bool`
+// ("false when either operand is null"), so `(int? < 5) ?? false` is `??` on a
+// non-nullable value — the left can never be null and the result is always the
+// left. lowerCoalesce returned nullptr for a non-pointer non-nullable LHS, so
+// the whole `??` lowered to null → false; it now returns the left operand.
+BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_true_via_coalesce) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: int? := 3; return (1 if ((a < 5) ?? false) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_false_via_coalesce) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: int? := 3; return (1 if ((a > 5) ?? false) else 0);"), 0);
+}
+BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_null_operand_is_false) {
+    // null < 5 is the definite bool `false` (§7.11), so `?? false` is false.
+    BEZEL_EXPECT_EQ(run(
+        "var a: int? := null; return (1 if ((a < 5) ?? false) else 0);"), 0);
+}
+BEZEL_TEST(codegen_1045_coalesce_nonnull, nonnull_bool_coalesce_returns_left_true) {
+    BEZEL_EXPECT_EQ(run("return (1 if ((5 > 3) ?? false) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1045_coalesce_nonnull, nonnull_bool_coalesce_returns_left_false) {
+    BEZEL_EXPECT_EQ(run("return (1 if ((5 < 3) ?? true) else 0);"), 0);
+}
