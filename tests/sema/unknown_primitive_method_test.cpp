@@ -157,3 +157,34 @@ BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_empty_and_from_still_ac
     auto r2 = checkBody("var s := string.From('x'); return s.Length;");
     BEZEL_EXPECT_FALSE(r2.diagnostics.hasErrors());
 }
+
+// #1048 / §9.5 / §9.6: the char/int-expecting primitive static methods
+// (string.Repeat(c: char, count: int); char classification/transform statics)
+// validate their argument types. A `string` (or other non-integer) argument
+// where a `char`/`int` is expected was previously accepted and crashed codegen
+// (which sext/trunc'd the lowered string pointer). They must now be rejected.
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_repeat_string_arg_rejected_1048) {
+    auto r = checkBody("var s := string.Repeat(\"x\", 3); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_repeat_string_count_rejected_1048) {
+    auto r = checkBody("var s := string.Repeat('x', \"3\"); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_isdigit_string_arg_rejected_1048) {
+    auto r = checkBody("var b := char.IsDigit(\"x\"); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_toupper_string_arg_rejected_1048) {
+    auto r = checkBody("var c := char.ToUpper(\"x\"); return 0;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+// Positive controls — correct char/int arguments must STILL be accepted.
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, string_repeat_char_arg_accepted_1048) {
+    auto r = checkBody("var s := string.Repeat('x', 3); return 0;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_unknown_primitive_method_spec3_4, char_isdigit_char_arg_accepted_1048) {
+    auto r = checkBody("var b := char.IsDigit('5'); return 0;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

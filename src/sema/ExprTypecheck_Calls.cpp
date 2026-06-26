@@ -559,6 +559,60 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // #1048: argument-type validation for the char/int-expecting primitive
+    // static methods. These set only their RESULT type in resolveMemberAccess
+    // and have no MethodSymbol, so they bypass checkArgsAgainstParams — a
+    // wrong-typed argument (a `string`/`double`/… where a `char`/`int` is
+    // expected) was accepted and crashed codegen, which lowered the argument
+    // and then `sext`/`trunc`'d a non-integer value (a string pointer):
+    // `string.Repeat("x", 3)`, `char.IsDigit("x")` both IR-failed. Reject any
+    // argument whose KNOWN type is not integer-like (char or an integer type)
+    // in those positions; leave an untyped/error argument to its own diagnostic.
+    if (auto* sma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if (auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(sma->target.get())) {
+            PrimitiveType recvPt = primitiveFromName(tid->name);
+            const auto& mm = sma->member;
+            auto isIntegerLike = [](PrimitiveType p) {
+                switch (p) {
+                    case PrimitiveType::Char:
+                    case PrimitiveType::Byte:  case PrimitiveType::SByte:
+                    case PrimitiveType::Short: case PrimitiveType::UShort:
+                    case PrimitiveType::Int:   case PrimitiveType::UInt:
+                    case PrimitiveType::Long:  case PrimitiveType::ULong:
+                        return true;
+                    default: return false;
+                }
+            };
+            auto requireIntLike = [&](size_t i, const char* what) {
+                if (i >= ce.args.size() || !ce.args[i].value) return;
+                const TypeRef* t = ctx_.exprType(*ce.args[i].value);
+                if (!t) return;  // untyped/error arg — its own diagnostic
+                if (t->kind == TypeRef::Kind::Primitive &&
+                    isIntegerLike(t->primitive))
+                    return;
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "'" + std::string(tid->name) + "." + std::string(mm) +
+                    "' requires a `char` " + what + " (stdlib §9.5/§9.6)");
+            };
+            // §9.6: string.Repeat(c: char, count: int).
+            if (recvPt == PrimitiveType::String && mm == "Repeat" &&
+                ce.args.size() == 2) {
+                requireIntLike(0, "first argument");
+                requireIntLike(1, "(int) count");
+            }
+            // §9.5: char classification / transform statics take a `char`.
+            if (recvPt == PrimitiveType::Char &&
+                (mm == "IsDigit" || mm == "IsLetter" || mm == "IsLetterOrDigit" ||
+                 mm == "IsWhiteSpace" || mm == "IsUpper" || mm == "IsLower" ||
+                 mm == "IsControl" || mm == "IsPunctuation" ||
+                 mm == "ToUpper" || mm == "ToLower" || mm == "ToString") &&
+                ce.args.size() == 1) {
+                requireIntLike(0, "argument");
+            }
+        }
+    }
     // §5.2: an explicit conversion `int(x)` — the callee is a primitive
     // type name with no symbol. The call's type is that primitive type.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
