@@ -2587,6 +2587,44 @@ bool MethodOwnership::targetIsNonOwnedField(const ast::Expr& target) const {
     return true;
 }
 
+// #926 / §28.6 (v0.153): a getter may not return a fresh owned value. See header.
+void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
+    if (producerState(e) == OwnershipState::Owned) {
+        report(Severity::Error, e.span.begin,
+               "a property or indexer getter may not return a freshly-produced "
+               "owned value — a getter is a borrow-producing position "
+               "(properties and indexers do not carry `owned`), so the value "
+               "would escape with no owner and leak; expose the factory as a "
+               "method returning `owned T` (§28.6)");
+    }
+}
+
+void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
+    if (!s) return;
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        if (rs->value) checkGetterFreshOwnedReturn(*rs->value);
+    } else if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+        scanGetterReturns(is->ifBranch.body);
+        for (const auto& eb : is->elifBranches) scanGetterReturns(eb.body);
+        if (is->hasElse) scanGetterReturns(is->elseBody);
+    } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        scanGetterReturns(ws->body);
+    } else if (auto* fr = dynamic_cast<const ast::ForStmt*>(s)) {
+        scanGetterReturns(fr->body);
+    } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        scanGetterReturns(ts->body);
+        for (const auto& c : ts->catches) scanGetterReturnsStmt(c.body.get());
+        if (ts->hasFinally) scanGetterReturns(ts->finallyBody);
+    } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        scanGetterReturns(db->body);
+    }
+}
+
+void MethodOwnership::scanGetterReturns(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& s : stmts) scanGetterReturnsStmt(s.get());
+}
+
 // §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
 // the contract.
 bool MethodOwnership::targetIsOwningInlineArraySlot(

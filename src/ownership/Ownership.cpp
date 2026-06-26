@@ -2117,8 +2117,31 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
                 if (innerM) checkMember(*innerM, ctx);
             }
         }
+    } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+        // #926 / §28.6 (v0.153): a property/indexer GETTER may not return a
+        // freshly-produced owned value (a getter is a borrow-producing position).
+        // This is the only ownership check run on accessors today — a NARROW
+        // getter-return check, not the full pass, so existing getters/setters
+        // surface no unrelated new diagnostics. The expression-bodied read-only
+        // property (`property X: T => E`) and each block-form `get` accessor
+        // (`get => E` / `get => do … end`) are covered. // per §28.6
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody) {
+            MethodOwnership mo(ctx);
+            mo.checkGetterFreshOwnedReturn(*pd->exprBody);
+        } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            for (const auto& acc : pd->accessors) {
+                if (acc.isSet) continue;  // getters only
+                MethodOwnership mo(ctx);
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                    acc.exprBody) {
+                    mo.checkGetterFreshOwnedReturn(*acc.exprBody);
+                } else if (acc.bodyKind ==
+                           ast::PropertyAccessorBodyKind::Block) {
+                    mo.scanGetterReturns(acc.stmts);
+                }
+            }
+        }
     }
-    // PropertyDecl accessors and other forms join in later O slices.
 }
 
 // ---------- Slice O9: owned-field definite-assignment (§7.9) --------

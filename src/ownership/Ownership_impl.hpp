@@ -105,6 +105,18 @@ public:
         const std::vector<sema::Symbol*>* paramSyms,
         const ast::Type* returnType, bool returnOwned);
 
+    // #926 / §28.6 (v0.153): a property/indexer GETTER may not return a freshly-
+    // produced owned value — a getter is a borrow-producing position (properties
+    // and indexers do not carry `owned`), so a fresh owned value would escape with
+    // no owner and leak. checkGetterFreshOwnedReturn reports when `e` is a fresh
+    // owned producer (producerState == Owned). scanGetterReturns / -Stmt walk a
+    // block-form getter accessor body for `return <fresh owned>` statements (nested
+    // in if/while/for/try/do). These run a NARROW check only (not the full
+    // ownership pass), so accessor bodies surface no other new diagnostics.
+    void checkGetterFreshOwnedReturn(const ast::Expr& e);
+    void scanGetterReturns(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+    void scanGetterReturnsStmt(const ast::Stmt* s);
+
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
