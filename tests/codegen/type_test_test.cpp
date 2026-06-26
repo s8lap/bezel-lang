@@ -160,3 +160,54 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, nonnull_class_is_true_regression) {
     BEZEL_EXPECT_EQ(runHier(
         "var d := new Dog(); return (1 if d is Dog else 0);"), 1);
 }
+
+// REGRESSION #1071 (§8.6 / §12.7): an Object/interface operand may hold a bare
+// `bz_string*`, which has NO leading vtable/descriptor word. `o is T` / `o as T`
+// for a non-string target T must NOT walk the string's `char* data` word as a
+// descriptor (that SIGSEGV'd); a string is never any other concrete type, so the
+// result is false (`is`) / true (`is not`) / null (`as`).
+BEZEL_TEST(codegen_cg19_string_operand_1071, is_value_target_on_string_is_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var o: Object := \"hello\"; return (1 if o is int else 0); "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg19_string_operand_1071, is_not_value_target_on_string_is_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var o: Object := \"hello\"; return (1 if o is not int else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_cg19_string_operand_1071, is_class_target_on_string_is_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Foo public x: int := 0; end Foo; "
+        "class C public static method Main(): int "
+        "  var o: Object := \"hello\"; return (1 if o is Foo else 0); "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg19_string_operand_1071, as_value_target_on_string_is_null) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var o: Object := \"hello\"; return (o as int ?? 7); "
+        "end Main; end C;"), 7);
+}
+
+// REGRESSION #1071: the matching cases still work — a boxed int IS int, and an
+// Object holding a string IS string (the guard must not break the genuine box
+// descriptor walk nor the existing `is string` fast path).
+BEZEL_TEST(codegen_cg19_string_operand_1071, boxed_int_is_int_still_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var o: Object := 42; return (1 if o is int else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_cg19_string_operand_1071, object_holding_string_is_string_still_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var o: Object := \"hello\"; return (1 if o is string else 0); "
+        "end Main; end C;"), 1);
+}

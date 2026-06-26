@@ -1334,7 +1334,47 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         }
         return nullptr;
     }
-    llvm::Value* isA = emitIsA(obj, targetDesc);
+    // #1071 / §8.6 / §12.7: an Object/interface operand may hold a bare
+    // bz_string* — a string has NO leading vtable/descriptor word (see the
+    // `is string` target branch above). emitIsA loads word-0 as a descriptor
+    // pointer and walks it; on a string that word is the `char* data` pointer,
+    // so the walk dereferences garbage → SIGSEGV. A string is never any other
+    // concrete type, so when the operand could be a string, gate emitIsA on
+    // bz_obj_is_string: a string yields isA=false (`is`→false, `is not`→true,
+    // `as`→null) and only a genuine box/class runs the descriptor walk.
+    bool mightHoldString = false;
+    if (const sema::TypeRef* opTy = ctx_.exprType(*te.operand)) {
+        if (opTy->kind == sema::TypeRef::Kind::Primitive &&
+            opTy->primitive == sema::PrimitiveType::Object) {
+            mightHoldString = true;
+        } else if (opTy->kind == sema::TypeRef::Kind::Named && opTy->declaration &&
+                   opTy->declaration->kind == ast::TypeDeclKind::Interface) {
+            mightHoldString = true;
+        }
+    }
+    llvm::Value* isA;
+    if (mightHoldString) {
+        auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* isStr = builder_.CreateICmpNE(
+            builder_.CreateCall(isStrFn, {obj, vtableTablePtr()}, "isa.isstr"),
+            builder_.getInt32(0));
+        llvm::BasicBlock* preGuardBB = builder_.GetInsertBlock();
+        auto* notStrBB = llvm::BasicBlock::Create(llvm_, "isa.notstr", currentFn_);
+        auto* afterGuardBB =
+            llvm::BasicBlock::Create(llvm_, "isa.guarded", currentFn_);
+        builder_.CreateCondBr(isStr, afterGuardBB, notStrBB);
+        builder_.SetInsertPoint(notStrBB);
+        llvm::Value* isAReal = emitIsA(obj, targetDesc);
+        llvm::BasicBlock* emitEndBB = builder_.GetInsertBlock();
+        builder_.CreateBr(afterGuardBB);
+        builder_.SetInsertPoint(afterGuardBB);
+        auto* phi = builder_.CreatePHI(i1(), 2);
+        phi->addIncoming(builder_.getInt1(false), preGuardBB);  // string → no match
+        phi->addIncoming(isAReal, emitEndBB);
+        isA = phi;
+    } else {
+        isA = emitIsA(obj, targetDesc);
+    }
     if (te.op == "is") return isA;
     if (te.op == "is not")
         return builder_.CreateXor(isA, builder_.getInt1(true));
