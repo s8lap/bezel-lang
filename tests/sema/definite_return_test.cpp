@@ -98,3 +98,48 @@ BEZEL_TEST(sema_ret_path, do_block_returns_ok) {
         "end F;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// #1063 / §21.7 / §31.2.2: a try whose body returns and whose catch arm is an
+// EXPRESSION-form throw (`catch E => throw;` rethrow, or `catch E => throw X`)
+// always exits — the throw-expression diverges. Before the fix these were
+// parsed as an ExpressionStmt wrapping a ThrowExpr (not a ThrowStmt), which
+// stmtAlwaysExits did not recognize, so they were wrongly flagged "does not
+// return a value on every path."
+BEZEL_TEST(sema_ret_path, try_return_catch_rethrow_ok) {
+    auto r = parseSemaAll(cls(
+        "public method F(): int "
+        "  try return 1; catch ArgumentException => throw; end; "
+        "end F;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_ret_path, try_return_catch_throw_new_ok) {
+    auto r = parseSemaAll(cls(
+        "public method F(): int "
+        "  try return 1; "
+        "  catch ArgumentException => throw new InvalidOperationException(\"x\"); end; "
+        "end F;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Boundary (negative control): a catch arm that genuinely FALLS THROUGH (an
+// expression statement that is NOT a throw) must still be diagnosed — the fix
+// recognizes only ThrowExpr expression-statements as always-exiting.
+BEZEL_TEST(sema_ret_path, try_return_catch_fallthrough_diagnoses) {
+    auto r = parseSemaAll(cls(
+        "public method F(): int "
+        "  try return 1; catch ArgumentException => var z: int := 5; end; "
+        "end F;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// The block-form throwing catch arm was already accepted; keep it covered so
+// the two forms stay in agreement.
+BEZEL_TEST(sema_ret_path, try_return_catch_block_throw_ok) {
+    auto r = parseSemaAll(cls(
+        "public method F(): int "
+        "  try return 1; "
+        "  catch ArgumentException => do throw new InvalidOperationException(\"x\"); end; end; "
+        "end F;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

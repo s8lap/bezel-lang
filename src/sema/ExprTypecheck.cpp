@@ -199,6 +199,16 @@ bool ExprTC::stmtsContainYield(
 bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
     if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
     if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
+    // §31.2.2 / §21.7: an EXPRESSION-form catch arm `catch E => throw …` (bare
+    // rethrow `throw;` or `throw expr`) is parsed as an ExpressionStmt wrapping
+    // a ThrowExpr (Parser_Stmts.cpp expression-leading branch), NOT a ThrowStmt.
+    // A throw-expression always diverges, so the statement always exits. Without
+    // this, `try return x; catch E => throw; end;` (and `=> throw new X()`) was
+    // wrongly flagged "does not return a value on every path" — while the block
+    // form `catch E => do throw …; end` (a ThrowStmt) was correctly accepted.
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s))
+        return es->expr &&
+               dynamic_cast<const ast::ThrowExpr*>(es->expr.get()) != nullptr;
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         if (!ifs->hasElse) return false;  // false edge falls through
         if (!bodyAlwaysExits(ifs->ifBranch.body)) return false;
