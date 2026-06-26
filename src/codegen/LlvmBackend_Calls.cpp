@@ -11578,8 +11578,15 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
                                       std::vector<llvm::Value*>& args) {
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return nullptr;
-    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    if (!md) return nullptr;
+    // #1059: do NOT bail when `ms->decl` is an OperatorDecl rather than a
+    // MethodDecl — an operator overload on a GENERIC record/class must
+    // specialize per-instantiation just like a regular method. callableInfo
+    // already accepts both decl kinds and fills `ci` from the right one; the
+    // body emission below uses `ci`, not the decl, so an operator inlines
+    // correctly. (Previously `auto* md = dynamic_cast<MethodDecl*>(ms->decl);
+    // if (!md) return nullptr;` excluded operators, so they fell through to the
+    // unspecialized compiled function and the specialized call args mismatched
+    // its parameter types — IR_FAIL.)
 
     // Save state.
     llvm::Value* savedThis = currentThis_;

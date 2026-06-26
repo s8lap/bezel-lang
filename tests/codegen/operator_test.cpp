@@ -106,3 +106,62 @@ BEZEL_TEST(codegen_cg48, primitive_unary_unchanged) {
         "  var x := 5; return -x; "
         "end Main; end C;"), -5);
 }
+
+// #1059 / §25 + §22: an operator overload on a GENERIC record/class is a
+// (non-generic) static method whose param/return types use the declaring type's
+// parameter `T`. It must specialize per-instantiation like a regular method;
+// before the fix it was emitted once with the unspecialized `T`-placeholder
+// layout and the specialized call args mismatched its parameter types (IR_FAIL
+// "Call parameter type does not match function signature"). Non-generic
+// operators and regular generic-record methods always worked; this is the
+// generic × operator-overload combination.
+BEZEL_TEST(codegen_cg48, generic_record_operator_int_1059) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Vec<T>(X: int) "
+        "  public static method operator +(a: Vec<T>, b: Vec<T>): Vec<T> => "
+        "    new Vec<T>(a.X + b.X); end Vec; "
+        "class C public static method Main(): int "
+        "  var c: Vec<int> := new Vec<int>(3) + new Vec<int>(4); return c.X; "
+        "end Main; end C;"), 7);
+}
+
+// A non-`int` type argument (string) — the unspecialized i32 placeholder layout
+// is genuinely wrong here, so this exercises real per-instantiation
+// specialization (not a coincidental i32-matches-int case).
+BEZEL_TEST(codegen_cg48, generic_record_operator_string_1059) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(V: T) "
+        "  public static method operator +(a: Box<T>, b: Box<T>): Box<T> => "
+        "    new Box<T>(a.V); end Box; "
+        "class C public static method Main(): int "
+        "  var a: Box<string> := new Box<string>(\"hi\"); "
+        "  var b: Box<string> := new Box<string>(\"yo\"); "
+        "  var c: Box<string> := a + b; return c.V.Length; "
+        "end Main; end C;"), 2);
+}
+
+// Two distinct instantiations (P<int> and P<long>) in one program each get
+// their own specialized operator.
+BEZEL_TEST(codegen_cg48, generic_record_operator_multi_instantiation_1059) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P<T>(X: T) "
+        "  public static method operator +(a: P<T>, b: P<T>): P<T> => "
+        "    new P<T>(a.X); end P; "
+        "class C public static method Main(): int "
+        "  var i: P<int> := new P<int>(5) + new P<int>(6); "
+        "  var l: P<long> := new P<long>(7L) + new P<long>(8L); "
+        "  return i.X + int(l.X); "
+        "end Main; end C;"), 12);
+}
+
+// A generic CLASS (reference type) operator returning `owned Vec<T>`.
+BEZEL_TEST(codegen_cg48, generic_class_operator_1059) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Vec<T> public X: int; "
+        "  public constructor(x: int) X := x; end constructor; "
+        "  public static method operator +(a: Vec<T>, b: Vec<T>): owned Vec<T> => "
+        "    new Vec<T>(a.X + b.X); end Vec; "
+        "class C public static method Main(): int "
+        "  using var c: Vec<int> := new Vec<int>(3) + new Vec<int>(4); return c.X; "
+        "end Main; end C;"), 7);
+}

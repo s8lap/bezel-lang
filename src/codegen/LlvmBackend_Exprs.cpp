@@ -4047,8 +4047,45 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             llvm::Value* orr = lowerExpr(*bin.right);
             if (!ol || !orr) return nullptr;
             std::vector<llvm::Value*> args{ol, orr};
+            // #1059: an operator overload on a GENERIC record/class is a
+            // (non-generic) static method whose parameter / return types use the
+            // declaring type's parameter `T` (e.g. `operator +(a: Vec<T>, b:
+            // Vec<T>): Vec<T>`). Set up the per-instantiation substitution from
+            // the operand that is an instance of the operator's declaring type
+            // (e.g. `Vec<int>` → T=int) so emitMethodCall SPECIALIZES the
+            // operator — its params lower to the specialized record struct,
+            // matching the already-specialized lowered operand types. Without
+            // this the operator was emitted once with the unspecialized `T`
+            // placeholder layout and the call's specialized args mismatched
+            // (IR_FAIL "Call parameter type does not match function signature").
+            auto savedOpSubst = genericSubst_;
+            auto savedOpSema = genericSubstSemaTy_;
+            for (const ast::Expr* operand : {bin.left.get(), bin.right.get()}) {
+                const sema::TypeRef* opTy = ctx_.exprType(*operand);
+                if (!opTy || opTy->kind != sema::TypeRef::Kind::Named ||
+                    opTy->declaration != opm->parent ||
+                    opTy->genericArgs.empty())
+                    continue;
+                auto* td = dynamic_cast<const ast::TypeDecl*>(
+                    opTy->declaration->decl);
+                if (!td || td->genericParams.size() != opTy->genericArgs.size())
+                    continue;
+                std::unordered_map<std::string_view, llvm::Type*> ns;
+                std::unordered_map<std::string_view, const sema::TypeRef*> nsem;
+                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                    ns[td->genericParams[gi].name] =
+                        lowerTypeRef(opTy->genericArgs[gi]);
+                    nsem[td->genericParams[gi].name] =
+                        resolveTypeParamRef(opTy->genericArgs[gi]);
+                }
+                genericSubst_ = std::move(ns);
+                genericSubstSemaTy_ = std::move(nsem);
+                break;
+            }
             llvm::Value* res =
                 emitMethodCall(opm, args, /*baseQualified=*/false);
+            genericSubst_ = std::move(savedOpSubst);
+            genericSubstSemaTy_ = std::move(savedOpSema);
             // §28.3 / §25.1 (#912, #965): an operand of a class-operator call
             // that is itself an OWNED TEMPORARY — a chained owned-returning
             // operator result (`(a + b)` in `a + b + c`), a bare `new C(...)`,
