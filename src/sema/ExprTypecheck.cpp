@@ -807,30 +807,36 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     // at the non-nullable-target coercion sites (local-init / assignment-store /
     // return). Restricted to a VALUE-TYPE nullable identifier in nullNarrowed_:
     // a primitive, an ENUM, or a RECORD — all laid out as the {flag, value}
-    // tagged-optional struct that `unwrapNarrowedNullable` extracts. A class /
-    // interface nullable (a bare pointer, not a struct) is EXCLUDED here — its
-    // narrowing rides the ownership flow, not this coercion.
-    if (fromExpr && from->nullable && !to->nullable) {
-        bool valueNullable =
-            from->kind == TypeRef::Kind::Primitive ||
-            (from->kind == TypeRef::Kind::Named && from->declaration &&
-             (from->declaration->kind == ast::TypeDeclKind::Enum ||
-              from->declaration->kind == ast::TypeDeclKind::Record));
-        if (valueNullable) {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fromExpr)) {
-                if (Symbol* s = ctx_.exprSymbol(*id))
-                    if (nullNarrowed_.count(s)) {
-                        if (from->kind == TypeRef::Kind::Primitive) {
-                            from = ctx_.primitiveTypeRef(from->primitive,
-                                                         /*nullable=*/false);
-                        } else {
-                            TypeRef* nn = ctx_.makeTypeRef();
-                            *nn = *from;
-                            nn->nullable = false;
-                            from = nn;
-                        }
+    // tagged-optional struct that `unwrapNarrowedNullable` extracts — OR a
+    // class / interface reference (#1056), whose nullable form is just a bare
+    // pointer: `unwrapNarrowedNullable` is a no-op for it (no struct), and a
+    // narrowed (non-null) pointer assigns directly to a non-nullable reference
+    // slot. (For a class reference the assignment still needs `move` — that
+    // ownership rule is orthogonal and enforced separately.)
+    if (fromExpr && from->nullable && !to->nullable &&
+        (from->kind == TypeRef::Kind::Primitive ||
+         (from->kind == TypeRef::Kind::Named && from->declaration))) {
+        // Peel a `move x` wrapper (#1056): a class/interface reference assignment
+        // transfers ownership via `move`, so `fromExpr` is a UnaryExpr whose
+        // operand is the narrowed identifier (value-type copies have the bare
+        // identifier directly).
+        const ast::Expr* narrowExpr = fromExpr;
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(fromExpr))
+            if (ue->op == "move" && ue->operand)
+                narrowExpr = ue->operand.get();
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(narrowExpr)) {
+            if (Symbol* s = ctx_.exprSymbol(*id))
+                if (nullNarrowed_.count(s)) {
+                    if (from->kind == TypeRef::Kind::Primitive) {
+                        from = ctx_.primitiveTypeRef(from->primitive,
+                                                     /*nullable=*/false);
+                    } else {
+                        TypeRef* nn = ctx_.makeTypeRef();
+                        *nn = *from;
+                        nn->nullable = false;
+                        from = nn;
                     }
-            }
+                }
         }
     }
     // `Object` (the root) accepts anything — never flag.

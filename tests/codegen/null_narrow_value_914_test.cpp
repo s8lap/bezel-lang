@@ -204,3 +204,29 @@ BEZEL_TEST(null_narrow_value_914, enum_genuinely_nullable_rejected) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
 }
+
+// §28 / §7.4 (#1056): a narrowed class/interface REFERENCE nullable assigns to a
+// non-nullable reference (via `move`, since it transfers ownership). The
+// narrowing peels the `move` wrapper; codegen stores the (non-null) pointer
+// directly (unwrapNarrowedNullable is a no-op for a non-struct pointer).
+BEZEL_TEST(null_narrow_value_914, reference_nullable_narrowed_move_assign) {
+    auto r = runJit(
+        "module M; class Box public V: int := 5; end Box; "
+        "class C public static method Main(): int "
+        "  var b: Box? := new Box(); "
+        "  if b is not null then using var x: Box := move b; return x.V; end; "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+// CONTROL: a genuinely-nullable class? `move`d to a non-nullable reference still
+// rejects (the value is not narrowed).
+BEZEL_TEST(null_narrow_value_914, reference_genuinely_nullable_rejected_1056) {
+    auto r = runJit(
+        "module M; class Box public V: int := 5; end Box; "
+        "class C public static method Main(): int "
+        "  var b: Box? := null; using var x: Box := move b; return x.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+}
