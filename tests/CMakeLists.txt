@@ -386,6 +386,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nullable_return_widening_843_test.cpp
     codegen/nullable_lifted_widening_840_test.cpp
     codegen/async_iter_var_frame_width_833_test.cpp
+    codegen/generic_state_machine_method_1060_1061_test.cpp  # fix #1060/#1061: generic async/iterator method monomorphized with state-machine transform
     codegen/int_min_mod_neg_one_844_test.cpp
     codegen/unary_plus_overload_852_test.cpp
     codegen/generic_nullable_value_param_846_test.cpp

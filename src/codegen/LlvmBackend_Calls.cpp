@@ -11291,8 +11291,87 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // being built lazily while a generic TEMPLATE body is mid-emission).
     bool savedGenTemplate = emittingGenericTemplateBody_;
     emittingGenericTemplateBody_ = false;
+    // #1060 / #1061: a lazily-built specialization of an async / iterator method
+    // emits its OWN state machine via the emit*Method helpers below, which
+    // overwrite the shared state-machine context (smStateStruct_, smSelf_, the
+    // spill maps, the async result type, …). When this specialization is built
+    // mid-emission of ANOTHER state-machine method's body — e.g. `await
+    // Echo<int>()` lowered inside an async `Run` — that clobbers the caller's
+    // live frame: emitAwaitSuspend would then GEP a null smStateStruct_/smSelf_
+    // and crash. Save and restore the full SM context (exactly as the
+    // locals/params/fn context above is saved) so building a specialization is
+    // transparent to the caller's state machine. Containers are moved out, which
+    // both saves them O(1) AND hands the helper a clean (empty) slate.
+    SuspendKind savedSmKind = smKind_;
+    llvm::StructType* savedSmStateStruct = smStateStruct_;
+    llvm::Value* savedSmSelf = smSelf_;
+    llvm::Value* savedSmStateGEP = smStateGEP_;
+    llvm::BasicBlock* savedSmDoneBB = smDoneBB_;
+    unsigned savedSmNextState = smNextSuspendState_;
+    unsigned savedIterCurValField = iterCurrentValField_;
+    llvm::Type* savedIterElemTy = iterElemTy_;
+    unsigned savedAsyncOuterField = asyncOuterTaskField_;
+    unsigned savedAsyncPendingField = asyncPendingTaskField_;
+    unsigned savedAsyncSpillField = asyncSpillPtrField_;
+    llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
+    llvm::Type* savedAsyncResultTy = asyncResultTy_;
+    const sema::TypeRef* savedAsyncResultSemaTy = asyncResultSemaType_;
+    auto savedSmStateBBs = std::move(smStateBBs_);
+    auto savedSmLocalFields = std::move(smLocalFields_);
+    auto savedSmForInSrcFields = std::move(smForInSrcFields_);
+    auto savedSmAllocaToField = std::move(smAllocaToField_);
+    auto savedSmIterEnumFrames = std::move(smIterEnumFramesAtState_);
+    auto savedAsyncHandlerSpill = std::move(asyncHandlerSpillSlots_);
 
     currentFn_ = specFn;
+    // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
+    // state-machine TRANSFORMATION applied to the specialized function — the
+    // plain body emission below would emit a raw `ret <value>` / yield body,
+    // which IR-fails (async: `ret i32` in a `Task`-returning function) or
+    // crashes at consumption (iterator: a yield body with no state machine).
+    // Route to the same emit*Method helpers the non-specialized method emission
+    // uses (LlvmBackend_Setup.cpp ~L3717); they create their OWN entry block and
+    // bind params, and read the active genericSubst_ to specialize the frame, so
+    // the specialized state machine matches the specialized signature.
+    bool emittedStateMachine = false;
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
+        if (isAsyncMethod(ms) &&
+            (containsYield(*ci.stmts) || returnsAsyncIteratorType(ms))) {
+            emitAsyncIteratorMethod(ms, specFn, ci);
+            emittedStateMachine = true;
+        } else if (!isAsyncMethod(ms) && containsYield(*ci.stmts)) {
+            emitIteratorMethod(ms, specFn, ci);
+            emittedStateMachine = true;
+        } else if (isAsyncMethod(ms)) {
+            emitAsyncMethod(ms, specFn, ci);
+            emittedStateMachine = true;
+        }
+    } else if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody &&
+               isAsyncMethod(ms)) {
+        // §30.1: an expression-bodied async method (`=> expr`) — synthesize a
+        // single `return <exprBody>` block and route it through the state-machine
+        // emission, exactly as the non-specialized path does. The synthesized
+        // ReturnStmt BORROWS the AST-owned exprBody; release it afterward so its
+        // destructor does not free the AST node.
+        std::vector<std::unique_ptr<ast::Stmt>> synthBody;
+        auto ret = std::make_unique<ast::ReturnStmt>();
+        ret->span = ci.exprBody->span;
+        ret->value.reset(const_cast<ast::Expr*>(ci.exprBody));
+        synthBody.push_back(std::move(ret));
+        CallableInfo aci = ci;
+        aci.bodyKind = ast::MethodBodyKind::Block;
+        aci.stmts = &synthBody;
+        aci.exprBody = nullptr;
+        if (returnsAsyncIteratorType(ms))
+            emitAsyncIteratorMethod(ms, specFn, aci);
+        else
+            emitAsyncMethod(ms, specFn, aci);
+        if (auto* rs = dynamic_cast<ast::ReturnStmt*>(synthBody[0].get()))
+            (void)rs->value.release();
+        emittedStateMachine = true;
+    }
+
+    if (!emittedStateMachine) {
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", specFn);
     builder_.SetInsertPoint(entryBB);
     locals_.clear();
@@ -11348,6 +11427,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         bool terminated = ci.stmts && lowerScopedBlock(*ci.stmts);
         if (!terminated) emitImplicitReturn(specFn);
     }
+    }  // !emittedStateMachine
 
     // Restore outer state.
     builder_.SetInsertPoint(savedInsert);
@@ -11366,6 +11446,27 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817
+    // Restore the caller's state-machine context (#1060 / #1061).
+    smKind_ = savedSmKind;
+    smStateStruct_ = savedSmStateStruct;
+    smSelf_ = savedSmSelf;
+    smStateGEP_ = savedSmStateGEP;
+    smDoneBB_ = savedSmDoneBB;
+    smNextSuspendState_ = savedSmNextState;
+    iterCurrentValField_ = savedIterCurValField;
+    iterElemTy_ = savedIterElemTy;
+    asyncOuterTaskField_ = savedAsyncOuterField;
+    asyncPendingTaskField_ = savedAsyncPendingField;
+    asyncSpillPtrField_ = savedAsyncSpillField;
+    asyncResumeFn_ = savedAsyncResumeFn;
+    asyncResultTy_ = savedAsyncResultTy;
+    asyncResultSemaType_ = savedAsyncResultSemaTy;
+    smStateBBs_ = std::move(savedSmStateBBs);
+    smLocalFields_ = std::move(savedSmLocalFields);
+    smForInSrcFields_ = std::move(savedSmForInSrcFields);
+    smAllocaToField_ = std::move(savedSmAllocaToField);
+    smIterEnumFramesAtState_ = std::move(savedSmIterEnumFrames);
+    asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpill);
 
     return specFn;
 }
