@@ -318,4 +318,32 @@ BEZEL_TEST(fresh_owned_receiver_1039, owned_producer_string_result_not_disposed_
     BEZEL_EXPECT_EQ(lsan, 0);  // no double-free / use-after-free
 }
 
+// ---- #1053 case 1: explicit `.Dispose()` on a fresh UNBOUND producer. -------
+// `new Cell().Dispose()` ran the synthesised destructor (n=0) but never
+// reclaimed the unbound heap block (LSan: "16 byte(s) leaked") — the explicit-
+// dispose path stayed dispatch-only for a receiver with no owning slot. Now a
+// fresh producer (NewExpr / `owned`-returning call) is reclaimed there exactly
+// once (the sole dispatch + the block free). A BOUND `var c := new X();
+// c.Dispose()` has a variable receiver (an owning slot) and is reclaimed by the
+// existing slot path — unaffected (no double-free).
+
+// `new Cell().Dispose()` — destructor exactly once AND block reclaimed.
+BEZEL_TEST(fresh_owned_receiver_1039, new_dispose_unbound_reclaimed_1053) {
+    expectDisposedAndLeakFree(
+        prog("do new Cell().Dispose(); end; return Cell.n;"), 0);
+}
+
+// `Make().Dispose()` — owned-producer receiver, explicit Dispose, reclaimed.
+BEZEL_TEST(fresh_owned_receiver_1039, owned_producer_dispose_reclaimed_1053) {
+    expectDisposedAndLeakFree(
+        progProducer("do Make().Dispose(); end; return Foo.n;"), 0);
+}
+
+// CONTROL: a BOUND local explicitly disposed is reclaimed exactly once by the
+// slot path (the fresh-producer reclaim must NOT also fire — variable receiver).
+BEZEL_TEST(fresh_owned_receiver_1039, bound_local_dispose_single_free_1053) {
+    expectDisposedAndLeakFree(
+        prog("do var c := new Cell(); c.Dispose(); end; return Cell.n;"), 0);
+}
+
 }  // namespace

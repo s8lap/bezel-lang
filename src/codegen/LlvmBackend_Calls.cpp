@@ -10063,6 +10063,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                     slot);
                             builder_.CreateBr(cont);
                             builder_.SetInsertPoint(cont);
+                        } else if (isFreshOwnedClassProducer(ma->target.get())) {
+                            // #1053-case-1 / #415: no owning slot, but the
+                            // receiver is a FRESH owned producer (`new X()` or an
+                            // `owned`-returning call) — owned by nothing else, so
+                            // dispatch-only (below) would leak its block. Reclaim
+                            // it exactly once: this IS the sole explicit Dispose
+                            // (one destructor run) plus the block free. A BORROW
+                            // receiver is NOT a fresh producer (its real owner
+                            // reclaims via ITS slot), so it stays dispatch-only.
+                            emitDisposeAndReclaim(recv);
                         } else {
                             emitDynamicDispose(recv);
                         }
@@ -10727,15 +10737,15 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
 
-    // #1039 / §28.3: a fresh `new <class>().ValueMethod()` call leaves the
-    // receiver temporary owned by nothing — dispose it after the value result
-    // is produced. Instance methods only (args[0] = receiver). The explicit
-    // `.Dispose()` (§28.5) is excluded: it is the one method that drives the
-    // receiver's own disposal, so a second reclaim here could double-free a
-    // future `new`-bound-style reclaim path. The helper is otherwise a no-op
-    // unless the receiver is a fresh `new` of a heap class and the result is a
-    // primitive/enum/unit value (Bezel's borrow checker forbids `this`
-    // escaping such a call, so post-call disposal is sound — §15.3).
+    // #1039 / #1053 / §28.3: a fresh owned-producer (`new <class>()` or an
+    // `owned`-returning call) used only as the receiver of an instance-method
+    // call (args[0] = receiver) leaves the temporary owned by nothing — dispose
+    // it after the call. The helper is a no-op unless the receiver is such a
+    // fresh producer of a heap class and the result is a primitive/enum/unit
+    // value (Bezel's borrow checker forbids `this` escaping such a call, so
+    // post-call disposal is sound — §15.3). An explicit `.Dispose()` never
+    // reaches here — it is handled by the dedicated `obj.Dispose()` path above,
+    // which reclaims a fresh unbound producer itself (#1053-case-1).
     if (!diverged_ && !isStaticMethod(ms) && !args.empty() &&
         ms->name != "Dispose") {
         const ast::Expr* recvExpr = nullptr;

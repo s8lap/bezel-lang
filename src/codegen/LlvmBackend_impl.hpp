@@ -5620,6 +5620,14 @@ private:
                                      llvm::Value* recvPtr,
                                      const sema::TypeRef* resultTy);
 
+    // #1039 / #1053: true if `e` is a FRESH owned-CLASS producer that transfers
+    // a +1 the caller solely owns — a literal `new <heap class>()` or a call to
+    // a method declared `): owned <heap class>`. A borrow-returning call (no
+    // `owned` return), a variable / field / `this`, or a non-class type all
+    // return false, so such a receiver's result is never reclaimed as a fresh
+    // temporary (no double-free / use-after-free).
+    bool isFreshOwnedClassProducer(const ast::Expr* e) const;
+
     // CG6/CG9: a call whose callee resolves to a known method → direct
     // LLVM call with lowered positional arguments. An instance method
     // (CG9) takes the receiver as an implicit leading `this` argument:

@@ -3078,43 +3078,48 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 }
 
 
-void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
-                                          llvm::Value* recvPtr,
-                                          const sema::TypeRef* resultTy) {
-    // #1039 / §28.3: a fresh owned class instance used ONLY as the receiver of
-    // a member access or method call — never bound to a variable — is owned by
-    // nothing and leaks. Dispose it after the value result has been extracted.
-    if (!recvExpr || !recvPtr || !resultTy) return;
-    // The receiver must be a FRESH owned-class producer that transfers a +1 the
-    // caller solely owns — either a literal `new T(...)` (#1039) or a call to a
-    // method declared to return `owned T` (#1053-case-2). Both leave the caller
-    // the sole owner of a fresh temporary; used only as a receiver, it is bound
-    // to nothing and leaks. A variable / field / `this` / property receiver is
-    // neither (never disposed → no double-free). CRITICAL: a call WITHOUT an
-    // `owned` return transfers no ownership — its result is a BORROW (e.g.
-    // `return this.field`), and disposing it would free a value owned elsewhere
-    // (use-after-free); such calls are excluded by the `returnOwned` gate.
-    bool freshOwnedProducer = false;
-    if (dynamic_cast<const ast::NewExpr*>(recvExpr)) {
-        freshOwnedProducer = true;
-    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(recvExpr)) {
+bool Emitter::isFreshOwnedClassProducer(const ast::Expr* e) const {
+    // #1039 / #1053: a literal `new T(...)` or a call to a method declared to
+    // return `owned T` — both transfer a fresh +1 the caller solely owns. A
+    // call WITHOUT an `owned` return transfers no ownership: its result is a
+    // BORROW (e.g. `return this.field`), and reclaiming it would free a value
+    // owned elsewhere (use-after-free). `returnOwned` (ast::MethodDecl) is the
+    // sound discriminator. A variable / field / `this` / property receiver is
+    // neither a NewExpr nor a call, so it is never a fresh producer.
+    if (!e) return false;
+    bool producer = false;
+    if (dynamic_cast<const ast::NewExpr*>(e)) {
+        producer = true;
+    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
         if (call->callee)
             if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
                     ctx_.exprSymbol(*call->callee)))
                 if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                    freshOwnedProducer = md->returnOwned;
+                    producer = md->returnOwned;
     }
-    if (!freshOwnedProducer) return;
+    if (!producer) return false;
     // The receiver type must be a heap CLASS: records/structs are value types
     // with no heap block or vtable disposer; interfaces/enums are not `new`-of-
     // class temporaries. A null declaration (builtin not exported as a TypeDecl)
-    // is conservatively skipped — leak, but sound.
-    const sema::TypeRef* rt = ctx_.exprType(*recvExpr);
+    // is conservatively excluded — leak, but sound.
+    const sema::TypeRef* rt = ctx_.exprType(*e);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
-        return;
-    const auto* rtd =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!rtd || rtd->kind != ast::TypeDeclKind::Class) return;
+        return false;
+    const auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    return rtd && rtd->kind == ast::TypeDeclKind::Class;
+}
+
+
+void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy) {
+    // #1039 / #1053 / §28.3: a fresh owned-class producer used ONLY as the
+    // receiver of a member access or method call — never bound to a variable —
+    // is owned by nothing and leaks. Dispose it after the value result has been
+    // extracted, when the receiver is a fresh `new`/`owned`-returning producer
+    // (#1039/#1053-case-2) and the result cannot alias into it.
+    if (!recvExpr || !recvPtr || !resultTy) return;
+    if (!isFreshOwnedClassProducer(recvExpr)) return;
     // The extracted result must be a NON-REFERENCE value — provably free of any
     // reference or borrow into the receiver: a numeric/bool/char/decimal
     // primitive, an enum, or unit. EXCLUDED, because each may alias into the
