@@ -2801,6 +2801,160 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
 }
 
 
+// #1069: node-walking IEnumerable wrapper for (Owned)LinkedList<T>. Mirrors
+// wrapArrayAsIEnumerable but the cursor is a bz_llist node pointer rather than an
+// index. Struct { ptr vtable, ptr llist, ptr current_node, ptr next_node }:
+//   - next_node    : the node MoveNext will return next (init = first node).
+//   - current_node : the node Current reads (set by MoveNext).
+// Exhaustion is next_node == null; no started-flag is needed. The wrapper SHARES
+// the list (no ownership), so an owning list still disposes its elements once at
+// its binder's scope end; Dispose just frees the enumerator struct.
+llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
+                                                  const sema::TypeRef* iEnumTy) {
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+
+    std::string elemName = elemTy->isIntegerTy()
+        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
+        : (elemTy->isPointerTy() ? "ptr" : "f");
+    std::string stName = "llenum." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy)
+        stTy = llvm::StructType::create(
+            llvm_, {ptrTy(), ptrTy(), ptrTy(), ptrTy()}, stName);
+
+    std::string prefix = "bz$llenum$" + elemName + "$";
+    auto getOrCreate = [&](const std::string& name, llvm::FunctionType* ft,
+                           std::function<void(llvm::Function*)> fill)
+        -> llvm::Function* {
+        if (auto* f = module_->getFunction(name)) return f;
+        auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                         name, module_.get());
+        fill(f);
+        return f;
+    };
+    auto* voidTy = llvm::Type::getVoidTy(llvm_);
+    auto* firstFT = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    auto* nextFT = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    auto* valFT = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+
+    // Dispose: free(self).
+    auto* dispFn = getOrCreate(prefix + "Dispose",
+        llvm::FunctionType::get(voidTy, {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            auto* freeFn = module_->getOrInsertFunction(
+                "free", llvm::FunctionType::get(voidTy, {ptrTy()}, false))
+                .getCallee();
+            b.CreateCall(llvm::FunctionType::get(voidTy, {ptrTy()}, false),
+                         freeFn, {f->arg_begin()});
+            b.CreateRetVoid();
+        });
+
+    // MoveNext: cur = next; if cur == null return false; current = cur;
+    //           next = node_next(cur); return true.
+    auto* mnFn = getOrCreate(prefix + "MoveNext",
+        llvm::FunctionType::get(i1(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", f);
+            auto* doneBB = llvm::BasicBlock::Create(llvm_, "ll.none", f);
+            auto* advBB = llvm::BasicBlock::Create(llvm_, "ll.adv", f);
+            llvm::IRBuilder<> b(entry);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* nextF = b.CreateStructGEP(stTy, self, 3);
+            llvm::Value* cur = b.CreateLoad(ptrTy(), nextF);
+            llvm::Value* isNull = b.CreateICmpEQ(
+                cur, llvm::ConstantPointerNull::get(ptrTy()));
+            b.CreateCondBr(isNull, doneBB, advBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateRet(llvm::ConstantInt::getFalse(llvm_));
+            b.SetInsertPoint(advBB);
+            b.CreateStore(cur, b.CreateStructGEP(stTy, self, 2));  // current = cur
+            auto* nextFn = module_->getOrInsertFunction("bz_llist_node_next",
+                                                        nextFT).getCallee();
+            llvm::Value* nn = b.CreateCall(nextFT, nextFn, {cur});
+            b.CreateStore(nn, nextF);                              // next = next(cur)
+            b.CreateRet(llvm::ConstantInt::getTrue(llvm_));
+        });
+
+    // Current: load value of current_node and return by value.
+    auto* curFn = getOrCreate(prefix + "Current",
+        llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* cur = b.CreateLoad(
+                ptrTy(), b.CreateStructGEP(stTy, self, 2));
+            auto* valFn = module_->getOrInsertFunction("bz_llist_node_value_ptr",
+                                                       valFT).getCallee();
+            llvm::Value* vp = b.CreateCall(valFT, valFn, {cur});
+            b.CreateRet(b.CreateLoad(elemTy, vp));
+        });
+
+    // GetEnumerator: a FRESH enumerator over the same list, positioned before the
+    // first element (current = null, next = first node) — replays from the head.
+    auto* geFn = getOrCreate(prefix + "GetEnumerator",
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+            auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocC = module_->getOrInsertFunction("calloc", callocFT)
+                                .getCallee();
+            llvm::Value* clone = b.CreateCall(callocFT, callocC,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+            llvm::Value* vt = b.CreateLoad(ptrTy(),
+                b.CreateStructGEP(stTy, self, 0));
+            b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+            llvm::Value* lst = b.CreateLoad(ptrTy(),
+                b.CreateStructGEP(stTy, self, 1));
+            b.CreateStore(lst, b.CreateStructGEP(stTy, clone, 1));
+            auto* firstFn = module_->getOrInsertFunction("bz_llist_first_node",
+                                                         firstFT).getCallee();
+            llvm::Value* first = b.CreateCall(firstFT, firstFn, {lst});
+            b.CreateStore(first, b.CreateStructGEP(stTy, clone, 3));  // next
+            b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                          b.CreateStructGEP(stTy, clone, 2));         // current
+            b.CreateRet(clone);
+        });
+
+    // vtable: [0]=self-ptr sentinel, [1]=Dispose, [2]=MoveNext, [3]=Current,
+    // [4]=GetEnumerator (same 5-slot shape as the array wrapper, §29.11 #943).
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()), dispFn, mnFn, curFn, geFn};
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate and fill the enumerator: { vtable, list, current=null, next=first }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64((int64_t)stSz)}, "llenum");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(list, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                         builder_.CreateStructGEP(stTy, en, 2));  // current
+    auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+    llvm::Value* first = builder_.CreateCall(firstFn, {list}, "ll.first");
+    builder_.CreateStore(first, builder_.CreateStructGEP(stTy, en, 3));  // next
+    return en;
+}
+
+
 // §29.2 (#552): generate (or reuse) a standalone thunk function for an
 // expression-form property getter. The thunk signature is `retTy(ptr self)`,
 // matching the block-getter protocol of ensurePropertyBlockGetter.  We save
@@ -3289,6 +3443,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                      an == "Queue" || an == "OwnedQueue");
                 if (actualIsArray) {
                     v = wrapArrayAsIEnumerable(v, formalTy);
+                }
+                // #1069: (Owned)LinkedList<T> is node-based (bz_llist), not
+                // array-backed — it needs the node-walking wrapper instead.
+                else if (actualTy && isLinkedListTypeName(actualTy)) {
+                    v = wrapLinkedListAsIEnumerable(v, formalTy);
                 }
                 // §29.2 (#552): when a user class (implementing IEnumerable<T>)
                 // is passed to an IEnumerable<T> parameter, wrap it in a thin

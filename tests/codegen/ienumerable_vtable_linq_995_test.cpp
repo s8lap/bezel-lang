@@ -308,3 +308,62 @@ BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_disposed_once
         "    return Cell.n; "
         "  end Main; end C;"), 0);
 }
+
+// #1069: a node-based (Owned)LinkedList<T> passed as an IEnumerable<T> param and
+// iterated must work — via the node-walking wrapper (wrapLinkedListAsIEnumerable),
+// since a LinkedList is bz_llist-backed, not array-backed (it was SIGSEGV before).
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_linkedlist_as_ienumerable_param_1069) {
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedLinkedList<Item>")), 7);
+}
+BEZEL_TEST(ienumerable_vtable_linq_995, borrowing_linkedlist_as_ienumerable_param_1069) {
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("LinkedList<Item>")), 7);
+}
+
+// #1069: re-enumerating a LinkedList through IEnumerable replays from the head
+// (GetEnumerator resets the cursor) — two Sum() calls each see all elements.
+BEZEL_TEST(ienumerable_vtable_linq_995, linkedlist_as_ienumerable_reenumerates_1069) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Item>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var c: OwnedLinkedList<Item> := [new Item(3), new Item(4)]; "
+        "    var a: int := Sum(c); var b: int := Sum(c); return a * 10 + b; "
+        "  end Main; end C;"), 77);
+}
+
+// #1069 disposal: an OwnedLinkedList iterated through IEnumerable (twice) disposes
+// its owned elements exactly once (the wrapper shares the list — no double-free).
+BEZEL_TEST(ienumerable_vtable_linq_995, owned_linkedlist_as_ienumerable_disposed_once_1069) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Cell public static n: int := 0; public V: int := 0; "
+        "  public constructor(v: int) this.V := v; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Cell>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    do using var c: OwnedLinkedList<Cell> := [new Cell(3), new Cell(4)]; "
+        "       var t: int := Sum(c); var u: int := Sum(c); end; "
+        "    return Cell.n; "
+        "  end Main; end C;"), 0);
+}
+
+// #1069: an EMPTY LinkedList through IEnumerable yields no elements and does not
+// crash (exhaustion = next_node == null, handled on the first MoveNext).
+BEZEL_TEST(ienumerable_vtable_linq_995, empty_linkedlist_as_ienumerable_param_1069) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Item>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s + 99; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var c: OwnedLinkedList<Item> := []; return Sum(c); "
+        "  end Main; end C;"), 99);
+}

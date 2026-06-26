@@ -3161,6 +3161,16 @@ private:
     llvm::Value* wrapArrayAsIEnumerable(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
 
+    // #1069: wrap a (Owned)LinkedList<T> — node-based bz_llist, NOT array-backed —
+    // in the same vtable-backed enumerator the array wrapper produces, but walking
+    // nodes (bz_llist_first_node / node_next / node_value_ptr) instead of an index.
+    // The wrapper SHARES the list (cloning over the borrowed list pointer); a
+    // second for-in replays from the head (§29.11). Cursor encoding: next_node is
+    // the node MoveNext returns; current_node is what Current reads — no
+    // started-flag needed (exhaustion is next_node == null).
+    llvm::Value* wrapLinkedListAsIEnumerable(llvm::Value* list,
+                                             const sema::TypeRef* iEnumTy);
+
     // §29.2 (#552): wrap a user-class instance (implementing IEnumerable<T>)
     // in a type-specific vtable-backed enumerator compatible with the iterator
     // state machine protocol ([0]=td, [1]=Dispose, [2]=MoveNext→i1,
