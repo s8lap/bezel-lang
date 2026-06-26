@@ -552,6 +552,7 @@ set(BEZEL_TEST_SOURCES
     codegen/bug_453_454_455_test.cpp
     codegen/owned_dict_disposal_test.cpp
     codegen/fresh_owned_receiver_disposal_1039_test.cpp
+    codegen/owned_local_reassign_disposal_913_1054_test.cpp
     codegen/owned_dict_field_value_dispose_893_894_test.cpp
     codegen/dict_clear_test.cpp
     codegen/dict_get_or_add_test.cpp

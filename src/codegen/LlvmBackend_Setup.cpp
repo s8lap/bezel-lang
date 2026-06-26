@@ -11428,6 +11428,48 @@ const sema::TypeRef* Emitter::taskTypeOfLocal(const ast::LocalDecl* ld) {
 }
 
 
+void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
+                                              llvm::Value* addr,
+                                              llvm::Type* elemTy,
+                                              llvm::Value* newVal) {
+    // §28.7 (#913/#1054): reassigning an owned class LOCAL must dispose the
+    // displaced value before overwriting (the class analog of the string/
+    // closure/box/owned-collection field-store helpers). Sound owned-detection:
+    // the target must be a plain local variable that `unwindOwnedLocalClass`
+    // classifies as a definitely-owned plain class/interface local (`new C()` /
+    // `owned`-returning initializer). That EXCLUDES a borrow-initialized local,
+    // a collection/task/subscription local, and any param (borrow OR owned — a
+    // ParameterSymbol is not a LocalDecl), so a borrowed value owned elsewhere
+    // is never disposed here (no double-free). The scope-end / explicit-dispose
+    // path re-loads the slot and disposes the NEW value; here we dispose the OLD
+    // one — exactly once each.
+    if (!addr) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return;  // field / index / static target — not a plain local
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc) return;  // a parameter (borrow or owned) — excluded
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld || !unwindOwnedLocalClass(ld)) return;  // not an owned plain class local
+    llvm::Value* old = builder_.CreateLoad(elemTy, addr, "reassign.old");
+    if (!old->getType()->isPointerTy()) return;
+    // Null-guard (a moved-out slot holds null) AND identity-guard (a self-
+    // assignment `c := c` would otherwise dispose the value being stored → UAF).
+    llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* live = builder_.CreateICmpNE(old, nullp, "reassign.live");
+    llvm::Value* doDispose = live;
+    if (newVal && newVal->getType()->isPointerTy())
+        doDispose = builder_.CreateAnd(
+            live, builder_.CreateICmpNE(old, newVal, "reassign.diff"));
+    auto* dispBB = llvm::BasicBlock::Create(llvm_, "reassign.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "reassign.cont", currentFn_);
+    builder_.CreateCondBr(doDispose, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
+    emitDisposeAndReclaim(old);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
 const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
     if (ld->type) {
         if (auto* rt = ctx_.resolvedType(*ld->type)) {

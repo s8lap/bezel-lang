@@ -394,6 +394,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     handled = lowerOwnedCollectionFieldStore(*as->target, addr,
                                                              rhs);
                 if (!handled) {
+                    // §28.7 (#1054): reassigning an owned class local must dispose
+                    // the displaced old value before overwriting (the class analog
+                    // of the string/closure/box/owned-collection field-store helpers
+                    // above). No-op for a borrow local/param, an array element, a
+                    // ref param, a static/record field, or a non-class target (none
+                    // has an owned-class-local Disposal entry → no double-free).
+                    disposeDisplacedOwnedClassLocal(as->target.get(), addr,
+                                                    elemTy, rhs);
                     builder_.CreateStore(rhs, addr);
                     // §27.5 / #673: guarded-boxed (non-for-var) locals keep the
                     // original pre-boxing alloca in sync so pre-emitted code that
@@ -617,6 +625,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* res =
                         emitMethodCall(opMethod, args, /*baseQualified=*/false);
                     if (res) {
+                        // §28.7 (#913): `c++` ≡ `c := T.operator++(c)` — reassigning
+                        // an owned class local disposes the displaced old value
+                        // first (the operator already borrowed `cur` above, so it is
+                        // safe to dispose now, before the store). No-op for a borrow
+                        // local/param (no disposal entry → no double-free).
+                        disposeDisplacedOwnedClassLocal(inc->target.get(), addr,
+                                                        elemTy, res);
                         builder_.CreateStore(res, addr);
                         // §27.5 / #673: sync to original alloca.
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))

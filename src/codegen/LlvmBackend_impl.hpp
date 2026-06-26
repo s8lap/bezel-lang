@@ -5620,6 +5620,21 @@ private:
                                      llvm::Value* recvPtr,
                                      const sema::TypeRef* resultTy);
 
+    // #913 / #1054 / §28.7: dispose the displaced old value of an owned class
+    // local before a reassignment store overwrites it. Fires only when `target`
+    // is a plain LOCAL variable (IdentifierExpr → LocalSymbol → LocalDecl) that
+    // is a definitely-owned plain class/interface local (unwindOwnedLocalClass:
+    // `new C(...)` or an `owned`-returning initializer; collections/tasks/
+    // subscriptions/borrow-initialized locals and params all return null). A
+    // borrow local/param, a field/index/static target, or an owned param is NOT
+    // an owned plain class local here, so its old value is never disposed (no
+    // double-free). Null-guarded (a moved-out slot holds null) and identity-
+    // guarded (self-assignment `c := c` must not dispose the value it stores).
+    // Call immediately before `CreateStore(newVal, addr)`.
+    void disposeDisplacedOwnedClassLocal(const ast::Expr* target,
+                                         llvm::Value* addr, llvm::Type* elemTy,
+                                         llvm::Value* newVal);
+
     // #1039 / #1053: true if `e` is a FRESH owned-CLASS producer that transfers
     // a +1 the caller solely owns — a literal `new <heap class>()` or a call to
     // a method declared `): owned <heap class>`. A borrow-returning call (no
