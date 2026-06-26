@@ -4571,6 +4571,34 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 };
                 lp = toFP(lp); rp = toFP(rp);
             }
+            // #1047: a lifted decimal arithmetic with a mixed INTEGER operand
+            // (`decimal? + int`, or `int + decimal?`) must promote the integer
+            // operand to a `%bz.decimal` (§5.1 int→decimal widening) before the
+            // decimal-arith branch below, which stores both operands into decimal
+            // slots and calls bz_decimal_*. Without this the i32 was stored raw
+            // into a decimal slot → a garbage decimal that faults/overflows at
+            // runtime (`decimal? + 1` threw instead of yielding 6). Mirrors the
+            // non-nullable `toDecSlot` helper; covers both operand orders so the
+            // `lp == decimalStructType()` gate below sees a decimal `lp`.
+            {
+                bool lpDec = lp->getType() == decimalStructType();
+                bool rpDec = rp->getType() == decimalStructType();
+                auto intToDec = [&](llvm::Value* v,
+                                    const ast::Expr* e) -> llvm::Value* {
+                    const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+                    sema::PrimitiveType p =
+                        (t && t->kind == sema::TypeRef::Kind::Primitive)
+                            ? t->primitive : sema::PrimitiveType::Int;
+                    llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+                    emitIntToDecimal(v, p, slot);
+                    return builder_.CreateLoad(decimalStructType(), slot,
+                                               "lift.dec.int");
+                };
+                if (lpDec && rp->getType()->isIntegerTy())
+                    rp = intToDec(rp, bin.right.get());
+                else if (rpDec && lp->getType()->isIntegerTy())
+                    lp = intToDec(lp, bin.left.get());
+            }
             // §4.4 / §7.11 / fix #663: decimal? lifted arithmetic — the payload
             // of a decimal? struct is a %bz.decimal (itself a struct), not a scalar.
             // All decimal runtime functions take pointers; mirror the non-nullable

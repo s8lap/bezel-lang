@@ -535,3 +535,28 @@ BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_variable_int_default_null) {
     BEZEL_EXPECT_EQ(run(
         "var a: decimal? := null; var d: int := 7; return int(a ?? d);"), 7);
 }
+
+// #1047 / §5.1 / §7.11: lifted decimal arithmetic with a mixed INTEGER operand
+// (decimal? + int, or int + decimal?) must promote the int to a decimal struct
+// before the bz_decimal_* call. Previously the i32 was stored raw into a decimal
+// slot → a garbage decimal that faulted/overflowed at runtime (threw instead of
+// computing). decimal? + decimal? and the non-nullable decimal + int were fine.
+BEZEL_TEST(codegen_1047_decimal_nullable, decimal_plus_int_present) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := 5; return int((a + 1) ?? 99);"), 6);
+}
+BEZEL_TEST(codegen_1047_decimal_nullable, decimal_times_int) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := 5; return int((a * 2) ?? 99);"), 10);
+}
+BEZEL_TEST(codegen_1047_decimal_nullable, decimal_minus_int) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := 5; return int((a - 1) ?? 99);"), 4);
+}
+BEZEL_TEST(codegen_1047_decimal_nullable, int_plus_decimal_operand_order) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := 5; return int((1 + a) ?? 99);"), 6);
+}
+BEZEL_TEST(codegen_1047_decimal_nullable, decimal_null_plus_int_propagates_null) {
+    BEZEL_EXPECT_EQ(run("var a: decimal? := null; return int((a + 1) ?? 99);"), 99);
+}
+BEZEL_TEST(codegen_1047_decimal_nullable, decimal_nullable_both_unchanged) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: decimal? := 5; var b: decimal? := 3; return int((a + b) ?? 99);"), 8);
+}
