@@ -2736,7 +2736,19 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
                     llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
-                    return builder_.CreateTrunc(cnt64, i32(), "dict.cnt");
+                    llvm::Value* cnt =
+                        builder_.CreateTrunc(cnt64, i32(), "dict.cnt");
+                    // #1028: a `.Count` PROPERTY read is a borrow position — the
+                    // scalar count is fully computed above, so an UNBOUND fresh
+                    // `owned Dictionary` materializer receiver
+                    // (`src.ToDictionary(k).Count`) leaves the temporary otherwise
+                    // unreferenced and leaks. Reclaim it here via bz_dict_free,
+                    // mirroring the array-backed `.Count`/`.Length` path (#1006b
+                    // above). No-op unless the receiver is exactly that shape (a
+                    // bound/`move`d/aliased dict receiver is never matched → no
+                    // UAF / double-free).
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), obj, tt);
+                    return cnt;
                 }
             }
         }

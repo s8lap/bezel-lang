@@ -1190,3 +1190,25 @@ const char* kToDictPlainVarReclaimed_1028 =
 BEZEL_TEST(linq_refcount, todictionary_plain_var_reclaimed_1028) {
     expectValueAndLeakFree(kToDictPlainVarReclaimed_1028, 3);
 }
+
+// #1028 (property-discard): an UNBOUND `src.ToDictionary(...).Count` reads the
+// `.Count` PROPERTY off a fresh `owned Dictionary` materializer that is then
+// otherwise unreferenced. The dict-`.Count` lowering computed the scalar but —
+// unlike the array-backed `.Count`/`.Length` path (#1006b) and the `.Count()`
+// METHOD form (#1013) — never reclaimed the temporary, so the dict struct +
+// entries leaked. The fix routes the property path through
+// freeUnboundOwnedBorrowingArrayTemp (bz_dict_free), mirroring the array path.
+// Value 3; LSan-clean. A bound / `using var` dict receiver is never matched
+// (no double-free).
+const char* kToDictPropertyDiscardReclaimed_1028 =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var src := new OwnedArray<int>(); "
+    "    src.Add(1); src.Add(2); src.Add(3); "
+    "    return src.ToDictionary((x: int) => x).Count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, todictionary_property_discard_reclaimed_1028) {
+    expectValueAndLeakFree(kToDictPropertyDiscardReclaimed_1028, 3);
+}
