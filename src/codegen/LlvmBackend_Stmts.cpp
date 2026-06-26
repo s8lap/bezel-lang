@@ -1285,7 +1285,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (dynamic_cast<const ast::BreakStmt*>(&s)) {
         if (!loopStack_.empty()) {
             emitLoopDisposals(loopStack_.back().scopeDepth);
-            if (!finallyStack_.empty()) {
+            // #1083 / §31.2: route through the finally ONLY when the break EXITS
+            // the try — i.e. the target loop was already open at try-entry (the
+            // try is nested inside the loop). A loop opened INSIDE the try body
+            // (loopStack_.size() > loopDepthAtEntry) is intra-try: break it
+            // directly, leaving the finally to run later when the try exits.
+            // Routing such a break through the finally skipped the rest of the
+            // try body and, with the mode slot still set, re-ran the finally.
+            if (!finallyStack_.empty() &&
+                loopStack_.size() <= finallyStack_.back().loopDepthAtEntry) {
                 auto& fr = finallyStack_.back();
                 builder_.CreateStore(builder_.getInt32(2), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
@@ -1299,7 +1307,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
         if (!loopStack_.empty()) {
             emitLoopDisposals(loopStack_.back().scopeDepth);
-            if (!finallyStack_.empty()) {
+            // #1083: as above — a continue of a loop opened inside the try is
+            // intra-try; only a continue that exits the try routes via finally.
+            if (!finallyStack_.empty() &&
+                loopStack_.size() <= finallyStack_.back().loopDepthAtEntry) {
                 auto& fr = finallyStack_.back();
                 builder_.CreateStore(builder_.getInt32(3), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
@@ -1543,6 +1554,10 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         FinallyFrame frame{finNormalBB, exitModSlot, retValSlot,
                            retTy, afterBB, loopBreakBB, loopContBB};
         frame.asyncRetSlot = asyncRetSlot;
+        // #1083: remember how many loops were already open at try-entry. A
+        // break/continue of a loop opened INSIDE the try body must not route
+        // through this finally (see the break/continue handlers).
+        frame.loopDepthAtEntry = loopStack_.size();
         finallyStack_.push_back(frame);
         // §29.7 (#623): track the AST finally-body alongside the frame so
         // a yield inside this try can snapshot the chain for Dispose.

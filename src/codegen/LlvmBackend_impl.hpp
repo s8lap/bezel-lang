@@ -879,6 +879,13 @@ private:
         llvm::BasicBlock* afterBB;      // continuation after the try
         llvm::BasicBlock* breakBB;      // outer loop break target at try-entry time
         llvm::BasicBlock* contBB;       // outer loop continue target at try-entry time
+        // #1083 / §31.2: loopStack_ size at try-entry. A break/continue whose
+        // target loop was pushed INSIDE the try body (loopStack_.size() >
+        // loopDepthAtEntry) stays within the try — it must jump straight to the
+        // loop target WITHOUT routing through this finally (the finally runs
+        // later, when the try itself exits). Only a break/continue that EXITS
+        // the try (target loop at/below this depth) routes through the finally.
+        std::size_t loopDepthAtEntry = 0;
         // #721 C1: an async method's `return` exits via emitAsyncComplete, not a
         // function `ret`, so its unwrapped result value can't ride retValSlot
         // (typed as the void Resume return). This slot (typed asyncResultTy_)
