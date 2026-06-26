@@ -122,3 +122,45 @@ BEZEL_TEST(generic_state_machine_method_1060_1061, nongeneric_iterator_regressio
         "    return s; "
         "  end Main; end C;"), 20);
 }
+
+// #1062: consuming a generic state-machine specialization INSIDE another state
+// machine. The specialization is built LAZILY, mid-emission of the outer
+// machine's body; emitResumeDispatch runs its done-block callback
+// (→ emitAsyncComplete) before publishing smStateStruct_/smSelf_, so without
+// resetting those scalars to their fresh (null) top-level values the spec's own
+// mn.done emitted a GEP/free of the OUTER frame (%async.Run / the outer resume's
+// arg) — a cross-function reference ("Referring to an argument in another
+// function") IR-verification failure. buildSpecializedMethodFn now clears the SM
+// scalars before routing to the helper, so the spec starts like a top-level
+// method.
+
+// Awaiting a generic async method inside another async method.
+BEZEL_TEST(generic_state_machine_method_1060_1061, await_generic_async_in_async_1062) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static async method Echo<T>(v: T): Task<T> return v; end Echo; "
+        "  public static async method Run(): Task<int> "
+        "    var a: int := await Echo<int>(20); "
+        "    var b: int := await Echo<int>(22); "
+        "    return a + b; "
+        "  end Run; "
+        "  public static method Main(): int return Run().Result; end Main; end C;"),
+        42);
+}
+
+// Consuming a generic iterator inside another (non-generic) iterator.
+BEZEL_TEST(generic_state_machine_method_1060_1061, generic_iterator_in_iterator_1062) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Inner<T>(n: int): IEnumerable<int> "
+        "    for var i in 1..n do yield return i; end; "
+        "  end Inner; "
+        "  public static method Outer(): IEnumerable<int> "
+        "    for var x in Inner<bool>(3) do yield return x * 10; end; "
+        "  end Outer; "
+        "  public static method Main(): int "
+        "    var s: int := 0; "
+        "    for var y in Outer() do s := s + y; end; "
+        "    return s; "
+        "  end Main; end C;"), 60);
+}

@@ -11322,6 +11322,33 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     auto savedSmAllocaToField = std::move(smAllocaToField_);
     auto savedSmIterEnumFrames = std::move(smIterEnumFramesAtState_);
     auto savedAsyncHandlerSpill = std::move(asyncHandlerSpillSlots_);
+    // #1062: RESET the SM scalars to their fresh top-level values before the
+    // helper runs — saving alone is not enough. emitResumeDispatch
+    // (LlvmBackend_Iterators.cpp) runs its `emitDone` callback (→ emitAsyncComplete)
+    // BEFORE it publishes smStateStruct_/smSelf_, so emitDone reads whatever they
+    // were on entry. At top level they are null (cleared after the previous SM
+    // method), so the fall-off emitAsyncComplete is a guarded no-op. For a spec
+    // built mid-emission of an OUTER state machine they would otherwise still hold
+    // the outer frame (e.g. %async.Run / the outer resume's self arg), so the
+    // spec's own mn.done would GEP the outer frame and free the outer's arg — a
+    // cross-function reference ("Referring to an argument in another function").
+    // Clearing them makes the lazy spec emission start exactly like a top-level
+    // method; the helper republishes the spec's own frame. (The containers above
+    // are already emptied by the std::move.)
+    smKind_ = SuspendKind::Yield;
+    smStateStruct_ = nullptr;
+    smSelf_ = nullptr;
+    smStateGEP_ = nullptr;
+    smDoneBB_ = nullptr;
+    smNextSuspendState_ = 0;
+    iterCurrentValField_ = 0;
+    iterElemTy_ = nullptr;
+    asyncOuterTaskField_ = 0;
+    asyncPendingTaskField_ = 0;
+    asyncSpillPtrField_ = 0;
+    asyncResumeFn_ = nullptr;
+    asyncResultTy_ = nullptr;
+    asyncResultSemaType_ = nullptr;
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
