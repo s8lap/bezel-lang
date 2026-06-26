@@ -2598,7 +2598,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     }
                     (void)lam;
                 }
+                // #1051 / §5.1: target-type an unsuffixed integer literal
+                // argument to a `uint`/`long`/`ulong` parameter, so a literal
+                // larger than `int.MaxValue` widens to the parameter type rather
+                // than being rejected — mirroring the variable-initializer hint
+                // (#184). Reset to None for any other parameter type so a too-
+                // large literal for an `int` parameter still rejects.
+                PrimitiveType savedArgHint = currentLiteralWideningHint_;
+                currentLiteralWideningHint_ = PrimitiveType::None;
+                if (calleeMd2 && pos2 < calleeMd2->params.size() &&
+                    calleeMd2->params[pos2].type) {
+                    if (auto* prt = ctx_.resolvedType(
+                            *calleeMd2->params[pos2].type)) {
+                        if (prt->kind == TypeRef::Kind::Primitive &&
+                            (prt->primitive == PrimitiveType::Long ||
+                             prt->primitive == PrimitiveType::ULong ||
+                             prt->primitive == PrimitiveType::UInt))
+                            currentLiteralWideningHint_ = prt->primitive;
+                    }
+                }
                 visitExpr(*a.value);
+                currentLiteralWideningHint_ = savedArgHint;
                 pendingLambdaParamType_ = savedPending;
                 pendingLambdaReturnType_ = savedLamRet;
                 pendingLambdaParamTypes_ = savedLamParams;
@@ -2705,7 +2725,41 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     currentScope_->names[id->name] = lsym;
                 }
             }
+            // #1051 / §5.1: target-type an unsuffixed integer literal constructor
+            // argument to a `uint`/`long`/`ulong` parameter (an explicit ctor
+            // parameter, or a positional-record field), so a literal > int.MaxValue
+            // widens instead of being rejected. Reset to None otherwise so a too-
+            // large literal for an `int` field still rejects.
+            PrimitiveType savedNewHint = currentLiteralWideningHint_;
+            currentLiteralWideningHint_ = PrimitiveType::None;
+            {
+                const ast::Type* paramTy = nullptr;
+                if (ctorDecl && posn < ctorDecl->params.size() &&
+                    ctorDecl->params[posn].type)
+                    paramTy = ctorDecl->params[posn].type.get();
+                else if (ne->type) {
+                    if (auto* rt = ctx_.resolvedType(*ne->type))
+                        if (rt->kind == TypeRef::Kind::Named && rt->declaration)
+                            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                    rt->declaration->decl))
+                                if (td->hasPositionalFields &&
+                                    posn < td->positionalFields.size() &&
+                                    td->positionalFields[posn].type)
+                                    paramTy =
+                                        td->positionalFields[posn].type.get();
+                }
+                if (paramTy) {
+                    if (auto* prt = ctx_.resolvedType(*paramTy)) {
+                        if (prt->kind == TypeRef::Kind::Primitive &&
+                            (prt->primitive == PrimitiveType::Long ||
+                             prt->primitive == PrimitiveType::ULong ||
+                             prt->primitive == PrimitiveType::UInt))
+                            currentLiteralWideningHint_ = prt->primitive;
+                    }
+                }
+            }
             if (a.value) visitExpr(*a.value);
+            currentLiteralWideningHint_ = savedNewHint;
             ++posn;
         }
     } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {

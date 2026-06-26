@@ -191,3 +191,37 @@ BEZEL_TEST(sema_literal, large_hex_literal_diagnosed) {
         "module M; class C public method M() _ := 0xFFFFFFFF; end M; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// #1051 / §5.1: an unsuffixed integer literal > int.MaxValue passed as an
+// argument to a `uint`/`long`/`ulong` parameter (method, explicit constructor,
+// or positional-record field) is target-typed to the parameter and widened,
+// rather than rejected with "does not fit in int" (mirrors the variable-init
+// hint, #184). A too-large literal for an `int` parameter still rejects.
+namespace {
+bool semaHasErrors(std::string_view src) {
+    auto r = parseSemaAll(src);
+    return r.diagnostics.hasErrors();
+}
+}  // namespace
+BEZEL_TEST(sema_expr_lit, literal_widens_to_uint_method_arg_1051) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Id(x: uint): uint return x; end Id; "
+        "public static method Main(): int var u: uint := Id(4000000000); "
+        "return (1 if (u > 1000) else 0); end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_widens_to_long_method_arg_1051) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Id(x: long): long return x; end Id; "
+        "public static method Main(): int var l: long := Id(5000000000); "
+        "return (1 if (l > 1000) else 0); end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_widens_to_positional_record_uint_field_1051) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; record P(V: uint); class C public static method Main(): int "
+        "var p := new P(4000000000); return (1 if (p.V > 1000) else 0); end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_too_large_for_int_param_still_rejected_1051) {
+    BEZEL_EXPECT_TRUE(semaHasErrors(
+        "module M; class C public static method Id(x: int): int return x; end Id; "
+        "public static method Main(): int return Id(5000000000); end Main; end C;"));
+}
