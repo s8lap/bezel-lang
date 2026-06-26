@@ -581,6 +581,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_using_var_owned_return_test.cpp
     codegen/event_raise_reentrant_dispose_908_test.cpp
     codegen/case_incompatible_type_pattern_test.cpp
+    codegen/case_relop_nullable_1074_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp

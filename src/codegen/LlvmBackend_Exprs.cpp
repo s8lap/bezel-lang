@@ -10009,6 +10009,41 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             return nullptr;
         }
 
+        // §19.3 (#1074): a relational pattern (`> 3`, `<= n`, …) on a nullable
+        // value — hasValue AND the unwrapped value satisfies the comparison. A
+        // null scrutinee never matches a relational pattern. Mirrors the
+        // non-nullable RelOpPattern handler below, applied to innerVal. Without
+        // this, a relational pattern on a nullable scrutinee fell through to the
+        // deferred null return → lowerCaseExpr bailed leaving `case.end`
+        // unterminated (the malformed-IR / verification crash).
+        if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(pat)) {
+            llvm::Value* rv =
+                rp->expr ? litAtWidth(*rp->expr, innerVal->getType()) : nullptr;
+            if (!rv && rp->expr)
+                rv = reconcile(lowerExpr(*rp->expr), innerVal->getType());
+            if (!rv) return nullptr;
+            bool fp = innerVal->getType()->isFloatingPointTy();
+            llvm::Value* cmp = nullptr;
+            if (rp->op == "<")
+                cmp = fp ? builder_.CreateFCmpOLT(innerVal, rv)
+                         : (scrutUnsigned ? builder_.CreateICmpULT(innerVal, rv)
+                                          : builder_.CreateICmpSLT(innerVal, rv));
+            else if (rp->op == ">")
+                cmp = fp ? builder_.CreateFCmpOGT(innerVal, rv)
+                         : (scrutUnsigned ? builder_.CreateICmpUGT(innerVal, rv)
+                                          : builder_.CreateICmpSGT(innerVal, rv));
+            else if (rp->op == "<=")
+                cmp = fp ? builder_.CreateFCmpOLE(innerVal, rv)
+                         : (scrutUnsigned ? builder_.CreateICmpULE(innerVal, rv)
+                                          : builder_.CreateICmpSLE(innerVal, rv));
+            else if (rp->op == ">=")
+                cmp = fp ? builder_.CreateFCmpOGE(innerVal, rv)
+                         : (scrutUnsigned ? builder_.CreateICmpUGE(innerVal, rv)
+                                          : builder_.CreateICmpSGE(innerVal, rv));
+            if (!cmp) return nullptr;
+            return builder_.CreateAnd(hasVal, cmp, "nv.relop.match");
+        }
+
         // #887 / §19.3: a record DESTRUCTURING pattern `T(x, y, ...)` on a
         // nullable record `T?` matches only when the value is present. Extract
         // the unwrapped record value (nullablePrimValue → element 1) and run the
