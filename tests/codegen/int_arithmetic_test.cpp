@@ -60,3 +60,47 @@ BEZEL_TEST(codegen_cg2, right_shift_arithmetic) {
 BEZEL_TEST(codegen_cg2, bitwise_not) {
     BEZEL_EXPECT_EQ(run("~0"), -1);
 }
+
+// #1049 / §5.1 / §6.2: a relational comparison between an unsigned value and a
+// non-negative constant must be UNSIGNED. The signedness used to require BOTH
+// operands unsigned, so `ulongVar > 1000` (unsigned vs a signed int literal)
+// used a SIGNED compare and gave the wrong result once the unsigned value's
+// high bit was set: `ulong 18e18 > 1000` returned false.
+namespace {
+int runBody(const std::string& body) {
+    auto r = bezel::test::runJit(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+BEZEL_TEST(codegen_1049_unsigned_compare, ulong_high_bit_gt_small_literal) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: ulong := 18000000000000000000; return (1 if (u > 1000) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1049_unsigned_compare, ulong_maxvalue_gt_small_literal) {
+    BEZEL_EXPECT_EQ(runBody("return (1 if (ulong.MaxValue > 1000) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1049_unsigned_compare, uint_high_bit_gt_small_literal) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: uint := 3000000000; return (1 if (u > 1000) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1049_unsigned_compare, ulong_high_bit_lt_small_literal_false) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: ulong := 18000000000000000000; return (1 if (u < 1000) else 0);"), 0);
+}
+BEZEL_TEST(codegen_1049_unsigned_compare, ulong_ge_small_literal) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: ulong := 18000000000000000000; return (1 if (u >= 5) else 0);"), 1);
+}
+// No-regression: a small unsigned vs a NEGATIVE constant keeps the signed
+// compare (`u > -5` is true), and small unsigned vs a larger positive literal
+// is still correctly false.
+BEZEL_TEST(codegen_1049_unsigned_compare, ulong_small_gt_negative_literal) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: ulong := 10; return (1 if (u > 0 - 5) else 0);"), 1);
+}
+BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var u: uint := 5; return (1 if (u > 1000) else 0);"), 0);
+}

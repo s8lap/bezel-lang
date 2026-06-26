@@ -5415,14 +5415,34 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // CG4: integer comparisons → i1.
     if (op == "=") return builder_.CreateICmpEQ(l, r);
     if (op == "<>") return builder_.CreateICmpNE(l, r);
-    if (op == "<") return uns ? builder_.CreateICmpULT(l, r)
-                              : builder_.CreateICmpSLT(l, r);
-    if (op == ">") return uns ? builder_.CreateICmpUGT(l, r)
-                              : builder_.CreateICmpSGT(l, r);
-    if (op == "<=") return uns ? builder_.CreateICmpULE(l, r)
-                               : builder_.CreateICmpSLE(l, r);
-    if (op == ">=") return uns ? builder_.CreateICmpUGE(l, r)
-                               : builder_.CreateICmpSGE(l, r);
+    // #1049: a relational comparison must be UNSIGNED when one operand is an
+    // unsigned type and the other is a NON-NEGATIVE constant (§5.1: the constant
+    // fits and is treated as the unsigned type). `isUnsignedBinOperand` requires
+    // BOTH operands unsigned (correct for arithmetic signedness), so
+    // `ulongVar > 1000` — unsigned value vs a signed int literal — used a SIGNED
+    // compare and gave the wrong result once the unsigned value exceeded the
+    // signed max (its high bit set): `ulong 18e18 > 1000` returned false. Gate on
+    // the OTHER operand being a non-negative constant so a possibly-negative
+    // signed operand keeps the signed compare (`u > -5` stays correct).
+    bool unsCmp = uns;
+    if (!unsCmp) {
+        bool lU = bin.left  && isUnsignedTargetExpr(*bin.left);
+        bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
+        auto nonNegConst = [](llvm::Value* v) {
+            auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v);
+            return ci && !ci->isNegative();
+        };
+        if ((lU && nonNegConst(r)) || (rU && nonNegConst(l)))
+            unsCmp = true;
+    }
+    if (op == "<") return unsCmp ? builder_.CreateICmpULT(l, r)
+                                 : builder_.CreateICmpSLT(l, r);
+    if (op == ">") return unsCmp ? builder_.CreateICmpUGT(l, r)
+                                 : builder_.CreateICmpSGT(l, r);
+    if (op == "<=") return unsCmp ? builder_.CreateICmpULE(l, r)
+                                  : builder_.CreateICmpSLE(l, r);
+    if (op == ">=") return unsCmp ? builder_.CreateICmpUGE(l, r)
+                                  : builder_.CreateICmpSGE(l, r);
     // CG4: logical and/or on i1. NOTE: §17 specifies short-circuit
     // evaluation; this eager form is observationally identical while
     // operands are side-effect-free (no calls lowered yet) — true
