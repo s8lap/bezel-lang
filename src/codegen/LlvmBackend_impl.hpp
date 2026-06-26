@@ -5606,15 +5606,16 @@ private:
                            llvm::Type*& elemTy,
                            llvm::Value** outRecvPtr = nullptr);
 
-    // #1039 / §28.3: a fresh `new <class>()` used ONLY as a member/method-call
-    // receiver, where the extracted result is a primitive / enum / unit value
-    // (provably no reference or borrow into the receiver), leaves the temporary
-    // owned by nothing — it leaks. Dispose it here (idempotent vtable Dispose +
-    // reclaim block exactly once), null-guarded. A no-op for any other
-    // receiver/result shape, so a non-fresh or reference-yielding receiver is
-    // never disposed (no double-free, no UAF). `recvPtr` MUST be the
-    // already-lowered receiver pointer (never re-lowered — that would re-run
-    // the constructor).
+    // #1039 / #1053 / §28.3: a fresh owned-class PRODUCER used ONLY as a
+    // member/method-call receiver — a literal `new <class>()` (#1039) or a call
+    // to a method returning `owned <class>` (#1053-case-2) — where the extracted
+    // result is a primitive / enum / unit value (provably no reference or borrow
+    // into the receiver), leaves the temporary owned by nothing and it leaks.
+    // Dispose it here (idempotent vtable Dispose + reclaim block exactly once),
+    // null-guarded. A no-op for any other receiver/result shape — a non-fresh
+    // receiver, a borrow-returning call, or a reference-yielding result is never
+    // disposed (no double-free, no UAF). `recvPtr` MUST be the already-lowered
+    // receiver pointer (never re-lowered — that would re-run the producer).
     void disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                      llvm::Value* recvPtr,
                                      const sema::TypeRef* resultTy);

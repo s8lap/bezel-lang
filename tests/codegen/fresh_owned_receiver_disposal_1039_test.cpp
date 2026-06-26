@@ -237,4 +237,85 @@ BEZEL_TEST(fresh_owned_receiver_1039, class_reference_result_not_disposed) {
     BEZEL_EXPECT_EQ(lsan, 0);  // no double-free / use-after-free
 }
 
+// ---- #1053 case 2: a method-result owned PRODUCER used as a receiver. -------
+// `Make(): owned Foo` transfers a fresh +1; used only as a receiver of a value
+// member/method, the temporary leaks just like a `new` receiver. It is disposed
+// on the SAME non-reference-value restriction. A method WITHOUT an `owned`
+// return transfers no ownership (its result is a borrow) and must NEVER be
+// disposed (use-after-free / double-free of a value owned elsewhere).
+
+// A Foo with an owned-producer factory, a value field and a value method.
+std::string progProducer(const std::string& mainBody) {
+    return
+        "module M; "
+        "class Foo "
+        "  public static n: int := 0; "
+        "  public V: int := 7; "
+        "  public constructor() n := n + 1; end constructor; "
+        "  public method GetV(): int return 7; end GetV; "
+        "  destructor n := n - 1; end destructor; "
+        "end Foo; "
+        "class P "
+        "  public static method Make(): owned Foo return new Foo(); end Make; "
+        "  public static method Main(): int " + mainBody + " end Main; "
+        "end P;";
+}
+
+// `Make().V` (owned-producer field read) and `Make().GetV()` (method call) —
+// each producer temp is disposed exactly once (n=0), leak-free.
+BEZEL_TEST(fresh_owned_receiver_1039, owned_producer_value_field_disposed_1053) {
+    expectDisposedAndLeakFree(
+        progProducer("do var v: int := Make().V; end; return Foo.n;"), 0);
+}
+BEZEL_TEST(fresh_owned_receiver_1039, owned_producer_value_method_disposed_1053) {
+    expectDisposedAndLeakFree(
+        progProducer("do var v: int := Make().GetV(); end; return Foo.n;"), 0);
+}
+BEZEL_TEST(fresh_owned_receiver_1039, owned_producer_two_temps_disposed_1053) {
+    expectDisposedAndLeakFree(
+        progProducer("do var a: int := Make().V; var b: int := Make().GetV(); "
+                     "end; return Foo.n;"), 0);
+}
+
+// CRITICAL EXCLUSION: a borrow-returning method (no `owned`) used as a receiver
+// must NOT be disposed. `Self(): Node return this;` returns a borrow of the
+// receiver; disposing it would double-free the bound `using var`. n=0 with no
+// double-free / use-after-free.
+BEZEL_TEST(fresh_owned_receiver_1039, borrow_returning_receiver_not_disposed_1053) {
+    std::string src =
+        "module M; "
+        "class Node public static n: int := 0; public V: int := 7; "
+        "  public constructor() n := n + 1; end constructor; "
+        "  public method Self(): Node return this; end Self; "
+        "  destructor n := n - 1; end destructor; "
+        "end Node; "
+        "class P public static method Main(): int "
+        "  do using var nd := new Node(); var v: int := nd.Self().V; end; "
+        "  return Node.n; end Main; end P;";
+    expectDisposedAndLeakFree(src, 0);  // nd disposed once; Self() borrow not freed
+}
+
+// An owned-producer receiver whose result is a heap `string` (borrows the
+// producer's refcounted string) must NOT be disposed — no use-after-free.
+// (The producer leaks, which is sound; the load-bearing check is no UAF/DF.)
+BEZEL_TEST(fresh_owned_receiver_1039, owned_producer_string_result_not_disposed_1053) {
+    std::string src =
+        "module M; "
+        "class Foo public static n: int := 0; public Name: string; "
+        "  public constructor() n := n + 1; Name := $\"hi{n}x\"; end constructor; "
+        "  public method GetName(): string return Name; end GetName; "
+        "  destructor n := n - 1; end destructor; "
+        "end Foo; "
+        "class P "
+        "  public static method Make(): owned Foo return new Foo(); end Make; "
+        "  public static method Main(): int "
+        "    do var s: string := Make().Name; var len: int := s.Length; end; "
+        "    do var t: string := Make().GetName(); var l2: int := t.Length; end; "
+        "    return 7; end Main; end P;";
+    BEZEL_EXPECT_EQ(run(src), 7);
+    int lsan = runUnderLeakSanitizer(src, /*detectLeaks=*/false);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);  // no double-free / use-after-free
+}
+
 }  // namespace

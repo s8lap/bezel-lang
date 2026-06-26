@@ -3085,13 +3085,26 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
     // a member access or method call — never bound to a variable — is owned by
     // nothing and leaks. Dispose it after the value result has been extracted.
     if (!recvExpr || !recvPtr || !resultTy) return;
-    // The receiver must be a literal `new T(...)`: the only provably-fresh,
-    // untracked owned temporary. A variable / field / `this` / property
-    // receiver is never a NewExpr, so it is never disposed here (which would
-    // be a double-free / UAF). A method-result-bound owned receiver
-    // (`MakeFoo().Bar()`) is also excluded — fresh-owned-producer detection
-    // beyond `new` is deferred (see issue #1039).
-    if (!dynamic_cast<const ast::NewExpr*>(recvExpr)) return;
+    // The receiver must be a FRESH owned-class producer that transfers a +1 the
+    // caller solely owns — either a literal `new T(...)` (#1039) or a call to a
+    // method declared to return `owned T` (#1053-case-2). Both leave the caller
+    // the sole owner of a fresh temporary; used only as a receiver, it is bound
+    // to nothing and leaks. A variable / field / `this` / property receiver is
+    // neither (never disposed → no double-free). CRITICAL: a call WITHOUT an
+    // `owned` return transfers no ownership — its result is a BORROW (e.g.
+    // `return this.field`), and disposing it would free a value owned elsewhere
+    // (use-after-free); such calls are excluded by the `returnOwned` gate.
+    bool freshOwnedProducer = false;
+    if (dynamic_cast<const ast::NewExpr*>(recvExpr)) {
+        freshOwnedProducer = true;
+    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(recvExpr)) {
+        if (call->callee)
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*call->callee)))
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                    freshOwnedProducer = md->returnOwned;
+    }
+    if (!freshOwnedProducer) return;
     // The receiver type must be a heap CLASS: records/structs are value types
     // with no heap block or vtable disposer; interfaces/enums are not `new`-of-
     // class temporaries. A null declaration (builtin not exported as a TypeDecl)
