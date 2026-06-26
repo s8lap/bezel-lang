@@ -1248,3 +1248,16 @@ BEZEL_TEST(linq_refcount, for_in_todictionary_materializer_reclaimed_1055) {
         "  for var e in src.ToDictionary((x: int) => x) do sum := sum + e.Value; end; "
         "  return sum; end Main; end C;", 6);
 }
+
+// #1057: a generic-key Dictionary for-in exited via `break` frees the
+// per-iteration key boxes the increment block skipped (the boxes from the break
+// index onward). Before the fix those boxes leaked (bz_dict_keys_gen). Normal
+// completion frees nothing extra (no double-free).
+BEZEL_TEST(linq_refcount, for_in_dict_break_frees_remaining_key_boxes_1057) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<int, int>(); "
+        "  d[1] := 10; d[2] := 20; d[3] := 30; var n := 0; "
+        "  for var e in d do n := n + 1; if n = 2 then break; end; end; "
+        "  return n; end Main; end C;", 2);
+}

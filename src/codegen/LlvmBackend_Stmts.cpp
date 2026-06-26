@@ -3194,6 +3194,29 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     }
 
     builder_.SetInsertPoint(endBB);
+    // #1057: the increment block frees each per-iteration key box (string /
+    // generic keys are separately malloc'd), but a `break` out of the loop skips
+    // the boxes from the break index onward — they leak. Free the remaining
+    // boxes (idxSlot .. cnt) here so every box is reclaimed on EVERY exit. On
+    // normal completion idxSlot == cnt, so this loop frees nothing (no double-
+    // free of the boxes the increment block already freed).
+    if (isStringKey || useGen) {
+        auto* clCondBB = llvm::BasicBlock::Create(llvm_, "de.cl.cond", currentFn_);
+        auto* clBodyBB = llvm::BasicBlock::Create(llvm_, "de.cl.body", currentFn_);
+        auto* clEndBB  = llvm::BasicBlock::Create(llvm_, "de.cl.end",  currentFn_);
+        builder_.CreateBr(clCondBB);
+        builder_.SetInsertPoint(clCondBB);
+        llvm::Value* ci = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(builder_.CreateICmpSLT(ci, cnt), clBodyBB, clEndBB);
+        builder_.SetInsertPoint(clBodyBB);
+        llvm::Value* ckp = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), keysArr, ci));
+        builder_.CreateCall(freeFn, {ckp});
+        builder_.CreateStore(
+            builder_.CreateAdd(ci, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(clCondBB);
+        builder_.SetInsertPoint(clEndBB);
+    }
     builder_.CreateCall(freeFn, {keysArr});
     if (isStringKey)
         builder_.CreateCall(freeFn, {lensArr});
