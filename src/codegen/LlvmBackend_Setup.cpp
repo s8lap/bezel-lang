@@ -3078,6 +3078,72 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 }
 
 
+void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy) {
+    // #1039 / §28.3: a fresh owned class instance used ONLY as the receiver of
+    // a member access or method call — never bound to a variable — is owned by
+    // nothing and leaks. Dispose it after the value result has been extracted.
+    if (!recvExpr || !recvPtr || !resultTy) return;
+    // The receiver must be a literal `new T(...)`: the only provably-fresh,
+    // untracked owned temporary. A variable / field / `this` / property
+    // receiver is never a NewExpr, so it is never disposed here (which would
+    // be a double-free / UAF). A method-result-bound owned receiver
+    // (`MakeFoo().Bar()`) is also excluded — fresh-owned-producer detection
+    // beyond `new` is deferred (see issue #1039).
+    if (!dynamic_cast<const ast::NewExpr*>(recvExpr)) return;
+    // The receiver type must be a heap CLASS: records/structs are value types
+    // with no heap block or vtable disposer; interfaces/enums are not `new`-of-
+    // class temporaries. A null declaration (builtin not exported as a TypeDecl)
+    // is conservatively skipped — leak, but sound.
+    const sema::TypeRef* rt = ctx_.exprType(*recvExpr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    const auto* rtd =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!rtd || rtd->kind != ast::TypeDeclKind::Class) return;
+    // The extracted result must be a NON-REFERENCE value — provably free of any
+    // reference or borrow into the receiver: a numeric/bool/char/decimal
+    // primitive, an enum, or unit. EXCLUDED, because each may alias into the
+    // receiver: `string` and `object` (reference-typed primitives — a field /
+    // method result borrows the receiver's refcounted string or sub-object); a
+    // struct (could embed a borrow of a receiver sub-object); any class /
+    // interface result (a reference). Excluding these frees the temporary ONLY
+    // when nothing aliases it. (Bezel's borrow checker guarantees an instance
+    // method cannot escape `this` past the call when its result is such a
+    // value, so post-call disposal is sound — §15.3.)
+    bool valueResult = false;
+    if (resultTy->kind == sema::TypeRef::Kind::Unit) {
+        valueResult = true;
+    } else if (resultTy->kind == sema::TypeRef::Kind::Primitive &&
+               resultTy->primitive != sema::PrimitiveType::None &&
+               resultTy->primitive != sema::PrimitiveType::String &&
+               resultTy->primitive != sema::PrimitiveType::Object) {
+        valueResult = true;
+    } else if (resultTy->kind == sema::TypeRef::Kind::Named &&
+               resultTy->declaration) {
+        const auto* td =
+            dynamic_cast<const ast::TypeDecl*>(resultTy->declaration->decl);
+        if (td && td->kind == ast::TypeDeclKind::Enum) valueResult = true;
+    }
+    if (!valueResult) return;
+    // Dispose (idempotent vtable Dispose + reclaim exactly once). A fresh `new`
+    // is non-null, but null-guard for safety/uniformity (folded away for a
+    // provably-non-null pointer).
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        recvPtr, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* dispBB =
+        llvm::BasicBlock::Create(llvm_, "freshrecv.dispose", currentFn_);
+    auto* contBB =
+        llvm::BasicBlock::Create(llvm_, "freshrecv.cont", currentFn_);
+    builder_.CreateCondBr(isNull, contBB, dispBB);
+    builder_.SetInsertPoint(dispBB);
+    emitDisposeAndReclaim(recvPtr);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
 llvm::Function* Emitter::elementDisposerThunk() {
     // #362 / stdlib §4.5: a standalone `void(void*)` thunk that runs an owning
     // collection element's destructor via the element's own vtable (slot 2,

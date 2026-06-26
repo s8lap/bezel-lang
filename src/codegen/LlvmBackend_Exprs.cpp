@@ -3550,8 +3550,19 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
         llvm::Type* elemTy = nullptr;
-        if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
-            return builder_.CreateLoad(elemTy, addr);
+        llvm::Value* recvPtr = nullptr;
+        if (llvm::Value* addr = fieldAddr(*ma, elemTy, &recvPtr)) {
+            llvm::Value* val = builder_.CreateLoad(elemTy, addr);
+            // #1039: a fresh `new <class>().valueField` read leaves the receiver
+            // temp owned by nothing — dispose it now that the value is copied
+            // out (no-op unless the receiver is a fresh `new` of a heap class
+            // and the field result is a primitive/enum/unit value). Guarded by
+            // !diverged_ so the disposal's control flow is never emitted into a
+            // terminated block.
+            if (!diverged_)
+                disposeFreshNewReceiverTemp(ma->target.get(), recvPtr,
+                                            ctx_.exprType(e));
+            return val;
         }
         // #213: a qualified static-field read `Type.Count` — static
         // fields have no instance slot, so fieldAddr misses; read the

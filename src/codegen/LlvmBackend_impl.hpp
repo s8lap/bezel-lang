@@ -5599,9 +5599,25 @@ private:
 
     // CG8: address of a field access `obj.f`. Returns the GEP pointer and
     // sets `elemTy` to the field's type. Null if `ma` isn't a field
-    // access we can lower.
+    // access we can lower. #1039: when `outRecvPtr` is non-null and the
+    // receiver is a heap-class instance, it receives the lowered receiver
+    // pointer (so a value-read caller can dispose a fresh `new` temporary).
     llvm::Value* fieldAddr(const ast::MemberAccessExpr& ma,
-                           llvm::Type*& elemTy);
+                           llvm::Type*& elemTy,
+                           llvm::Value** outRecvPtr = nullptr);
+
+    // #1039 / §28.3: a fresh `new <class>()` used ONLY as a member/method-call
+    // receiver, where the extracted result is a primitive / enum / unit value
+    // (provably no reference or borrow into the receiver), leaves the temporary
+    // owned by nothing — it leaks. Dispose it here (idempotent vtable Dispose +
+    // reclaim block exactly once), null-guarded. A no-op for any other
+    // receiver/result shape, so a non-fresh or reference-yielding receiver is
+    // never disposed (no double-free, no UAF). `recvPtr` MUST be the
+    // already-lowered receiver pointer (never re-lowered — that would re-run
+    // the constructor).
+    void disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
+                                     llvm::Value* recvPtr,
+                                     const sema::TypeRef* resultTy);
 
     // CG6/CG9: a call whose callee resolves to a known method → direct
     // LLVM call with lowered positional arguments. An instance method

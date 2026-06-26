@@ -10727,6 +10727,24 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
 
+    // #1039 / §28.3: a fresh `new <class>().ValueMethod()` call leaves the
+    // receiver temporary owned by nothing — dispose it after the value result
+    // is produced. Instance methods only (args[0] = receiver). The explicit
+    // `.Dispose()` (§28.5) is excluded: it is the one method that drives the
+    // receiver's own disposal, so a second reclaim here could double-free a
+    // future `new`-bound-style reclaim path. The helper is otherwise a no-op
+    // unless the receiver is a fresh `new` of a heap class and the result is a
+    // primitive/enum/unit value (Bezel's borrow checker forbids `this`
+    // escaping such a call, so post-call disposal is sound — §15.3).
+    if (!diverged_ && !isStaticMethod(ms) && !args.empty() &&
+        ms->name != "Dispose") {
+        const ast::Expr* recvExpr = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get()))
+            recvExpr = ma->target.get();
+        disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call));
+    }
+
     return result;
 }
 

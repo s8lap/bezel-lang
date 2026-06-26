@@ -2661,7 +2661,7 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 
 
 llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
-                       llvm::Type*& elemTy) {
+                       llvm::Type*& elemTy, llvm::Value** outRecvPtr) {
     auto* ms = storageMemberOf(ctx_.exprSymbol(ma));
     // per §14.1/§14.2 (issue #505): when `ms` is null, sema did not resolve
     // the member access (e.g. `x.v` where `x` is an unannotated lambda param
@@ -2943,6 +2943,10 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     // and is dispatched correctly by lowerVirtualPropertyGet before reaching
     // this path.
     if (!obj->getType()->isPointerTy()) return nullptr;
+    // #1039: expose the lowered class-instance receiver pointer so a value-read
+    // caller can dispose a fresh `new <class>()` temporary after extracting a
+    // value result (otherwise the temp — owned by nothing — leaks).
+    if (outRecvPtr) *outRecvPtr = obj;
     // §28.2 v0.135 / issue #621: checked disposal mode guard for stored-field
     // access through a class receiver. Only class instances carry a per-object
     // disposed flag (records are value types with no disposal lifetime).
