@@ -106,3 +106,30 @@ BEZEL_TEST(async_using_var_await_dispose_910, method_level_using_var_across_awai
         "  end Main; "
         "end C;"), 0);
 }
+
+// #1122 / §30.5: awaiting a BOUND-LOCAL OwnedTask whose result is a built-in
+// OWNING collection (`OwnedArray<T>` — the result type of Task.WhenAllOwned)
+// must discharge the bound operand. Before the fix awaitTaskKind's resultIsClass
+// only recognized a result type with a user CLASS declaration, so an
+// OwnedTask<OwnedArray<Res>> (a built-in, declaration-less Named) was classified
+// NotTask and `var ot := …; await ot;` spuriously reported `ot` as "dropped
+// without disposal". OwnedArray<T> is a heap/reference type (stdlib §3.1), so
+// this is a valid Pattern B — the await consumes `ot` and the result is bound.
+BEZEL_TEST(async_using_var_await_dispose_910, await_bound_owntask_owning_collection_1122) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
+        "class C "
+        "  public static async method MakeArr(): OwnedTask<OwnedArray<Res>> "
+        "    var a := new OwnedArray<Res>(); a.Add(new Res(7)); return a; "
+        "  end MakeArr; "
+        "  public static async method Run(): Task<int> "
+        "    var ot := MakeArr(); "
+        "    using var arr := await ot; "          // ot consumed by the await
+        "    return arr[0].n; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    return await Run(); "
+        "  end Main; "
+        "end C;"), 7);
+}

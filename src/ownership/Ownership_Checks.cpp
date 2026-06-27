@@ -2899,9 +2899,25 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
     auto resultIsClass = [&]() -> bool {
         if (ot->genericArgs.empty() || !ot->genericArgs.front()) return false;
         const sema::TypeRef* arg = ot->genericArgs.front();
-        if (arg->kind != sema::TypeRef::Kind::Named || !arg->declaration)
-            return false;
-        return arg->declaration->kind == ast::TypeDeclKind::Class;
+        if (arg->kind != sema::TypeRef::Kind::Named) return false;
+        if (arg->declaration)
+            return arg->declaration->kind == ast::TypeDeclKind::Class;
+        // §30.5 / stdlib §3.1 (#1122): a built-in OWNING collection result
+        // (`OwnedArray<T>` etc. — the result type of `Task.WhenAllOwned`) is a
+        // heap/reference type that carries a disposal obligation, so an
+        // `OwnedTask<OwnedArray<T>>` is a valid Pattern B: its awaited result
+        // must be `using var`-bound and the awaited operand consumed. These
+        // resolve to a Named TypeRef with a NULL declaration (built-in), which
+        // the declaration-based check above misses — so the await was wrongly
+        // classified NotTask and the bound-local operand was not discharged.
+        if (arg->astNode && arg->astNode->name &&
+            arg->astNode->name->parts.size() == 1) {
+            std::string_view an = arg->astNode->name->parts.front();
+            return an == "OwnedArray" || an == "OwnedStack" ||
+                   an == "OwnedQueue" || an == "OwnedLinkedList" ||
+                   an == "OwnedDictionary" || an == "OwnedSet";
+        }
+        return false;
     };
     if (head == "Task") {
         if (ot->genericArgs.empty()) return AwaitTaskKind::UnitTask;
