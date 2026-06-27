@@ -5019,6 +5019,51 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         } else if (!isThis && n == 0) {
             // base() into a class whose own base still needs an implicit chain.
             emitImplicitBase(targetCls, currentThis_);
+        } else if (isThis && currentThis_) {
+            // #1087: `this(args)` chaining to the PRIMARY constructor of THIS
+            // class. A primary-ctor class (`class C(x: int)`) has no explicit
+            // ConstructorSymbol for its primary ctor, so ctorByArity returned
+            // null and the `base(...)` branches above don't apply. Reproduce the
+            // primary ctor's construction sequence: store each chained positional
+            // arg into its param-field (mirroring `new C(args)`,
+            // LlvmBackend_Exprs.cpp), run the base chain, then run the field
+            // initializers. The additional ctor body SKIPS emitOwnFieldInit for a
+            // `this(...)` delegation (expecting the chained ctor to run it), so
+            // without this nothing initialized the primary-ctor class — its
+            // positional params and field initializers all stayed calloc-zero.
+            llvm::StructType* st = classStruct(targetCls);
+            if (auto* td =
+                    dynamic_cast<const ast::TypeDecl*>(targetCls->decl)) {
+                bool allPositional = true;
+                for (const auto& a : call->args)
+                    if (!a.name.empty()) { allPositional = false; break; }
+                if (td->kind == ast::TypeDeclKind::Class &&
+                    td->hasPositionalFields && allPositional &&
+                    n == td->positionalFields.size()) {
+                    for (std::size_t pi = 0;
+                         pi < td->positionalFields.size(); ++pi) {
+                        const ast::Param& pf = td->positionalFields[pi];
+                        for (sema::Symbol* mm : targetCls->members) {
+                            auto* fs = dynamic_cast<sema::FieldSymbol*>(mm);
+                            if (!fs || fs->posParam != &pf) continue;
+                            auto pit = fieldIndex_.find(fs);
+                            if (pit == fieldIndex_.end()) break;
+                            if (!call->args[pi].value) break;
+                            llvm::Value* v = lowerExpr(*call->args[pi].value);
+                            if (!v) break;
+                            v = coerceNumericToType(
+                                v, st->getElementType(pit->second),
+                                isUnsignedTargetExpr(*call->args[pi].value));
+                            builder_.CreateStore(
+                                v, builder_.CreateStructGEP(st, currentThis_,
+                                                            pit->second));
+                            break;
+                        }
+                    }
+                }
+            }
+            emitImplicitBase(targetCls, currentThis_);
+            emitOwnFieldInit(targetCls, currentThis_, st);
         }
         return;
     }
