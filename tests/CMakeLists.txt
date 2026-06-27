@@ -598,6 +598,7 @@ set(BEZEL_TEST_SOURCES
     codegen/const_qualified_ref_1095_test.cpp
     codegen/operator_operand_order_1096_test.cpp
     codegen/static_inline_array_init_1098_test.cpp
+    codegen/throw_in_catch_guard_1097_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp

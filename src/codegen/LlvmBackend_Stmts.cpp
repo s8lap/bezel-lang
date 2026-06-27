@@ -1646,12 +1646,27 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
                 llvm::Value* g = lowerExpr(*arm.guard);
-                if (!g) g = builder_.getInt1(false);
-                // Guard returned normally (did not throw): restore the in-flight
-                // exception so a non-match continues matching / re-propagates
-                // with it. (The matched armBB clears the slot again below.)
-                builder_.CreateStore(exc, emitExcSlot());
-                builder_.CreateCondBr(g, armBB, nextBB);
+                if (diverged_) {
+                    // §31.2.1 / §31.5 (#1097): the guard expression ITSELF threw
+                    // (e.g. `catch E when throw new F()` — a `throw` is a
+                    // bottom-typed expression valid in any expression position).
+                    // The new exception supersedes the in-flight one and
+                    // propagates via the throw's own unwind branch, which already
+                    // terminated this prep block. Do NOT restore the exception or
+                    // branch on the throw's (poison) value — that produced a
+                    // `br ptr poison` malformed-IR crash. Reset the divergence
+                    // flag for the rest of the catch-dispatch chain; armBB/nextBB
+                    // become unreachable from this guard (harmless dead blocks).
+                    diverged_ = false;
+                } else {
+                    if (!g) g = builder_.getInt1(false);
+                    // Guard returned normally (did not throw): restore the
+                    // in-flight exception so a non-match continues matching /
+                    // re-propagates with it. (The matched armBB clears the slot
+                    // again below.)
+                    builder_.CreateStore(exc, emitExcSlot());
+                    builder_.CreateCondBr(g, armBB, nextBB);
+                }
             } else {
                 builder_.CreateBr(armBB);
             }
