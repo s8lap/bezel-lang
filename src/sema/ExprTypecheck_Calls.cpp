@@ -5406,6 +5406,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
+    // §15.1.2 (#1100): an inline array `[N]T` exposes ONLY `.Length` and the
+    // indexer `arr[i]` (with iteration via `for var x in arr`). It is a value
+    // type that does NOT implement `IEnumerable<T>` and CANNOT be extended
+    // (§26.2), so LINQ / IEnumerable operators (`.Count()`, `.Sum()`,
+    // `.Where()`, `.ToArray()`, …) — and any other arbitrary member — have no
+    // member to resolve on it. An InlineArray receiver yields no `targetType`
+    // below, so the `knownCompleteUserType` "no member" diagnostic never fired;
+    // the call then typed to nothing and codegen defaulted the result (Count→0,
+    // Sum→garbage, a bool result in a branch → an IR-verification crash). Reject
+    // any member on an InlineArray receiver other than `.Length` and the
+    // universal Object members (§8.1, synthesized on every type), directing the
+    // caller to materialize a heap `Array<T>`.
+    if (ma.target) {
+        if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+            if (recvTy->kind == TypeRef::Kind::InlineArray) {
+                const auto& mm = ma.member;
+                bool allowed =
+                    mm == "Length" ||
+                    mm == "ToString" || mm == "Equals" ||
+                    mm == "GetHashCode" || mm == "GetType";
+                if (!allowed) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("no member `") + std::string(mm) +
+                        "` on inline array type `[N]T`: inline arrays expose "
+                        "only `.Length` and the indexer `[i]`, and do not "
+                        "implement `IEnumerable<T>` (\xC2\xA7""15.1.2) nor admit "
+                        "extension methods (\xC2\xA7""26.2) — LINQ/IEnumerable "
+                        "operators are unavailable; materialize a heap "
+                        "`Array<T>` (iterate the slots into a fresh array) to "
+                        "use them");
+                    return;
+                }
+            }
+        }
+    }
     TypeSymbol* targetType = nullptr;
     // `this.X` — currentType_ takes precedence over name lookup so
     // we don't have to teach `this` to be an expression with type
