@@ -5557,6 +5557,31 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         }
     }
     } // end eitherNull2 guard
+    // §8.4 (#1106): `=`/`<>` on USER-CLASS-typed operands invokes the class's
+    // `Equals` (null-safe), never a raw pointer compare. Classes cannot overload
+    // `=`/`<>` (§25.2); they customize equality via an `Equals` override, and `=`
+    // must dispatch it. Route both operands through lowerObjectEquals (vtable
+    // kEqualsSlot dispatch — the override, or the default reference-identity
+    // thunk for a class with none, so a non-overriding class keeps ptr-compare
+    // semantics; null-safe on the receiver). Excludes a null-literal operand
+    // (`a = null` is the reference-equality-to-null form, handled by the scalar
+    // path below) and fires only when BOTH operands are user-class pointers
+    // (Object/interface/record/builtin handled elsewhere). Without this, `a = b`
+    // on a class with an overridden Equals did a raw ICmp ptr-compare and
+    // bypassed the override (defect 2).
+    if ((op == "=" || op == "<>") &&
+        l->getType()->isPointerTy() && r->getType()->isPointerTy()) {
+        auto isUserClassExpr = [&](const ast::Expr* e) -> bool {
+            if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) return false;
+            const sema::TypeRef* t = ctx_.exprType(*e);
+            return t && t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                   t->declaration->kind == ast::TypeDeclKind::Class;
+        };
+        if (isUserClassExpr(bin.left.get()) && isUserClassExpr(bin.right.get())) {
+            if (llvm::Value* eq = lowerObjectEquals(l, r))
+                return op == "=" ? eq : builder_.CreateNot(eq);
+        }
+    }
     // CG4: integer comparisons → i1.
     if (op == "=") return builder_.CreateICmpEQ(l, r);
     if (op == "<>") return builder_.CreateICmpNE(l, r);

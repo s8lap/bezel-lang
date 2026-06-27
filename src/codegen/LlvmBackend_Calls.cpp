@@ -9313,7 +9313,19 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 bool isIfaceRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
                     recvTy->declaration->kind == ast::TypeDeclKind::Interface;
-                if (isObjectRecv || isIfaceRecv) {
+                // #1106: a concrete CLASS receiver with NO Equals/GetHashCode
+                // override (the default §8.3 reference-identity / identity-hash)
+                // has no MethodSymbol, so the call reaches this ms==null fallback
+                // — route it through the same uniform vtable dispatch as an
+                // Object/interface receiver (a class WITH an override resolves a
+                // real MethodSymbol earlier and never reaches here). Without this
+                // the default Equals/GetHashCode on a class mis-lowered: a bare
+                // field load that returned false and crashed an `if` branch with
+                // `br i32` (defects 1 + 3). Mirrors the ToString gate above.
+                bool isNamedClassRecv =
+                    recvTy && recvTy->kind == K::Named && recvTy->declaration &&
+                    recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                if (isObjectRecv || isIfaceRecv || isNamedClassRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
                         llvm::Value* other = lowerExpr(*call.args[0].value);
