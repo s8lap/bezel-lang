@@ -1778,6 +1778,50 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
         }
     }
+    // §8.4 / §10 (#1137): enum comparison (`=`/`<>`/`<`/`<=`/`>`/`>=`) is an
+    // underlying-integer comparison between operands of the SAME enum type (spec
+    // §8.4 table: "Enum | Underlying integer comparison"). The operands are
+    // reduced to their underlying integers before any type check, so an
+    // `enum = int` or `enumA = enumB` (different enums) silently compiled as a
+    // raw int comparison. Require both operands to be the same enum: if either
+    // operand is an enum, the other must be the same enum (a non-enum or a
+    // different enum is a compile error). A `null` literal operand is exempt —
+    // null comparison of a nullable enum (`c = null`) is governed by §8.4's
+    // null-safe equality, not this rule.
+    if (op == "=" || op == "<>" || op == "<" || op == ">" ||
+        op == "<=" || op == ">=") {
+        const TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        const TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        auto enumOf = [&](const TypeRef* t) -> const TypeSymbol* {
+            if (t && t->kind == TypeRef::Kind::Named && t->declaration &&
+                t->declaration->kind == ast::TypeDeclKind::Enum)
+                return t->declaration;
+            return nullptr;
+        };
+        bool leftNull = be.left &&
+            dynamic_cast<const ast::NullLiteralExpr*>(be.left.get());
+        bool rightNull = be.right &&
+            dynamic_cast<const ast::NullLiteralExpr*>(be.right.get());
+        const TypeSymbol* le = enumOf(lt);
+        const TypeSymbol* re = enumOf(rt);
+        // Only enforce when BOTH operands have a RESOLVED type — an unresolved
+        // operand (e.g. `this` inside an enum method, or an error expression) is
+        // left to other diagnostics rather than risk a false positive.
+        if (lt && rt && !leftNull && !rightNull && (le || re) && le != re) {
+            std::string other = le ? (re ? std::string(re->name) : "a non-enum")
+                                   : "a non-enum";
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` compares enum `" +
+                std::string(le ? le->name : re->name) + "` with " +
+                (le && re ? ("a different enum `" + other + "`")
+                          : std::string("a non-enum operand")) +
+                " — an enum may be compared only with a value of the same enum "
+                "type (\xC2\xA7""8.4 / \xC2\xA7""10).");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+    }
     // §9.2/§8.3: `=` / `<>` on a body record that is not auto-equality-bearing
     // and that declares no equality of its own is a compile error at the use
     // site. "A body record is **not** auto-equality-bearing — and `=` on it

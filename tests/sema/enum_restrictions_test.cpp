@@ -6,6 +6,7 @@
 #include "test_harness.hpp"
 
 #include "sema/TypeResolution.hpp"
+#include "sema/ExprTypecheck.hpp"
 
 namespace {
 
@@ -103,4 +104,79 @@ BEZEL_TEST(sema_enum, auto_increment_overflow_rejected) {
     auto r = parseSemaAll(
         "module M; enum E: byte X := 255, Y; end E;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ── #1137 / §8.4 / §10: enum comparison operand type-checking ─────────────────
+// An enum may be compared (=/<>/</<=/>/>=) only with a value of the SAME enum;
+// the operands are reduced to their underlying integers, so without an operand
+// type-check `enum = int` / `enumA = enumB` silently compiled as an int compare.
+
+namespace {
+// Full sema pipeline (resolveTypes + expression typechecking) — the enum
+// comparison check lives in the expression-typecheck pass, which parseSemaAll's
+// resolve-only path does not run.
+bezel::test::SemaResult parseSemaFull(std::string_view src) {
+    auto r = bezel::test::parseAndCollect(src);
+    if (r.sourceFile && r.ctx) {
+        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
+        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+}  // namespace
+
+// enum compared with an int literal is rejected (#1137).
+BEZEL_TEST(sema_enum, enum_vs_int_comparison_rejected_1137) {
+    auto r = parseSemaFull(
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  if Color.Green = 1 then return 1; end; return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// enum compared with a DIFFERENT enum is rejected (#1137).
+BEZEL_TEST(sema_enum, enum_vs_different_enum_comparison_rejected_1137) {
+    auto r = parseSemaFull(
+        "module M; enum Color Red, Green; end Color; enum Size Small, Big; end Size; "
+        "class C public static method Main(): int "
+        "  if Color.Red = Size.Small then return 1; end; return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Relational enum-vs-int is also rejected (#1137).
+BEZEL_TEST(sema_enum, enum_vs_int_relational_rejected_1137) {
+    auto r = parseSemaFull(
+        "module M; enum Color Red, Green; end Color; "
+        "class C public static method Main(): int "
+        "  if Color.Red < 1 then return 1; end; return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Same-enum comparison stays accepted (#1137 must not over-reject).
+BEZEL_TEST(sema_enum, same_enum_comparison_accepted_1137) {
+    auto r = parseSemaFull(
+        "module M; enum Color Red, Green; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color := Color.Green; "
+        "  if c = Color.Green then return 1; end; return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// `this = E.X` inside an enum method stays accepted (`this` is the same enum).
+BEZEL_TEST(sema_enum, enum_method_this_comparison_accepted_1137) {
+    auto r = parseSemaFull(
+        "module M; enum Status Ok, Error; "
+        "  public method IsOk(): bool => this = Status.Ok; end Status; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A nullable enum compared with `null` stays accepted (§8.4 null-safe equality).
+BEZEL_TEST(sema_enum, nullable_enum_vs_null_accepted_1137) {
+    auto r = parseSemaFull(
+        "module M; enum Color Red, Green; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := null; "
+        "  if c = null then return 1; end; return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
