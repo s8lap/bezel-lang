@@ -1997,6 +1997,101 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             "(`Drain`/`PopAt`/`PopFirst`/`PopLast`) to transfer "
                             "ownership out, or use a borrowing `Array<T>`");
                     }
+                    // §22.5 / §4.x (#920 / #1103-B): a method call on an OWNING
+                    // CONTAINER collection whose name is not part of that family's
+                    // stdlib surface (nor a universal Object member, a borrowing
+                    // LINQ operator, or the enumerable protocol) was silently
+                    // ACCEPTED and mis-lowered — e.g. `arr.TakeAt(0)` (nonexistent),
+                    // `arr.Set(0, v)` (`Set` is no collection's method), an arbitrary
+                    // `arr.Frobnicate()`. Reject any name outside a GENEROUS union of
+                    // every valid owning-collection method (over-inclusion never
+                    // over-rejects — a name valid on a SIBLING owning type is allowed
+                    // here too; that finer per-type precision is a follow-up). Scoped
+                    // to the six owning CONTAINER collections (not OwnedBuffer / the
+                    // owning iterators, whose surfaces differ). Only a DIRECT owning
+                    // receiver triggers it; a LINQ query result has an IEnumerable
+                    // receiver (colName != Owned*) and is unaffected.
+                    bool isOwningContainer =
+                        colName == "OwnedArray" || colName == "OwnedStack" ||
+                        colName == "OwnedQueue" || colName == "OwnedLinkedList" ||
+                        colName == "OwnedSet" || colName == "OwnedDictionary";
+                    if (isOwningContainer) {
+                        auto allowedOwningMethod = [](std::string_view mm) -> bool {
+                            return
+                                // §4.x native owning-collection surface (union over
+                                // OwnedArray/Stack/Queue/LinkedList/Set/Dictionary).
+                                mm == "Add" || mm == "AddRange" || mm == "AddFirst" ||
+                                mm == "AddLast" || mm == "AddBefore" ||
+                                mm == "AddAfter" || mm == "Insert" ||
+                                mm == "Remove" || mm == "RemoveAt" ||
+                                mm == "RemoveFirst" || mm == "RemoveLast" ||
+                                mm == "RemoveNode" || mm == "Clear" ||
+                                mm == "Contains" || mm == "ContainsKey" ||
+                                mm == "IndexOf" || mm == "Find" || mm == "Sort" ||
+                                mm == "Reverse" || mm == "Push" || mm == "Pop" ||
+                                mm == "Peek" || mm == "TryPop" || mm == "TryPeek" ||
+                                mm == "Enqueue" || mm == "Dequeue" ||
+                                mm == "TryDequeue" || mm == "PopAt" ||
+                                mm == "PopFirst" || mm == "PopLast" ||
+                                mm == "TryPopFirst" || mm == "TryPopLast" ||
+                                mm == "PopValue" || mm == "TryPopValue" ||
+                                mm == "TryAdd" || mm == "Take" || mm == "TryTake" ||
+                                mm == "Get" || mm == "Set" || mm == "TryGetValue" ||
+                                mm == "GetOrAdd" ||
+                                mm == "UnionWith" || mm == "IntersectWith" ||
+                                mm == "ExceptWith" || mm == "IsSubsetOf" ||
+                                mm == "IsSupersetOf" || mm == "Drain" ||
+                                mm == "DrainAndProcess" ||
+                                // common property/length accessors also usable in
+                                // `.Count()` method form.
+                                mm == "Count" || mm == "Capacity" ||
+                                mm == "Length" || mm == "IsEmpty" ||
+                                mm == "IsReadOnly" || mm == "Keys" ||
+                                mm == "Values" || mm == "First" || mm == "Last" ||
+                                mm == "FirstNode" || mm == "LastNode" ||
+                                // universal Object members (§8.1) + IDisposable.
+                                mm == "ToString" || mm == "Equals" ||
+                                mm == "GetHashCode" || mm == "GetType" ||
+                                mm == "Dispose" ||
+                                // enumerable protocol (§4.12/§4.13).
+                                mm == "GetEnumerator" ||
+                                mm == "GetAsyncEnumerator" ||
+                                mm == "MoveNext" || mm == "MoveNextAsync" ||
+                                // borrowing LINQ operators (§5) — valid on any
+                                // IEnumerable, incl. an owning collection. Included
+                                // generously; the materializer copy-forms
+                                // (ToArray/ToSet/ToDictionary) are rejected above for
+                                // owning receivers but kept here so this check does
+                                // not double-report them.
+                                mm == "Where" || mm == "Select" ||
+                                mm == "SelectMany" || mm == "Skip" ||
+                                mm == "SkipWhile" || mm == "TakeWhile" ||
+                                mm == "Distinct" || mm == "OrderBy" ||
+                                mm == "OrderByDescending" || mm == "ThenBy" ||
+                                mm == "ThenByDescending" || mm == "GroupBy" ||
+                                mm == "Aggregate" || mm == "All" || mm == "Any" ||
+                                mm == "Average" || mm == "Sum" || mm == "Min" ||
+                                mm == "Max" || mm == "FirstOrNull" ||
+                                mm == "LastOrNull" || mm == "Single" ||
+                                mm == "SingleOrNull" || mm == "ElementAt" ||
+                                mm == "Concat" || mm == "Append" || mm == "Union" ||
+                                mm == "Intersect" || mm == "Except" || mm == "Zip" ||
+                                mm == "SequenceEqual" || mm == "OfType" ||
+                                mm == "Reversed" || mm == "Sorted" || mm == "Join" ||
+                                mm == "ForEach" || mm == "AsReadOnly" ||
+                                mm == "ToArray" || mm == "ToSet" ||
+                                mm == "ToDictionary" || mm == "ToList";
+                        };
+                        if (!allowedOwningMethod(m)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `" + std::string(colName) +
+                                "<T>` (§22.5 / §4.x) — it is not part of the owning "
+                                "collection's surface, a universal Object member, or "
+                                "a LINQ operator");
+                        }
+                    }
                     // Array/Stack/Queue/Set/LinkedList methods
                     bool isArrLike = colName == "Array" || colName == "OwnedArray" ||
                         colName == "Stack" || colName == "OwnedStack" ||

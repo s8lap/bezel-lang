@@ -240,6 +240,45 @@ BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
         "end Main; end C;", 2);
 }
 
+// §22.5 / §4.x (#1103-B / #920): a method call on a direct owning-collection
+// receiver whose name is outside the owning surface (nor a universal Object
+// member / LINQ operator / enumerable protocol) is rejected — `TakeAt`
+// (nonexistent), an arbitrary `Frobnicate` (was silently accepted + mis-lowered
+// to a wrong value).
+BEZEL_TEST(array_span_549, ownedarray_unknown_method_takeat_rejected_1103b) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); a.Add(7); "
+        "  return a.TakeAt(0); "
+        "end Main; end C;"));
+}
+
+BEZEL_TEST(array_span_549, ownedarray_unknown_method_arbitrary_rejected_1103b) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); a.Add(7); "
+        "  a.Frobnicate(); "
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// #1103-B regression: the real owning-collection surface stays accepted — the
+// element accessor `Get`, `Count`, `RemoveAt`, and a borrowing LINQ `Where`.
+BEZEL_TEST(array_span_549, ownedarray_real_surface_accepted_1103b) {
+    expectValueAndAsanClean(
+        "module M; import System.Collections.Generic; "
+        "class Cell public _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; end Cell; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<Cell>(); "
+        "  a.Add(new Cell(7)); a.Add(new Cell(9)); "
+        "  var hi := a.Where((c) => c._v > 8).Count(); "  // 1
+        "  return a.Get(1)._v + a.Count + hi; "           // 9 + 2 + 1 = 12
+        "end Main; end C;", 12);
+}
+
 // ===========================================================================
 // §4.15 AsSpan(start, length): partial view.
 // ===========================================================================
