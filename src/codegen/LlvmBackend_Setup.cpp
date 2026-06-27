@@ -4216,6 +4216,42 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     val = cl->isDict ? materializeHeapDictLiteral(cl, fty)
                                      : materializeHeapCollectionLiteral(cl, fty);
             }
+            // §15.1 (#1098): an INLINE-ARRAY static field
+            // (`static _arr: [N]T := [a, b, c]`). The backing global is an
+            // `[N x T]` aggregate; the heap-materialize above returns null for a
+            // non-heap inline array and lowerExpr returns null for a
+            // CollectionLiteralExpr, so the literal was dropped and the static
+            // array stayed zero. Store each element into the global, mirroring
+            // the local inline-array init path (lowerLocalDecl §15.1).
+            if (!val) {
+                auto* cl =
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(initExpr);
+                auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(
+                    gvIt->second->getValueType());
+                if (cl && !cl->isDict && !cl->elements.empty() && arrTy) {
+                    llvm::Type* elemTy = arrTy->getElementType();
+                    for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                        if (!cl->elements[i]) continue;
+                        llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                        if (!ev) continue;
+                        if (ev->getType() != elemTy &&
+                            ev->getType()->isIntegerTy() &&
+                            elemTy->isIntegerTy()) {
+                            unsigned eb = ev->getType()->getIntegerBitWidth();
+                            unsigned db = elemTy->getIntegerBitWidth();
+                            ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                         : builder_.CreateTrunc(ev, elemTy);
+                        }
+                        llvm::Value* gep = builder_.CreateGEP(
+                            arrTy, gvIt->second,
+                            {builder_.getInt32(0),
+                             builder_.getInt32(static_cast<unsigned>(i))});
+                        builder_.CreateStore(coerceToNullableSlot(elemTy, ev),
+                                             gep);
+                    }
+                    continue;  // inline-array literal stored element-wise
+                }
+            }
             if (!val) val = lowerExpr(*initExpr);
             if (!val) continue;
             builder_.CreateStore(val, gvIt->second);
