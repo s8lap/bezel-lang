@@ -600,6 +600,27 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                                 const std::string& spec,
                                 const sema::TypeRef* rt) {
     if (spec.empty() || !val) return nullptr;
+    // §18.5 / §2.5 (#1099): a DateTime value with a (non-alignment) format spec
+    // — `$"{dt:yyyy-MM-dd}"` — dispatches to the runtime DateTime formatter, the
+    // SAME bz_datetime_to_string_fmt that `DateTime.ToString(format)` uses,
+    // instead of falling through to the no-arg ToString (which rendered the full
+    // "…T00:00:00" form). The alignment path (`,WIDTH:FORMAT`) recurses here with
+    // the inner format, so this single branch covers both.
+    if (spec[0] != ',' && rt && rt->kind == sema::TypeRef::Kind::Named &&
+        val->getType()->isIntegerTy(64)) {
+        bool isDateTime =
+            (rt->declaration && rt->declaration->name == "DateTime") ||
+            (rt->astNode && rt->astNode->name &&
+             !rt->astNode->name->parts.empty() &&
+             rt->astNode->name->parts.back() == "DateTime");
+        if (isDateTime) {
+            llvm::Value* fmtStr =
+                lowerStringLiteral("\"" + spec + "\"", false);
+            auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                {i64(), ptrTy()});
+            return builder_.CreateCall(fn, {val, fmtStr}, "dt.fmt");
+        }
+    }
     // §18.5 alignment specifier `,WIDTH` or `,WIDTH:FORMAT`:
     // Positive width = right-align, negative = left-align.
     // First apply FORMAT (if any) to get the value string, then pad.
