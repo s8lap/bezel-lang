@@ -2348,8 +2348,18 @@ void ExprTC::visitMember(const ast::Member& m) {
             // §22.8 applies to auto-property initializers too.
             bool save = inFieldInitializer_;
             inFieldInitializer_ = true;
+            // #1088 (mirrors the #582 / §22.13 fix for FIELD initializers): an
+            // auto-property initializer may reference other classes by name
+            // (`property P: int := C.Default();`, a static method/field). It has
+            // no enclosing method scope, so without moduleScope_ as
+            // currentScope_ the class qualifier resolves to null → no exprSymbol
+            // → codegen lowerExpr returns null → the init store is skipped → the
+            // backing field stays zero. (A foldable constant initializer needs
+            // no name resolution, which is why it worked.)
+            Scope* saveScope = currentScope_;
+            if (!currentScope_) currentScope_ = moduleScope_.get();
             visitExpr(*pd->autoInitializer);
-            inFieldInitializer_ = false;
+            currentScope_ = saveScope;
             inFieldInitializer_ = save;
         }
         for (const auto& a : pd->accessors) {
