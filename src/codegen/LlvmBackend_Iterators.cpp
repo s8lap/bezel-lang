@@ -356,6 +356,14 @@ bool Emitter::containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             }
             if (containsYield(ts->finallyBody)) return true;
         }
+        // #1107/#16: recurse into `case`-statement arms so an iterator whose
+        // body yields inside a `case` arm is routed to the iterator state
+        // machine (in lockstep with sema's stmtsContainYield). Without this the
+        // method would be lowered as a normal function and its arm yields would
+        // be mis-emitted.
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get()))
+            for (const auto& arm : cs->arms)
+                if (containsYield(arm.stmts)) return true;
     }
     return false;
 }
@@ -393,6 +401,19 @@ void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             // yield there, and suspendInTryPosition rejects such programs before
             // the resume switch is built.
             collectYields(ts->body, out);
+        }
+        // #1107/#16/#17: a `yield return` inside a `case`-statement arm consumes
+        // a resume-state slot too. Recurse into each block-form arm IN ARM ORDER
+        // (the same order lowerCaseStmt lowers them) so the resume-switch
+        // allocates the right number of state blocks. Without this the arm
+        // yields were uncounted: the yield-return lowering's
+        // `nextState < smStateBBs_.size()` guard then failed, the insert point
+        // stayed on the already-`ret`'d arm block, and the case lowering's
+        // branch was appended after the terminator → "Terminator found in the
+        // middle of a basic block" IR-verification crash.
+        else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            for (const auto& arm : cs->arms)
+                collectYields(arm.stmts, out);
         }
     }
 }

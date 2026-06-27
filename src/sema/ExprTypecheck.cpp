@@ -192,6 +192,14 @@ bool ExprTC::stmtsContainYield(
         // doesn't misfire on iterator methods whose yield is wrapped in try.
         if (auto* trys = dynamic_cast<const ast::TryStmt*>(s.get()))
             if (stmtsContainYield(trys->body)) return true;
+        // #1107/#16 (§29.3 / §21.7): a `yield return` inside a `case`-statement
+        // arm makes the enclosing method an iterator too — recurse into each
+        // block-form arm. Without this an iterator whose entire body is a
+        // yielding `case` was misclassified as a normal value-returning method
+        // and wrongly rejected "does not return a value on every path".
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get()))
+            for (const auto& arm : cs->arms)
+                if (stmtsContainYield(arm.stmts)) return true;
     }
     return false;
 }
