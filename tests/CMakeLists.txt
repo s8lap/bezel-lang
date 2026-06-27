@@ -613,6 +613,7 @@ set(BEZEL_TEST_SOURCES
     codegen/class_object_method_dispatch_1106_test.cpp
     codegen/base_tostring_1106_test.cpp
     codegen/generic_unconstrained_objmethod_1091_test.cpp
+    codegen/generics_inheritance_1101_1076_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp

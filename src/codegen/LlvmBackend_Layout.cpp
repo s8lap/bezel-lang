@@ -875,38 +875,73 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         return specSt;
     }
 
-    // §14 / #617: a non-generic class `D` that inherits a concrete generic
-    // instantiation `Base<string>` has inherited fields whose LLVM types depend
-    // on the base's concrete type args (e.g. `_value: T` must be ptr for
-    // T=string, not the i32 placeholder that falls out of an unresolved T).
-    // The concrete args are recorded in `t->baseTypeRefs` parallel to
-    // `t->baseTypes`.  Build a temporary substitution from the FIRST generic
-    // class base with concrete args and run through the specialised-struct path
-    // so storageType uses the right concrete type for every inherited field.
-    // This also gives `D` a proper per-layout entry in specializedStructs_
-    // (so repeat calls with empty genericSubst_ find the correct specialization
-    // via the specFieldTys cache key, not the unspecialized fallback below).
+    // §14 / #617 / #1101-B: a non-generic class `D` that inherits a concrete
+    // generic instantiation `Base<string>` — DIRECTLY or through intermediate
+    // non-generic links (`Child: Mid: Box<string>`) — has inherited generic-T
+    // fields whose LLVM types depend on the ancestor's concrete type args
+    // (e.g. `_v: T` must be ptr for T=string, not the i32 placeholder that
+    // falls out of an unresolved T). Walk the FULL class base chain, composing
+    // each generic ancestor's param→concrete-arg bindings into one substitution
+    // (resolving a base's args through the bindings accumulated at lower levels,
+    // so `Mid<U>: Box<U>` links compose), then run through the specialised-struct
+    // path so storageType uses the right concrete type for every inherited field.
+    // This also gives `D` a proper per-layout entry in specializedStructs_ (so
+    // repeat calls with empty genericSubst_ find the correct specialization via
+    // the specFieldTys cache key, not the unspecialized fallback below).
+    // (The prior code only handled a single IMMEDIATE generic base, so a
+    // grandchild `Child: Mid: Box<string>` kept the i32 placeholder for the
+    // inherited field and read it from the wrong slot — #1101-B.)
     if (t->genericParams.empty()) {
-        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
-            const sema::TypeSymbol* base = t->baseTypes[bi];
-            if (!base || base->kind != ast::TypeDeclKind::Class) continue;
-            if (base->genericParams.empty()) continue;
-            if (bi >= t->baseTypeRefs.size() || !t->baseTypeRefs[bi]) continue;
-            const sema::TypeRef* baseRef = t->baseTypeRefs[bi];
-            if (baseRef->genericArgs.empty()) continue;
-            auto* td = dynamic_cast<const ast::TypeDecl*>(base->decl);
-            if (!td || td->genericParams.size() != baseRef->genericArgs.size())
-                continue;
-            // Build a substitution covering the generic base's params.
+        std::unordered_map<std::string_view, llvm::Type*> tmpSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> tmpSema;
+        // curArgs: the current level's generic-param-name → concrete TypeRef.
+        // `t` is non-generic so it starts empty; each base level resolves its
+        // own args through it (composition).
+        std::unordered_map<std::string_view, const sema::TypeRef*> curArgs;
+        for (const sema::TypeSymbol* cur = t; cur;) {
+            const sema::TypeSymbol* base = baseClassOf(cur);
+            if (!base) break;
+            const sema::TypeRef* baseRef = nullptr;
+            for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
+                if (cur->baseTypes[bi] == base) {
+                    baseRef = (bi < cur->baseTypeRefs.size())
+                                  ? cur->baseTypeRefs[bi] : nullptr;
+                    break;
+                }
+            }
+            std::unordered_map<std::string_view, const sema::TypeRef*> nextArgs;
+            if (!base->genericParams.empty()) {
+                auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
+                if (!baseRef || !btd ||
+                    btd->genericParams.size() != baseRef->genericArgs.size())
+                    break;  // unresolvable — fall through to unspecialized layout
+                for (std::size_t gi = 0; gi < btd->genericParams.size(); ++gi) {
+                    const sema::TypeRef* arg = baseRef->genericArgs[gi];
+                    // Resolve a bare generic-param ref (`T`, no declaration)
+                    // through the lower level's bindings; concrete args pass
+                    // through unchanged.
+                    if (arg && arg->kind == sema::TypeRef::Kind::Named &&
+                        !arg->declaration && arg->astNode && arg->astNode->name &&
+                        arg->astNode->name->parts.size() == 1) {
+                        auto it = curArgs.find(arg->astNode->name->parts[0]);
+                        if (it != curArgs.end()) arg = it->second;
+                    }
+                    std::string_view pname = btd->genericParams[gi].name;
+                    nextArgs[pname] = arg;
+                    // Record the layout binding (keep the lowest/most-derived
+                    // binding on a param-name collision — it is the concrete one).
+                    if (arg && tmpSema.find(pname) == tmpSema.end()) {
+                        tmpSubst[pname] = lowerTypeRef(arg);
+                        tmpSema[pname] = arg;
+                    }
+                }
+            }
+            cur = base;
+            curArgs = std::move(nextArgs);
+        }
+        if (!tmpSubst.empty()) {
             auto savedSubst = genericSubst_;
             auto savedSemaTy = genericSubstSemaTy_;
-            std::unordered_map<std::string_view, llvm::Type*> tmpSubst;
-            std::unordered_map<std::string_view, const sema::TypeRef*> tmpSema;
-            for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
-                std::string_view pname = td->genericParams[gi].name;
-                tmpSubst[pname] = lowerTypeRef(baseRef->genericArgs[gi]);
-                tmpSema[pname] = baseRef->genericArgs[gi];
-            }
             genericSubst_ = std::move(tmpSubst);
             genericSubstSemaTy_ = std::move(tmpSema);
             llvm::StructType* result = classStruct(t);  // re-enter via spec path

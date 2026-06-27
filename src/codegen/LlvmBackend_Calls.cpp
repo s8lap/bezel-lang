@@ -10631,6 +10631,40 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     }
                 }
             }
+        } else if (!ms->parent->genericParams.empty()) {
+            // §12 / §14 / #1101-C: an INHERITED generic-base method called via a
+            // BARE identifier (implicit `this.Make()`), not a member access — so
+            // `recvExpr` is null and none of the branches above fired. The
+            // inherited body then ran as the T→i32 template, an IR_FAIL on a
+            // ptr/struct `T?` return for a non-int instantiation (the call
+            // returned `{i8,i32}` into a ptr-returning caller). Recover the
+            // enclosing class from the current function (mirroring
+            // indexReceiverDecl's reverse-lookup of currentFn_) and bind the
+            // base's generic params from the derived→base<…> chain, exactly as
+            // the `this`/`base` keyword branch above.
+            const sema::TypeSymbol* enclosingCls = nullptr;
+            if (currentFn_) {
+                for (const auto& [m2, fn] : methodFns_)
+                    if (fn == currentFn_ && m2->parent) {
+                        enclosingCls = m2->parent;
+                        break;
+                    }
+                if (!enclosingCls && currentSpecMethodSymbol_)
+                    enclosingCls = currentSpecMethodSymbol_->parent;
+            }
+            if (enclosingCls && enclosingCls != ms->parent) {
+                sema::TypeRef synth;
+                synth.kind = sema::TypeRef::Kind::Named;
+                synth.declaration = const_cast<sema::TypeSymbol*>(enclosingCls);
+                std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    ancSema;
+                if (computeAncestorGenericSubst(&synth, ms->parent, ancSubst,
+                                                ancSema)) {
+                    genericSubst_ = std::move(ancSubst);
+                    genericSubstSemaTy_ = std::move(ancSema);
+                }
+            }
         }
     }
     // §26.5 (#714): a GENERIC EXTENSION METHOD (ms->parent == null,
@@ -11408,7 +11442,19 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
                 if (resolved && resolved->kind == sema::TypeRef::Kind::Named &&
                     resolved->declaration &&
                     resolved->declaration->kind == ast::TypeDeclKind::Record)
-                    retTy = recordStruct(resolved->declaration);
+                    // #1076: lower the CONCRETE resolved record instantiation
+                    // under ITS OWN type args (lowerTypeRef sets up the per-arg
+                    // substitution), NOT a bare `recordStruct(decl)` under the
+                    // METHOD's active substitution. When the method's type params
+                    // and the record's type params share names (`Select<A,B>: A`
+                    // with `A = Pair<int,int>` where `Pair<A,B>` reuses A/B),
+                    // recordStruct(Pair) under {A→Pair<int,int>, B→int} wrongly
+                    // re-specialized Pair's fields → `Pair<Pair<int,int>,int>`
+                    // ($spec1), mismatching the body's `ret $spec0` (IR_FAIL).
+                    // lowerTypeRef(resolved) builds the canonical Pair<int,int>
+                    // ($spec0) that the body returns. A non-generic record
+                    // resolves identically to the old recordStruct(decl) path.
+                    retTy = lowerTypeRef(resolved);
             }
         }
     }

@@ -5076,28 +5076,82 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
                 derived = currentType_;
         }
     }
-    if (derived && derived != parent) {
-        for (std::size_t bi = 0; bi < derived->baseTypes.size(); ++bi) {
-            if (derived->baseTypes[bi] == parent &&
-                bi < derived->baseTypeRefs.size() &&
-                derived->baseTypeRefs[bi] &&
-                !derived->baseTypeRefs[bi]->genericArgs.empty()) {
-                recvTy = derived->baseTypeRefs[bi];
-                break;
-            }
-        }
-    }
-    if (!recvTy || recvTy->declaration != parent || recvTy->genericArgs.empty())
-        return declared;
-    // Build the parent-param-name -> concrete-arg map, positional by index so
-    // each param maps to the same-index argument (param `B` at genericParams[1]
-    // -> recvTy->genericArgs[1]) rather than to the first argument.
+    // Build the parent-param-name -> concrete-arg map.
     std::unordered_map<std::string_view, TypeRef*> classSubst;
-    for (std::size_t gi = 0; gi < parent->genericParams.size() &&
-                             gi < recvTy->genericArgs.size(); ++gi) {
-        if (parent->genericParams[gi] && recvTy->genericArgs[gi])
-            classSubst[parent->genericParams[gi]->name] =
-                recvTy->genericArgs[gi];
+    if (recvTy && recvTy->declaration == parent && !recvTy->genericArgs.empty()) {
+        // Direct: the receiver IS the parent instantiation (`b: Box<int>`).
+        // Positional by index (param `B` at genericParams[1] -> genericArgs[1]).
+        for (std::size_t gi = 0; gi < parent->genericParams.size() &&
+                                 gi < recvTy->genericArgs.size(); ++gi)
+            if (parent->genericParams[gi] && recvTy->genericArgs[gi])
+                classSubst[parent->genericParams[gi]->name] =
+                    recvTy->genericArgs[gi];
+    } else if (derived && derived != parent) {
+        // Inherited: the receiver is a DERIVED type that fixes `parent`'s
+        // generic args somewhere up the base chain. Walk the chain transitively
+        // from `derived` up to `parent`, COMPOSING the type-arg bindings at each
+        // level: this handles both a single level (`IntHolder: Base<int>`, #722)
+        // and a multi-level chain (`Child: Mid: Box<int>`) plus intermediate
+        // generic links (`Child: Mid<int>: Box<U>`). #1101-A: the prior one-level
+        // walk only matched an immediate base, so the binding was dropped through
+        // 2+ levels and the inherited generic-T member typed as `?` (e.g. a
+        // binary-operator operand rejected as "operator + not defined for `?`").
+        // Mirrors the codegen base-substitution (computeAncestorGenericSubst).
+        const TypeSymbol* cur = derived;
+        // curArgs: cur's generic-param-name -> concrete TypeRef at this level.
+        // Seeded from the receiver's own bound args when the receiver itself is
+        // a generic instantiation (`Child<int>`); usually `derived` is the
+        // enclosing class with bare params, so curArgs starts empty.
+        std::unordered_map<std::string_view, TypeRef*> curArgs;
+        if (recvTy && recvTy->declaration == derived &&
+            !recvTy->genericArgs.empty() &&
+            derived->genericParams.size() == recvTy->genericArgs.size())
+            for (std::size_t gi = 0; gi < derived->genericParams.size(); ++gi)
+                if (derived->genericParams[gi])
+                    curArgs[derived->genericParams[gi]->name] =
+                        recvTy->genericArgs[gi];
+        while (cur && cur != parent) {
+            const TypeSymbol* base = nullptr;
+            TypeRef* baseRef = nullptr;
+            for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
+                if (cur->baseTypes[bi] &&
+                    cur->baseTypes[bi]->kind == ast::TypeDeclKind::Class) {
+                    base = cur->baseTypes[bi];
+                    baseRef = (bi < cur->baseTypeRefs.size())
+                                  ? cur->baseTypeRefs[bi] : nullptr;
+                    break;
+                }
+            }
+            if (!base) break;  // `parent` not on the class chain
+            std::unordered_map<std::string_view, TypeRef*> nextArgs;
+            if (!base->genericParams.empty()) {
+                if (!baseRef ||
+                    baseRef->genericArgs.size() != base->genericParams.size())
+                    return declared;  // unresolvable generic link
+                for (std::size_t gi = 0; gi < base->genericParams.size(); ++gi) {
+                    TypeRef* arg = baseRef->genericArgs[gi];
+                    // Resolve a bare generic-param ref (`T`, no declaration)
+                    // through this level's bindings; a concrete arg passes
+                    // through unchanged.
+                    if (arg && arg->kind == TypeRef::Kind::Named &&
+                        !arg->declaration && arg->astNode && arg->astNode->name &&
+                        arg->astNode->name->parts.size() == 1) {
+                        auto it = curArgs.find(arg->astNode->name->parts[0]);
+                        if (it != curArgs.end()) arg = it->second;
+                    }
+                    if (base->genericParams[gi])
+                        nextArgs[base->genericParams[gi]->name] = arg;
+                }
+            }
+            cur = base;
+            curArgs = std::move(nextArgs);
+        }
+        if (cur != parent) return declared;  // ancestor not reached
+        for (const Symbol* gp : parent->genericParams) {
+            auto it = curArgs.find(gp->name);
+            if (it != curArgs.end() && it->second)
+                classSubst[gp->name] = it->second;
+        }
     }
     if (classSubst.empty()) return declared;
     // substituteReturnType handles both the bare-param case (with the `T?`
