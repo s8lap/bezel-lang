@@ -5,6 +5,8 @@ record Money(Amount: decimal, Currency: string)
 end Money;
 
 // Projection-style conversion: instance method on the source type.
+// (Projects onto the preamble `User(Name: string, Id: int)` — the source's
+// Email is dropped; field order/types must match the target record, §9.1.)
 record UserDto(Id: int, Name: string, Email: string)
-  public method ToUser(): User => new User(Id, Name, Email);
+  public method ToUser(): User => new User(Name, Id);
 end UserDto;

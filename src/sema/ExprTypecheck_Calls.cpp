@@ -4285,7 +4285,85 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     // a ConstructorSymbol, and may combine with chained body
     // constructors. That interaction is deferred — skip such types.
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
-        if (td->hasPositionalFields) return;
+        if (td->hasPositionalFields) {
+            // #1105 (§9.1): a RECORD's positional fields ARE its primary
+            // constructor — one argument per field, in declaration order, no
+            // chaining and no per-field defaults. Validate `new Record(args)`
+            // here; record construction otherwise skipped ALL argument checking
+            // (the early return), so too-few / too-many / wrong-typed args were
+            // silently accepted and miscompiled (`new Pt(1)`→Y=0; `new
+            // Pt("a","b")`→garbage; `new Pt(3.14,..)`→int bit-pattern; some
+            // wrong-typed forms reach codegen and crash IR verification). A
+            // primary-constructor CLASS may combine positional fields with
+            // chained body constructors (the deferred interaction above) — so
+            // restrict to records. Generic records need per-instantiation type
+            // substitution of the field types (the #428 family) — defer those;
+            // validate non-generic records, which is where the cluster lives.
+            if (t->kind == ast::TypeDeclKind::Record &&
+                t->genericParams.empty()) {
+                // The positional fields are the constructor's parameter list
+                // (one per field, declaration order). Reuse the same arity +
+                // named-argument binding + per-argument assignability check the
+                // class-constructor / method paths use (checkArgsAgainstParams):
+                // it handles reordered named args (`new Pt(Y := 4, X := 3)`).
+                const auto& fields = td->positionalFields;
+                // §5.1 (#738): a record positional argument initializes a field,
+                // so an in-range int literal/constant bound to a narrower-int
+                // field (`new Box(30000)` into `short?`) narrows implicitly —
+                // mirror the local-decl / assignment retyping (ExprTypecheck.cpp
+                // AssignStmt path) before the assignability check. Bind first
+                // (no diagnostics) so each argument's target field is known even
+                // for reordered named args.
+                auto fitsInIntTy = [](long long v, PrimitiveType pt) -> bool {
+                    switch (pt) {
+                        case PrimitiveType::SByte:  return v >= -128 && v <= 127;
+                        case PrimitiveType::Byte:   return v >= 0 && v <= 255;
+                        case PrimitiveType::Short:  return v >= -32768 && v <= 32767;
+                        case PrimitiveType::UShort: return v >= 0 && v <= 65535;
+                        case PrimitiveType::UInt:   return v >= 0 && v <= 4294967295LL;
+                        case PrimitiveType::ULong:  return v >= 0;
+                        default:                    return true;
+                    }
+                };
+                BindResult pre = bindArgsToParams(
+                    fields, ne.args, ne.span.begin,
+                    /*calleeDesc=*/std::string(), /*emit=*/false);
+                if (pre.ok) {
+                    for (std::size_t j = 0; j < fields.size(); ++j) {
+                        int ai = pre.paramToArg[j];
+                        if (ai < 0 || !fields[j].type) continue;
+                        const ast::CallArgument& a =
+                            ne.args[static_cast<std::size_t>(ai)];
+                        if (!a.value || a.isDiscard || !a.modifier.empty())
+                            continue;
+                        TypeRef* fromTy = ctx_.exprType(*a.value);
+                        TypeRef* toTy = ctx_.resolvedType(*fields[j].type);
+                        if (fromTy && toTy &&
+                            fromTy->kind == TypeRef::Kind::Primitive &&
+                            fromTy->primitive == PrimitiveType::Int &&
+                            toTy->kind == TypeRef::Kind::Primitive) {
+                            PrimitiveType tgt = toTy->primitive;
+                            bool narrower =
+                                tgt == PrimitiveType::Byte ||
+                                tgt == PrimitiveType::SByte ||
+                                tgt == PrimitiveType::Short ||
+                                tgt == PrimitiveType::UShort ||
+                                tgt == PrimitiveType::UInt ||
+                                tgt == PrimitiveType::ULong;
+                            if (narrower) {
+                                auto cv = foldIntConstExprTC(*a.value);
+                                if (cv && fitsInIntTy(*cv, tgt))
+                                    ctx_.setExprType(a.value.get(), toTy);
+                            }
+                        }
+                    }
+                }
+                checkArgsAgainstParams(
+                    fields, ne.args, ne.span.begin,
+                    std::string("`new ") + std::string(t->name) + "`");
+            }
+            return;
+        }
     }
     std::vector<ConstructorSymbol*> ctors;
     for (Symbol* m : t->members) {

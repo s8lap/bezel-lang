@@ -175,11 +175,24 @@ BEZEL_TEST(own_record_escape, return_value_record_clean_9_7) {
 // CONTROL (§9.7 null-source form): a borrow-bearing record whose borrow-
 // carrying field is `null` carries no live borrow source; returning it is the
 // null-source exception the spec explicitly admits.
+//
+// The borrow field must be NULLABLE for the null-source form to be expressible:
+// per §9.7 (L979) the form is "every reference-typed field is null", which a
+// non-nullable `R` field can never satisfy (§7 forbids null in a non-nullable
+// reference). Migrated for #1105: `new Record(null)` is now type-checked, and
+// `null` into the shared `Holder(Ref: R)` (non-nullable) is a §7 type error
+// (exactly as `var x: R := null` / `Take(null)` are) — so this test uses a
+// record with a nullable borrow field, which is the genuine null-source form.
 BEZEL_TEST(own_record_escape, return_record_null_source_clean_9_7) {
-    auto r = parseAndCheckOwnership(wrapRecord(
-        "public static method None(): Holder "
-        "  return new Holder(null); "
-        "end None;"));
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class R public V: int := 0; destructor end destructor; end R; "
+        "record NHolder(Ref: R?); "
+        "class C "
+        "  public static method None(): NHolder "
+        "    return new NHolder(null); "
+        "  end None; "
+        "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

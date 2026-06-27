@@ -1472,6 +1472,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     } else if (t->kind == ast::TypeDeclKind::Class) {
                         // Slice T7: constructor arity / arg types.
                         checkNewExprArgs(*ne, t);
+                    } else if (t->kind == ast::TypeDeclKind::Record) {
+                        // #1105 (§9.1): validate a POSITIONAL record's primary-
+                        // constructor `new` args (count + per-field type). Record
+                        // construction previously skipped all arg checking, so
+                        // too-few / too-many / wrong-typed args were silently
+                        // accepted and miscompiled. Only positional records are
+                        // routed here; checkNewExprArgs validates the positional
+                        // fields and returns (generic records defer to #428).
+                        if (auto* rtd =
+                                dynamic_cast<const ast::TypeDecl*>(t->decl))
+                            if (rtd->hasPositionalFields)
+                                checkNewExprArgs(*ne, t);
                     }
                     // §14.1 / §2.5 (#428 phase B): imported generic RECORD
                     // construction is now supported — codegen performs per-
