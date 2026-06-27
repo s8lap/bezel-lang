@@ -9490,15 +9490,37 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     unsigned sb = srcTy->getIntegerBitWidth();
     unsigned db = dstTy->getIntegerBitWidth();
     if (db < sb) {
-        // §5.2: integer narrowing raises OverflowException if the value
-        // does not fit the target. Truncate, extend back with the
-        // target's signedness, and compare to the original — a mismatch
-        // means the value was out of range.
+        // §5.2: integer narrowing raises OverflowException if the value does not
+        // fit the target's range. Range-check the SOURCE value against the
+        // destination's [min, max] using the SOURCE's signedness.
+        //
+        // #1133: the old "truncate, re-extend with the DEST's signedness, compare
+        // bit patterns" round-trip was wrong on a signedness mismatch. For
+        // `int(ulong.MaxValue)` the truncated -1 sign-extended back to all-ones,
+        // which equals the unsigned source's bit pattern, so the (huge) value
+        // falsely passed and yielded -1. A bit-pattern round-trip conflates an
+        // unsigned source value with a negative dest value that share low bits.
         llvm::Value* trunc = builder_.CreateTrunc(src, dstTy);
-        llvm::Value* back = dstUns ? builder_.CreateZExt(trunc, srcTy)
-                                   : builder_.CreateSExt(trunc, srcTy);
-        emitGuardThrow(builder_.CreateICmpNE(back, src),
-                       "OverflowException");
+        int64_t dstMax, dstMin;
+        if (dstUns) {
+            dstMin = 0;
+            dstMax = static_cast<int64_t>((1ULL << db) - 1ULL);
+        } else {
+            dstMin = -static_cast<int64_t>(1ULL << (db - 1));
+            dstMax = static_cast<int64_t>((1ULL << (db - 1)) - 1ULL);
+        }
+        llvm::Value* hiC = llvm::ConstantInt::getSigned(srcTy, dstMax);
+        llvm::Value* bad;
+        if (srcUns) {
+            // An unsigned source is >= 0, so only the upper bound can be
+            // exceeded; compare UNSIGNED (dstMax >= 0 always fits srcTy).
+            bad = builder_.CreateICmpUGT(src, hiC);
+        } else {
+            llvm::Value* loC = llvm::ConstantInt::getSigned(srcTy, dstMin);
+            bad = builder_.CreateOr(builder_.CreateICmpSLT(src, loC),
+                                    builder_.CreateICmpSGT(src, hiC));
+        }
+        emitGuardThrow(bad, "OverflowException");
         return trunc;
     }
     if (db > sb) {

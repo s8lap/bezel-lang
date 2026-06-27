@@ -417,6 +417,59 @@ BEZEL_TEST(codegen_numeric_conv, double_to_long_range_739) {
         1);
 }
 
+// ── #1133 / §5.2: integer narrowing across a signedness mismatch ─────────────
+// `int(ulong.MaxValue)` must raise OverflowException, not silently yield -1.
+// The old round-trip check re-extended the truncated value with the DEST's
+// signedness and compared bit patterns — for an unsigned source this conflated
+// the huge unsigned value with a negative dest value sharing low bits.
+
+// ulong.MaxValue → int overflows (was: silently returned -1).
+BEZEL_TEST(codegen_numeric_conv, ulong_max_to_int_overflows_1133) {
+    BEZEL_EXPECT_EQ(run(
+        "var big: ulong := 18446744073709551615; "
+        "try var r: int := int(big); return 0; "          // no throw = bug
+        "catch OverflowException => return 7; end;"),      // caught = correct
+        7);
+}
+
+// An unsigned value just past int.MaxValue (whose low 32 bits set the dest sign
+// bit) also overflows — the case a zero-extend round-trip would miss.
+BEZEL_TEST(codegen_numeric_conv, ulong_intmax_plus_one_to_int_overflows_1133) {
+    BEZEL_EXPECT_EQ(run(
+        "var u: ulong := 2147483648; "                     // int.MaxValue + 1
+        "try var r: int := int(u); return 0; "
+        "catch OverflowException => return 7; end;"),
+        7);
+}
+
+// A fitting unsigned→signed narrowing still succeeds (no spurious throw):
+// ulong int.MaxValue → int is exactly in range.
+BEZEL_TEST(codegen_numeric_conv, ulong_intmax_to_int_in_range_1133) {
+    BEZEL_EXPECT_EQ(run(
+        "var u: ulong := 2147483647; return int(u) - 2147483605;"),  // 42
+        42);
+}
+
+// A negative signed value → unsigned narrowing overflows (cannot fit unsigned).
+BEZEL_TEST(codegen_numeric_conv, negative_long_to_uint_overflows_1133) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: long := -1L; "
+        "try var r: uint := uint(n); return 0; "
+        "catch OverflowException => return 7; end;"),
+        7);
+}
+
+// Signed→signed narrowing is unaffected: in-range keeps its value, out-of-range
+// still throws.
+BEZEL_TEST(codegen_numeric_conv, long_to_int_signed_unaffected_1133) {
+    BEZEL_EXPECT_EQ(run(
+        "var ok := 0; "
+        "var a: long := -5L; if int(a) = -5 then ok := ok + 1; end; "        // in range
+        "try var b: int := int(5000000000L); catch OverflowException => ok := ok + 6; end; "
+        "return ok;"),                                     // 1 + 6 = 7
+        7);
+}
+
 // NOTE: an UNCAUGHT NaN/Inf/out-of-range→int conversion propagates via the
 // runtime's unhandled-exception path (prints "Unhandled exception", exit 70).
 // That path calls exit() in-process, so it cannot be exercised under the JIT
