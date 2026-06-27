@@ -5626,6 +5626,21 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 auto* endBB = llvm::BasicBlock::Create(llvm_, "coal.end", currentFn_);
                 llvm::Value* hasVal = nullablePrimHasValue(l);
                 llvm::Value* primVal = nullablePrimValue(l);
+                // #1104: pre-build the nullable-wrapped form of the (non-null) LHS
+                // payload HERE in entryBB (so it dominates the PHI's entry edge),
+                // for the case the RHS is also a nullable value (`int? ?? int?`).
+                // There the result is `T?` and both PHI incomings must be the
+                // `{i8 hasValue; T}` struct — previously the PHI used the bare-T
+                // payload type while the RHS was `{i8,T}` → an LLVM PHI same-type
+                // assertion (SIGABRT). The wrap is dead (DCE'd) when the result is
+                // non-nullable (`int? ?? 5`).
+                llvm::Type* coalNullableTy = llvm::StructType::get(
+                    llvm_, {nullablePrimHasValTy(), primVal->getType()});
+                llvm::Value* wrappedLhs = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(coalNullableTy),
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+                wrappedLhs = builder_.CreateInsertValue(wrappedLhs, primVal,
+                                                        {1u});
                 builder_.CreateCondBr(hasVal, endBB, rhsBB);
                 builder_.SetInsertPoint(rhsBB);
                 llvm::Value* r = lowerExpr(*bin.right);
@@ -5665,8 +5680,14 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 builder_.SetInsertPoint(endBB);
                 diverged_ = false;
                 if (rhsDiv) return primVal;
-                auto* phi = builder_.CreatePHI(primVal->getType(), 2);
-                phi->addIncoming(primVal, entryBB);
+                // #1104: when the RHS is itself a nullable value (its lowered
+                // type is the same `{i8,T}` struct), the `??` result is `T?` —
+                // wrap the LHS payload so both incomings match. Otherwise the
+                // result is the bare payload `T` (the common `int? ?? 5` case).
+                bool resultNullable = r->getType() == coalNullableTy;
+                auto* phi = builder_.CreatePHI(
+                    resultNullable ? coalNullableTy : primVal->getType(), 2);
+                phi->addIncoming(resultNullable ? wrappedLhs : primVal, entryBB);
                 phi->addIncoming(r, rhsEndBB);
                 return phi;
             }

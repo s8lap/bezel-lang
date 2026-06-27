@@ -601,6 +601,7 @@ set(BEZEL_TEST_SOURCES
     codegen/throw_in_catch_guard_1097_test.cpp
     codegen/datetime_interp_format_1099_test.cpp
     codegen/yield_after_break_1102_test.cpp
+    codegen/coalesce_value_nullable_rhs_1104_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp

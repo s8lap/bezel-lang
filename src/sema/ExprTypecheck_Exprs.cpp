@@ -2124,13 +2124,26 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // untyped, prefer the RHS type — `null ?? x` has x's type.
         bool lhsIsNullLiteral =
             be.left && dynamic_cast<const ast::NullLiteralExpr*>(be.left.get());
+        // #1104: the result is nullable iff the RHS is nullable — `a ?? b` is
+        // `a`'s value when non-null, else `b`. When `b` is itself nullable
+        // (`int? ?? int?`) the result CAN be null (both null), so it stays `T?`;
+        // only when the RHS is non-nullable (`int? ?? 5`) does the result narrow
+        // to the non-nullable `T`. Typing both-nullable as non-nullable made the
+        // codegen value (`{i8,T}`) disagree with the slot type (bare `T`) on a
+        // chained `(a ?? b) ?? c` → wrong value / PHI-mismatch crash.
+        bool rhsNullable = false;
+        if (be.right)
+            if (TypeRef* rt = ctx_.exprType(*be.right))
+                rhsNullable = rt->nullable;
         if (lt && !lhsIsNullLiteral) {
-            if (lt->nullable) {
+            if (lt->nullable && !rhsNullable) {
                 TypeRef* nn = ctx_.makeTypeRef(*lt);
                 nn->nullable = false;
                 ctx_.setExprType(&be, nn);
             } else {
-                ctx_.setExprType(&be, lt);  // already non-nullable
+                // RHS nullable → keep LHS's nullability; or LHS already
+                // non-nullable.
+                ctx_.setExprType(&be, lt);
             }
         } else if (be.right) {
             // LHS untyped or null literal — fall back to the RHS type.
