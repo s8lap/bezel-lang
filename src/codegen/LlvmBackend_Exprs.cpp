@@ -4577,6 +4577,24 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     {
         const sema::TypeRef* lTy = bin.left  ? ctx_.exprType(*bin.left)  : nullptr;
         const sema::TypeRef* rTy = bin.right ? ctx_.exprType(*bin.right) : nullptr;
+        // §7.11 / #914 / #1117: a NESTED narrowed nullable arithmetic result is
+        // lowered as a {i8, T} struct (the lifted path always builds the struct),
+        // but its sema type is the NON-nullable T (the nullable operand was proven
+        // non-null by null-flow narrowing). When such a value flows in as an
+        // operand here, unwrap it to its scalar payload so this operator sees a
+        // plain T — otherwise an outer `(a+b) + b` emits `add {i8,i64}, i64`
+        // (malformed IR). Only unwrap when the operand's sema type is a
+        // NON-nullable primitive: a genuine nullable operand must keep its struct
+        // for the lifted path below.
+        auto unwrapIfNarrowed = [&](llvm::Value* v,
+                                    const sema::TypeRef* t) -> llvm::Value* {
+            if (v && t && t->kind == sema::TypeRef::Kind::Primitive &&
+                !t->nullable && v->getType()->isStructTy())
+                return unwrapNarrowedNullable(v, lowerTypeRef(t));
+            return v;
+        };
+        l = unwrapIfNarrowed(l, lTy);
+        r = unwrapIfNarrowed(r, rTy);
         // §7.11 lifting: detect nullable value type operands.
         // For mixed T + T? where left is non-nullable: lNullable = false but
         // rNullable = true. The left payload is the raw scalar (l itself),
@@ -4690,9 +4708,21 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             // it is unavailable. Using the operand type built a too-narrow struct
             // and `insertvalue`d the widened payload → malformed IR.
             const sema::TypeRef* nvTy = lNullable ? lTy : rTy;
-            if (const sema::TypeRef* brt = ctx_.exprType(bin))
+            if (const sema::TypeRef* brt = ctx_.exprType(bin)) {
                 if (isNullableValueTy(brt))
                     nvTy = brt;
+                // #1117: the result struct's payload width must be the PROMOTED
+                // result width — `int? + long` is `long?` (i64 payload), not the
+                // narrow nullable OPERAND type `int?` (i32). When the nullable
+                // operand is proven non-null (§7.11/#914), sema types the result
+                // as the NON-nullable promoted primitive (e.g. `long`); the
+                // isNullableValueTy gate above misses it, leaving nvTy at the
+                // narrow operand type → the widened i64 payload truncated to i32
+                // (silent wrap). nullableValueStructTy reads only ->primitive, so
+                // a non-nullable promoted primitive gives the correct payload.
+                else if (brt->kind == sema::TypeRef::Kind::Primitive)
+                    nvTy = brt;
+            }
             // Build the conditional branch.
             auto* entryBB  = builder_.GetInsertBlock();
             auto* opBB     = llvm::BasicBlock::Create(llvm_, "lift.op",  currentFn_);
