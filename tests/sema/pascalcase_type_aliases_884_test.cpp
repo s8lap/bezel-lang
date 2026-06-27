@@ -279,3 +279,51 @@ BEZEL_TEST(sema_pascalcase_aliases_884,
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// §3.4 (#1081): the PascalCase primitive-alias names are RESERVED — a user type
+// may not be declared with one of them. Before the fix, `record Single` silently
+// shadowed the `float` alias and `new Single(42).v` read 0; now it is a clean
+// compile error directing the author to a different name.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sema_pascalcase_aliases_884, user_record_single_reserved_rejected_1081) {
+    auto r = parseSema(
+        "module M; record Single(v: int); "
+        "class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "reserved primitive-alias type name"));
+}
+
+BEZEL_TEST(sema_pascalcase_aliases_884, user_class_double_reserved_rejected_1081) {
+    auto r = parseSema(
+        "module M; class Double end Double; "
+        "class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "reserved primitive-alias type name"));
+}
+
+BEZEL_TEST(sema_pascalcase_aliases_884, user_record_int32_reserved_rejected_1081) {
+    auto r = parseSema(
+        "module M; record Int32(x: int); "
+        "class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "reserved primitive-alias type name"));
+}
+
+BEZEL_TEST(sema_pascalcase_aliases_884, user_interface_string_reserved_rejected_1081) {
+    auto r = parseSema(
+        "module M; interface String end String; "
+        "class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "reserved primitive-alias type name"));
+}
+
+// §3.4: `Object` is NOT reserved (it has no keyword alias) — and an ordinary
+// non-alias user type name is accepted. Neither triggers the #1081 reservation.
+BEZEL_TEST(sema_pascalcase_aliases_884, user_record_non_reserved_name_accepted_1081) {
+    auto r = parseSema(
+        "module M; record MyValue(v: int); "
+        "class C public static method Main(): int "
+        "  var a := new MyValue(5); return a.v; end Main; end C;");
+    BEZEL_EXPECT_FALSE(anyMessageMentions(r, "reserved primitive-alias type name"));
+}

@@ -20,6 +20,24 @@ std::string_view moduleSymbolName(const ast::QualifiedName* qn) {
     return qn->parts.back();
 }
 
+// §3.4 (#1081): the PascalCase primitive-alias library type names are RESERVED —
+// a user type (class/record/enum/interface/type alias) may not be declared with
+// one of these names. Each names a compiler-known primitive value type (or
+// `string`) through its lowercase keyword alias, and §3.4's dual-form rule makes
+// the PascalCase form interchangeable with the keyword everywhere a type is
+// named; a user type with one of these names would silently shadow the primitive
+// at some use sites and not others (the #1081 wrong-value bug: `record Single`
+// resolved to `float`, so `new Single(42).v` read 0). `Object` is intentionally
+// NOT reserved (§3.4: it has no keyword alias and is referenced unconditionally),
+// and the lowercase keywords cannot reach a type-decl name (the lexer tokenizes
+// them as keywords, not identifiers).
+bool isReservedPrimitiveAliasName(std::string_view n) {
+    return n == "Boolean" || n == "Byte" || n == "SByte" || n == "Int16" ||
+           n == "UInt16"  || n == "Int32" || n == "UInt32" || n == "Int64" ||
+           n == "UInt64"  || n == "Single" || n == "Double" ||
+           n == "Decimal" || n == "Char"  || n == "String";
+}
+
 // Forward declarations for the recursive descent.
 Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
                        ScopeId parentScope);
@@ -178,6 +196,18 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
                             ScopeId parentScope) {
     auto* sym = ctx.makeSymbol<TypeSymbol>();
     sym->name = td.name;
+    // §3.4 (#1081): reject a user type whose name is a reserved PascalCase
+    // primitive-alias (Single/Double/Int32/String/…). The symbol is still
+    // registered so later passes have a well-formed type to resolve against; the
+    // diagnostic makes the program a compile error.
+    if (isReservedPrimitiveAliasName(td.name)) {
+        ctx.diagnostics().report(
+            Severity::Error, td.span.begin,
+            std::string("`") + std::string(td.name) +
+            "` is a reserved primitive-alias type name (§3.4) and may not be "
+            "declared as a user type — it names a built-in primitive value type "
+            "through its lowercase keyword alias; choose a different name");
+    }
     sym->kind = td.kind;
     sym->visibility = td.visibility;
     sym->modifiers = td.modifiers;
