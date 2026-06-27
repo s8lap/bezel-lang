@@ -1695,9 +1695,16 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         // A named-type (record/class/enum) parameter must receive an operand of
         // that exact declared type — the discriminating position for the
         // reversed-operand (commutation) case.
+        // §7.11 (#1132): user-defined operator lifting over nullable operands is
+        // DEFERRED — a `Vec?` operand does NOT match a non-nullable `Vec`
+        // parameter. Without the nullability gate the operator resolved and
+        // codegen passed the `{i8, Vec}` wrapper struct to a function expecting a
+        // bare `Vec` (malformed IR). Requiring nullability agreement makes the
+        // operator not resolve, so the use is cleanly rejected below.
         if (pt->kind == TypeRef::Kind::Named)
             return at->kind == TypeRef::Kind::Named &&
-                   pt->declaration == at->declaration;
+                   pt->declaration == at->declaration &&
+                   (pt->nullable || !at->nullable);
         // A primitive parameter accepts a primitive operand (numeric widening /
         // coercion is handled downstream); the kinds must still agree.
         if (pt->kind == TypeRef::Kind::Primitive)
@@ -1730,6 +1737,46 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     if (auto* rt = ctx_.resolvedType(*od->returnType))
                         ctx_.setExprType(&be, rt);
             return;
+        }
+        // §7.11 (#1132): user-defined operator lifting over nullable operands is
+        // DEFERRED. The operator did NOT resolve above (the nullability gate in
+        // operandMatchesParam), but it IS declared on the operand's underlying
+        // type and an operand is nullable. Emit a precise diagnostic rather than
+        // the generic "operator not defined" message below — the operator exists;
+        // only its lifting over `T?` is unsupported. (`=`/`<>` are excluded: they
+        // are already null-safe per §8.4.)
+        if (op != "=" && op != "<>") {
+            auto nullableUserOperand = [&](const ast::Expr* operand) -> bool {
+                if (!operand) return false;
+                const TypeRef* t = ctx_.exprType(*operand);
+                if (!t || !t->nullable) return false;
+                TypeSymbol* ts = memberTargetType(operand);
+                if (!ts || (ts->kind != ast::TypeDeclKind::Record &&
+                            ts->kind != ast::TypeDeclKind::Class))
+                    return false;
+                for (Symbol* m : ts->members) {
+                    auto* ms = dynamic_cast<MethodSymbol*>(m);
+                    if (ms && ms->isOperator && ms->operatorToken == op &&
+                        ms->params.size() == 2)
+                        return true;
+                }
+                return false;
+            };
+            if (nullableUserOperand(be.left.get()) ||
+                nullableUserOperand(be.right.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) + "` does not lift over a "
+                    "nullable operand of a user-defined-operator type — lifting "
+                    "of user-defined operators over `T?` is deferred (\xC2\xA7"
+                    "7.11); unwrap the operand(s) with `!` or `??` to the "
+                    "non-nullable type first");
+                // Error recovery: type the result as the left operand's type so
+                // downstream uses do not cascade an "untyped expression" error.
+                if (TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr)
+                    ctx_.setExprType(&be, lt);
+                return;
+            }
         }
     }
     // §25.2 (#746 R41-C): a relational operator (`<`, `>`, `<=`, `>=`) on a

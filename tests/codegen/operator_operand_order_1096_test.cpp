@@ -120,3 +120,43 @@ BEZEL_TEST(operator_operand_order_1096, first_overload_still_resolves_1131) {
         "  return (a + 7).N; "                             // 17 (V+int overload)
         "end Main; end App;"), 17);
 }
+
+// ── #1132 / §7.11: a user operator overload over a NULLABLE operand is a clean ─
+// reject (lifting of user-defined operators over T? is deferred), not malformed
+// IR. The operator previously resolved (nullability was ignored) and codegen
+// passed the {i8, Vec} wrapper struct to the bare-Vec operator function.
+BEZEL_TEST(operator_operand_order_1096, nullable_user_operator_rejected_not_crash_1132) {
+    auto r = runJit(
+        std::string(VEC) +
+        "class Mn public static method Main(): int "
+        "  var a: Vec? := new Vec(1, 2); "
+        "  var c := a + a; "                               // Vec? + Vec? — deferred
+        "  return 0; "
+        "end Main; end Mn;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Unwrapping the nullable operands with `!` resolves to the non-nullable
+// operator and computes correctly (the spec-endorsed workaround).
+BEZEL_TEST(operator_operand_order_1096, nullable_user_operator_unwrap_works_1132) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(VEC) +
+        "class Mn public static method Main(): int "
+        "  var a: Vec? := new Vec(1, 2); "
+        "  var b: Vec? := new Vec(3, 4); "
+        "  var c := a! + b!; "
+        "  return c.X + c.Y; "                             // 4 + 6 = 10
+        "end Main; end Mn;"), 10);
+}
+
+// Non-nullable record operator use is unaffected (regression guard).
+BEZEL_TEST(operator_operand_order_1096, non_nullable_record_operator_unaffected_1132) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(VEC) +
+        "class Mn public static method Main(): int "
+        "  var a := new Vec(1, 2); var b := new Vec(3, 4); "
+        "  var c := a + b; "
+        "  return c.X + c.Y; "                             // 10
+        "end Main; end Mn;"), 10);
+}
