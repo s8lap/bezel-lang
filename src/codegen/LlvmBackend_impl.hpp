@@ -1449,6 +1449,20 @@ private:
         return ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
     }
 
+    // #1080 / §23.4: a virtual/override/abstract (or interface) INDEXER needs a
+    // vtable slot so `base[i]` and `this[i]` dispatch to the most-derived getter
+    // — the indexer analog of isVirtualProperty (the non-indexer guard there
+    // deliberately excludes indexers, which historically had no slot).
+    bool isVirtualIndexer(const sema::PropertySymbol* ps) {
+        if (!ps || !ps->isIndexer) return false;
+        for (auto mod : ps->modifiers) {
+            if (mod == "static") return false;
+            if (mod == "virtual" || mod == "override" || mod == "abstract")
+                return true;
+        }
+        return ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
+    }
+
     // #481 / §23: does this property declare a setter? An auto-property without
     // a `readonly`/`private set` restriction has both; an expression-bodied or
     // block getter-only property has only a getter. Checked off the PropertyDecl
@@ -2825,6 +2839,56 @@ private:
                 for (auto mod : ps->modifiers)
                     if (mod == "static") { isStatic = true; break; }
                 if (!isStatic) return ps;
+            }
+            t = baseClassOf(t);
+        }
+        return nullptr;
+    }
+
+    // #1080 / §23.4: a vtable-slot key for an INDEXER that distinguishes
+    // overloads by their index-parameter signature (two indexers `[i: int]` and
+    // `[s: bool]` must get DISTINCT slots, not collide on the shared name
+    // ".this"). A base virtual indexer and its derived override have the same
+    // index signature → the same key → the override reuses the base's slot
+    // (mirrors how #1085 keys method-overload slots by arity).
+    std::string indexerSlotKey(const sema::PropertySymbol* ps) {
+        std::string key(ps->name);  // ".this"
+        // Key off the AST index-parameter type spellings (the same source
+        // lowerIndexerGet uses); the sema ParameterSymbols' resolvedDeclType is
+        // not reliably populated when buildVtable runs.
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+            for (const auto& p : pd->indexerParams) {
+                key += "#";
+                if (p.type && p.type->name && !p.type->name->parts.empty()) {
+                    for (auto part : p.type->name->parts) {
+                        key += std::string(part);
+                        key += ".";
+                    }
+                } else {
+                    key += "?";
+                }
+            }
+        }
+        return key;
+    }
+
+    // #1080 / §23.4: the most-derived INDEXER on `cls`'s chain whose index
+    // signature matches `proto` (the indexer that introduced the vtable slot).
+    // classPropertyByName deliberately skips indexers; this fills an indexer's
+    // slot with the concrete class's getter/setter so a derived override fills
+    // the base-introduced slot, while keeping overloaded indexers distinct.
+    sema::PropertySymbol* classIndexerMatching(const sema::TypeSymbol* cls,
+                                               const sema::PropertySymbol* proto) {
+        if (!proto) return nullptr;
+        const std::string want = indexerSlotKey(proto);
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ps || !ps->isIndexer) continue;
+                bool isStatic = false;
+                for (auto mod : ps->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (!isStatic && indexerSlotKey(ps) == want) return ps;
             }
             t = baseClassOf(t);
         }

@@ -1298,11 +1298,18 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
             continue;
         }
         if (auto* ps = dynamic_cast<sema::PropertySymbol*>(m)) {
-            if (!isVirtualProperty(ps)) continue;
-            propGetSlot_[ps] = assignSlot(std::string(ps->name),
-                                          VSlot{nullptr, ps, false});
+            // #1080: a virtual indexer also gets a slot. Its key is the
+            // index-signature key (so overloaded indexers `[i:int]`/`[s:bool]`
+            // get distinct slots while a base/derived override of the same
+            // signature aligns). The slot fill (declareVtables Pass D) uses the
+            // INDEXER accessor builder (its signature carries the index params),
+            // and lowerIndexerGet/Set dispatch through it.
+            bool vIdx = isVirtualIndexer(ps);
+            if (!isVirtualProperty(ps) && !vIdx) continue;
+            std::string key = vIdx ? indexerSlotKey(ps) : std::string(ps->name);
+            propGetSlot_[ps] = assignSlot(key, VSlot{nullptr, ps, false});
             if (propertyHasSetter(ps))
-                propSetSlot_[ps] = assignSlot(std::string(ps->name) + "$set",
+                propSetSlot_[ps] = assignSlot(key + "$set",
                                               VSlot{nullptr, ps, true});
         }
     }
@@ -1751,13 +1758,26 @@ void Emitter::declareVtables() {
                 // #481 / §12.5: resolve the most-derived accessor on `ts`'s
                 // chain. classPropertyByName returns the override if present,
                 // else the base declaration (abstract → no body → null fn).
+                // #1080: classPropertyByName skips indexers, so an indexer slot
+                // resolves its implementation via classIndexerMatching (by index
+                // signature, so an overloaded indexer fills its own slot).
                 sema::PropertySymbol* impl =
-                    classPropertyByName(ts, vs.prop->name);
-                if (impl)
-                    if (llvm::Function* fn =
-                            ensurePropertyAccessorFn(ts, impl, vs.isSet))
+                    vs.prop->isIndexer
+                        ? classIndexerMatching(ts, vs.prop)
+                        : classPropertyByName(ts, vs.prop->name);
+                if (impl) {
+                    // #1080: an indexer slot carries the INDEXER accessor (its
+                    // signature has the index params), not the plain
+                    // `T get(ptr this)` property accessor.
+                    llvm::Function* fn =
+                        vs.prop->isIndexer
+                            ? (vs.isSet ? ensureIndexerSetterFn(ts, impl)
+                                        : ensureIndexerGetterFn(ts, impl))
+                            : ensurePropertyAccessorFn(ts, impl, vs.isSet);
+                    if (fn)
                         elems[kVirtualMethodsBase + i] =
                             llvm::cast<llvm::Constant>(fn);
+                }
             }
         }
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());

@@ -1081,6 +1081,49 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         emitPendingCheck();
         return r;
     }
+    // #1080 / §23.4: a virtual/override/abstract indexer on a CLASS receiver
+    // dispatches dynamically through the vtable slot (the static getter-body
+    // resolution below binds the COMPILE-TIME receiver type's getter, so a
+    // `base[i]` or `this[i]` read would run the base/abstract body). Load the
+    // getter fn-ptr from vt[propGetSlot_] and call it as `T get(ptr this,
+    // idx...)`. Mirrors the #481 property-vtable path; the slot was assigned by
+    // buildVtable and filled with ensureIndexerGetterFn.
+    if (recvDecl->kind == ast::TypeDeclKind::Class) {
+        auto gsIt = propGetSlot_.find(ps);
+        if (gsIt != propGetSlot_.end()) {
+            llvm::Type* retTy = lowerType(pd->type.get());
+            if (!retTy) retTy = i32();
+            std::vector<llvm::Type*> paramTys;
+            paramTys.push_back(ptrTy());
+            for (const auto& p : pd->indexerParams) {
+                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                paramTys.push_back(pt ? pt : i32());
+            }
+            auto* gFnTy = llvm::FunctionType::get(retTy, paramTys, false);
+            llvm::Value* obj = lowerExpr(*ix.target);
+            if (obj && obj->getType()->isPointerTy()) {
+                llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+                llvm::Value* fnPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), vptr,
+                                       {builder_.getInt32(gsIt->second)}),
+                    "idxget");
+                std::vector<llvm::Value*> callArgs;
+                callArgs.push_back(obj);
+                for (std::size_t k = 0; k < pd->indexerParams.size() &&
+                     k < ix.indices.size(); ++k) {
+                    if (!ix.indices[k].value) return nullptr;
+                    llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+                    if (!argVal) return nullptr;
+                    callArgs.push_back(
+                        coerceNumericToType(argVal, paramTys[k + 1], false));
+                }
+                llvm::Value* r = builder_.CreateCall(gFnTy, fnPtr, callArgs);
+                emitPendingCheck();
+                return r;
+            }
+        }
+    }
     // Find a getter accessor body. The getter is either an expression body
     // (`property [i]: T => expr;` or `get => expr;`) or a BLOCK body
     // (`get => do … end;`, §23.4). A block body may contain a `return`, so it
@@ -1257,6 +1300,49 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         builder_.CreateCall(sFnTy, fnPtr, callArgs);
         emitPendingCheck();
         return true;
+    }
+    // #1080 / §23.4: a virtual/override/abstract indexer SETTER on a CLASS
+    // receiver dispatches dynamically through the vtable slot (symmetric with
+    // the getter path above). Load the setter fn-ptr from vt[propSetSlot_] and
+    // call it as `void set(ptr this, idx..., value)`.
+    if (recvDecl->kind == ast::TypeDeclKind::Class) {
+        auto ssIt = propSetSlot_.find(ps);
+        if (ssIt != propSetSlot_.end()) {
+            llvm::Type* valTy = lowerType(pd->type.get());
+            if (!valTy) valTy = i32();
+            std::vector<llvm::Type*> paramTys;
+            paramTys.push_back(ptrTy());
+            for (const auto& p : pd->indexerParams) {
+                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                paramTys.push_back(pt ? pt : i32());
+            }
+            paramTys.push_back(valTy);
+            auto* sFnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), paramTys, false);
+            llvm::Value* obj = lowerExpr(*ix.target);
+            if (obj && obj->getType()->isPointerTy()) {
+                llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+                llvm::Value* fnPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), vptr,
+                                       {builder_.getInt32(ssIt->second)}),
+                    "idxset");
+                std::vector<llvm::Value*> callArgs;
+                callArgs.push_back(obj);
+                for (std::size_t k = 0; k < pd->indexerParams.size() &&
+                     k < ix.indices.size(); ++k) {
+                    if (!ix.indices[k].value) return false;
+                    llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+                    if (!argVal) return false;
+                    callArgs.push_back(
+                        coerceNumericToType(argVal, paramTys[k + 1], false));
+                }
+                callArgs.push_back(coerceNumericToType(val, valTy, false));
+                builder_.CreateCall(sFnTy, fnPtr, callArgs);
+                emitPendingCheck();
+                return true;
+            }
+        }
     }
     // Find a setter accessor body.
     const ast::Expr* setterExpr = nullptr;
