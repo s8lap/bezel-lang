@@ -7744,6 +7744,56 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
 
     auto* recvTy = ctx_.exprType(*ma->target);
     if (!recvTy) return nullptr;
+    // #1091 (§8.1/§14.2): GetHashCode/Equals on a bare unconstrained generic
+    // type parameter `T` (Named, no declaration). The value-semantics gate below
+    // only matches a CONCRETE primitive/record/enum, so an unconstrained-T
+    // receiver fell through and the call returned a 0 stub (ToString on the same
+    // T already works via the genericSubst path in the ms==null fallback).
+    // Resolve T → its concrete bound type through the active monomorphization and
+    // route to the matching handler: primitive/record/enum →
+    // lowerValueSemMethodOn; class/interface/string/Object → lowerObject*. (Only
+    // the broken members — GetHashCode/Equals — are intercepted here; ToString
+    // keeps its existing working path.)
+    if ((isGetHashCode || isEquals) &&
+        recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
+        !genericSubstSemaTy_.empty() && recvTy->astNode &&
+        recvTy->astNode->name && recvTy->astNode->name->parts.size() == 1) {
+        auto sit = genericSubstSemaTy_.find(recvTy->astNode->name->parts[0]);
+        if (sit != genericSubstSemaTy_.end() && sit->second) {
+            const sema::TypeRef* concrete = sit->second;
+            using K = sema::TypeRef::Kind;
+            using P = sema::PrimitiveType;
+            bool concreteValSem =
+                (concrete->kind == K::Primitive &&
+                 concrete->primitive != P::String &&
+                 concrete->primitive != P::Object) ||
+                (concrete->kind == K::Named && concrete->declaration &&
+                 (concrete->declaration->kind == ast::TypeDeclKind::Record ||
+                  concrete->declaration->kind == ast::TypeDeclKind::Enum));
+            bool concreteRefSem =
+                (concrete->kind == K::Named && concrete->declaration &&
+                 (concrete->declaration->kind == ast::TypeDeclKind::Class ||
+                  concrete->declaration->kind == ast::TypeDeclKind::Interface)) ||
+                (concrete->kind == K::Primitive &&
+                 (concrete->primitive == P::String ||
+                  concrete->primitive == P::Object));
+            if (concreteValSem) {
+                if (llvm::Value* recv = lowerExpr(*ma->target))
+                    return lowerValueSemMethodOn(concrete, recv, call, member);
+            } else if (concreteRefSem) {
+                if (llvm::Value* recv = lowerExpr(*ma->target)) {
+                    if (isGetHashCode) {
+                        if (llvm::Value* r = lowerObjectGetHashCode(recv))
+                            return r;
+                    } else if (call.args[0].value) {
+                        if (llvm::Value* other = lowerExpr(*call.args[0].value))
+                            if (llvm::Value* r = lowerObjectEquals(recv, other))
+                                return r;
+                    }
+                }
+            }
+        }
+    }
     // Lower the receiver ONLY for the value-semantics receiver kinds the core
     // handles (a primitive Equals/GetHashCode, or any record/enum member); a
     // primitive ToString (left to the dedicated string path) or a non-value
