@@ -3272,6 +3272,35 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 return builder_.CreateSelect(isNull, emptyStr, msgPtr);
             }
         }
+        // stdlib §2.17 / §31.4 (#1107/#11-13): `ex.InnerException` on a
+        // `TypeInitializationException` reads the wrapped original exception
+        // stored at byte offset 16 of the 24-byte object (the static-init-failure
+        // wrapper stores it there; LlvmBackend_Setup.cpp). It is the only
+        // built-in with surface beyond `Exception` (stdlib §2.17) — `Message`
+        // sits at offset 8, the inner exception ptr at offset 16. Returns the
+        // inner exception pointer (nullable `Exception?`). Without this the
+        // access fell to a generic property getter that returned null, so
+        // `inner is not null` / `inner is ArgumentException` were false and
+        // binding the result then testing `is`/`as` dereferenced null (SIGSEGV).
+        if (ma->target && ma->member == "InnerException") {
+            auto* tt = ctx_.exprType(*ma->target);
+            bool isTIE =
+                tt && tt->kind == sema::TypeRef::Kind::Named &&
+                ((tt->declaration &&
+                  tt->declaration->name == "TypeInitializationException") ||
+                 (!tt->declaration && tt->astNode && tt->astNode->name &&
+                  !tt->astNode->name->parts.empty() &&
+                  tt->astNode->name->parts[0] ==
+                      "TypeInitializationException"));
+            if (isTIE) {
+                llvm::Value* excObj = lowerExpr(*ma->target);
+                if (!excObj) return nullptr;
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* innerSlot = builder_.CreateGEP(
+                    i8Ty, excObj, builder_.getInt64(16));
+                return builder_.CreateLoad(ptrTy(), innerSlot);
+            }
+        }
     }
     // issue #494 / §29.2 / §29.3: explicit `e.Current` property access where
     // `e` is typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema

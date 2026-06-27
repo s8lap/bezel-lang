@@ -609,6 +609,7 @@ set(BEZEL_TEST_SOURCES
     codegen/task_fromresult_class_reject_1107_test.cpp
     codegen/generic_owned_field_string_reject_1107_test.cpp
     codegen/iter_case_arm_yield_1107_test.cpp
+    codegen/type_init_inner_exception_1107_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp
