@@ -206,3 +206,83 @@ BEZEL_TEST(codegen_cg_517, char_just_below_surrogate_ok_spec_5_2) {
 BEZEL_TEST(codegen_cg_517, char_just_above_surrogate_ok_spec_5_2) {
     BEZEL_EXPECT_EQ(run("var c := char(0xE000); return int(c);"), 0xE000);
 }
+
+// ---------------------------------------------------------------------------
+// #1094 — §6.5: a shift's count is masked by the LEFT operand's bit width, and
+// the result keeps the left operand's (narrow) type. Before the fix, a narrow
+// left operand with a WIDER count (`byte << int`) widened the left to the
+// count's width, masked the count by the WRONG width (&31 instead of &7), and
+// truncated back — `byte(1) << int(8)` gave 0 instead of 1. (`byte << byte` and
+// `int << int`, both same width, already worked.)
+// ---------------------------------------------------------------------------
+
+// byte(1) << int(8): 8 & 7 == 0 → 1 << 0 == 1 (was 0).
+BEZEL_TEST(codegen_cg_1094, byte_shl_int_count_8_masks_by_byte_width) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte := 1; var n: int := 8; var c: byte := a << n; return int(c);"), 1);
+}
+
+// byte(1) << int(9): 9 & 7 == 1 → 1 << 1 == 2 (was 0).
+BEZEL_TEST(codegen_cg_1094, byte_shl_int_count_9_masks_by_byte_width) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte := 1; var n: int := 9; var c: byte := a << n; return int(c);"), 2);
+}
+
+// byte(200) << int(1): 400 wraps at byte width → 144.
+BEZEL_TEST(codegen_cg_1094, byte_shl_wraps_at_byte_width) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte := 200; var n: int := 1; var c: byte := a << n; return int(c);"), 144);
+}
+
+// short(1) << int(17): 17 & 15 == 1 → 2.
+BEZEL_TEST(codegen_cg_1094, short_shl_int_count_masks_by_short_width) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: short := 1; var n: int := 17; var c: short := a << n; return int(c);"), 2);
+}
+
+// ushort(0x8000) >> int(17): 17 & 15 == 1 → logical >> 1 == 0x4000 (16384).
+BEZEL_TEST(codegen_cg_1094, ushort_shr_logical_masks_by_ushort_width) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: ushort := 32768; var n: int := 17; var c: ushort := a >> n; return int(c);"),
+        16384);
+}
+
+// sbyte(-128) >> int(1): arithmetic (signed) shift → -64.
+BEZEL_TEST(codegen_cg_1094, sbyte_shr_arithmetic) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: sbyte := -128; var n: int := 1; var c: sbyte := a >> n; return int(c);"), -64);
+}
+
+// byte(128) >> int(1): logical (unsigned) shift → 64 (not -64).
+BEZEL_TEST(codegen_cg_1094, byte_shr_logical) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte := 128; var n: int := 1; var c: byte := a >> n; return int(c);"), 64);
+}
+
+// Regression: int(1) << int(32) still masks by 32 (== 0) → 1; int << int unchanged.
+BEZEL_TEST(codegen_cg_1094, int_shl_same_width_regression) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: int := 1; var n: int := 32; return a << n;"), 1);
+}
+
+// --- nullable-lifted shift: same operand-width masking + correct signedness ---
+
+// byte?(1) << int(9): 9 & 7 == 1 → 2 (was a compiler crash / wrong value).
+BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_int_count_masks_by_byte_width) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := 1; var n: int := 9; var c: byte? := a << n; return int(c!);"), 2);
+}
+
+// byte?(128) >> int(1): logical >> → 64 (a signed AShr regressed it to -64 once
+// the left payload was narrowed to i8).
+BEZEL_TEST(codegen_cg_1094, nullable_byte_shr_logical) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := 128; var n: int := 1; var c: byte? := a >> n; return int(c!);"), 64);
+}
+
+// byte?(null) << int: null propagates (no shift performed).
+BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_null_propagates) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: byte? := null; var n: int := 1; var c: byte? := a << n; "
+        "return (0 if c = null else 99);"), 0);
+}

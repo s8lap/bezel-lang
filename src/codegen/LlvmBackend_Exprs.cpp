@@ -4864,12 +4864,45 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     else if (op == "|")   payloadResult = builder_.CreateOr(lp, rp);
                     else if (op == "^")   payloadResult = builder_.CreateXor(lp, rp);
                     else if (op == "<<" || op == ">>") {
-                        unsigned bits = lp->getType()->getIntegerBitWidth();
-                        llvm::Value* mask = llvm::ConstantInt::get(rp->getType(), bits - 1);
+                        // §6.5 (#1094): a nullable shift's result type is the LEFT
+                        // operand's type — it is NOT promoted by the count. The
+                        // lifted operands were widened to a common width, so mask
+                        // and shift at the RESULT payload width (the left operand's
+                        // true width), not the widened `lp` width. Without this,
+                        // `byte? << int 9` widened lp to i32, masked &31 (i32),
+                        // shifted 1<<9 = 512, then truncated to byte = 0 instead of
+                        // masking &7 → 1<<1 = 2. Narrow lp to the result width, mask
+                        // the count by that width, and coerce the count to it (the
+                        // masked count fits). Coercing the count also avoids the
+                        // LLVM "both shift operands same type" assert (a crash) when
+                        // lp/rp widths differ.
+                        llvm::Type* resTy =
+                            nullableValueStructTy(nvTy)->getElementType(1);
+                        llvm::Value* lsh = lp;
+                        if (resTy->isIntegerTy() && resTy != lp->getType())
+                            lsh = builder_.CreateTrunc(lp, resTy);
+                        unsigned bits = lsh->getType()->getIntegerBitWidth();
+                        llvm::Value* mask =
+                            llvm::ConstantInt::get(rp->getType(), bits - 1);
                         llvm::Value* cnt = builder_.CreateAnd(rp, mask, "shcnt");
-                        if (op == "<<")  payloadResult = builder_.CreateShl(lp, cnt);
-                        else             payloadResult = uns ? builder_.CreateLShr(lp, cnt)
-                                                             : builder_.CreateAShr(lp, cnt);
+                        if (cnt->getType() != lsh->getType())
+                            cnt = builder_.CreateZExtOrTrunc(cnt, lsh->getType());
+                        if (op == "<<") {
+                            payloadResult = builder_.CreateShl(lsh, cnt);
+                        } else {
+                            // #814 / §6.5: `>>` fill is logical (LShr) iff the
+                            // SHIFTED (LEFT) operand is unsigned, arithmetic (AShr)
+                            // for a signed left operand — independent of the
+                            // operation's common signedness `uns` (mirrors the
+                            // non-nullable path). Using `uns` here arithmetic-shifted
+                            // an unsigned `byte?` once lp was narrowed to i8 (-128 >>
+                            // 1 = -64 instead of 64).
+                            bool lShiftUns =
+                                bin.left && isUnsignedTargetExpr(*bin.left);
+                            payloadResult = lShiftUns
+                                ? builder_.CreateLShr(lsh, cnt)
+                                : builder_.CreateAShr(lsh, cnt);
+                        }
                     }
                 }
             }
@@ -5113,9 +5146,17 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // CG25 (§6.2): mixed-width integer operands — widen the narrower to
     // the wider (zero-extend for unsigned, sign-extend otherwise) so the
     // op and any overflow check run at one width.
+    // §6.5 (#1094): a SHIFT is EXCLUDED — its result type is the LEFT operand's
+    // type and the count never promotes the left operand (§6.2 promotion does
+    // not apply to `<<`/`>>`; sema keeps the narrow type). Widening the narrow
+    // left operand to the (wider) count's width here made the count mask use the
+    // count's bit-width (`byte 1 << int 8` masked &31, shifted i32 1<<8=256, then
+    // truncated back to byte = 0). Keep each operand at its own width; the shift
+    // block below masks the count by the LEFT operand's width and coerces the
+    // count to the left's type for the LLVM shift.
     if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy() &&
         !l->getType()->isIntegerTy(1) && !r->getType()->isIntegerTy(1) &&
-        l->getType() != r->getType()) {
+        l->getType() != r->getType() && op != "<<" && op != ">>") {
         unsigned lw = l->getType()->getIntegerBitWidth();
         unsigned rw = r->getType()->getIntegerBitWidth();
         llvm::Type* wide = lw >= rw ? l->getType() : r->getType();
@@ -5432,13 +5473,22 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         if (op == "&") return builder_.CreateAnd(l, r);
         if (op == "|") return builder_.CreateOr(l, r);
         if (op == "^") return builder_.CreateXor(l, r);
-        // §6.5: shift count is reduced modulo the operand's bit width.
+        // §6.5: shift count is reduced modulo the LEFT operand's bit width.
         // LLVM shl/lshr/ashr with count >= bitwidth produces poison; mask
         // the count to [0, bitwidth-1] before emitting the shift.
         if (op == "<<" || op == ">>") {
+            // #1094: `bits` is the LEFT operand's width — it is no longer widened
+            // to the count's width (the §6.2 promotion exclusion above), so this
+            // is the spec's "operand bit width" (8 for byte, 16 for short, …).
             unsigned bits = l->getType()->getIntegerBitWidth();
             llvm::Value* mask = llvm::ConstantInt::get(r->getType(), bits - 1);
             llvm::Value* cnt = builder_.CreateAnd(r, mask, "shcnt");
+            // The count and the shifted (left) operand may now differ in width
+            // (e.g. `byte << int`). The masked count is in [0, bits-1], so it
+            // fits the left operand's type; coerce it there (LLVM requires both
+            // shift operands to share a type) — a no-op when widths already match.
+            if (cnt->getType() != l->getType())
+                cnt = builder_.CreateZExtOrTrunc(cnt, l->getType());
             if (op == "<<")  return builder_.CreateShl(l, cnt);
             // #814 / §6.5: `>>` fill is logical (LShr) iff the SHIFTED value (the
             // LEFT operand) is unsigned; arithmetic (AShr) for a signed value.
