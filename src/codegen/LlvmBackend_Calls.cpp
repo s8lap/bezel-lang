@@ -9373,6 +9373,20 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     call.args.empty()) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 std::string_view rbn = builtinTypeName(recvTy);
+                // #1102C / §29.11: GetEnumerator() on a vtable-backed
+                // IEnumerable<T> (a yield-method result / interface-typed value)
+                // — the source value the yield method returns IS the enumerator
+                // (its vtable is [0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,
+                // [4]=GetEnumerator; the consumer drives slots 2/3 directly).
+                // Return the receiver unchanged — the SAME identity the §30.7
+                // GetAsyncEnumerator path returns for the async iterator — so a
+                // `using var it := C.Gen().GetEnumerator()` disposes exactly that
+                // one struct (slot 1) with no separate leaked source temp and no
+                // double-free. (The Array/OwnedArray case below instead wraps +
+                // clones because the array is a distinct long-lived object.)
+                if (isVtableBackedIEnumerableType(recvTy)) {
+                    return lowerExpr(*ma->target);
+                }
                 if ((rbn == "Array" || rbn == "OwnedArray") && recvTy &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                     llvm::Value* arr = lowerExpr(*ma->target);

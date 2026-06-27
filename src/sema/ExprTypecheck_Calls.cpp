@@ -2474,6 +2474,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tr->genericArgs.push_back(recvTy->genericArgs[0]);
                         ctx_.setExprType(&ce, tr);
                     }
+                    // #1102C / §29.11: `GetEnumerator()` on a vtable-backed
+                    // IEnumerable<T> / OwnedEnumerable<T> (a yield-method result
+                    // or an interface-typed value, NOT the array-backed
+                    // collections handled above) returns IEnumerator<T>. Type the
+                    // result as the builtin IEnumerator<T> sentinel so the
+                    // manual-protocol MoveNext()→bool typing (#494, below) fires —
+                    // without this `var b := it.MoveNext()` inferred `b` as the
+                    // i32 default and `if b` emitted a malformed `br i32`. Codegen
+                    // returns the receiver unchanged (the source iterator struct
+                    // IS the enumerator; its vtable slot 2 = MoveNext).
+                    if ((colName == "IEnumerable" || colName == "OwnedEnumerable") &&
+                        m == "GetEnumerator" && ce.args.empty() &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        static const ast::Type* kIEnumeratorNode2 =
+                            []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("IEnumerator");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kIEnumeratorNode2;
+                        tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                        ctx_.setExprType(&ce, tr);
+                    }
                     // issue #494 / §29.2 / §29.3: builtin IEnumerator<T> /
                     // OwnedEnumerator<T> call-expression methods.
                     //   MoveNext(): bool — advances the iterator (vtable slot 2)
