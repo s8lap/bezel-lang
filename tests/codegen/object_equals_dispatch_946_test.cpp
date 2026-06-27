@@ -159,3 +159,61 @@ BEZEL_TEST(codegen_object_hashcode_948, user_override_reached_through_object) {
         "using var a := new P(2); var oa: Object := a; "
         "return oa.GetHashCode();"), 2);
 }
+
+// ── #1119: Object.ReferenceEquals(a, b) (§8.1/§8.4) ──────────────────────────
+// Pointer-identity compare; was rejected as a nonexistent static method.
+
+// Same reference → true; two distinct objects → false.
+BEZEL_TEST(codegen_reference_equals_1119, identity_true_distinct_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class N public v: int := 0; end N; "
+        "class C public static method Main(): int "
+        "  using var a := new N(); using var b := new N(); "
+        "  var acc := 0; "
+        "  if Object.ReferenceEquals(a, a) then acc := acc + 1; end; "
+        "  if Object.ReferenceEquals(a, b) then acc := acc + 10; end; "
+        "  return acc; "                                  // 1 (same ref only)
+        "end Main; end C;"), 1);
+}
+
+// §8.4: ReferenceEquals IGNORES an Equals override — P(5) and P(5) are
+// Equals-equal but distinct references, so ReferenceEquals is false.
+BEZEL_TEST(codegen_reference_equals_1119, ignores_equals_override) {
+    BEZEL_EXPECT_EQ(runWithP(
+        "using var a := new P(5); using var b := new P(5); "
+        "var acc := 0; "
+        "if a.Equals(b) then acc := acc + 1; end; "               // +1: override
+        "if Object.ReferenceEquals(a, b) then acc := acc + 10; end; "  // +0: distinct
+        "return acc;"), 1);
+}
+
+// A null reference compares equal to another null.
+BEZEL_TEST(codegen_reference_equals_1119, null_equals_null) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class N public v: int := 0; end N; "
+        "class C public static method Main(): int "
+        "  var a: N? := null; "
+        "  return (1 if Object.ReferenceEquals(a, null) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.4: passing value-type arguments always returns false (each boxing is a
+// fresh object).
+BEZEL_TEST(codegen_reference_equals_1119, value_type_args_always_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return (1 if Object.ReferenceEquals(5, 5) else 0); "
+        "end Main; end C;"), 0);
+}
+
+// An object reached through both its class type and an interface type is the
+// same reference → true.
+BEZEL_TEST(codegen_reference_equals_1119, class_and_interface_ref_same_object) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; interface IShape method Area(): int; end IShape; "
+        "class Sq: IShape public method Area(): int => 4; end Sq; "
+        "class C public static method Main(): int "
+        "  using var s := new Sq(); var i: IShape := s; "
+        "  return (1 if Object.ReferenceEquals(s, i) else 0); "
+        "end Main; end C;"), 1);
+}

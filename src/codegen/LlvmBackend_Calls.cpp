@@ -6946,6 +6946,23 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     const auto& m = ma->member;
     using P = sema::PrimitiveType;
 
+    // §8.1 / §8.4 (#1119): Object.ReferenceEquals(a, b): bool — compares object
+    // identity, ignoring any Equals override. Classes / interfaces / Object? all
+    // lower to a raw pointer, so the identity test is a pointer `icmp eq` (a null
+    // reference compares equal to another null, true). A value-type argument is
+    // boxed to a FRESH heap object per the spec, so it never aliases another box
+    // — when an operand is not a pointer (a value type), the result is always
+    // false (§8.4: "Passing value-type arguments always returns false").
+    if (pt == P::Object && m == "ReferenceEquals" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* a = lowerExpr(*call.args[0].value);
+        llvm::Value* b = lowerExpr(*call.args[1].value);
+        if (!a || !b) return nullptr;
+        if (!a->getType()->isPointerTy() || !b->getType()->isPointerTy())
+            return builder_.getFalse();
+        return builder_.CreateICmpEQ(a, b, "refeq");
+    }
+
     // §5: char static classification methods — char.IsDigit(c), etc.
     if (pt == P::Char && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);

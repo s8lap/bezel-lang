@@ -5947,6 +5947,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+                // §8.1 / §8.4 (#1119): Object.ReferenceEquals(a, b): bool —
+                // compares object identity, ignoring any Equals override. Codegen
+                // lowers it to a pointer-identity compare. (Passing value-type
+                // arguments always returns false — each boxing creates a fresh
+                // object — which the pointer compare yields naturally.)
+                if (pt == PrimitiveType::Object && mbr == "ReferenceEquals") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
                 // per §3.4: the primitive-static handler above recognises a
                 // fixed, closed set of names.  Any name that reached this
                 // point is NOT in that set — emit a diagnostic and return so
