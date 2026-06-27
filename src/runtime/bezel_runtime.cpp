@@ -2642,6 +2642,73 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     return sh;
 }
 
+// §9.3 (#1099B): Decimal.ToString(format) — honor the "F"/"f" fixed-point
+// specifier ("F2" → exactly 2 fraction digits; bare "F" → 2 by .NET default).
+// The mantissa is rounded half-up to the requested precision (bz_decimal_round)
+// then formatted with EXACTLY that many fraction digits (trailing zeros padded;
+// prec == 0 drops the point). Any other / malformed format falls back to the
+// plain ToString — no worse than before, when the format argument was discarded
+// entirely. `fmt_p` is a bz_string {data,len,width,rc}.
+extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
+                                          const void* fmt_p) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    const char* fmt = (fh && fh->data && fh->width == 1) ? fh->data : "";
+    int64_t flen = fh ? fh->len : (int64_t)strlen(fmt);
+    if (flen >= 1 && (fmt[0] == 'F' || fmt[0] == 'f')) {
+        int prec = 2;            // .NET default for "F" with no digit count
+        bool ok = true;
+        if (flen > 1) {
+            prec = 0;
+            for (int64_t i = 1; i < flen; ++i) {
+                if (fmt[i] < '0' || fmt[i] > '9') { ok = false; break; }
+                prec = prec * 10 + (fmt[i] - '0');
+                if (prec > 28) { ok = false; break; }  // decimal max scale
+            }
+        }
+        if (ok) {
+            bz_decimal_t r;
+            bz_decimal_round(a, prec, &r);
+            __uint128_t m = dec_mantissa(&r);
+            uint32_t s = dec_scale(&r);          // s <= prec after rounding
+            int neg = dec_sign(&r);
+            bool valueIsZero = (m == 0);
+            // mantissa digits, most-significant first.
+            char digits[40]; int nd = 0;
+            if (m == 0) { digits[0] = '0'; nd = 1; }
+            else { while (m > 0) { digits[nd++] = (char)('0' + (int)(m % 10)); m /= 10; } }
+            for (int i = 0; i < nd / 2; ++i) {
+                char t = digits[i]; digits[i] = digits[nd-1-i]; digits[nd-1-i] = t;
+            }
+            char buf[80]; int pos = 0;
+            if (neg && !valueIsZero) buf[pos++] = '-';   // never "-0.00"
+            int int_digits = nd - (int)s;
+            if (int_digits <= 0) buf[pos++] = '0';
+            else for (int i = 0; i < int_digits; ++i) buf[pos++] = digits[i];
+            if (prec > 0) {
+                buf[pos++] = '.';
+                int written = 0;
+                // leading zeros when |value| < 1 (int_digits < 0).
+                for (int i = 0; i < -int_digits && written < prec; ++i) {
+                    buf[pos++] = '0'; ++written;
+                }
+                int fracStart = int_digits > 0 ? int_digits : 0;
+                for (int i = fracStart; i < nd && written < prec; ++i) {
+                    buf[pos++] = digits[i]; ++written;
+                }
+                while (written < prec) { buf[pos++] = '0'; ++written; }  // pad
+            }
+            buf[pos] = '\0';
+            int64_t len = (int64_t)pos;
+            char* data = (char*)malloc((size_t)len + 1);
+            memcpy(data, buf, (size_t)len + 1);
+            bz_string_hdr* hdr = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+            hdr->data = data; hdr->len = len; hdr->width = 1; hdr->rc = 1;
+            return hdr;
+        }
+    }
+    return bz_decimal_to_string(a);   // unsupported / malformed format
+}
+
 // ---------------------------------------------------------------------------
 // Per §2.5: TimeSpan component extractors.
 // Ticks are signed 100-ns units.

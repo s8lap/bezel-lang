@@ -659,3 +659,72 @@ BEZEL_TEST(codegen_decimal_521, decimal_from_negative_int_unchanged_743) {
         "  return (1 if d < 0m else 0); "  // 1
         "end Main; end C;"), 1);
 }
+
+// ---------------------------------------------------------------------------
+// #1099B (§9.3): Decimal.ToString(format) honors the "F"/"f" fixed-point
+// specifier. Before the fix the generic numeric ToString(format) path (which
+// only handles float/double F/E/G and int D/X) dropped a decimal format to the
+// plain ToString — `1.5m.ToString("F2")` gave "1.5" instead of "1.50". The
+// runtime bz_decimal_to_string_fmt rounds half-up to the precision and pads with
+// trailing zeros. (Tests check Length + selected chars; runJit returns the raw
+// exit code.)
+// ---------------------------------------------------------------------------
+
+// 1.5m.ToString("F2") == "1.50" (length 4).
+BEZEL_TEST(codegen_decimal_521, tostring_f2_pads_trailing_zero_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d: decimal := 1.5m; return d.ToString(\"F2\").Length; "  // "1.50"
+        "end Main; end C;"), 4);
+}
+
+// 1.5m.ToString("F2") char content is exactly "1.50".
+BEZEL_TEST(codegen_decimal_521, tostring_f2_content_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := (1.5m).ToString(\"F2\"); "
+        "  return (1 if s[0] = char(49) and s[1] = char(46) and "
+        "                s[2] = char(53) and s[3] = char(48) else 0); "  // '1''.'​'5''0'
+        "end Main; end C;"), 1);
+}
+
+// 123.456m.ToString("F2") rounds half-up to "123.46" (length 6).
+BEZEL_TEST(codegen_decimal_521, tostring_f2_rounds_half_up_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := (123.456m).ToString(\"F2\"); "
+        "  return (1 if s.Length = 6 and s[5] = char(54) else 0); "  // "123.46"
+        "end Main; end C;"), 1);
+}
+
+// Integer decimal with "F2" gains the fraction: 2m → "2.00" (length 4).
+BEZEL_TEST(codegen_decimal_521, tostring_f2_integer_adds_fraction_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d: decimal := 2m; return d.ToString(\"F2\").Length; "  // "2.00"
+        "end Main; end C;"), 4);
+}
+
+// "F0" drops the point and rounds: 1.5m → "2" (length 1).
+BEZEL_TEST(codegen_decimal_521, tostring_f0_rounds_no_point_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d: decimal := 1.5m; return d.ToString(\"F0\").Length; "  // "2"
+        "end Main; end C;"), 1);
+}
+
+// Negative: -1.5m.ToString("F2") == "-1.50" (length 5).
+BEZEL_TEST(codegen_decimal_521, tostring_f2_negative_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d: decimal := -1.5m; return d.ToString(\"F2\").Length; "  // "-1.50"
+        "end Main; end C;"), 5);
+}
+
+// Regression: the no-format ToString() is unchanged ("1.5", length 3).
+BEZEL_TEST(codegen_decimal_521, tostring_no_format_unchanged_1099b) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d: decimal := 1.5m; return d.ToString().Length; "  // "1.5"
+        "end Main; end C;"), 3);
+}

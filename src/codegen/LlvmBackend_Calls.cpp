@@ -4401,10 +4401,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* fn = declareC("bz_decimal_to_string", ptrTy(), {ptrTy()});
                 return builder_.CreateCall(fn, {slot}, "dec.tostr");
             }
-            // Decimal.ToString(format: string) — not implemented; fall through to plain ToString.
-            if (mname == "ToString" && call.args.size() == 1) {
-                auto* fn = declareC("bz_decimal_to_string", ptrTy(), {ptrTy()});
-                return builder_.CreateCall(fn, {slot}, "dec.tostr");
+            // Decimal.ToString(format: string) — §9.3 (#1099B). Honor the
+            // format (the "F"/"f" fixed-point specifier; other formats fall back
+            // to the plain ToString in the runtime). Was: the format arg was
+            // discarded and plain ToString called — `1.5m.ToString("F2")` gave
+            // "1.5" instead of "1.50".
+            if (mname == "ToString" && call.args.size() == 1 &&
+                call.args[0].value) {
+                llvm::Value* fmtVal = lowerExpr(*call.args[0].value);
+                if (!fmtVal) return nullptr;
+                auto* fn = declareC("bz_decimal_to_string_fmt", ptrTy(),
+                                    {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {slot, fmtVal}, "dec.tostrf");
             }
             // Decimal.CompareTo(other: decimal): int — §9.3.
             if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {

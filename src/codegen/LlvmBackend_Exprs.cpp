@@ -895,6 +895,27 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             ma->member == "ToString") {
                             llvm::Value* recv = lowerExpr(*ma->target);
                             if (!recv) return nullptr;
+                            // §9.3 (#1099B): decimal ToString(format) — route to
+                            // the runtime decimal formatter (honors the "F"/"f"
+                            // fixed-point specifier; other/malformed formats fall
+                            // back to plain ToString). The generic numeric path
+                            // below only handles float/double (F/E/G) and int
+                            // (D/X), so a decimal "F2" fell to emitPrimitiveToString
+                            // with the format DISCARDED (`1.5m.ToString("F2")` →
+                            // "1.5" instead of "1.50"). Passing the lowered format
+                            // value supports a non-literal format string too.
+                            if (tt->primitive == sema::PrimitiveType::Decimal) {
+                                llvm::Value* fmtVal =
+                                    lowerExpr(*call->args[0].value);
+                                if (!fmtVal) return nullptr;
+                                llvm::AllocaInst* dslot =
+                                    entryAlloca(decimalStructType());
+                                builder_.CreateStore(recv, dslot);
+                                auto* fn = declareC("bz_decimal_to_string_fmt",
+                                                    ptrTy(), {ptrTy(), ptrTy()});
+                                return builder_.CreateCall(fn, {dslot, fmtVal},
+                                                           "dec.tostrf");
+                            }
                             // Try to extract the format specifier from a literal arg.
                             std::string bezelFmt;
                             if (auto* sl = dynamic_cast<const ast::StringLiteralExpr*>(
