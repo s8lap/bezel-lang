@@ -540,32 +540,47 @@ BEZEL_TEST(task_state_942, from_result_not_faulted_not_cancelled) {
 
 // §30.3: a Task.FromException task is completed AND faulted, but NOT cancelled
 // (its error is not an OperationCanceledException).
-// Value-only (compileAndRun, not expectValueLeakFree): a FromException task
-// disposed without being awaited/caught leaks its exception object — a
-// pre-existing gap tracked as #962, independent of the #942 state-property fix.
+// #962 RESOLVED: a FromException task disposed without being awaited/caught used
+// to leak its exception object, but the #854 bound-faulted-task scope-end
+// disposal (LlvmBackend_Setup.cpp ~L12203 — bz_task_is_error → dispose error_obj
+// before fire-and-forget) now reclaims it. Verified LSan-clean (this assertion is
+// now expectValueLeakFree, upgraded from value-only).
 BEZEL_TEST(task_state_942, from_exception_is_faulted_not_cancelled) {
-    BEZEL_EXPECT_EQ(compileAndRun(
+    expectValueLeakFree(
         "module M; class C public static method Main(): int "
         "  using var tf := Task.FromException<int>("
         "      new InvalidOperationException(\"x\")); "
         "  if not tf.IsCompleted then return 7; end; "
         "  if tf.IsCancelled then return 8; end; "
         "  return (1 if tf.IsFaulted else 0); "
-        "end Main; end C;"),
+        "end Main; end C;",
         1);
 }
 
 // §30.3: a Task.FromCancelled task is completed AND cancelled, and — because
 // faulted and cancelled are distinct states — NOT faulted (the error is an
 // OperationCanceledException, distinguished by its vtable).
-// Value-only for the same pre-existing-leak reason as above (#962).
+// #962 RESOLVED (see above): now leak-checked.
 BEZEL_TEST(task_state_942, from_cancelled_is_cancelled_not_faulted) {
-    BEZEL_EXPECT_EQ(compileAndRun(
+    expectValueLeakFree(
         "module M; class C public static method Main(): int "
         "  using var tc := Task.FromCancelled<int>(); "
         "  if not tc.IsCompleted then return 7; end; "
         "  if tc.IsFaulted then return 8; end; "
         "  return (1 if tc.IsCancelled else 0); "
-        "end Main; end C;"),
+        "end Main; end C;",
+        1);
+}
+
+// §30.3 / #962 regression: a FromException task with a USER exception type
+// (carrying a destructor) disposed without await is also reclaimed leak-free.
+BEZEL_TEST(task_state_942, from_exception_user_type_unawaited_leak_free_962) {
+    expectValueLeakFree(
+        "module M; "
+        "class MyErr: Exception public constructor(m: string) base(m); end constructor; end MyErr; "
+        "class C public static method Main(): int "
+        "  using var tf := Task.FromException<int>(new MyErr(\"boom\")); "
+        "  return (1 if tf.IsFaulted else 0); "
+        "end Main; end C;",
         1);
 }
