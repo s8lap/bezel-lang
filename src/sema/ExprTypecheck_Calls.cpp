@@ -2927,6 +2927,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // inferred from the argument.
                         if (m == "FromResult" && !ce.args.empty() && ce.args[0].value) {
                             TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                            // §30.5 (#1107, sweep #9): FromResult is restricted to
+                            // non-class T — value types, `string`, runtime-managed
+                            // reference types. A CLASS / interface T must use
+                            // `Task.FromOwnedResult` (Pattern B: the produced task
+                            // owns the result, transferred to the awaiter). Reject
+                            // a class-typed T (taken from the explicit type arg
+                            // `FromResult<C>(…)`, else inferred from the argument);
+                            // value-builtin wrapper classes (Int32, …) are value
+                            // types and stay allowed.
+                            TypeRef* tArg = argTy;
+                            if (!ma->typeArgs.empty() && ma->typeArgs[0])
+                                if (TypeRef* et =
+                                        ctx_.resolvedType(*ma->typeArgs[0]))
+                                    tArg = et;
+                            if (tArg && tArg->kind == TypeRef::Kind::Named &&
+                                tArg->declaration &&
+                                (tArg->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 tArg->declaration->kind ==
+                                     ast::TypeDeclKind::Interface) &&
+                                !tArg->declaration->isValueBuiltin) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Task.FromResult<T>` is restricted to "
+                                    "non-class T (value types, `string`, "
+                                    "runtime-managed reference types); `" +
+                                    std::string(tArg->declaration->name) +
+                                    "` is a class type — use "
+                                    "`Task.FromOwnedResult<T>` (Pattern B, "
+                                    "ownership transfer) instead (\xC2\xA7""30.5)");
+                            }
                             auto* tt = makeTaskTypeRef();
                             if (argTy) tt->genericArgs.push_back(argTy);
                             ctx_.setExprType(&ce, tt);
