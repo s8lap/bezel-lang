@@ -1973,6 +1973,28 @@ private:
     // a call (caller falls through to ordinary method dispatch).
     llvm::Value* tryLowerValueSemanticsCall(const ast::CallExpr& call);
 
+    // #1075: the value-semantics dispatch core, taking an ALREADY-LOWERED,
+    // non-nullable receiver value + type. Factored out of
+    // tryLowerValueSemanticsCall so the null-conditional path
+    // (lowerNullCondValueSemCall) can reuse it with the unwrapped inner value of
+    // a nullable value-type receiver. Returns the GetHashCode (i32) / Equals
+    // (i1) / record-or-enum ToString result, or null if not handled (a primitive
+    // ToString is left to the dedicated string path).
+    llvm::Value* lowerValueSemMethodOn(const sema::TypeRef* recvTy,
+                                       llvm::Value* recv,
+                                       const ast::CallExpr& call,
+                                       std::string_view member);
+
+    // §7.5 / #1075: lower `valueRecv?.ToString()/GetHashCode()/Equals(x)` on a
+    // NULLABLE value-type/enum/record receiver — `hasValue ? wrap(method(inner))
+    // : null` — mirroring the §7.5 lift the MethodSymbol path applies. `recv` is
+    // the receiver's nullable {i8 hasValue; T} struct.
+    llvm::Value* lowerNullCondValueSemCall(const ast::CallExpr& call,
+                                           const ast::NullCondMemberExpr& nm,
+                                           const sema::TypeRef* recvTy,
+                                           llvm::Value* recv, bool isToString,
+                                           bool isGetHashCode, bool isEquals);
+
     // §9.8 / §2.14–2.15 (issue #550): BinarySerializer/BinaryDeserializer
     // construction, ToBytes, AsReadOnlySpan, and synthesized Serialize/
     // Deserialize on records and enums.  Returns the lowered value, or

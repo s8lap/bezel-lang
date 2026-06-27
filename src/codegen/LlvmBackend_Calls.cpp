@@ -7744,6 +7744,36 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
 
     auto* recvTy = ctx_.exprType(*ma->target);
     if (!recvTy) return nullptr;
+    // Lower the receiver ONLY for the value-semantics receiver kinds the core
+    // handles (a primitive Equals/GetHashCode, or any record/enum member); a
+    // primitive ToString (left to the dedicated string path) or a non-value
+    // receiver returns nullptr WITHOUT lowering, so the outer dispatch lowers the
+    // receiver exactly once even when it has side effects (#1075). The dispatch
+    // core itself is factored into lowerValueSemMethodOn so the null-conditional
+    // path can reuse it with the unwrapped nullable inner value.
+    bool primValueSem = recvTy->kind == sema::TypeRef::Kind::Primitive &&
+        recvTy->primitive != sema::PrimitiveType::String &&
+        recvTy->primitive != sema::PrimitiveType::Object &&
+        (isEquals || isGetHashCode);
+    bool namedValueSem = recvTy->kind == sema::TypeRef::Kind::Named &&
+        recvTy->declaration &&
+        (recvTy->declaration->kind == ast::TypeDeclKind::Record ||
+         recvTy->declaration->kind == ast::TypeDeclKind::Enum);
+    if (!primValueSem && !namedValueSem) return nullptr;
+
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv) return nullptr;
+    return lowerValueSemMethodOn(recvTy, recv, call, member);
+}
+
+llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
+                                            llvm::Value* recv,
+                                            const ast::CallExpr& call,
+                                            std::string_view member) {
+    bool isToString    = member == "ToString"    && call.args.empty();
+    bool isGetHashCode = member == "GetHashCode"  && call.args.empty();
+    bool isEquals      = member == "Equals"       && call.args.size() == 1;
+    if (!recvTy || !recv) return nullptr;
     // fix #747 R43 / stdlib §9.1–§9.5: a PRIMITIVE value type (int/long/bool/
     // char/double/…) implements IEquatable<T> with an auto-generated
     // `Equals(other): bool` and a `GetHashCode(): int`. Codegen had no handler,
@@ -7756,8 +7786,6 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         recvTy->primitive != sema::PrimitiveType::String &&
         recvTy->primitive != sema::PrimitiveType::Object &&
         (isEquals || isGetHashCode)) {
-        llvm::Value* recv = lowerExpr(*ma->target);
-        if (!recv) return nullptr;
         if (isGetHashCode) {
             // §8.3-style: the value itself as an i32 hash (bit-pattern for FP).
             if (recv->getType()->isDoubleTy())
@@ -7793,9 +7821,6 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     bool isRecord = ts->kind == ast::TypeDeclKind::Record;
     bool isEnum   = ts->kind == ast::TypeDeclKind::Enum;
     if (!isRecord && !isEnum) return nullptr;
-
-    llvm::Value* recv = lowerExpr(*ma->target);
-    if (!recv) return nullptr;
 
     if (isEnum) {
         // §8.5: enum ToString → the type's qualified name (spec default).
@@ -11864,6 +11889,27 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         }
         return nullptr;  // Dispose() is void — result discarded.
     }
+    // §7.5 / #1075: an inherited Object value-semantics method (ToString /
+    // GetHashCode / Equals) called via `?.` on a NULLABLE value-type/enum/record
+    // receiver has NO MethodSymbol, so the ms-driven path below bails and the T?
+    // result is zero-initialised (= null) — and a `?.ToString()` result with a
+    // non-pointer IR type crashed a downstream string compare. Lower it as
+    // `hasValue ? wrap(method(inner)) : null`.
+    if (!ms && nm.target) {
+        bool isToString    = nm.member == "ToString"    && call.args.empty();
+        bool isGetHashCode = nm.member == "GetHashCode"  && call.args.empty();
+        bool isEquals      = nm.member == "Equals"       && call.args.size() == 1;
+        if (isToString || isGetHashCode || isEquals) {
+            const sema::TypeRef* recvTy0 = ctx_.exprType(*nm.target);
+            if (recvTy0 && isNullableValueTy(recvTy0)) {
+                llvm::Value* recv = lowerExpr(*nm.target);
+                if (recv && recv->getType()->isStructTy())
+                    return lowerNullCondValueSemCall(call, nm, recvTy0, recv,
+                                                     isToString, isGetHashCode,
+                                                     isEquals);
+            }
+        }
+    }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
     llvm::FunctionType* fnTy = methodFnType(ms);
     if (!fnTy) return nullptr;
@@ -11972,6 +12018,62 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     auto* phi = builder_.CreatePHI(ptrTy(), 2);
     phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
     phi->addIncoming(r, callEnd);
+    return phi;
+}
+
+
+// §7.5 / #1075: lower `valueRecv?.ToString()/GetHashCode()/Equals(x)` on a
+// nullable value-type/enum/record receiver. `recv` is the receiver's nullable
+// {i8 hasValue; T} struct; the result is the §7.5-lifted nullable form of the
+// method's return: `string?` (a plain ptr, null when the receiver is null) for
+// ToString, `int?` for GetHashCode, `bool?` for Equals.
+llvm::Value* Emitter::lowerNullCondValueSemCall(
+        const ast::CallExpr& call, const ast::NullCondMemberExpr& nm,
+        const sema::TypeRef* recvTy, llvm::Value* recv, bool isToString,
+        bool isGetHashCode, bool isEquals) {
+    (void)isGetHashCode; (void)isEquals;
+    // The non-nullable inner type drives emitValueToString / the dispatch core.
+    sema::TypeRef innerTy = *recvTy;
+    innerTy.nullable = false;
+
+    auto* entryBB = builder_.GetInsertBlock();
+    auto* callBB = llvm::BasicBlock::Create(llvm_, "ncvs.do", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "ncvs.end", currentFn_);
+    llvm::Value* hasVal = nullablePrimHasValue(recv);  // i1
+    builder_.CreateCondBr(hasVal, callBB, endBB);
+
+    builder_.SetInsertPoint(callBB);
+    llvm::Value* innerVal = nullablePrimValue(recv);   // the T in {i8,T}
+    // ToString routes through emitValueToString (handles primitive/enum/record),
+    // which the dispatch core deliberately leaves to the dedicated string path;
+    // GetHashCode/Equals go through the factored value-semantics core.
+    llvm::Value* res = isToString
+        ? emitValueToString(innerVal, &innerTy)
+        : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member);
+    if (!res) return nullptr;
+    bool refResult = res->getType()->isPointerTy();   // ToString → string ptr
+    llvm::Type* wrapTy = refResult
+        ? static_cast<llvm::Type*>(ptrTy())
+        : static_cast<llvm::Type*>(llvm::StructType::get(
+              llvm_, {nullablePrimHasValTy(), res->getType()}));
+    llvm::Value* callVal = res;
+    if (!refResult) {
+        callVal = builder_.CreateInsertValue(
+            llvm::UndefValue::get(wrapTy),
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+        callVal = builder_.CreateInsertValue(callVal, res, {1u});
+    }
+    auto* callEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(wrapTy, 2);
+    phi->addIncoming(refResult ? static_cast<llvm::Value*>(
+                                     llvm::ConstantPointerNull::get(ptrTy()))
+                               : static_cast<llvm::Value*>(
+                                     llvm::ConstantAggregateZero::get(wrapTy)),
+                     entryBB);
+    phi->addIncoming(callVal, callEnd);
     return phi;
 }
 

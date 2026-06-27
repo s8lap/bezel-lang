@@ -3989,7 +3989,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // nullable form so downstream consumers (`??`, `= null`, `!`, an `int?`
     // slot) see the §7.5 result type. A unit/void result and an already-nullable
     // return are left unchanged.
-    if (dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        // §8.1/§8.3/§8.5 (#1075): an inherited Object value-semantics method
+        // (`ToString`/`GetHashCode`/`Equals`) on a VALUE-type/enum/record
+        // receiver has no MethodSymbol, so the member-access value-method typing
+        // (keyed on a plain `.`) never ran and the call is left untyped — codegen
+        // then zero-inits the `T?` result (= null) or crashes a string compare.
+        // Set the raw return type here (ToString→string, GetHashCode→int,
+        // Equals→bool) so the lift below makes it nullable, matching the codegen
+        // null-conditional value-method lowering.
+        if (!ctx_.exprType(ce) && ncm->target) {
+            const TypeRef* rt = ctx_.exprType(*ncm->target);
+            const TypeSymbol* rd = rt ? rt->declaration : nullptr;
+            bool valuePrim = rt && rt->kind == TypeRef::Kind::Primitive &&
+                rt->primitive != PrimitiveType::String &&
+                rt->primitive != PrimitiveType::Object;
+            bool valueNamed = rd && (rd->kind == ast::TypeDeclKind::Record ||
+                                     rd->kind == ast::TypeDeclKind::Enum);
+            if (valuePrim || valueNamed) {
+                if (ncm->member == "ToString" && ce.args.empty())
+                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
+                else if (ncm->member == "GetHashCode" && ce.args.empty())
+                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                else if (ncm->member == "Equals" && ce.args.size() == 1)
+                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            }
+        }
         if (auto* ct = ctx_.exprType(ce)) {
             if (!ct->nullable && ct->kind != TypeRef::Kind::Unit) {
                 TypeRef* nn = ctx_.makeTypeRef(*ct);
