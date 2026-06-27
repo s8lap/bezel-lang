@@ -2279,6 +2279,32 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             return lowerStringLiteral("\"\"", false);
         }
     }
+    // §8.5 (#1118): a generic type-parameter operand `$"{x}"` where `x: T` is an
+    // unresolved Named TypeRef (no declaration). Resolve T to its concrete
+    // instantiation via the active generic substitution and recurse, so a T
+    // bound to a class/record/enum formats by that type's rule — in particular a
+    // class with a ToString override dispatches virtually. Without this the value
+    // (a class pointer, say) fell to the bz_string fallback below and rendered as
+    // "" (the W pointer read as a string). The `!= fieldTy` guard avoids a
+    // self-recursion if the substitution maps the name to itself.
+    if (fieldTy && fieldTy->kind == K::Named && !fieldTy->declaration &&
+        fieldTy->astNode && fieldTy->astNode->name &&
+        fieldTy->astNode->name->parts.size() == 1 &&
+        !genericSubstSemaTy_.empty()) {
+        auto sit = genericSubstSemaTy_.find(fieldTy->astNode->name->parts[0]);
+        if (sit != genericSubstSemaTy_.end() && sit->second &&
+            sit->second != fieldTy)
+            return emitValueToString(val, sit->second);
+    }
+    // §8.5 (#1118 fallback): an unresolved generic-T operand whose substitution
+    // is unavailable but whose runtime value is a heap object (class/interface
+    // pointer) — dispatch through the dynamic ToString (override else type name),
+    // the same path the interface branch uses, instead of mis-reading the object
+    // as a bz_string.
+    if (fieldTy && fieldTy->kind == K::Named && !fieldTy->declaration &&
+        val->getType()->isPointerTy()) {
+        if (llvm::Value* r = lowerObjectToString(val)) return r;
+    }
     // Fallback: format by the LLVM shape (string ptr → identity; integer → int).
     if (val->getType()->isPointerTy()) return val;            // assume bz_string
     if (val->getType()->isIntegerTy(64))

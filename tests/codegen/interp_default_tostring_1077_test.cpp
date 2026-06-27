@@ -94,3 +94,61 @@ BEZEL_TEST(interp_default_tostring_1077, base_static_type_dispatches_derived) {
         "  return $\"{b}\".Length; "               // "DER" = 3
         "end Main; end C;"), 3);
 }
+
+// ── #1118: interpolating a generic type-parameter operand `$"{x}"` (x: T) ─────
+//
+// A generic-T operand is a declaration-less Named TypeRef; the interp lowering
+// fell to `pv = ev`, reading the heap object as a bz_string → "". The fix routes
+// it through emitValueToString, which resolves T via the generic substitution
+// (and otherwise dispatches the dynamic ToString).
+
+// T bound to a class with a ToString override dispatches virtually → "ABCD".
+BEZEL_TEST(interp_default_tostring_1077, generic_param_class_override_1118) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W public override method ToString(): string => \"ABCD\"; end W; "
+        "class C "
+        "  public method Show<T>(x: T): int => ($\"{x}\").Length; "
+        "  public static method Main(): int "
+        "    using var c := new C(); using var w := new W(); "
+        "    return c.Show<W>(w); "                // "ABCD" = 4
+        "  end Main; end C;"), 4);
+}
+
+// Surrounding literals survive and the value renders: `$"[{x}]"` → "[ABCD]".
+BEZEL_TEST(interp_default_tostring_1077, generic_param_with_literals_1118) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W public override method ToString(): string => \"ABCD\"; end W; "
+        "class C "
+        "  public method Show<T>(x: T): int => ($\"[{x}]\").Length; "
+        "  public static method Main(): int "
+        "    using var c := new C(); using var w := new W(); "
+        "    return c.Show<W>(w); "                // "[ABCD]" = 6
+        "  end Main; end C;"), 6);
+}
+
+// T bound to a class with NO override interpolates as its type name ("Plain").
+BEZEL_TEST(interp_default_tostring_1077, generic_param_class_default_1118) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Plain public v: int := 0; end Plain; "
+        "class C "
+        "  public method Show<T>(x: T): int => ($\"{x}\").Length; "
+        "  public static method Main(): int "
+        "    using var c := new C(); using var p := new Plain(); "
+        "    return c.Show<Plain>(p); "            // "Plain" = 5
+        "  end Main; end C;"), 5);
+}
+
+// T bound to a value type (int) resolves through the substitution → "42".
+BEZEL_TEST(interp_default_tostring_1077, generic_param_value_type_1118) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C "
+        "  public method Show<T>(x: T): int => ($\"{x}\").Length; "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    return c.Show<int>(42); "             // "42" = 2
+        "  end Main; end C;"), 2);
+}

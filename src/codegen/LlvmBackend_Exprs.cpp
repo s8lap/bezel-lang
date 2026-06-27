@@ -332,6 +332,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 // empty / garbage string.
                                 pv = emitValueToString(ev, rt);
                             }
+                        } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                                   !rt->declaration) {
+                            // §8.5 (#1118): a generic type-parameter operand
+                            // (`x: T`) is a declaration-less Named TypeRef whose
+                            // runtime value is a heap object. Route through
+                            // emitValueToString, which resolves T via the generic
+                            // substitution (→ the concrete type's ToString rule)
+                            // and otherwise dispatches the dynamic ToString.
+                            // Previously this fell to `pv = ev`, reading the object
+                            // as a bz_string → "".
+                            pv = emitValueToString(ev, rt);
                         } else {
                             pv = ev;  // string or unknown ptr — use as-is
                         }
