@@ -295,3 +295,45 @@ BEZEL_TEST(owned_sink, builtin_dict_add_borrow_value_rejected) {
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// stdlib §6.7 / §30.10 (#1121): Task.WhenAllOwned<T>(owned tasks:
+// OwnedArray<OwnedTask<T>>) is an owned sink — passing a bare owned local
+// `tasks` is an implicit §28.8 transfer that discharges its disposal
+// obligation (the documented `await Task.WhenAllOwned(tasks)` form). Before the
+// fix the intrinsic had no owned-sink entry, so `tasks` was reported as "dropped
+// without disposal" — a spurious reject of canonical code.
+BEZEL_TEST(owned_sink, task_whenallowned_consumes_owned_array_1121) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Collections.Generic; "
+        "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
+        "class C "
+        "  public static async method Make(v: int): OwnedTask<Res> return new Res(v); end Make; "
+        "  public static async method LoadAll(): OwnedTask<OwnedArray<Res>> "
+        "    var tasks := new OwnedArray<OwnedTask<Res>>(); "
+        "    tasks.Add(Make(3)); "
+        "    using var wt := Task.WhenAllOwned<Res>(tasks); "
+        "    return await wt; "
+        "  end LoadAll; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Parity guard: the explicit `move tasks` form (the spec-canonical owned
+// transfer) compiles identically — the implicit form above must match it.
+BEZEL_TEST(owned_sink, task_whenallowned_explicit_move_accepted_1121) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Collections.Generic; "
+        "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
+        "class C "
+        "  public static async method Make(v: int): OwnedTask<Res> return new Res(v); end Make; "
+        "  public static async method LoadAll(): OwnedTask<OwnedArray<Res>> "
+        "    var tasks := new OwnedArray<OwnedTask<Res>>(); "
+        "    tasks.Add(Make(3)); "
+        "    using var wt := Task.WhenAllOwned<Res>(move tasks); "
+        "    return await wt; "
+        "  end LoadAll; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

@@ -2287,6 +2287,15 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         // into the spawned domain — each is an owned-consuming position.
         if (tid->name == "Domain" && ma->member == "Spawn")
             return argPos >= 1;
+        // stdlib §6.7 / §30.10 (#1121): Task.WhenAllOwned<T>(owned tasks:
+        // OwnedArray<OwnedTask<T>>) takes ownership of its argument array (and
+        // its tasks) — the documented `await Task.WhenAllOwned(tasks)` form. The
+        // owned-arg position (0) is an owned sink, so passing a bare owned local
+        // discharges its disposal obligation (an implicit §28.8 transfer, exactly
+        // as the explicit `move tasks` already does). `Task` is a static builtin
+        // whose identifier carries no exprType, so match it syntactically.
+        if (tid->name == "Task" && ma->member == "WhenAllOwned")
+            return argPos == 0;
     }
     const sema::TypeRef* tt = ctx_.exprType(*ma->target);
     // Built-in collections resolve to a Named TypeRef with a null declaration
