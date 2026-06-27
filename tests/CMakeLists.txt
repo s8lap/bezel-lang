@@ -611,6 +611,7 @@ set(BEZEL_TEST_SOURCES
     codegen/iter_case_arm_yield_1107_test.cpp
     codegen/type_init_inner_exception_1107_test.cpp
     codegen/class_object_method_dispatch_1106_test.cpp
+    codegen/base_tostring_1106_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp

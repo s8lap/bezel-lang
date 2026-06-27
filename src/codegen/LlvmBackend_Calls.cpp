@@ -9070,6 +9070,76 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             call.callee.get())) {
         if (cg_ma->member == "ToString" && cg_ma->target &&
                 call.args.empty()) {
+            // #1106 (§12.3 defect 5): `base.ToString()` must dispatch
+            // NON-virtually to the BASE class's ToString — never the virtual
+            // vtable slot below, which points at the most-derived override and
+            // would recurse infinitely (base.ToString() inside the override →
+            // the same override → stack-overflow SIGSEGV). Resolve the enclosing
+            // class's base chain: call the first ancestor ToString override
+            // directly on the receiver; when no ancestor overrides ToString
+            // (base is Object) emit the §8.5 type-name default — Object.ToString
+            // returns the runtime type's name, i.e. the enclosing class's name.
+            if (auto* btid = dynamic_cast<const ast::IdentifierExpr*>(
+                    cg_ma->target.get())) {
+                // The enclosing (derived) class is the owner of the method being
+                // emitted — recover it from currentFn_ via methodFns_ (the
+                // §8.5 type-name default is the runtime type's name, i.e. this
+                // class). When the class has no explicit base, `base` types as
+                // Object (no declaration), so the receiver's exprType is not a
+                // reliable source; the method-owner reverse-map is.
+                const sema::TypeSymbol* cg_cls = nullptr;
+                if (btid->name == "base") {
+                    for (auto& kv : methodFns_)
+                        if (kv.second == currentFn_ && kv.first) {
+                            cg_cls = kv.first->parent;
+                            break;
+                        }
+                    if (!cg_cls) {
+                        const sema::TypeRef* btRecvTy =
+                            ctx_.exprType(*cg_ma->target);
+                        if (btRecvTy &&
+                            btRecvTy->kind == sema::TypeRef::Kind::Named)
+                            cg_cls = btRecvTy->declaration;
+                    }
+                }
+                if (btid->name == "base" && cg_cls) {
+                    const sema::TypeSymbol* startBase = nullptr;
+                    for (const sema::TypeSymbol* b : cg_cls->baseTypes)
+                        if (b && b->kind == ast::TypeDeclKind::Class) {
+                            startBase = b; break;
+                        }
+                    sema::MethodSymbol* baseToStr = nullptr;
+                    for (const sema::TypeSymbol* cur = startBase;
+                         cur && !baseToStr;) {
+                        for (sema::Symbol* sym : cur->members) {
+                            auto* m = dynamic_cast<sema::MethodSymbol*>(sym);
+                            if (m && !isStaticMethod(m) &&
+                                m->name == "ToString" && m->params.empty()) {
+                                baseToStr = m; break;
+                            }
+                        }
+                        const sema::TypeSymbol* nxt = nullptr;
+                        for (const sema::TypeSymbol* b : cur->baseTypes)
+                            if (b && b->kind == ast::TypeDeclKind::Class) {
+                                nxt = b; break;
+                            }
+                        cur = nxt;
+                    }
+                    if (baseToStr) {
+                        auto fit = methodFns_.find(baseToStr);
+                        llvm::Value* brecv = lowerExpr(*cg_ma->target);
+                        if (fit != methodFns_.end() && brecv)
+                            return builder_.CreateCall(
+                                fit->second->getFunctionType(),
+                                fit->second, {brecv});
+                    }
+                    // No base override → §8.5 type-name default (the enclosing
+                    // class's name; Object.ToString returns the runtime type).
+                    return lowerStringLiteral(
+                        std::string("\"") + std::string(cg_cls->name) + "\"",
+                        false);
+                }
+            }
             const sema::TypeRef* cg_recvTy =
                 ctx_.exprType(*cg_ma->target);
             if (cg_recvTy) {
