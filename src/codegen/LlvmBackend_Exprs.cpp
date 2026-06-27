@@ -5275,17 +5275,50 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                         structSide = r; plainSide = l; nvTy = rt;
                     }
             }
-            if (structSide && plainSide && nvTy &&
-                plainSide->getType() == nullableValueStructTy(nvTy)
-                                            ->getElementType(1)) {
+            // #1113: a narrow nullable payload (`byte?`/`short?` → i8/i16)
+            // compared to an int LITERAL (which lowers at i32) arrives here with a
+            // WIDER plainSide; the strict `payloadTy == plainSide` gate then fell
+            // through to a path that ICmp'd the i8 payload against the i32 literal
+            // — an LLVM "both operands same type" assert (a compiler crash). Mirror
+            // the non-nullable comparison: WIDEN the narrower operand to the wider
+            // (NOT truncate the literal — truncating wraps an out-of-range value
+            // into the payload range, e.g. `byte? = 261` would wrongly be equal to
+            // a `5` payload). Each side widens by ITS OWN signedness so the value
+            // is preserved (`sbyte -5` sign-extends; `byte 5` zero-extends). Only
+            // matching integer kinds; a non-integer / equal-width pair is unchanged.
+            llvm::Value* eqPayload =
+                structSide ? nullablePrimValue(structSide) : nullptr;
+            if (structSide && plainSide && nvTy && eqPayload &&
+                eqPayload->getType() != plainSide->getType() &&
+                eqPayload->getType()->isIntegerTy() &&
+                plainSide->getType()->isIntegerTy()) {
+                const ast::Expr* structExpr =
+                    (structSide == l) ? bin.left.get() : bin.right.get();
+                const ast::Expr* plainExpr =
+                    (plainSide == l) ? bin.left.get() : bin.right.get();
+                bool payloadUns =
+                    structExpr && isUnsignedTargetExpr(*structExpr);
+                bool plainUns = plainExpr && isUnsignedTargetExpr(*plainExpr);
+                unsigned pw = eqPayload->getType()->getIntegerBitWidth();
+                unsigned sw = plainSide->getType()->getIntegerBitWidth();
+                if (pw < sw)
+                    eqPayload = builder_.CreateIntCast(
+                        eqPayload, plainSide->getType(), /*isSigned=*/!payloadUns);
+                else
+                    plainSide = builder_.CreateIntCast(
+                        plainSide, eqPayload->getType(), /*isSigned=*/!plainUns);
+            }
+            if (structSide && plainSide && nvTy && eqPayload &&
+                plainSide->getType() == eqPayload->getType()) {
                 llvm::Value* hasVal = nullablePrimHasValue(structSide);
-                // Inner equality of the value slot against the plain value,
-                // computed by the inner (non-nullable) type's rule so an enum
-                // compares its i32 value and a float would use FCmp.
+                // Inner equality of the (possibly widened) value slot against the
+                // plain value, by the inner (non-nullable) type's rule (an enum
+                // compares its i32 value; a float would use FCmp). Equality is
+                // sign-agnostic, but the widening above preserved each value.
                 sema::TypeRef innerTy = *nvTy;
                 innerTy.nullable = false;
-                llvm::Value* innerEq = emitValueEquality(
-                    nullablePrimValue(structSide), plainSide, &innerTy);
+                llvm::Value* innerEq =
+                    emitValueEquality(eqPayload, plainSide, &innerTy);
                 llvm::Value* eq = builder_.CreateAnd(hasVal, innerEq);
                 return op == "=" ? eq : builder_.CreateNot(eq);
             }
