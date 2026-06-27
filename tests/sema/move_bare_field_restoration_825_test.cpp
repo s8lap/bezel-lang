@@ -114,6 +114,46 @@ BEZEL_TEST(move_bare_field_restoration_825, nullable_bare_move_no_null_restore_r
     BEZEL_EXPECT_TRUE(hasFieldRestorationError(r));
 }
 
+// §28.8.1 (#1125): `move _log!` — a force-unwrap (null-forgiving `!`) of a
+// nullable owned field — is a move of `_log` exactly like `move _log`, so the
+// field is left moved-from and must be restored before exit. Before the fix the
+// `!` form (a PostfixBangExpr wrapping the field) bypassed the field-move
+// recognition entirely, so this compiled with NO diagnostic — and the owner's
+// auto-disposer then double-freed the moved-out object (deterministic SIGSEGV).
+// It must be rejected with the same §28.8.1 diagnostic as the bare form.
+BEZEL_TEST(move_bare_field_restoration_825, nullable_force_unwrap_move_no_restore_rejected) {
+    auto r = parseAndCheckOwnership(withNullableField(
+        "public method Take(): owned Logfile "
+        "  return move _log!; "
+        "end Take;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasFieldRestorationError(r));
+}
+
+// §28.8.1 (#1125): the qualified force-unwrap form `move this._log!` must be
+// rejected identically.
+BEZEL_TEST(move_bare_field_restoration_825, qualified_force_unwrap_move_no_restore_rejected) {
+    auto r = parseAndCheckOwnership(withNullableField(
+        "public method Take(): owned Logfile "
+        "  return move this._log!; "
+        "end Take;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasFieldRestorationError(r));
+}
+
+// §28.8.1 (#1125 / spec line 3529): the canonical nullable-owned-field detach
+// `move _log!` immediately followed by `_log := null` IS the spec-endorsed
+// pattern and must compile cleanly (the field is restored before exit).
+BEZEL_TEST(move_bare_field_restoration_825, nullable_force_unwrap_move_null_restore_accepted) {
+    auto r = parseAndCheckOwnership(withNullableField(
+        "public method Take(): owned Logfile "
+        "  var d := move _log!; "
+        "  _log := null; "
+        "  return d; "
+        "end Take;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // §28.8.1: a bare `move` of a LOCAL variable (not a field) must not trigger
 // the field-restoration check — exprIsOwnedFieldRead correctly returns false
 // for a non-field local.

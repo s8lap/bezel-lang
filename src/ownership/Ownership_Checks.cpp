@@ -11,17 +11,39 @@ namespace bezel::ownership {
 // The statement/flow-walking definitions live in Ownership.cpp alongside
 // the public checkOwnership entry point.
 
+namespace {
+// §28.8.1 (#1125): the operand of a `move` may be a force-unwrap of a nullable
+// owned field/local — `move _slot!` / `move this._slot!`. The null-forgiving
+// `!` is a postfix PostfixBangExpr wrapping the field/local reference. The spec
+// (line 3529) endorses `move _slot!` followed by `_slot := null` as THE
+// canonical nullable-owned-field detach pattern, so the force-unwrap form is a
+// move of the underlying field/local exactly like the bare form and carries the
+// same §28.8.1 field-restoration obligation. Look through a single leading `!`
+// so the move-recognition below sees the field/local identifier. (Undiagnosed,
+// the field stays moved-from with no restoration check, and the owner's
+// auto-disposer re-disposes the moved-out object → double-free / SIGSEGV.)
+const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
+    // The null-forgiving `!` is a postfix operator → PostfixBangExpr (§A.7),
+    // not a prefix UnaryExpr.
+    if (auto* b = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        if (b->operand) return b->operand.get();
+    return e;
+}
+} // namespace
+
 void MethodOwnership::recordMovesIn(const ast::Expr& e) {
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (un->op == "move") {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                    un->operand.get())) {
+            // §28.8.1 (#1125): unwrap a force-unwrap `move x!` to the underlying
+            // field/local reference — `move _slot!` is a move of `_slot`.
+            const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
                 // §28.8.1 / #825: a bare `move _field` is syntactically
                 // identical to `move this._field` — both leave the field in
                 // moved-from state and must be restored before the method exits.
                 // exprIsOwnedFieldRead resolves the bare identifier via sema
                 // and returns true only for an `owned` field of the current class.
-                if (exprIsOwnedFieldRead(*un->operand)) {
+                if (exprIsOwnedFieldRead(*mop)) {
                     // §28.8.1, #897 #898: check-then-mark via recordFieldMove
                     // so a second move of an already-moved-from field errors.
                     recordFieldMove(id->name, un->span.begin);
@@ -30,8 +52,7 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 markMovedByName(id->name, id->span.begin);
                 return;
             }
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                    un->operand.get())) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(mop)) {
                 if (auto* tid =
                         dynamic_cast<const ast::IdentifierExpr*>(
                             ma->target.get())) {
@@ -524,13 +545,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
     }
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (un->op == "move") {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                    un->operand.get())) {
+            // §28.8.1 (#1125): unwrap a force-unwrap `move x!` to the underlying
+            // field/local reference — `move _slot!` is a move of `_slot`.
+            const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
                 // §28.8.1 / #825: a bare `move _field` (in return/assignment/
                 // expr position) is the same operation as `move this._field` —
                 // it leaves the field moved-from. Check via sema symbol before
                 // falling through to the local-move path.
-                if (exprIsOwnedFieldRead(*un->operand)) {
+                if (exprIsOwnedFieldRead(*mop)) {
                     // §28.8.1, #897 #898: check-then-mark.
                     recordFieldMove(id->name, un->span.begin);
                     return;
@@ -541,8 +564,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // Slice O8: `move this.field` — mark the field as
             // moved-from. The field must be reassigned before
             // method exit.
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                    un->operand.get())) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(mop)) {
                 if (auto* tid =
                         dynamic_cast<const ast::IdentifierExpr*>(
                             ma->target.get())) {
