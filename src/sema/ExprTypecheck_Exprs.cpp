@@ -1648,8 +1648,44 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         }
         return nullptr;
     };
-    if (auto* m = onType(be.left.get())) return m;
-    return onType(be.right.get());
+    // §25 (#1096): the operator's operands must match its declared parameters
+    // IN ORDER (left → param 0, right → param 1). Bezel does not auto-commute
+    // operator overloads — §25 defines no commutation, and silently swapping
+    // would be unsound for non-commutative operators (`4 - v` ≠ `v - 4`). The
+    // matched type is found on either operand, but the operand at each position
+    // must be the type the corresponding parameter declares; otherwise the
+    // operator does not apply. (Previously a reversed-operand match, e.g.
+    // `4 * v` against `operator *(Vec, int)`, was accepted, and codegen emitted
+    // the args in source order → an IR-verification crash.)
+    auto operandMatchesParam = [&](const ast::Expr* operand,
+                                   Symbol* paramSym) -> bool {
+        auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
+        if (!ps) return false;
+        TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
+                                   : ps->resolvedDeclType;
+        TypeRef* at = operand ? ctx_.exprType(*operand) : nullptr;
+        if (!pt || !at) return false;
+        // A named-type (record/class/enum) parameter must receive an operand of
+        // that exact declared type — the discriminating position for the
+        // reversed-operand (commutation) case.
+        if (pt->kind == TypeRef::Kind::Named)
+            return at->kind == TypeRef::Kind::Named &&
+                   pt->declaration == at->declaration;
+        // A primitive parameter accepts a primitive operand (numeric widening /
+        // coercion is handled downstream); the kinds must still agree.
+        if (pt->kind == TypeRef::Kind::Primitive)
+            return at->kind == TypeRef::Kind::Primitive;
+        return false;
+    };
+    auto tryOperand = [&](const ast::Expr* operand) -> MethodSymbol* {
+        MethodSymbol* m = onType(operand);
+        if (m && operandMatchesParam(be.left.get(), m->params[0]) &&
+            operandMatchesParam(be.right.get(), m->params[1]))
+            return m;
+        return nullptr;
+    };
+    if (auto* m = tryOperand(be.left.get())) return m;
+    return tryOperand(be.right.get());
 }
 
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {
@@ -1689,6 +1725,36 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     "` — comparison operators must be explicitly overloaded "
                     "(§25.2)");
                 ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
+        }
+    }
+    // §25.1 (#1096): an arithmetic/bitwise/shift operator on a record/class
+    // operand requires a matching user-defined overload whose parameters match
+    // the operand ORDER (findBinaryOperator enforces the order; Bezel does not
+    // auto-commute). An undeclared operator, or a reversed-operand use like
+    // `4 * v` against `operator *(Vec, int)`, otherwise fell through to the
+    // built-in numeric rule and codegen emitted a struct-level arithmetic op →
+    // an IR-verification crash. Reject cleanly. (Primitive and value-builtin
+    // operands — e.g. string `+`, decimal arithmetic, DateTime — keep their
+    // built-in operators: they have no record/class memberTargetType here.)
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+        for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
+            TypeSymbol* ts = memberTargetType(operand);
+            if (ts && !ts->isValueBuiltin &&
+                (ts->kind == ast::TypeDeclKind::Record ||
+                 ts->kind == ast::TypeDeclKind::Class)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) +
+                    "` is not defined for type `" + std::string(ts->name) +
+                    "` with these operands — declare a matching `operator " +
+                    std::string(op) +
+                    "` whose parameters match the operand order (Bezel does not "
+                    "auto-commute operator overloads) (§25)");
+                if (auto* opTy = ctx_.exprType(*operand))
+                    ctx_.setExprType(&be, opTy);
                 return;
             }
         }
