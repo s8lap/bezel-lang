@@ -2429,7 +2429,16 @@ void ExprTC::visitMember(const ast::Member& m) {
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
         if (cd->value) {
+            // §22.12 / §A.8 (sweep #7): a const initializer may reference another
+            // const or enum constant via a QUALIFIED name (`K.V`, `Color.Red`).
+            // Resolving that class/enum qualifier needs moduleScope_ reachable as
+            // currentScope_ (a const member has no enclosing method scope) —
+            // without it `K` resolves to null, `K.V` has no exprSymbol, and
+            // isConstInitExpr below falsely rejects it. Mirrors #582/#1088.
+            Scope* saveScope = currentScope_;
+            if (!currentScope_) currentScope_ = moduleScope_.get();
             visitExpr(*cd->value);
+            currentScope_ = saveScope;
             // §22.12 (#747 R42): a `const` member's initializer must be a
             // compile-time-constant expression. Without this check an
             // initializer that read a (non-const) static field or called a

@@ -595,6 +595,7 @@ set(BEZEL_TEST_SOURCES
     codegen/indexer_vtable_dispatch_1080_test.cpp
     codegen/range_descending_step_1092_test.cpp
     codegen/delegate_call_argcheck_1093_test.cpp
+    codegen/const_qualified_ref_1095_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp
