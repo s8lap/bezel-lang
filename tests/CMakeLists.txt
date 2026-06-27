@@ -589,6 +589,7 @@ set(BEZEL_TEST_SOURCES
     codegen/auto_property_nonconst_init_1088_test.cpp
     codegen/primary_ctor_this_chain_1087_test.cpp
     codegen/conditional_null_branch_nullable_1089_test.cpp
+    codegen/virtual_overload_inherited_1090_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp

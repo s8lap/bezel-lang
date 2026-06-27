@@ -288,10 +288,66 @@ std::string methodSignatureString(std::string_view name,
 }
 }  // namespace
 
+// §22.6/§12.1 (#1090): collect same-name overloads across the class hierarchy.
+void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
+                                       std::vector<MethodSymbol*>& out) {
+    if (!start) return;
+    // Does an already-collected (more-derived) overload `d` shadow the base
+    // candidate `b`? An override re-declares the same signature in a derived
+    // class, so identical (arity + parameter types) means `b` is the method
+    // `d` overrides — keep only the most-derived one to avoid a spurious
+    // same-signature ambiguity. (A generic base param compares unequal to its
+    // concrete override and is left for §22.6 ranking to disambiguate.)
+    auto shadows = [&](MethodSymbol* d, MethodSymbol* b) -> bool {
+        if (d->params.size() != b->params.size()) return false;
+        for (std::size_t i = 0; i < d->params.size(); ++i) {
+            auto* dp = dynamic_cast<ParameterSymbol*>(d->params[i]);
+            auto* bp = dynamic_cast<ParameterSymbol*>(b->params[i]);
+            if (!dp || !bp) return false;
+            // A `ref`/`out` modifier participates in overload identity (§22.6),
+            // so two overloads differing only by modifier are NOT the same
+            // signature — never dedup them (an override matches modifiers too).
+            if (dp->modifier != bp->modifier) return false;
+            TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType)
+                                       : dp->resolvedDeclType;
+            TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
+                                       : bp->resolvedDeclType;
+            if (!typeRefEqual(dt, bt)) return false;
+        }
+        return true;
+    };
+    std::vector<TypeSymbol*> frontier{start};
+    std::unordered_set<TypeSymbol*> seen;
+    std::size_t i = 0;
+    while (i < frontier.size()) {
+        TypeSymbol* cur = frontier[i++];
+        if (!cur || !seen.insert(cur).second) continue;
+        for (Symbol* m : cur->members) {
+            auto* cand = dynamic_cast<MethodSymbol*>(m);
+            if (!cand || cand->name != name) continue;
+            bool shadowed = false;
+            for (MethodSymbol* prev : out)
+                if (shadows(prev, cand)) { shadowed = true; break; }
+            if (!shadowed) out.push_back(cand);
+        }
+        for (TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) frontier.push_back(b);
+    }
+}
+
 // §22.6 method-overload resolution; see header for contract.
 MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                                             const ast::CallExpr& ce) {
     if (!initial || !initial->parent) return initial;
+
+    // §12.1/§22.6 (#1090): the candidate set is every same-name overload on the
+    // receiver's class hierarchy, not just the one class `lookupMember` stopped
+    // at — otherwise an overload declared only in a base class is invisible and
+    // a valid call to it is mis-rejected. Most-derived first so first-wins
+    // arity selection still honours §22.6 closer-wins.
+    std::vector<MethodSymbol*> overloads;
+    collectHierarchyOverloads(initial->parent, initial->name, overloads);
+    if (overloads.empty()) overloads.push_back(initial);
 
     bool hasNamed = false;
     for (const auto& a : ce.args)
@@ -313,9 +369,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         if (!hasNamed && initial->params.size() == ce.args.size())
             return initial;
         if (hasNamed && initMd && canBindTo(initMd)) return initial;
-        for (Symbol* m : initial->parent->members) {
-            auto* cand = dynamic_cast<MethodSymbol*>(m);
-            if (!cand || cand->name != initial->name) continue;
+        for (MethodSymbol* cand : overloads) {
             if (!hasNamed) {
                 if (cand->params.size() == ce.args.size()) return cand;
             } else {
@@ -336,9 +390,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     std::vector<MethodSymbol*> cands;
     std::vector<const ast::MethodDecl*> decls;
     std::vector<BindResult> binds;
-    for (Symbol* m : initial->parent->members) {
-        auto* cand = dynamic_cast<MethodSymbol*>(m);
-        if (!cand || cand->name != initial->name) continue;
+    for (MethodSymbol* cand : overloads) {
         auto* md = dynamic_cast<const ast::MethodDecl*>(cand->decl);
         if (!md) continue;
         BindResult b = bindArgsToParams(md->params, ce.args, ce.span.begin,
@@ -3962,14 +4014,27 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     if (!md || !ms->parent) return;
     // §22.5 named-argument binding is now performed by checkArgsAgainstParams,
     // so a named-arg call is checked here too (no bail).
-    // Bail if the name has more than one method overload in the type.
-    int sameName = 0;
-    for (Symbol* m : ms->parent->members) {
-        if (dynamic_cast<MethodSymbol*>(m) && m->name == ms->name) {
-            ++sameName;
-        }
+    // `ms` is the overload resolveMethodOverload selected for this call. Count
+    // the name's overloads across the receiver's whole class hierarchy (#1090):
+    // counting only ms->parent's own members missed an overload declared in a
+    // base class, so a call to an inherited overload was arity-checked against
+    // the wrong (sole-assumed) member and mis-rejected.
+    std::vector<MethodSymbol*> overloads;
+    collectHierarchyOverloads(ms->parent, ms->name, overloads);
+    if (overloads.size() != 1) {
+        // Multi-overload set: overload resolution already validated the call
+        // against the chosen overload, so re-checking would double-report. The
+        // one gap is a call that matches NO overload (resolution fell back to a
+        // non-binding member) — surface its arity error rather than letting it
+        // slip through unchecked.
+        BindResult b = bindArgsToParams(md->params, ce.args, ce.span.begin,
+                                        std::string(), /*emit=*/false);
+        if (!b.ok)
+            checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
+                                   std::string("call to `") +
+                                   std::string(ms->name) + "`");
+        return;
     }
-    if (sameName != 1) return;
     checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                            std::string("call to `") +
                            std::string(ms->name) + "`");

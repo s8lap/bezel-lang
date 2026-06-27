@@ -557,6 +557,15 @@ private:
     MethodSymbol* resolveMethodOverload(MethodSymbol* initial,
                                         const ast::CallExpr& ce);
 
+    // §22.6/§12.1 (#1090): collect every same-name method overload visible on
+    // `start` and its base classes, most-derived first, with a more-derived
+    // overload shadowing a less-derived one of the same signature (so an
+    // override does not duplicate the method it overrides). Lets overload
+    // resolution and the arity check see an overload declared in a base class
+    // that `lookupMember`'s first-match BFS stopped short of.
+    void collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
+                                   std::vector<MethodSymbol*>& out);
+
     // Slices T5/T6/T7: shared check of an all-positional argument list
     // against a parameter list — argument count within [required,
     // total] (optional params lower the minimum), then per-argument

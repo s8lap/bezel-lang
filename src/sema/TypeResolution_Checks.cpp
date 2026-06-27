@@ -1218,6 +1218,53 @@ TypeRef* Resolver::applyGenericSubst(
     return tr;
 }
 
+void Resolver::buildBaseGenericSubst(
+        MethodSymbol* derived, MethodSymbol* base,
+        std::unordered_map<std::string_view, TypeRef*>& out) {
+    // Example: Container<T> base, IntBox : Container<int> derived → {T → int}.
+    // Look up the base type's TypeRef from the derived class's baseTypeRefs
+    // (which store the resolved generic args).
+    TypeSymbol* derivedClass = derived ? derived->parent : nullptr;
+    TypeSymbol* baseClass = base ? base->parent : nullptr;
+    if (!derivedClass || !baseClass) return;
+    for (std::size_t bi = 0; bi < derivedClass->baseTypes.size(); ++bi) {
+        if (derivedClass->baseTypes[bi] != baseClass) continue;
+        TypeRef* baseRef = (bi < derivedClass->baseTypeRefs.size())
+                           ? derivedClass->baseTypeRefs[bi] : nullptr;
+        if (!baseRef) break;
+        // Match base class generic params to the concrete args.
+        for (std::size_t gi = 0; gi < baseClass->genericParams.size() &&
+             gi < baseRef->genericArgs.size(); ++gi) {
+            if (auto* gp = dynamic_cast<GenericParamSymbol*>(
+                              baseClass->genericParams[gi])) {
+                out[gp->name] = baseRef->genericArgs[gi];
+            }
+        }
+        break;
+    }
+}
+
+bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
+    if (!derived || !base) return false;
+    if (derived->params.size() != base->params.size()) return false;
+    std::unordered_map<std::string_view, TypeRef*> genericSubst;
+    buildBaseGenericSubst(derived, base, genericSubst);
+    for (std::size_t i = 0; i < derived->params.size(); ++i) {
+        auto* dp = dynamic_cast<ParameterSymbol*>(derived->params[i]);
+        auto* bp = dynamic_cast<ParameterSymbol*>(base->params[i]);
+        if (!dp || !bp) return false;
+        // A `ref`/`out`/`owned` modifier is part of the signature (§22.6) — an
+        // override must match it, so a modifier difference means this is a
+        // DIFFERENT overload, not the one being overridden.
+        if (dp->modifier != bp->modifier) return false;
+        TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType) : nullptr;
+        TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType) : nullptr;
+        TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
+        if (!typeRefEqual(dt, btSubst)) return false;
+    }
+    return true;
+}
+
 void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                            MemberSymbol* baseSym) {
     auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
@@ -1231,29 +1278,8 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     };
 
     // Build generic substitution map: base class's T → concrete arg.
-    // Example: Container<T> base, IntBox : Container<int> derived →
-    // {T → int}. Look up the base type's TypeRef from the derived
-    // class's baseTypeRefs (which store the resolved generic args).
     std::unordered_map<std::string_view, TypeRef*> genericSubst;
-    TypeSymbol* derivedClass = derived->parent;
-    TypeSymbol* baseClass = base->parent;
-    if (derivedClass && baseClass) {
-        for (std::size_t bi = 0; bi < derivedClass->baseTypes.size(); ++bi) {
-            if (derivedClass->baseTypes[bi] != baseClass) continue;
-            TypeRef* baseRef = (bi < derivedClass->baseTypeRefs.size())
-                               ? derivedClass->baseTypeRefs[bi] : nullptr;
-            if (!baseRef) break;
-            // Match base class generic params to the concrete args.
-            for (std::size_t gi = 0; gi < baseClass->genericParams.size() &&
-                 gi < baseRef->genericArgs.size(); ++gi) {
-                if (auto* gp = dynamic_cast<GenericParamSymbol*>(
-                                  baseClass->genericParams[gi])) {
-                    genericSubst[gp->name] = baseRef->genericArgs[gi];
-                }
-            }
-            break;
-        }
-    }
+    buildBaseGenericSubst(derived, base, genericSubst);
 
     // Visibility must match exactly.
     if (derived->visibility != base->visibility) {
@@ -1308,8 +1334,11 @@ void Resolver::checkHidingAndOverride() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Class) continue;
-        // Gather base CLASS members by name (transitive).
-        std::unordered_map<std::string_view, MemberSymbol*> baseMembers;
+        // Gather base CLASS members by name (transitive). A name can map to
+        // SEVERAL members — overloaded virtual methods (#1090) — so collect all
+        // of them (most-derived first) and pick the matching overload below.
+        std::unordered_map<std::string_view, std::vector<MemberSymbol*>>
+            baseMembers;
         std::vector<TypeSymbol*> frontier;
         for (TypeSymbol* b : t->baseTypes) {
             if (b && b->kind == ast::TypeDeclKind::Class) {
@@ -1340,8 +1369,9 @@ void Resolver::checkHidingAndOverride() {
                         continue;
                 }
                 if (auto* ms = dynamic_cast<MemberSymbol*>(m)) {
-                    // First (most-derived) base wins on collision.
-                    baseMembers.emplace(ms->name, ms);
+                    // Collect every same-name base member (most-derived first);
+                    // an overloaded method contributes one entry per overload.
+                    baseMembers[ms->name].push_back(ms);
                 }
             }
             for (TypeSymbol* b : cur->baseTypes) {
@@ -1367,7 +1397,23 @@ void Resolver::checkHidingAndOverride() {
             if (!ms || ms->name.empty()) continue;
             auto it = baseMembers.find(ms->name);
             if (it == baseMembers.end()) continue;
-            MemberSymbol* base = it->second;
+            const std::vector<MemberSymbol*>& bases = it->second;
+            // Pick the base overload this member matches. For an overloaded
+            // method, match by SIGNATURE so a derived override of one overload
+            // is validated against the right base overload (not whichever was
+            // first in declaration order) (#1090). Non-method members and a
+            // single candidate use the most-derived (front) entry unchanged.
+            MemberSymbol* base = bases.front();
+            if (auto* dm = dynamic_cast<MethodSymbol*>(ms); dm && bases.size() > 1) {
+                MemberSymbol* arityMatch = nullptr;
+                for (MemberSymbol* cand : bases) {
+                    auto* bm = dynamic_cast<MethodSymbol*>(cand);
+                    if (!bm || bm->params.size() != dm->params.size()) continue;
+                    if (!arityMatch) arityMatch = cand;
+                    if (overrideParamsMatch(dm, bm)) { arityMatch = cand; break; }
+                }
+                if (arityMatch) base = arityMatch;
+            }
             bool isOverride = hasMod(ms, "override");
             if (isOverride) {
                 if (!baseMemberOverridable(base)) {

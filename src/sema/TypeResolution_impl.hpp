@@ -273,6 +273,20 @@ private:
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym);
 
+    // Build the base-class generic substitution map (base class T → the
+    // concrete arg the derived class binds it to) for an override pair, e.g.
+    // Container<T> base, IntBox : Container<int> → {T → int}. Shared by
+    // checkOverrideSignatureMatch and overrideParamsMatch (#1090).
+    void buildBaseGenericSubst(
+        MethodSymbol* derived, MethodSymbol* base,
+        std::unordered_map<std::string_view, TypeRef*>& out);
+
+    // §12.1/§22.5 (#1090): does the derived method's parameter list match the
+    // base method's (same arity, same parameter types after generic subst)?
+    // Used to pick the correct overload among several same-name base members
+    // before validating an override. Non-reporting.
+    bool overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base);
+
     // Slice S15: §12.2 forbids a derived class from reusing a base
     // CLASS member's name except to override a virtual/abstract base
     // member (§12.1). Interface members are excluded — re-declaring an
