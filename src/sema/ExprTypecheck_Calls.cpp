@@ -6256,7 +6256,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                // `catch var e: SerializationException` is used.
                                n == "SerializationException"    ||
                                n == "ChannelClosedException"    ||  // §30.15 #600c
-                               n == "DomainFaultedException";       // §30.14 #600c
+                               n == "DomainFaultedException"    ||  // §30.14 #600c
+                               // #976 / stdlib §7.4 / §7.5: System.Threading +
+                               // System.IO exception families.
+                               n == "TimeoutException"          ||
+                               n == "IOException"               ||
+                               n == "FileNotFoundException"     ||
+                               n == "DirectoryNotFoundException"||
+                               n == "EndOfStreamException"      ||
+                               n == "PathTooLongException";
                     };
                     if (beName(tt->astNode->name->parts.back())) {
                         ctx_.setExprType(
@@ -7561,7 +7569,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                        n == "OperationCanceledException"||
                        n == "TypeInitializationException" ||
                        n == "FormatException"           ||
-                       n == "StackOverflowException";
+                       n == "StackOverflowException"    ||
+                       // #976 / stdlib §7.4 / §7.5: System.Threading + System.IO.
+                       n == "TimeoutException"          ||
+                       n == "IOException"               ||
+                       n == "FileNotFoundException"     ||
+                       n == "DirectoryNotFoundException"||
+                       n == "EndOfStreamException"      ||
+                       n == "PathTooLongException";
             };
             for (const TypeSymbol* cur = targetType; cur && !isBuiltinExInheritedMember;) {
                 auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);

@@ -1863,6 +1863,18 @@ Emitter::builtinExceptionHierarchy() {
         // §9.8 / issue #550: thrown by synthesised Serialize/Deserialize when
         // the binary stream is malformed (unknown fields, truncated data, etc.).
         {"SerializationException", "Exception"},
+        // issue #976 / stdlib §7.4: System.Threading TimeoutException.
+        {"TimeoutException", "Exception"},
+        // issue #976 / stdlib §7.5: the System.IO exception family. All derive
+        // from IOException, which derives from Exception. Registered so
+        // `catch var ex: IOException` matches a thrown FileNotFoundException
+        // (etc.) via the descriptor base-chain, and `throw new IOException(...)`
+        // lowers like any other built-in exception.
+        {"IOException", "Exception"},
+        {"FileNotFoundException", "IOException"},
+        {"DirectoryNotFoundException", "IOException"},
+        {"EndOfStreamException", "IOException"},
+        {"PathTooLongException", "IOException"},
     };
     return h;
 }

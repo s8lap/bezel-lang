@@ -296,3 +296,82 @@ BEZEL_TEST(codegen_593, single_user_type_arm_catches_spec_31_2_1) {
         "end Main; end C;"),
         99);
 }
+
+// ── Group 6 (issue #976): System.IO / System.Threading exception families ─────
+//
+// stdlib §7.4 (TimeoutException) and §7.5 (IOException, FileNotFoundException,
+// DirectoryNotFoundException, EndOfStreamException, PathTooLongException — all
+// derive from IOException, which derives from Exception). These were
+// unresolvable type names before #976; now they resolve as built-in exceptions
+// (no import-gating yet, matching KeyNotFoundException) so they work as catch-arm
+// type tests, `throw new` targets, and base classes.
+
+// A bare IOException catch with .Message access (built-in → message storage
+// works at runtime). "disk gone".Length == 9.
+BEZEL_TEST(codegen_976, io_exception_caught_message_spec_7_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.IO; class C public static method Main(): int "
+        "  try throw new IOException(\"disk gone\"); "
+        "  catch var ex: IOException => return ex.Message.Length; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        9);
+}
+
+// catch IOException matches a thrown subtype (FileNotFoundException is-a
+// IOException via the descriptor base-chain).
+BEZEL_TEST(codegen_976, io_base_catches_subtype_spec_7_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.IO; class C public static method Main(): int "
+        "  try throw new FileNotFoundException(\"nf\"); "
+        "  catch var ex: IOException => return 7; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        7);
+}
+
+// A sibling type must NOT cross-catch: a thrown DirectoryNotFoundException is
+// not a FileNotFoundException, so it propagates to the outer IOException arm.
+BEZEL_TEST(codegen_976, io_siblings_do_not_cross_catch_spec_7_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.IO; class C public static method Main(): int "
+        "  try "
+        "    try throw new DirectoryNotFoundException(\"d\"); "
+        "    catch var ex: FileNotFoundException => return 1; "  // must NOT fire
+        "    end; "
+        "  catch var ex: IOException => return 20; "             // fires
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        20);
+}
+
+// System.Threading TimeoutException resolves and is catchable (§7.4).
+BEZEL_TEST(codegen_976, timeout_exception_caught_spec_7_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Threading; class C public static method Main(): int "
+        "  try throw new TimeoutException(\"late\"); "
+        "  catch var ex: TimeoutException => return ex.Message.Length; "  // 4
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        4);
+}
+
+// A user class deriving from a built-in IO exception is catchable as IOException.
+BEZEL_TEST(codegen_976, user_class_inherits_io_exception_spec_7_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.IO; "
+        "class MyIoErr: IOException "
+        "  public constructor(msg: string) base(msg); end constructor; "
+        "end MyIoErr; "
+        "class C public static method Main(): int "
+        "  try throw new MyIoErr(\"custom\"); "
+        "  catch var ex: IOException => return 33; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        33);
+}

@@ -93,7 +93,14 @@ static bool isBuiltinExceptionTypeName(std::string_view n) {
            n == "OperationCanceledException"||
            n == "TypeInitializationException" ||
            n == "FormatException"           ||
-           n == "StackOverflowException";
+           n == "StackOverflowException"    ||
+           // #976 / stdlib §7.4 / §7.5: System.Threading + System.IO families.
+           n == "TimeoutException"          ||
+           n == "IOException"               ||
+           n == "FileNotFoundException"     ||
+           n == "DirectoryNotFoundException"||
+           n == "EndOfStreamException"      ||
+           n == "PathTooLongException";
 }
 
 // #625 / §12 / §31: true when `ts` (a user class TypeSymbol) or any user-class

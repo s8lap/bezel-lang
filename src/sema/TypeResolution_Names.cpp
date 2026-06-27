@@ -50,7 +50,18 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "FormatException" || n == "StackOverflowException" ||
         // §9.8 / issue #550: thrown by synthesised Serialize/Deserialize on
         // malformed binary input.
-        n == "SerializationException") {
+        n == "SerializationException" ||
+        // issue #976 / stdlib §7.4 / §7.5: System.Threading TimeoutException and
+        // the System.IO exception family. Per the spec these live in
+        // System.Threading / System.IO and require `import`, but — like
+        // KeyNotFoundException (System.Collections.Generic) above — the compiler
+        // does not yet enforce import-gating for those namespaces (File/Directory/
+        // Path resolve without import too), so they join the resolvable built-in
+        // exception set, enabling `catch var ex: IOException` and `throw new
+        // IOException(...)`. Hierarchy is in builtinExceptionHierarchy() (codegen).
+        n == "TimeoutException" || n == "IOException" ||
+        n == "FileNotFoundException" || n == "DirectoryNotFoundException" ||
+        n == "EndOfStreamException" || n == "PathTooLongException") {
         return 0;
     }
     if (n == "Task") return kBuiltinTaskLike;
