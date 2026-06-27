@@ -1272,6 +1272,55 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (prt && prt->kind == TypeRef::Kind::Function && prt->funcReturn)
             ctx_.setExprType(&ce, prt->funcReturn);
     }
+    // #1093 / §5.1: a call THROUGH a function-typed value (a delegate local /
+    // parameter / field, an indexed function element, or a chained call result)
+    // must type-check its arguments against the function type's parameter list —
+    // arity and per-argument assignability — exactly as a named-method call
+    // does (checkCallArity). Without this the delegate-invocation path skipped
+    // argument checking, so a wrong-typed or wrong-arity argument was silently
+    // accepted and miscompiled. A method/constructor callee is excluded (it has
+    // its own checkCallArity); only a genuine function-typed callee is checked.
+    {
+        bool isMethodOrCtor = dynamic_cast<MethodSymbol*>(calleeSym) ||
+                              dynamic_cast<ConstructorSymbol*>(calleeSym);
+        TypeRef* ft = ce.callee ? ctx_.exprType(*ce.callee) : nullptr;
+        if ((!ft || ft->kind != TypeRef::Kind::Function) && !isMethodOrCtor) {
+            if (auto* loc = dynamic_cast<LocalSymbol*>(calleeSym))
+                ft = loc->declType;
+            else if (auto* par = dynamic_cast<ParameterSymbol*>(calleeSym))
+                ft = par->declType ? ctx_.resolvedType(*par->declType)
+                                   : par->resolvedDeclType;
+        }
+        if (!isMethodOrCtor && ft && ft->kind == TypeRef::Kind::Function) {
+            // Defer named / modifier / discard arguments (by-ref delegate
+            // binding is not modeled here), mirroring checkImportedCallArity.
+            bool simple = true;
+            for (const auto& a : ce.args)
+                if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) {
+                    simple = false;
+                    break;
+                }
+            if (simple) {
+                if (ce.args.size() != ft->funcParams.size()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "call supplies " + std::to_string(ce.args.size()) +
+                        " argument(s) but the function value expects " +
+                        std::to_string(ft->funcParams.size()) + " (§5.1)");
+                } else {
+                    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+                        if (!ce.args[i].value || !ft->funcParams[i].type) continue;
+                        checkAssignable(
+                            ctx_.exprType(*ce.args[i].value),
+                            ft->funcParams[i].type,
+                            ce.args[i].value->span.begin,
+                            "argument " + std::to_string(i + 1) +
+                                " of the function call");
+                    }
+                }
+            }
+        }
+    }
     // CG27c / CG60: if the callee has no resolved symbol but has a type,
     // propagate the appropriate type to the CallExpr:
     // - If the callee has a Function TypeRef (e.g. indexed array element
