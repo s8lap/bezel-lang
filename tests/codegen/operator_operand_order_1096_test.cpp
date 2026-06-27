@@ -87,3 +87,36 @@ BEZEL_TEST(operator_operand_order_1096, builtin_arithmetic_unaffected) {
         "  return s.Length + int(d); "                    // 4 + 4 = 8
         "end Main; end C;"), 8);
 }
+
+// ── #1131 / §22.6 / §25: ALL overloads of an operator symbol are reachable ────
+// A type may declare several overloads of the same operator; resolution must
+// pick the one matching the operands, not just the first-declared.
+
+// `V + V` resolves the SECOND-declared `operator +(V, V)` overload (the first is
+// `operator +(V, int)`), which was previously dead.
+BEZEL_TEST(operator_operand_order_1096, second_overload_reachable_1131) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record V(N: int) "
+        "  public static method operator +(a: V, b: int): V => new V(a.N + b); "
+        "  public static method operator +(a: V, b: V): V => new V(a.N + b.N); "
+        "end V; "
+        "class App public static method Main(): int "
+        "  var a := new V(10); var b := new V(5); "
+        "  return (a + b).N; "                             // 15 (V+V overload)
+        "end Main; end App;"), 15);
+}
+
+// The first-declared overload (`V + int`) still resolves correctly.
+BEZEL_TEST(operator_operand_order_1096, first_overload_still_resolves_1131) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record V(N: int) "
+        "  public static method operator +(a: V, b: int): V => new V(a.N + b); "
+        "  public static method operator +(a: V, b: V): V => new V(a.N + b.N); "
+        "end V; "
+        "class App public static method Main(): int "
+        "  var a := new V(10); "
+        "  return (a + 7).N; "                             // 17 (V+int overload)
+        "end Main; end App;"), 17);
+}

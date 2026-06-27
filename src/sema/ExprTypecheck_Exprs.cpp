@@ -1652,10 +1652,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
 // declares one. `=`/`<>` on classes are excluded (they invoke Equals,
 // §25.2).
 MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
-    auto onType = [&](const ast::Expr* operand) -> MethodSymbol* {
-        if (!operand) return nullptr;
+    // §22.6 / §25 (#1131): collect ALL binary-operator overloads of `be.op`
+    // declared on the operand's type. A type may declare several overloads of the
+    // same operator symbol (e.g. `operator +(V, int)` and `operator +(V, V)`);
+    // returning only the FIRST and validating just that one made every later
+    // overload unreachable (the matching overload was wrongly rejected). The
+    // caller (`tryOperand`) picks the candidate whose parameters match the
+    // operands in order.
+    auto candidatesOn = [&](const ast::Expr* operand) -> std::vector<MethodSymbol*> {
+        std::vector<MethodSymbol*> out;
+        if (!operand) return out;
         TypeSymbol* ts = memberTargetType(operand);
-        if (!ts) return nullptr;
+        if (!ts) return out;
         // §25: user-defined `operator =` and `<>` on class types take
         // precedence over built-in reference equality — only skip when
         // no user-defined operator exists (handled by falling through).
@@ -1663,9 +1671,9 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (ms && ms->isOperator && ms->operatorToken == be.op &&
                 ms->params.size() == 2)
-                return ms;
+                out.push_back(ms);
         }
-        return nullptr;
+        return out;
     };
     // §25 (#1096): the operator's operands must match its declared parameters
     // IN ORDER (left → param 0, right → param 1). Bezel does not auto-commute
@@ -1697,10 +1705,13 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         return false;
     };
     auto tryOperand = [&](const ast::Expr* operand) -> MethodSymbol* {
-        MethodSymbol* m = onType(operand);
-        if (m && operandMatchesParam(be.left.get(), m->params[0]) &&
-            operandMatchesParam(be.right.get(), m->params[1]))
-            return m;
+        // #1131: examine EVERY overload of the operator declared on `operand`'s
+        // type and return the first whose parameters match the operands in order.
+        for (MethodSymbol* m : candidatesOn(operand)) {
+            if (operandMatchesParam(be.left.get(), m->params[0]) &&
+                operandMatchesParam(be.right.get(), m->params[1]))
+                return m;
+        }
         return nullptr;
     };
     if (auto* m = tryOperand(be.left.get())) return m;
