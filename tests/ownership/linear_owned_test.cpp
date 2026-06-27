@@ -95,7 +95,10 @@ BEZEL_TEST(own_linear, both_using_vars_clean) {
 }
 
 BEZEL_TEST(own_linear, null_initializer_is_polynull_no_obligation) {
+    // #1084: a bare `var x := null` (typeless) is now a §7.1 reject (a null
+    // literal carries no type to infer); the PolyNull ownership state it tests is
+    // preserved with a nullable annotation (`var x: T? := null`).
     auto r = parseAndCheckOwnership(wrap(
-        "var x := null;"));
+        "var x: T? := null;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

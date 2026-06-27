@@ -2812,6 +2812,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     currentScope_->names[ld->name] = lsym;
                     return;  // early-return: lsym->declType intentionally null
                 }
+                // §7.1 (#1084): a bare `null` literal carries no type of its own,
+                // so `var x := null` with no annotation gives the local no
+                // determinable type. Codegen later lowers a use of `x` (e.g.
+                // `x ?? 99`) with mismatched LLVM types and aborts on a PHI
+                // assertion (a compiler crash). Reject at the declaration,
+                // directing the user to a nullable type annotation. Mirrors the
+                // untyped collection-literal reject above.
+                if (dynamic_cast<const ast::NullLiteralExpr*>(
+                        ld->initializer.get())) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ld->initializer->span.begin,
+                        "cannot infer a type for `" + std::string(ld->name) +
+                        "` from a bare `null` — `null` has no type of its own; "
+                        "add a nullable type annotation (`var " +
+                        std::string(ld->name) + ": <T>? := null`) (§7.1)");
+                    currentScope_->names[ld->name] = lsym;
+                    return;  // early-return: lsym->declType intentionally null
+                }
                 lsym->declType = ctx_.exprType(*ld->initializer);
                 // per §14.1 + §A.7 (issue #391): a `var x := Generic.Create();`
                 // without a type annotation gives the call no target, so a

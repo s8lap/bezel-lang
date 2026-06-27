@@ -86,9 +86,13 @@ BEZEL_TEST(own_join, no_else_with_owned_in_then_is_clash) {
     (void)r;
 }
 
+// #1084: the PolyNull-from-null tests below annotate the null local
+// (`var x: Stream? := null`) — a bare typeless `var x := null` is now a §7.1
+// reject. The PolyNull ownership behavior (null absorbing into Owned/Borrowed
+// across branch joins) is unchanged by the annotation.
 BEZEL_TEST(own_join, null_init_then_owned_in_branch_absorbs) {
     auto r = parseAndCheckOwnership(wrap(
-        "var x := null; "
+        "var x: Stream? := null; "
         "if cond then x := new Stream(); "
         "else x := new Stream(); "
         "end; "
@@ -100,7 +104,7 @@ BEZEL_TEST(own_join, null_init_then_owned_in_branch_absorbs) {
 
 BEZEL_TEST(own_join, polynull_absorbs_borrowed) {
     auto r = parseAndCheckOwnership(wrap(
-        "var x := null; "
+        "var x: Stream? := null; "
         "if cond then x := source.Inner; "
         "else x := source.Other; "
         "end;"));

@@ -133,3 +133,31 @@ BEZEL_TEST(sema_local_infer, no_initializer_no_ascription_no_type) {
             BEZEL_EXPECT_TRUE(x->declType->primitive == PrimitiveType::Int);
     }
 }
+
+// #1084 (§7.1): a bare `var x := null` carries no inferable type — a null
+// literal has no type of its own. Before the fix it was silently accepted with
+// an unresolved null type, and a later use (`x ?? 99`) crashed codegen with an
+// LLVM PHI assertion. Reject at the declaration, directing the user to a
+// nullable annotation.
+BEZEL_TEST(sema_local_infer, bare_null_initializer_rejected_1084) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C public method M() var x := null; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool mentionsInfer = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("cannot infer a type") != std::string::npos)
+            mentionsInfer = true;
+    BEZEL_EXPECT_TRUE(mentionsInfer);
+}
+
+// #1084 regression: a nullable-ANNOTATED null local is well-typed (the §7.1
+// reject is only for the typeless bare form).
+BEZEL_TEST(sema_local_infer, annotated_null_initializer_accepted_1084) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C public method M() var x: int? := null; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    auto* x = findLocal(r, "x");
+    BEZEL_EXPECT_TRUE(x != nullptr);
+}
