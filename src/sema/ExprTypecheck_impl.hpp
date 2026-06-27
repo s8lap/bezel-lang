@@ -198,6 +198,13 @@ private:
     // is typed as the element type (its body can then resolve `p.x`).
     TypeRef* linqLambdaElementType(const ast::Expr* callee);
 
+    // stdlib §5 (#1124): for an `Aggregate(seed, (acc, x) => …)` call, return the
+    // fold lambda's two parameter types {TAccum, T} — TAccum = the seed argument's
+    // type, T = the source element type — so an untyped `(acc, x)` fold lambda gets
+    // its parameters typed (its body then resolves; otherwise codegen emits a
+    // `ret void` against the i32 accumulator return type). Empty when not such a call.
+    std::vector<TypeRef*> aggregateFoldLambdaParamTypes(const ast::CallExpr& ce);
+
     // §2.3: cache of synthetic TypeSymbol objects for always-available
     // built-in classes (Console, Math, Convert, Environment).
     std::unordered_map<std::string, TypeSymbol*> builtinClassCache_;

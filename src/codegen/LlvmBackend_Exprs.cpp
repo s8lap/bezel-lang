@@ -6223,6 +6223,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             if (par && par->declType) {
                 if (sema::TypeRef* rt = ctx_.resolvedType(*par->declType))
                     ty = lowerTypeRef(rt);
+            } else if (par && par->resolvedDeclType) {
+                // #1124: an inferred (un-annotated) lambda parameter whose type
+                // sema resolved from context — e.g. an `Aggregate(seed, (acc, x)
+                // => …)` fold's `acc: TAccum`, seeded from the seed argument's
+                // type. Honor it so a non-element accumulator (a `string`
+                // accumulator, say) is lowered with its true LLVM type instead of
+                // the i32 default (which mismatched the caller's accumulator type
+                // and emitted malformed IR). For an element-typed inferred param
+                // (the common single-param LINQ case) this yields the same type
+                // the expected-function-type fallback below would.
+                ty = lowerTypeRef(par->resolvedDeclType);
             }
             // If the param type is still i32 (unresolved) but we have an
             // expected function type from the call site, infer from that.

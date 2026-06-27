@@ -4952,6 +4952,30 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     return recvTy->genericArgs[0];
 }
 
+// stdlib §5 (#1124): `src.Aggregate(seed, (acc, x) => …)` — the fold lambda is
+// `(TAccum, T) -> TAccum`, where TAccum is the seed argument's type and T is the
+// source element type. Return {TAccum, T} so an un-annotated `(acc, x)` fold gets
+// its parameters typed before its body is visited. (The single-param LINQ seeding
+// `linqLambdaElementType` does not apply: the fold lambda has two parameters whose
+// types come from different sources — the seed and the element.) Empty otherwise.
+std::vector<TypeRef*> ExprTC::aggregateFoldLambdaParamTypes(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target || ma->member != "Aggregate" || ce.args.size() < 2)
+        return {};
+    if (!ce.args[0].value) return {};
+    TypeRef* seedTy = ctx_.exprType(*ce.args[0].value);   // TAccum
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!seedTy || !recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        recvTy->genericArgs.empty() || !recvTy->genericArgs[0])
+        return {};
+    // Same source gate as linqLambdaElementType: a collection / lazy-IEnumerable
+    // sentinel carries the element as genericArgs[0]; a user class is excluded
+    // (except Range, which is IEnumerable<T> over genericArgs[0]).
+    if (recvTy->declaration && recvTy->declaration->name != "Range")
+        return {};
+    return { seedTy, recvTy->genericArgs[0] };            // {TAccum, T}
+}
+
 // per §24.3: enforce the event visibility fence. `op` is the producer-side
 // operation being attempted on the event (`Raise`, `RaiseAsync`, `Add`,
 // `Remove`, or `+=` / `-=`). These are in scope only when the event's static

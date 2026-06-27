@@ -2687,6 +2687,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
                     else if (linqElem)    pendingLambdaParamType_ = linqElem;
+                    // stdlib §5 (#1124): an `Aggregate(seed, (acc, x) => …)` fold
+                    // lambda is `(TAccum, T) -> TAccum`. Seed BOTH parameters — acc
+                    // from the seed's type, x from the source element — so an
+                    // un-annotated `(acc, x)` resolves its body (else the inferred
+                    // params stay untyped and codegen emits `ret void` against the
+                    // accumulator return type → IR_FAIL).
+                    else if (auto aggP = aggregateFoldLambdaParamTypes(*ce);
+                             aggP.size() == 2 && lam->params.size() == 2)
+                        pendingLambdaParamTypes_ = aggP;
                     // fix #829: a lambda bound to a function-typed parameter
                     // `(T1, …, Tn) -> R` — thread the positional Ti so an untyped
                     // lambda arg `(a, b) => …` gets its inferred param types (the
