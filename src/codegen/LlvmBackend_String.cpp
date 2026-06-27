@@ -621,6 +621,19 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
             return builder_.CreateCall(fn, {val, fmtStr}, "dt.fmt");
         }
     }
+    // §18.5 / §9.3 (#1099B in interpolation): a decimal value with a fixed-point
+    // format — `$"{d:F2}"` — dispatches to the runtime decimal formatter, matching
+    // the explicit `d.ToString("F2")` path, instead of falling through to the
+    // no-format ToString (which dropped the precision: "1.5" not "1.50").
+    if (spec[0] != ',' && rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+        rt->primitive == sema::PrimitiveType::Decimal) {
+        llvm::Value* fmtStr = lowerStringLiteral("\"" + spec + "\"", false);
+        llvm::AllocaInst* dslot = entryAlloca(decimalStructType());
+        builder_.CreateStore(val, dslot);
+        auto* fn = declareC("bz_decimal_to_string_fmt", ptrTy(),
+                            {ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {dslot, fmtStr}, "dec.fmt");
+    }
     // §18.5 alignment specifier `,WIDTH` or `,WIDTH:FORMAT`:
     // Positive width = right-align, negative = left-align.
     // First apply FORMAT (if any) to get the value string, then pad.

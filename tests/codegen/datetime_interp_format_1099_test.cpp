@@ -68,3 +68,48 @@ BEZEL_TEST(datetime_interp_format_1099, numeric_format_unaffected) {
         "  return ok; "                                    // 1 + 2 = 3
         "end Main; end C;"), 3);
 }
+
+// #1099A (residual): a DateTime format spec containing `:` (HH:mm:ss) was
+// mis-parsed — the interpolation format-spec lexer rejected the colon (and `/`,
+// `.`, space), so `$"{d:HH:mm:ss}"` left the whole `d:HH:mm:ss` as the
+// expression and the format was discarded. Bezel has no ternary `:`, so a
+// depth-0 `:` is always the format separator; the lexer now admits the date/time
+// separators.
+BEZEL_TEST(datetime_interp_format_1099, time_format_with_colons) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d := new DateTime(2024, 3, 15); "
+        "  var s := $\"{d:HH:mm:ss}\"; "
+        "  return (3 if s.Length = 8 and s = \"00:00:00\" else 0); "
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(datetime_interp_format_1099, combined_date_time_format) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d := new DateTime(2024, 3, 15); "
+        "  var s := $\"{d:yyyy-MM-dd HH:mm:ss}\"; "
+        "  return (3 if s.Length = 19 and s = \"2024-03-15 00:00:00\" else 0); "
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(datetime_interp_format_1099, slash_date_format) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d := new DateTime(2024, 3, 15); "
+        "  var s := $\"{d:yyyy/MM/dd}\"; "
+        "  return (1 if s = \"2024/03/15\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1099B in interpolation: a decimal fixed-point format in an interpolation hole
+// (`$"{d:F2}"`) now uses the same runtime decimal formatter as the explicit
+// `d.ToString("F2")` — was the no-format ToString, dropping the precision.
+BEZEL_TEST(datetime_interp_format_1099, decimal_fixed_format_in_interpolation) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x: decimal := 1.5m; "
+        "  var s := $\"{x:F2}\"; "
+        "  return (3 if s.Length = 4 and s = \"1.50\" else 0); "
+        "end Main; end C;"), 3);
+}

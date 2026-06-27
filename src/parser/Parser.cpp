@@ -104,10 +104,21 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                     else if (d == 0 && k + 1 < exprText.size()) {
                         // `:FORMAT` — standard format specifier.
                         if (ek == ':') {
+                            // §18.5 (#1099A): the format spec is everything after
+                            // this first depth-0 `:` (Bezel has no ternary `:`, so
+                            // a `:` outside brackets is always the format
+                            // separator). Besides alphanumerics and sign, a custom
+                            // date/time format carries separators — `:` (HH:mm:ss),
+                            // `/` (yyyy/MM/dd), `.` (fff), and spaces (a combined
+                            // `yyyy-MM-dd HH:mm:ss`). Rejecting those left the colon
+                            // form mis-parsed as the expression (the spec was
+                            // discarded → no-arg ToString).
                             bool looksLikeFmt = true;
                             for (size_t f = k + 1; f < exprText.size(); ++f) {
                                 char fc = exprText[f];
-                                if (!std::isalnum(fc) && fc != '-' && fc != '+')
+                                if (!std::isalnum(static_cast<unsigned char>(fc)) &&
+                                    fc != '-' && fc != '+' && fc != ':' &&
+                                    fc != '/' && fc != '.' && fc != ' ')
                                     { looksLikeFmt = false; break; }
                             }
                             if (looksLikeFmt) {
