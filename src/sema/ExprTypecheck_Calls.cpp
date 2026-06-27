@@ -5598,6 +5598,33 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     break;
                 }
             }
+            // §12.3 (#1106 defect 6): when the class has no explicit class base,
+            // `base` is `Object`, whose only members are the universal §8.1
+            // ones (ToString/Equals/GetHashCode/GetType/ReferenceEquals). A
+            // `base.M` naming any OTHER member is not a base-class member — it
+            // silently resolved to nothing and mis-lowered to 0. Reject. (A
+            // class WITH a class base whose chain lacks M is already diagnosed
+            // "no member M on type B" by the known-complete-user-type path.)
+            if (!targetType) {
+                const auto& bm = ma.member;
+                bool universalObjMember =
+                    bm == "ToString" || bm == "Equals" ||
+                    bm == "GetHashCode" || bm == "GetType" ||
+                    bm == "ReferenceEquals";
+                if (!universalObjMember) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`base." + std::string(bm) +
+                        "` does not name a base-class member: `" +
+                        std::string(currentType_->name) +
+                        "` has no class base (its base is `Object`), and "
+                        "`Object` has no `" + std::string(bm) +
+                        "` — `base.M` calls a base class's implementation "
+                        "(\xC2\xA7""12.3); use `this." + std::string(bm) +
+                        "` or just `" + std::string(bm) + "`");
+                    return;
+                }
+            }
         }
     }
     // §3.4: `int.MaxValue`, `double.NaN`, `char.MaxValue`, etc. — static

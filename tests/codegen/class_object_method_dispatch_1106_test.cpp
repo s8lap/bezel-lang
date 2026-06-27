@@ -31,6 +31,10 @@ int run(const std::string& prog) {
     auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
+bool rejected(const std::string& prog) {
+    auto r = runJit(prog);
+    return !r.ran && r.diagnostics.hasErrors();
+}
 // A class with a value-based Equals/GetHashCode override.
 const char* kP =
     "class P "
@@ -119,4 +123,54 @@ BEZEL_TEST(class_object_method_dispatch_1106, gethashcode_override) {
         "class C public static method Main(): int "
         "  using var a := new P(42); return a.GetHashCode(); "  // 42
         "end Main; end C;"), 42);
+}
+
+// #1106 defect 6 (§12.3): `base.M()` where M is declared only on the calling
+// class (its base is Object, which has no M) is rejected — was silently
+// accepted and returned 0 (mis-lowered to a stub).
+BEZEL_TEST(class_object_method_dispatch_1106, base_call_own_method_rejected) {
+    BEZEL_EXPECT_TRUE(rejected(
+        "module M; "
+        "class A "
+        "  public virtual method UserM(): int => 42; "
+        "  public method CallBase(): int => base.UserM(); "  // UserM is A's own
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); return a.CallBase(); "
+        "end Main; end C;"));
+}
+
+// Regression guard: `base.M()` to a method the explicit base provides is
+// accepted and dispatches the base implementation non-virtually.
+BEZEL_TEST(class_object_method_dispatch_1106, base_call_real_base_method_accepted) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class B public virtual method RealM(): int => 7; end B; "
+        "class A: B public override method RealM(): int => base.RealM() + 5; end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); return a.RealM(); "     // base 7 + 5 = 12
+        "end Main; end C;"), 12);
+}
+
+// Regression guard: `base.M()` to an inherited (non-overridden) base method is
+// accepted.
+BEZEL_TEST(class_object_method_dispatch_1106, base_call_inherited_method_accepted) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class B public virtual method Helper(): int => 9; end B; "
+        "class A: B public method Use(): int => base.Helper(); end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); return a.Use(); "       // 9
+        "end Main; end C;"), 9);
+}
+
+// Regression guard: `base.ToString()` (a universal Object member) is NOT
+// over-rejected by the §12.3 base-member check.
+BEZEL_TEST(class_object_method_dispatch_1106, base_call_universal_object_member_ok) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A public override method ToString(): string => base.ToString(); end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); return a.ToString().Length; "  // "A" → 1
+        "end Main; end C;"), 1);
 }
