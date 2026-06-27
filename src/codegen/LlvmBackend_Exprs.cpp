@@ -628,18 +628,31 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         llvm::Value* rv = lowerExpr(*ma->target);
                         llvm::Value* x  = lowerExpr(*call->args[0].value);
                         if (rv && x) {
-                            llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u}, "rc.lo");
-                            llvm::Value* hi  = builder_.CreateExtractValue(rv, {1u}, "rc.hi");
+                            // §16 (#1080-sweep): Contains is Step-INDEPENDENT —
+                            // membership is by endpoints + inclusivity. For a
+                            // DESCENDING range (Start > End) the lo/hi roles are
+                            // reversed, so use min/max(Start, End); the half-open
+                            // form excludes the END endpoint specifically (the
+                            // excluded point is always End, ascending or not).
+                            llvm::Value* st  = builder_.CreateExtractValue(rv, {0u}, "rc.st");
+                            llvm::Value* en  = builder_.CreateExtractValue(rv, {1u}, "rc.en");
                             llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "rc.flg");
                             llvm::Value* xW  = x->getType() == i64()
                                                    ? x
                                                    : builder_.CreateSExt(x, i64(), "rc.xw");
-                            llvm::Value* geL  = builder_.CreateICmpSGE(xW, lo, "rc.geL");
+                            llvm::Value* asc = builder_.CreateICmpSLE(st, en, "rc.asc");
+                            llvm::Value* lo  = builder_.CreateSelect(asc, st, en, "rc.lo");
+                            llvm::Value* hi  = builder_.CreateSelect(asc, en, st, "rc.hi");
+                            llvm::Value* ge  = builder_.CreateICmpSGE(xW, lo, "rc.ge");
+                            llvm::Value* le  = builder_.CreateICmpSLE(xW, hi, "rc.le");
+                            llvm::Value* inR = builder_.CreateAnd(ge, le, "rc.in");
                             llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "rc.incl");
-                            llvm::Value* leLE = builder_.CreateICmpSLE(xW, hi, "rc.leLE");
-                            llvm::Value* leLT = builder_.CreateICmpSLT(xW, hi, "rc.leLT");
-                            llvm::Value* leH  = builder_.CreateSelect(incl, leLE, leLT, "rc.leH");
-                            return builder_.CreateAnd(geL, leH, "rc.res");
+                            llvm::Value* notEnd =
+                                builder_.CreateICmpNE(xW, en, "rc.notEnd");
+                            // half-open (!incl) excludes the End point.
+                            llvm::Value* endOk =
+                                builder_.CreateOr(incl, notEnd, "rc.endOk");
+                            return builder_.CreateAnd(inR, endOk, "rc.res");
                         }
                     }
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
@@ -2172,21 +2185,34 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         "r.open");
                 }
                 if (mbr == "IsEmpty") {
-                    // §9.8: a range is empty when it contains no values.
-                    // For an ascending range with Step=1 (default):
-                    //   inclusive (..)  : empty if hi < lo
-                    //   half-open (..<) : empty if hi <= lo
-                    // For Step != 1 (not yet fully general), we approximate with
-                    // the same endpoint test (correct for default-step ranges).
-                    llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u}, "r.lo");
-                    llvm::Value* hi  = builder_.CreateExtractValue(rv, {1u}, "r.hi");
-                    llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
+                    // §16: a range is empty when it has no values in the
+                    // ITERATION DIRECTION (set by the Step's sign, §16 L2333 —
+                    // a direction that disagrees with the step is empty), or both
+                    // endpoints are equal with an exclusive upper bound.
+                    //   ascending (step >= 0): empty if Start > End (closed) /
+                    //                          Start >= End (half-open)
+                    //   descending (step <  0): empty if Start < End (closed) /
+                    //                          Start <= End (half-open)
+                    // The prior code ignored Step → wrong for descending /
+                    // direction-mismatch ranges (e.g. `10..0 step -1` reported
+                    // empty; `0..10 step -1` reported non-empty).
+                    llvm::Value* st   = builder_.CreateExtractValue(rv, {0u}, "r.st");
+                    llvm::Value* en   = builder_.CreateExtractValue(rv, {1u}, "r.en");
+                    llvm::Value* step = builder_.CreateExtractValue(rv, {2u}, "r.step");
+                    llvm::Value* flg  = builder_.CreateExtractValue(rv, {3u}, "r.flg");
                     llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "r.incl");
-                    // inclusive: empty when hi < lo (i.e. NOT hi >= lo).
-                    llvm::Value* emptyIncl = builder_.CreateICmpSLT(hi, lo, "r.ei");
-                    // half-open: empty when hi <= lo (i.e. NOT hi > lo).
-                    llvm::Value* emptyHalf = builder_.CreateICmpSLE(hi, lo, "r.eh");
-                    return builder_.CreateSelect(incl, emptyIncl, emptyHalf, "r.empty");
+                    llvm::Value* stepNeg = builder_.CreateICmpSLT(
+                        step, llvm::ConstantInt::get(i64(), 0), "r.stepNeg");
+                    llvm::Value* ascIncl  = builder_.CreateICmpSGT(st, en, "r.ai");
+                    llvm::Value* ascHalf  = builder_.CreateICmpSGE(st, en, "r.ah");
+                    llvm::Value* descIncl = builder_.CreateICmpSLT(st, en, "r.di");
+                    llvm::Value* descHalf = builder_.CreateICmpSLE(st, en, "r.dh");
+                    llvm::Value* emptyAsc =
+                        builder_.CreateSelect(incl, ascIncl, ascHalf, "r.ea");
+                    llvm::Value* emptyDesc =
+                        builder_.CreateSelect(incl, descIncl, descHalf, "r.ed");
+                    return builder_.CreateSelect(stepNeg, emptyDesc, emptyAsc,
+                                                 "r.empty");
                 }
             }
         }
@@ -4169,16 +4195,20 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         if (!bin.left || !bin.right) return nullptr;
         auto* range = dynamic_cast<const ast::RangeExpr*>(bin.right.get());
         if (range && range->lo && range->hi && !range->step) {
-            llvm::Value* x = lowerExpr(*bin.left);
-            llvm::Value* lo = lowerExpr(*range->lo);
-            llvm::Value* hi = lowerExpr(*range->hi);
-            if (!x || !lo || !hi) return nullptr;
-            // x >= lo AND (x <= hi for inclusive, x < hi for half-open).
-            llvm::Value* geL = builder_.CreateICmpSGE(x, lo);
-            llvm::Value* leH = range->inclusive
-                                   ? builder_.CreateICmpSLE(x, hi)
-                                   : builder_.CreateICmpSLT(x, hi);
-            return builder_.CreateAnd(geL, leH);
+            llvm::Value* x  = lowerExpr(*bin.left);
+            llvm::Value* st = lowerExpr(*range->lo);
+            llvm::Value* en = lowerExpr(*range->hi);
+            if (!x || !st || !en) return nullptr;
+            // §16: Contains is Step-INDEPENDENT — membership is [min(Start,End),
+            // max(Start,End)] (so a descending literal like `10..0` works), with
+            // the End endpoint excluded when half-open (`..<`).
+            llvm::Value* asc = builder_.CreateICmpSLE(st, en);
+            llvm::Value* lo  = builder_.CreateSelect(asc, st, en);
+            llvm::Value* hi  = builder_.CreateSelect(asc, en, st);
+            llvm::Value* inR = builder_.CreateAnd(
+                builder_.CreateICmpSGE(x, lo), builder_.CreateICmpSLE(x, hi));
+            if (range->inclusive) return inR;
+            return builder_.CreateAnd(inR, builder_.CreateICmpNE(x, en));
         }
         // fix #499 / §9.8: `x in r` where r is a Range-typed variable.
         // Load the stored { i64 start, i64 end, i64 step, i8 flags } struct
@@ -4191,22 +4221,26 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* x = lowerExpr(*bin.left);
                 llvm::Value* rv = lowerExpr(*bin.right);
                 if (!x || !rv) return nullptr;
-                llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u}, "r.lo");
-                llvm::Value* hi  = builder_.CreateExtractValue(rv, {1u}, "r.hi");
+                llvm::Value* st  = builder_.CreateExtractValue(rv, {0u}, "r.st");
+                llvm::Value* en  = builder_.CreateExtractValue(rv, {1u}, "r.en");
                 llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
                 // Widen x to i64 for comparison against i64 start/end.
                 llvm::Value* xW = x->getType() == i64()
                                       ? x
                                       : builder_.CreateSExt(x, i64(), "r.xw");
-                llvm::Value* geL = builder_.CreateICmpSGE(xW, lo, "r.geL");
-                // flags bit 0: IsEndInclusive.
-                llvm::Value* incl =
-                    builder_.CreateTrunc(flg, i1(), "r.incl");
-                // Build both branches and select.
-                llvm::Value* leLE = builder_.CreateICmpSLE(xW, hi, "r.leLE");
-                llvm::Value* leLT = builder_.CreateICmpSLT(xW, hi, "r.leLT");
-                llvm::Value* leH  = builder_.CreateSelect(incl, leLE, leLT, "r.leH");
-                return builder_.CreateAnd(geL, leH, "r.in");
+                // §16: Contains is Step-INDEPENDENT — [min(Start,End),
+                // max(Start,End)] so a descending range works; the End endpoint
+                // is excluded when half-open. flags bit 0 = IsEndInclusive.
+                llvm::Value* asc = builder_.CreateICmpSLE(st, en, "r.asc");
+                llvm::Value* lo  = builder_.CreateSelect(asc, st, en, "r.lo");
+                llvm::Value* hi  = builder_.CreateSelect(asc, en, st, "r.hi");
+                llvm::Value* inR = builder_.CreateAnd(
+                    builder_.CreateICmpSGE(xW, lo, "r.ge"),
+                    builder_.CreateICmpSLE(xW, hi, "r.le"), "r.inR");
+                llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "r.incl");
+                llvm::Value* notEnd = builder_.CreateICmpNE(xW, en, "r.notEnd");
+                llvm::Value* endOk = builder_.CreateOr(incl, notEnd, "r.endOk");
+                return builder_.CreateAnd(inR, endOk, "r.in");
             }
         }
         // §17.5/§4.6: `c in s` — char membership test in a string.
