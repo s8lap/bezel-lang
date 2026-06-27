@@ -9647,6 +9647,64 @@ llvm::Value* Emitter::buildRecordValue(
         if (mappingOk) {
             for (std::size_t i = 0; i < fields.size(); ++i) {
                 if (!fieldArg[i] || !fieldArg[i]->value) return nullptr;
+                // §9.1 / §15.4 (#1129): an INLINE-ARRAY field whose positional
+                // argument is a collection literal `[e1, e2, …]` must be built IN
+                // PLACE. A CollectionLiteralExpr is not a general expression value
+                // — lowerExpr returns null/garbage for it — so the normal
+                // lower-then-store path below left the record's array field
+                // uninitialized (read-back garbage). Mirror the field-initializer
+                // path (Setup.cpp): GEP into the field slot and store each element.
+                // (Binding the literal to a named local first already worked
+                // because the local-decl path materializes the array.)
+                {
+                    auto fit = fieldIndex_.find(fields[i]);
+                    if (fit != fieldIndex_.end()) {
+                        llvm::Type* fty0 = st->getElementType(fit->second);
+                        auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                            fieldArg[i]->value.get());
+                        if (cl && !cl->isDict) {
+                            if (auto* aty =
+                                    llvm::dyn_cast<llvm::ArrayType>(fty0)) {
+                                // Elements belong to the outer scope — lower them
+                                // under the enclosing substitution (issue #597).
+                                auto rS = genericSubst_;
+                                auto rT = genericSubstSemaTy_;
+                                genericSubst_ = argSubst;
+                                genericSubstSemaTy_ = argSemaTy;
+                                llvm::Value* fieldGep =
+                                    builder_.CreateStructGEP(st, slot, fit->second);
+                                llvm::Type* elemTy = aty->getElementType();
+                                for (std::size_t k = 0; k < cl->elements.size();
+                                     ++k) {
+                                    if (!cl->elements[k]) continue;
+                                    llvm::Value* ev = lowerExpr(*cl->elements[k]);
+                                    if (!ev) continue;
+                                    if (ev->getType() != elemTy &&
+                                        ev->getType()->isIntegerTy() &&
+                                        elemTy->isIntegerTy()) {
+                                        unsigned eb =
+                                            ev->getType()->getIntegerBitWidth();
+                                        unsigned db =
+                                            elemTy->getIntegerBitWidth();
+                                        ev = db > eb
+                                                 ? builder_.CreateSExt(ev, elemTy)
+                                                 : builder_.CreateTrunc(ev, elemTy);
+                                    }
+                                    builder_.CreateStore(
+                                        ev,
+                                        builder_.CreateGEP(
+                                            fty0, fieldGep,
+                                            {builder_.getInt32(0),
+                                             builder_.getInt32(
+                                                 static_cast<unsigned>(k))}));
+                                }
+                                genericSubst_ = std::move(rS);
+                                genericSubstSemaTy_ = std::move(rT);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // issue #597: lower the construction argument under the
                 // ENCLOSING substitution (its expression belongs to the outer
                 // scope), then restore the record's own substitution for the

@@ -346,3 +346,49 @@ BEZEL_TEST(codegen_inline_array, local_const_array_size_arithmetic_734) {
         "  return arr[7] + arr.Length; "  // 9 + 8 = 17
         "end Main; end C;"), 17);
 }
+
+// ── #1129 / §9.1 / §15.4: a positional record built with an inline-array ──────
+// LITERAL constructor argument must materialize the array into the field.
+// Before the fix the CollectionLiteralExpr argument was not a general
+// expression value, so the field was left uninitialized (read-back garbage).
+
+// `new G([7,8,9])` for `record G(cells: [3]int)` → the field holds [7,8,9].
+BEZEL_TEST(codegen_inline_array, record_inline_array_literal_arg_1129) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record G(cells: [3]int); "
+        "class C public static method Main(): int "
+        "  var a := new G([7, 8, 9]); "
+        "  return a.cells[0] + a.cells[1] + a.cells[2]; "   // 24
+        "end Main; end C;"), 24);
+}
+
+// A leading scalar field is not clobbered by the inline-array literal store.
+BEZEL_TEST(codegen_inline_array, record_scalar_plus_inline_array_literal_1129) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record G(tag: int, cells: [2]int); "
+        "class C public static method Main(): int "
+        "  var a := new G(42, [10, 20]); "
+        "  return a.tag + a.cells[0] + a.cells[1]; "        // 42 + 30 = 72
+        "end Main; end C;"), 72);
+}
+
+// Element width coercion: an int literal stored into a `[N]byte` field.
+BEZEL_TEST(codegen_inline_array, record_byte_inline_array_literal_1129) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record G(cells: [3]byte); "
+        "class C public static method Main(): int "
+        "  var a := new G([100, 50, 25]); "
+        "  return int(a.cells[0]) + int(a.cells[1]) + int(a.cells[2]); "  // 175
+        "end Main; end C;"), 175);
+}
+
+// Regression: binding the literal to a named local first still works.
+BEZEL_TEST(codegen_inline_array, record_inline_array_named_local_unaffected_1129) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record G(cells: [3]int); "
+        "class C public static method Main(): int "
+        "  var xs: [3]int := [7, 8, 9]; "
+        "  var a := new G(xs); "
+        "  return a.cells[0] + a.cells[1] + a.cells[2]; "   // 24
+        "end Main; end C;"), 24);
+}
