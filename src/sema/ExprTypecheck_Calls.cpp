@@ -1972,6 +1972,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 }
                 if (!colName.empty()) {
+                    // §4.5 (#1022/#920): an OWNING collection deliberately exposes
+                    // NO non-owning value copy-form — `ToArray`/`ToSet`/
+                    // `ToDictionary` would each manufacture a second collection over
+                    // the same uniquely owned elements (double-owning them) or drain
+                    // the source. The borrowing `Sorted`/`Reversed`/`AsSpan` forms
+                    // are rejected separately below; this catches the materializer
+                    // copy-forms, which were silently accepted and mis-reclaimed by
+                    // codegen. Only a DIRECT owning-collection receiver triggers it —
+                    // a LINQ query result (`owned.Where(p).ToArray()`) has an
+                    // IEnumerable receiver, so colName != Owned* and it stays valid.
+                    // `OwnedBuffer<T>` is exempt (§4.14 gives it owning spans) and is
+                    // not in this set.
+                    if ((colName == "OwnedArray" || colName == "OwnedStack" ||
+                         colName == "OwnedQueue" || colName == "OwnedLinkedList" ||
+                         colName == "OwnedSet" || colName == "OwnedDictionary") &&
+                        (m == "ToArray" || m == "ToSet" || m == "ToDictionary")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("`") + std::string(colName) +
+                            "<T>` does not expose `" + std::string(m) +
+                            "` — an owning collection has no non-owning copy-form "
+                            "(copying would double-own its elements, §4.5); drain it "
+                            "(`Drain`/`PopAt`/`PopFirst`/`PopLast`) to transfer "
+                            "ownership out, or use a borrowing `Array<T>`");
+                    }
                     // Array/Stack/Queue/Set/LinkedList methods
                     bool isArrLike = colName == "Array" || colName == "OwnedArray" ||
                         colName == "Stack" || colName == "OwnedStack" ||

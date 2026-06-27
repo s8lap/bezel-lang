@@ -190,6 +190,56 @@ BEZEL_TEST(array_span_549, array_asspan_index_unaffected_1022) {
         "end Main; end C;", 8);
 }
 
+// §4.5 (#1022): the non-owning copy-form materializers ToArray/ToSet/ToDictionary
+// are rejected on an OWNING collection — copying would double-own its uniquely
+// owned elements. (Before the fix they were silently accepted and codegen
+// mis-reclaimed the materializer backing.) §4.5 L1202: "There is no ToArray() on
+// OwnedArray<T> that produces a non-owning copy."
+BEZEL_TEST(array_span_549, ownedarray_toarray_rejected_1022) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class R end R; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  _ := a.ToArray(); "
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+BEZEL_TEST(array_span_549, ownedarray_toset_rejected_1022) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class R end R; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  _ := a.ToSet(); "
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+BEZEL_TEST(array_span_549, ownedarray_todictionary_rejected_1022) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; "
+        "import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+        "  _ := a.ToDictionary((x) => x); "
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.5 (#1022) regression: a LINQ query result over an owning collection has an
+// IEnumerable receiver, so its ToArray() materializer is the borrowing copy-form
+// and stays VALID (only a DIRECT owning-collection receiver is rejected).
+BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
+    expectValueAndAsanClean(
+        "module M; "
+        "import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); a.Add(7); a.Add(8); a.Add(9); "
+        "  using var e: Array<int> := a.Where((x) => x > 7).ToArray(); "
+        "  return e.Length; "  // 2 (8 and 9)
+        "end Main; end C;", 2);
+}
+
 // ===========================================================================
 // §4.15 AsSpan(start, length): partial view.
 // ===========================================================================

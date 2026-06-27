@@ -718,8 +718,10 @@ BEZEL_TEST(linq_refcount, using_var_toarray_not_double_freed_1003) {
 // its ELEMENTS (so producerState is Borrowed and #1009's class/interface discard
 // path never fires), yet the BACKING is owned by nothing — it leaked (96B / 2
 // allocs) before #1015. Reclaimed via the #1004 helper (backing freed, elements
-// borrowed → not disposed; the source OwnedArray<Cell> disposes the Cell once at
-// its using-var end). Cell.n == 1 (Cell still alive, owned by `a`).
+// borrowed → not disposed; the Cell is disposed once at `cell`'s using-var end).
+// Cell.n == 1 (Cell still alive). Receiver retargeted from OwnedArray<Cell> to a
+// borrowing Array<Cell> (the #1015 backing-reclaim is receiver-agnostic) because
+// #1022 now rejects copy-forms on owning collections (§4.5).
 BEZEL_TEST(linq_refcount, discard_toarray_backing_freed_1015) {
     expectValueAndLeakFree(
         "module M; "
@@ -727,7 +729,8 @@ BEZEL_TEST(linq_refcount, discard_toarray_backing_freed_1015) {
         "  public constructor() Cell.n := Cell.n + 1; end constructor; "
         "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); a.Add(new Cell()); "
+        "  using var cell := new Cell(); "
+        "  using var a := new Array<Cell>(); a.Add(cell); "
         "  _ := a.ToArray(); "
         "  return Cell.n; "
         "end Main; end C;", 1);
@@ -745,11 +748,13 @@ BEZEL_TEST(linq_refcount, discard_toarray_string_leak_free_1015) {
 }
 
 // #1015: discarding a fresh ToDictionary materializer frees the dict backing
-// (bz_dict_free, not bz_array_free — #1013's dict-backed reclaim path).
+// (bz_dict_free, not bz_array_free — #1013's dict-backed reclaim path). Receiver
+// retargeted from OwnedArray<int> to a borrowing Array<int> (the reclaim is
+// receiver-agnostic) because #1022 now rejects copy-forms on owning collections.
 BEZEL_TEST(linq_refcount, discard_todictionary_backing_freed_1015) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+        "  using var a := new Array<int>(); a.Add(1); a.Add(2); "
         "  _ := a.ToDictionary((x) => x); "
         "  return 0; "
         "end Main; end C;", 0);
@@ -1128,12 +1133,17 @@ BEZEL_TEST(linq_refcount, owning_coll_owned_temp_count_unbound_no_double_free_10
 // reclaim was array-only (bz_array_free), so the bz_dict struct + its entries
 // leaked (80 bytes). The fix extends the reclaim to dict materializers. The count
 // (2) is read from the dict BEFORE the free; ASan confirms no leak.
+//
+// NOTE: the five ToDictionary tests below source from a borrowing `Array<int>`
+// (was `OwnedArray<int>`). #1022 now rejects copy-form materializers on an owning
+// collection (§4.5); the dict-materializer reclaim these test is receiver-agnostic
+// (value elements), so the borrowing source exercises the identical reclaim path.
 const char* kToDictUnboundCount =
     "module M; class C "
     "  public static method Main(): int "
     "    var n: int := 0; "
     "    do "
-    "      using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+    "      using var a := new Array<int>(); a.Add(1); a.Add(2); "
     "      n := a.ToDictionary((x) => x).Count(); "  // unbound dict temp reclaimed
     "    end; "
     "    return n; "                                   // 2 — count correct, no leak
@@ -1153,7 +1163,7 @@ const char* kToDictBoundCount =
     "  public static method Main(): int "
     "    var n: int := 0; "
     "    do "
-    "      using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+    "      using var a := new Array<int>(); a.Add(1); a.Add(2); "
     "      using var d := a.ToDictionary((x) => x); "
     "      n := d.Count(); "                           // bound — sole free is d's
     "    end; "
@@ -1178,7 +1188,7 @@ const char* kToDictPlainVarReclaimed_1028 =
     "  public static method Main(): int "
     "    var n: int := 0; "
     "    do "
-    "      using var src := new OwnedArray<int>(); "
+    "      using var src := new Array<int>(); "
     "      src.Add(1); src.Add(2); src.Add(3); "
     "      var d := src.ToDictionary((x: int) => x); "
     "      n := d.Count; "
@@ -1203,7 +1213,7 @@ BEZEL_TEST(linq_refcount, todictionary_plain_var_reclaimed_1028) {
 const char* kToDictPropertyDiscardReclaimed_1028 =
     "module M; class C "
     "  public static method Main(): int "
-    "    using var src := new OwnedArray<int>(); "
+    "    using var src := new Array<int>(); "
     "    src.Add(1); src.Add(2); src.Add(3); "
     "    return src.ToDictionary((x: int) => x).Count; "
     "  end Main; "
@@ -1243,7 +1253,7 @@ BEZEL_TEST(linq_refcount, for_in_split_array_materializer_break_reclaimed_1055) 
 BEZEL_TEST(linq_refcount, for_in_todictionary_materializer_reclaimed_1055) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
-        "  using var src := new OwnedArray<int>(); "
+        "  using var src := new Array<int>(); "
         "  src.Add(1); src.Add(2); src.Add(3); var sum := 0; "
         "  for var e in src.ToDictionary((x: int) => x) do sum := sum + e.Value; end; "
         "  return sum; end Main; end C;", 6);
