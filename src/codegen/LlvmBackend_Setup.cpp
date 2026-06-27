@@ -1276,8 +1276,25 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
     for (sema::Symbol* m : t->members) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(m)) {
             if (isStaticMethod(ms) || !isVirtual(ms)) continue;
-            vtableSlot_[ms] = assignSlot(std::string(ms->name),
-                                         VSlot{ms, nullptr, false});
+            // #1085: key the vtable slot by name + ARITY, not the bare name.
+            // Two virtual OVERLOADS sharing a name (`F(x)` / `F(x, y)`) were
+            // keyed identically, so the second collapsed onto the first's slot
+            // (last-writer-wins) and every call to the earlier overload
+            // dispatched to the wrong body. Arity is the disambiguator the rest
+            // of the vtable/itable machinery already uses (interface-impl and
+            // abstract-impl matching are arity-based), and it keeps the SAME key
+            // for a base virtual and its derived override of the same arity so
+            // the override correctly reuses the base slot. The `#` separator
+            // can't appear in an identifier or the property `$set` suffix, so a
+            // method `F#0` never collides with a property `F` / setter `F$set`.
+            // Single-overload classes keep their exact slot layout (distinct
+            // names → distinct keys either way; only the override-reuse lookup
+            // is affected). Dispatch is unchanged — it is keyed by MethodSymbol*
+            // (vtableSlot_[ms]), which now receives a distinct slot per overload.
+            vtableSlot_[ms] = assignSlot(
+                std::string(ms->name) + "#" +
+                    std::to_string(ms->params.size()),
+                VSlot{ms, nullptr, false});
             continue;
         }
         if (auto* ps = dynamic_cast<sema::PropertySymbol*>(m)) {

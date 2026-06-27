@@ -585,6 +585,7 @@ set(BEZEL_TEST_SOURCES
     codegen/interp_default_tostring_1077_test.cpp
     codegen/array_slice_range_var_1079_test.cpp
     codegen/break_continue_in_finally_1083_test.cpp
+    codegen/virtual_overload_dispatch_1085_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp
