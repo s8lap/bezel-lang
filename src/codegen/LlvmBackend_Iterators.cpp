@@ -691,6 +691,22 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         }
         disposeStack_.pop_back();
 
+        // #1102 (sweep #8): a `yield return` that is UNREACHABLE — e.g. one that
+        // follows a `yield break` — still consumes a resume-state block (mn.sN),
+        // but the body flow stops at the break, so that block's continuation is
+        // never emitted and it is left with no terminator (an IR-verification
+        // crash). A resume into such a dead state cannot occur at runtime (the
+        // state counter never advances past the break / off the end), so
+        // terminate any orphan state block with `ret false` (exhausted). Only
+        // blocks the body never reached are affected — reachable yield states
+        // already carry their terminators.
+        for (llvm::BasicBlock* bb : stateBBs) {
+            if (bb && !bb->getTerminator()) {
+                builder_.SetInsertPoint(bb);
+                builder_.CreateRet(builder_.getFalse());
+            }
+        }
+
         // #747: if a suspending for-loop registered implicit allocas (or an SSA
         // temporary fails to dominate a use across a yield), promote them into the
         // frame's spill area so they survive the resume — fixing the sync-iterator
