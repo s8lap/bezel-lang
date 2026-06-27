@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.153 — June 2026**
+**Version 0.154 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -243,6 +243,8 @@ Each primitive keyword aliases a standard library type. `string`, though a refer
 Static members of the standard library type are accessible through either form: `int.Parse`, `int.MaxValue`, `double.IsNaN`, `string.IsNullOrEmpty`.
 
 `Object` has no lowercase keyword alias. Keyword aliases are reserved for primitive value types; `Object` is a class and is referenced as `Object` unconditionally. Code coming from C#, where `object` is a keyword for `System.Object`, should write `Object` in Bezel.
+
+The PascalCase standard-library names in the table above (`Boolean`, `Byte`, `SByte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Single`, `Double`, `Decimal`, `Char`, `String`) are **reserved type names**: a program may not declare a user type (class, record, enum, interface, or type alias) whose name is one of them. Each names a compiler-known primitive (or `string`) through its lowercase keyword alias, and the dual-form rule above makes the PascalCase form interchangeable with the keyword everywhere a type is named; allowing a user type to take one of these names would let a declaration silently shadow the primitive at some use sites and not others, producing a different value than the author intended. Declaring such a type is a compile error directing the author to choose a different name. (This does not reserve other standard-library type names — only the PascalCase aliases of the primitive value types and `String`; an ordinary library type such as `Array` or `Stream` may still be shadowed by a user type under the normal name-resolution rules.)
 
 <a id="sec-operators-on-primitive-types"></a>
 ### 3.5 Operators on primitive types
@@ -535,7 +537,7 @@ Operators `&` (AND), `|` (OR), `^` (XOR), `<<` (left shift), `>>` (right shift),
 
 `~x` is the bitwise complement; for signed types, `~x = -(x + 1)`. The keyword `not` is boolean negation, valid only on `bool`. `not` is not user-overloadable; types wanting domain-specific inversion provide a named method (e.g. `.Negate()`) or overload `~` if a bitwise reading applies. `~` and `not` are not interchangeable.
 
-Left shift fills with zeros on the right. Right shift fills with the sign bit on signed types, zero on unsigned. The shift count is reduced modulo the operand's bit width.
+A shift's result type is the type of its **left** operand. The right operand supplies only the shift count: it does **not** participate in the mixed-type promotion of [§6.2](#sec-mixed-type-arithmetic), so a narrower left operand is *not* widened to match a wider count (`byte << int` yields `byte`, not `int`). Left shift fills with zeros on the right. Right shift fills with the sign bit on signed types, zero on unsigned. The shift count is reduced modulo the bit width of the **left (shifted) operand's type** — `& 7` for `byte`/`sbyte`, `& 15` for `short`/`ushort`, `& 31` for the 32-bit types (`int`/`uint`), `& 63` for the 64-bit types (`long`/`ulong`). Bits shifted beyond the left operand's width are discarded; a shift never raises `OverflowException` (it is a bit operation, not one of the overflow-checked operators of [§6.1](#sec-integer-arithmetic)).
 
 Compound assignments: `&=`, `|=`, `^=`, `<<=`, `>>=`. There is no `~=` (unary operators have no compound form).
 
@@ -633,7 +635,7 @@ The result type is nullable (or `()` for procedure-typed values).
 <a id="sec-null-coalescing-and-="></a>
 ### 7.7 Null-coalescing (`??` and `??=`)
 
-`a ?? b` returns `a` if non-null, else `b`. The right operand's type must be compatible with the non-nullable form of the left.
+`a ?? b` returns `a` if non-null, else `b`. The right operand's type must be compatible with the non-nullable form of the left. When the operands are owned (or owned-nullable), `??` is a two-branch *expression* and its result ownership follows the same meet rule as an `if`/`else` join — see the producer table in [§28.3](#sec-local-variables-ownership-and-borrows): `owned ?? owned` is owned (the chosen value is discharged once), and an owned arm mixed with a borrowed arm is rejected.
 
 ```bezel
 var displayName: string := user?.Name ?? "Anonymous";
@@ -4908,6 +4910,7 @@ The ownership state of an expression is determined by the expression form:
 | Function call producing an ordinary value type, `string`, or runtime-managed type | Not applicable ([§28.9](#sec-runtime-managed-types)) |
 | Function call producing a move-only value type (an owning inline array `[N owned]T?` or `[N owned]T`) | Owned. The result is a move-only value ([§15.3](#sec-move-only-value-types)); the caller takes ownership and must discharge by binding into a local (auto-disposed at scope end via the move-only-local rule), into an owning-inline-array slot, or into a class field of move-only type. |
 | `x as T` | Borrowed (source: same as `x`'s source if `x` is borrowed; same source as `x` if `x` is owned). The cast does not move from `x`; `x` retains its ownership state. The result is nullable. See [§17.4](#sec-the-is-is-not-and-as-operators) for the rationale. |
+| `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` — the same two-branch merge as the control-flow join above. `owned ⊓ owned = ` **owned**: the result carries the disposal obligation — when `a` is non-null its value is consumed into the result, when `a` is null the result takes `b`'s owned value; exactly one of the two owned values is produced at runtime and is discharged once, so there is no leak and no double-free. `borrowed ⊓ borrowed = ` **borrowed** (carrying both arms' source-lifetime constraints). An **owned** arm together with a **borrowed** arm disagree and the expression is **rejected**, exactly as an `if`/`else` whose branches leave a variable owned on one path and borrowed on the other is rejected — equalize the arms first ([§28.3](#sec-local-variables-ownership-and-borrows) two-branch patterns). A `null`-literal arm absorbs to the other arm's state. The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
 | Captured borrow inside a closure | Borrowed (source: same as the captured local's source). The closure value itself is runtime-managed; the captured borrow's lifetime is tracked separately. |
 | Captured owned local inside a closure | Borrowed (source: the local's enclosing scope). Capturing does not transfer ownership; the closure cannot outlive the local's scope. See [§28.9](#sec-runtime-managed-types). |
 

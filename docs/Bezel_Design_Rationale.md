@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.153 — June 2026**
+**Companion to the Bezel Language Specification, v0.154 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7158,6 +7158,26 @@ Language spec: §28.6 (two leak-prevention bullets + the field-store / getter ex
 #### Migration
 
 Source-breaking only for code that already leaked or dangled. A program that stored a `new`/owned-returning value into a borrow field, returned a fresh owned value from a getter, or constructed a borrow-bearing record from a temporary literal now gets a clear diagnostic with the fix (declare the field `owned`; use a method returning `owned T`; bind the source to a named local). Every such program was already a leak or a dangling borrow at runtime; nothing sound stops compiling.
+
+### v0.154 changelog (v0.153 → v0.154)
+
+v0.154 settles two design questions surfaced by the implementation and clarifies one under-specified rule. Like v0.153 it changes no capability; it states rules the foundations already implied.
+
+#### The questions
+
+- **Null-coalescing ownership (#1029).** §7.7 specified the *value* of `a ?? b` but said nothing about its *ownership* when the operands are owned. `var x := maybeOwned ?? new T()` leaked the right operand when the left was null, because the result was classified as a borrow and never acquired a disposal obligation. The answer was already present elsewhere: `??` is a two-branch expression, structurally identical to an `if`/`else` that assigns `x` on both paths, so it must obey the same ownership-merge (meet) rule the producer table and the two-branch patterns of §28.3 already define. The resolution adds `a ?? b` to the §28.3 producer table — `owned ⊓ owned = owned` (the chosen value is discharged exactly once; the other arm is never produced at runtime, so no leak and no double-free), `borrowed ⊓ borrowed = borrowed`, and an owned arm mixed with a borrowed arm is rejected exactly as the analogous `if`/`else` is — with a cross-reference from §7.7. No new rule: the existing meet rule, applied to an expression form it had not been spelled out for.
+
+- **Reserved primitive-alias type names (#1081).** §3.4 makes each primitive's PascalCase standard-library name (`Int32`, `Single`, …) interchangeable with its lowercase keyword everywhere a type is named. A user type declared with one of those names (`record Single`) therefore *silently shadows the primitive at some use sites and not others*, producing a value the author did not intend rather than an error. The resolution reserves exactly those PascalCase aliases of the primitive value types and `String` as type names: declaring a user type with such a name is a compile error. Only those names are reserved — ordinary library type names (`Array`, `Stream`) remain shadowable under normal name resolution — because only the primitive aliases carry the keyword-interchangeability that makes shadowing ambiguous.
+
+- **Shift operand width (#1094) — clarification.** §6.5 said the shift count is reduced "modulo the operand's bit width" without stating *which* operand or whether a narrow left operand promotes to match a wider count. Bezel's arithmetic is operand-width with checked overflow (§6.1/§6.2 promote only on a width *mismatch*; `byte + byte` stays `byte` and overflows at byte width), so shift must match: the result type is the **left** operand, the right operand is only a count and never promotes the left, and the count is reduced modulo the **left** operand's width. This is a clarification, not a normative change — it tightens "the operand's" to "the left operand's" and states the no-promotion-from-count rule the type system already follows; it makes `<<`/`>>` consistent with the rest of the operator family rather than the lone operator that would promote `byte → int`.
+
+#### Touched
+
+Language spec: §7.7 (the `??`-ownership cross-reference) and §28.3 (the `a ?? b` producer-table row); §3.4 (the reserved-primitive-alias-names paragraph); §6.5 (the left-operand-width shift clarification). No standard-library change. Compiler (implementation, following this revision): the ownership pass classifies `??` by the two-branch meet and discharges the chosen owned value once (#1029); name resolution rejects a user type named after a primitive alias (#1081); codegen masks a shift count by the left operand's width without widening the left operand (#1094). Version headers bumped to v0.154.
+
+#### Migration
+
+Source-breaking only for code that was already wrong. A program that named a user type after a primitive alias was already at risk of silent shadowing and now gets a clear diagnostic (rename the type). A `??` over an owned arm mixed with a borrowed arm now reports the same ownership-merge error an equivalent `if`/`else` already reported. The `??`-ownership and shift fixes otherwise change only previously-leaking or previously-miscomputed programs; nothing sound stops compiling.
 
 ---
 
