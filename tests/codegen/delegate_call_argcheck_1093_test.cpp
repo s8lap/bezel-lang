@@ -92,3 +92,51 @@ BEZEL_TEST(delegate_call_argcheck_1093, nullary_func_unchanged) {
         "  return f(); "                                   // 42
         "end Main; end C;"), 42);
 }
+
+// ── #1138 / §27.7: calling a function-typed FIELD types the call result, so ───
+// a by-value (record) result materializes (was a zeroed record because the
+// untyped call result left `var p := h._fn()` untyped → field reads folded to 0).
+
+// A function-typed field returning a record.
+BEZEL_TEST(delegate_call_argcheck_1093, field_func_record_result_1138) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pt(x: int, y: int); "
+        "class Holder "
+        "  public _fn: () -> Pt; "
+        "  public constructor() _fn := () => new Pt(3, 4); end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  var p := h._fn(); "
+        "  return p.x + p.y; "                             // 7
+        "end Main; end C;"), 7);
+}
+
+// A function-typed field with parameters returning a record.
+BEZEL_TEST(delegate_call_argcheck_1093, field_func_args_record_result_1138) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pt(x: int, y: int); "
+        "class Holder "
+        "  public _mk: (int, int) -> Pt; "
+        "  public constructor() _mk := (a, b) => new Pt(a, b); end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  var p := h._mk(5, 6); "
+        "  return p.x + p.y; "                             // 11
+        "end Main; end C;"), 11);
+}
+
+// Regression: a function-typed field returning an int still works.
+BEZEL_TEST(delegate_call_argcheck_1093, field_func_int_result_1138) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  public _fn: () -> int; "
+        "  public constructor() _fn := () => 42; end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  return h._fn(); "                               // 42
+        "end Main; end C;"), 42);
+}

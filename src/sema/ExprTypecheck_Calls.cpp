@@ -1271,6 +1271,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         TypeRef* prt = par->declType ? ctx_.resolvedType(*par->declType) : nullptr;
         if (prt && prt->kind == TypeRef::Kind::Function && prt->funcReturn)
             ctx_.setExprType(&ce, prt->funcReturn);
+    } else if (dynamic_cast<FieldSymbol*>(calleeSym)) {
+        // #1138 / §27.7: a call through a function-typed FIELD (`h._fn()` where
+        // `_fn: () -> Pt`). The local/parameter branches above miss a FieldSymbol
+        // callee, and the `!calleeSym` fallback below does not fire (the field
+        // resolves to a symbol), so the call result stayed untyped — then
+        // `var p := h._fn()` could not type `p`, and a by-value (record) result's
+        // field reads folded to 0. Propagate the callee's resolved function
+        // return type (the field read is already typed as the function type).
+        if (TypeRef* ft = ce.callee ? ctx_.exprType(*ce.callee) : nullptr)
+            if (ft->kind == TypeRef::Kind::Function && ft->funcReturn)
+                ctx_.setExprType(&ce, ft->funcReturn);
     }
     // #1093 / §5.1: a call THROUGH a function-typed value (a delegate local /
     // parameter / field, an indexed function element, or a chained call result)
