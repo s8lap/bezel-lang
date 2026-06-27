@@ -1321,10 +1321,13 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // Element type T from the return type's first generic arg
     // (IAsyncEnumerable<T> / IAsyncEnumerator<T>).
     llvm::Type* elemTy = i32();
+    const sema::TypeRef* elemSemaTy = nullptr;  // #1102B
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
-        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0])
-            elemTy = lowerTypeRef(retRef->genericArgs[0]);
+        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
+            elemSemaTy = retRef->genericArgs[0];
+            elemTy = lowerTypeRef(elemSemaTy);
+        }
     }
     // The per-advance MoveNextAsync result is Task<bool>; the await-result type
     // the Resume completes is bool (i1). asyncResultTy_ sizes bz_task_complete.
@@ -1476,6 +1479,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // Yield-specific live state for the YieldStmt handler (lowerStmt).
         iterCurrentValField_ = CURRENT_VAL_FIELD;
         iterElemTy_ = elemTy;
+        iterElemSemaTy_ = elemSemaTy;  // #1102B (nullable-value element coercion)
 
         // Publish the live sm*_ state BEFORE emitResumeDispatch so the emitDone
         // lambda below (which emitResumeDispatch runs before it itself publishes

@@ -1399,6 +1399,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (ys->value) {
                 llvm::Value* v = lowerExpr(*ys->value);
                 if (v) {
+                    // #1102B / §7.1: for an `IEnumerable<T?>` iterator the element
+                    // slot is the tagged nullable-value struct `{i8,T}`; a bare
+                    // `yield return <T>` (or `yield return null`) lowers to the
+                    // payload type, which != iterElemTy_, so the store below was
+                    // silently dropped and current_val stayed calloc-zeroed (every
+                    // consumed element read null). Coerce the value into the
+                    // declared element type first — a no-op for non-nullable
+                    // elements (coerceReturnToNullableValue returns v unchanged
+                    // unless the element is a nullable value type).
+                    v = coerceReturnToNullableValue(v, iterElemSemaTy_);
                     if (v->getType() != iterElemTy_ &&
                         v->getType()->isIntegerTy() && iterElemTy_->isIntegerTy())
                         v = builder_.CreateTrunc(v, iterElemTy_);

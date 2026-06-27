@@ -4440,6 +4440,11 @@ private:
     // ---- Yield-specific live state (used only when smKind_ == Yield) ----
     unsigned iterCurrentValField_ = 0;
     llvm::Type* iterElemTy_ = nullptr;
+    // #1102B: the element's SEMA type (the iterator return's generic arg), so the
+    // yield-return store can coerce a bare value / `null` into a nullable-value
+    // element struct `{i8,T}` (an `IEnumerable<T?>` iterator). Without it the
+    // bare payload's LLVM type != iterElemTy_ and the store was silently dropped.
+    const sema::TypeRef* iterElemSemaTy_ = nullptr;
 
     // ---- Async-specific live state (used only when smKind_ == Await) ----
     // Frame field indices for the two trailing async slots (see emitAsyncMethod):

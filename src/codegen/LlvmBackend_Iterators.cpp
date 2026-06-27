@@ -435,10 +435,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
     // Determine element type T from the return type's generic arg.
     llvm::Type* elemTy = i32();  // default
+    const sema::TypeRef* elemSemaTy = nullptr;  // #1102B
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
-        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0])
-            elemTy = lowerTypeRef(retRef->genericArgs[0]);
+        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
+            elemSemaTy = retRef->genericArgs[0];
+            elemTy = lowerTypeRef(elemSemaTy);
+        }
     }
 
     // Build the kind-agnostic frame; the yield driver's extra trailing fields are
@@ -662,6 +665,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // Yield-specific live state for the YieldStmt handler in lowerStmt.
         iterCurrentValField_ = CURRENT_VAL_FIELD;
         iterElemTy_ = elemTy;
+        iterElemSemaTy_ = elemSemaTy;  // #1102B (nullable-value element coercion)
         // #747: enable for-loop frame-spill for THIS MoveNext, reusing the async
         // spill-area mechanism. registerForLoopSpillSlots records a suspending
         // for-loop's implicit allocas (index / array-ptr / enumerator) into
