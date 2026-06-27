@@ -68,3 +68,57 @@ BEZEL_TEST(parse_overloads_747, decimal_parse_capitalized_unaffected) {
         "  var d := Decimal.Parse(\"7\"); return int(d); "  // 7
         "end Main; end F;"), 7);
 }
+
+// ── #1134 / §5.2: int.Parse / int.TryParse range-check ───────────────────────
+// An out-of-range string must raise OverflowException (Parse) / return false
+// (TryParse), not silently truncate to the low 32 bits.
+
+// int.Parse of a value beyond int.MaxValue raises OverflowException.
+BEZEL_TEST(parse_overloads_747, int_parse_overflow_throws_1134) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := int.Parse(\"99999999999\"); return 0; "  // no throw = bug
+        "  catch var e: OverflowException => return 1; "       // caught = correct
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// A valid in-range value still parses correctly (no spurious throw).
+BEZEL_TEST(parse_overloads_747, int_parse_in_range_unaffected_1134) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  return int.Parse(\"2147483647\") - 2147483605; "    // MaxValue - 2147483605 = 42
+        "end Main; end F;"), 42);
+}
+
+// byte.Parse range-check: "300" exceeds byte range → OverflowException.
+BEZEL_TEST(parse_overloads_747, byte_parse_overflow_throws_1134) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var b := byte.Parse(\"300\"); return 0; "
+        "  catch var e: OverflowException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// int.TryParse returns false for an out-of-range value (no exception).
+BEZEL_TEST(parse_overloads_747, int_tryparse_overflow_returns_false_1134) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var v: int := 0; "
+        "  var ok: bool := int.TryParse(\"99999999999\", out v); "
+        "  return (1 if not ok else 0); "                      // ok must be false
+        "end Main; end F;"), 1);
+}
+
+// int.TryParse still succeeds and sets the value for an in-range string.
+BEZEL_TEST(parse_overloads_747, int_tryparse_in_range_unaffected_1134) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var v: int := 0; "
+        "  var ok: bool := int.TryParse(\"123\", out v); "
+        "  return (v if ok else 0); "                          // 123
+        "end Main; end F;"), 123);
+}

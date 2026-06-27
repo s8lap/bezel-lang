@@ -7352,6 +7352,16 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         if (pt == P::Long) {
             builder_.CreateStore(val64, outAddr);
         } else {
+            // #1134 / stdlib §5.2: int.TryParse must return FALSE for an
+            // out-of-range value, not silently wrap the low 32 bits. strtol on a
+            // 64-bit platform returns the full magnitude, so range-check it.
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(
+                    val64, llvm::ConstantInt::getSigned(i64(), INT32_MIN)),
+                builder_.CreateICmpSLE(
+                    val64, llvm::ConstantInt::getSigned(i64(), INT32_MAX)),
+                "tryp.inrange");
+            ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
             builder_.CreateStore(builder_.CreateTrunc(val64, i32()), outAddr);
         }
         return ok;
@@ -7485,15 +7495,33 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             llvm::Value* data = loadStringData(arg);
             if (pt == P::Int || pt == P::UInt || pt == P::Short ||
                 pt == P::UShort || pt == P::Byte || pt == P::SByte) {
-                auto* atoiFn = module_->getFunction("atoi");
-                if (!atoiFn) {
-                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
-                    atoiFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
+                // #1134 / stdlib §5.2: parse at full 64-bit width via strtoll,
+                // then OverflowException if the value is outside the target
+                // type's range — `atoi` silently truncated an out-of-range string
+                // to the low 32 bits (e.g. int.Parse("99999999999") → garbage).
+                auto* strtollFn =
+                    declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                auto* endSlot = entryAlloca(ptrTy());
+                llvm::Value* v64 = builder_.CreateCall(
+                    strtollFn, {data, endSlot, builder_.getInt32(10)}, "parse.v");
+                int64_t lo, hi;
+                switch (pt) {
+                    case P::Int:    lo = INT32_MIN; hi = INT32_MAX;   break;
+                    case P::UInt:   lo = 0;         hi = UINT32_MAX;  break;
+                    case P::Short:  lo = INT16_MIN; hi = INT16_MAX;   break;
+                    case P::UShort: lo = 0;         hi = UINT16_MAX;  break;
+                    case P::Byte:   lo = 0;         hi = UINT8_MAX;   break;
+                    default:        lo = INT8_MIN;  hi = INT8_MAX;    break; // SByte
                 }
-                llvm::Value* r = builder_.CreateCall(atoiFn, {data});
-                // Narrow if needed.
-                if (pt != P::Int && pt != P::UInt) r = builder_.CreateTrunc(r, lowerPrimitive(pt));
-                return r;
+                llvm::Value* tooLow = builder_.CreateICmpSLT(
+                    v64, llvm::ConstantInt::getSigned(i64(), lo), "parse.lo");
+                llvm::Value* tooHigh = builder_.CreateICmpSGT(
+                    v64, llvm::ConstantInt::getSigned(i64(), hi), "parse.hi");
+                emitGuardThrow(builder_.CreateOr(tooLow, tooHigh, "parse.ovf"),
+                               "OverflowException");
+                return (pt == P::Int || pt == P::UInt)
+                           ? builder_.CreateTrunc(v64, i32())
+                           : builder_.CreateTrunc(v64, lowerPrimitive(pt));
             }
             if (pt == P::Long || pt == P::ULong) {
                 auto* atollFn = module_->getFunction("atoll");
