@@ -719,16 +719,25 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         useFloatEmit = true;
         scale = 100.0;
     } else if (kind == 'X' && isInt) {
-        // §18.5 X[n]: zero-padded hex to n digits minimum.
+        // §18.5 X[n]: zero-padded hex to n digits minimum. The value is widened
+        // to i64 below, so the conversion MUST carry the `ll` length modifier —
+        // a bare `%X`/`%x` reads only the low 32 bits of the i64 argument
+        // (#1123: `4294967296:X` printed "0", ulong-max printed "FFFFFFFF").
         char xch = (specCh == 'x') ? 'x' : 'X';
         snprintfFmt = width >= 0
-            ? ("%0" + std::to_string(width) + xch)
-            : (std::string("%") + xch);
+            ? ("%0" + std::to_string(width) + "ll" + xch)
+            : (std::string("%ll") + xch);
     } else if (kind == 'D' && isInt) {
-        // §18.5 D[n]: zero-padded decimal to n digits minimum.
+        // §18.5 D[n]: zero-padded decimal to n digits minimum. Carry the `ll`
+        // length modifier (#1123) so the full 64-bit value is read, and select
+        // the unsigned conversion `llu` for unsigned operands so a large
+        // unsigned value is not rendered as negative.
+        bool unsD = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                    isUnsignedPrim(rt->primitive);
+        const char* dconv = unsD ? "llu" : "lld";
         snprintfFmt = width >= 0
-            ? ("%0" + std::to_string(width) + "d")
-            : "%d";
+            ? ("%0" + std::to_string(width) + dconv)
+            : (std::string("%") + dconv);
     } else {
         return nullptr;  // unknown format spec
     }
@@ -752,8 +761,20 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
             dv = builder_.CreateFMul(dv, llvm::ConstantFP::get(dblTy, scale));
         return emitSnprintfToString(snprintfFmt, dv);
     } else {
+        // #1123: widen to i64 by the operand's signedness. For `X` (hex), format
+        // the operand's natural-width BIT PATTERN — zero-extend so a sub-32-bit
+        // unsigned value is not sign-extended (`byte 255:X2` must be "FF", not
+        // "FFFFFFFF"); for a signed type the i8/i32 bits are the two's-complement
+        // pattern already, and zero-extension preserves exactly those bits (e.g.
+        // `int -1:X` → "FFFFFFFF"). For `D` (decimal), preserve the signed value:
+        // sign-extend signed operands, zero-extend unsigned ones (paired with the
+        // `llu` conversion above).
+        bool zeroExt = (kind == 'X') ||
+                       (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                        isUnsignedPrim(rt->primitive));
         llvm::Value* iv = val->getType()->isIntegerTy(64) ? val
-            : builder_.CreateSExt(val, i64());
+            : (zeroExt ? builder_.CreateZExt(val, i64())
+                       : builder_.CreateSExt(val, i64()));
         return emitSnprintfToString(snprintfFmt, iv);
     }
 }

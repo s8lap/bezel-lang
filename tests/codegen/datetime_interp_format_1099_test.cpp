@@ -113,3 +113,59 @@ BEZEL_TEST(datetime_interp_format_1099, decimal_fixed_format_in_interpolation) {
         "  return (3 if s.Length = 4 and s = \"1.50\" else 0); "
         "end Main; end C;"), 3);
 }
+
+// ── #1123: `:X` / `:D` integer format must not truncate 64-bit values nor ──────
+// sign-extend sub-32-bit unsigned values. Before the fix the value was widened
+// to i64 but formatted with a 32-bit conversion (`%X`/`%d`), so snprintf read
+// only the low 32 bits; and a sub-32-bit unsigned value was sign-extended.
+
+// A 64-bit value whose low 32 bits are zero printed "0"; must be the full hex.
+BEZEL_TEST(datetime_interp_format_1099, hex_64bit_no_truncation_1123) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var v: long := 4294967296L; "
+        "  return (1 if $\"{v:X}\" = \"100000000\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// ulong max: all 16 hex digits, no truncation to FFFFFFFF.
+BEZEL_TEST(datetime_interp_format_1099, hex_ulong_max_full_width_1123) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var u: ulong := 18446744073709551615; "
+        "  return (1 if $\"{u:X}\" = \"FFFFFFFFFFFFFFFF\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// `:D` of a 64-bit value must print the full decimal, not a wrapped i32.
+BEZEL_TEST(datetime_interp_format_1099, decimal_D_64bit_no_truncation_1123) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d: long := 1000000000000L; "
+        "  return (1 if $\"{d:D}\" = \"1000000000000\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// A sub-32-bit unsigned value (byte 255) must be zero-extended: "FF", not the
+// sign-extended "FFFFFFFF".
+BEZEL_TEST(datetime_interp_format_1099, hex_unsigned_byte_no_sext_1123) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b: byte := 255; "
+        "  return (1 if $\"{b:X2}\" = \"FF\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// Regression: a signed int's `:X` is its 32-bit two's-complement pattern
+// (`-1` → "FFFFFFFF"), and a large unsigned `:D` is not rendered negative.
+BEZEL_TEST(datetime_interp_format_1099, signed_int_hex_and_unsigned_decimal_1123) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n: int := -1; "
+        "  var u: ulong := 12345678901234567890; "
+        "  var ok := 0; "
+        "  if $\"{n:X}\" = \"FFFFFFFF\" then ok := ok + 1; end; "
+        "  if $\"{u:D}\" = \"12345678901234567890\" then ok := ok + 2; end; "
+        "  return ok; "                                    // 1 + 2 = 3
+        "end Main; end C;"), 3);
+}
