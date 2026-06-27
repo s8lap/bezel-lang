@@ -923,6 +923,60 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (tsym && !t.genericArgs.empty() &&
         t.genericArgs.size() == tsym->genericParams.size()) {
         checkGenericConstraints(t, tsym, ref.genericArgs, scope);
+        // §28.5 (#1107, sweep #9): a generic CLASS with an `owned T` field (T a
+        // type parameter) admits T = class/interface only. A `where T: class`
+        // constraint over-admits `string` and function types (§14.2), which are
+        // runtime-managed (§28.9) and carry no disposal obligation — so binding
+        // such a type to the owned field's parameter is a compile error at the
+        // instantiation site (paralleling the §14.4 owning-collection element
+        // check and the `[N owned]T` rule of spec L1946). Fires for every
+        // spelling — typed local / field / parameter / `new` — like §14.4.
+        if (tsym->kind == ast::TypeDeclKind::Class) {
+            if (auto* gtd = dynamic_cast<const ast::TypeDecl*>(tsym->decl)) {
+                for (const auto& mem : gtd->members) {
+                    auto* fd = dynamic_cast<const ast::FieldDecl*>(mem.get());
+                    if (!fd || !fd->type || !fd->type->name) continue;
+                    bool isOwned = false;
+                    for (const auto& md : fd->modifiers)
+                        if (md == "owned") { isOwned = true; break; }
+                    if (!isOwned) continue;
+                    // The field's type must be a bare type parameter of tsym
+                    // (`T` or `T?`); a concrete or composite type carries its own
+                    // §28.5 field check at the declaration.
+                    if (fd->type->name->parts.size() != 1) continue;
+                    std::string_view pn = fd->type->name->parts.back();
+                    std::size_t pIdx = tsym->genericParams.size();
+                    for (std::size_t i = 0; i < tsym->genericParams.size(); ++i)
+                        if (tsym->genericParams[i] &&
+                            tsym->genericParams[i]->name == pn) {
+                            pIdx = i;
+                            break;
+                        }
+                    if (pIdx >= ref.genericArgs.size()) continue;
+                    const TypeRef* arg = ref.genericArgs[pIdx];
+                    const char* badKind = nullptr;
+                    if (arg && arg->kind == TypeRef::Kind::Primitive &&
+                        arg->primitive == PrimitiveType::String)
+                        badKind = "`string`";
+                    else if (arg && arg->kind == TypeRef::Kind::Function)
+                        badKind = "a function value";
+                    if (badKind) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`") + std::string(tsym->name) +
+                            "` may not be instantiated with " + badKind +
+                            " for type parameter `" + std::string(pn) +
+                            "`: it is the type of the `owned` field `" +
+                            std::string(fd->name) +
+                            "`, and only class or interface types may be "
+                            "`owned` \xE2\x80\x94 `string` and function values "
+                            "are runtime-managed and carry no disposal "
+                            "obligation (\xC2\xA7""28.5 / \xC2\xA7""28.9); use a "
+                            "class-typed argument.");
+                    }
+                }
+            }
+        }
         // §14.2: record this concrete instantiation so a deferred inner
         // obligation owned by `tsym` (recorded while resolving tsym's body)
         // can be re-checked against the binding it supplies here. Recording

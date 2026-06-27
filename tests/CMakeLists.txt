@@ -607,6 +607,7 @@ set(BEZEL_TEST_SOURCES
     codegen/iter_manual_enumerator_1102c_test.cpp
     codegen/record_ctor_arg_validation_1105_test.cpp
     codegen/task_fromresult_class_reject_1107_test.cpp
+    codegen/generic_owned_field_string_reject_1107_test.cpp
     codegen/case_named_const_pattern_957_test.cpp
     codegen/char_is_control_test.cpp
     codegen/async_using_var_await_dispose_910_test.cpp
