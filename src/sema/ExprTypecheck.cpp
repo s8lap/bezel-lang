@@ -1196,6 +1196,32 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
                              const ast::Expr& e) {
     TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
     TypeRef* et = cnd.elseValue ? ctx_.exprType(*cnd.elseValue) : nullptr;
+    // §20 / §7.4 (#1089): a bare `null` branch does not impose a type — it makes
+    // the RESULT nullable around the OTHER branch's type. `T if c else null`
+    // (and its mirror) is `T?`. A `null` literal carries no type of its own, so
+    // without this it fell to the bottom-typed-branch rule below and the result
+    // was typed as the non-null branch's type `T` (non-nullable). An inferred
+    // `var x := T if c else null` was then non-nullable, so x got null-narrowed
+    // (§7.4) and `x ?? d` lowered to a bare value-read (ignoring the null tag) —
+    // returning T's zero on the null path instead of `d`.
+    bool thenNull = cnd.thenValue &&
+        dynamic_cast<const ast::NullLiteralExpr*>(cnd.thenValue.get());
+    bool elseNull = cnd.elseValue &&
+        dynamic_cast<const ast::NullLiteralExpr*>(cnd.elseValue.get());
+    auto nullableOf = [&](TypeRef* ty) -> TypeRef* {
+        if (!ty || ty->nullable) return ty;
+        TypeRef* nn = ctx_.makeTypeRef(*ty);
+        nn->nullable = true;
+        return nn;
+    };
+    if (elseNull && !thenNull && tt) {
+        ctx_.setExprType(&e, nullableOf(tt));
+        return;
+    }
+    if (thenNull && !elseNull && et) {
+        ctx_.setExprType(&e, nullableOf(et));
+        return;
+    }
     // A bottom-typed branch leaves its type null: the result is the other
     // branch's type, with no compatibility constraint. This is the valid
     // `x if c else throw E` idiom (and its mirror).
