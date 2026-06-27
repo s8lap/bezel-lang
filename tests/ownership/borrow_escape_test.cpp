@@ -399,3 +399,35 @@ BEZEL_TEST(own_escape, return_class_field_indirect_from_using_var_still_diagnose
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ── #1136 / §27.7 / §28.3: function-value call result on a `using var` ────────
+// Calling a function VALUE (`h._fn()` where `_fn: () -> int`) yields the
+// function's declared return type. A value-typed result (int) is a copy, never a
+// borrow of the receiver, so returning it from a `using var` scope is sound — it
+// was spuriously rejected as a borrow escape.
+BEZEL_TEST(own_escape, return_value_typed_fn_field_call_on_using_var_clean_1136) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Holder "
+        "  public _fn: () -> int; "
+        "  public constructor() _fn := () => 7; end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  return h._fn(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Soundness guard: returning the `using var` itself is still diagnosed.
+BEZEL_TEST(own_escape, return_using_var_itself_still_diagnosed_1136) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Holder public _v: int := 0; destructor end destructor; end Holder; "
+        "class C public static method Get(): Holder "
+        "  using var h := new Holder(); "
+        "  return h; "
+        "end Get; "
+        "public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}

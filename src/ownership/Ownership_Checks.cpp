@@ -870,6 +870,22 @@ bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
             }
         }
     }
+    // §27.7 (#1136): calling a function VALUE (`h._fn()` where `_fn: () -> int`)
+    // produces the function's declared RETURN type — a value-typed return (int,
+    // a record, an enum) is a copy, never a borrow of the receiver. Sema does not
+    // always type the result of a function-value invocation, so the typed branch
+    // below misses it and the conservative default would wrongly flag the call as
+    // a borrow escape of the `using var` receiver. Resolve the callee's function
+    // type and gate on its return type (a class/borrow-typed return stays a
+    // borrow candidate and is still checked). Checked before the
+    // possibly-untyped `exprType(e)` branch.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (call->callee) {
+            if (const sema::TypeRef* ct = ctx_.exprType(*call->callee))
+                if (ct->kind == sema::TypeRef::Kind::Function && ct->funcReturn)
+                    return isBorrowableType(ct->funcReturn);
+        }
+    }
     // Prefer sema's resolved type for the returned expression: user-type
     // field/property/method-call results are typed here (e.g. `r.V`/`r.Size()`
     // returning int → value type → not a borrow). isBorrowableType is
