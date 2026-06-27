@@ -61,6 +61,49 @@ bool isRightAssociative(std::string_view op) {
     return op == "??";
 }
 
+// §17.1 mandatory parenthesization (#1086): the operator categories that are
+// "non-associative across categories" and require explicit parentheses when
+// mixed. Only the categories the spec lists as incompatible appear here; an
+// operator outside them (`*`/`/`/`mod`, `??`, `in`/`is`/`as`) is `None` and
+// never triggers the rule.
+enum class OpCategory { None, Additive, Shift, Range, Bitwise, Relational,
+                        Equality, Logical };
+
+OpCategory opCategory(std::string_view op) {
+    if (op == "+" || op == "-") return OpCategory::Additive;
+    if (op == "<<" || op == ">>") return OpCategory::Shift;
+    if (op == ".." || op == "..<") return OpCategory::Range;
+    if (op == "&" || op == "|" || op == "^") return OpCategory::Bitwise;
+    if (op == "<" || op == "<=" || op == ">" || op == ">=")
+        return OpCategory::Relational;
+    if (op == "=" || op == "<>") return OpCategory::Equality;
+    if (op == "and" || op == "or") return OpCategory::Logical;
+    return OpCategory::None;
+}
+
+// The §17.1 incompatible-category pairs (symmetric): bitwise with
+// equality/relational/logical, shift with additive, range with bitwise.
+bool incompatibleCategories(OpCategory a, OpCategory b) {
+    auto is = [&](OpCategory x, OpCategory y) {
+        return (a == x && b == y) || (a == y && b == x);
+    };
+    using C = OpCategory;
+    return is(C::Bitwise, C::Equality) || is(C::Bitwise, C::Relational) ||
+           is(C::Bitwise, C::Logical) || is(C::Shift, C::Additive) ||
+           is(C::Range, C::Bitwise);
+}
+
+// The category of an operand IF it is an UNPARENTHESIZED binary or range node
+// (the only operands that can carry a competing operator category); otherwise
+// None. A `(...)`-grouped operand carries `parenthesized` and is exempt.
+OpCategory operandCategory(const ast::Expr* e) {
+    if (!e || e->parenthesized) return OpCategory::None;
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e))
+        return opCategory(b->op);
+    if (dynamic_cast<const ast::RangeExpr*>(e)) return OpCategory::Range;
+    return OpCategory::None;
+}
+
 } // namespace
 
 // Issue #135: span-stamping wrappers. Each captures the location of the
@@ -131,6 +174,34 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
     // ops associate to the left. The keyword relationals `is`, `is not`, and
     // `as` have a Type on the right-hand side and produce TypeTestExpr; `in`
     // takes a regular expression on the right.
+    // §17.1 (#1086): reject an unparenthesized mix of incompatible operator
+    // categories (`a & 1 = 0`, `a << 2 + 1`, `mask & 0..n`, …). Run as each
+    // binary/range node is built — the parser still knows whether an operand was
+    // parenthesized (no ParenExpr node survives into the AST).
+    auto checkMandatoryParens = [&](std::string_view op,
+                                    const SourceLocation& loc,
+                                    const ast::Expr* l, const ast::Expr* r) {
+        OpCategory oc = opCategory(op);
+        if (oc == OpCategory::None) return;
+        auto childOp = [](const ast::Expr* e) -> std::string_view {
+            if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) return b->op;
+            if (dynamic_cast<const ast::RangeExpr*>(e)) return "..";
+            return {};
+        };
+        for (const ast::Expr* operand : {l, r}) {
+            OpCategory cc = operandCategory(operand);
+            if (cc != OpCategory::None && incompatibleCategories(oc, cc)) {
+                diagnostics_.report(
+                    Severity::Error, loc,
+                    std::string("operators `") + std::string(op) + "` and `" +
+                    std::string(childOp(operand)) + "` are of incompatible "
+                    "precedence categories and may not be mixed without "
+                    "parentheses (§17.1); add explicit parentheses to "
+                    "disambiguate");
+                return;  // one diagnostic per node
+            }
+        }
+    };
     auto left = parseUnaryExpression();
     for (;;) {
         // §17.3 / #468: `!=` is NOT a Bezel operator (Appendix A). The lexer
@@ -215,6 +286,10 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
                 advance();
                 re->step = parseBinaryExpression(prec + 1);
             }
+            // §17.1: a range bound that is an unparenthesized bitwise expression
+            // (`0 & 1 .. n`) is a cross-category mix.
+            checkMandatoryParens(opText, opTok.location, re->lo.get(),
+                                 re->hi.get());
             left = std::unique_ptr<ast::Expr>(re.release());
         } else {
             const int nextMin =
@@ -231,6 +306,8 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
             bin->op = opText;
             bin->left = std::move(left);
             bin->right = std::move(right);
+            checkMandatoryParens(opText, opTok.location, bin->left.get(),
+                                 bin->right.get());
             left = std::unique_ptr<ast::Expr>(bin.release());
         }
     }
@@ -597,6 +674,10 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ')' to close parenthesized expression");
         }
+        // §17.1 (#1086): mark the group so the mandatory-parenthesization check
+        // treats `(a & 1) = 0` as explicitly parenthesized (legal) rather than a
+        // bare cross-category mix.
+        if (inner) inner->parenthesized = true;
         return inner;
     }
 

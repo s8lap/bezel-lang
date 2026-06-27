@@ -602,7 +602,14 @@ struct OperatorDecl : Member {
 // call (`(...)`). Unary, binary, `new`, `?.`, `?(`, indexing, casts, and
 // everything else land in later slices.
 
-struct Expr : Node {};
+struct Expr : Node {
+    // §17.1 mandatory parenthesization (#1086): source-level parens leave no
+    // ParenExpr node — the tree shape encodes grouping — so the parser stamps
+    // this flag on the inner expression of a `(...)` group. The cross-category
+    // mandatory-parenthesization check reads it to tell `(a & 1) = 0` (legal)
+    // from `a & 1 = 0` (a §17.1 error). It has no meaning after parsing.
+    bool parenthesized = false;
+};
 
 // Numeric / char / string literals carry the raw lexeme; value parsing and
 // type interpretation are sema's job (matches how the lexer handles literals).

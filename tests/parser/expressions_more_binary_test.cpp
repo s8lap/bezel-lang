@@ -3,10 +3,13 @@
 // Doesn't cover the keyword relationals `in`/`is`/`is not`/`as` (their own
 // slice — they bind types or differ in associativity rules).
 //
-// Reminder: the §17.1 mandatory-parenthesization rules (e.g. shift mixed
-// with arithmetic, range mixed with bitwise) are sema's job — the parser
-// accepts the syntax; sema rejects it. The tests below exercise the parse,
-// not the mandatory-paren rule.
+// Note: the §17.1 mandatory-parenthesization rules (e.g. shift mixed with
+// arithmetic, bitwise mixed with equality, range mixed with bitwise) are
+// enforced in the expression parser (#1086) — they need the source-level paren
+// grouping, which leaves no node in the AST. The mixed-precedence tests below
+// use explicit parentheses or non-mandated category pairs so they exercise the
+// PARSE shape; the rejection of the bare mixes lives in
+// mandatory_parens_1086_test.cpp.
 
 #include <string>
 
@@ -99,8 +102,14 @@ BEZEL_TEST(parser_more_binary, shift_tighter_than_bitwise) {
                     std::string("(a | (b << c))"));
 }
 
-BEZEL_TEST(parser_more_binary, bitwise_tighter_than_equality) {
-    BEZEL_EXPECT_EQ(parseInitText("a & b = c & d"),
+BEZEL_TEST(parser_more_binary, bitwise_with_equality_needs_parens) {
+    // §17.1 (#1086): bitwise (`&`) mixed with equality (`=`) WITHOUT
+    // parentheses is now a mandatory-parenthesization error (the `a & MASK = 0`
+    // pitfall). The explicit-paren form still parses with bitwise binding
+    // tighter inside each operand — the precedence this test once exercised via
+    // the bare form. (The bare-form rejection is covered by
+    // mandatory_parens_1086_test.cpp.)
+    BEZEL_EXPECT_EQ(parseInitText("(a & b) = (c & d)"),
                     std::string("((a & b) = (c & d))"));
 }
 

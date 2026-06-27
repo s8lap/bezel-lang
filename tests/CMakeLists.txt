@@ -28,6 +28,7 @@ set(BEZEL_TEST_SOURCES
     parser/statements_control_flow_test.cpp
     parser/expressions_new_and_postfix_test.cpp
     parser/expressions_more_binary_test.cpp
+    parser/mandatory_parens_1086_test.cpp
     parser/expressions_typetest_and_in_test.cpp
     parser/conditional_and_throw_test.cpp
     parser/for_stmt_test.cpp
