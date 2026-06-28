@@ -10725,6 +10725,32 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 return builder_.getInt1(false);
             return emitIsA(scrut, desc);
         }
+        // §19.5 (#1206): a bare type-name pattern whose name resolves to a
+        // RECORD or ENUM — a sealed value type with no subtyping — is
+        // statically decidable.  Records are struct values (not pointers) and
+        // enums are i32 values; neither carries a vtable/descriptor, so the
+        // runtime emitIsA path (above) is wrong for them.  Decide at compile
+        // time: if the scrutinee's static type IS the named record/enum the arm
+        // always matches; any different concrete type means never-match.
+        // A pointer-typed scrutinee (e.g. an Object holding a boxed record)
+        // cannot syntactically reach here with a bare value-type name pattern —
+        // sema would reject it — but guard it anyway.  Mirrors the BindingPattern
+        // typed-binding branch (L10916-10923).  per §19.5 (#1206)
+        if (np->name && !np->name->parts.empty()) {
+            std::string_view last = np->name->parts.back();
+            for (const auto& sym : ctx_.symbols()) {
+                auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+                if (!ts || ts->name != last) continue;
+                if (ts->kind == ast::TypeDeclKind::Record ||
+                    ts->kind == ast::TypeDeclKind::Enum) {
+                    if (scrut->getType()->isPointerTy())
+                        return builder_.getInt1(false);
+                    bool sameType =
+                        scrutTy && scrutTy->declaration == ts;
+                    return builder_.getInt1(sameType);
+                }
+            }
+        }
         return nullptr;  // unresolved name — deferred
     }
     // #473 / §19.3: a primitive type pattern `int`, `string`, … (TypePattern).
