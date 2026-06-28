@@ -3442,18 +3442,34 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // Determine index.
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "popatl.len");
-            llvm::Value* isEmpty = builder_.CreateICmpEQ(
-                len, builder_.getInt64(0), "popat.empty");
-            emitGuardThrow(isEmpty, "InvalidOperationException");
             llvm::Value* idx = nullptr;
             if (m == "PopAt") {
                 llvm::Value* rawIdx = lowerExpr(*call.args[0].value);
                 if (!rawIdx) return nullptr;
                 idx = builder_.CreateSExt(rawIdx, i64(), "popat.idx");
-            } else if (m == "PopLast") {
-                idx = builder_.CreateSub(len, builder_.getInt64(1), "popl.idx");
-            } else {  // PopFirst
-                idx = builder_.getInt64(0);
+                // per stdlib §4.5 (#1199): PopAt(index) calls BoundsCheck(index)
+                // first, raising IndexOutOfRangeException when index < 0 or
+                // index >= Count (this also covers the empty-array case, where
+                // Count == 0). Mirrors the OwnedArray indexer / ElementAt
+                // bounds-check. Without this guard bz_array_pop_at leaves *out
+                // unwritten on an out-of-bounds index, so the caller reads an
+                // uninitialized owned T and faults (SIGSEGV) instead of throwing.
+                llvm::Value* neg = builder_.CreateICmpSLT(
+                    idx, builder_.getInt64(0), "popat.neg");
+                llvm::Value* oor = builder_.CreateICmpSGE(idx, len, "popat.oor");
+                emitGuardThrow(builder_.CreateOr(neg, oor),
+                               "IndexOutOfRangeException");
+            } else {
+                // PopFirst / PopLast raise InvalidOperationException on an empty
+                // array, matching Stack.Pop / Queue.Dequeue (stdlib §4.5
+                // "raises if empty"). The derived index is then in bounds.
+                llvm::Value* isEmpty = builder_.CreateICmpEQ(
+                    len, builder_.getInt64(0), "popat.empty");
+                emitGuardThrow(isEmpty, "InvalidOperationException");
+                if (m == "PopLast")
+                    idx = builder_.CreateSub(len, builder_.getInt64(1), "popl.idx");
+                else  // PopFirst
+                    idx = builder_.getInt64(0);
             }
             llvm::AllocaInst* out = entryAlloca(retTy);
             // bz_array_pop_at: copy element at idx into *out, then remove the
