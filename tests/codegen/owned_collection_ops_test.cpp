@@ -147,3 +147,112 @@ BEZEL_TEST(owned_coll_ops_4_5, array_int_insert_at_ends) {
         "  return a.Get(0) * 100 + a.Get(1) * 10 + a.Get(2); "  // 1*100 + 5*10 + 9 = 159
         "end Main; end C;"), 159);
 }
+
+// ===========================================================================
+// #1200 — Array<T>.RemoveAt(i) and Insert(i, v) must bounds-check i and raise
+// IndexOutOfRangeException instead of silently clamping/no-oping.
+// stdlib §4.5: both route through BoundsCheck.
+// RemoveAt valid range: 0 <= i < Count.  Insert valid range: 0 <= i <= Count.
+// ===========================================================================
+
+// §4.5 (#1200): RemoveAt(10) on a 3-element Array<int> is out of bounds →
+// IndexOutOfRangeException (was a silent no-op before the fix).
+BEZEL_TEST(array_bounds_1200, array_removeat_oob_high_throws_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [1, 2, 3]; "
+        "  try "
+        "    a.RemoveAt(10); "
+        "    return a.Count; "         // reached only if no throw
+        "  catch IndexOutOfRangeException => return 1; "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §4.5 (#1200): RemoveAt(-1) — a negative index is likewise out of bounds.
+BEZEL_TEST(array_bounds_1200, array_removeat_negative_throws_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [1, 2, 3]; "
+        "  try "
+        "    a.RemoveAt(-1); "
+        "    return a.Count; "
+        "  catch IndexOutOfRangeException => return 1; "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §4.5 (#1200): Insert(99, v) — index > Count is out of bounds.
+BEZEL_TEST(array_bounds_1200, array_insert_oob_high_throws_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [1, 2, 3]; "
+        "  try "
+        "    a.Insert(99, 42); "
+        "    return a.Count; "
+        "  catch IndexOutOfRangeException => return 1; "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §4.5 (#1200): Insert(-5, v) — a negative index is out of bounds.
+BEZEL_TEST(array_bounds_1200, array_insert_negative_throws_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [1, 2, 3]; "
+        "  try "
+        "    a.Insert(-5, 42); "
+        "    return a.Count; "
+        "  catch IndexOutOfRangeException => return 1; "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §4.5 (#1200): valid RemoveAt — first, last, and middle element all work.
+// RemoveAt(0) then RemoveAt(Count-1) on [10,20,30,40] → [20,30] → Count=2.
+BEZEL_TEST(array_bounds_1200, array_removeat_inbounds_ok_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [10, 20, 30, 40]; "
+        "  a.RemoveAt(0); "           // remove first → [20, 30, 40]
+        "  a.RemoveAt(a.Count - 1); " // remove last  → [20, 30]
+        "  return a.Count; "          // 2
+        "end Main; end C;"), 2);
+}
+
+// §4.5 (#1200): Insert at Count (== append) is valid and must NOT throw.
+// Insert(0,1) then Insert(Count,9) on [5] → [1,5,9] → Count=3.
+BEZEL_TEST(array_bounds_1200, array_insert_at_count_is_valid_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [5]; "
+        "  a.Insert(0, 1); "          // prepend  → [1, 5]
+        "  a.Insert(a.Count, 9); "    // append (index == Count) → [1, 5, 9]
+        "  return a.Count; "          // 3
+        "end Main; end C;"), 3);
+}
+
+// §4.5 (#1200): OwnedArray<T>.RemoveAt obeys the same bounds rule (the guard
+// fires before the element disposer is invoked, so no partial dispose).
+BEZEL_TEST(array_bounds_1200, ownedarray_removeat_oob_throws_1200) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<R>(); "
+        "  a.Add(new R()); a.Add(new R()); "
+        "  try "
+        "    a.RemoveAt(10); "        // OOB — guard fires before any dispose
+        "    return a.Count; "
+        "  catch IndexOutOfRangeException => return R._n; " // 0: no dispose yet
+        "  end; "
+        "end Main; end C;"), 0);
+}

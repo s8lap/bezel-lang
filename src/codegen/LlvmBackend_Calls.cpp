@@ -3147,6 +3147,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* v   = lowerExpr(*call.args[1].value);
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
+            // per §4.5 (#1200): Insert(index, item) raises IndexOutOfRangeException
+            // when index < 0 or index > Count (Insert at exactly Count is valid —
+            // it appends; mirrors the BoundsCheck convention in stdlib §4.5).
+            {
+                auto* insLenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* insLen = builder_.CreateCall(insLenFn, {recv}, "ins.len");
+                llvm::Value* insNeg = builder_.CreateICmpSLT(
+                    idx, builder_.getInt64(0), "ins.neg");
+                llvm::Value* insOor = builder_.CreateICmpSGT(idx, insLen, "ins.oor");
+                emitGuardThrow(builder_.CreateOr(insNeg, insOor, "ins.oob"),
+                               "IndexOutOfRangeException");
+            }
             v = ensureNullableElem(v);
             // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: Insert co-owns a +1
             // per string element, exactly like Add — transfer a +1 producer,
@@ -3258,6 +3270,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* idx = lowerExpr(*call.args[0].value);
             if (!idx) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
+            // per §4.5 (#1200): RemoveAt(index) raises IndexOutOfRangeException
+            // when index < 0 or index >= Count (valid range 0..Count-1), matching
+            // the BoundsCheck convention in stdlib §4.5 and the PopAt guard (#1199).
+            {
+                auto* raLenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* raLen = builder_.CreateCall(raLenFn, {recv}, "ra.len");
+                llvm::Value* raNeg = builder_.CreateICmpSLT(
+                    idx, builder_.getInt64(0), "ra.neg");
+                llvm::Value* raOor = builder_.CreateICmpSGE(idx, raLen, "ra.oor");
+                emitGuardThrow(builder_.CreateOr(raNeg, raOor, "ra.oob"),
+                               "IndexOutOfRangeException");
+            }
             // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.135 fix #619:
             // OwnedArray<T>.RemoveAt disposes the removed element (ClassOwned row —
             // class or interface); a borrowing Array<string> releases the removed
