@@ -506,22 +506,51 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 }
             }
         } else {
-            // §5 (#749 follow-up): an explicitly L/U/UL-suffixed literal whose
-            // magnitude overflows 64 bits is unrepresentable in any integer
-            // type. The unsuffixed path above rejects such a value (via the
-            // `int` branch), but the suffixed path did not — so a value like
-            // `99999999999999999999999UL` was silently accepted and later
-            // miscompiled (an enum member materialized to 0, #749). Reject it.
-            // (A value that fits 64 bits but exceeds the *named* suffix's range
-            // — e.g. an `L` literal in (2^63, 2^64) — is left to the broader
-            // literal-typing work: that boundary entangles with the
-            // `-9223372036854775808L` long.MinValue magnitude, 2^63.)
+            // §4.2 / §5 (#749, #1155): an explicitly L/U/UL-suffixed literal
+            // names its type, and its value must be representable in that
+            // type's range. A magnitude that overflows 64 bits is
+            // unrepresentable in any integer type (e.g. `99999999999999999999999UL`,
+            // which once silently miscompiled an enum member to 0, #749). A
+            // magnitude that fits 64 bits but exceeds the *named* suffix's range
+            // — an `L` literal in (2^63, 2^64), or a `U` literal in (2^32, 2^64)
+            // — does not fit the type the suffix selects and once silently
+            // wrapped (`9223372036854775808L` → long.MinValue, `5000000000U` →
+            // wrapped uint, #1155). Reject both.
             unsigned long long mag = 0;
-            if (intLiteralMagnitude(il->text, mag) && errno == ERANGE) {
-                ctx_.diagnostics().report(
-                    Severity::Error, il->span.begin,
-                    "integer literal is too large to represent (exceeds the "
-                    "64-bit range of any integer type) (§5)");
+            if (intLiteralMagnitude(il->text, mag)) {
+                if (errno == ERANGE) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, il->span.begin,
+                        "integer literal is too large to represent (exceeds the "
+                        "64-bit range of any integer type) (§5)");
+                } else {
+                    // §4.2: per-type maximum representable magnitude. `long`
+                    // admits |long.MinValue| = 2^63 only as the direct operand
+                    // of a unary minus (#1155); a bare `long` literal caps at
+                    // long.MaxValue = 2^63 − 1.
+                    using P = PrimitiveType;
+                    unsigned long long maxMag;
+                    switch (pt) {
+                        case P::Long:
+                            maxMag = literalUnderUnaryMinus_
+                                         ? 9223372036854775808ULL   // 2^63
+                                         : 9223372036854775807ULL;  // 2^63 − 1
+                            break;
+                        case P::UInt:
+                            maxMag = 4294967295ULL;  // 2^32 − 1
+                            break;
+                        case P::ULong:
+                        default:
+                            maxMag = 18446744073709551615ULL;  // 2^64 − 1
+                            break;
+                    }
+                    if (mag > maxMag) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, il->span.begin,
+                            std::string("integer literal does not fit in `") +
+                            primitiveSpelling(pt) + "` (§4.2)");
+                    }
+                }
             }
         }
         ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
@@ -588,7 +617,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // For non-literal expressions, recurse into children so their
     // own literals get typed. The expression itself may also get a
     // type from the operator's result rules (slice 3c).
+    // §4.2 (#1155): flag a unary-minus's direct integer-literal operand so
+    // its range-check admits the negative-boundary magnitude (long.MinValue =
+    // -2^63, written as `-9223372036854775808L`).
+    bool savedNegLit = literalUnderUnaryMinus_;
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        literalUnderUnaryMinus_ =
+            (ue->op == "-" && ue->operand &&
+             dynamic_cast<const ast::IntLiteralExpr*>(ue->operand.get()) !=
+                 nullptr);
+    } else {
+        literalUnderUnaryMinus_ = false;
+    }
     visitChildren(e);
+    literalUnderUnaryMinus_ = savedNegLit;
     // Slice 3c: binary / unary operator result typing.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         typeBinary(*be);

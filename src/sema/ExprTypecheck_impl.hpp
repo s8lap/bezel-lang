@@ -96,6 +96,13 @@ private:
     // (long, ulong, uint) and the initializer is an unsuffixed int literal
     // that overflows int, widen it to the declared type instead of erroring.
     PrimitiveType currentLiteralWideningHint_ = PrimitiveType::None;
+    // §4.2 / issue #1155: true while typing an integer literal that is the
+    // direct operand of a unary minus. A signed type's negative boundary
+    // magnitude (|long.MinValue| = 2^63) is one greater than its positive
+    // maximum, so `-9223372036854775808L` is long.MinValue and must be
+    // admitted even though the bare literal `9223372036854775808L` overflows
+    // `long`. Set by visitExpr around the operand of a unary `-`.
+    bool literalUnderUnaryMinus_ = false;
     // Slice S7: tracks whether we're inside a constructor (or static
     // constructor) body — the only places where `this.<readonly>` may
     // be assigned. Field initializers are handled separately (slice

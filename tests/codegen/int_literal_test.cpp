@@ -101,3 +101,90 @@ BEZEL_TEST(codegen_cg1, long_min_value_literal_is_smallest) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// #1155 / §4.2: a suffixed integer literal names its type, and its value must
+// be representable in that type's range. A value that exceeds the suffix's
+// range was once silently accepted and wrapped (`9223372036854775808L` (2^63,
+// > long.MaxValue) → long.MinValue; `5000000000U` (> uint.MaxValue) → wrapped
+// uint). It must now be a clean compile error, not a silent wrap.
+
+// True iff some Error diagnostic's message contains `substr`.
+namespace {
+bool anyErrorContains(const bezel::test::JitResult& r, const char* substr) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(substr) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+} // namespace
+
+// §4.2: `9223372036854775808L` is 2^63, one past long.MaxValue (2^63 − 1) —
+// rejected (it once wrapped to long.MinValue and compiled).
+BEZEL_TEST(codegen_cg1, suffixed_long_over_max_rejected_1155) {
+    auto r = runJit(
+        "module M; class App public static method Main(): int "
+        "  var a: long := 9223372036854775808L; "
+        "  return (1 if a < 0 else 0); end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `long`"));
+}
+
+// §4.2: `5000000000U` exceeds uint.MaxValue (2^32 − 1) — rejected (it once
+// wrapped silently).
+BEZEL_TEST(codegen_cg1, suffixed_uint_over_max_rejected_1155) {
+    auto r = runJit(
+        "module M; class App public static method Main(): int "
+        "  var a: uint := 5000000000U; "
+        "  return (1 if a < 100 else 0); end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `uint`"));
+}
+
+// §4.2: `9223372036854775807L` IS long.MaxValue (2^63 − 1) — in range, still
+// types and runs correctly (a > 0).
+BEZEL_TEST(codegen_cg1, suffixed_long_at_max_accepted_1155) {
+    auto r = runJit(
+        "module M; class App public static method Main(): int "
+        "  var a: long := 9223372036854775807L; "
+        "  return (1 if a > 0 else 0); end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// §4.2: `4000000000U` is within uint's range (< 2^32) — in range, runs (a > 0).
+BEZEL_TEST(codegen_cg1, suffixed_uint_in_range_accepted_1155) {
+    auto r = runJit(
+        "module M; class App public static method Main(): int "
+        "  var a: uint := 4000000000U; "
+        "  return (1 if a > 0 else 0); end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// §4.2: the negative-boundary literal `-9223372036854775808L` is long.MinValue
+// (−2^63); its 2^63 magnitude is admitted under a unary minus even though the
+// bare `9223372036854775808L` is rejected above. Must still compile and be < 0.
+BEZEL_TEST(codegen_cg1, long_min_value_negation_still_accepted_1155) {
+    auto r = runJit(
+        "module M; class App public static method Main(): int "
+        "  var a: long := -9223372036854775808L; "
+        "  return (1 if a < 0 else 0); end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// §4.2: a magnitude one past |long.MinValue| (`-9223372036854775809L`, 2^63 + 1)
+// exceeds long even under a unary minus — rejected.
+BEZEL_TEST(codegen_cg1, negation_beyond_long_min_rejected_1155) {
+    auto r = runJit(
+        "module M; class App public static method Main(): int "
+        "  var a: long := -9223372036854775809L; "
+        "  return 0; end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `long`"));
+}
