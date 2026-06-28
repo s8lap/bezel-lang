@@ -2845,6 +2845,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "string" || colName == "String") {
                         if (m == "Join")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        // §9.6 / #1145: the single-argument `String.From`
+                        // overloads accept only `char`, `CString`, or `WString`
+                        // (the char-array form is the three-arg
+                        // `From(buffer, start, count)`). A 1-arg call with any
+                        // other argument — e.g. `From(Array<char>)` — has no
+                        // matching overload (Bezel omits implicit conversions,
+                        // rationale §5.1). Without this guard the call
+                        // mis-lowered as `From(char)`, sign-extending the
+                        // argument's pointer to i32 → malformed IR. Reject it
+                        // here with a clean no-overload diagnostic.
+                        if (m == "From" && ce.args.size() == 1 &&
+                            ce.args[0].value) {
+                            TypeRef* at = ctx_.exprType(*ce.args[0].value);
+                            bool ok = false;
+                            if (at && at->kind == TypeRef::Kind::Primitive &&
+                                at->primitive == P::Char)
+                                ok = true;
+                            else if (at && at->kind == TypeRef::Kind::Named &&
+                                     at->declaration &&
+                                     (at->declaration->name == "CString" ||
+                                      at->declaration->name == "WString"))
+                                ok = true;
+                            if (at && !ok)
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "no matching overload of `String.From` — "
+                                    "the single-argument form takes a `char` "
+                                    "(or an FFI `CString`/`WString`); to build "
+                                    "a string from a char array use "
+                                    "`String.From(buffer, start, count)` "
+                                    "(§9.6)");
+                        }
                     }
                     // File static methods (§7.3)
                     if (colName == "File") {

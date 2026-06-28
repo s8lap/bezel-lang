@@ -378,3 +378,42 @@ BEZEL_TEST(codegen_string_from_747, out_of_range_count_throws) {
         "  catch IndexOutOfRangeException => return 0; end; "  // 0
         "end Main; end C;"), 0);
 }
+
+// ── #1145 / §9.6: a 1-arg `String.From(Array<char>)` has NO matching overload ─
+// The single-argument forms take `char` / `CString` / `WString`; the char-array
+// form is the THREE-arg `From(buffer, start, count)`. Bezel omits implicit
+// conversions (rationale §5.1), so a 1-arg array call must be a clean no-overload
+// compile error. Before the fix it mis-resolved to `From(value: char)` and
+// codegen sign-extended the array's heap pointer to i32 → malformed IR
+// (`sext ptr to i32`), aborting compilation instead of diagnosing.
+BEZEL_TEST(codegen_string_from_747, one_arg_char_array_no_overload_rejected_1145) {
+    BEZEL_EXPECT_TRUE(hasSemaError(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var arr := new Array<char>(); "
+        "  arr.Add('h'); arr.Add('i'); "
+        "  var t := String.From(arr); "                 // §9.6 — no 1-arg array overload
+        "  return t.Length; "
+        "end Main; end C;"));
+}
+
+// #1145 CONTROL: the valid 1-arg `String.From(char)` form is unaffected.
+BEZEL_TEST(codegen_string_from_747, one_arg_char_still_builds_1145) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var t := String.From('A'); "
+        "  return t.Length; "                           // 1
+        "end Main; end C;"), 1);
+}
+
+// #1145 CONTROL: the valid 3-arg array form is unaffected (still builds "hi").
+BEZEL_TEST(codegen_string_from_747, three_arg_array_still_builds_1145) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var arr := new Array<char>(); "
+        "  arr.Add('h'); arr.Add('i'); "
+        "  var t := String.From(arr, 0, arr.Length); "
+        "  return t.Length; "                           // 2
+        "end Main; end C;"), 2);
+}
