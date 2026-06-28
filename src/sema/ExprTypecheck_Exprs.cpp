@@ -3412,6 +3412,56 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             currentScope_ = &armEnumScope;
             inEnumScrutineeCaseArms_ = true;
         }
+        // §19/§5.1 (#1202): a relational (`> EXPR`) or range (`lo..hi`) pattern
+        // operand is compared against the scrutinee by codegen with a single
+        // ICmp/FCmp keyed on the scrutinee's representation (litAtWidth/reconcile,
+        // LlvmBackend_Exprs.cpp). When the operand's primitive is in a DIFFERENT
+        // comparison class than the scrutinee — a string pointer vs a scalar, a
+        // bool i1 vs a wider int, a float vs an integer, a decimal vs either —
+        // those reach CreateICmp with mismatched operand types and abort the
+        // backend. Mirror the #964 ConstantPattern guard: reject such a pattern
+        // here with the same §19 diagnostic. A genuine cross-numeric
+        // accept/reconcile is a separate §19.3 ruling and is out of scope. A
+        // `decimal` SCRUTINEE is excluded — its codegen path (decOperand/decCmp,
+        // #1152) already bridges any numeric bound, so a decimal scrutinee with
+        // an integer/float bound compiles and must keep doing so.
+        auto cmpClassOf = [](PrimitiveType p) -> int {
+            switch (p) {
+                case PrimitiveType::String: return 1;
+                case PrimitiveType::Bool:   return 2;
+                case PrimitiveType::Char:
+                case PrimitiveType::Byte:  case PrimitiveType::SByte:
+                case PrimitiveType::Short: case PrimitiveType::UShort:
+                case PrimitiveType::Int:   case PrimitiveType::UInt:
+                case PrimitiveType::Long:  case PrimitiveType::ULong:
+                    return 3;  // integer family — codegen sext/zext-bridges widths
+                case PrimitiveType::Float:
+                case PrimitiveType::Double:
+                    return 4;  // floating family
+                case PrimitiveType::Decimal: return 5;
+                default: return 0;  // None/Object — not a relational/range operand
+            }
+        };
+        auto checkPatternOperand = [&](const ast::Expr* operand) {
+            if (!operand) return;
+            if (!(ce->scrutinee && scrutTy &&
+                  scrutTy->kind == TypeRef::Kind::Primitive))
+                return;
+            const TypeRef* ot = ctx_.exprType(*operand);
+            if (!ot || ot->kind != TypeRef::Kind::Primitive) return;
+            int sc = cmpClassOf(scrutTy->primitive);
+            int oc = cmpClassOf(ot->primitive);
+            // Fire only when the scrutinee is one of the directly-compared
+            // classes (string/bool/integer/float) and the operand is a primitive
+            // in a different comparison class. A decimal scrutinee (sc == 5) is
+            // excluded — see the note above.
+            if ((sc >= 1 && sc <= 4) && oc != 0 && sc != oc)
+                ctx_.diagnostics().report(
+                    Severity::Error, operand->span.begin,
+                    "case pattern operand type is not compatible with the "
+                    "scrutinee type (\xC2\xA7""19) — a `case` pattern operand "
+                    "must be comparable to the scrutinee");
+        };
         for (const auto& arm : ce->arms) {
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
             // boolean CONDITION expression (a ConstantPattern) — typecheck its
@@ -3467,7 +3517,29 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // VARIABLE operand (a literal already worked). Visit it.
             if (auto* rop =
                     dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get())) {
-                if (rop->expr) visitExpr(*rop->expr);
+                if (rop->expr) {
+                    visitExpr(*rop->expr);
+                    // per §19/§5.1 (#1202)
+                    checkPatternOperand(rop->expr.get());
+                }
+            }
+            // §19.3 / §A.8 (#1202): a range pattern's bounds are constant
+            // operands; type them (so the compatibility check and codegen see
+            // their types) and reject a bound whose comparison class is
+            // incompatible with the scrutinee instead of aborting the backend.
+            if (auto* rangep =
+                    dynamic_cast<const ast::RangePattern*>(arm.pattern.get())) {
+                if (auto* rng = dynamic_cast<const ast::RangeExpr*>(
+                        rangep->rangeExpr.get())) {
+                    if (rng->lo) {
+                        visitExpr(*rng->lo);
+                        checkPatternOperand(rng->lo.get());  // per §19/§5.1 (#1202)
+                    }
+                    if (rng->hi) {
+                        visitExpr(*rng->hi);
+                        checkPatternOperand(rng->hi.get());  // per §19/§5.1 (#1202)
+                    }
+                }
             }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).

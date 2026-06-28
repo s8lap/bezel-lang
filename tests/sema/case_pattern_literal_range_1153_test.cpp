@@ -217,3 +217,122 @@ BEZEL_TEST(sema_case_pattern_range, enum_scrutinee_unaffected_spec_19) {
     BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// --- §19 / §5.1 (issue #1202): a relational/range pattern operand whose -----
+//     comparison class differs from the scrutinee must be rejected, not abort.
+//
+// Before this fix, the #964 cross-category compatibility guard was applied only
+// to a ConstantPattern; a RelOpPattern operand (`> EXPR`) and a RangePattern
+// lo/hi bound were unchecked. A string pointer, a bool, a float, or a decimal
+// operand over an integer scrutinee (or an int operand over a string scrutinee)
+// then reached codegen's CreateICmp with mismatched LLVM operand types and
+// tripped `ICmpInst::AssertOK` — aborting the compiler (SIGABRT). The operand
+// is now rejected at sema with the §19 compatibility diagnostic.
+
+// True iff some error diagnostic mentions the §19 relational/range operand
+// compatibility reject (the message produced by checkPatternOperand, #1202).
+namespace {
+bool hasCasePatternOperandError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("pattern operand type is not compatible") !=
+                std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// `case x > "hi"` over an `int` scrutinee — a string operand cannot be
+// compared to an integer; reject (was a compiler abort). #1202.
+BEZEL_TEST(sema_case_pattern_range, case_relop_type_mismatch_rejected_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x > \"hi\" => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `case x > 1.5` over an `int` scrutinee — a float operand over an integer
+// scrutinee (cross-numeric reconcile is a separate §19.3 ruling); reject
+// rather than abort the backend. #1202.
+BEZEL_TEST(sema_case_pattern_range, case_relop_float_over_int_rejected_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x > 1.5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `case x 1.5..3.5` over an `int` scrutinee — a float range bound over an
+// integer scrutinee; reject (both lo and hi are incompatible). #1202.
+BEZEL_TEST(sema_case_pattern_range, case_range_type_mismatch_rejected_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x 1.5..3.5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `case x > 5` over a `string` scrutinee — an integer operand over a string
+// scrutinee; reject (the symmetric direction). #1202.
+BEZEL_TEST(sema_case_pattern_range, case_relop_string_scrutinee_rejected_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: string): int "
+        "    return case x > 5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// A COMPATIBLE relational pattern — an integer operand over an integer
+// scrutinee (codegen reconciles widths) — must still be accepted. #1202.
+BEZEL_TEST(sema_case_pattern_range, case_relop_compatible_ok_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x > 3 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A COMPATIBLE range pattern — integer bounds over an integer scrutinee —
+// must still be accepted. #1202.
+BEZEL_TEST(sema_case_pattern_range, case_range_compatible_ok_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x 1..10 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A `decimal` scrutinee with an integer relational bound must NOT be rejected:
+// its codegen path (decOperand/decCmp, #1152) bridges any numeric bound, so the
+// compatibility gate excludes a decimal scrutinee. Regression guard. #1202.
+BEZEL_TEST(sema_case_pattern_range, case_relop_decimal_scrutinee_ok_1202) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: decimal): int "
+        "    return case x > 5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
