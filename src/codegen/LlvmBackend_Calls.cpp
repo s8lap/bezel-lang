@@ -5170,12 +5170,45 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
-    // §9.6: string.Join(separator, items: Array<string>): string
+    // §9.6: string.Join(separator, items: IEnumerable<string>): string
     if ((cls == "string" || cls == "String") && m == "Join" &&
         call.args.size() == 2 && call.args[0].value && call.args[1].value) {
         llvm::Value* sep = lowerExpr(*call.args[0].value);
-        llvm::Value* arr = lowerExpr(*call.args[1].value);
-        if (!sep || !arr) return nullptr;
+        if (!sep) return nullptr;
+        // per stdlib §9.6 (#1182): `items` is an IEnumerable<string>, NOT just a
+        // concrete Array<string>. A lazy LINQ query (`.Where(...)`/`.Select(...)`),
+        // a vtable-backed IEnumerable, a LinkedList/Set/Range — none of these
+        // lower to a bz_array_t*; lowering one and then indexing it below with
+        // bz_array_ptr_at dereferences a query/state-machine/node-list pointer as
+        // if it were an array → SIGSEGV (#1182). Materialize ANY source uniformly
+        // into a fresh bz_array_t* snapshot via the shared lazy-enumerator path
+        // (the same one `ToArray()` and `for-in` use): lowerToLazyEnumerator wraps
+        // a concrete Array/Stack/Queue, a dict-backed Set, a LinkedList, a Range,
+        // or a vtable IEnumerable, and bz_lazy_to_array drains it to a contiguous
+        // pointer array of the element strings. The snapshot is freed at the
+        // return site below with a NULL element disposer — the join only borrows
+        // the element strings (it copies their bytes), it does not own them, so
+        // there is no element release, no leak, no double-free. Elements are
+        // always strings (IEnumerable<string>): one pointer (8 bytes) each — the
+        // same element width the loop below indexes with.
+        llvm::Value* matTemp = nullptr;
+        llvm::Value* arr = nullptr;
+        {
+            sema::TypeRef* itElem = nullptr;
+            llvm::Value* lazy = lowerToLazyEnumerator(*call.args[1].value, itElem);
+            if (lazy) {
+                auto* toArr =
+                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+                arr = builder_.CreateCall(
+                    toArr, {lazy, builder_.getInt64(8)}, "join.items");
+                matTemp = arr;
+            } else {
+                // Not an IEnumerable source the lazy path recognizes — lower it
+                // directly (prior behavior; no worse than before for this case).
+                arr = lowerExpr(*call.args[1].value);
+            }
+        }
+        if (!arr) return nullptr;
         // Emit inline join: iterate parts, concat sep+part (skip sep before first)
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
@@ -5268,6 +5301,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
             builder_.CreateStructGEP(stringType(), strObj, 2));
             initStringRc(strObj);  // #422: producer's reference, rc := 1
+        // per stdlib §9.6 (#1182): reclaim the materialized snapshot AFTER the
+        // joined string is fully built. NULL element disposer: the join borrowed
+        // the element strings (copied their bytes) — frees only the snapshot's
+        // header + buffer, never the strings (no leak, no double-free). A no-op
+        // when the items argument was lowered directly (matTemp == null).
+        if (matTemp) {
+            auto* freeFn = declareC("bz_array_free",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(
+                freeFn, {matTemp, llvm::ConstantPointerNull::get(ptrTy())});
+        }
         return strObj;
     }
 

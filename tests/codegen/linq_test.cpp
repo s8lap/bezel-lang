@@ -623,3 +623,76 @@ BEZEL_TEST(linq, control_for_over_lazy_spec_5) {
         "  return s; "  // 2+4+6 = 12
         "end Main; end C;"), 12);
 }
+
+// --- #1182: string.Join(sep, items: IEnumerable<string>) over a LAZY query ---
+// stdlib §9.6: Join's second argument is an IEnumerable<string>, not just a
+// concrete Array<string>. A lazy LINQ query (.Where/.Select) returns a lazy
+// IEnumerable; the Join lowering used to read it as a bz_array_t* backing and
+// dereferenced garbage → SIGSEGV. It now materializes any IEnumerable<string>
+// uniformly (the shared lazy-enumerator path) before joining.
+BEZEL_TEST(linq, string_join_lazy_query_arg_1182) {
+    // Where keeps both -> "ab,cd" (length 5). Was a SIGSEGV before the fix.
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+        "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 0)); "
+        "  return s.Length; "  // "ab,cd" -> 5
+        "end Main; end C;"), 5);
+}
+
+// Exact content (not just length): "ab,cd" — index 2 is the ',' separator (44),
+// index 0 is 'a' (97), index 4 is 'd' (100). 44 + (97-97) + (100-100) = 44.
+BEZEL_TEST(linq, string_join_lazy_query_content_1182) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+        "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 0)); "
+        "  return int(s[2]) + (int(s[0]) - 97) + (int(s[4]) - 100); "
+        "end Main; end C;"), 44);
+}
+
+// .Select(...) (a different lazy operator) joins the same way.
+BEZEL_TEST(linq, string_join_lazy_select_arg_1182) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+        "  var s := string.Join(\",\", xs.Select((x: string) => x)); "
+        "  return s.Length; "  // "ab,cd" -> 5
+        "end Main; end C;"), 5);
+}
+
+// CONTROL: a concrete Array<string> second argument is unchanged.
+BEZEL_TEST(linq, string_join_concrete_array_control_1182) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+        "  var s := string.Join(\",\", xs); "
+        "  return s.Length; "  // "ab,cd" -> 5
+        "end Main; end C;"), 5);
+}
+
+// An empty lazy query joins to the empty string (no separator emitted).
+BEZEL_TEST(linq, string_join_lazy_empty_1182) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+        "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 9)); "
+        "  return s.Length; "  // "" -> 0
+        "end Main; end C;"), 0);
+}
+
+// A single-element lazy query joins with NO trailing separator.
+BEZEL_TEST(linq, string_join_lazy_single_1182) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+        "  var s := string.Join(\",\", xs.Where((x: string) => x = \"ab\")); "
+        "  return s.Length; "  // "ab" -> 2 (no trailing ',')
+        "end Main; end C;"), 2);
+}
