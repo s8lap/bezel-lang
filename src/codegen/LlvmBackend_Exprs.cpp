@@ -3384,7 +3384,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (const sema::TypeRef* et = ctx_.exprType(e)) {
         if (et->kind == sema::TypeRef::Kind::Function) {
             if (auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e))) {
-                if (!ps->isIndexer) {
+                // per §23.1/§23.2 / §27.6 (#1187): the #756 getter-as-function-
+                // value promotion applies only when a NON-function property read
+                // is target-typed up to `() -> T`. When the property's DECLARED
+                // type is ITSELF a function type, the read is an ordinary value
+                // read — the getter already yields the function value — and the
+                // thunk must be skipped. Promoting here would wrap the getter as a
+                // `() -> ((…) -> T)` closure and bind it into a `(…) -> T` slot,
+                // so the later call passes the user args at the wrong arity
+                // (static SIGSEGV / instance garbage). Discriminate on the
+                // declared type from the PropertyDecl (or the imported member
+                // type for a cross-module property, which has no AST decl).
+                bool declaredFunc = false;
+                if (const auto* pd =
+                        dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                    declaredFunc =
+                        pd->type && pd->type->kind == ast::TypeKind::Function;
+                } else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) {
+                    declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
+                }
+                if (!ps->isIndexer && !declaredFunc) {
                     const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
                     llvm::Value* recv =
                         (ma && ma->target) ? lowerExpr(*ma->target) : currentThis_;
