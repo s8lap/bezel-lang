@@ -13219,10 +13219,26 @@ llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
     for (const sema::TypeSymbol* cur = ts; cur && !userEq;) {
         for (sema::Symbol* sym : cur->members) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-            if (ms && !ms->isOperator && !isStaticMethod(ms) &&
-                ms->name == "Equals" && ms->params.size() == 1) {
-                userEq = ms; break;
-            }
+            if (!(ms && !ms->isOperator && !isStaticMethod(ms) &&
+                  ms->name == "Equals" && ms->params.size() == 1))
+                continue;
+            // #1115/#1151: only an `Equals` whose parameter is a REFERENCE —
+            // its compiled param[1] lowers to a pointer (e.g. `Equals(Object?)`)
+            // — is the §8.4 Object.Equals override bound into the uniform
+            // `i1(ptr, ptr)` slot-4 thunk. A VALUE-typed `Equals(other: int)`
+            // (the IEquatable<int> contract impl) has an i32 param[1]; binding
+            // it here would pass the thunk's ptr argument to an i32 parameter →
+            // malformed IR ("Call parameter type does not match"). Such an
+            // Equals fills only its IEquatable itable slot; the class keeps the
+            // §8.3 reference-identity default for the Object.Equals thunk. (Only
+            // skip when we can prove the param is non-pointer; an uncompiled
+            // method conservatively keeps the prior accept behavior.)
+            auto fit = methodFns_.find(ms);
+            if (fit != methodFns_.end() &&
+                fit->second->getFunctionType()->getNumParams() >= 2 &&
+                !fit->second->getFunctionType()->getParamType(1)->isPointerTy())
+                continue;
+            userEq = ms; break;
         }
         const sema::TypeSymbol* nxt = nullptr;
         for (const sema::TypeSymbol* b : cur->baseTypes)

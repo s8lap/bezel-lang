@@ -549,8 +549,19 @@ sema::MethodSymbol* Emitter::classEqualsOverride(const sema::TypeSymbol* cls) {
     for (auto* cur = cls; cur;) {
         for (auto* sym : cur->members) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-            if (ms && !ms->isOperator && ms->name == "Equals" &&
-                ms->params.size() == 1 && !isStaticMethod(ms))
+            if (!(ms && !ms->isOperator && ms->name == "Equals" &&
+                  ms->params.size() == 1 && !isStaticMethod(ms)))
+                continue;
+            // #1115/#1151: only a REFERENCE-parameter `Equals` (compiled
+            // param[1] is a pointer, e.g. `Equals(Object?)`) is the §8.4
+            // Object.Equals override used for collection element comparison; a
+            // value-typed `Equals(other: int)` (an IEquatable<int> impl) is not
+            // — returning it would pass a pointer argument to an i32 parameter.
+            // Conservatively keep the prior accept for an uncompiled method.
+            auto fit = methodFns_.find(ms);
+            if (fit == methodFns_.end() ||
+                (fit->second->getFunctionType()->getNumParams() >= 2 &&
+                 fit->second->getFunctionType()->getParamType(1)->isPointerTy()))
                 return ms;
         }
         const sema::TypeSymbol* nxt = nullptr;

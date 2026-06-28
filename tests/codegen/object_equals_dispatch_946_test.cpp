@@ -217,3 +217,48 @@ BEZEL_TEST(codegen_reference_equals_1119, class_and_interface_ref_same_object) {
         "  return (1 if Object.ReferenceEquals(s, i) else 0); "
         "end Main; end C;"), 1);
 }
+
+// ── #1151 / §8.3-§8.4: a VALUE-typed `Equals(other: int)` is NOT the Object ────
+// override and must not be bound into the uniform i1(ptr,ptr) slot-4 thunk.
+// Before the fix the classEqualsThunk/classEqualsOverride lookups accepted ANY
+// 1-param `Equals`, so a class with `Equals(other: int)` (e.g. an IEquatable<int>
+// contract impl) passed the thunk's ptr argument to the method's i32 parameter
+// → "Call parameter type does not match" IR-verification crash, even with no
+// interface present. The fix guards the override lookup on the compiled param[1]
+// being a pointer; a value-typed Equals fills only its own (later, itable) slot.
+
+// #1151: a class with a value-typed Equals(int) and NO interface compiles + the
+// method is directly callable (was an IR-fail).
+BEZEL_TEST(codegen_object_equals_946, value_typed_equals_int_compiles_1151) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public method Equals(other: int): bool => other > 3; "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    return (5 if c.Equals(7) else 0); "          // true → 5
+        "  end Main; end C;"), 5);
+}
+
+// #1151: a class implementing the (decl-less) builtin IEquatable<int> with the
+// contract Equals(int) compiles (the implements-clause IR-fail was this same
+// Equals-thunk confound, not the interface itself).
+BEZEL_TEST(codegen_object_equals_946, class_implements_iequatable_int_compiles_1151) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C: IEquatable<int> "
+        "  public method Equals(other: int): bool => true; "
+        "  public static method Main(): int "
+        "    using var m := new C(); return 5; "
+        "  end Main; end C;"), 5);
+}
+
+// #1151 keep-green: a real `Equals(Object?)` override (pointer param) IS still
+// bound to the Object.Equals slot-4 thunk and dispatches through `=` / `.Equals`.
+BEZEL_TEST(codegen_object_equals_946, object_param_equals_still_overrides_1151) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class P "
+        "  public override method Equals(other: Object?): bool => true; "
+        "  public static method Main(): int "
+        "    using var a := new P(); using var b := new P(); "
+        "    return (7 if a.Equals(b) else 0) + (3 if a = b else 0); "  // 10
+        "  end Main; end P;"), 10);
+}
