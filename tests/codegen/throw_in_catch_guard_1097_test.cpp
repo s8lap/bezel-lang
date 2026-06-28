@@ -135,3 +135,48 @@ BEZEL_TEST(throw_in_catch_guard_1097, guard_throw_supersede_repeated_no_corrupti
         "  return total; "                              // 100
         "end Main; end C;"), 100);
 }
+
+// ── #1150 / §31.2.1: a guard that BARE-RE-RAISES its own bound exception ───────
+// (`catch ex: E1 when throw ex`) supersedes the in-flight exception and
+// propagates — exactly like a guard that throws a NEW exception (#1097/#1108).
+// The issue reported rc=1 (arm body runs) using a `catch E1 ex` binding form
+// that does not parse; with the real `catch ex: E1` binding the #1108
+// guard-divergence machinery already routes the re-raise correctly. These pin
+// the behavior the issue flagged as untested. (§31.2.1: a guard that throws is
+// "not caught by a later arm of the same try and does not resume guard
+// evaluation"; the re-raised E1 propagates to the ENCLOSING handler.)
+
+// #1150: a guard's `throw ex` re-raise of the bound E1 propagates to the OUTER
+// `catch E1` (rc=5), NOT the inner arm body (which would return 1).
+BEZEL_TEST(throw_in_catch_guard_1097, guard_reraise_binding_propagates_to_outer_1150) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new E1(); "
+        "    catch ex: E1 when throw ex => return 1; "  // guard re-raises E1
+        "    end; "
+        "  catch E1 => return 5; "                      // enclosing handler
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 5);
+}
+
+// #1150 / §31.2.1: the superseding re-raise is NOT caught by a LATER arm of the
+// SAME try — it skips the same-try `catch E1 => return 9` and is caught only by
+// the ENCLOSING `catch E1` (rc=5). A regression that let the later same-try arm
+// catch it would return 9.
+BEZEL_TEST(throw_in_catch_guard_1097, guard_reraise_binding_skips_later_same_try_arm_1150) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new E1(); "
+        "    catch ex: E1 when throw ex => return 1; "  // re-raises E1
+        "    catch E1 => return 9; "                    // same-try later arm — must NOT catch
+        "    end; "
+        "  catch E1 => return 5; "                      // enclosing handler catches
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 5);
+}
