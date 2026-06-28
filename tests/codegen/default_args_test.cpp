@@ -127,6 +127,63 @@ BEZEL_TEST(codegen_cg45, ctor_default_reads_earlier_param_spec_22_5) {
         "end Main; end C;"), 14);
 }
 
+// §22.5 / §17.11 (issue #1163): `default(T)` is a permitted default-value
+// expression. For a REFERENCE / nullable-reference parameter (`R?`) the omitted
+// argument is the null reference (ptr null). Regression: the omitted-arg default
+// `default(R?)` was lowered as a bare `i32 0` (the i32 placeholder for an
+// unresolved TypeRef — the parameter-default expression's inner type is not
+// walked by type resolution) and passed to the `ptr` parameter, so codegen
+// aborted with "Call parameter type does not match function signature". The
+// fix lowers the omitted `default(T)` at the parameter's own (resolved) lowered
+// type. `U.M()` takes the default → r is null → returns 5.
+BEZEL_TEST(codegen_cg45, default_ref_type_default_arg_omitted_spec_22_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class R public V: int; public constructor(v: int) V := v; end; end R; "
+        "static class U public static method M(r: R? := default(R?)): int "
+        "  if r = null then return 5; end; return r!.V; "
+        "end M; end U; "
+        "class C public static method Main(): int => U.M(); "
+        "end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg45, default_ref_type_explicit_arg_overrides_spec_22_5) {
+    // The explicit reference argument is passed; the `default(R?)` default is
+    // not taken. U.M(new R(9)) → r!.V = 9.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class R public V: int; public constructor(v: int) V := v; end; end R; "
+        "static class U public static method M(r: R? := default(R?)): int "
+        "  if r = null then return 5; end; return r!.V; "
+        "end M; end U; "
+        "class C public static method Main(): int => U.M(new R(9)); "
+        "end C;"), 9);
+}
+
+BEZEL_TEST(codegen_cg45, default_nullable_value_type_default_arg_spec_22_5) {
+    // `default(int?)` is the null nullable-value (the tagged {i8,int} zero).
+    // P() takes the default → x is null → returns 11.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "static class U public static method P(x: int? := default(int?)): int "
+        "  if x = null then return 11; end; return x!; "
+        "end P; end U; "
+        "class C public static method Main(): int => U.P(); "
+        "end C;"), 11);
+}
+
+BEZEL_TEST(codegen_cg45, default_value_type_default_arg_spec_22_5) {
+    // `default(int)` is the value-type zero (0); the value-type path is
+    // unaffected by the #1163 reference-type fix. N() → x = 0, +7 = 7.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "static class U public static method N(x: int := default(int)): int "
+        "  => x + 7; "
+        "end U; "
+        "class C public static method Main(): int => U.N(); "
+        "end C;"), 7);
+}
+
 // True iff the front end rejected `src` during sema with a diagnostic whose
 // message contains `needle` (and the program did not run).
 namespace {

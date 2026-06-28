@@ -3680,7 +3680,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 builder_.CreateStore(ordered[k], slot);
                 paramSlots_[paramSyms[k]] = slot;
             }
-            ordered[j] = lowerExpr(*dv);
+            // fix #1163 / §22.5 / §17.11: a `default(T)` default-value
+            // expression is reached through the PARAMETER declaration, whose
+            // inner type node (the `T` of `default(T)`) the type-resolution pass
+            // does NOT walk — it resolves only the parameter's own `: Type`
+            // annotation (TypeResolution_Names.cpp resolves `p.type`, not
+            // `p.defaultValue`). So lowering the DefaultExpr the ordinary way
+            // calls `lowerType(de->type)` on an UNRESOLVED TypeRef, which falls
+            // back to the i32 placeholder; a reference / nullable-ref
+            // `default(R?)` then becomes a bare `i32 0` passed to a `ptr`
+            // parameter ("Call parameter type does not match function
+            // signature"). Lower the omitted-argument `default(T)` at the
+            // PARAMETER's OWN lowered type, which IS resolved (resolveType on
+            // `p.type` above): `ptr null` for a reference / nullable-ref, the
+            // tagged {i8,T} zero for a nullable value, and 0 / 0.0 / false for a
+            // value type — exactly the zero value `default(T)` denotes, already
+            // in the parameter's representation.
+            if (dynamic_cast<const ast::DefaultExpr*>(dv)) {
+                ordered[j] = llvm::Constant::getNullValue(
+                    lowerType(params[j].type.get()));
+            } else {
+                ordered[j] = lowerExpr(*dv);
+            }
             paramSlots_ = std::move(savedParams);
             if (!ordered[j]) return false;
             // A defaulted parameter has no call-site argument expression;
