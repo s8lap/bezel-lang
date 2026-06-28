@@ -55,6 +55,61 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
     return false;
 }
 
+// Simple (last-component) name of a Named TypeRef, or empty for non-Named.
+// (A file-local copy of ExprTypecheck.cpp's `namedTypeSimpleName`, which is
+// static to its own translation unit.)
+static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
+    if (!ref || ref->kind != TypeRef::Kind::Named) return {};
+    if (ref->declaration) return ref->declaration->name;
+    if (!ref->importedName.empty()) return ref->importedName;
+    if (ref->astNode && ref->astNode->name &&
+        !ref->astNode->name->parts.empty())
+        return ref->astNode->name->parts.back();
+    return {};
+}
+
+// per §15.4 (#1174): the admissible TARGET types for a collection literal are a
+// CLOSED list — an inline array, `Array<T>`/`OwnedArray<T>`, `Set`, `Stack`,
+// `Queue`, `LinkedList`, `Dictionary`, and user types declared
+// `FromCollectionLiteral`. A collection INTERFACE
+// (`IEnumerable<T>`/`IList<T>`/`ICollection<T>`/`IReadOnly*`/…) is NOT on that
+// list: an abstract interface has no concrete backing the literal could be
+// materialized into, so a literal bound to such a target lowered to an
+// empty/garbage value (a silent miscompile — the call-argument materializer
+// `materializeCollectionLiteralForArg` declines an interface target). This
+// predicate recognises a non-admissible interface target so the caller can
+// reject it per §15.4.
+static bool isCollectionLiteralInterfaceTarget(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    // A user-declared interface (§11.x InterfaceDecl).
+    if (t->declaration)
+        return t->declaration->kind == ast::TypeDeclKind::Interface;
+    // A builtin collection interface (null declaration) — match by simple name.
+    std::string_view n = callsNamedTypeSimpleName(t);
+    return n == "IEnumerable" || n == "IEnumerator" || n == "IList" ||
+           n == "ICollection" || n == "IReadOnlyList" ||
+           n == "IReadOnlyCollection" || n == "ISet" || n == "IReadOnlySet" ||
+           n == "IDictionary" || n == "IReadOnlyDictionary";
+}
+
+// per §15.4 (#1174): emit the "collection literal cannot target an interface"
+// diagnostic. Shared by the user-method argument path (checkArgsAgainstParams)
+// and the builtin string-method paths (string.Trim / string.Join) whose
+// IEnumerable<T> parameters are not modelled as `ast::Param`s.
+static void reportCollectionLiteralInterfaceTarget(
+    DiagnosticEngine& diags, SourceLocation loc, std::string_view ifaceName) {
+    std::string named = ifaceName.empty()
+                            ? std::string("an interface")
+                            : ("the interface type `" + std::string(ifaceName) +
+                               "`");
+    diags.report(
+        Severity::Error, loc,
+        "a collection literal `[...]` cannot target " + named +
+        " — §15.4 admits only a concrete collection target (an inline array, "
+        "`Array<T>`/`OwnedArray<T>`, `Set`, `Stack`, `Queue`, `LinkedList`, "
+        "`Dictionary`); construct one of those and pass it (§15.4)");
+}
+
 // §22.6 classify how `argTy` matches `paramTy` at one argument position.
 // Exact when the types are equal (Resolver::typeRefEqual); Convert when a
 // §5.1 implicit conversion applies; NotApplicable otherwise (the candidate
@@ -662,6 +717,44 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                  mm == "ToUpper" || mm == "ToLower" || mm == "ToString") &&
                 ce.args.size() == 1) {
                 requireIntLike(0, "argument");
+            }
+        }
+    }
+    // per §15.4 (#1174): the builtin string methods whose parameter is an
+    // `IEnumerable<T>` — `string.Trim(chars: IEnumerable<char>)` (stdlib §9.6)
+    // and `string.Join(sep: string, items: IEnumerable<string>)` (stdlib §3.4)
+    // — set only their RESULT type in resolveMemberAccess and have no
+    // MethodSymbol, so they bypass checkArgsAgainstParams. A collection literal
+    // in the IEnumerable position has no concrete backing to materialize into
+    // (codegen lowered it to null → an empty/garbage result, a silent
+    // miscompile). Reject the literal here, exactly as the user-method path
+    // does (§15.4 admits only a concrete collection target). A non-literal
+    // argument (e.g. an `Array<char>` value) is unaffected.
+    if (auto* bma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        const auto& mm = bma->member;
+        // string.Trim(IEnumerable<char>): instance receiver of type `string`.
+        if (mm == "Trim" && ce.args.size() == 1 && ce.args[0].value &&
+            bma->target) {
+            const TypeRef* recv = ctx_.exprType(*bma->target);
+            if (recv && recv->kind == TypeRef::Kind::Primitive &&
+                recv->primitive == PrimitiveType::String &&
+                dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ce.args[0].value.get())) {
+                reportCollectionLiteralInterfaceTarget(
+                    ctx_.diagnostics(), ce.args[0].value->span.begin,
+                    "IEnumerable<char>");
+            }
+        }
+        // string.Join(string, IEnumerable<string>): static call on `string`.
+        if (mm == "Join" && ce.args.size() == 2 && ce.args[1].value) {
+            auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(bma->target.get());
+            if (tid && primitiveFromName(tid->name) == PrimitiveType::String &&
+                dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ce.args[1].value.get())) {
+                reportCollectionLiteralInterfaceTarget(
+                    ctx_.diagnostics(), ce.args[1].value->span.begin,
+                    "IEnumerable<string>");
             }
         }
     }
@@ -4555,8 +4648,23 @@ void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
         if (!a.value || !a.modifier.empty() || a.isDiscard) continue;
         const ast::Param& p = params[j];
         if (!p.type) continue;
+        TypeRef* paramTy = ctx_.resolvedType(*p.type);
+        // per §15.4 (#1174): a collection literal passed directly to a
+        // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
+        // IReadOnly*) is not admissible — the literal has no concrete backing
+        // to materialize into and silently miscompiled to an empty/garbage
+        // value. Reject here (the literal is untyped, so checkAssignable below
+        // would not catch it). Passing a CONCRETE collection (e.g. an
+        // `Array<T>` variable) to the same parameter remains fine.
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(a.value.get()) &&
+            isCollectionLiteralInterfaceTarget(paramTy)) {
+            reportCollectionLiteralInterfaceTarget(
+                ctx_.diagnostics(), a.value->span.begin,
+                callsNamedTypeSimpleName(paramTy));
+            continue;
+        }
         checkAssignable(ctx_.exprType(*a.value),
-                        ctx_.resolvedType(*p.type),
+                        paramTy,
                         a.value->span.begin,
                         std::string("argument `") + std::string(p.name) +
                         "` to " + calleeDesc);
