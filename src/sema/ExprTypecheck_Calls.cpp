@@ -2507,6 +2507,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                   !elem->nullable));
                             if ((m == "Min" || m == "Max") && ce.args.empty() &&
                                 ptrComparableElem) {
+                                // per §5.1 / §14.2 (#1198): enforce the
+                                // IComparable<T> constraint on class/interface
+                                // elements. String always satisfies it (stdlib
+                                // §9.6). For a user class, scan the AST
+                                // TypeDecl::baseTypes for "IComparable" — we
+                                // use the AST list, not TypeSymbol::baseTypes,
+                                // because the latter skips builtin interface
+                                // bases (IComparable has no user TypeDecl and
+                                // is never inserted into TypeSymbol::baseTypes
+                                // — see comment at ~L7955). Without this check
+                                // sema types the result as T and codegen
+                                // IR-fails (no CompareTo to dispatch through).
+                                bool implIComp = true; // string: always true
+                                if (elem->kind == TypeRef::Kind::Named &&
+                                    elem->declaration) {
+                                    const auto* td =
+                                        dynamic_cast<const ast::TypeDecl*>(
+                                            elem->declaration->decl);
+                                    if (td) {
+                                        implIComp = false;
+                                        for (const auto& bt : td->baseTypes) {
+                                            if (!bt || !bt->name ||
+                                                bt->name->parts.empty())
+                                                continue;
+                                            if (bt->name->parts.back() ==
+                                                "IComparable") {
+                                                implIComp = true; break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!implIComp) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        std::string(m) +
+                                        "() without a selector requires the "
+                                        "element type to implement "
+                                        "IComparable<T> (stdlib §5.1 / §14.2 "
+                                        "/ #1198); " +
+                                        std::string(elem->declaration->name) +
+                                        " does not implement IComparable<T>. "
+                                        "Use " + std::string(m) +
+                                        "(selector: (T) -> U) instead.");
+                                    return;
+                                }
                                 ctx_.setExprType(&ce, elem);
                             } else {
                             bool elemIsDecimal =

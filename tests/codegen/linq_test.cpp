@@ -121,6 +121,75 @@ BEZEL_TEST(linq, max_string_1194) {
         "end Main; end C;"), 1);
 }
 
+// stdlib §5.1 / §14.2 (#1198): no-selector Min()/Max() over a class element
+// that does NOT implement IComparable<T> must be rejected at sema with a
+// clear diagnostic — not silently mistyped and then IR-failed in codegen.
+// Anti-over-reject: a class that DOES implement IComparable<T> is still
+// accepted (covered by max_class_icomparable_1194 above).
+BEZEL_TEST(linq, min_max_non_icomparable_class_rejected_1198) {
+    // NotComparable has no IComparable<T> base — both Min() and Max()
+    // must fail with errors and the program must not run.
+    auto r_max = runJit(
+        "module M; import System.Collections.Generic; "
+        "class NotComparable "
+        "  public val: int := 0; "
+        "  public constructor(v: int) val := v; end constructor; "
+        "end NotComparable; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<NotComparable>(); "
+        "  a.Add(new NotComparable(1)); "
+        "  var mx := a.Max(); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r_max.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r_max.ran);
+    // Confirm the diagnostic cites IComparable.
+    bool found_max = false;
+    for (const auto& d : r_max.diagnostics.diagnostics())
+        if (d.message.find("IComparable") != std::string::npos)
+            found_max = true;
+    BEZEL_EXPECT_TRUE(found_max);
+
+    auto r_min = runJit(
+        "module M; import System.Collections.Generic; "
+        "class NotComparable "
+        "  public val: int := 0; "
+        "  public constructor(v: int) val := v; end constructor; "
+        "end NotComparable; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<NotComparable>(); "
+        "  a.Add(new NotComparable(1)); "
+        "  var mn := a.Min(); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r_min.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r_min.ran);
+    bool found_min = false;
+    for (const auto& d : r_min.diagnostics.diagnostics())
+        if (d.message.find("IComparable") != std::string::npos)
+            found_min = true;
+    BEZEL_EXPECT_TRUE(found_min);
+}
+
+// stdlib §5.1 / §14.2 (#1198): anti-over-reject — a class element with a
+// selector lambda is accepted regardless of IComparable (the selector returns
+// a concrete numeric T, satisfying the `where U: IComparable<U>` form).
+BEZEL_TEST(linq, min_max_selector_non_icomparable_accepted_1198) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class Box "
+        "  public val: int := 0; "
+        "  public constructor(v: int) val := v; end constructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Box>(); "
+        "  a.Add(new Box(3)); a.Add(new Box(9)); a.Add(new Box(5)); "
+        "  var mx := a.Max((b) => b.val); "
+        "  var mn := a.Min((b) => b.val); "
+        "  return int(mx = 9 and mn = 3); "
+        "end Main; end C;"), 1);
+}
+
 // --- First (eager element access) ---
 
 BEZEL_TEST(linq, first) {
