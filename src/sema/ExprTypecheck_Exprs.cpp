@@ -2980,6 +2980,33 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 pendingLambdaReturnType_ = savedLamRet;
                 pendingLambdaParamTypes_ = savedLamParams;
             }
+            // per §7.4 (#1188): a `ref`/`out` argument can be reassigned by the
+            // callee — including being set to null — so a prior null-narrowing
+            // (`nullNarrowed_`) or §12.7 type-narrowing (`narrowings_`) on the
+            // passed-in local no longer holds after the call. Invalidate it,
+            // mirroring the AssignmentStmt invalidation, so a later member
+            // access re-requires a guard instead of dereferencing a nulled
+            // value (ACCEPT_TRAP → SIGSEGV). A by-value argument cannot mutate
+            // the caller's local, so its narrowing survives. The `out var` /
+            // `out using var` forms declare a fresh local that has no prior
+            // narrowing, so erasing is a harmless no-op there.
+            if (a.value &&
+                (a.modifier == "ref" || a.modifier == "out" ||
+                 a.modifier == "out var" || a.modifier == "out using var" ||
+                 a.modifier == "out owned")) {
+                if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get())) {
+                    if (aid->name != "this" && aid->name != "base") {
+                        if (Symbol* asym = lookupName(aid->name)) {
+                            if (dynamic_cast<LocalSymbol*>(asym) ||
+                                dynamic_cast<ParameterSymbol*>(asym)) {
+                                narrowings_.erase(asym);
+                                nullNarrowed_.erase(asym);
+                            }
+                        }
+                    }
+                }
+            }
             ++pos2;
         }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {

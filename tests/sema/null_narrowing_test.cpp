@@ -425,3 +425,67 @@ BEZEL_TEST(sema_null_narrow, eq_null_then_block_does_not_narrow_spec_8_4) {
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §7.4 (#1188): a `ref` argument can be reassigned by the callee (including to
+// null), so a prior null-narrowing on the passed-in local no longer holds after
+// the call — a subsequent bare member access becomes an error again, exactly
+// like a direct reassignment. (Before the fix this compiled and dereferenced
+// the nulled value at run time → SIGSEGV.)
+BEZEL_TEST(sema_null_narrow, ref_arg_invalidates_null_narrowing_1188) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class User public Name: int := 0; end User; "
+        "class C "
+        "  public static method Clear(ref u: User?) u := null; end Clear; "
+        "  public static method Run(): int "
+        "    var u: User? := new User(); "
+        "    if u <> null then "
+        "      Clear(ref u); "
+        "      return u.Name; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1188): an `out` argument is likewise (re)written by the callee, so it
+// invalidates the passed-in local's null-narrowing.
+BEZEL_TEST(sema_null_narrow, out_arg_invalidates_null_narrowing_1188) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class User public Name: int := 0; end User; "
+        "class C "
+        "  public static method Reset(out u: User?) u := null; end Reset; "
+        "  public static method Run(): int "
+        "    var u: User? := new User(); "
+        "    if u <> null then "
+        "      Reset(out u); "
+        "      return u.Name; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1188): a BY-VALUE argument cannot mutate the caller's local, so the
+// narrowing must SURVIVE the call — the trailing member access stays legal.
+// (The invalidation must not over-reject plain by-value calls.)
+BEZEL_TEST(sema_null_narrow, byvalue_arg_keeps_narrowing_1188) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class User public Name: int := 0; end User; "
+        "class C "
+        "  public static method Look(u: User?) end Look; "
+        "  public static method Run(): int "
+        "    var u: User? := new User(); "
+        "    if u <> null then "
+        "      Look(u); "
+        "      return u.Name; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
