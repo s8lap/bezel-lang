@@ -4866,6 +4866,27 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         // the int's raw bits (issue #408 / #410).
         v = coerceNumericToType(v, st->getElementType(idxIt->second),
                                 isUnsignedTargetExpr(*init));
+        // per §23.1 (#1169) / §7: a field or auto-property of nullable VALUE type
+        // (`int? := 42`, `bool? := true`, a nullable record `Pt? := new Pt(3,4)`)
+        // lowers to a tagged {i8 hasValue; T value} slot, but the initializer is
+        // the bare inner T (or already T?). Without wrapping, the bare scalar is
+        // stored over the {i8,T} slot — clobbering the hasValue byte and leaving
+        // the value half stale (present-but-zero reads). Wrap/widen to the tagged
+        // struct exactly as a constructor-body assignment and the method-return
+        // path (coerceReturnToNullableValue) do. A reference-typed nullable
+        // (`string? := "hi"`) is NOT a value type, so isNullableValueTy is false
+        // and this is skipped; an initializer already of type T? round-trips
+        // unchanged (coerceReturnToNullableValue returns it as-is).
+        {
+            const sema::TypeRef* fieldRt = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            if (fieldRt && isNullableValueTy(fieldRt))
+                v = coerceReturnToNullableValue(v, fieldRt,
+                                                isUnsignedTargetExpr(*init));
+        }
         // #429 / §4.6 / §28.9: a CLASS string field / auto-property initializer
         // gives the field its own reference, like a later assignment. The field
         // is calloc-zeroed (null) before this, so there is no old value to
