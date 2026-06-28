@@ -15,6 +15,7 @@
 //   - §30.2 / Appendix C.6: `await` is valid inside an `async` lambda (the
 //     lambda is its own async boundary, independent of the enclosing method).
 
+#include "ownership/Ownership.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/sema_support.hpp"
@@ -27,6 +28,20 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
     if (r.sourceFile && r.ctx) {
         bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
         bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+
+// Like parseSemaAll but also runs the ownership checker (§28), which is
+// needed to verify that borrow-escape checks do NOT fire on value-typed
+// returns like `return t.Result` (Task<int>.Result is int — a copy, not
+// a borrow).
+bezel::test::SemaResult parseSemaAllWithOwnership(std::string_view src) {
+    auto r = bezel::test::parseAndCollect(src);
+    if (r.sourceFile && r.ctx) {
+        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
+        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+        bezel::ownership::checkOwnership(*r.sourceFile, *r.ctx);
     }
     return r;
 }
@@ -130,5 +145,48 @@ BEZEL_TEST(sema_async_lambda_30_6, async_method_unaffected) {
         "    return n + 1; "
         "  end Consumer; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §30.3 (#1175 fix): `Task<T>.Result` is typed T in sema. Pre-fix the
+// expression was left untyped, which silently accepted a type-mismatch
+// initializer (`var s: string := t.Result` where t is Task<int>). Post-fix
+// the type is known (int) and the mismatch is diagnosed as a type-conversion
+// error (§5.1). Sema-level test verifying the ACCEPT_TRAP is gone.
+BEZEL_TEST(sema_async_30_3_1175, task_result_type_mismatch_rejected) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static async method Produce(): Task<int> "
+        "    return 42; "
+        "  end Produce; "
+        "  public static method Main(): int "
+        "    using var t: Task<int> := C.Produce(); "
+        "    var s: string := t.Result; "  // int->string: must be rejected (§5.1)
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    // The int->string type mismatch on t.Result must be diagnosed.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §30.3 (#1175 fix): `Task<T>.Result` typed T means `return t.Result` is a
+// value-typed return (e.g. int), not a borrow. Pre-fix: returnedExprMayBorrow()
+// fell to its conservative default (return true) on the untyped expression and
+// emitted a false-positive "borrow returned from `t`..." ownership error. Post-
+// fix: Result is typed int -> isBorrowableType(int) = false -> no escape error.
+// Uses the ownership checker (§28) to drive returnedExprMayBorrow.
+BEZEL_TEST(sema_async_30_3_1175, task_result_return_no_borrow_escape) {
+    auto r = parseSemaAllWithOwnership(
+        "module M; class C "
+        "  public static async method Produce(): Task<int> "
+        "    return 42; "
+        "  end Produce; "
+        "  public static method Get(): int "
+        "    using var t: Task<int> := C.Produce(); "
+        "    t.Wait(); "
+        "    return t.Result; "  // value-typed copy: must compile without error
+        "  end Get; "
+        "end C;");
+    // A value-typed `return t.Result` must not trigger a borrow-escape error.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

@@ -196,3 +196,55 @@ BEZEL_TEST(async_sync_wait_941, wait_synchronous_await_still_runs) {
         "  end Main; end C;",
         9);
 }
+
+// ---------------------------------------------------------------------------
+// §30.3 (#1175 fix): `return t.Result` from a non-async method must compile
+// and return the task's value. Pre-fix this was rejected with a false-positive
+// "borrow returned from `t` would outlive its source" because sema left
+// Task<T>.Result untyped; returnedExprMayBorrow() fell to its conservative
+// `return true`, triggering the borrow-escape check on what is actually a
+// value-typed copy (the int result). Post-fix: Result is typed T (int) in
+// resolveMemberAccess, so isBorrowableType returns false and no escape error
+// fires. Spec §30.3 ("`Wait()` and `Result` are synchronous escape hatches
+// for non-async code"), v0.131.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_sync_wait_941, result_returned_directly_no_borrow_escape_1175) {
+    expectValue941(
+        "module M; class C "
+        "  public static async method Produce(): Task<int> "
+        "    await Task.Delay(0); "
+        "    return 42; "
+        "  end Produce; "
+        "  public static method Main(): int "
+        "    using var t := C.Produce(); "
+        "    t.Wait(); "
+        "    return t.Result; "  // pre-fix: BAD_REJECT borrow-escape
+        "  end Main; end C;",
+        42);
+}
+
+// ---------------------------------------------------------------------------
+// §30.3 (#1175 fix): IsCompleted / IsFaulted / IsCancelled are bool readonly
+// properties on Task (and its subclasses Task<T>, OwnedTask<T>) — spec §30.3.
+// Pre-fix these were untyped in sema (no TypeSymbol on the task type);
+// post-fix they are typed bool in resolveMemberAccess so `if t.IsCompleted`
+// and similar uses compile correctly. Test: after Wait(), the completed-and-
+// non-faulted task returns t.Result; the path gated on IsCompleted must run.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_sync_wait_941, iscompleted_isfaulted_iscancelled_typed_1175) {
+    expectValue941(
+        "module M; class C "
+        "  public static async method Produce(): Task<int> "
+        "    await Task.Delay(0); "
+        "    return 77; "
+        "  end Produce; "
+        "  public static method Main(): int "
+        "    using var t := C.Produce(); "
+        "    t.Wait(); "
+        "    if t.IsCompleted and not t.IsFaulted and not t.IsCancelled then "
+        "      return t.Result; "
+        "    end; "
+        "    return 0; "
+        "  end Main; end C;",
+        77);
+}

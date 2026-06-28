@@ -7442,6 +7442,81 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // §30.3 (#1175): Task<T> / Task / OwnedTask<T> instance readonly property
+        // reads. None of these types has a user TypeSymbol, so the ordinary member-
+        // lookup path never types their properties. Without this handler,
+        // resolveMemberAccess leaves them untyped, causing two bugs from one root:
+        //   (1) BAD_REJECT: returnedExprMayBorrow() falls through to its conservative
+        //       `return true` at the end, so `return t.Result` is rejected as a
+        //       "borrow returned from `t` would outlive its source" — a false positive,
+        //       because Result is a VALUE-typed copy (int, string, …), not a reference
+        //       into the task.
+        //   (2) ACCEPT_TRAP: `var s: string := t.Result` (where t is Task<int>) is
+        //       silently accepted — the type-mismatch check never fires on an untyped
+        //       right-hand side — and codegen emits malformed IR (GEP on i32).
+        //
+        // Detection mirrors isTaskTypeName() in codegen (LlvmBackend_Setup.cpp):
+        //   path A — declaration==null, name in astNode->name->parts[0]
+        //   path B — builtinClassSym (declaration with null decl), name in declaration->name
+        //
+        // Properties typed:
+        //   IsCompleted / IsFaulted / IsCancelled → bool  (all three task types)
+        //   Result → T (genericArgs[0])                   (Task<T> ONLY; §30.3 explicitly
+        //                                                   rejects OwnedTask<T>.Result —
+        //                                                   OwnedTask consumes via await)
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            auto taskTypeNameFn = [](const TypeRef* rt) -> std::string_view {
+                if (!rt || rt->kind != TypeRef::Kind::Named) return {};
+                if (!rt->declaration) {
+                    if (rt->astNode && rt->astNode->name &&
+                        !rt->astNode->name->parts.empty())
+                        return rt->astNode->name->parts[0];
+                    return {};
+                }
+                if (!rt->declaration->decl) return rt->declaration->name;
+                return {};
+            };
+            std::string_view tn = taskTypeNameFn(tt);
+            bool isAnyTask = (tn == "Task" || tn == "OwnedTask");
+            if (isAnyTask) {
+                const auto& mbr = ma.member;
+                // §30.3: IsCompleted / IsFaulted / IsCancelled are bool properties
+                // declared on the base `Task` class and inherited by Task<T> and
+                // OwnedTask<T> (spec §30.3 class hierarchy). Type them bool so that
+                // `if t.IsCompleted` and similar expressions resolve correctly.
+                if (mbr == "IsCompleted" || mbr == "IsFaulted" ||
+                    mbr == "IsCancelled") {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+                // §30.3: Result is T (the task's value type), declared ONLY on
+                // Task<T>. OwnedTask<T> does not expose Result — the result is
+                // single-consumer and ownership-transferring; consumers must `await`
+                // an OwnedTask<T> in an owned-consuming position (§30.5 Pattern B).
+                // Emit a clean diagnostic for OwnedTask<T>.Result and type Task<T>.Result → T.
+                if (mbr == "Result") {
+                    if (tn == "OwnedTask") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            "`OwnedTask<T>` does not expose a `Result` property "
+                            "(\xC2\xA7""30.3): the result is single-consumer and "
+                            "ownership-transferring; consume it via `await` in an "
+                            "owned-consuming position (\xC2\xA7""30.5 Pattern B)");
+                        return;
+                    }
+                    // Task<T>.Result → T (genericArgs[0]).  A bare `Task` (no type
+                    // argument) has no value to read; leave it untyped and let codegen
+                    // handle or reject it (there is no `Task.Result` in the spec).
+                    if (tn == "Task" && tt && !tt->genericArgs.empty() &&
+                        tt->genericArgs[0]) {
+                        ctx_.setExprType(&ma, tt->genericArgs[0]);
+                        return;
+                    }
+                }
+            }
+        }
         // CG27a (§4.6): handle known intrinsic string members directly —
         // string has no user TypeSymbol in the symbol table.
         if (ma.target) {
