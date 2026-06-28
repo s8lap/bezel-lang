@@ -293,7 +293,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // current value first. Field / static-field / index targets keep the
             // natural left-to-right order (their LHS may have side effects, and
             // they cannot be the lambda being initialized for the first time).
-            if (as->op == ":=" &&
+            if (as->op == "??=") {
+                // §7.7 (#1190): null-coalescing assignment short-circuits —
+                // the RHS must be evaluated ONLY when the LHS is null. Compute
+                // the target address now but DEFER `lowerExpr(*as->value)` into
+                // the LHS-is-null branch handled immediately below, so a
+                // non-null LHS never runs (nor produces) the RHS. Lowering it
+                // eagerly here would violate short-circuit and, for an owned
+                // RHS, leave an unobserved owned value (leak / double-free).
+                addr = lvalueAddr(*as->target, elemTy);
+                if (!addr) return false;
+            } else if (as->op == ":=" &&
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 localSlot(*as->target) != nullptr) {
                 rhs = lowerExpr(*as->value);
@@ -305,6 +315,76 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!addr) return false;
                 rhs = lowerExpr(*as->value);
                 if (!rhs) return false;
+            }
+            // §7.7 (#1190): null-coalescing assignment `x ??= e`. Mirror the
+            // `??` binary operator's short-circuit (LlvmBackend_Exprs.cpp
+            // lowerBinary "??"): null-test the LHS first and lower the RHS
+            // inside the null branch ONLY. Self-contained — returns before the
+            // `:=`-only coercion/field-store blocks below.
+            if (as->op == "??=") {
+                llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                llvm::Value* isNull = nullptr;
+                if (cur->getType()->isPointerTy()) {
+                    isNull = builder_.CreateICmpEQ(
+                        cur, llvm::ConstantPointerNull::get(ptrTy()));
+                } else if (cur->getType()->isStructTy()) {
+                    // CG-nullable: nullable primitive {i8 hasValue; primType
+                    // value}. Null when hasValue == 0.
+                    isNull = builder_.CreateNot(nullablePrimHasValue(cur));
+                }
+                // A non-nullable target can never be null → nothing to do.
+                if (!isNull) return false;
+                auto* assignBB =
+                    llvm::BasicBlock::Create(llvm_, "coaleq.do", currentFn_);
+                auto* endBB =
+                    llvm::BasicBlock::Create(llvm_, "coaleq.end", currentFn_);
+                builder_.CreateCondBr(isNull, assignBB, endBB);
+                builder_.SetInsertPoint(assignBB);
+                // RHS evaluated here ONLY (the LHS was null) — short-circuit.
+                rhs = lowerExpr(*as->value);
+                if (!rhs) {
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(endBB);
+                    return false;
+                }
+                // §5.1: numeric widening to the target slot (mirror the `:=`
+                // path's coerceNumericToType, issue #408 / #421 / #410).
+                if (elemTy)
+                    rhs = coerceNumericToType(
+                        rhs, elemTy, isUnsignedTargetExpr(*as->value));
+                // CG-nullable: wrap a plain primitive RHS into the target's
+                // {hasValue, value} struct (or normalize a null literal).
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(elemTy)) {
+                    if (st->getNumElements() == 2 &&
+                        st->getElementType(0) == nullablePrimHasValTy() &&
+                        rhs->getType() != elemTy) {
+                        if (rhs->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(rhs)) {
+                            rhs = llvm::ConstantAggregateZero::get(elemTy);
+                        } else if (rhs->getType() == st->getElementType(1)) {
+                            llvm::Value* wrapped = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(elemTy),
+                                llvm::ConstantInt::get(
+                                    nullablePrimHasValTy(), 1), {0u});
+                            rhs = builder_.CreateInsertValue(wrapped, rhs, {1u});
+                        }
+                    }
+                }
+                // #429 / §4.6 / §28.9: `field ??= e` stores into a (currently
+                // null) CLASS string field/auto-property only when null, so
+                // there is no old value to release — but the field still takes
+                // an INDEPENDENT +1 (transfer a producer / retain a borrow),
+                // released on the owner's disposal. Restricted to class string
+                // field lvalues. The slot is null here, so a plain store is
+                // correct after the retain.
+                if (isStringFieldLvalue(*as->target) &&
+                    rhs->getType()->isPointerTy() &&
+                    !isPlusOneStringProducer(as->value.get()))
+                    emitStringRetain(rhs);
+                builder_.CreateStore(rhs, addr);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+                return false;
             }
             // §8.6: a value-typed RHS assigned to an Object/interface lvalue is
             // boxed (so a later is/as/dispatch on the target sees a box). Keyed
@@ -413,55 +493,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // loads from it (e.g. a while-loop condition) sees the update.
                     if (llvm::AllocaInst* ns = localSlot(*as->target))
                         syncCellToOrigSlot(ns, rhs);
-                }
-            } else if (as->op == "??=") {
-                // §4.7: null-coalescing assignment `x ??= e` — store e
-                // into x only when x is currently null.
-                llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                llvm::Value* isNull = nullptr;
-                if (cur->getType()->isPointerTy()) {
-                    isNull = builder_.CreateICmpEQ(
-                        cur, llvm::ConstantPointerNull::get(ptrTy()));
-                } else if (cur->getType()->isStructTy()) {
-                    // CG-nullable: nullable primitive {i8 hasValue; primType value}.
-                    // Null when hasValue == 0.
-                    isNull = builder_.CreateNot(nullablePrimHasValue(cur));
-                    // Wrap rhs (plain prim) into nullable struct for the store.
-                    if (rhs->getType() != elemTy) {
-                        if (auto* st = llvm::dyn_cast<llvm::StructType>(elemTy)) {
-                            if (st->getNumElements() == 2 &&
-                                st->getElementType(0) == nullablePrimHasValTy() &&
-                                rhs->getType() == st->getElementType(1)) {
-                                llvm::Value* wrapped = builder_.CreateInsertValue(
-                                    llvm::UndefValue::get(elemTy),
-                                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
-                                rhs = builder_.CreateInsertValue(wrapped, rhs, {1u});
-                            }
-                        }
-                    }
-                }
-                if (isNull) {
-                    auto* assignBB = llvm::BasicBlock::Create(llvm_, "coaleq.do", currentFn_);
-                    auto* endBB = llvm::BasicBlock::Create(llvm_, "coaleq.end", currentFn_);
-                    builder_.CreateCondBr(isNull, assignBB, endBB);
-                    builder_.SetInsertPoint(assignBB);
-                    // #429 / §4.6 / §28.9: `field ??= e` stores into a (currently
-                    // null) CLASS string field/auto-property only when null, so
-                    // there is no old value to release — but the field still takes
-                    // an INDEPENDENT +1 (transfer a producer / retain a borrow),
-                    // released on the owner's disposal. Without this a borrow `e`
-                    // would be released by disposal without a matching retain (a
-                    // double-free). Restricted to class string field lvalues (a
-                    // string local / record field / array element keeps the plain
-                    // store). The slot is null here, so a plain store is correct
-                    // after the retain.
-                    if (isStringFieldLvalue(*as->target) &&
-                        rhs->getType()->isPointerTy() &&
-                        !isPlusOneStringProducer(as->value.get()))
-                        emitStringRetain(rhs);
-                    builder_.CreateStore(rhs, addr);
-                    builder_.CreateBr(endBB);
-                    builder_.SetInsertPoint(endBB);
                 }
             } else {
                 // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`

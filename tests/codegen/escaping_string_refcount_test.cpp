@@ -431,6 +431,42 @@ const char* kFieldCoalesceAssign =
     "  return h.Name!.Length; "              // "coalesce" => 8
     "end Main; end C;";
 
+// §7.7 (#1190): null-coalescing assignment `x ??= e` SHORT-CIRCUITS — the RHS is
+// evaluated ONLY when x is currently null. A counting method `Bump()` runs once
+// (for the null `d`), never for the non-null `c`. Pre-fix the RHS lowered
+// eagerly and `Bump()` ran twice (Count == 2). Encodes Count*100 + c! *10 + d!:
+// non-null `c` keeps 1, null `d` becomes 7, Count is 1 → 1*100 + 1*10 + 7 == 117.
+const char* kCoalesceAssignShortCircuit =
+    "module M; class C "
+    "  public static Count: int := 0; "
+    "  public static method Bump(): int "
+    "    Count := Count + 1; return 7; "
+    "  end Bump; "
+    "  public static method Main(): int "
+    "    var c: int? := 1; "
+    "    c ??= Bump(); "            // non-null → Bump() must NOT run
+    "    var d: int? := null; "
+    "    d ??= Bump(); "            // null → Bump() runs once, d := 7
+    "    return Count * 100 + c! * 10 + d!; "
+    "  end Main; "
+    "end C;";
+
+// §7.7 / §28.9 (#1190): a non-null `string?` field `??=` a +1 STRING PRODUCER
+// (`"co" + "alesce"`) must NOT evaluate the producer — short-circuit. Pre-fix the
+// producer minted a +1 that was never stored (the field was non-null) nor
+// released → a LEAK. The field keeps "kept" (length 4); LSan-clean confirms the
+// producer was never minted.
+const char* kCoalesceAssignNonNullNoLeak =
+    "module M; class Holder "
+    "  public Name: string?; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  using var h := new Holder(); "
+    "  h.Name := \"kept\"; "
+    "  h.Name ??= \"co\" + \"alesce\"; "   // non-null → producer skipped, no leak
+    "  return h.Name!.Length; "            // "kept" => 4
+    "end Main; end C;";
+
 // §28.5 / §28.9: EXPLICIT `.Dispose()` (not `using var`) reclaims the string
 // field too — the disposer's run-once flag + the post-release slot-nulling make a
 // re-entrant disposal a no-op, so no double-free. Looped → steady-state
@@ -1312,6 +1348,17 @@ BEZEL_TEST(codegen_escaping_string_429, explicit_dispose_loop_reclaimed_28_5) {
 
 BEZEL_TEST(codegen_escaping_string_429, field_coalesce_assign_reclaimed_4_7) {
     expectValueAndLeakFree(kFieldCoalesceAssign, 8);
+}
+
+// §7.7 (#1190): `??=` short-circuits — the RHS runs only when the LHS is null.
+BEZEL_TEST(codegen_escaping_string_429, coalesce_assign_short_circuits_nonnull_lhs_1190) {
+    BEZEL_EXPECT_EQ(compileAndRun(kCoalesceAssignShortCircuit), 117);
+}
+
+// §7.7 / §28.9 (#1190): a non-null `string?` field `??=` a +1 producer must not
+// evaluate (mint) the producer — leak-free confirms the short-circuit.
+BEZEL_TEST(codegen_escaping_string_429, coalesce_assign_nonnull_skips_owned_rhs_1190) {
+    expectValueAndLeakFree(kCoalesceAssignNonNullNoLeak, 4);
 }
 
 // --- RECORD control: borrow semantics, no double-free ---------------------
