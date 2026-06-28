@@ -666,6 +666,57 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // per §8.4 (#1126): `Object.ReferenceEquals(a, b)` on a VALUE-TYPE argument
+    // is almost always a mistake. Value types are compared by value; a value
+    // passed where an `Object?` is expected is boxed into a FRESH heap object,
+    // so the identity comparison is meaningless (always false). The result is
+    // already correct (#1119 lowers a pointer-identity compare); §8.4 states
+    // "the compiler warns". This is ADVISORY only — compilation still succeeds
+    // (DiagnosticEngine::hasErrors counts only errors). A value type is a
+    // non-`string`/non-`Object` primitive, a record, or an enum (§14.2 / §3).
+    // Args are typed post-order, so their resolved types are available here.
+    if (auto* oma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if (oma->member == "ReferenceEquals" && oma->target) {
+            if (auto* oid =
+                    dynamic_cast<const ast::IdentifierExpr*>(oma->target.get())) {
+                if (oid->name == "Object" && ce.args.size() == 2) {
+                    auto isValueTypeArg = [](const TypeRef* t) -> bool {
+                        if (!t) return false;  // untyped/error/`null` → no warn
+                        switch (t->kind) {
+                            case TypeRef::Kind::Primitive:
+                                // `string`/`Object` are reference types; every
+                                // other primitive is a value type (§14.2 / §3).
+                                return t->primitive != PrimitiveType::String &&
+                                       t->primitive != PrimitiveType::Object &&
+                                       t->primitive != PrimitiveType::None;
+                            case TypeRef::Kind::Named:
+                                // records and enums are value types
+                                // (§9 / §10 / §14.2). Classes/interfaces and
+                                // builtin named types are reference types.
+                                return t->declaration &&
+                                       (t->declaration->kind ==
+                                            ast::TypeDeclKind::Record ||
+                                        t->declaration->kind ==
+                                            ast::TypeDeclKind::Enum);
+                            default:
+                                return false;
+                        }
+                    };
+                    bool anyValue = false;
+                    for (const auto& a : ce.args)
+                        if (a.value && isValueTypeArg(ctx_.exprType(*a.value)))
+                            anyValue = true;
+                    if (anyValue)
+                        ctx_.diagnostics().report(
+                            Severity::Warning, ce.span.begin,
+                            "`Object.ReferenceEquals` is called with a value-type "
+                            "argument; reference equality on a value type is "
+                            "always false (each value is boxed into a fresh "
+                            "object) (\xC2\xA7""8.4)");
+                }
+            }
+        }
+    }
     // #1048: argument-type validation for the char/int-expecting primitive
     // static methods. These set only their RESULT type in resolveMemberAccess
     // and have no MethodSymbol, so they bypass checkArgsAgainstParams — a
