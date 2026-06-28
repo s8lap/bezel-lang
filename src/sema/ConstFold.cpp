@@ -5,6 +5,32 @@
 
 namespace bezel::sema {
 
+// per §6.5 (#1210): for shift operators the count is masked by the LEFT
+// operand's bit width before the shift — matching the runtime behaviour that
+// §6.5 mandates and that codegen already enforces (#1094). This helper infers
+// the bit width purely from the AST shape, without a type-checker context:
+//   • an untyped integer literal is `int` (32-bit) per §2;
+//   • unary +/-/~ on a known-width sub-expression inherits that width;
+//   • a binary arithmetic/bitwise expression whose BOTH sides have the same
+//     known width inherits that width (Bezel has no implicit integer widening);
+//   • any other form (identifier naming a const, cast, …) returns 0, meaning
+//     "unknown" — the caller leaves those shifts unmasked.
+// Only 32 is returned for normal literal-arithmetic; 8/16/64 require type
+// information that is not available at this level.
+static int inferIntWidthBitsForShift(const ast::Expr& e) {
+    if (dynamic_cast<const ast::IntLiteralExpr*>(&e)) return 32;
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return u->operand ? inferIntWidthBitsForShift(*u->operand) : 0;
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        // Both operands must agree on a known width; any unknown → 0.
+        int lw = b->left  ? inferIntWidthBitsForShift(*b->left)  : 0;
+        int rw = b->right ? inferIntWidthBitsForShift(*b->right) : 0;
+        return (lw != 0 && rw != 0) ? lw : 0;
+    }
+    // IdentifierExpr or any other form: width needs a type-checker pass.
+    return 0;
+}
+
 std::optional<long long> foldIntConst(
     const ast::Expr& e,
     const std::function<std::optional<long long>(std::string_view, int)>&
@@ -58,8 +84,26 @@ std::optional<long long> foldIntConst(
             return *r == 0 ? std::nullopt : std::optional<long long>(*l / *r);
         if (b->op == "%")
             return *r == 0 ? std::nullopt : std::optional<long long>(*l % *r);
-        if (b->op == "<<") return *l << *r;
-        if (b->op == ">>") return *l >> *r;
+        // §6.5 (#1210): mask the shift count by the left operand's bit width
+        // so the const-fold matches the runtime value produced by the §6.5
+        // rule (and the codegen masking added in #1094). An unmasked
+        // `*l << *r` with r >= 64 is UB in C++, and with r >= 32 (for int-
+        // typed left operands) diverges from the §6.5 value — most critically
+        // producing a giant arraySizeValue for `[1 << 40]int` (SIGSEGV).
+        // Width inference returns 0 when the left expr type is unavailable
+        // (e.g. a named-const identifier); those shifts remain unmasked here
+        // (the same as before this fix) — acceptable for the rare case and
+        // noted in the helper's comment above.
+        if (b->op == "<<" || b->op == ">>") {
+            int leftBits = inferIntWidthBitsForShift(*b->left);
+            long long cnt = (leftBits > 0) ? (*r & (leftBits - 1)) : *r;
+            // Guard against C++ UB: a shift by >= 64 on a long long is UB
+            // regardless of the spec rule; clamp to a no-op shift when the
+            // left-operand width is unknown and the count is out of range.
+            if (cnt < 0 || cnt >= 64) return std::nullopt;
+            if (b->op == "<<") return *l << cnt;
+            return *l >> cnt;
+        }
         if (b->op == "&") return *l & *r;
         if (b->op == "|") return *l | *r;
         if (b->op == "^") return *l ^ *r;

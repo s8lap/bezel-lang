@@ -136,3 +136,44 @@ BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_propagates) 
         "var u: uint? := null; var r: bool? := u > 1000; "
         "return (1 if (r ?? false) else 0);"), 0);
 }
+
+// #1210 / §6.5: const-fold of a shift masks the count by the LEFT operand's
+// bit width (int → & 31, matching the runtime rule enforced by codegen #1094).
+// Before the fix, `1 << 40` folded to 1099511627776 (unmasked), causing an
+// inline-array with that size to allocate a ~16 GB stack frame → SIGSEGV.
+// After the fix it folds to `1 << (40 & 31)` = `1 << 8` = 256.
+
+// CRASH FIX: an inline array whose size is a shift const-fold with count >= 32
+// must NOT produce a giant stack frame. `[1 << 40]int` must have length 256.
+BEZEL_TEST(shift_const_fold_masks_count_1210,
+           inline_array_shift_size_no_overflow_1210) {
+    // §6.5: 1 << 40 for int-typed operand: 40 & 31 = 8, so 1 << 8 = 256.
+    // Length must be 256, not ~1e12 (which was the pre-fix unmasked value).
+    BEZEL_EXPECT_EQ(runBody(
+        "var a: [1 << 40]int; return a.Length - 255;"), 1);
+}
+
+// RIGHT-SHIFT: same masking applies to >>.
+// 1024 >> 33: 33 & 31 = 1, so 1024 >> 1 = 512.
+BEZEL_TEST(shift_const_fold_masks_count_1210,
+           inline_array_right_shift_size_masked_1210) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var a: [1024 >> 33]int; return a.Length - 511;"), 1);
+}
+
+// NO-REGRESSION: a normal in-range shift const must still fold correctly.
+// 1 << 4 = 16; array length must be 16, not 0 or some other value.
+BEZEL_TEST(shift_const_fold_masks_count_1210,
+           inline_array_normal_shift_size_unchanged_1210) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var a: [1 << 4]int; return a.Length;"), 16);
+}
+
+// CONST-THROUGH-IDENTIFIER: `const SZ: int := 1 << 40;` used as array size —
+// the fold recurses into the const's initialiser, masking there too.
+BEZEL_TEST(shift_const_fold_masks_count_1210,
+           inline_array_const_shift_size_masked_1210) {
+    BEZEL_EXPECT_EQ(runBody(
+        "const SZ: int := 1 << 40; "
+        "var a: [SZ]int; return a.Length - 255;"), 1);
+}
