@@ -139,6 +139,87 @@ BEZEL_TEST(method_constraint_callsite_746, single_constraint_ok) {
     BEZEL_EXPECT_FALSE(hasContradictionError(r));
 }
 
+// ---------------------------------------------------------------------------
+// §14.2 / fix #1078: method call on an UNCONSTRAINED type parameter is rejected.
+// An unconstrained T has only Object members (ToString/Equals/GetHashCode/
+// GetType); any call to a non-Object member on a bare T must be a sema error
+// ("no member `M` on unconstrained type parameter `T`"). The constrained case
+// (where T: ISomething) still resolves through the constraint and must pass.
+// ---------------------------------------------------------------------------
+
+namespace {
+bool hasUnconstrainedParamError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("unconstrained type parameter") != std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// §14.2 (#1078): a method call on an unconstrained class-level T field is
+// rejected — T provides no member `Value`, so this is ill-formed.
+BEZEL_TEST(method_constraint_callsite_746,
+           unconstrained_class_field_t_method_rejected_1078) {
+    // Holder<T> (no constraint); _item.Value() on unconstrained T must error.
+    auto r = parseSemaAll(
+        "module M; "
+        "class Holder<T> "
+        "  private _item: T?; "
+        "  public method GetValue(): int _item!.Value(); return 0; end GetValue; "
+        "end Holder; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasUnconstrainedParamError(r));
+}
+
+// §14.2 (#1078): a method call on an unconstrained generic METHOD parameter T
+// is rejected — the method's `x: T` (no where-clause) provides no `GetN()`.
+BEZEL_TEST(method_constraint_callsite_746,
+           unconstrained_method_param_t_method_rejected_1078) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class U "
+        "  public static method Wrap<T>(x: T): int x.GetN(); return 0; end Wrap; "
+        "end U; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasUnconstrainedParamError(r));
+}
+
+// §14.2 (#1078): ANTI-OVER-REJECT — a CONSTRAINED T (`where T: IFoo`) method
+// call on member F() provided by IFoo must still be ACCEPTED (no error).
+BEZEL_TEST(method_constraint_callsite_746,
+           constrained_t_iface_member_accepted_1078) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo method F(): int; end IFoo; "
+        "class Holder<T> where T: IFoo "
+        "  private _item: T?; "
+        "  public method GetF(): int return _item!.F(); end GetF; "
+        "end Holder; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasUnconstrainedParamError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §14.2 (#1078): ANTI-OVER-REJECT — Object members (ToString, GetHashCode)
+// on an unconstrained T are valid and must NOT be rejected.  Tests that the
+// new `else` branch only fires for non-Object members.
+BEZEL_TEST(method_constraint_callsite_746,
+           object_members_on_unconstrained_t_accepted_1078) {
+    // ToString() and GetHashCode() are the clearest Object-provided members
+    // (§14.1); calling them on unconstrained T must not trigger §14.2 reject.
+    auto r = parseSemaAll(
+        "module M; "
+        "static class U "
+        "  public static method CheckObj<T>(x: T): int "
+        "    var s := x.ToString(); "
+        "    var h := x.GetHashCode(); "
+        "    return h; "
+        "  end CheckObj; "
+        "end U; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasUnconstrainedParamError(r));
+}
+
 // §7.1 / §14.2 (#741 f13): a nullable type argument that violates a `value`
 // constraint must be NAMED with its `?` in the diagnostic. The constraint was
 // always correctly enforced; only the displayed name was wrong (`int` for the

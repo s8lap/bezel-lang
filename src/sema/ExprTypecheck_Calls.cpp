@@ -1609,6 +1609,76 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             if (ma->target) {
                 auto* recvTy = ctx_.exprType(*ma->target);
+                // §14.2 / fix #1078: method call on an UNCONSTRAINED type parameter.
+                // When the callee is `t.Foo()` where `t: T` (unconstrained), the
+                // call has no calleeSym and the receiver is a bare type-parameter
+                // TypeRef with no known member surface.  Emit a clean sema error
+                // instead of silently miscompiling (returning 0) or crashing the
+                // IR verifier at codegen (§14.2 forbids any member call on T that
+                // is not backed by a where-constraint providing the member).
+                //
+                // Guards (all must hold to avoid false positives):
+                //  · recvTy is Named with null declaration and a 1-part name
+                //    (bare type parameters look exactly like this).
+                //  · The member is NOT one of the Object-provided set — those are
+                //    handled in resolveMemberAccess and dispatch through vtable
+                //    slots, so they work correctly and must remain accepted.
+                //  · The 1-part name is an actually-declared generic type
+                //    parameter on the enclosing method or class (guards against
+                //    stdlib synthetic unresolved Named types such as Array<T>,
+                //    IEnumerator<T>, etc., which also have null declarations but
+                //    are not generic params).
+                //
+                // Does NOT fire for field/property ACCESS on record-typed T (e.g.
+                // `_val.X` where T=Pt at runtime) — those are MemberAccessExprs
+                // used as plain values, never as CallExpr callees, so typeCall is
+                // never invoked for them.  Codegen's name-based lookup (fix #590)
+                // handles those correctly.
+                if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                        !recvTy->declaration && recvTy->astNode &&
+                        recvTy->astNode->name &&
+                        recvTy->astNode->name->parts.size() == 1) {
+                    std::string_view paramName =
+                        recvTy->astNode->name->parts[0];
+                    const auto& mbr = ma->member;
+                    bool isObjectMember =
+                        mbr == "ToString"    || mbr == "GetHashCode" ||
+                        mbr == "Equals"      || mbr == "CompareTo"   ||
+                        mbr == "GetType";
+                    if (!isObjectMember) {
+                        bool isDeclaredParam = false;
+                        if (currentMethodDecl_) {
+                            for (const auto& gp :
+                                    currentMethodDecl_->genericParams)
+                                if (gp.name == paramName) {
+                                    isDeclaredParam = true; break;
+                                }
+                        }
+                        if (!isDeclaredParam && currentType_ &&
+                                currentType_->decl) {
+                            if (auto* td =
+                                    dynamic_cast<const ast::TypeDecl*>(
+                                        currentType_->decl)) {
+                                for (const auto& gp : td->genericParams)
+                                    if (gp.name == paramName) {
+                                        isDeclaredParam = true; break;
+                                    }
+                            }
+                        }
+                        if (isDeclaredParam) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "no member `" + std::string(mbr) +
+                                "` on unconstrained type parameter `" +
+                                std::string(paramName) +
+                                "`; add a `where " +
+                                std::string(paramName) +
+                                ": <constraint>` that provides this "
+                                "member (§14.2)");
+                            return;
+                        }
+                    }
+                }
                 // #466 / §26.5 / §3: reject chaining a member call/access onto the
                 // VOID result of an in-place collection method. Per §26.5
                 // ("instance members win"), `a.Reverse()` on a concrete Array<T>

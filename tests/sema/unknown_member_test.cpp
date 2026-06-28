@@ -311,8 +311,10 @@ BEZEL_TEST(sema_unknown_member, interface_real_member_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §14.1: a generic type parameter `T` (Named with null declaration) stays
-// permissive — its member set is not statically known.
+// §14.2 / fix #1078: a method call on an unconstrained generic type parameter
+// `T` is now a sema error — the call has no constraint backing and no member
+// surface (§14.2 permits only Object members on unconstrained T). Prior to
+// fix #1078 this was silently accepted and miscompiled to 0 at runtime.
 BEZEL_TEST(sema_unknown_member, generic_param_receiver_permissive) {
     auto r = parseSemaAll(
         "module M; "
@@ -322,7 +324,9 @@ BEZEL_TEST(sema_unknown_member, generic_param_receiver_permissive) {
         "    return 0; "
         "  end M; "
         "end Box;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // Post-#1078: t.Whatever() on unconstrained T is a compile error, not
+    // silently accepted (the old "permissive" behavior was wrong per §14.2).
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §12.7: a member declared only on the narrowed (derived) type resolves after
