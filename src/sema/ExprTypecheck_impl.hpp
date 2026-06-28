@@ -81,6 +81,16 @@ private:
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
 
+    // §22.5 (issue #1160): while type-checking parameter i's default-value
+    // expression, that parameter and every parameter declared AFTER it are out
+    // of scope — a default may read only EARLIER parameters. This set holds the
+    // forbidden (self-and-later) parameter symbols for the default currently
+    // being checked; it is empty outside that window. `lookupName` consults it
+    // and records the offending name in `forwardParamRef_` so `runMethodBody`
+    // can report the §22.5 error at the default expression.
+    std::unordered_set<Symbol*> forbiddenForwardParams_;
+    std::string forwardParamRef_;
+
     // issue #484 / §14.2: the MethodDecl currently being type-checked, or null
     // when outside a method body. Used by resolveMemberAccess to walk the
     // method's generic constraints when the receiver is a type parameter —

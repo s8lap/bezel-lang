@@ -126,3 +126,54 @@ BEZEL_TEST(codegen_cg45, ctor_default_reads_earlier_param_spec_22_5) {
         "  var n := new N(7); return n.V; "
         "end Main; end C;"), 14);
 }
+
+// True iff the front end rejected `src` during sema with a diagnostic whose
+// message contains `needle` (and the program did not run).
+namespace {
+bool rejectedWith(const std::string& src, const std::string& needle) {
+    auto r = runJit(src);
+    if (r.ran || !r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+} // namespace
+
+BEZEL_TEST(codegen_cg45, default_forward_param_ref_rejected_spec_22_5) {
+    // §22.5 (issue #1160): a default may read only parameters declared EARLIER
+    // in the same list — a forward reference (`a := b` where `b` is later) reads
+    // an uninitialized slot and must be a compile error, not silently accepted.
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class C "
+        "  public static method M(a: int := b, b: int := 7): int => a * 100 + b; "
+        "  public static method Main(): int => M(); "
+        "end C;",
+        "§22.5"));
+}
+
+BEZEL_TEST(codegen_cg45, default_self_param_ref_rejected_spec_22_5) {
+    // §22.5 (issue #1160): a default may not reference the parameter it belongs
+    // to (`a := a`) — that is a self/forward reference into an uninitialized
+    // slot.
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class C "
+        "  public static method M(a: int := a): int => a; "
+        "  public static method Main(): int => M(); "
+        "end C;",
+        "§22.5"));
+}
+
+BEZEL_TEST(codegen_cg45, ctor_default_forward_param_ref_rejected_spec_22_5) {
+    // §22.5 (issue #1160): the forward-reference rule applies to constructors
+    // too — the default for `a` may not read the later ctor parameter `b`.
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class N "
+        "  public V: int := 0; "
+        "  public constructor(a: int := b, b: int := 7) V := a + b; "
+        "  end constructor; "
+        "end N; "
+        "class C public static method Main(): int "
+        "  var n := new N(); return n.V; "
+        "end Main; end C;",
+        "§22.5"));
+}

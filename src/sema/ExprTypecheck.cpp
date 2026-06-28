@@ -1788,7 +1788,20 @@ Symbol* ExprTC::lookupExtensionMember(
 Symbol* ExprTC::lookupName(std::string_view name) {
     for (Scope* s = currentScope_; s; s = s->parent) {
         auto it = s->names.find(name);
-        if (it != s->names.end()) return it->second;
+        if (it != s->names.end()) {
+            // §22.5 (issue #1160): a default-value expression may read only
+            // parameters declared EARLIER in the same list. While checking
+            // such a default, `forbiddenForwardParams_` holds this-and-later
+            // params; a reference to one is recorded so `runMethodBody`
+            // reports the §22.5 error. The symbol is still returned (so the
+            // expression types as that param's type and no cascading
+            // "unresolved identifier" follows) — the recorded error fails the
+            // compile.
+            if (!forbiddenForwardParams_.empty() &&
+                forbiddenForwardParams_.count(it->second))
+                forwardParamRef_ = std::string(name);
+            return it->second;
+        }
     }
     // An unqualified member name resolves as an implicit-`this`
     // reference — search the enclosing type AND its base types
@@ -2251,9 +2264,36 @@ void ExprTC::runMethodBody(
     narrowings_.clear();
     // §7.4 (issue #418): nullability narrowing is likewise method-local.
     nullNarrowed_.clear();
-    for (const auto& p : params) {
-        if (p.defaultValue) visitExpr(*p.defaultValue);
+    // §22.5 (issue #1160): a default-value expression may read parameters
+    // appearing EARLIER in the same parameter list; a reference to the
+    // parameter itself or to a LATER one is a forward reference that would read
+    // an uninitialized slot, and is rejected. While checking parameter i's
+    // default, mark params i..n-1 as forbidden (lookupName records the hit in
+    // forwardParamRef_), then report at the default expression.
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (!params[i].defaultValue) continue;
+        forbiddenForwardParams_.clear();
+        if (paramSyms) {
+            for (std::size_t j = i;
+                 j < params.size() && j < paramSyms->size(); ++j) {
+                if ((*paramSyms)[j])
+                    forbiddenForwardParams_.insert((*paramSyms)[j]);
+            }
+        }
+        forwardParamRef_.clear();
+        visitExpr(*params[i].defaultValue);
+        if (!forwardParamRef_.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, params[i].defaultValue->span.begin,
+                std::string("a default-value expression may not reference "
+                            "parameter `") +
+                    forwardParamRef_ +
+                    "` — a default may read only parameters declared earlier "
+                    "in the same list, not the parameter itself or a later one "
+                    "(§22.5)");
+        }
     }
+    forbiddenForwardParams_.clear();
     if (exprBody) visitExpr(*exprBody);
     if (stmts) {
         for (const auto& s : *stmts) {
