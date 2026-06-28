@@ -3193,7 +3193,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // §23 (#1192): mark the plain-`:=` target node so resolveMemberAccess
+        // exempts it from the write-only-property read diagnostic (a plain `:=`
+        // to a set-only property is a write; a compound `op=` reads first, so it
+        // is NOT exempt). Restored after the target is visited.
+        const ast::Expr* savedPlainSet = plainSetAssignTargetNode_;
+        plainSetAssignTargetNode_ = (as->op == ":=") ? as->target.get() : nullptr;
         if (as->target) visitExpr(*as->target);
+        plainSetAssignTargetNode_ = savedPlainSet;
         // §23.5: "Assigning to a member of a value-typed indexer result is a
         // compile error: `g[0].X := 5` would modify a discarded copy." A
         // value-typed indexer get returns a COPY (records/enums are value

@@ -174,6 +174,16 @@ private:
     // cleared) by visitExpr(LambdaExpr).
     TypeRef* pendingLambdaParamType_ = nullptr;
 
+    // §23 (#1192): the member-access node that is the DIRECT target of a plain
+    // `:=` assignment (e.g. `c.X` in `c.X := 7`). Set around the assignment
+    // target's visitExpr in the AssignmentStmt handler; consumed by
+    // resolveMemberAccess to EXEMPT exactly that node from the write-only
+    // (set-only) property read diagnostic — a plain `:=` to a set-only property
+    // is a write (handled by the setter), but any other access position (a
+    // read, a compound-assignment target, an intermediate `.x` in a chain, an
+    // RHS) is a read and must be rejected.
+    const ast::Expr* plainSetAssignTargetNode_ = nullptr;
+
     // fix #829 / §A.7: when a lambda's expected type is a known function type
     // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a
     // call argument bound to a function-typed parameter), this holds those

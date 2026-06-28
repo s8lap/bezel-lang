@@ -5953,6 +5953,23 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
     }
 }
 
+// §23 (#1192): a property is WRITE-ONLY (set-only) iff it is a block-body
+// property whose accessor list declares a `set` arm but no `get` arm. The
+// expression-body (`=> e`) and auto (`X: int := …`) forms always have a getter,
+// so they are never write-only. Reading a write-only property is an error (it
+// has no getter to call). Indexers are accessed via IndexExpr, not a named
+// MemberAccessExpr, so this predicate is only consulted for named properties.
+static bool propertyDeclIsSetOnly(const ast::PropertyDecl* pd) {
+    if (!pd || pd->isIndexer ||
+        pd->bodyKind != ast::PropertyBodyKind::Block)
+        return false;
+    bool hasGet = false, hasSet = false;
+    for (const auto& acc : pd->accessors) {
+        if (acc.isSet) hasSet = true; else hasGet = true;
+    }
+    return hasSet && !hasGet;
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
@@ -8108,6 +8125,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        // §23 (#1192): reject a READ of a write-only (set-only) property — it has
+        // no getter. The direct target of a plain `:=` assignment is exempt (that
+        // is a write, dispatched to the setter); every other access position
+        // (a value read, a compound `op=` target, an intermediate `.x` in a
+        // chain, an RHS) is a read.
+        if (pd && propertyDeclIsSetOnly(pd) && &ma != plainSetAssignTargetNode_) {
+            ctx_.diagnostics().report(
+                Severity::Error, ma.span.begin,
+                std::string("property `") + std::string(pd->name) +
+                "` is write-only (it declares only a `set` accessor) and "
+                "cannot be read (§23)");
+        }
         if (pd && pd->type) {
             if (auto* rt = ctx_.resolvedType(*pd->type)) {
                 ctx_.setExprType(&ma,

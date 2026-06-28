@@ -30,6 +30,14 @@ bool hasNoSetterError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// §23 (#1192): the mirror diagnostic — reading a write-only (set-only) property.
+bool hasWriteOnlyError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("is write-only") != std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // §23.3: assignment to a block-form getter-only property is rejected.
@@ -81,4 +89,60 @@ BEZEL_TEST(getter_only_property_747, auto_property_ok) {
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasNoSetterError(r));
+}
+
+// §23 (#1192): reading a write-only (set-only block) property is rejected — it
+// has no getter. (Previously accepted, silently yielding 0.)
+BEZEL_TEST(getter_only_property_747, set_only_read_rejected_1192) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property Val: int set => do _x := value; end; end; "
+        "  public static method Main(): int "
+        "    using var c := new C(); c.Val := 7; return c.Val; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasWriteOnlyError(r));
+}
+
+// §23 (#1192): a compound `op=` on a set-only property READS first, so it is
+// also rejected (the plain `:=` exemption does not extend to compound forms).
+BEZEL_TEST(getter_only_property_747, set_only_compound_assign_rejected_1192) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property Val: int set => do _x := value; end; end; "
+        "  public static method Main(): int "
+        "    using var c := new C(); c.Val += 3; return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasWriteOnlyError(r));
+}
+
+// §23 (#1192): a plain `:=` write to a set-only property is NOT a read — it is
+// dispatched to the setter and must be accepted (no write-only error).
+BEZEL_TEST(getter_only_property_747, set_only_plain_write_ok_1192) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property Val: int set => do _x := value; end; end; "
+        "  public method Show(): int => _x; "
+        "  public static method Main(): int "
+        "    using var c := new C(); c.Val := 7; return c.Show(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasWriteOnlyError(r));
+}
+
+// §23 (#1192): a read-write (get+set) property read is unaffected — no error.
+BEZEL_TEST(getter_only_property_747, get_set_read_ok_1192) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property Val: int get => _x; set => do _x := value; end; end; "
+        "  public static method Main(): int "
+        "    using var c := new C(); c.Val := 9; return c.Val; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasWriteOnlyError(r));
 }
