@@ -2160,6 +2160,16 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // A non-virtual, non-interface method ref must have a concrete origFn.
     if (!origFn && !dynamicDispatch) return nullptr;
 
+    // #1170 / §24.4: reuse a cached thunk for this method so a named method
+    // reference resolves to a STABLE fn pointer (the cell's fn at offset 0).
+    // This lets `event -= OnTick` match the `event += OnTick` handler by value
+    // (fn + receiver) — see bz_event_remove_closure. The thunk body is
+    // receiver-independent (it loads `this` from env), so one thunk per method
+    // is correct. On a cache hit skip re-emitting the body and go straight to
+    // building a fresh closure cell with the current receiver.
+    if (auto cit = methodThunks_.find(ms); cit != methodThunks_.end())
+        return buildMethodClosureCell(cit->second, instMethod, receiverVal);
+
     // Build the thunk's parameter types: (ptr env, user_params...).
     std::vector<llvm::Type*> thunkParamTys;
     thunkParamTys.push_back(ptrTy());  // env_ptr
@@ -2278,6 +2288,16 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
+    // #1170 / §24.4: cache the thunk so subsequent references to this method
+    // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
+    methodThunks_[ms] = thunk;
+
+    return buildMethodClosureCell(thunk, instMethod, receiverVal);
+}
+
+llvm::Value* Emitter::buildMethodClosureCell(llvm::Function* thunk,
+                                             bool instMethod,
+                                             llvm::Value* receiverVal) {
     // Build closure cell { thunk_ptr, env_ptr, rc, envdtor }.
     // #422 / #672 / §27.6 / §28.9: a method reference is a runtime-managed
     // function value backed by the same closure cell as a lambda (now 32 bytes:
@@ -2288,6 +2308,9 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // for a method thunk holds a borrow and needs no typed disposal).
     // For a primitive/enum extension receiver the env block stores the raw value
     // bytes (≤ 8 bytes for all supported primitives).
+    // #1170: a FRESH cell+env is built per reference (the thunk fn is shared via
+    // the cache), so each reference still has its own rc/lifetime; equality is
+    // by the cell's { fn, receiver-in-env } value (bz_event_remove_closure).
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(

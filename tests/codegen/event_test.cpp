@@ -118,6 +118,55 @@ BEZEL_TEST(codegen_events_24, plus_equals_adds_handler_inside_class) {
         "end Main; end C;"), 10);  // 7 + 3
 }
 
+// §24.4 (#1170): `event -= OnTick` removes the named-method handler that
+// `event += OnTick` subscribed, so the handler stops firing. The two method
+// references resolve to the SAME function value (the spec note in §24.4: "the
+// same method reference resolves to the same function pointer"), matched by the
+// closure's { fn, receiver } value — not by wrapper-pointer identity. Before
+// the fix each method-group conversion built a fresh thunk/closure, so `-=`
+// never matched and both raises fired (returned 7).
+BEZEL_TEST(codegen_events_24, event_remove_named_method_handler_1170) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Counter "
+        "  public Total: int := 0; "
+        "  public event Tick: Ev; "
+        "  private method OnTick(e: Ev) Total := Total + e.N; end OnTick; "
+        "  public method Go() "
+        "    Tick += OnTick; Tick.Raise(new Ev(3)); "   // fires: Total = 3
+        "    Tick -= OnTick; Tick.Raise(new Ev(4)); "   // removed: no-op
+        "  end Go; "
+        "end Counter; "
+        "class C public static method Main(): int "
+        "  var c := new Counter(); c.Go(); return c.Total; "
+        "end Main; end C;"), 3);  // only the first Raise observed
+}
+
+// §24.4 (#1170): with two named-method handlers subscribed, `-=` removes the
+// FIRST matching handler and leaves the rest. Removing OnA stops its
+// contribution while OnB keeps firing.
+BEZEL_TEST(codegen_events_24, event_remove_named_method_first_match_only_1170) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Counter "
+        "  public Total: int := 0; "
+        "  public event Tick: Ev; "
+        "  private method OnA(e: Ev) Total := Total + e.N; end OnA; "
+        "  private method OnB(e: Ev) Total := Total + 10 * e.N; end OnB; "
+        "  public method Go() "
+        "    Tick += OnA; Tick += OnB; "
+        "    Tick.Raise(new Ev(1)); "   // both fire: 1 + 10 = 11
+        "    Tick -= OnA; "             // remove OnA only
+        "    Tick.Raise(new Ev(1)); "   // OnB fires: + 10
+        "  end Go; "
+        "end Counter; "
+        "class C public static method Main(): int "
+        "  var c := new Counter(); c.Go(); return c.Total; "
+        "end Main; end C;"), 21);  // 11 + 10
+}
+
 // §24.1 / §24.3: a no-payload event (`event Ping;`) has payload () and a
 // no-argument Raise()/() -> () handler (stdlib §6.5 EventSource<()> convenience).
 BEZEL_TEST(codegen_events_24, no_payload_event_raise_and_subscribe) {

@@ -441,6 +441,15 @@ private:
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
+    // #1170 / §24.4: cached method-reference thunk per method symbol. A named
+    // method reference (`event += OnTick`) must resolve to a STABLE function
+    // pointer so `event -= OnTick` removes the subscribed handler by value
+    // (fn + receiver) — see bz_event_remove_closure. Without caching, each
+    // makeMethodThunk call emits a fresh thunk$N, defeating the equality. The
+    // thunk body is receiver-independent (it loads `this` from the env block),
+    // so a single thunk per method is correct; the per-conversion receiver
+    // lives in the freshly-allocated env, never in the shared thunk.
+    std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodThunks_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
     std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
     // CG47 / fix #582 / §22.13: one entry per static-initialisation unit that
@@ -5644,6 +5653,12 @@ private:
     // The thunk has calling convention (ptr env, params...) -> ret.
     llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
                                  llvm::Value* receiverVal);
+
+    // #1170: build a fresh closure cell { thunk, env, rc, envdtor } wrapping a
+    // (possibly cached) method thunk and the current receiver. Shared by the
+    // cache-hit and cache-miss paths of makeMethodThunk.
+    llvm::Value* buildMethodClosureCell(llvm::Function* thunk, bool instMethod,
+                                        llvm::Value* receiverVal);
 
     // §27.6 (#756): a property reference in function-value position →
     // a closure whose thunk computes the getter on the captured receiver.

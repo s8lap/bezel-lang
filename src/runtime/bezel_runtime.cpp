@@ -5647,12 +5647,50 @@ extern "C" void* bz_event_handler_at(void* srcp, int64_t idx) {
     return nullptr;
 }
 
+// Two closure cells denote the SAME handler when their { fn, receiver } pair is
+// equal — NOT when the wrapper pointers themselves are identical. Each named
+// method reference (`event += OnTick`; `event -= OnTick`) materializes a FRESH
+// closure cell: the fn (offset 0) is the method's thunk — STABLE per method,
+// because codegen memoizes one thunk per method symbol (#1170) — and the env
+// (offset 8) is a freshly-allocated block holding the receiver. So the cell
+// handed to `-=` is a different allocation than the one stored by `+=`, with a
+// different env-block POINTER but the SAME thunk fn and the SAME receiver value
+// inside env. Comparing the fn and the receiver *value* (the env's first word)
+// makes `-=` find the handler. The identical-wrapper fast path also handles a
+// stored lambda/field variable removed via the same variable (per §24.4: the
+// same method reference compares equal; separately-built lambdas need not).
+//
+// Layout per bz_closure_release: fn at offset 0, env at offset 8. A non-null
+// env block is always >= 8 bytes (method-thunk env is sized to >= 8; a lambda
+// env stores pointer-sized capture words), so reading its first word is in
+// bounds. The env read is reached only when the fn pointers already match.
+static bool bz_closure_same(void* a, void* b) {
+    if (a == b) return true;        // identical wrapper (or both null)
+    if (!a || !b) return false;
+    void* a_fn; void* b_fn;
+    memcpy(&a_fn, a, sizeof(void*));
+    memcpy(&b_fn, b, sizeof(void*));
+    if (a_fn != b_fn) return false;
+    void* a_env; void* b_env;
+    memcpy(&a_env, (uint8_t*)a + 8, sizeof(void*));  // env ptr at offset 8
+    memcpy(&b_env, (uint8_t*)b + 8, sizeof(void*));
+    if (a_env == b_env) return true;        // same env (or both null): match
+    if (!a_env || !b_env) return false;     // one captures a receiver, one not
+    void* a_recv; void* b_recv;
+    memcpy(&a_recv, a_env, sizeof(void*));   // receiver = first word of env
+    memcpy(&b_recv, b_env, sizeof(void*));
+    return a_recv == b_recv;
+}
+
 extern "C" void bz_event_remove_closure(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;
     if (!s) return;
-    // §24.4: -= removes the FIRST matching handler.
+    // §24.4: -= removes the FIRST matching handler. A handler matches by the
+    // closure wrapper's { fn, env } VALUE, not by wrapper-pointer identity, so
+    // a method-group `-=` removes the corresponding `+=`. // per §24.4 (#1170)
     for (int64_t i = 0; i < s->count; ++i) {
-        if (s->handlers[i].active && s->handlers[i].closure == closure) {
+        if (s->handlers[i].active &&
+            bz_closure_same(s->handlers[i].closure, closure)) {
             s->handlers[i].active = false;
             return;
         }
