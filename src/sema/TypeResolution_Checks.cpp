@@ -506,6 +506,33 @@ void Resolver::checkConstTypes() {
     }
 }
 
+// per §22.12 (#1211): return true when `e` contains a division or modulo
+// node whose RHS folds to zero, making the expression unfoldable due to a
+// compile-time division by zero rather than because the expression is
+// structurally non-constant.  Only called for integer-const initializers
+// that have already passed the shape-constant check (isConstInitExpr), so
+// the tree only contains literals, unary ops, binary ops, and const refs.
+static bool containsConstDivByZero(
+    const ast::Expr& e,
+    const std::function<std::optional<long long>(std::string_view, int)>&
+        resolve,
+    int depth = 0) {
+    if (depth > 64) return false;
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (!b->left || !b->right) return false;
+        if (b->op == "/" || b->op == "mod") {
+            auto r = foldIntConst(*b->right, resolve, depth + 1);
+            if (r && *r == 0) return true;
+        }
+        return containsConstDivByZero(*b->left, resolve, depth + 1) ||
+               containsConstDivByZero(*b->right, resolve, depth + 1);
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return u->operand &&
+               containsConstDivByZero(*u->operand, resolve, depth + 1);
+    return false;
+}
+
 void Resolver::checkTypeConsts(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstMemberSymbol*>(m);
@@ -572,6 +599,19 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                         " does not fit its declared type — a const initializer "
                         "must be a representable compile-time constant "
                         "(§6.1 / Appendix C.11)");
+                }
+            } else {
+                // per §22.12 (#1211): the initializer is structurally a
+                // constant expression (passed isConstInitExpr) but
+                // foldIntConst returned nullopt — report the specific cause
+                // when it is a division or modulo by zero.
+                if (containsConstDivByZero(*cd->value, resolve)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("const `") + std::string(cs->name) +
+                        "` initializer contains a division or modulo by "
+                        "zero — a const initializer must fold to a "
+                        "representable compile-time-constant value (§22.12)");
                 }
             }
         }

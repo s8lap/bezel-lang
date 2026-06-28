@@ -82,7 +82,9 @@ std::optional<long long> foldIntConst(
         if (b->op == "*") return *l * *r;
         if (b->op == "/")
             return *r == 0 ? std::nullopt : std::optional<long long>(*l / *r);
-        if (b->op == "%")
+        // §2 / §22.12 (#1211): `mod` is Bezel's modulo keyword; it maps to
+        // the same C++ `%` operation with the same zero-divisor guard.
+        if (b->op == "%" || b->op == "mod")
             return *r == 0 ? std::nullopt : std::optional<long long>(*l % *r);
         // §6.5 (#1210): mask the shift count by the left operand's bit width
         // so the const-fold matches the runtime value produced by the §6.5
