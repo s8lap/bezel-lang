@@ -719,7 +719,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         if (targetTy2 &&
                             targetTy2->kind == sema::TypeRef::Kind::Named &&
                             targetTy2->declaration) {
-                            auto* ps = findIndexer(targetTy2->declaration);
+                            auto* ps = selectIndexer(targetTy2->declaration,
+                                                     *ix);  // per §23.4 (#1172)
                             auto* pd = ps ? dynamic_cast<const ast::PropertyDecl*>(
                                                ps->decl) : nullptr;
                             if (ps && pd) {

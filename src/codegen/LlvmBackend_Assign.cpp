@@ -37,6 +37,52 @@ const sema::PropertySymbol* Emitter::findIndexer(
                    // exactly (e.g. a widening index) → the first indexer
 }
 
+// §23.4 (#1172): select the indexer OVERLOAD for `ix` by its FULL parameter
+// list (arity + every parameter type), not just the first parameter as
+// findIndexer does (#774). The prior first-parameter-only match selected the
+// wrong overload when overloads shared a first parameter type (`[r,c]` vs
+// `[r,s]` → IR_FAIL when the wrong getter bound a string to an int param), and
+// picked a 1-parameter overload for a 2-argument call (dropping the extra index
+// → WRONG_VALUE). Candidates are gathered over the receiver type and its bases.
+// Selection mirrors the sema selector in ExprTypecheck_Exprs.cpp so codegen
+// lowers exactly the overload sema typed: an exact full-list match wins; failing
+// that the sole/first arity-matching candidate is used (its arguments coerced at
+// the call site, preserving the single-indexer widening path). Null when no
+// candidate's arity matches (sema has already reported §23.4).
+const sema::PropertySymbol* Emitter::selectIndexer(
+    const sema::TypeSymbol* ts, const ast::IndexExpr& ix) const {
+    if (!ts) return nullptr;
+    const std::size_t nargs = ix.indices.size();
+    std::vector<const sema::TypeRef*> argTys;
+    argTys.reserve(nargs);
+    for (const auto& idx : ix.indices)
+        argTys.push_back(idx.value ? ctx_.exprType(*idx.value) : nullptr);
+    const sema::PropertySymbol* arityOnly = nullptr;
+    std::vector<const sema::TypeSymbol*> frontier{ts};
+    for (std::size_t fi = 0; fi < frontier.size(); ++fi) {
+        const sema::TypeSymbol* t = frontier[fi];
+        for (const sema::Symbol* m : t->members) {
+            auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+            if (!ps || !ps->isIndexer) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd || pd->indexerParams.size() != nargs) continue;
+            if (!arityOnly) arityOnly = ps;
+            bool all = true;
+            for (std::size_t k = 0; k < nargs; ++k) {
+                const sema::TypeRef* pty =
+                    pd->indexerParams[k].type
+                        ? ctx_.resolvedType(*pd->indexerParams[k].type)
+                        : nullptr;
+                if (!indexerArgMatches(pty, argTys[k])) { all = false; break; }
+            }
+            if (all) return ps;  // exact full-parameter-list match
+        }
+        for (const sema::TypeSymbol* b : t->baseTypes)
+            if (b) frontier.push_back(b);
+    }
+    return arityOnly;  // sole/first arity match (implicit conv), or null
+}
+
 
 // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read `a[i]` /
 // `dict[key]` against the runtime backing. Mirrors the `.Get(i)` (§4.5) and
@@ -1041,7 +1087,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         return nullptr;
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
     if (!recvDecl) return nullptr;
-    auto* ps = findIndexer(recvDecl, ctx_.exprType(*ix.indices[0].value));
+    auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
@@ -1259,7 +1305,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         return false;
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
     if (!recvDecl) return false;
-    auto* ps = findIndexer(recvDecl, ctx_.exprType(*ix.indices[0].value));
+    auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;
@@ -1442,7 +1488,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     // [i]: T declaration). Built-in arrays fall through to lvalueAddr instead.
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix->target.get());
     if (!recvDecl) return false;
-    auto* ps = findIndexer(recvDecl, ctx_.exprType(*ix->indices[0].value));
+    auto* ps = selectIndexer(recvDecl, *ix);  // per §23.4 (#1172)
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return false;

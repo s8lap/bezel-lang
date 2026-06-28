@@ -2363,6 +2363,20 @@ private:
         const sema::TypeSymbol* ts,
         const sema::TypeRef* argTy = nullptr) const;
 
+    // §23.4 (#1172): select the indexer OVERLOAD for the access `ix` by its
+    // FULL parameter list — the candidate's parameter count must equal the
+    // number of index arguments AND each parameter type must structurally match
+    // the corresponding argument (an exact full-list match is preferred; a sole
+    // arity-matching candidate is accepted, leaving implicit conversion to the
+    // per-argument coercion at the call site). Candidates are gathered over the
+    // receiver type and its base types (an inherited indexer is a valid
+    // candidate), mirroring the sema selector in ExprTypecheck_Exprs.cpp.
+    // Returns null when no candidate's arity matches. Unlike findIndexer (which
+    // keys only on the first parameter, #774), this never drops or mis-binds
+    // later index arguments.
+    const sema::PropertySymbol* selectIndexer(
+        const sema::TypeSymbol* ts, const ast::IndexExpr& ix) const;
+
     // §22.10/§23.4 (#747 R42): resolve the receiver TypeSymbol of an indexer
     // access `target[i]`. Normally the target's sema exprType carries the
     // declaration; but `this[i]` inside an instance method has no sema exprType

@@ -951,43 +951,75 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // a borrow, so returning it from an owned `using var` local is
                 // not a borrow escape (a CLASS/borrow-typed result still is).
                 else if (tt->kind == TypeRef::Kind::Named && tt->declaration) {
-                    // §23.4 (#774): with overloaded indexers the result type
-                    // depends on WHICH overload the argument selects. Among this
-                    // type's own indexers, pick the one whose first parameter
-                    // type matches the index argument's type; fall back to the
-                    // transitive `.this` lookup (the first indexer, incl.
-                    // inherited) when the arg type is unknown or no own overload
-                    // matches exactly — preserving the prior single-indexer path.
-                    const TypeRef* argTy =
-                        (!ix->indices.empty() && ix->indices[0].value)
-                            ? ctx_.exprType(*ix->indices[0].value)
-                            : nullptr;
-                    PropertySymbol* ps = nullptr;
-                    if (argTy) {
-                        for (Symbol* m : tt->declaration->members) {
-                            auto* cand = dynamic_cast<PropertySymbol*>(m);
-                            if (!cand || !cand->isIndexer) continue;
-                            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
-                                cand->decl);
-                            if (!cpd || cpd->indexerParams.empty() ||
-                                !cpd->indexerParams[0].type)
-                                continue;
-                            const TypeRef* pty = ctx_.resolvedType(
-                                *cpd->indexerParams[0].type);
-                            if (pty && pty->kind == argTy->kind &&
-                                (pty->kind == TypeRef::Kind::Primitive
-                                     ? pty->primitive == argTy->primitive
-                                     : pty->kind == TypeRef::Kind::Named
-                                         ? pty->declaration == argTy->declaration
-                                         : false)) {
-                                ps = cand;
-                                break;
+                    // §23.4 (#1172): resolve the indexer OVERLOAD for
+                    // `obj[a, b, ...]` by its FULL parameter list — the
+                    // candidate's parameter COUNT must equal the number of index
+                    // arguments AND every parameter type must match the
+                    // corresponding argument (an exact structural match is
+                    // preferred; a sole arity-matching candidate is accepted with
+                    // implicit conversion, as the single-indexer path always
+                    // has). Candidates are gathered over the receiver type and
+                    // its bases (an inherited indexer is a valid candidate),
+                    // mirroring lookupMember's frontier walk and the codegen
+                    // selector (Emitter::selectIndexer) so codegen lowers exactly
+                    // the overload typed here. This replaces the prior
+                    // first-parameter-only match (#774), which ignored arity and
+                    // later parameters: it selected the wrong overload (`[r,c]`
+                    // vs `[r,s]` → IR_FAIL), or a 1-parameter overload for a
+                    // 2-argument call (dropping the extra index → WRONG_VALUE),
+                    // and accepted an arity-mismatched call outright.
+                    const std::size_t nargs = ix->indices.size();
+                    std::vector<const TypeRef*> argTys;
+                    argTys.reserve(nargs);
+                    for (const auto& idxArg : ix->indices)
+                        argTys.push_back(idxArg.value
+                                             ? ctx_.exprType(*idxArg.value)
+                                             : nullptr);
+                    auto allParamsMatch =
+                        [&](const ast::PropertyDecl* cpd) -> bool {
+                        for (std::size_t k = 0; k < nargs; ++k) {
+                            const TypeRef* a = argTys[k];
+                            const TypeRef* p =
+                                cpd->indexerParams[k].type
+                                    ? ctx_.resolvedType(
+                                          *cpd->indexerParams[k].type)
+                                    : nullptr;
+                            if (!p || !a || p->kind != a->kind) return false;
+                            if (p->kind == TypeRef::Kind::Primitive) {
+                                if (p->primitive != a->primitive) return false;
+                            } else if (p->kind == TypeRef::Kind::Named) {
+                                if (p->declaration != a->declaration)
+                                    return false;
+                            } else {
+                                return false;
                             }
                         }
+                        return true;
+                    };
+                    PropertySymbol* ps = nullptr;        // exact full-list match
+                    PropertySymbol* arityOnly = nullptr;  // first arity match
+                    bool anyIndexer = false;
+                    std::vector<TypeSymbol*> frontier{tt->declaration};
+                    for (std::size_t fi = 0; fi < frontier.size() && !ps; ++fi) {
+                        TypeSymbol* t = frontier[fi];
+                        for (Symbol* m : t->members) {
+                            auto* cand = dynamic_cast<PropertySymbol*>(m);
+                            if (!cand || !cand->isIndexer) continue;
+                            anyIndexer = true;
+                            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
+                                cand->decl);
+                            if (!cpd || cpd->indexerParams.size() != nargs)
+                                continue;
+                            if (!arityOnly) arityOnly = cand;
+                            if (allParamsMatch(cpd)) { ps = cand; break; }
+                        }
+                        for (TypeSymbol* b : t->baseTypes)
+                            if (b) frontier.push_back(b);
                     }
-                    if (!ps)
-                        ps = dynamic_cast<PropertySymbol*>(
-                            lookupMember(tt->declaration, ".this"));
+                    // No exact full-list match: a sole arity-matching candidate
+                    // is the selection (the arguments are implicitly converted,
+                    // exactly as the single-indexer path always did).
+                    if (!ps) ps = arityOnly;
                     if (ps && ps->isIndexer) {
                         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
                                 ps->decl)) {
@@ -999,6 +1031,17 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                                 ps->parent));
                             }
                         }
+                    } else if (anyIndexer && nargs > 0) {
+                        // §23.4: the receiver declares indexer(s) but none has
+                        // the argument count — e.g. `g[i, j]` against a
+                        // 1-parameter indexer (previously accepted, silently
+                        // dropping the extra index). Reject cleanly.
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin,
+                            "no indexer overload matches the " +
+                                std::to_string(nargs) +
+                                (nargs == 1 ? " argument" : " arguments") +
+                                " (§23.4)");
                     }
                 }
             }
