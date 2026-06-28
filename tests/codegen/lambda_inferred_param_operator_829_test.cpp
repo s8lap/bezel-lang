@@ -153,3 +153,65 @@ BEZEL_TEST(lambda_inferred_param_operator_829, aggregate_explicit_params_1124) {
         "  return xs.Aggregate(0, (acc: int, x: int) => acc + x); "
         "end Main; end C;"), 15);
 }
+
+// ── #1140: class (receiver) type parameter substituted into function-typed ──
+//           method parameter during lambda param inference (§14 / §27.4)
+//
+// A method on a generic class Box<T> that takes a function-typed parameter
+// `(T)->T` — the class type param T must be substituted with the concrete
+// bound arg (int from `Box<int>`) so the untyped lambda `(x)=>x*3` infers
+// x:int and the body's `x*3` resolves to `int*int`.  Before the fix the class
+// type param was not applied and the lambda param stayed `?`, causing
+// "operator * not defined for type `?`" (BAD_REJECT).
+
+// Plain generic class: Map((x)=>x*3) on Box<int>(10) should return 30.
+BEZEL_TEST(lambda_inferred_param_operator_829, class_recv_tp_in_func_param_1140) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public method Map(f: (T) -> T): T => f(_v); "
+        "end Box; "
+        "class App "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(10); "
+        "    return b.Map((x) => x * 3); "
+        "  end Main; "
+        "end App;"), 30);
+}
+
+// Two type params: Box2<T,U> with Map2(f:(T)->U):U — T:=int, U:=int, f
+// doubles its input (10*2=20), result 20.
+BEZEL_TEST(lambda_inferred_param_operator_829, class_recv_two_tp_in_func_param_1140) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box2<T, U> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public method Map2(f: (T) -> U): U => f(_v); "
+        "end Box2; "
+        "class App "
+        "  public static method Main(): int "
+        "    using var b := new Box2<int, int>(10); "
+        "    return b.Map2((x) => x * 2); "
+        "  end Main; "
+        "end App;"), 20);
+}
+
+// Regression: explicit annotation still works (x:int explicit, not inferred).
+BEZEL_TEST(lambda_inferred_param_operator_829, class_recv_explicit_ann_still_works_1140) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public method Map(f: (T) -> T): T => f(_v); "
+        "end Box; "
+        "class App "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(10); "
+        "    return b.Map((x: int) => x * 3); "
+        "  end Main; "
+        "end App;"), 30);
+}

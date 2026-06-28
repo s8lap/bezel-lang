@@ -2991,9 +2991,84 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 *calleeMd2->params[pos2].type)) {
                             if (pt->kind == TypeRef::Kind::Function &&
                                 !pt->funcParams.empty()) {
+                                // #1140 / §14: a function-typed param `(T)->R`
+                                // on a generic class Box<T> instantiated as
+                                // Box<int> must yield `(int)->R` for lambda
+                                // param inference, not the raw class type-param
+                                // T. Build the class-level substitution map
+                                // from the receiver's bound generic args
+                                // (mirrors substituteMemberType's direct path).
+                                std::unordered_map<std::string_view, TypeRef*>
+                                    classSubst;
+                                if (auto* ms2 = dynamic_cast<
+                                        sema::MethodSymbol*>(calleeSym2)) {
+                                    TypeSymbol* parentTs = ms2->parent;
+                                    if (parentTs &&
+                                        !parentTs->genericParams.empty()) {
+                                        const ast::Expr* recv = nullptr;
+                                        if (auto* maC = dynamic_cast<
+                                                const ast::MemberAccessExpr*>(
+                                                    ce->callee.get()))
+                                            recv = maC->target.get();
+                                        TypeRef* recvTy =
+                                            recv ? ctx_.exprType(*recv)
+                                                 : nullptr;
+                                        // Fallback: local/param declared type.
+                                        if (recv && (!recvTy ||
+                                            recvTy->declaration != parentTs ||
+                                            recvTy->genericArgs.empty())) {
+                                            Symbol* sym =
+                                                ctx_.exprSymbol(*recv);
+                                            if (auto* loc = dynamic_cast<
+                                                    LocalSymbol*>(sym)) {
+                                                if (loc->declType &&
+                                                    loc->declType->declaration
+                                                        == parentTs &&
+                                                    !loc->declType->genericArgs
+                                                        .empty())
+                                                    recvTy = loc->declType;
+                                            } else if (auto* par =
+                                                           dynamic_cast<
+                                                               ParameterSymbol*>(
+                                                               sym)) {
+                                                if (par->declType) {
+                                                    if (auto* prt =
+                                                            ctx_.resolvedType(
+                                                                *par->declType))
+                                                        if (prt->declaration
+                                                                == parentTs &&
+                                                            !prt->genericArgs
+                                                                .empty())
+                                                            recvTy = prt;
+                                                }
+                                            }
+                                        }
+                                        if (recvTy &&
+                                            recvTy->declaration == parentTs &&
+                                            !recvTy->genericArgs.empty()) {
+                                            for (std::size_t gi = 0;
+                                                 gi < parentTs->genericParams
+                                                              .size() &&
+                                                 gi < recvTy->genericArgs
+                                                              .size(); ++gi) {
+                                                if (parentTs->genericParams[gi]
+                                                    && recvTy->genericArgs[gi])
+                                                    classSubst[parentTs
+                                                        ->genericParams[gi]
+                                                        ->name] =
+                                                        recvTy->genericArgs[gi];
+                                            }
+                                        }
+                                    }
+                                }
                                 pendingLambdaParamTypes_.clear();
-                                for (const auto& fp : pt->funcParams)
-                                    pendingLambdaParamTypes_.push_back(fp.type);
+                                for (const auto& fp : pt->funcParams) {
+                                    TypeRef* paramTy = fp.type;
+                                    if (!classSubst.empty())
+                                        paramTy = substituteReturnType(
+                                            paramTy, classSubst);
+                                    pendingLambdaParamTypes_.push_back(paramTy);
+                                }
                             }
                         }
                     }
