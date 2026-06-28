@@ -7490,20 +7490,40 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
             continue;
         }
         // R40 / §9.5: a `with`-replacement of a nullable VALUE-type field must
-        // store the tagged {i8,T} struct, not the raw scalar — otherwise the
-        // scalar overwrites the hasValue byte and leaves the value half stale
-        // (wrong value, or coincidentally non-null). Wrap the replacement value
-        // exactly as the positional-constructor path does. (Narrow nullable
-        // fields like `byte?`, where the lowered value width differs from the
-        // element width, are a separate gap tracked in the R40 follow-up.)
+        // store the tagged {i8,T} struct, not the raw scalar/payload — otherwise
+        // the bare value overwrites the hasValue byte and leaves the value half
+        // stale (wrong value, or coincidentally non-null). Wrap the replacement
+        // value exactly as the positional-constructor path does.
+        // fix #1130 / §9.7: the value-half T may itself be a STRUCT — a nullable
+        // RECORD field (`Inner?`) whose override is a non-null record value
+        // `new Inner(5)` of type `%record.Inner`. The old guard `!isStructTy()`
+        // excluded exactly that case, so the non-null→nullable widening was
+        // skipped: the bare `%record.Inner` was stored over the `{i8,%record.Inner}`
+        // slot, clobbering the tag and leaving the payload half = the source
+        // record's bytes (rc=3 in the repro; zeroed payload when source was null).
+        // Wrap whenever `v` is not already the tagged struct, matching the value
+        // half by exact type or layout-identity (the specialized-vs-unspecialized
+        // record-struct mismatch a monomorphized body induces, #460). (Narrow
+        // nullable fields like `byte?`, where the lowered value width differs from
+        // the element width, are a separate gap tracked in the R40 follow-up.)
         if (const sema::TypeRef* fty = recordMemberTypeResolved(m)) {
-            if (isNullableValueTy(fty) && !v->getType()->isStructTy()) {
+            if (isNullableValueTy(fty)) {
                 auto* expectedSt = nullableValueStructTy(fty);
-                if (v->getType()->isPointerTy() &&
-                    llvm::isa<llvm::ConstantPointerNull>(v))
+                llvm::Type* slotTy = expectedSt->getElementType(1);
+                if (v->getType() == expectedSt) {
+                    // Already the tagged {i8,T} struct (override value already
+                    // typed T?, variant A) — store as-is.
+                } else if (v->getType()->isPointerTy() &&
+                           llvm::isa<llvm::ConstantPointerNull>(v)) {
                     v = nullableValueNull(fty);
-                else if (v->getType() == expectedSt->getElementType(1))
+                } else if (v->getType() == slotTy) {
                     v = wrapNullableValue(fty, v);
+                } else if (auto* vSt =
+                               llvm::dyn_cast<llvm::StructType>(v->getType())) {
+                    if (auto* sSt = llvm::dyn_cast<llvm::StructType>(slotTy))
+                        if (vSt->isLayoutIdentical(sSt))
+                            v = wrapNullableValue(fty, v);
+                }
             }
         }
         builder_.CreateStore(v, slot);
