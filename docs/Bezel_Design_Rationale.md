@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.154 — June 2026**
+**Companion to the Bezel Language Specification, v0.155 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7178,6 +7178,28 @@ Language spec: §7.7 (the `??`-ownership cross-reference) and §28.3 (the `a ?? 
 #### Migration
 
 Source-breaking only for code that was already wrong. A program that named a user type after a primitive alias was already at risk of silent shadowing and now gets a clear diagnostic (rename the type). A `??` over an owned arm mixed with a borrowed arm now reports the same ownership-merge error an equivalent `if`/`else` already reported. The `??`-ownership and shift fixes otherwise change only previously-leaking or previously-miscomputed programs; nothing sound stops compiling.
+
+### v0.155 changelog (v0.154 → v0.155)
+
+v0.155 settles two standard-library surface questions surfaced by the implementation and corrects one documentation defect. Like the revisions before it, it changes no capability; it pins down values and surfaces the foundations already implied, and removes a sentence that contradicted the rest of the document.
+
+#### The questions
+
+- **Default `DateTime.ToString()` format (#1114).** A `DateTime` inherits `ToString()` from `Object` (language spec §8.1) and additionally declares `ToString(format)`, but the *default* rendering produced by the no-argument form was never stated. The resolution defines it as the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` — the same value already produced when a `DateTime` is interpolated into a string with no format specifier, so the explicit and implicit no-format paths agree. `ToString(format)` continues to select an explicit format. No new capability: a value the language already rendered one way (interpolation) is now stated for the method form too.
+
+- **Dictionary write surface — there is no `.Set` method (#1112).** The owning- and borrowing-dictionary types expose their write surface as the indexer (`dict[key] := value`, add-or-update) and `Add(key, value)` (insert, raising on a duplicate key); neither §4.8 nor §4.9 ever listed a `Set` method. The resolution states this explicitly and pins the convention for *all* collection types: the write surface is the indexer or the type's own insertion method (`Add` / `Push` / `Enqueue`), and there is no `Set` method on any collection — a `.Set(...)` call is rejected as an unknown member. This follows the established library model (a hash map's update is its indexer, not a named setter) and lets the collection method-surface validation reject `OwnedArray.Set` and its siblings, directing the author to `arr[i] := v`.
+
+#### The defect
+
+- **Owning-collection borrow capabilities listed non-existent materializers (#1109).** §28.6, enumerating the operations available on a *borrow* of an owning collection, listed "the materializers `ToArray` / `Sorted` / `Reversed`." This contradicted stdlib §4.5 — owning collection types deliberately have **no** value-copy materializers at all, because a uniquely-owned element cannot be copied out without double-owning or draining it — and §28.11's element-slot policy, and it was unsound in practice: a borrowing snapshot of an owning collection is an unchecked use-after-free (the snapshot is invalidated by any owning operation, which Bezel does not track). The sentence is corrected to drop the materializers and note that they are simply not part of the owning collection's surface, on a borrow or otherwise. A genuinely sound borrowing-snapshot remains a deferred future feature (it needs the §28.11 borrow-storing-primitive lifetime rules).
+
+#### Touched
+
+Standard library: §2.5 (the `DateTime` no-argument `ToString()` declaration and its ISO 8601 default); §4.8 (the dictionary write-surface paragraph, covering §4.9 by the same convention). Language spec: §28.6 (the owning-collection-borrow read-operation list no longer lists the materializers). No grammar or semantic rule changes. Compiler (implementation, following this revision): the no-argument `DateTime.ToString()` lowers to the runtime default-format formatter (ISO 8601) (#1114); collection method-surface validation rejects a `.Set` call and other non-surface members (#1112 / #920). The §28.6 correction needs no code — the implementation already rejects the materializers on `Owned*` receivers. Version headers bumped to v0.155.
+
+#### Migration
+
+Source-breaking only for code that was already wrong or relied on an unspecified value. A `.Set(...)` call on a collection now reports an unknown-member error (use the indexer `coll[k] := v` or the type's insertion method). A no-argument `DateTime.ToString()` that previously produced an empty/garbage string (and crashed when its result was used) now returns the ISO 8601 rendering. Nothing sound stops compiling.
 
 ---
 

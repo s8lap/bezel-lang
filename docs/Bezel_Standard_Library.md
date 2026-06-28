@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.154 — June 2026**
+**Companion to the Bezel Language Specification, v0.155 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -224,6 +224,7 @@ public record DateTime
 
   public method ToUtc(): DateTime;
   public method ToLocal(): DateTime;
+  public method ToString(): string;                // ISO 8601: "yyyy-MM-ddTHH:mm:ss"
   public method ToString(format: string): string;
 
   public static method Parse(s: string): DateTime;
@@ -268,6 +269,8 @@ end TimeSpan;
 ```
 
 `DateOnly` and `TimeOnly` are similar value records carrying only the date or time components, respectively.
+
+The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` (e.g. `2024-03-15T00:00:00`); it is the value also used when a `DateTime` is interpolated into a string with no format specifier. `ToString(format)` selects an explicit format.
 
 <a id="sec-guid"></a>
 ### 2.6 `Guid`
@@ -1440,6 +1443,8 @@ end IEqualityComparer;
 ```
 
 Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `TryGetValue` for safe lookup.
+
+The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwnedDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member.
 
 Iteration over a `Dictionary<K, V>` — `for var entry in dict do ... end` — yields `DictionaryEntry<K, V>` values (the element type of the `ICollection<DictionaryEntry<K, V>>` conformance), one per live entry in a single pass, in insertion order. `entry.Key` and `entry.Value` read the entry; for class-typed values, `entry.Value` is a *borrow* of the stored value — the dictionary retains ownership (the borrowing column of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). Removing a key and re-adding it places it at the end of the iteration order. `Clear()` resets the order. `Contains(key)` is an alias for `ContainsKey(key)`, enabling the `in` operator (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) to test key membership: `key in dict` is equivalent to `dict.ContainsKey(key)`.
 
