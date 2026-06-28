@@ -1656,7 +1656,22 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // double-dispose. Run after recordMovesIn so a `move`d-owned RHS has
     // already transferred and is correctly NOT seen as a borrow.
     if (indexerSetterTakesOwned(*as.target)) {
-        checkOwnedArgSource(*as.value, as.value->span.begin);
+        // §28.11 (#395/#1167): the owning-collection indexer setter TAKES
+        // ownership of the RHS exactly like `Add` — so a bare owned LOCAL must
+        // be CONSUMED (marked moved-from), or it is disposed TWICE: once by the
+        // slot and again by its scope-end auto-drop (the #1167 double-free
+        // SIGSEGV). Mirror `recordMovesInArgs`' owned-sink consumption: reject a
+        // borrow flowing into the owned slot, else record the implicit move of a
+        // bare owned-local source. A fresh `new` / owned-returning call has no
+        // local to consume; a `move`d local was already moved by recordMovesIn
+        // above (and is no longer a bare identifier here).
+        if (const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
+            if (!checkOwnedArgSource(*as.value, id->span.begin))
+                markMovedByName(id->name, id->span.begin);
+        } else {
+            checkOwnedArgSource(*as.value, as.value->span.begin);
+        }
     }
     if (const auto* id =
             dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {

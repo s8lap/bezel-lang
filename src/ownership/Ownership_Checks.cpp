@@ -2266,7 +2266,11 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
         if (tt->astNode && tt->astNode->name &&
             !tt->astNode->name->parts.empty()) {
             std::string_view cn = tt->astNode->name->parts[0];
-            return cn == "OwnedArray" || cn == "OwnedDictionary";
+            // #1167: OwnedBuffer<T>'s indexer setter also takes owned (stdlib
+            // §4.14) — it was omitted here, so `buf[i] := <owned local>` never
+            // consumed the RHS → double-free.
+            return cn == "OwnedArray" || cn == "OwnedDictionary" ||
+                   cn == "OwnedBuffer";
         }
         return false;
     }

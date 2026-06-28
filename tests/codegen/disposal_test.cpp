@@ -114,3 +114,74 @@ BEZEL_TEST(codegen_cg13, nested_do_blocks_dispose_inner_first) {
         "end; "
         "return afterInner * 10 + _n;"), 12);
 }
+
+// ── #1167 / §28.11: an owning-collection indexer-set `coll[i] := <owned> ──────
+// transfers ownership of the RHS to the slot exactly like Add. A bare owned
+// LOCAL must be CONSUMED (left moved-from), or it is disposed twice — once by
+// the slot and again by its scope-end auto-drop — a double-free SIGSEGV. The
+// destructor counter must be exactly 2 (the replaced slot value + the new value,
+// each disposed once), and the program must not crash. The full in-process JIT
+// run is the load-bearing check (a double-free crashes the shard).
+BEZEL_TEST(codegen_cg13, owning_array_indexer_set_bare_owned_local_single_dispose_1167) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "  public static method Main(): int "
+        "    do "
+        "      using var arr := new OwnedArray<C>(); arr.Add(new C()); "
+        "      var nv := new C(); arr[0] := nv; "          // bare owned local → consumed
+        "    end; "
+        "    return _n; "                                  // 2
+        "  end Main; end C;"), 2);
+}
+
+// #1167: OwnedBuffer indexer-set consumes the bare owned local too (the buffer
+// was omitted from indexerSetterTakesOwned, so it double-freed).
+BEZEL_TEST(codegen_cg13, owning_buffer_indexer_set_bare_owned_local_single_dispose_1167) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "  public static method Main(): int "
+        "    do "
+        "      using var buf := new OwnedBuffer<C>(2); buf[0] := new C(); "
+        "      var nv := new C(); buf[0] := nv; "
+        "    end; "
+        "    return _n; "                                  // 2
+        "  end Main; end C;"), 2);
+}
+
+// #1167 control: the explicit `move`d form was already correct — still 2.
+BEZEL_TEST(codegen_cg13, owning_array_indexer_set_move_local_single_dispose_1167) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "  public static method Main(): int "
+        "    do "
+        "      using var arr := new OwnedArray<C>(); arr.Add(new C()); "
+        "      var nv := new C(); arr[0] := move nv; "
+        "    end; "
+        "    return _n; "                                  // 2
+        "  end Main; end C;"), 2);
+}
+
+// #1167 control: a fresh `new` directly into the slot — single dispose, 2.
+BEZEL_TEST(codegen_cg13, owning_array_indexer_set_fresh_new_single_dispose_1167) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "  public static method Main(): int "
+        "    do "
+        "      using var arr := new OwnedArray<C>(); arr.Add(new C()); "
+        "      arr[0] := new C(); "
+        "    end; "
+        "    return _n; "                                  // 2
+        "  end Main; end C;"), 2);
+}
