@@ -1655,7 +1655,31 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // #720 B1).
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
+                // #1108: a `when` guard that THROWS supersedes the in-flight
+                // exception (E1); E1 must be freed exactly once. Expose E1 as
+                // the caught object LEAVING this arm for the duration of the
+                // guard so a guard `throw` routes through emitThrowValue's
+                // existing #397/#866 caught-exception free (LlvmBackend_Setup
+                // ~2142) — emitted at a LIVE insert point (before the throw's
+                // own branch) and already guarded against double-free by
+                // `isDirectRethrow` (a guard re-raising the SAME bound object
+                // keeps it in flight) and `throwLeavesArm`. This adds NO new
+                // free; it reuses the battle-tested path. Without it E1 leaked
+                // (the arm's `caughtException` disposal is registered only in
+                // armBB below, which is unreachable on the guard-throw edge).
+                // Restored immediately after the guard so armBB re-establishes
+                // its own caught-exception context from the correct outer state.
+                llvm::Value* savedGuardCaught = currentCaughtExc_;
+                std::string_view savedGuardCaughtName = currentCaughtName_;
+                llvm::BasicBlock* savedGuardArmTarget = caughtExcArmTarget_;
+                currentCaughtExc_ = exc;
+                currentCaughtName_ =
+                    arm.hasBinding ? arm.varName : std::string_view{};
+                caughtExcArmTarget_ = unwindBB();
                 llvm::Value* g = lowerExpr(*arm.guard);
+                currentCaughtExc_ = savedGuardCaught;
+                currentCaughtName_ = savedGuardCaughtName;
+                caughtExcArmTarget_ = savedGuardArmTarget;
                 if (diverged_) {
                     // §31.2.1 / §31.5 (#1097): the guard expression ITSELF threw
                     // (e.g. `catch E when throw new F()` — a `throw` is a
