@@ -6633,6 +6633,33 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
         captures.push_back(ce);
     }
+    // #1207 / §27.5/§22.3: captured outer ref/out params.
+    // A ref/out param lives in refParams_ (a pointer to the caller's storage),
+    // not paramSlots_, so the paramSlots_ loop above silently skips it.
+    // We capture the caller's pointer directly: the env field holds it, and
+    // inside the lambda the restored ptr-alloca is registered in cellVars_ with
+    // the param's element type, so boxedStorage routes reads/writes through the
+    // caller's storage — aliasing the caller's variable exactly as §27.5 requires
+    // ("modifications inside the lambda are visible outside, and vice versa").
+    // No heap cell is allocated; no RC obligation arises (the ref param is a
+    // borrow of the caller's storage, not owned by this method or the lambda).
+    std::vector<const sema::Symbol*> capturedRefParamSyms;
+    for (auto& [sym, addrElem] : refParams_) {
+        if (capturedSyms.find(sym) != capturedSyms.end())
+            capturedRefParamSyms.push_back(sym);
+    }
+    for (const sema::Symbol* sym : capturedRefParamSyms) {
+        auto& [callerPtr, elemTy] = refParams_[sym];
+        CaptureEntry ce;
+        ce.valTy    = elemTy;    // the value type behind the pointer
+        ce.envValue = callerPtr; // the pointer itself goes into the env field
+        ce.sym      = sym;
+        ce.decl     = nullptr;
+        // semaTy / releaseBoxInEnvdtor / freeCellInEnvdtor all stay at their
+        // zero-initialised defaults: the closure holds no ownership over the
+        // caller's storage, so the envdtor must not release or free anything.
+        captures.push_back(ce);
+    }
     // Box and collect captured outer locals.
     std::vector<const ast::Node*> capturedLocalDecls;
     for (auto& [decl, slot] : locals_) {

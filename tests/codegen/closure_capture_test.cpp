@@ -277,3 +277,60 @@ BEZEL_TEST(codegen_closures_27_5, while_iife_capture_and_loop_increment_spec_27_
         "  end Main; "
         "end C;"), 30);
 }
+
+// §27.5/§22.3 / #1207: a `ref` parameter captured by a lambda must alias
+// the caller's storage — the lambda's write goes through to the caller's
+// variable.  Before the fix, refParams_ was never consulted by the capture
+// loop (only paramSlots_ and locals_), so the symbol was silently dropped
+// from the closure env and the lambda's write was lost (rc=10, not 110).
+BEZEL_TEST(codegen_closures_27_5, ref_param_captured_by_lambda_1207) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Bump(ref x: int): int "
+        "    var f := () => do x := x + 100; return 0; end; "
+        "    var i := f(); "
+        "    return x; "   // must see the lambda's write: 10 + 100 = 110
+        "  end Bump; "
+        "  public static method Main(): int "
+        "    var v := 10; "
+        "    return Bump(ref v); "
+        "  end Main; "
+        "end C;"), 110);
+}
+
+// §27.5/§22.3 / #1207: same as above for `out` parameters — the lambda's
+// write reaches the caller's storage (3 + 7 = 10; before the fix rc=3).
+BEZEL_TEST(codegen_closures_27_5, out_param_captured_by_lambda_1207) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Produce(out x: int): int "
+        "    x := 3; "
+        "    var f := () => do x := x + 7; return 0; end; "
+        "    var i := f(); "
+        "    return x; "   // must see the lambda's write: 3 + 7 = 10
+        "  end Produce; "
+        "  public static method Main(): int "
+        "    var v: int; "
+        "    return Produce(out v); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// §27.5/§22.3 / #1207: read back via the outer method after the lambda runs
+// — confirms the write-back propagates to the caller's variable (not just
+// the local copy within the method).
+BEZEL_TEST(codegen_closures_27_5, ref_param_capture_visible_to_caller_1207) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method BumpRef(ref x: int): int "
+        "    var f := () => do x := x + 100; return 0; end; "
+        "    var i := f(); "
+        "    return 0; "
+        "  end BumpRef; "
+        "  public static method Main(): int "
+        "    var v := 10; "
+        "    var _ := BumpRef(ref v); "
+        "    return v; "   // caller observes 110 — write went through ref
+        "  end Main; "
+        "end C;"), 110);
+}
