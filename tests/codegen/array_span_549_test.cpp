@@ -883,3 +883,90 @@ BEZEL_TEST(array_span_549, readonly_span_setter_rejected_spec_4_15) {
         "  return 0; "
         "end Main; end C;"));
 }
+
+// ===========================================================================
+// §4.8/§4.9 v0.155 / #920 / #1112: `.Set()` is not a method on any collection;
+// undeclared methods on non-owning collections must be rejected cleanly
+// (not SIGSEGV). The write surface is the indexer `coll[i] := v`.
+// ===========================================================================
+
+// §4.5 / #920 / #1112: OwnedArray.Set(i,v) is rejected with an indexer hint.
+BEZEL_TEST(array_span_549, ownedarray_set_rejected_with_indexer_hint_920) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); a.Add(7); "
+        "  a.Set(0, 99); "  // §4.5/§4.8 v0.155: .Set is not a method — use a[0] := 99
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.3 / #920 / #1112: Array.Set(i,v) is rejected with an indexer hint.
+BEZEL_TEST(array_span_549, array_set_rejected_with_indexer_hint_920) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); a.Add(7); "
+        "  a.Set(0, 99); "  // §4.3/§4.8 v0.155: .Set is not a method — use a[0] := 99
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.8 / #920 / #1112: Dictionary.Set(k,v) is rejected with an indexer hint.
+BEZEL_TEST(array_span_549, dict_set_rejected_with_indexer_hint_920) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string,int>(); "
+        "  d.Set(\"x\", 99); "  // §4.8 v0.155: .Set is not a method — use d[\"x\"] := 99
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.8 / #920: Dictionary.Nope() is rejected with a clean diagnostic (was SIGSEGV).
+BEZEL_TEST(array_span_549, dict_undeclared_method_nope_rejected_cleanly_920) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<int,int>(); "
+        "  d.Nope(); "  // §4.8 / #920: unknown method on Dictionary → clean error
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// §4.10 / #920: Set<T>.Blah() is rejected with a clean diagnostic.
+BEZEL_TEST(array_span_549, set_undeclared_method_rejected_cleanly_920) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var s := new Set<int>(); "
+        "  s.Blah(); "  // §4.10 / #920: unknown method on Set → clean error
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// Anti-over-reject guard: real methods on Array/Dictionary still accepted.
+// §4.3/§4.8 / #920 / #1112.
+BEZEL_TEST(array_span_549, array_and_dict_real_surface_still_accepted_920) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a[0] := 99; "
+        "  using var d := new Dictionary<string,int>(); "
+        "  d.Add(\"k\", 1); d[\"k\"] := 42; "
+        "  var v := 0; d.TryGetValue(\"k\", out v); "
+        "  return a.Count + a.Where((x) => x > 10).Count() + v; "
+        // a=[99,20] after a[0]:=99; both >10; 2 + 2 + 42 = 46
+        "end Main; end C;", 46);
+}
+
+// Anti-over-reject guard: real methods on OwnedArray still accepted.
+// §4.5 / #920 / #1112.
+BEZEL_TEST(array_span_549, ownedarray_real_surface_still_accepted_920) {
+    expectValueAndAsanClean(
+        "module M; "
+        "class Cell public _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; end Cell; "
+        "class C public static method Main(): int "
+        "  using var a := new OwnedArray<Cell>(); "
+        "  a.Add(new Cell(5)); a.Add(new Cell(7)); "
+        "  a[0] := new Cell(9); "  // indexer-set disposes old Cell(5)
+        "  return a.Count + a.Get(0)._v + a.Get(1)._v; "  // 2 + 9 + 7 = 18
+        "end Main; end C;", 18);
+}

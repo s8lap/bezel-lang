@@ -2237,6 +2237,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         colName == "OwnedQueue" || colName == "OwnedLinkedList" ||
                         colName == "OwnedSet" || colName == "OwnedDictionary";
                     if (isOwningContainer) {
+                        // §4.8/§4.9 v0.155 (#920/#1112): `.Set()` is not a method
+                        // on any collection type; the indexer `coll[i] := v` or
+                        // `dict[key] := value` is the spec-declared write surface.
+                        // Emit a targeted hint before the generic "not in surface"
+                        // reject so the user knows exactly what to use instead.
+                        if (m == "Set") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "`.Set()` is not a method on any collection type "
+                                "(§4.8/§4.9 v0.155, #920/#1112): use the indexer "
+                                "`coll[i] := v` to update a slot in an "
+                                "array/stack/queue, or `dict[key] := value` to "
+                                "add-or-update a dictionary entry");
+                        } else {
                         auto allowedOwningMethod = [](std::string_view mm) -> bool {
                             return
                                 // §4.x native owning-collection surface (union over
@@ -2257,7 +2271,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "TryPopFirst" || mm == "TryPopLast" ||
                                 mm == "PopValue" || mm == "TryPopValue" ||
                                 mm == "TryAdd" || mm == "Take" || mm == "TryTake" ||
-                                mm == "Get" || mm == "Set" || mm == "TryGetValue" ||
+                                mm == "Get" || mm == "TryGetValue" ||
                                 mm == "GetOrAdd" ||
                                 mm == "UnionWith" || mm == "IntersectWith" ||
                                 mm == "ExceptWith" || mm == "IsSubsetOf" ||
@@ -2286,6 +2300,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // not double-report them.
                                 mm == "Where" || mm == "Select" ||
                                 mm == "SelectMany" || mm == "Skip" ||
+                                mm == "Take" ||
                                 mm == "SkipWhile" || mm == "TakeWhile" ||
                                 mm == "Distinct" || mm == "OrderBy" ||
                                 mm == "OrderByDescending" || mm == "ThenBy" ||
@@ -2312,6 +2327,103 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "collection's surface, a universal Object member, or "
                                 "a LINQ operator");
                         }
+                        }  // end else (m != "Set")
+                    }
+                    // §4.x / §22.5 (#920/#1112 v0.155): validate non-owning
+                    // collection method calls. A DIRECT non-owning-collection
+                    // receiver whose called method name is not on that family's
+                    // stdlib surface (nor a universal Object member / LINQ
+                    // operator / enumerable protocol) was silently accepted and
+                    // mis-lowered — e.g. `d.Nope()` on a Dictionary would produce
+                    // a SIGSEGV at runtime. Reject any name outside a generous
+                    // union of every valid non-owning-collection method.
+                    bool isNonOwningContainer =
+                        colName == "Array" || colName == "Stack" ||
+                        colName == "Queue" || colName == "Set" ||
+                        colName == "LinkedList" || colName == "Dictionary";
+                    if (isNonOwningContainer) {
+                        // §4.8/§4.9 v0.155 (#920/#1112): targeted hint for .Set.
+                        if (m == "Set") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "`.Set()` is not a method on any collection type "
+                                "(§4.8/§4.9 v0.155, #920/#1112): use the indexer "
+                                "`coll[i] := v` to update a slot in an "
+                                "array/stack/queue, or `dict[key] := value` to "
+                                "add-or-update a dictionary entry");
+                        } else {
+                        auto allowedNonOwningMethod = [](std::string_view mm) -> bool {
+                            return
+                                // §4.x native non-owning surface (union over
+                                // Array/Stack/Queue/Set/LinkedList/Dictionary).
+                                mm == "Add" || mm == "AddRange" || mm == "AddFirst" ||
+                                mm == "AddLast" || mm == "AddBefore" ||
+                                mm == "AddAfter" || mm == "Insert" ||
+                                mm == "Remove" || mm == "RemoveAt" ||
+                                mm == "RemoveFirst" || mm == "RemoveLast" ||
+                                mm == "RemoveNode" || mm == "Clear" ||
+                                mm == "Contains" || mm == "ContainsKey" ||
+                                mm == "IndexOf" || mm == "Find" || mm == "Sort" ||
+                                mm == "Reverse" || mm == "Push" || mm == "Pop" ||
+                                mm == "Peek" || mm == "TryPop" || mm == "TryPeek" ||
+                                mm == "Enqueue" || mm == "Dequeue" ||
+                                mm == "TryDequeue" || mm == "TryAdd" ||
+                                mm == "Get" || mm == "TryGetValue" || mm == "GetOrAdd" ||
+                                mm == "UnionWith" || mm == "IntersectWith" ||
+                                mm == "ExceptWith" || mm == "IsSubsetOf" ||
+                                mm == "IsSupersetOf" ||
+                                mm == "Count" || mm == "Capacity" ||
+                                mm == "Length" || mm == "IsEmpty" ||
+                                mm == "IsReadOnly" || mm == "Keys" ||
+                                mm == "Values" || mm == "First" || mm == "Last" ||
+                                mm == "FirstNode" || mm == "LastNode" ||
+                                // Dict-specific.
+                                mm == "PopValue" || mm == "TryPopValue" ||
+                                mm == "Drain" || mm == "DrainAndProcess" ||
+                                // Array/Stack/Queue-specific.
+                                mm == "PopAt" || mm == "PopFirst" || mm == "PopLast" ||
+                                mm == "TryPopFirst" || mm == "TryPopLast" ||
+                                mm == "AsSpan" || mm == "AsReadOnlySpan" ||
+                                mm == "DisposeElements" ||
+                                // universal Object members (§8.1) + IDisposable.
+                                mm == "ToString" || mm == "Equals" ||
+                                mm == "GetHashCode" || mm == "GetType" ||
+                                mm == "Dispose" ||
+                                // enumerable protocol.
+                                mm == "GetEnumerator" ||
+                                mm == "GetAsyncEnumerator" ||
+                                mm == "MoveNext" || mm == "MoveNextAsync" ||
+                                // borrowing LINQ operators (§5).
+                                mm == "Where" || mm == "Select" ||
+                                mm == "SelectMany" || mm == "Skip" ||
+                                mm == "Take" ||
+                                mm == "SkipWhile" || mm == "TakeWhile" ||
+                                mm == "Distinct" || mm == "OrderBy" ||
+                                mm == "OrderByDescending" || mm == "ThenBy" ||
+                                mm == "ThenByDescending" || mm == "GroupBy" ||
+                                mm == "Aggregate" || mm == "All" || mm == "Any" ||
+                                mm == "Average" || mm == "Sum" || mm == "Min" ||
+                                mm == "Max" || mm == "FirstOrNull" ||
+                                mm == "LastOrNull" || mm == "Single" ||
+                                mm == "SingleOrNull" || mm == "ElementAt" ||
+                                mm == "Concat" || mm == "Append" || mm == "Union" ||
+                                mm == "Intersect" || mm == "Except" || mm == "Zip" ||
+                                mm == "SequenceEqual" || mm == "OfType" ||
+                                mm == "Reversed" || mm == "Sorted" || mm == "Join" ||
+                                mm == "ForEach" || mm == "AsReadOnly" ||
+                                mm == "ToArray" || mm == "ToSet" ||
+                                mm == "ToDictionary" || mm == "ToList";
+                        };
+                        if (!allowedNonOwningMethod(m)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `" + std::string(colName) +
+                                "<T>` (§22.5 / §4.x) — it is not part of this "
+                                "collection's method surface, a universal Object "
+                                "member, or a LINQ operator");
+                        }
+                        }  // end else (m != "Set")
                     }
                     // Array/Stack/Queue/Set/LinkedList methods
                     bool isArrLike = colName == "Array" || colName == "OwnedArray" ||

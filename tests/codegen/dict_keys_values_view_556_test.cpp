@@ -57,9 +57,9 @@ BEZEL_TEST(dict_keys_values_view_556, keys_count_string_keyed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 10); "
-        "  d.Set(\"b\", 20); "
-        "  d.Set(\"c\", 30); "
+        "  d[\"a\"] := 10; "
+        "  d[\"b\"] := 20; "
+        "  d[\"c\"] := 30; "
         "  return d.Keys.Count; "
         "end Main; end C;"), 3);
 }
@@ -78,7 +78,7 @@ BEZEL_TEST(dict_keys_values_view_556, keys_count_one_entry) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"only\", 42); "
+        "  d[\"only\"] := 42; "
         "  return d.Keys.Count; "
         "end Main; end C;"), 1);
 }
@@ -94,8 +94,8 @@ BEZEL_TEST(dict_keys_values_view_556, values_count_string_keyed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"x\", 1); "
-        "  d.Set(\"y\", 2); "
+        "  d[\"x\"] := 1; "
+        "  d[\"y\"] := 2; "
         "  return d.Values.Count; "
         "end Main; end C;"), 2);
 }
@@ -114,9 +114,9 @@ BEZEL_TEST(dict_keys_values_view_556, values_count_matches_dict_count) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 100); "
-        "  d.Set(\"b\", 200); "
-        "  d.Set(\"c\", 300); "
+        "  d[\"a\"] := 100; "
+        "  d[\"b\"] := 200; "
+        "  d[\"c\"] := 300; "
         "  return d.Values.Count; "
         "end Main; end C;"), 3);
 }
@@ -133,8 +133,8 @@ BEZEL_TEST(dict_keys_values_view_556, keys_to_array_count_string_keyed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"p\", 1); "
-        "  d.Set(\"q\", 2); "
+        "  d[\"p\"] := 1; "
+        "  d[\"q\"] := 2; "
         "  using var arr := d.Keys.ToArray(); "
         "  return arr.Count; "
         "end Main; end C;"), 2);
@@ -157,9 +157,9 @@ BEZEL_TEST(dict_keys_values_view_556, keys_to_array_three_entries) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"one\", 1); "
-        "  d.Set(\"two\", 2); "
-        "  d.Set(\"three\", 3); "
+        "  d[\"one\"] := 1; "
+        "  d[\"two\"] := 2; "
+        "  d[\"three\"] := 3; "
         "  using var arr := d.Keys.ToArray(); "
         "  return arr.Count; "
         "end Main; end C;"), 3);
@@ -175,8 +175,8 @@ BEZEL_TEST(dict_keys_values_view_556, values_to_array_count_string_keyed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 10); "
-        "  d.Set(\"b\", 20); "
+        "  d[\"a\"] := 10; "
+        "  d[\"b\"] := 20; "
         "  using var arr := d.Values.ToArray(); "
         "  return arr.Count; "
         "end Main; end C;"), 2);
@@ -199,9 +199,9 @@ BEZEL_TEST(dict_keys_values_view_556, values_to_array_int_values_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 5); "
-        "  d.Set(\"b\", 10); "
-        "  d.Set(\"c\", 15); "
+        "  d[\"a\"] := 5; "
+        "  d[\"b\"] := 10; "
+        "  d[\"c\"] := 15; "
         "  using var arr := d.Values.ToArray(); "
         "  var sum := 0; "
         "  for var v in arr do sum := sum + v; end; "
@@ -223,9 +223,9 @@ BEZEL_TEST(dict_keys_values_view_556, keys_to_array_linq_take) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"alpha\", 1); "
-        "  d.Set(\"beta\", 2); "
-        "  d.Set(\"gamma\", 3); "
+        "  d[\"alpha\"] := 1; "
+        "  d[\"beta\"] := 2; "
+        "  d[\"gamma\"] := 3; "
         "  using var arr := d.Keys.ToArray(); "
         "  using var first2 := arr.Take(2).ToArray(); "
         "  return first2.Count; "
@@ -244,8 +244,8 @@ BEZEL_TEST(dict_keys_values_view_556, regression_for_in_keys) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"x\", 10); "
-        "  d.Set(\"y\", 20); "
+        "  d[\"x\"] := 10; "
+        "  d[\"y\"] := 20; "
         "  var sum := 0; "
         "  for var k in d.Keys do sum := sum + k.Length; end; "
         "  return sum; "
@@ -258,8 +258,8 @@ BEZEL_TEST(dict_keys_values_view_556, regression_for_in_values) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 7); "
-        "  d.Set(\"b\", 3); "
+        "  d[\"a\"] := 7; "
+        "  d[\"b\"] := 3; "
         "  var sum := 0; "
         "  for var v in d.Values do sum := sum + v; end; "
         "  return sum; "

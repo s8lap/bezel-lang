@@ -143,7 +143,7 @@ BEZEL_TEST(move_iface_slot_28_11, move_through_concrete_owned_array_accepted) {
 BEZEL_TEST(move_iface_slot_28_11, move_through_concrete_owned_dict_accepted) {
     auto r = parseAndCheckOwnership(wrap(
         "using var d := new OwnedDictionary<string, R>(); "
-        "d.Set(\"a\", move (new R())); "
+        "d[\"a\"] := move (new R()); "
         "using var x := move d[\"a\"]; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

@@ -6,7 +6,7 @@
 // nullable VALUE type (int?, bool?, enum?, nullable record V?), which lowers
 // to a tagged struct {i8 hasValue; T}.  #539 fixed the encode/decode paths for
 // the case where the argument already IS a struct (e.g. `var v: int? := 42;
-// d.Set("x", v)` — `v` lowers as the {i8,i32} struct and encodeValue boxes
+// d["x"] := v` — `v` lowers as the {i8,i32} struct and encodeValue boxes
 // it).  However, when the argument is a non-nullable SCALAR LITERAL (e.g.
 // `d.Add("a", 42)` where 42 lowers as bare i32) or a null literal (`null`
 // lowers as a null pointer), encodeValue's guard
@@ -29,7 +29,7 @@
 // the round-trip (hasValue byte is stored in the malloc'd box).
 //
 // Root cause of the gap vs #539: #539's tests used `var v: int? := 42;
-// d.Set("x", v)` — the sema type of `v` is already int?, so lowerExpr emits
+// d["x"] := v` — the sema type of `v` is already int?, so lowerExpr emits
 // the tagged struct directly.  But `d.Add("a", 42)` passes a bare integer
 // literal that lowerExpr emits as i32; encodeValue saw a non-struct and fell
 // through to the ZExt/inttoptr path, bypassing the box.
@@ -277,13 +277,13 @@ BEZEL_TEST(dict_nullable_read_544, control_record_add_indexer_spec_4_8) {
 }
 
 // #544 CONTROL: #539's Set-based nullable paths still pass (regression guard).
-// var v: int? := 42; d.Set("x", v); then TryGetValue -> 42.
+// var v: int? := 42; d["x"] := v; then TryGetValue -> 42.
 BEZEL_TEST(dict_nullable_read_544, control_539_set_var_tryget_spec_4_8_7) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int?>(); "
         "  var v: int? := 42; "
-        "  d.Set(\"x\", v); "
+        "  d[\"x\"] := v; "
         "  var vx: int? := null; "
         "  var found := d.TryGetValue(\"x\", out vx); "
         "  if not found then return -1; end; "

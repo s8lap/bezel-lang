@@ -66,7 +66,7 @@ BEZEL_TEST(dict_decode_570_571, str_key_nullable_record_indexer_nonnull_spec_4_8
         "module M; record Item(Score: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Item?>(); "
-        "  d.Set(\"x\", new Item(42)); "
+        "  d[\"x\"] := new Item(42); "
         "  var v: Item? := d[\"x\"]; "
         "  if v = null then return -1; end; "
         "  return v!.Score; "
@@ -81,7 +81,7 @@ BEZEL_TEST(dict_decode_570_571, str_key_nullable_record_indexer_null_spec_4_8_7_
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Item?>(); "
         "  var n: Item? := null; "
-        "  d.Set(\"x\", n); "
+        "  d[\"x\"] := n; "
         "  var v: Item? := d[\"x\"]; "
         "  if v <> null then return v!.Score; end; "
         "  return 0; "   // null means success
@@ -95,7 +95,7 @@ BEZEL_TEST(dict_decode_570_571, str_key_nullable_record_two_field_spec_4_8_7_9) 
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Point?>(); "
-        "  d.Set(\"p\", new Point(3, 7)); "
+        "  d[\"p\"] := new Point(3, 7); "
         "  var v: Point? := d[\"p\"]; "
         "  if v = null then return -1; end; "
         "  return v!.x * 10 + v!.y; "   // 3*10 + 7 = 37
@@ -113,7 +113,7 @@ BEZEL_TEST(dict_decode_570_571, int_key_nullable_record_indexer_nonnull_spec_4_8
         "module M; record Item(Score: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, Item?>(); "
-        "  d.Set(1, new Item(99)); "
+        "  d[1] := new Item(99); "
         "  var v: Item? := d[1]; "
         "  if v = null then return -1; end; "
         "  return v!.Score; "
@@ -128,7 +128,7 @@ BEZEL_TEST(dict_decode_570_571, int_key_nullable_record_indexer_null_spec_4_8_7_
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, Item?>(); "
         "  var n: Item? := null; "
-        "  d.Set(2, n); "
+        "  d[2] := n; "
         "  var v: Item? := d[2]; "
         "  if v <> null then return v!.Score; end; "
         "  return 0; "
@@ -147,7 +147,7 @@ BEZEL_TEST(dict_decode_570_571, int_key_keys_toarray_value_spec_4_8) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, string>(); "
-        "  d.Set(42, \"x\"); "
+        "  d[42] := \"x\"; "
         "  using var arr := d.Keys.ToArray(); "
         "  return arr[0]; "   // must return 42, not garbage
         "end Main; end C;"), 42);
@@ -159,9 +159,9 @@ BEZEL_TEST(dict_decode_570_571, int_key_keys_toarray_sum_spec_4_8) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, string>(); "
-        "  d.Set(10, \"a\"); "
-        "  d.Set(20, \"b\"); "
-        "  d.Set(30, \"c\"); "
+        "  d[10] := \"a\"; "
+        "  d[20] := \"b\"; "
+        "  d[30] := \"c\"; "
         "  using var arr := d.Keys.ToArray(); "
         "  var sum := 0; "
         "  for var k in arr do sum := sum + k; end; "
@@ -174,8 +174,8 @@ BEZEL_TEST(dict_decode_570_571, int_key_keys_toarray_count_spec_4_8) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(1, 100); "
-        "  d.Set(2, 200); "
+        "  d[1] := 100; "
+        "  d[2] := 200; "
         "  using var arr := d.Keys.ToArray(); "
         "  return arr.Count; "
         "end Main; end C;"), 2);
@@ -193,7 +193,7 @@ BEZEL_TEST(dict_decode_570_571, record_key_keys_toarray_field_spec_4_8_9) {
         "module M; record Key(Id: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<Key, string>(); "
-        "  d.Set(new Key(7), \"v\"); "
+        "  d[new Key(7)] := \"v\"; "
         "  using var arr := d.Keys.ToArray(); "
         "  return arr[0].Id; "   // must return 7, not garbage
         "end Main; end C;"), 7);
@@ -210,8 +210,8 @@ BEZEL_TEST(dict_decode_570_571, regression_str_key_keys_toarray_count_spec_4_8) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 1); "
-        "  d.Set(\"b\", 2); "
+        "  d[\"a\"] := 1; "
+        "  d[\"b\"] := 2; "
         "  using var arr := d.Keys.ToArray(); "
         "  return arr.Count; "
         "end Main; end C;"), 2);
@@ -222,8 +222,8 @@ BEZEL_TEST(dict_decode_570_571, regression_str_key_for_in_keys_spec_4_8) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"ab\", 10); "
-        "  d.Set(\"cde\", 20); "
+        "  d[\"ab\"] := 10; "
+        "  d[\"cde\"] := 20; "
         "  var sum := 0; "
         "  for var k in d.Keys do sum := sum + k.Length; end; "
         "  return sum; "   // 2+3=5
@@ -236,7 +236,7 @@ BEZEL_TEST(dict_decode_570_571, regression_record_values_snapshot_spec_4_8) {
         "module M; record Item(Score: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Item>(); "
-        "  d.Set(\"a\", new Item(42)); "
+        "  d[\"a\"] := new Item(42); "
         "  using var arr := d.Values.ToArray(); "
         "  var v := arr[0]; "
         "  return v.Score; "
@@ -249,7 +249,7 @@ BEZEL_TEST(dict_decode_570_571, regression_nonnull_record_indexer_spec_4_8) {
         "module M; record Item(Score: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Item>(); "
-        "  d.Set(\"k\", new Item(55)); "
+        "  d[\"k\"] := new Item(55); "
         "  var v := d[\"k\"]; "
         "  return v.Score; "
         "end Main; end C;"), 55);

@@ -38,8 +38,8 @@ BEZEL_TEST(dict_values_iter_537, string_key_int_values_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"a\", 10); "
-        "  d.Set(\"b\", 20); "
+        "  d[\"a\"] := 10; "
+        "  d[\"b\"] := 20; "
         "  var sum := 0; "
         "  for var v in d.Values do sum := sum + v; end; "
         "  return sum; "
@@ -52,8 +52,8 @@ BEZEL_TEST(dict_values_iter_537, string_key_int_values_count) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"x\", 1); "
-        "  d.Set(\"y\", 2); "
+        "  d[\"x\"] := 1; "
+        "  d[\"y\"] := 2; "
         "  var n := 0; "
         "  for var v in d.Values do n := n + 1; end; "
         "  return n; "
@@ -66,8 +66,8 @@ BEZEL_TEST(dict_values_iter_537, string_key_update_does_not_double) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"k\", 5); "
-        "  d.Set(\"k\", 99); "
+        "  d[\"k\"] := 5; "
+        "  d[\"k\"] := 99; "
         "  var n := 0; "
         "  for var v in d.Values do n := n + 1; end; "
         "  return n; "
@@ -79,9 +79,9 @@ BEZEL_TEST(dict_values_iter_537, string_key_three_entries_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"one\", 1); "
-        "  d.Set(\"two\", 2); "
-        "  d.Set(\"three\", 3); "
+        "  d[\"one\"] := 1; "
+        "  d[\"two\"] := 2; "
+        "  d[\"three\"] := 3; "
         "  var sum := 0; "
         "  for var v in d.Values do sum := sum + v; end; "
         "  return sum; "
@@ -98,8 +98,8 @@ BEZEL_TEST(dict_values_iter_537, string_key_string_values_length_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, string>(); "
-        "  d.Set(\"a\", \"hi\"); "
-        "  d.Set(\"b\", \"world\"); "
+        "  d[\"a\"] := \"hi\"; "
+        "  d[\"b\"] := \"world\"; "
         "  var total := 0; "
         "  for var v in d.Values do total := total + v.Length; end; "
         "  return total; "
@@ -116,8 +116,8 @@ BEZEL_TEST(dict_values_iter_537, int_key_int_values_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(3, 100); "
-        "  d.Set(4, 200); "
+        "  d[3] := 100; "
+        "  d[4] := 200; "
         "  var sum := 0; "
         "  for var v in d.Values do sum := sum + v; end; "
         "  return sum; "
@@ -129,9 +129,9 @@ BEZEL_TEST(dict_values_iter_537, int_key_int_values_count) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(1, 10); "
-        "  d.Set(2, 20); "
-        "  d.Set(1, 99); "            // update: still only 2 keys
+        "  d[1] := 10; "
+        "  d[2] := 20; "
+        "  d[1] := 99; "            // update: still only 2 keys
         "  var n := 0; "
         "  for var v in d.Values do n := n + 1; end; "
         "  return n; "
@@ -163,8 +163,8 @@ BEZEL_TEST(dict_values_iter_537, keys_still_works_regression_guard) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(3, 100); "
-        "  d.Set(4, 200); "
+        "  d[3] := 100; "
+        "  d[4] := 200; "
         "  var sum := 0; "
         "  for var k in d.Keys do sum := sum + k; end; "
         "  return sum; "              // 3 + 4 = 7
@@ -183,8 +183,8 @@ BEZEL_TEST(dict_values_iter_537, bare_dict_not_iterable_still_errors) {
     auto r = runJit(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(3, 100); "
-        "  d.Set(4, 200); "
+        "  d[3] := 100; "
+        "  d[4] := 200; "
         "  var sum := 0; "
         "  for var e in d do sum := sum + e; end; "
         "  return sum; "

@@ -305,7 +305,7 @@ BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
         "module M; class C "
         "  public static method Main(): int "
         "    using var d := new OwnedDictionary<string, int>(); "
-        "    d.Set(\"x\", 42); "
+        "    d[\"x\"] := 42; "
         "    var count := 0; "
         "    for var entry in d.Drain() do "
         "      using var e := entry; "

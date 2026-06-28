@@ -45,9 +45,9 @@ BEZEL_TEST(codegen_collection_keys, dict_int_key_roundtrip_spec_4_8) {
         "module M; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(1, 100); "
-        "  d.Set(2, 200); "
-        "  d.Set(1, 111); "                       // updates key 1, no new entry
+        "  d[1] := 100; "
+        "  d[2] := 200; "
+        "  d[1] := 111; "                       // updates key 1, no new entry
         "  var v := 0; d.TryGetValue(1, out v); "
         "  var w := 0; d.TryGetValue(2, out w); "
         "  return int(d.Count = 2 and v = 111 and w = 200 "
@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_collection_keys, dict_int_key_containskey_param_spec_4_8) {
         "  end Lookup; "
         "  public static method Main(): int "
         "    using var d := new Dictionary<int, int>(); "
-        "    d.Set(7, 70); "
+        "    d[7] := 70; "
         "    return int(Lookup(d, 7) and not Lookup(d, 8)); "
         "  end Main; "
         "end C;"), 1);
@@ -94,8 +94,8 @@ BEZEL_TEST(codegen_collection_keys, dict_int_key_equal_keys_same_entry_spec_8_3)
         "module M; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(5, 100); "
-        "  d.Set(2 + 3, 999); "                   // equal key, distinct build
+        "  d[5] := 100; "
+        "  d[2 + 3] := 999; "                   // equal key, distinct build
         "  var v := 0; d.TryGetValue(5, out v); "
         "  return int(d.Count = 1 and v = 999); "
         "end Main; end C;"), 1);
@@ -112,8 +112,8 @@ BEZEL_TEST(codegen_collection_keys, dict_enum_key_roundtrip_spec_4_8) {
         "enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<Color, int>(); "
-        "  d.Set(Color.Red, 50); "
-        "  d.Set(Color.Blue, 70); "
+        "  d[Color.Red] := 50; "
+        "  d[Color.Blue] := 70; "
         "  var v := 0; d.TryGetValue(Color.Blue, out v); "
         "  return int(d.Count = 2 and v = 70 "
         "         and d.ContainsKey(Color.Red) "
@@ -133,8 +133,8 @@ BEZEL_TEST(codegen_collection_keys, dict_record_value_set_get_spec_4_8) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Point>(); "
-        "  d.Set(\"a\", new Point(1, 2)); "
-        "  d.Set(\"b\", new Point(3, 4)); "
+        "  d[\"a\"] := new Point(1, 2); "
+        "  d[\"b\"] := new Point(3, 4); "
         "  var p := new Point(0, 0); "
         "  d.TryGetValue(\"a\", out p); "
         "  var q := new Point(0, 0); "
@@ -151,9 +151,9 @@ BEZEL_TEST(codegen_collection_keys, dict_record_value_update_spec_4_8) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Point>(); "
-        "  d.Set(\"a\", new Point(1, 2)); "
-        "  d.Set(\"b\", new Point(3, 4)); "
-        "  d.Set(\"a\", new Point(9, 9)); "       // update a's record value
+        "  d[\"a\"] := new Point(1, 2); "
+        "  d[\"b\"] := new Point(3, 4); "
+        "  d[\"a\"] := new Point(9, 9); "       // update a's record value
         "  var p := new Point(0, 0); d.TryGetValue(\"a\", out p); "
         "  var q := new Point(0, 0); d.TryGetValue(\"b\", out q); "
         "  return int(d.Count = 2 and p.x = 9 and p.y = 9 "
@@ -291,8 +291,8 @@ BEZEL_TEST(codegen_collection_keys, for_in_dict_int_keys_sum_spec_4_8) {
         "module M; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(3, 100); "
-        "  d.Set(4, 200); "
+        "  d[3] := 100; "
+        "  d[4] := 200; "
         "  var sum := 0; "
         "  for var k in d.Keys do sum := sum + k; end; "
         "  return sum; "                              // 3 + 4 = 7
@@ -306,9 +306,9 @@ BEZEL_TEST(codegen_collection_keys, for_in_dict_int_keys_count_spec_4_8) {
         "module M; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  d.Set(3, 100); "
-        "  d.Set(4, 200); "
-        "  d.Set(3, 111); "                           // updates key 3, no new key
+        "  d[3] := 100; "
+        "  d[4] := 200; "
+        "  d[3] := 111; "                           // updates key 3, no new key
         "  var n := 0; "
         "  for var k in d.Keys do n := n + 1; end; "
         "  return n; "                                // 2 distinct keys
@@ -323,8 +323,8 @@ BEZEL_TEST(codegen_collection_keys, for_in_dict_string_keys_value_spec_4_8) {
         "module M; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  d.Set(\"ab\", 1); "
-        "  d.Set(\"cde\", 2); "
+        "  d[\"ab\"] := 1; "
+        "  d[\"cde\"] := 2; "
         "  var total := 0; "
         "  for var k in d.Keys do total := total + k.Length; end; "
         "  return total; "                            // 2 + 3 = 5
@@ -343,8 +343,8 @@ BEZEL_TEST(codegen_collection_keys, for_in_dict_record_keys_field_spec_4_8) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<Point, int>(); "
-        "  d.Set(new Point(1, 10), 100); "
-        "  d.Set(new Point(2, 20), 200); "
+        "  d[new Point(1, 10)] := 100; "
+        "  d[new Point(2, 20)] := 200; "
         "  var sum := 0; "
         "  for var k in d.Keys do sum := sum + k.y; end; "
         "  return sum; "                              // 10 + 20 = 30

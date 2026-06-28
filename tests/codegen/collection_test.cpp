@@ -29,7 +29,7 @@ BEZEL_TEST(collection_array, set_and_remove) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  a.Set(1, 99); "
+        "  a[1] := 99; "
         "  a.RemoveAt(0); "
         "  return int(a.Length = 2 and a.Get(0) = 99 and a.Get(1) = 3); "
         "end Main; end C;"), 1);
@@ -116,7 +116,7 @@ BEZEL_TEST(collection_dict, set_and_remove) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"x\", 10); "
-        "  d.Set(\"x\", 99); "
+        "  d[\"x\"] := 99; "
         "  var v := 0; "
         "  d.TryGetValue(\"x\", out v); "
         "  d.Remove(\"x\"); "
