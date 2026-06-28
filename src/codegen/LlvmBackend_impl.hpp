@@ -2253,6 +2253,31 @@ private:
             llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
         return builder_.CreateInsertValue(res, val, {1u});
     }
+    // §23.2/§23.3 (#1168) / §7.1 (#541): coerce an expression-bodied property
+    // getter result `v` to the property's declared nullable-VALUE type `declTy`
+    // (`int?`, `bool?`, …) — exactly as a method return / lambda body does. When
+    // `declTy` is `T?` and `v` is the bare inner `T` the getter body yielded, a
+    // `null` pointer literal becomes the all-zero null struct and a bare `T`
+    // (after any numeric widening, §5.1) is wrapped to `{i8 1, T}`. Returns `v`
+    // unchanged when it is already the `{i8,T}` optional or `declTy` is not a
+    // nullable value type. Without this the getter read returns a bare `T`;
+    // unwrapping it (`??`, `!`) does CreateExtractValue on a non-struct and
+    // asserts in LLVM (#1168).
+    llvm::Value* wrapNullableGetterResult(const sema::TypeRef* declTy,
+                                          llvm::Value* v) {
+        if (!v || !declTy || !isNullableValueTy(declTy)) return v;
+        auto* expectedSt = nullableValueStructTy(declTy);
+        if (v->getType() == expectedSt) return v;  // already wrapped
+        if (v->getType()->isPointerTy() &&
+            llvm::isa<llvm::ConstantPointerNull>(v))
+            return nullableValueNull(declTy);
+        llvm::Type* payloadTy = expectedSt->getElementType(1);
+        if (v->getType() != payloadTy)
+            v = coerceNumericToType(v, payloadTy);
+        if (v->getType() == payloadTy)
+            v = wrapNullableValue(declTy, v);
+        return v;
+    }
     // fix #569 / #460: if `v`'s type differs from `want` but both are
     // layout-identical aggregates (the specialized-vs-unspecialized record-struct
     // mismatch a monomorphized generic body induces), reinterpret `v` to `want`

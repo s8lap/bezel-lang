@@ -3415,7 +3415,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             [](const auto& m){ return m == "static"; });
             if (isStaticProp) {
                 // Static property: no 'this', just evaluate the getter body.
-                return lowerExpr(*getter);
+                // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
+                // declared `T?` optional, same as the instance paths below.
+                return wrapNullableGetterResult(ctx_.exprType(*ma),
+                                                lowerExpr(*getter));
             }
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
@@ -3534,6 +3537,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 propSym->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = propSym->parent;
             llvm::Value* v = lowerExpr(*getter);
+            // §23.2/§23.3 (#1168): a `T?`-declared expression-bodied property
+            // whose body yields the bare inner `T` must wrap the result to the
+            // declared `{i8 hasValue; T}` optional, just as a method/lambda
+            // return does (#541). Wrap while the receiver's generic context is
+            // still active so a generic `T?` payload lowers correctly.
+            v = wrapNullableGetterResult(ctx_.exprType(*ma), v);
             currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
@@ -3702,7 +3711,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // CG33b: a bare computed-property read evaluates its getter
         // against the current `this`.
         if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e)))
-            return lowerExpr(*getter);
+            // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
+            // property's declared `T?` optional (see the qualified `obj.P`
+            // read above for the rationale).
+            return wrapNullableGetterResult(ctx_.exprType(e), lowerExpr(*getter));
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));

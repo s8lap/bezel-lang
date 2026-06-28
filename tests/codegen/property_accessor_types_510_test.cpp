@@ -339,3 +339,137 @@ BEZEL_TEST(property_accessor_types_510, control_interface_int_property) {
         "    using var sq := new Square(); return SizeOf(sq); "
         "  end Main; end C;"), 9);
 }
+
+// ---------------------------------------------------------------------------
+// #1168: the NON-virtual, inline expression-bodied property getter path
+// (LlvmBackend_Exprs.cpp CG33b) is a sibling of Bug3 above. A `T?`-declared
+// expression-bodied property whose body yields the bare inner `T` (a value-type
+// field read) was returned UN-wrapped — codegen never promoted the result to
+// the declared `{i8 hasValue; T}` optional. Unwrapping the read (`??`, `!`)
+// then did CreateExtractValue on a bare `i32`, asserting in LLVM (checkGEPType).
+// per §23.2 / §23.3 / §7 (#1168)
+// ---------------------------------------------------------------------------
+
+// 7a. THE REPRO: `obj.P ?? d` on a value-type field-backed `int?` getter wraps
+//     the bare field value and coalesces to the present value.
+// per §23.2 / §23.3 / §7 (#1168)
+BEZEL_TEST(property_accessor_types_510, nullable_property_getter_wraps_value_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  private _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  public property Maybe: int? => _x; "
+        "  destructor end destructor; "
+        "end Holder; "
+        "class P public static method Main(): int "
+        "  using var h := new Holder(7); "
+        "  return h.Maybe ?? 0; "
+        "end Main; end P;"), 7);
+}
+
+// 7b. force-unwrap (`!`) of the same getter — the wrapped value carries
+//     hasValue=1 so the unwrap yields the inner value (§7.5).
+// per §23.2 / §23.3 / §7.5 (#1168)
+BEZEL_TEST(property_accessor_types_510, nullable_property_getter_force_unwrap_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  private _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  public property Maybe: int? => _x; "
+        "  destructor end destructor; "
+        "end Holder; "
+        "class P public static method Main(): int "
+        "  using var h := new Holder(11); "
+        "  return h.Maybe!; "
+        "end Main; end P;"), 11);
+}
+
+// 7c. accessor-block expression-body getter (`get => _x;`) goes through the
+//     same inline CG33b path and must wrap identically.
+// per §23.2 / §23.3 / §7 (#1168)
+BEZEL_TEST(property_accessor_types_510, nullable_accessor_expr_getter_wraps_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  private _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  public property Maybe: int? get => _x; end; "
+        "  destructor end destructor; "
+        "end Holder; "
+        "class P public static method Main(): int "
+        "  using var h := new Holder(5); "
+        "  return h.Maybe ?? 0; "
+        "end Main; end P;"), 5);
+}
+
+// 7d. bare implicit-`this` read of the getter from another method (the
+//     IdentifierExpr CG33b path) must wrap the same way.
+// per §23.2 / §23.3 / §7 (#1168)
+BEZEL_TEST(property_accessor_types_510, nullable_property_getter_bare_read_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  private _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  public property Maybe: int? => _x; "
+        "  public method Get(): int => Maybe ?? 0; "
+        "  destructor end destructor; "
+        "end Holder; "
+        "class P public static method Main(): int "
+        "  using var h := new Holder(9); "
+        "  return h.Get(); "
+        "end Main; end P;"), 9);
+}
+
+// 7e. generic class `T?` getter (T = int): the wrap runs in the receiver's
+//     generic context so the payload lowers to the concrete type.
+// per §23.2 / §23.3 / §7 / §14.1 (#1168)
+BEZEL_TEST(property_accessor_types_510, nullable_generic_property_getter_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> "
+        "  private _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property Maybe: T? => _v; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class P public static method Main(): int "
+        "  using var b := new Box<int>(42); "
+        "  return b.Maybe ?? 0; "
+        "end Main; end P;"), 42);
+}
+
+// 7g. STATIC `T?`-declared expression-bodied property read via the type name
+//     (the static CG33b branch) must wrap the same way.
+// per §23.2 / §23.3 / §7 / §22.13 (#1168)
+BEZEL_TEST(property_accessor_types_510, nullable_static_property_getter_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  private static _x: int := 8; "
+        "  public static property Maybe: int? => _x; "
+        "end Holder; "
+        "class P public static method Main(): int "
+        "  return Holder.Maybe ?? 0; "
+        "end Main; end P;"), 8);
+}
+
+// 7f. control: a body that is ALREADY `T?` (a nullable field) must NOT be
+//     double-wrapped — the read passes the optional through unchanged.
+// per §23.2 / §23.3 / §7 (#1168 control)
+BEZEL_TEST(property_accessor_types_510, nullable_property_getter_passthrough_1168) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  private _y: int?; "
+        "  public constructor(y: int?) _y := y; end constructor; "
+        "  public property Maybe: int? => _y; "
+        "  destructor end destructor; "
+        "end Holder; "
+        "class P public static method Main(): int "
+        "  using var h := new Holder(7); "
+        "  return h.Maybe ?? 0; "
+        "end Main; end P;"), 7);
+}
