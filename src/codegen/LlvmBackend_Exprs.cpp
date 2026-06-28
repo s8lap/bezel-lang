@@ -10312,6 +10312,20 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     return builder_.CreateAnd(hasVal, eq, "nv.enum.match");
                 }
             }
+            // §19.5 (#1128): a bare TYPE-name pattern on a nullable record/enum
+            // scrutinee (`Pt?` matched by `Pt`, `Color?` by `Color`) is a
+            // type-test, not a constant. Records and enums are sealed VALUE
+            // types with no subtyping (§9.6 / §10), so the bare name matches
+            // exactly its own type and — per §19.5 ("a bare type pattern T
+            // matches only non-null values") — only when the value is present
+            // (hasValue). Without this the bare type name (whose last part is
+            // not an enum constant) fell through to the deferred `return
+            // nullptr` below → lowerCaseExpr/Stmt left `case.end` unterminated
+            // (expr-position IR-verify crash) or silently skipped the arm and
+            // every later arm (stmt-position wrong value).
+            if (np->name && !np->name->parts.empty() && scrutTy->declaration &&
+                np->name->parts.back() == scrutTy->declaration->name)
+                return hasVal;
             return nullptr;  // type-test pattern deferred
         }
 
@@ -10432,6 +10446,33 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 patternMatches(pat, innerVal, enumTy, isStr, /*scrutTy=*/nullptr);
             if (!sub) return nullptr;
             return builder_.CreateAnd(hasVal, sub, "nv.destr.match");
+        }
+
+        // §19.5 (#1128): a bare TYPE pattern `T` on a nullable VALUE-type
+        // scrutinee `T?` (e.g. `int` on `int?`) is a type-test. Per §19.5 "a
+        // bare type pattern T matches only non-null values", so it matches
+        // exactly when the value is present (hasValue) AND the pattern type is
+        // the scrutinee's underlying value type. The scrutinee is the unboxed
+        // tagged struct {i8 hasValue; T value}, so the static types already
+        // agree and the test reduces to `hasValue`; a pattern type that differs
+        // from the underlying value type can never match. Without this the
+        // pattern fell through to the deferred `return nullptr` below →
+        // lowerCaseExpr/Stmt left `case.end` unterminated (expr-position
+        // IR-verify crash) or silently skipped the arm and every later arm
+        // (stmt-position wrong value).
+        if (auto* tp = dynamic_cast<const ast::TypePattern*>(pat)) {
+            const sema::TypeRef* patTy =
+                tp->type ? ctx_.resolvedType(*tp->type) : nullptr;
+            bool sameUnderlying = false;
+            if (patTy) {
+                if (patTy->kind == sema::TypeRef::Kind::Primitive &&
+                    scrutTy->kind == sema::TypeRef::Kind::Primitive)
+                    sameUnderlying = patTy->primitive == scrutTy->primitive;
+                else if (patTy->kind == sema::TypeRef::Kind::Named &&
+                         scrutTy->kind == sema::TypeRef::Kind::Named)
+                    sameUnderlying = patTy->declaration == scrutTy->declaration;
+            }
+            return sameUnderlying ? hasVal : builder_.getInt1(false);
         }
 
         // Other pattern kinds on a nullable value are deferred.

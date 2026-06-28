@@ -342,6 +342,7 @@ set(BEZEL_TEST_SOURCES
     codegen/case_expr_nullable_result_573_test.cpp
     codegen/case_untyped_binding_nullable_747_test.cpp
     codegen/case_type_pattern_null_760_test.cpp
+    codegen/case_nullable_value_type_pattern_1128_test.cpp
     codegen/destructor_field_move_runtime_763_test.cpp
     codegen/dtor_bare_move_dispose_899_test.cpp
     codegen/selectmany_lazy_inner_758_test.cpp
