@@ -2686,8 +2686,19 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     // (which rejects array operands). per §15.1.2
     if (auto* arr = llvm::dyn_cast<llvm::ArrayType>(l->getType()))
         return emitInlineArrayEquality(l, r, arr);
-    if (l->getType()->isFloatingPointTy())
-        return builder_.CreateFCmpOEQ(l, r);
+    if (l->getType()->isFloatingPointTy()) {
+        // §9.2 / §4.4 (fix #1165): a float/double field's `=` must use the
+        // SAME NaN-aware reflexive equality the scalar `=` uses (§4.3.1:
+        // "NaN = NaN is true"), not raw IEEE oeq. Mirror the scalar lowering in
+        // LlvmBackend_Exprs.cpp (`oeq(l,r) OR (isNaN(l) AND isNaN(r))`) so two
+        // records with equal NaN fields compare equal. isNaN(x) is `fcmp uno
+        // x, x`. (+0.0/-0.0 stay equal: oeq is already true for them.)
+        llvm::Value* ieee_eq  = builder_.CreateFCmpOEQ(l, r, "feq");
+        llvm::Value* l_is_nan = builder_.CreateFCmpUNO(l, l, "lnan");
+        llvm::Value* r_is_nan = builder_.CreateFCmpUNO(r, r, "rnan");
+        llvm::Value* both_nan = builder_.CreateAnd(l_is_nan, r_is_nan, "bnan");
+        return builder_.CreateOr(ieee_eq, both_nan, "feq_ref");
+    }
     return builder_.CreateICmpEQ(l, r);
 }
 

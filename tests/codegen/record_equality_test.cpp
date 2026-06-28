@@ -96,3 +96,67 @@ BEZEL_TEST(codegen_cg29b, nested_record_inner_mismatch) {
         "  return (1 if x = y else 0); "
         "end Main; end C;"), 0);
 }
+
+// §9.2 / §4.4 / §4.3.1 (fix #1165): the auto-generated record `=` compares each
+// field by its declared type's `=`. A double field must therefore use the
+// SAME NaN-aware reflexive equality as a scalar double (§4.3.1: "NaN = NaN is
+// true"), not raw IEEE oeq. Two records with equal NaN fields compare equal.
+BEZEL_TEST(codegen_cg29b, double_field_nan_records_are_equal) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record R(v: double); "
+        "class C public static method Main(): int "
+        "  var nan := 0.0 / 0.0; "
+        "  var a := new R(nan); var b := new R(nan); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.2 / §4.4: ordinary equal double fields still compare equal.
+BEZEL_TEST(codegen_cg29b, double_field_equal_records) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record R(v: double); "
+        "class C public static method Main(): int "
+        "  var a := new R(1.5); var b := new R(1.5); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.2 / §4.4: distinct (non-NaN) double fields are not equal — the NaN-aware
+// path must not collapse different finite values.
+BEZEL_TEST(codegen_cg29b, double_field_distinct_records_not_equal) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record R(v: double); "
+        "class C public static method Main(): int "
+        "  var a := new R(1.0); var b := new R(2.0); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §9.2 / §4.4 (fix #1165 consistency): a record's 0.0 vs -0.0 field comparison
+// must match the SCALAR `0.0 = -0.0` result (IEEE oeq → equal), so the record
+// path and scalar path agree.
+BEZEL_TEST(codegen_cg29b, double_field_signed_zero_matches_scalar) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record R(v: double); "
+        "class C public static method Main(): int "
+        "  var negz := -0.0; "
+        "  var recEq := 1 if new R(0.0) = new R(negz) else 0; "
+        "  var scalarEq := 1 if 0.0 = negz else 0; "
+        "  return (1 if recEq = scalarEq else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.2 / §8.3: a record with mixed field types (double + int + string) still
+// compares correctly field-by-field; the float path change is field-local.
+BEZEL_TEST(codegen_cg29b, mixed_field_record_equality) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Mixed(d: double, n: int, s: string); "
+        "class C public static method Main(): int "
+        "  var a := new Mixed(3.5, 7, \"hi\"); "
+        "  var b := new Mixed(3.5, 7, \"hi\"); "
+        "  var eq := 1 if a = b else 0; "
+        "  var c := new Mixed(3.5, 8, \"hi\"); "
+        "  var neq := 1 if a = c else 0; "
+        "  return (1 if eq = 1 and neq = 0 else 0); "
+        "end Main; end C;"), 1);
+}
