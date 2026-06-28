@@ -109,6 +109,18 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         llvm::Value* absIdx = builder_.CreateAdd(
             builder_.CreateSExt(base, i64()),
             builder_.CreateSExt(idx,  i64()), "sp.absi");
+        // §4.15 (#1158): also bounds-check the absolute index against the source
+        // array's LIVE Count. The span's Length is fixed at construction, but the
+        // backing Array<T> can shrink (RemoveAt/Remove/Clear) below Start+Length;
+        // the spec getter is `return Source[Start + i]`, which routes through the
+        // array's own Count-checked indexer (§4.4 / §31.2). bz_array_get does NOT
+        // bounds-check, so without this a shrunk array yields stale backing data
+        // instead of throwing. Mirrors the `arr[i]` Count check below (unsigned
+        // compare also rejects a negative absolute index).
+        auto* spLenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* arrCount = builder_.CreateCall(spLenFn, {src}, "sp.cnt");
+        emitGuardThrow(builder_.CreateICmpUGE(absIdx, arrCount, "sp.cntoob"),
+                       "IndexOutOfRangeException");
         int64_t esz = collectionElemSize(recvTy);
         llvm::Type* retTy = i32();
         if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0])

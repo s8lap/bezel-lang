@@ -815,6 +815,60 @@ BEZEL_TEST(array_span_549, asan_readonly_span_does_not_free_array_spec_4_15) {
 }
 
 // ===========================================================================
+// §4.15 "Caveat: array mutation during span lifetime" (#1158): the span getter
+// is `return Source[Start + i]`, which routes through the array's own
+// Count-checked indexer. If the array shrinks below Start+Length after the span
+// was constructed, an access whose absolute index is past the new Count throws
+// IndexOutOfRangeException (NOT a stale read of the old backing slot).
+// ===========================================================================
+
+// §4.15: [10,20,30,40]; sp=AsSpan(0,4); RemoveAt(3) (Count→3); sp[3] passes the
+// span Length check (3 < 4) but Start+3=3 >= live Count 3 → throw. Before #1158
+// the getter called bz_array_get directly and returned the stale 40.
+BEZEL_TEST(array_span_549, indexer_throws_after_array_shrinks_spec_4_15_1158) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var arr := new Array<int>(); "
+        "  arr.Add(10); arr.Add(20); arr.Add(30); arr.Add(40); "
+        "  var sp := arr.AsSpan(0, 4); "
+        "  arr.RemoveAt(3); "          // Count now 3
+        "  try "
+        "    return sp[3]; "            // stale 40 before fix; now throws
+        "  catch IndexOutOfRangeException => return 1; "  // caught → pass
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §4.15 (#1158): an in-bounds access after the shrink still reads correctly —
+// sp[2] (Start+2=2 < Count 3) returns 30. Guards against over-eager rejection.
+BEZEL_TEST(array_span_549, indexer_inbounds_after_shrink_ok_spec_4_15_1158) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var arr := new Array<int>(); "
+        "  arr.Add(10); arr.Add(20); arr.Add(30); arr.Add(40); "
+        "  var sp := arr.AsSpan(0, 4); "
+        "  arr.RemoveAt(3); "          // Count now 3
+        "  return sp[2]; "             // 30 (still in range)
+        "end Main; end C;", 30);
+}
+
+// §4.15 (#1158): ReadOnlyArraySpan<T> getter behaves identically — sp[3] after
+// the shrink throws IndexOutOfRangeException.
+BEZEL_TEST(array_span_549, readonly_indexer_throws_after_shrink_spec_4_15_1158) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var arr := new Array<int>(); "
+        "  arr.Add(10); arr.Add(20); arr.Add(30); arr.Add(40); "
+        "  var ro := arr.AsReadOnlySpan(0, 4); "
+        "  arr.RemoveAt(3); "          // Count now 3
+        "  try "
+        "    return ro[3]; "
+        "  catch IndexOutOfRangeException => return 1; "  // caught → pass
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// ===========================================================================
 // §4.15 Diagnostic: ReadOnlyArraySpan indexer setter rejected at compile time.
 // ===========================================================================
 
