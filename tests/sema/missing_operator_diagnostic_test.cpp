@@ -350,3 +350,95 @@ BEZEL_TEST(sema_missing_op, primitive_relational_ok_25_2) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(anyMessageMentions(r, "25.2"));
 }
+
+// ---------------------------------------------------------------------------
+// #1204 / §6.2 / §5.1: a relational/equality comparison between two TYPED
+// primitives with no implicit conversion between them (signed ↔ unsigned same
+// width, float vs decimal) must be rejected.  A typed `int` variable vs a
+// typed `uint` variable has no common type (§5.1); the programmer must cast.
+// An UNTYPED integer literal or a literal-derived expression is allowed (it
+// "adopts" the other operand's type), so `uint > 1000` must not be rejected.
+// ---------------------------------------------------------------------------
+
+// Reject: typed int var `<` typed uint var — no common type.
+BEZEL_TEST(typed_signed_unsigned_compare_rejected_1204,
+           int_var_lt_uint_var_no_common_type) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var a: int := 0 - 1; var b: uint := 1; "
+        "  return (1 if a < b else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Reject: typed uint var `>` typed int var (operand order reversed).
+BEZEL_TEST(typed_signed_unsigned_compare_rejected_1204,
+           uint_var_gt_int_var_no_common_type) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var a: uint := 1; var b: int := 0 - 1; "
+        "  return (1 if a > b else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Reject: typed long var `=` typed ulong var.
+BEZEL_TEST(typed_signed_unsigned_compare_rejected_1204,
+           long_var_eq_ulong_var_no_common_type) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var a: long := 5; var b: ulong := 5; "
+        "  return (1 if a = b else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Reject: typed double var `<` typed decimal var (IR_FAIL case).
+BEZEL_TEST(float_decimal_compare_rejected_1204,
+           double_var_lt_decimal_var_no_common_type) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var x: double := 1.5; var y: decimal := 2.0m; "
+        "  return (1 if x < y else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Guard: typed uint var `>` an UNTYPED integer literal must NOT be rejected —
+// the literal adopts the uint type for the comparison (§5.1 / §6.2 / #1204).
+// This was the regression introduced by the prior fix attempt.
+BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
+           uint_var_gt_int_literal_not_rejected) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var u: uint := 3000000000; "
+        "  return (1 if u > 1000 else 0); end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Guard: typed ulong var `>` a LITERAL-DERIVED binary expression (e.g. `0 - 5`)
+// must NOT be rejected — both sides of the nested expression are literals.
+BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
+           ulong_var_gt_literal_derived_expr_not_rejected) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var u: ulong := 10; "
+        "  return (1 if u > 0 - 5 else 0); end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Guard: same-type comparison (int vs int) must remain valid.
+BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
+           same_type_compare_not_rejected) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var a: int := 5; var b: int := 10; "
+        "  return (1 if a < b else 0); end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Guard: int `<` long (widening per §5.1) must remain valid.
+BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
+           int_lt_long_widening_not_rejected) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var a: int := 5; var b: long := 10; "
+        "  return (1 if a < b else 0); end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

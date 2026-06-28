@@ -75,6 +75,24 @@ const char* primitiveSpelling(PrimitiveType p) {
     return "<unknown>";
 }
 
+// §6.2/#1204: returns true when `e` is a "literal-derived expression" — built
+// entirely from integer or float literals via unary/binary operators.  Such
+// expressions have no declared signed/unsigned type of their own and are
+// compatible with any numeric operand in a comparison (e.g. `ulong > 1000`,
+// `ulong > 0 - 5`).  Only named variable references or non-literal sub-exprs
+// cause this to return false, triggering the signed↔unsigned rejection below.
+static bool isLiteralDerivedExpr(const ast::Expr* e) {
+    if (!e) return false;
+    if (dynamic_cast<const ast::IntLiteralExpr*>(e))   return true;
+    if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return true;
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e))
+        return isLiteralDerivedExpr(ue->operand.get());
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
+        return isLiteralDerivedExpr(be->left.get()) &&
+               isLiteralDerivedExpr(be->right.get());
+    return false;
+}
+
 // #625 / §12 / §31: true when `name` is a built-in exception type identifier.
 // Mirrors the isBuiltinExName lambda in ExprTypecheck_Calls.cpp (kept in sync).
 static bool isBuiltinExceptionTypeName(std::string_view n) {
@@ -2083,6 +2101,43 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     }
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=" || op == "and" || op == "or") {
+        // per §6.2/§5.1 (#1204): relational/equality operators require that
+        // the two operand types be compatible (one must implicitly widen to
+        // the other, §5.1).  When both operands are non-nullable, non-literal
+        // typed primitives with no widening relation (e.g. `int` vs `uint`,
+        // `double` vs `decimal`), reject with the same §6.2 diagnostic the
+        // arithmetic path uses.  An operand that is a literal-derived
+        // expression (a bare integer or float literal, or a unary/binary
+        // expression built entirely from such literals) is treated as
+        // "adoptable" and does NOT trigger the rejection — this preserves
+        // patterns like `ulong > 1000` or `ulong > 0 - 5` which work without
+        // an explicit cast because the constant has no declared signedness.
+        if (op != "and" && op != "or") {
+            TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
+            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+            if (lt && rt &&
+                lt->kind == TypeRef::Kind::Primitive &&
+                rt->kind == TypeRef::Kind::Primitive &&
+                !lt->nullable && !rt->nullable &&
+                lt->primitive != rt->primitive &&
+                !primitiveWidens(lt->primitive, rt->primitive) &&
+                !primitiveWidens(rt->primitive, lt->primitive) &&
+                isPromotablePrimitive(lt->primitive) &&
+                isPromotablePrimitive(rt->primitive) &&
+                !isLiteralDerivedExpr(be.left.get()) &&
+                !isLiteralDerivedExpr(be.right.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    std::string("operator `") + std::string(op) +
+                    "` has no implicit conversion between operand types `" +
+                    primitiveSpelling(lt->primitive) + "` and `" +
+                    primitiveSpelling(rt->primitive) +
+                    "` (§6.2/§5.1); add an explicit cast (§5.2) to convert"
+                    " one operand to the other's type.");
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
+        }
         ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
     }
