@@ -3544,36 +3544,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     for (const auto& c : cp->constants) {
                         if (!c) continue;
                         visitExpr(*c);
-                        // §19 (#964): a scrutinee-bearing arm whose constant has
-                        // a type fundamentally incompatible with the scrutinee
-                        // crashes codegen (an `ICmp` over a string pointer vs an
-                        // i32, or i1 vs a wider int — "operands not the same
-                        // type"). Reject it here with a clean §19 diagnostic
-                        // instead. Conservative: only the ptr-vs-scalar (string)
-                        // and i1-vs-int (bool) category mismatches between two
-                        // primitives — numeric widths are bridged by codegen's
-                        // reconcile, so int/long/char/byte patterns are unaffected.
-                        if (ce->scrutinee && scrutTy &&
-                            scrutTy->kind == TypeRef::Kind::Primitive) {
-                            const TypeRef* ct = ctx_.exprType(*c);
-                            if (ct && ct->kind == TypeRef::Kind::Primitive) {
-                                bool sStr = scrutTy->primitive ==
-                                            PrimitiveType::String;
-                                bool cStr = ct->primitive ==
-                                            PrimitiveType::String;
-                                bool sBool = scrutTy->primitive ==
-                                             PrimitiveType::Bool;
-                                bool cBool = ct->primitive ==
-                                             PrimitiveType::Bool;
-                                if (sStr != cStr || sBool != cBool)
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, c->span.begin,
-                                        "case pattern constant type is not "
-                                        "compatible with the scrutinee type "
-                                        "(\xC2\xA7""19) — a `case` constant must "
-                                        "be comparable to the scrutinee");
-                            }
-                        }
+                        // §19 (#964/#1213): a scrutinee-bearing arm whose
+                        // constant has a comparison class incompatible with the
+                        // scrutinee crashes codegen (ICmp with mismatched LLVM
+                        // operand types — SIGABRT in ICmpInst::AssertOK). The
+                        // #964 guard was string/bool-only; #1213 extends it to
+                        // cover float/decimal constants over an integer scrutinee
+                        // (and the symmetric directions) by reusing the same
+                        // cmpClassOf-based checkPatternOperand that #1202 added
+                        // for RelOpPattern and RangePattern. per §19/§5.1.
+                        checkPatternOperand(c.get());  // per §19/§5.1 (#1213)
                     }
             }
             // §19.3 (#726): a relational pattern (`> limit`) carries an operand

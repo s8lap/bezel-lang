@@ -534,3 +534,81 @@ BEZEL_TEST(sema_case_pattern_range,
     BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// --- §19 / §5.1 (issue #1213): a ConstantPattern whose constant is in a ------
+//     different comparison class than the scrutinee must be rejected, not abort.
+//
+// Before this fix (#964) the ConstantPattern guard only covered string/bool
+// class mismatches; a float or decimal constant over an integer scrutinee (or
+// vice versa) still reached codegen's CreateICmp with mismatched LLVM operand
+// types and tripped ICmpInst::AssertOK (SIGABRT, rc 134). The fix extends the
+// guard to use the same cmpClassOf-based checkPatternOperand introduced by
+// #1202 for RelOpPattern/RangePattern, so all comparison-class mismatches are
+// rejected uniformly at sema (§19).
+
+// `case x 1.5` over an `int` scrutinee — float constant over int is an ICmp
+// type mismatch that aborted the compiler (rc 134); must reject cleanly. #1213.
+BEZEL_TEST(sema_case_pattern_range, case_const_float_over_int_rejected_1213) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x 1.5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `case x 1.0m` over an `int` scrutinee — decimal constant over int is also
+// an ICmp type mismatch; must be rejected with the same §19 diagnostic. #1213.
+BEZEL_TEST(sema_case_pattern_range, case_const_decimal_over_int_rejected_1213) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x 1.0m => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `case x 5` over an `int` scrutinee — an untyped integer literal constant
+// over an integer scrutinee is COMPATIBLE and must still be accepted. #1213.
+BEZEL_TEST(sema_case_pattern_range, case_const_int_over_int_ok_1213) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x 5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// `case x 2.5` over a `double` scrutinee — float constant over float scrutinee
+// is COMPATIBLE (same comparison class); must be accepted. #1213.
+BEZEL_TEST(sema_case_pattern_range, case_const_float_over_double_ok_1213) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: double): int "
+        "    return case x 2.5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// `case x 1.5` over a `decimal` scrutinee — decimal's codegen path bridges
+// any numeric bound (decOperand/decCmp), so a float constant over a decimal
+// scrutinee must NOT be rejected. Regression guard for the sc==5 exclusion.
+// #1213.
+BEZEL_TEST(sema_case_pattern_range, case_const_float_over_decimal_ok_1213) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: decimal): int "
+        "    return case x 1.5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
