@@ -2876,22 +2876,59 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
 }
 
 
-// §28.5: the per-instantiation vtable to install in a freshly-constructed
-// instance of the active monomorphization of `ts`, in place of the shared
-// `vt$<T>`. Identical to the shared vtable except slot 2 (Dispose) is a
-// specialized disposer that classifies and disposes the class's owned type-
-// parameter field(s) using the active substitution. Falls back to the shared
-// vtable when the class needs no specialization. Cached per (class, spec field
-// types) so each distinct instantiation builds exactly one.
+// §28.5 / §14 / #1143: the per-instantiation vtable to install in a freshly-
+// constructed instance of the active monomorphization of `ts`, in place of the
+// shared `vt$<T>`. Specialized when:
+//
+// (a) The class has an owned type-parameter field: the shared (type-erased)
+//     disposer cannot classify the owned field — a per-instantiation Dispose
+//     (slot 2) must use the concrete substituted type. This is the §28.5 case.
+//
+// (b) The class implements a generic interface whose itable contains method(s)
+//     with a class-typed return or param (T bound to a reference type). The
+//     shared itable stores the i32-placeholder template function — it reads
+//     fields at the wrong struct offset and returns a truncated i32 instead of
+//     the full class pointer, producing a corrupted reference (SIGSEGV on any
+//     vtable access through the returned value). A per-instantiation itable
+//     with concrete-typed functions must replace slot 1 (itmap). §12/§13/§14.
+//
+// Falls back to the shared vtable when neither condition holds. Cached per
+// (class, spec-field-type vector) so each distinct instantiation builds once.
 llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) {
     llvm::GlobalVariable* shared = vtableOf(ts);
-    // No specialization needed: no active substitution, or no owned type-param
-    // field. Use the shared vtable (the unchanged, type-erased disposer).
-    if (!shared || genericSubst_.empty() || !classHasOwnedTypeParamField(ts))
-        return shared;
+    if (!shared || genericSubst_.empty()) return shared;
 
-    // Key by the same spec field types as the instance struct so Box<Res> and
-    // Box<int> get distinct vtables (and distinct disposers).
+    bool needsSpecDispose = classHasOwnedTypeParamField(ts);
+
+    // Condition (b): scan the class's interfaces for any method whose concrete
+    // function type (under the active genericSubst_) differs from the compiled
+    // template function's type.
+    bool needsSpecItable = false;
+    {
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(ts, supers);
+        for (const sema::TypeSymbol* iface : supers) {
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            for (sema::Symbol* m : iface->members) {
+                auto* im = dynamic_cast<sema::MethodSymbol*>(m);
+                if (!im || isStaticMethod(im)) continue;
+                sema::MethodSymbol* impl = findInterfaceImpl(ts, im);
+                if (!impl) continue;
+                auto mit = methodFns_.find(impl);
+                if (mit == methodFns_.end()) continue;
+                llvm::FunctionType* concFnTy = methodFnType(impl);
+                if (concFnTy && concFnTy != mit->second->getFunctionType()) {
+                    needsSpecItable = true;
+                    break;
+                }
+            }
+            if (needsSpecItable) break;
+        }
+    }
+
+    if (!needsSpecDispose && !needsSpecItable) return shared;
+
+    // Key by the spec field types so Box<Elem> and Box<int> get distinct vtables.
     std::vector<const sema::Symbol*> storage;
     collectInstanceStorage(ts, storage);
     std::vector<llvm::Type*> specFieldTys;
@@ -2904,21 +2941,91 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     auto sit = specMap.find(specFieldTys);
     if (sit != specMap.end()) return sit->second;
 
-    // Build the specialized disposer for THIS instantiation, then clone the
-    // shared vtable's initializer with slot 2 (Dispose) replaced by it. The
-    // shared vtable already has its full initializer (built in declareVtables,
-    // before bodies), so every other slot (descriptor, itmap, virtual methods)
-    // carries over unchanged.
     std::string suffix = "$spec" + std::to_string(specMap.size());
-    llvm::Function* specDispose = emitSpecializedDisposer(ts, suffix);
 
+    // (a) Specialized disposer — only when the class has an owned T field.
+    llvm::Function* specDispose = nullptr;
+    if (needsSpecDispose)
+        specDispose = emitSpecializedDisposer(ts, suffix);
+
+    // (b) Specialized itable(s) + itmap — only when interface method types differ.
+    // per §12/§13/§14 (#1143): for each interface the class implements, take the
+    // existing itable (already has correct event/property slots from Pass D) and
+    // replace each method slot whose concrete type differs from the template with
+    // a buildSpecializedMethodFn result under the active genericSubst_.
+    llvm::GlobalVariable* specItmapGV = nullptr;
+    if (needsSpecItable) {
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(ts, supers);
+        std::vector<llvm::Constant*> newItmapElems;
+        for (const sema::TypeSymbol* iface : supers) {
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            std::vector<sema::MethodSymbol*> ifaceMethods;
+            for (sema::Symbol* m : iface->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
+            }
+            auto itabIt = itables_.find({ts, iface});
+            if (itabIt == itables_.end()) continue;
+            llvm::GlobalVariable* existingItab = itabIt->second;
+            auto* existingInit =
+                llvm::cast<llvm::ConstantArray>(existingItab->getInitializer());
+            unsigned numSlots = existingInit->getType()->getNumElements();
+            std::vector<llvm::Constant*> newItabElems;
+            newItabElems.reserve(numSlots);
+            for (unsigned i = 0; i < numSlots; ++i)
+                newItabElems.push_back(existingInit->getAggregateElement(i));
+            for (unsigned mi = 0; mi < ifaceMethods.size() && mi < numSlots; ++mi) {
+                sema::MethodSymbol* impl = findInterfaceImpl(ts, ifaceMethods[mi]);
+                if (!impl) continue;
+                auto mit = methodFns_.find(impl);
+                if (mit == methodFns_.end()) continue;
+                llvm::FunctionType* concFnTy = methodFnType(impl);
+                if (!concFnTy || concFnTy == mit->second->getFunctionType()) continue;
+                CallableInfo ci;
+                if (!callableInfo(impl, ci)) continue;
+                std::vector<llvm::Type*> paramTys;
+                for (unsigned pi = 0; pi < concFnTy->getNumParams(); ++pi)
+                    paramTys.push_back(concFnTy->getParamType(pi));
+                if (llvm::Function* specFn =
+                        buildSpecializedMethodFn(impl, ci, paramTys))
+                    newItabElems[mi] = llvm::cast<llvm::Constant>(specFn);
+            }
+            auto* newItabArrTy = llvm::ArrayType::get(ptrTy(), newItabElems.size());
+            auto* newItabGV = new llvm::GlobalVariable(
+                *module_, newItabArrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(newItabArrTy, newItabElems),
+                "itab$" + std::string(ts->name) + "$" +
+                    std::string(iface->name) + suffix);
+            auto dit = descArray_.find(iface);
+            if (dit != descArray_.end()) {
+                newItmapElems.push_back(llvm::cast<llvm::Constant>(dit->second));
+                newItmapElems.push_back(
+                    llvm::ConstantExpr::getPointerCast(newItabGV, ptrTy()));
+            }
+        }
+        newItmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+        auto* newItmapArrTy =
+            llvm::ArrayType::get(ptrTy(), newItmapElems.size());
+        specItmapGV = new llvm::GlobalVariable(
+            *module_, newItmapArrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(newItmapArrTy, newItmapElems),
+            "itmap$" + std::string(ts->name) + suffix);
+    }
+
+    // Clone the shared vtable initializer and patch the needed slots.
     auto* arrTy = llvm::cast<llvm::ArrayType>(shared->getValueType());
     auto* sharedInit = llvm::cast<llvm::ConstantArray>(shared->getInitializer());
     std::vector<llvm::Constant*> elems;
     elems.reserve(arrTy->getNumElements());
     for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
         elems.push_back(sharedInit->getAggregateElement(i));
-    elems[2] = llvm::cast<llvm::Constant>(specDispose);  // slot 2 = Dispose
+    if (specDispose)
+        elems[2] = llvm::cast<llvm::Constant>(specDispose);  // slot 2 = Dispose
+    if (specItmapGV)
+        elems[1] = llvm::ConstantExpr::getPointerCast(specItmapGV, ptrTy());  // slot 1 = itmap
     auto* init = llvm::ConstantArray::get(arrTy, elems);
     auto* gv = new llvm::GlobalVariable(
         *module_, arrTy, /*isConstant=*/true,
