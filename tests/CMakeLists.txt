@@ -364,6 +364,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_forgotten_await_777_test.cpp
     codegen/selectmany_range_selector_775_test.cpp
     codegen/checked_cast_reinterpret_753_test.cpp
+    codegen/widen_to_unsigned_1159_test.cpp   # fix #1159: §5.2 signed→wider-unsigned cast checks negativity (OverflowException)
     codegen/linq_last_single_predicate_789_test.cpp
     codegen/accessor_grammar_691_test.cpp
     codegen/async_get_async_enumerator_757_test.cpp

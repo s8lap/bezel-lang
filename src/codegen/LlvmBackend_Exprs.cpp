@@ -9206,6 +9206,16 @@ llvm::Value* Emitter::lowerPrimCastScalar(sema::PrimitiveType targetPt,
     if (db > sb) {
         if (srcTy->isIntegerTy(1))
             return builder_.CreateZExt(payload, dstTy);  // bool→int always zero-ext
+        // §5.2 (#1159): widening a SIGNED source to an UNSIGNED destination is a
+        // CHECKED conversion — a negative value is not representable in any
+        // unsigned type, so raise OverflowException before sign-extending (which
+        // would otherwise silently yield a huge positive value). Mirrors the
+        // widening-to-unsigned guard in lowerConversion for the nullable path.
+        if (!srcUns && dstUns) {
+            llvm::Value* bad = builder_.CreateICmpSLT(
+                payload, llvm::ConstantInt::get(srcTy, 0), "s2u.widen.oor");
+            emitGuardThrow(bad, "OverflowException");
+        }
         return srcUns ? builder_.CreateZExt(payload, dstTy)
                       : builder_.CreateSExt(payload, dstTy);
     }
@@ -9548,6 +9558,19 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         // (true=1, false=0). Sign-extending i1 would give -1 for true.
         if (srcTy->isIntegerTy(1))
             return builder_.CreateZExt(src, dstTy);
+        // §5.2 (#1159): widening a SIGNED source to an UNSIGNED destination is a
+        // CHECKED conversion — an explicit integer conversion "preserves the
+        // numeric value or fails", and a negative value is not representable in
+        // any unsigned type. Without this guard the sign-extension below silently
+        // turned a negative source into a huge positive value (e.g. ulong(-1) =
+        // 2^64-1). The narrowing path range-checks [0,max] and the same-width
+        // path checks the sign bit (#753); this closes the widening-to-unsigned
+        // gap. Raise OverflowException when src < 0 before the extension.
+        if (!srcUns && dstUns) {
+            llvm::Value* bad = builder_.CreateICmpSLT(
+                src, llvm::ConstantInt::get(srcTy, 0), "s2u.widen.oor");
+            emitGuardThrow(bad, "OverflowException");
+        }
         return srcUns ? builder_.CreateZExt(src, dstTy)
                       : builder_.CreateSExt(src, dstTy);
     }
