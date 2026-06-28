@@ -169,3 +169,80 @@ BEZEL_TEST(codegen_cg21b, finally_no_throw_original_propagates_720) {
         "  end; "
         "end Main; end C;"), 41);
 }
+
+// ── #1149 / §31.2: a finally that THROWS supersedes the in-flight exception ───
+// E1, which must then be freed exactly once (sibling of the #1108 catch-guard
+// supersede leak). E1 was previously freed ZERO times — a 16-byte leak — because
+// a direct `throw` in the finally TERMINATES the body and bypasses the
+// supersede/restore check (the body's own throw propagates E2 directly). The fix
+// exposes E1 as the caught object for the duration of the finally body so a
+// `throw` routes through emitThrowValue's #397/#866 caught-exception free,
+// guarded against double-free by isDirectRethrow / throwLeavesArm. runJit exit
+// codes don't observe the leak directly (gated by the run's ASan harness); these
+// cases pin the supersede CONTROL FLOW and stress the free path so a double-free
+// regression — which crashes the in-process JIT suite — is caught.
+
+// #1149: the finally's E2 supersedes E1 and is caught by the outer `catch E2`.
+BEZEL_TEST(finally_supersede_1149, finally_throw_supersedes_outer_catches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; class E2 end E2; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new E1(); finally throw new E2(); end; "
+        "  catch E2 => return 7; "                       // superseding E2 caught
+        "  catch E1 => return 1; "                       // E1 must NOT be seen
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 7);
+}
+
+// #1149: the superseding E2 skips a non-matching outer arm and is caught by the
+// matching one (the original E1 is superseded, never reaches the E1 arm).
+BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_skips_nonmatching_arm) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; class E2 end E2; class E3 end E3; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new E1(); finally throw new E2(); end; "
+        "  catch E3 => return 2; "                       // not matched
+        "  catch E2 => return 9; "                       // superseding E2 caught
+        "  catch E1 => return 1; "                       // superseded — skipped
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 9);
+}
+
+// #1149: a finally whose throw is conditional (the body does NOT statically
+// terminate — exercises the supersede check path, finUTerm=false). E2 supersedes.
+BEZEL_TEST(finally_supersede_1149, finally_conditional_throw_supersedes) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; class E2 end E2; "
+        "class C public static method Main(): int "
+        "  var t := true; "
+        "  try "
+        "    try throw new E1(); finally if t then throw new E2(); end; end; "
+        "  catch E2 => return 5; "
+        "  catch E1 => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 5);
+}
+
+// #1149: the finally-supersede repeated 100x — each iteration's superseded E1
+// must be freed exactly once. A double-free regression crashes the in-process
+// JIT run here; a leak accumulates (caught by the ASan harness). rc=100.
+BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_repeated_no_corruption) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; class E2 end E2; "
+        "class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 100 do "
+        "    try "
+        "      try throw new E1(); finally throw new E2(); end; "
+        "    catch E2 => total := total + 1; "
+        "    end; "
+        "    i := i + 1; "
+        "  end; "
+        "  return total; "                               // 100
+        "end Main; end C;"), 100);
+}

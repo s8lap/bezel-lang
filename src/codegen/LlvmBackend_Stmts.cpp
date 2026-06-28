@@ -1967,7 +1967,31 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             asyncHandlerSpillSlots_.push_back(pendingExcSlot);
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
+            // #1149 (sibling of #1108): a `throw` inside the finally body
+            // SUPERSEDES the captured in-flight exception E1 (§31.2). E1 is then
+            // abandoned and must be freed exactly once — otherwise it leaks (the
+            // direct-throw path terminates the body and bypasses the supersede
+            // check below; the finThrew edge only catches a fall-through-with-
+            // bz$exc-set, which a direct throw never produces). Expose E1 as the
+            // caught object for the duration of the finally body so a `throw`
+            // routes through emitThrowValue's existing #397/#866 caught-exception
+            // free — emitted at a live insert point before the throw's branch and
+            // guarded against double-free by isDirectRethrow/throwLeavesArm. A
+            // finally has no exception binding, so currentCaughtName_ stays empty
+            // (never a direct-rethrow); caughtExcArmTarget_ = unwindBB() (= the
+            // outer unwind target a finally throw branches to) makes throwLeavesArm
+            // true. Restored immediately after so the supersede/restore logic and
+            // outer scopes see the correct caught context. Mirrors the #1108 fix.
+            llvm::Value* savedFinCaught = currentCaughtExc_;
+            std::string_view savedFinCaughtName = currentCaughtName_;
+            llvm::BasicBlock* savedFinArmTarget = caughtExcArmTarget_;
+            currentCaughtExc_ = builder_.CreateLoad(ptrTy(), pendingExcSlot);
+            currentCaughtName_ = std::string_view{};
+            caughtExcArmTarget_ = unwindBB();
             bool finUTerm = lowerScopedBlock(trys.finallyBody);
+            currentCaughtExc_ = savedFinCaught;
+            currentCaughtName_ = savedFinCaughtName;
+            caughtExcArmTarget_ = savedFinArmTarget;
             if (!finUTerm) {
                 // Restore the captured in-flight exception and re-propagate. If
                 // the finally itself threw (set bz$exc non-null), that NEW
@@ -2009,7 +2033,21 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                                  pendingExcSlot);
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
-            if (!lowerScopedBlock(trys.finallyBody)) {
+            // #1149: expose the captured in-flight E1 as the caught object for
+            // the finally body so a `throw` inside frees E1 exactly once via
+            // emitThrowValue's #397/#866 path (§31.2 supersede). See the async
+            // branch above for the full rationale + double-free guards.
+            llvm::Value* savedFinCaught = currentCaughtExc_;
+            std::string_view savedFinCaughtName = currentCaughtName_;
+            llvm::BasicBlock* savedFinArmTarget = caughtExcArmTarget_;
+            currentCaughtExc_ = builder_.CreateLoad(ptrTy(), pendingExcSlot);
+            currentCaughtName_ = std::string_view{};
+            caughtExcArmTarget_ = unwindBB();
+            bool finBodyTerm = lowerScopedBlock(trys.finallyBody);
+            currentCaughtExc_ = savedFinCaught;
+            currentCaughtName_ = savedFinCaughtName;
+            caughtExcArmTarget_ = savedFinArmTarget;
+            if (!finBodyTerm) {
                 llvm::Value* afterFin =
                     builder_.CreateLoad(ptrTy(), emitExcSlot());
                 llvm::Value* finThrew = builder_.CreateICmpNE(
