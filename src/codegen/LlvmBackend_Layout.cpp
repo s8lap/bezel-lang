@@ -54,20 +54,21 @@ bool Emitter::isUnsignedPrim(sema::PrimitiveType p) {
 // fill of a right-SHIFT use a *different* signedness — each operand's own (and,
 // for shift, the LEFT operand's). Those sites use isUnsignedTargetExpr directly.
 bool Emitter::isUnsignedBinOperand(const ast::BinaryExpr& bin) {
+    // per §8.4/§10.3 (#1189): typeRefIsUnsigned also recognises a Named-kind
+    // enum operand (its signedness is its underlying primitive's), so a
+    // relational comparison of two unsigned-backed enums selects icmp ult.
     auto unsignedExpr = [&](const ast::Expr* e) {
         if (!e) return false;
-        auto* rt = ctx_.exprType(*e);
-        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
-               isUnsignedPrim(rt->primitive);
+        return typeRefIsUnsigned(ctx_.exprType(*e));
     };
     return unsignedExpr(bin.left.get()) && unsignedExpr(bin.right.get());
 }
 
 
 bool Emitter::isUnsignedTargetExpr(const ast::Expr& e) {
-    auto* rt = ctx_.exprType(e);
-    return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
-           isUnsignedPrim(rt->primitive);
+    // per §8.4/§10.3 (#1189): include a Named-kind enum target, whose signedness
+    // is that of its underlying primitive (byte/ushort/uint/ulong → unsigned).
+    return typeRefIsUnsigned(ctx_.exprType(e));
 }
 
 

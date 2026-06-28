@@ -1522,6 +1522,24 @@ private:
         return nullptr;
     }
 
+    // per §8.4/§10.3 (#1189): the signedness of a resolved TypeRef. An enum is
+    // represented by its underlying integer (§10.3), so a Named-kind TypeRef
+    // whose declaration is an enum carries the signedness of that underlying
+    // primitive — not "signed by default". Routing the enum case through
+    // enumIsUnsigned lets relational comparison of an unsigned-backed enum
+    // (byte/ushort/uint/ulong) select the unsigned predicate (icmp ult) instead
+    // of the signed one (icmp slt), which read values above the signed midpoint
+    // as negative.
+    bool typeRefIsUnsigned(const sema::TypeRef* rt) {
+        if (!rt) return false;
+        if (rt->kind == sema::TypeRef::Kind::Primitive)
+            return isUnsignedPrim(rt->primitive);
+        if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+            rt->declaration->kind == ast::TypeDeclKind::Enum)
+            return enumIsUnsigned(rt->declaration);
+        return false;
+    }
+
     // §4.6: lazily get (or create) the %bz_string struct type.
     // Layout: { ptr data, i64 length, i8 width, i64 rc }
     //   data  : pointer to the code-point array (elements are width bytes each)

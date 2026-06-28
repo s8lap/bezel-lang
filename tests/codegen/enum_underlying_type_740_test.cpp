@@ -375,3 +375,72 @@ BEZEL_TEST(enum_underlying_749, long_min_value_literal_accepted) {
         "  return (0 if x = -9223372036854775808L else 1); "
         "end Main; end C;"), 0);
 }
+
+// §8.4/§10.3 (#1189): a relational comparison (`<` `<=` `>` `>=`) of two
+// unsigned-backed enum values must use the UNSIGNED integer predicate. The enum
+// representation is its underlying integer (§10.3); with a `byte`-backed enum a
+// value above the signed midpoint (200 = 0xC8) read as signed is -56, so a
+// signed `icmp slt` made `Code.Lo (10) < Code.Hi (200)` evaluate FALSE. The
+// detection helpers (isUnsignedBinOperand/isUnsignedTargetExpr) only recognised
+// Primitive-kind operands; a Named-kind enum fell through to the signed path.
+BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare) {
+    // per §8.4/§10.3 — every relational op on a byte-backed enum is unsigned.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum Code: byte Lo := 10, Hi := 200; end Code; "
+        "class C public static method Main(): int "
+        "  if not (Code.Lo < Code.Hi)  then return 1; end; "
+        "  if not (Code.Lo <= Code.Hi) then return 2; end; "
+        "  if not (Code.Hi > Code.Lo)  then return 3; end; "
+        "  if not (Code.Hi >= Code.Lo) then return 4; end; "
+        "  if not (Code.Lo <= Code.Lo) then return 5; end; "
+        "  if not (Code.Hi >= Code.Hi) then return 6; end; "
+        "  return 0; "
+        "end Main; end C;"), 0);
+}
+
+// §8.4/§10.3 (#1189): the nullable-lifted form goes through the same shared
+// detection helper, so `Code? a < Code? b` of byte-backed enums is also unsigned.
+BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare_nullable) {
+    // per §8.4/§10.3 / §7.2 — nullable lift preserves the unsigned predicate.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum Code: byte Lo := 10, Hi := 200; end Code; "
+        "class C public static method Main(): int "
+        "  var a: Code? := Code.Lo; var b: Code? := Code.Hi; "
+        "  return (0 if a < b else 1); "
+        "end Main; end C;"), 0);
+}
+
+// §8.4/§10.3 (#1189): the same defect affects every unsigned underlying width —
+// `ushort` (40000 > 0x7FFF) and `uint` (4e9 > 2^31) values above the signed max.
+BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare_ushort_uint) {
+    // per §8.4/§10.3 — ushort/uint relational compare is unsigned, not signed.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum US: ushort Lo := 100, Hi := 40000;     end US; "
+        "enum UI: uint   Lo := 100, Hi := 4000000000; end UI; "
+        "class C public static method Main(): int "
+        "  if not (US.Lo < US.Hi) then return 1; end; "
+        "  if not (UI.Lo < UI.Hi) then return 2; end; "
+        "  return 0; "
+        "end Main; end C;"), 0);
+}
+
+// §8.4/§10.3 (#1189) regression guard: a SIGNED underlying type (`sbyte`) must
+// STILL use the signed predicate. Neg (-100 = 0x9C) read unsigned is 156, so a
+// wrongly-unsigned `icmp ult` would make `Neg < Pos (100)` FALSE; the signed
+// `icmp slt` keeps -100 < 100 true. This pins that the fix is gated on the
+// enum's underlying signedness, not applied to every enum.
+BEZEL_TEST(enum_underlying_1189, signed_enum_relational_compare_unaffected) {
+    // per §8.4/§10.3 — sbyte-backed enum compares signed (negative ordinals).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum E: sbyte Neg := -100, Pos := 100; end E; "
+        "class C public static method Main(): int "
+        "  if not (E.Neg < E.Pos)  then return 1; end; "
+        "  if not (E.Pos > E.Neg)  then return 2; end; "
+        "  if not (E.Neg <= E.Pos) then return 3; end; "
+        "  return 0; "
+        "end Main; end C;"), 0);
+}
