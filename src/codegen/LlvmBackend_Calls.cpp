@@ -5261,6 +5261,43 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     }
 
     if (cls == "Math") {
+        // #1141 / stdlib §1: Math.Min/Max/Clamp are declared ONLY as the generic
+        // `Min<T>(a, b): T where T: IComparable<T>` (no numeric overload). For a
+        // non-numeric value-type argument (a record/enum that implements
+        // `IComparable<T>`, §14.2) the comparison must dispatch through the
+        // type's `CompareTo`, not the numeric sitofp-to-double path (which emits
+        // `sitofp %record … to double` → malformed IR). `comparableCompareTo`
+        // returns the operand type's single-parameter `CompareTo` method when the
+        // operand is such a value type, else null (numeric path handles int/
+        // double); `emitCompareToCmp` lowers `a.CompareTo(b)` to its int result,
+        // spilling a record receiver to a stack slot (records pass `this` by
+        // pointer — CG29). Enums lower as their integer ordinal and never reach
+        // here (they take the integer min/max branch).
+        auto comparableCompareTo =
+            [&](const ast::Expr* e) -> sema::MethodSymbol* {
+            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            if (t && t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                (t->declaration->kind == ast::TypeDeclKind::Record ||
+                 t->declaration->kind == ast::TypeDeclKind::Enum)) {
+                if (sema::MethodSymbol* cm =
+                        findMethodByName(t->declaration, "CompareTo"))
+                    if (cm->params.size() == 1) return cm;
+            }
+            return nullptr;
+        };
+        auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
+                                    llvm::Value* b) -> llvm::Value* {
+            llvm::Value* recv = a;
+            if (cmpMs->parent &&
+                cmpMs->parent->kind == ast::TypeDeclKind::Record &&
+                !recv->getType()->isPointerTy()) {
+                llvm::Value* tmp = entryAlloca(recordStruct(cmpMs->parent));
+                builder_.CreateStore(recv, tmp);
+                recv = tmp;
+            }
+            std::vector<llvm::Value*> cargs{recv, b};
+            return emitMethodCall(cmpMs, cargs, /*baseQualified=*/false);
+        };
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);
             if (!arg) return nullptr;
@@ -5378,6 +5415,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if (a->getType()->isIntegerTy()) {
                     llvm::Value* cmp = builder_.CreateICmpSLT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "min.result");
+                } else if (sema::MethodSymbol* cmpMs =
+                               comparableCompareTo(call.args[0].value.get())) {
+                    // #1141: non-numeric IComparable<T> → a if a.CompareTo(b) <= 0.
+                    llvm::Value* cmp = emitCompareToCmp(cmpMs, a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* le = builder_.CreateICmpSLE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(le, a, b, "min.cmp.result");
                 } else {
                     // float/double: use llvm.minnum intrinsic
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
@@ -5391,6 +5436,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if (a->getType()->isIntegerTy()) {
                     llvm::Value* cmp = builder_.CreateICmpSGT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "max.result");
+                } else if (sema::MethodSymbol* cmpMs =
+                               comparableCompareTo(call.args[0].value.get())) {
+                    // #1141: non-numeric IComparable<T> → a if a.CompareTo(b) >= 0.
+                    llvm::Value* cmp = emitCompareToCmp(cmpMs, a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* ge = builder_.CreateICmpSGE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(ge, a, b, "max.cmp.result");
                 } else {
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
@@ -5457,6 +5510,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateICmpSLT(val, lo), lo, val);
                 return builder_.CreateSelect(
                     builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
+            } else if (sema::MethodSymbol* cmpMs =
+                           comparableCompareTo(call.args[0].value.get())) {
+                // #1141: non-numeric IComparable<T> → value.CompareTo(lo) < 0 ?
+                // lo : (value.CompareTo(hi) > 0 ? hi : value).
+                llvm::Value* cmpLo = emitCompareToCmp(cmpMs, val, lo);
+                llvm::Value* cmpHi = emitCompareToCmp(cmpMs, val, hi);
+                if (!cmpLo || !cmpHi) return nullptr;
+                llvm::Value* ltLo = builder_.CreateICmpSLT(
+                    cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
+                llvm::Value* gtHi = builder_.CreateICmpSGT(
+                    cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
+                llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
+                return builder_.CreateSelect(ltLo, lo, inner, "clamp.cmp.result");
             } else {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);

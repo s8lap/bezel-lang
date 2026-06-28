@@ -4237,6 +4237,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // #1141 / stdlib §1: Math.Min<T>/Max<T>/Clamp<T> (declared only as
+        // `where T: IComparable<T>`) instantiated with a non-numeric VALUE type
+        // — a record/enum that implements IComparable<T> (§14.2). The result
+        // type is T (same as the operands). The numeric same-as-arg block above
+        // only covers primitive double/float/long, so a record/enum operand left
+        // the call mistyped (defaulting to int) and a `.field` access on the
+        // result folded to 0. Type the call as the operand's type so member
+        // access on the result resolves. (Codegen routes the comparison through
+        // the operand type's `CompareTo` — see tryLowerBuiltinClassCall.)
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            if ((ma->member == "Min" || ma->member == "Max" ||
+                 ma->member == "Clamp") &&
+                ma->target && !ce.args.empty() && ce.args[0].value) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get())) {
+                    if (tid->name == "Math") {
+                        if (auto* argTy = ctx_.exprType(*ce.args[0].value))
+                            if (argTy->kind == TypeRef::Kind::Named &&
+                                argTy->declaration &&
+                                (argTy->declaration->kind ==
+                                     ast::TypeDeclKind::Record ||
+                                 argTy->declaration->kind ==
+                                     ast::TypeDeclKind::Enum))
+                                ctx_.setExprType(&ce, argTy);
+                    }
+                }
+            }
+        }
     }
     // CallExpr where the callee is a constructor reference (e.g.
     // `T(args)` form — rare in Bezel since `new T(args)` is the

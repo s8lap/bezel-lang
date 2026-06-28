@@ -203,3 +203,88 @@ BEZEL_TEST(math_convert, convert_tryto_int32_trailing_junk_spec_2_3) {
         "  return (1 if not ok else 0); "
         "end Main; end C;"), 1);
 }
+
+// ── #1141 / stdlib §1 / §14.2: Math.Min/Max/Clamp over a NON-NUMERIC ──────────
+// IComparable<T> value type. Math.Min/Max/Clamp are declared ONLY as the
+// generic `Min<T>(a, b): T where T: IComparable<T>` (no numeric overload), so a
+// record/enum that implements IComparable<T> is a valid type argument (§14.2).
+// Before the fix the intrinsic was hard-wired to a numeric sitofp-to-double
+// lowering, so a record operand emitted `sitofp %record … to double` →
+// malformed IR / compile abort; sema also left the result mistyped (defaulting
+// to int), so a `.field` access on the result folded to 0. Codegen now routes
+// the comparison through the type's `CompareTo`, and sema types the result as T.
+namespace {
+// A value type (record) implementing IComparable<Money>.
+const char* kMoney =
+    "module M; import System; "
+    "record Money(cents: int): IComparable<Money> "
+    "  public method CompareTo(other: Money): int => "
+    "    (1 if cents > other.cents else (-1 if cents < other.cents else 0)); "
+    "end Money; ";
+std::string moneyMain(const std::string& body) {
+    return std::string(kMoney) +
+           "class App public static method Main(): int " + body +
+           " end Main; end App;";
+}
+}  // namespace
+
+// #1141: Math.Min<Money> returns the lesser operand (CompareTo dispatch), not
+// an IR_FAIL — Money(150) vs Money(99) → 99.
+BEZEL_TEST(math_comparable_1141, min_record_explicit_type_arg) {
+    BEZEL_EXPECT_EQ(run(moneyMain(
+        "  var a := new Money(150); var b := new Money(99); "
+        "  var lo := Math.Min<Money>(a, b); "
+        "  return lo.cents;")), 99);
+}
+
+// #1141: the INFERRED form `Math.Min(a, b)` also dispatches via CompareTo.
+BEZEL_TEST(math_comparable_1141, min_record_inferred) {
+    BEZEL_EXPECT_EQ(run(moneyMain(
+        "  var a := new Money(150); var b := new Money(99); "
+        "  return Math.Min(a, b).cents;")), 99);
+}
+
+// #1141: Math.Max<Money> returns the greater operand → 150.
+BEZEL_TEST(math_comparable_1141, max_record) {
+    BEZEL_EXPECT_EQ(run(moneyMain(
+        "  var a := new Money(150); var b := new Money(99); "
+        "  return Math.Max<Money>(a, b).cents;")), 150);
+}
+
+// #1141: Math.Clamp<Money> — below range clamps to lo (80 → 99).
+BEZEL_TEST(math_comparable_1141, clamp_record_below_range) {
+    BEZEL_EXPECT_EQ(run(moneyMain(
+        "  var v := new Money(80); var lo := new Money(99); var hi := new Money(150); "
+        "  return Math.Clamp<Money>(v, lo, hi).cents;")), 99);
+}
+
+// #1141: Math.Clamp<Money> — above range clamps to hi (200 → 150).
+BEZEL_TEST(math_comparable_1141, clamp_record_above_range) {
+    BEZEL_EXPECT_EQ(run(moneyMain(
+        "  var v := new Money(200); var lo := new Money(99); var hi := new Money(150); "
+        "  return Math.Clamp<Money>(v, lo, hi).cents;")), 150);
+}
+
+// #1141: Math.Clamp<Money> — in range returns the value unchanged (120 → 120).
+BEZEL_TEST(math_comparable_1141, clamp_record_in_range) {
+    BEZEL_EXPECT_EQ(run(moneyMain(
+        "  var v := new Money(120); var lo := new Money(99); var hi := new Money(150); "
+        "  return Math.Clamp<Money>(v, lo, hi).cents;")), 120);
+}
+
+// #1141 CONTROL: the numeric int path is unaffected — Min(8,3)=3, Max(8,3)=8,
+// Clamp(20,0,10)=10 → 3*100 + 8 + 10 = 318 (runJit returns the full int).
+BEZEL_TEST(math_comparable_1141, numeric_int_unaffected) {
+    BEZEL_EXPECT_EQ(run(mainBody(
+        "return Math.Min(8, 3) * 100 + Math.Max(8, 3) + Math.Clamp(20, 0, 10);")),
+        318);
+}
+
+// #1141 CONTROL: the numeric double path is unaffected — Min(2.5,7.5)=2,
+// Max=7, Clamp(99,0,10)=10 → 2*100 + 7 + 10 = 217.
+BEZEL_TEST(math_comparable_1141, numeric_double_unaffected) {
+    BEZEL_EXPECT_EQ(run(mainBody(
+        "  var lo := Math.Min(2.5, 7.5); var hi := Math.Max(2.5, 7.5); "
+        "  var c := Math.Clamp(99.0, 0.0, 10.0); "
+        "  return int(lo) * 100 + int(hi) + int(c);")), 217);
+}
