@@ -1424,7 +1424,18 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         // load is guarded by `isA` so a failed cast (or a null operand) never
         // dereferences the box.
         if (isBoxableValueType(rt)) {
-            llvm::Type* valTy = lowerTypeRef(rt);
+            // §17.4: the result of `as` is ALWAYS nullable, so the target may be
+            // written either bare (`o as int`) or already-nullable (`o as int?`).
+            // The box stores the BARE value bytes, and the result struct built
+            // below is itself the tagged {hasValue, T}. So `valTy` — the type of
+            // the unboxed payload and of the value slot we fill — must be the
+            // NON-NULLABLE underlying type. Without stripping, a nullable target
+            // (`int?`/`Rec?`) made `valTy` the {i8, T} struct, so the load read a
+            // {i8,T} and the wrap below inserted that {i8,T} into the T slot of
+            // another {i8,T} → malformed insertvalue (issue #1154).
+            sema::TypeRef rtBase = *rt;
+            rtBase.nullable = false;
+            llvm::Type* valTy = lowerTypeRef(&rtBase);
             auto* loadBB = llvm::BasicBlock::Create(llvm_, "unbox.load",
                                                     currentFn_);
             auto* contBB = llvm::BasicBlock::Create(llvm_, "unbox.cont",

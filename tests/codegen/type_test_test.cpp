@@ -211,3 +211,58 @@ BEZEL_TEST(codegen_cg19_string_operand_1071, object_holding_string_is_string_sti
         "  var o: Object := \"hello\"; return (1 if o is string else 0); "
         "end Main; end C;"), 1);
 }
+
+// ── fix #1154 (§17.4 / §8.6): `o as int?` / `o as Rec?` where the `as` TARGET
+// is written already-nullable. §17.4 "the result type of `as` is always
+// nullable", so the target may be written bare (`o as int`) or nullable
+// (`o as int?`); both must unbox to the same tagged {hasValue, T}. A nullable
+// value-type target previously double-wrapped the unboxed result — the {i8,T}
+// tagged struct was inserted into the T value-slot of another {i8,T}, emitting
+// `insertvalue { i8, i32 } %a, { i8, i32 } %b, 1` → IR-verify failure.
+
+// §17.4: a boxed int, `o as int?` → Some(7); the value reads back unchanged.
+BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_int_nullable_match_spec_17_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var o: Object := 7; var x := o as int?; "
+        "  return (x! if x <> null else -1); "
+        "end Main; end C;"), 7);
+}
+
+// §17.4 / §8.6: an Object holding a record, `o as int?` is null (no crash).
+BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_int_nullable_nomatch_is_null_spec_17_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Rec(v: int); class C public static method Main(): int "
+        "  var o: Object := new Rec(5); var x := o as int?; "
+        "  return (1 if x = null else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §17.4 / §8.6 (issue #416): a boxed record, `o as Rec?` → Some(Rec); field reads.
+BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_record_nullable_match_spec_17_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Rec(v: int); class C public static method Main(): int "
+        "  var o: Object := new Rec(9); var r := o as Rec?; "
+        "  return (r!.v if r <> null else -1); "
+        "end Main; end C;"), 9);
+}
+
+// §17.4 / §8.6: an Object holding an int, `o as Rec?` is null (no crash).
+BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_record_nullable_nomatch_is_null_spec_17_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Rec(v: int); class C public static method Main(): int "
+        "  var o: Object := 7; var r := o as Rec?; "
+        "  return (1 if r = null else 0); "
+        "end Main; end C;"), 1);
+}
+
+// REGRESSION: a REFERENCE-type nullable target `o as Dog?` lowers to a plain
+// pointer (select isA ? obj : null); the value-unbox fix must not touch it.
+BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_class_nullable_still_works_regression) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Animal end Animal; class Dog : Animal end Dog; "
+        "class C public static method Main(): int "
+        "  var d := new Dog(); var o: Object := d; var dd := o as Dog?; "
+        "  return (1 if dd <> null else 0); "
+        "end Main; end C;"), 1);
+}
