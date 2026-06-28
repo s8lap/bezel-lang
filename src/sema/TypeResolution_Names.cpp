@@ -810,6 +810,17 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (first == "Range") {
                     ref.declaration = ctx_.builtinClassSym("Range");
                 }
+                // #1115 / §2.8–§2.9: the auto-imported builtin generic interfaces
+                // IComparable<T> / IEquatable<T> get a REAL synthesized Interface
+                // TypeSymbol (with the CompareTo/Equals contract member) attached
+                // as the declaration, so they lower as ordinary heap interface
+                // references through the user-interface itable path — usable as a
+                // field/parameter/return/local value type, not just a `where`
+                // bound. The arity check above (still) diagnoses wrong arity; this
+                // only attaches the declaration when the name+arity are valid.
+                if (first == "IComparable" || first == "IEquatable") {
+                    ref.declaration = ctx_.builtinInterfaceSym(first);
+                }
                 return;
             }
         }
