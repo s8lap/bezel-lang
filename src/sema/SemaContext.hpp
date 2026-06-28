@@ -296,15 +296,18 @@ public:
     // types with no disposal obligation per §28).
     TypeSymbol* builtinClassSym(std::string_view name);
 
-    // #1115 / §2.8–§2.9: a compiler-synthesized REAL Interface TypeSymbol for
-    // the auto-imported builtin generic interfaces IComparable<T> /
-    // IEquatable<T>, so they lower as ordinary heap interface references through
-    // the existing user-generic-interface itable path (every codegen layer keys
-    // off declaration->kind==Interface). The SAME pointer is cached/returned per
-    // name (pointer-equality guards). Carries one generic param `T` and one
-    // member MethodSymbol (CompareTo(other:T):int / Equals(other:T):bool) backed
-    // by a real abstract ast::MethodDecl so methodFnType resolves the itable
-    // signature. Returns nullptr for any non-builtin-interface name.
+    // #1115 / §2.8–§2.9 / #975 / stdlib §5: a compiler-synthesized REAL Interface
+    // TypeSymbol for the auto-imported builtin generic interfaces IComparable<T>
+    // / IEquatable<T> / IEqualityComparer<T>, so they lower as ordinary heap
+    // interface references through the existing user-generic-interface itable path
+    // (every codegen layer keys off declaration->kind==Interface). The SAME
+    // pointer is cached/returned per name (pointer-equality guards). Each carries
+    // one generic param `T` and one or more member MethodSymbols backed by real
+    // abstract ast::MethodDecls so methodFnType resolves the itable signature:
+    //   IComparable:       CompareTo(other: T): int
+    //   IEquatable:        Equals(other: T): bool
+    //   IEqualityComparer: Equals(a: T, b: T): bool; GetHashCode(value: T): int
+    // Returns nullptr for any non-builtin-interface name.
     TypeSymbol* builtinInterfaceSym(std::string_view name);
 
     // §26.5 (#714): store/retrieve the free-type-variable binding that was
@@ -422,25 +425,52 @@ inline TypeSymbol* SemaContext::builtinClassSym(std::string_view name) {
     return ts;
 }
 
-// #1115 / §2.8–§2.9: synthesize (and cache) a real Interface TypeSymbol for the
-// builtin generic interfaces IComparable<T> / IEquatable<T>, mirroring the shape
-// SymbolCollection produces for a user `interface I<T> method M(other: T): R`,
-// so they join the existing user-interface itable codegen path with no new
-// codegen. The contract member is CompareTo(other: T): int / Equals(other: T):
-// bool, backed by a real abstract ast::MethodDecl (methodFnType needs the decl
-// to build the itable signature; the return-type node is pre-resolved so it
-// lowers to int/bool, not the i32 fallback).
+// #1115 / §2.8–§2.9 / #975 (stdlib §5): synthesize (and cache) a real Interface
+// TypeSymbol for the builtin generic interfaces IComparable<T> / IEquatable<T> /
+// IEqualityComparer<T>, mirroring the shape SymbolCollection produces for a user
+// `interface I<T> method M(...): R`, so they join the existing user-interface
+// itable codegen path with no new codegen. The contract members are:
+//   IComparable:       CompareTo(other: T): int
+//   IEquatable:        Equals(other: T): bool
+//   IEqualityComparer: Equals(a: T, b: T): bool; GetHashCode(value: T): int
+// each backed by a real abstract ast::MethodDecl (methodFnType needs the decl to
+// build the itable signature; every return-type node is pre-resolved so it lowers
+// to int/bool, not the i32 fallback). Each generic-`T` parameter gets its own
+// Type node so per-use substitution (T → the instantiation argument) is keyed
+// independently. The synthesized interface dispatches identically to a user
+// `interface` with the same shape — IEqualityComparer is a user-IMPLEMENTED
+// agent (stdlib §5); the Dictionary/Set comparer-constructor overloads that
+// would *consume* one are a separate, still-deferred feature.
 inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
-    const bool isCmp = (name == "IComparable");
-    if (!isCmp && name != "IEquatable") return nullptr;
+    // Per-method contract spec. Every parameter is the generic `T` (the only
+    // shape the three builtin interfaces need); paramNames give the spec-faithful
+    // names. retName/retPrim must agree so the pre-resolved return node matches
+    // methodFnType's lowering.
+    struct MethodSpec {
+        const char* methodName;
+        const char* retName;
+        PrimitiveType retPrim;
+        std::vector<const char*> paramNames;  // each parameter has type `T`
+    };
+    std::vector<MethodSpec> methods;
+    const char* ifaceName = nullptr;
+    if (name == "IComparable") {
+        ifaceName = "IComparable";
+        methods = {{"CompareTo", "int", PrimitiveType::Int, {"other"}}};
+    } else if (name == "IEquatable") {
+        ifaceName = "IEquatable";
+        methods = {{"Equals", "bool", PrimitiveType::Bool, {"other"}}};
+    } else if (name == "IEqualityComparer") {
+        ifaceName = "IEqualityComparer";
+        methods = {{"Equals", "bool", PrimitiveType::Bool, {"a", "b"}},
+                   {"GetHashCode", "int", PrimitiveType::Int, {"value"}}};
+    } else {
+        return nullptr;
+    }
+
     auto key = std::string(name);
     auto it = builtinInterfaceCache_.find(key);
     if (it != builtinInterfaceCache_.end()) return it->second;
-
-    const char* ifaceName  = isCmp ? "IComparable" : "IEquatable";
-    const char* methodName = isCmp ? "CompareTo"   : "Equals";
-    const char* retName    = isCmp ? "int"         : "bool";
-    const PrimitiveType retPrim = isCmp ? PrimitiveType::Int : PrimitiveType::Bool;
 
     // ── AST nodes (owned, transitively, by builtinInterfaceAst_) ───────────────
     auto typeDecl = std::make_unique<ast::TypeDecl>();
@@ -449,28 +479,42 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
     typeDecl->name = ifaceName;  // string-literal string_view (stable)
     typeDecl->genericParams.push_back(ast::GenericParam{/*variance=*/"", "T"});
 
-    auto methodDecl = std::make_unique<ast::MethodDecl>();
-    methodDecl->visibility = ast::Visibility::Public;
-    methodDecl->name = methodName;
-    methodDecl->bodyKind = ast::MethodBodyKind::Abstract;
-    auto retType = std::make_unique<ast::Type>();
-    retType->kind = ast::TypeKind::Named;
-    retType->name = std::make_unique<ast::QualifiedName>();
-    retType->name->parts.push_back(retName);
-    methodDecl->returnType = std::move(retType);
-    ast::Param param;
-    param.name = "other";
-    auto paramType = std::make_unique<ast::Type>();
-    paramType->kind = ast::TypeKind::Named;
-    paramType->name = std::make_unique<ast::QualifiedName>();
-    paramType->name->parts.push_back("T");  // the generic param → substituted per use
-    param.type = std::move(paramType);
-    methodDecl->params.push_back(std::move(param));
-
-    ast::MethodDecl* mdRaw = methodDecl.get();
-    ast::Type* retRaw = mdRaw->returnType.get();
-    ast::Type* paramTypeRaw = mdRaw->params[0].type.get();
-    typeDecl->members.push_back(std::move(methodDecl));
+    // Build one abstract MethodDecl per contract member, remembering the raw
+    // return-type node (to pre-resolve) and each raw param-type node (to back the
+    // ParameterSymbol::declType) before the decls are moved into typeDecl.
+    struct RawMethod {
+        ast::MethodDecl* md;
+        ast::Type* ret;
+        std::vector<ast::Type*> paramTypes;
+    };
+    std::vector<RawMethod> raws;
+    for (const auto& spec : methods) {
+        auto methodDecl = std::make_unique<ast::MethodDecl>();
+        methodDecl->visibility = ast::Visibility::Public;
+        methodDecl->name = spec.methodName;
+        methodDecl->bodyKind = ast::MethodBodyKind::Abstract;
+        auto retType = std::make_unique<ast::Type>();
+        retType->kind = ast::TypeKind::Named;
+        retType->name = std::make_unique<ast::QualifiedName>();
+        retType->name->parts.push_back(spec.retName);
+        methodDecl->returnType = std::move(retType);
+        RawMethod rm;
+        rm.ret = methodDecl->returnType.get();
+        for (const char* pname : spec.paramNames) {
+            ast::Param param;
+            param.name = pname;
+            auto paramType = std::make_unique<ast::Type>();
+            paramType->kind = ast::TypeKind::Named;
+            paramType->name = std::make_unique<ast::QualifiedName>();
+            paramType->name->parts.push_back("T");  // generic param → substituted per use
+            param.type = std::move(paramType);
+            rm.paramTypes.push_back(param.type.get());
+            methodDecl->params.push_back(std::move(param));
+        }
+        rm.md = methodDecl.get();
+        raws.push_back(std::move(rm));
+        typeDecl->members.push_back(std::move(methodDecl));
+    }
     ast::TypeDecl* tdRaw = typeDecl.get();
     builtinInterfaceAst_.push_back(std::move(typeDecl));
 
@@ -483,21 +527,27 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
     auto* tparam = makeSymbol<GenericParamSymbol>();
     tparam->name = "T";
     ts->genericParams.push_back(tparam);
-    auto* ms = makeSymbol<MethodSymbol>();
-    ms->name = methodName;
-    ms->visibility = ast::Visibility::Public;
-    ms->parent = ts;
-    ms->decl = mdRaw;
-    auto* ps = makeSymbol<ParameterSymbol>();
-    ps->name = "other";
-    ps->declType = paramTypeRaw;
-    ms->params.push_back(ps);
-    ts->members.push_back(ms);
+    for (std::size_t i = 0; i < methods.size(); ++i) {
+        const MethodSpec& spec = methods[i];
+        const RawMethod& rm = raws[i];
+        auto* ms = makeSymbol<MethodSymbol>();
+        ms->name = spec.methodName;
+        ms->visibility = ast::Visibility::Public;
+        ms->parent = ts;
+        ms->decl = rm.md;
+        for (std::size_t p = 0; p < spec.paramNames.size(); ++p) {
+            auto* ps = makeSymbol<ParameterSymbol>();
+            ps->name = spec.paramNames[p];
+            ps->declType = rm.paramTypes[p];
+            ms->params.push_back(ps);
+        }
+        ts->members.push_back(ms);
 
-    // The return-type node must resolve to int/bool so methodFnType's
-    // lowerType(returnType) yields i32/i1, matching the implementing class's
-    // CompareTo/Equals signature (else the itable fnTy disagrees — risk #3).
-    setResolvedType(retRaw, primitiveTypeRef(retPrim, false));
+        // The return-type node must resolve to int/bool so methodFnType's
+        // lowerType(returnType) yields i32/i1, matching the implementing class's
+        // method signature (else the itable fnTy disagrees — risk #3).
+        setResolvedType(rm.ret, primitiveTypeRef(spec.retPrim, false));
+    }
 
     builtinInterfaceCache_[key] = ts;
     return ts;

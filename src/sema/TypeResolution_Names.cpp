@@ -77,7 +77,9 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §2.8 / §2.9: auto-imported generic interfaces (stdlib §2.8–§2.9).
         // Registered here so they resolve as base types and field/param types
         // (fix #576: "unresolved type name 'IComparable'").
-        n == "IComparable" || n == "IEquatable" ||
+        // §5 / #975: IEqualityComparer<T> — the user-implemented equality agent
+        // (Equals(a,b):bool, GetHashCode(value):int); arity 1.
+        n == "IComparable" || n == "IEquatable" || n == "IEqualityComparer" ||
         // §3 stdlib collection types (arity 1):
         n == "Stack" || n == "OwnedStack" ||
         n == "Queue" || n == "OwnedQueue" ||
@@ -810,15 +812,16 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (first == "Range") {
                     ref.declaration = ctx_.builtinClassSym("Range");
                 }
-                // #1115 / §2.8–§2.9: the auto-imported builtin generic interfaces
-                // IComparable<T> / IEquatable<T> get a REAL synthesized Interface
-                // TypeSymbol (with the CompareTo/Equals contract member) attached
-                // as the declaration, so they lower as ordinary heap interface
-                // references through the user-interface itable path — usable as a
-                // field/parameter/return/local value type, not just a `where`
-                // bound. The arity check above (still) diagnoses wrong arity; this
-                // only attaches the declaration when the name+arity are valid.
-                if (first == "IComparable" || first == "IEquatable") {
+                // #1115 / §2.8–§2.9 / #975: the auto-imported builtin generic
+                // interfaces IComparable<T> / IEquatable<T> / IEqualityComparer<T>
+                // get a REAL synthesized Interface TypeSymbol (with their contract
+                // members) attached as the declaration, so they lower as ordinary
+                // heap interface references through the user-interface itable path
+                // — usable as a field/parameter/return/local value type, not just
+                // a `where` bound. The arity check above (still) diagnoses wrong
+                // arity; this only attaches the declaration when name+arity valid.
+                if (first == "IComparable" || first == "IEquatable" ||
+                    first == "IEqualityComparer") {
                     ref.declaration = ctx_.builtinInterfaceSym(first);
                 }
                 return;
