@@ -197,3 +197,45 @@ BEZEL_TEST(codegen_cg35_itable, overloaded_impl_binds_matching_arity_reversed_74
         "  return i.Run(5); "  // 10, not 99
         "end Main; end C;"), 10);
 }
+
+// fix #1139 / §11.2 rule-1: an implementing class may declare a parameter as
+// T? where the interface requires T (nullability widening).  Interface dispatch
+// must bridge the ABI difference ({i8,T} vs T) via an adapter thunk so the
+// value reaches the impl body correctly — without it the body reads the
+// hasValue tag (1) as the payload, giving a constant wrong result.
+BEZEL_TEST(codegen_cg35_itable, nullable_widening_param_dispatch_1139) {
+    // interface declares int, impl declares int? (§11.2 rule-1).
+    // ip.Handle(42) must return 42, not 1 (the non-null tag).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IProc method Handle(x: int): int; end IProc; "
+        "class P: IProc "
+        "  public method Handle(x: int?): int => x ?? 99; "
+        "end P; "
+        "class App "
+        "  public static method Main(): int "
+        "    using var p := new P(); var ip: IProc := p; "
+        "    return ip.Handle(42); "
+        "  end Main; "
+        "end App;"), 42);
+}
+
+// Verify that ip.Handle(0) returns 0 (has value = 0, not null) and
+// ip.Handle(7) returns 7 — the adapter forwards the actual value, not a tag.
+BEZEL_TEST(codegen_cg35_itable, nullable_widening_param_various_values_1139) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IProc method Handle(x: int): int; end IProc; "
+        "class P: IProc "
+        "  public method Handle(x: int?): int => x ?? 99; "
+        "end P; "
+        "class App "
+        "  public static method Main(): int "
+        "    using var p := new P(); var ip: IProc := p; "
+        "    var r1 := ip.Handle(7); "    // 7
+        "    var r2 := ip.Handle(0); "    // 0  (has value, value=0)
+        "    var r3 := ip.Handle(35); "   // 35
+        "    return r1 + r2 + r3; "        // 42
+        "  end Main; "
+        "end App;"), 42);
+}

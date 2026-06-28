@@ -1344,6 +1344,12 @@ private:
     // keyed by the class's own instance EventSymbol.
     std::unordered_map<const sema::EventSymbol*, llvm::Function*>
         eventAccessorFns_;
+    // fix #1139 / §11.2 nullability-widening: adapter thunks for itable slots
+    // where the implementing method declares T? and the interface declares T.
+    // Keyed by (ifaceMethod, implMethod) pair; generated once per pair.
+    std::map<std::pair<const sema::MethodSymbol*, const sema::MethodSymbol*>,
+             llvm::Function*>
+        nullableWideningThunks_;
     // Per class: the itmap$C global ([td$I1, itab$C$I1, …, null]).
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         itmaps_;
@@ -3010,6 +3016,10 @@ private:
     // `ptr bz$<Class>$<Event>$get(ptr this)` that returns the object's backing
     // EventSource<T>. Placed in the class's itab so interface-typed event
     // access reaches the real source. `es` is the class's own instance event.
+    // fix #1139 / §11.2: generate (or return cached) a thunk that adapts the
+    // interface ABI (T for each param) to the impl ABI (T? for widened params).
+    llvm::Function* ensureNullableWideningThunk(const sema::MethodSymbol* ifaceMs,
+                                                const sema::MethodSymbol* implMs);
     llvm::Function* emitEventAccessor(const sema::TypeSymbol* cls,
                                       const sema::EventSymbol* es);
 

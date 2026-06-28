@@ -1367,6 +1367,113 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
 }
 
 
+// fix #1139 / §11.2 nullability-widening: generate an adapter thunk for an
+// itable slot where the implementing method declares T? for a parameter that
+// the interface declares as T.  The thunk has the interface's ABI and wraps
+// each widened argument (T → {i8 1, T}) before forwarding to the impl body.
+// Cached; returns nullptr when no ABI mismatch exists (direct fn ptr suffices).
+llvm::Function* Emitter::ensureNullableWideningThunk(
+    const sema::MethodSymbol* ifaceMs,
+    const sema::MethodSymbol* implMs)
+{
+    // Fetch the implementation's compiled LLVM function.
+    auto fIt = methodFns_.find(const_cast<sema::MethodSymbol*>(implMs));
+    if (fIt == methodFns_.end()) return nullptr;
+    llvm::Function* implFn = fIt->second;
+    if (!implFn) return nullptr;
+
+    // Get both function types and compare.
+    llvm::FunctionType* ifaceTy = methodFnType(ifaceMs);
+    if (!ifaceTy) return nullptr;
+    llvm::FunctionType* implTy = implFn->getFunctionType();
+
+    // No mismatch → use the direct function pointer (no thunk needed).
+    if (ifaceTy == implTy) return nullptr;
+    if (ifaceTy->getNumParams() != implTy->getNumParams()) return nullptr;
+    bool needsThunk = false;
+    for (unsigned i = 0; i < ifaceTy->getNumParams(); ++i)
+        if (ifaceTy->getParamType(i) != implTy->getParamType(i))
+            { needsThunk = true; break; }
+    if (!needsThunk) return nullptr;
+
+    // Cache lookup.
+    auto key = std::make_pair(ifaceMs, implMs);
+    if (auto it = nullableWideningThunks_.find(key);
+        it != nullableWideningThunks_.end())
+        return it->second;
+
+    // Emit the thunk with the interface's signature.
+    std::string name = "bz$nw$" +
+                       std::string(implMs->parent ? implMs->parent->name : "") +
+                       "$" + std::string(implMs->name);
+    auto* thunk = llvm::Function::Create(
+        ifaceTy, llvm::GlobalValue::InternalLinkage, name, module_.get());
+    nullableWideningThunks_[key] = thunk;
+
+    // Save/restore builder state (same pattern as emitEventAccessor).
+    llvm::Function* savedFn = currentFn_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    currentFn_ = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    builder_.SetInsertPoint(entry);
+
+    // Build the argument list for the impl call, wrapping widened params.
+    std::vector<llvm::Value*> implArgs;
+    unsigned paramIdx = 0;
+    for (llvm::Argument& arg : thunk->args()) {
+        llvm::Type* ifaceArgTy = ifaceTy->getParamType(paramIdx);
+        llvm::Type* implArgTy  = implTy ->getParamType(paramIdx);
+        if (implArgTy == ifaceArgTy || paramIdx == 0) {
+            // Receiver (ptr) or type-identical param: pass through unchanged.
+            implArgs.push_back(&arg);
+        } else {
+            // §11.2 rule-1 widening: impl expects T? ({i8,T}), iface passed T.
+            // Build {hasValue=1, value=arg} using the impl param's resolved type.
+            unsigned pIdx = paramIdx - 1;  // 0-based, excluding receiver
+            sema::TypeRef* implParamRef = nullptr;
+            if (pIdx < implMs->params.size()) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                               implMs->params[pIdx]);
+                if (ps) {
+                    // Prefer the pre-resolved TypeRef; fall back to resolving
+                    // from the AST type when resolvedDeclType was not populated
+                    // (which can happen for method-symbol params at itable-build
+                    // time — sema populates resolvedDeclType lazily per call-site).
+                    if (ps->resolvedDeclType)
+                        implParamRef = ps->resolvedDeclType;
+                    else if (ps->declType)
+                        implParamRef = ctx_.resolvedType(*ps->declType);
+                }
+            }
+            // If still null, fall back via the impl method's AST MethodDecl.
+            if (!implParamRef) {
+                auto* md = dynamic_cast<const ast::MethodDecl*>(implMs->decl);
+                if (md && pIdx < md->params.size() && md->params[pIdx].type)
+                    implParamRef = ctx_.resolvedType(*md->params[pIdx].type);
+            }
+            llvm::Value* wrapped = nullptr;
+            if (implParamRef && isNullableValueTy(implParamRef))
+                wrapped = wrapNullableValue(implParamRef, &arg);
+            else
+                wrapped = &arg;  // fallback (§11.2-valid programs never reach here)
+            implArgs.push_back(wrapped);
+        }
+        ++paramIdx;
+    }
+
+    llvm::Value* result = builder_.CreateCall(implTy, implFn, implArgs,
+                                              "nw.ret");
+    if (ifaceTy->getReturnType()->isVoidTy())
+        builder_.CreateRetVoid();
+    else
+        builder_.CreateRet(result);
+
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+    return thunk;
+}
+
+
 // §24.7 (#477 B7): emit a per-class event accessor `ptr get(ptr this)` that
 // returns the object's backing EventSource<T> (the event's instance field).
 // Cached per EventSymbol. Self-contained: saves/restores the builder so it may
@@ -1675,8 +1782,17 @@ void Emitter::declareVtables() {
                 llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
                 if (sema::MethodSymbol* impl = findInterfaceImpl(ts, im)) {
                     auto mit = methodFns_.find(impl);
-                    if (mit != methodFns_.end())
-                        fp = llvm::cast<llvm::Constant>(mit->second);
+                    if (mit != methodFns_.end()) {
+                        // fix #1139 / §11.2: if the impl widens a parameter
+                        // to T? where the interface declares T, their LLVM
+                        // ABIs differ ({i8,T} vs T).  Install an adapter thunk
+                        // that wraps each widened arg before forwarding.
+                        if (llvm::Function* thunk =
+                                ensureNullableWideningThunk(im, impl))
+                            fp = llvm::cast<llvm::Constant>(thunk);
+                        else
+                            fp = llvm::cast<llvm::Constant>(mit->second);
+                    }
                 }
                 itabElems.push_back(fp);
             }
