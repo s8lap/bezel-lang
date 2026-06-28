@@ -790,11 +790,6 @@ llvm::Value* Emitter::emitSnprintfToString(const std::string& fmt,
         snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
                                        "snprintf", module_.get());
     }
-    const unsigned BUF = 64;
-    llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
-    llvm::Value* bufPtr = builder_.CreateGEP(
-        llvm::ArrayType::get(i8Ty, BUF), buf,
-        {builder_.getInt64(0), builder_.getInt64(0)});
     // Build format string global.
     auto* fmtData = llvm::ConstantDataArray::getString(llvm_, fmt, true);
     unsigned fid = stringLiteralIdx_++;
@@ -802,16 +797,23 @@ llvm::Value* Emitter::emitSnprintfToString(const std::string& fmt,
         *module_, fmtData->getType(), true,
         llvm::GlobalValue::PrivateLinkage, fmtData,
         ".bz.fmtspec." + std::to_string(fid));
+    // per §18.5 (#1186): an alignment width or numeric format spec can render
+    // arbitrarily wide (e.g. $"{x,1000000000}" or $"{5:D100}").  A fixed-size
+    // stack buffer would over-read when snprintf's *untruncated* return length
+    // exceeds the buffer (SIGSEGV, or a stack-byte disclosure at sub-crash
+    // widths).  Render with the standard two-pass idiom into a heap buffer
+    // sized exactly to the reported length: a sizing call with a null buffer
+    // and size 0 yields the would-be length, then a second snprintf renders
+    // the full, NUL-terminated result fully in-bounds.
     llvm::Value* wr = builder_.CreateCall(
-        snpFn, {bufPtr, builder_.getInt64(BUF), fmtGV, val});
+        snpFn, {llvm::ConstantPointerNull::get(ptrTy()),
+                builder_.getInt64(0), fmtGV, val});
     llvm::Value* l64 = builder_.CreateSExt(wr, i64());
-    // Build heap-backed bz_string.
+    // Build heap-backed bz_string: malloc len+1, render into it (snprintf
+    // writes len chars plus the NUL terminator within this exact bound).
     llvm::Value* dSz = builder_.CreateAdd(l64, builder_.getInt64(1));
-    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
     llvm::Value* dc = builder_.CreateCall(mallocFn, {dSz});
-    builder_.CreateCall(memcpyFn, {dc, bufPtr, l64});
-    llvm::Value* np = builder_.CreateGEP(i8Ty, dc, l64);
-    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
+    builder_.CreateCall(snpFn, {dc, dSz, fmtGV, val});
     uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
     llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)});
     builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));

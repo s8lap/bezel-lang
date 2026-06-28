@@ -238,4 +238,34 @@ BEZEL_TEST(codegen_cg27d, fixed_point_format_double_unchanged_739) {
         "end Main; end C;"), 1);
 }
 
+// #1186 / §18.5: an alignment width wider than the old fixed 64-byte stack
+// render buffer must render the full, correct padding (a positive width
+// right-pads with spaces == PadLeft) and never over-read the buffer.  Before
+// the fix this memcpy'd snprintf's untruncated length out of a 64-byte alloca,
+// leaking uninitialized stack bytes (sub-crash) or SIGSEGV-ing at huge widths.
+BEZEL_TEST(codegen_cg27d, interp_wide_alignment_no_overread_1186) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 5; "
+        "  var s := $\"{x,200}\"; "
+        "  var expected := x.ToString().PadLeft(200); "
+        "  var ok := (s.Length = 200) and (s = expected); "
+        "  return (1 if ok else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1186 / §18.5: a numeric format spec (D100 → 100-digit zero-padded) that
+// renders far wider than the old 64-byte buffer must render correctly and
+// in-bounds.  All format specs (D/F/E/G/P/X) funnel through the same helper.
+BEZEL_TEST(codegen_cg27d, interp_wide_format_spec_no_overread_1186) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n := 5; "
+        "  var s := $\"{n:D100}\"; "
+        "  var expected := n.ToString().PadLeft(100, '0'); "
+        "  var ok := (s.Length = 100) and (s = expected); "
+        "  return (1 if ok else 0); "
+        "end Main; end C;"), 1);
+}
+
 }  // namespace
