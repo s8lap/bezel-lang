@@ -742,6 +742,7 @@ set(BEZEL_TEST_SOURCES
     codegen/main_args_633_test.cpp
     codegen/serialization_edges_635_637_638_test.cpp
     codegen/ownedbuffer_span_636_test.cpp
+    codegen/ownedbuffer_class_slot_nullable_1157_test.cpp
     codegen/owning_span_779_test.cpp
     codegen/span_type_annotation_959_test.cpp
     codegen/string_span_883_test.cpp

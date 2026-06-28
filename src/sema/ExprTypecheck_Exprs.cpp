@@ -832,8 +832,36 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 "owner for each owned element (§15.6)");
                         if (isRangeIdx && cn == "Array")
                             ctx_.setExprType(&e, tt);
-                        else
-                            ctx_.setExprType(&e, tt->genericArgs[0]);
+                        else {
+                            TypeRef* elem = tt->genericArgs[0];
+                            // §4.14 (#1157): for class-typed T, an
+                            // `OwnedBuffer<T>` stores `T?` in each slot
+                            // (nullable references, all null until set). Its
+                            // indexer is declared `[i: int]: T?`, so the
+                            // indexer-get must be typed `T?` — an empty-slot
+                            // read then requires a null guard / `?.` (a bare
+                            // `buf[i].member` would null-deref → SIGSEGV) and
+                            // `buf[i] := null` (the natural §28.8.1 restoration)
+                            // is accepted. Value-typed T (primitive / record /
+                            // enum, incl. the value-builtins DateTime/Range/…)
+                            // stores `T` directly with value defaults, so its
+                            // indexer stays non-nullable `T`. A bare generic
+                            // param (no declaration) is left non-nullable —
+                            // its category is unknown until instantiation.
+                            if (cn == "OwnedBuffer" && elem && !elem->nullable &&
+                                elem->kind == TypeRef::Kind::Named &&
+                                elem->declaration &&
+                                (elem->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 elem->declaration->kind ==
+                                     ast::TypeDeclKind::Interface) &&
+                                !elem->declaration->isValueBuiltin) {
+                                TypeRef* nn = ctx_.makeTypeRef(*elem);
+                                nn->nullable = true;
+                                elem = nn;
+                            }
+                            ctx_.setExprType(&e, elem);
+                        }
                     } else if (isDict && tt->genericArgs.size() > 1 &&
                              tt->genericArgs[1])
                         ctx_.setExprType(&e, tt->genericArgs[1]);
