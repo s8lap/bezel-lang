@@ -224,3 +224,72 @@ BEZEL_TEST(user_indexer_record_23_4, control_collection_indexer_still_works) {
         "  return a[1] + 0; "                    // 20
         "end Main; end C;"), 20);
 }
+
+// ── #1147 / §23.5: assigning to a member of a value-typed indexer result ──────
+// "Assigning to a member of a value-typed indexer result is a compile error:
+// `g[0].X := 5` would modify a discarded copy." A value-typed indexer get
+// returns a COPY, so a member write to it is silently lost. Before the fix
+// `c[0].A := 99` compiled and ran (returning the OLD value — the write dropped);
+// it is now a clean §23.5 compile error.
+
+// #1147: member-assign on a RECORD-valued user indexer result is rejected.
+BEZEL_TEST(user_indexer_record_23_4, value_indexer_result_member_assign_rejected_1147) {
+    auto r = runJit(
+        "module M; record Pair(A: int, B: int); "
+        "class C "
+        "  private _p: Pair; "
+        "  public constructor() _p := new Pair(60, 7); end constructor; "
+        "  public property [i: int]: Pair => _p; "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    c[0].A := 99; "                      // §23.5 — write to a discarded copy
+        "    return c[0].A; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #1147: the same reject on a built-in collection (Dictionary<K, record>) whose
+// indexer returns a record value — `d[k].x := …` is a discarded-copy write.
+BEZEL_TEST(user_indexer_record_23_4, dict_record_value_member_assign_rejected_1147) {
+    auto r = runJit(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<string, Point>(); "
+        "  d[\"a\"] := new Point(1, 2); "
+        "  d[\"a\"].x := 99; "                     // §23.5
+        "  return d[\"a\"].x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #1147 CONTROL: a CLASS-valued indexer result is a REFERENCE — `c[0].X := 99`
+// writes through it to the real object, so it MUST stay accepted and mutate.
+BEZEL_TEST(user_indexer_record_23_4, class_indexer_result_member_assign_accepted_1147) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Cell public property X: int; end Cell; "
+        "class C "
+        "  private owned _c: Cell; "
+        "  public constructor() _c := new Cell(); _c.X := 5; end constructor; "
+        "  public property [i: int]: Cell => _c; "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    c[0].X := 99; "                       // writes through the reference
+        "    return c[0].X; "                      // 99 — real object mutated
+        "  end Main; end C;"), 99);
+}
+
+// #1147 CONTROL: the whole-element indexer SET (`d[k] := record`) and a field
+// READ (`d[k].x`) are unaffected — only member-ASSIGN on the result is rejected.
+BEZEL_TEST(user_indexer_record_23_4, value_indexer_whole_set_and_read_unaffected_1147) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<string, Point>(); "
+        "  d[\"a\"] := new Point(1, 2); "
+        "  d[\"a\"] := new Point(7, 8); "          // whole-element replace — OK
+        "  return d[\"a\"].x + d[\"a\"].y; "        // field read — OK → 15
+        "end Main; end C;"), 15);
+}

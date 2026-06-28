@@ -3045,6 +3045,34 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         if (as->target) visitExpr(*as->target);
+        // §23.5: "Assigning to a member of a value-typed indexer result is a
+        // compile error: `g[0].X := 5` would modify a discarded copy." A
+        // value-typed indexer get returns a COPY (records/enums are value
+        // types — §9), so a member write to it is silently lost. Reject when
+        // the assignment target is `<index>.member` and the index expression's
+        // result is a value type (a record or enum). A class/interface indexer
+        // result is a reference — `g[0].X := …` writes through it to the real
+        // object — so that case stays accepted.
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(as->target.get())) {
+            if (auto* ix =
+                    dynamic_cast<const ast::IndexExpr*>(ma->target.get())) {
+                if (TypeRef* rt = ctx_.exprType(*ix)) {
+                    bool valueTyped =
+                        rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                        (rt->declaration->kind == ast::TypeDeclKind::Record ||
+                         rt->declaration->kind == ast::TypeDeclKind::Enum);
+                    if (valueTyped)
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->target->span.begin,
+                            "assigning to a member of a value-typed indexer "
+                            "result modifies a discarded copy — the indexer "
+                            "returns a value, so the write is lost; read it "
+                            "into a local, modify it, then write the whole "
+                            "value back through the indexer setter (§23.5)");
+                }
+            }
+        }
         // §6.5: a compound bitwise/shift assignment (`&= |= ^= <<= >>=`) carries
         // the same operand-type restriction as the binary bitwise operators — it
         // is not valid on a `bool` / `char` / floating-point target. Compound
