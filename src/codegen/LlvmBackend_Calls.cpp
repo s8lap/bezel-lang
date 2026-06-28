@@ -2475,11 +2475,73 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // per §3: .Sort() — in-place ascending sort for int arrays.
         // Uses bz_array_sort with a built-in i32 comparator thunk.
         if (m == "Sort" && call.args.empty()) {
-            // Choose comparator based on element type: int → bz$intcmp, string → bz$strcmp.
             llvm::Type* elemTy2 = getElemTy();
-            bool isStringElem = elemTy2 == ptrTy();
+            // #1195: detect class IComparable<T> BEFORE the isStringElem check —
+            // class elements are ptrTy()-typed just like strings, so without this
+            // guard a class-element pointer was passed to strcmp → wrong order.
+            // per §14.2 / stdlib §2.8.
+            const sema::TypeRef* elemTR = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            sema::MethodSymbol* classCompareMs = nullptr;
+            if (elemTR && elemTR->kind == sema::TypeRef::Kind::Named &&
+                elemTR->declaration &&
+                elemTR->declaration->kind == ast::TypeDeclKind::Class) {
+                sema::MethodSymbol* cm =
+                    findMethodByName(elemTR->declaration, "CompareTo");
+                if (cm && cm->params.size() == 1) classCompareMs = cm;
+            }
+            // Choose comparator: class IComparable → bz$classcmp$<Name>,
+            // string → bz$strcmp, int/other → bz$intcmp.
+            bool isStringElem = !classCompareMs && (elemTy2 == ptrTy());
             llvm::Function* cmpFn = nullptr;
-            if (isStringElem) {
+            if (classCompareMs) {
+                // Class IComparable<T> comparator thunk: dispatches a.CompareTo(b)
+                // via vtable (virtual/override) or direct compiled call otherwise.
+                // Each thunk arg is ptr* — a pointer to the class-pointer slot in
+                // the array buffer.  per §14.2 / #1195.
+                std::string thunkName = std::string("bz$classcmp$") +
+                                        std::string(elemTR->declaration->name);
+                cmpFn = module_->getFunction(thunkName);
+                if (!cmpFn) {
+                    auto* thunkTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn = llvm::Function::Create(thunkTy,
+                                                   llvm::Function::InternalLinkage,
+                                                   thunkName, module_.get());
+                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                    llvm::IRBuilder<> thunkB(bb);
+                    llvm::Value* aSlot = &*cmpFn->arg_begin();
+                    llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
+                    // Load class pointers from element slots.
+                    llvm::Value* aPtr = thunkB.CreateLoad(ptrTy(), aSlot);
+                    llvm::Value* bPtr = thunkB.CreateLoad(ptrTy(), bSlot);
+                    // Dispatch a.CompareTo(b): vtable slot if virtual, else direct.
+                    auto* cmpToTy = llvm::FunctionType::get(
+                        i32(), {ptrTy(), ptrTy()}, false);
+                    llvm::Value* result = nullptr;
+                    auto vsIt = vtableSlot_.find(classCompareMs);
+                    if (vsIt != vtableSlot_.end()) {
+                        // Virtual dispatch: load vtable from receiver (field 0),
+                        // then load the function pointer from the slot.  §12.
+                        unsigned vtSlot = vsIt->second;
+                        llvm::Value* vtable = thunkB.CreateLoad(ptrTy(), aPtr);
+                        llvm::Value* slotPtr = thunkB.CreateGEP(
+                            ptrTy(), vtable, {thunkB.getInt32(vtSlot)});
+                        llvm::Value* fnPtr = thunkB.CreateLoad(ptrTy(), slotPtr);
+                        result = thunkB.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr});
+                    } else {
+                        // Non-virtual: direct call to the compiled method body.
+                        auto fnIt = methodFns_.find(classCompareMs);
+                        if (fnIt != methodFns_.end()) {
+                            result = thunkB.CreateCall(
+                                fnIt->second->getFunctionType(),
+                                fnIt->second, {aPtr, bPtr});
+                        } else {
+                            result = llvm::ConstantInt::get(i32(), 0);
+                        }
+                    }
+                    thunkB.CreateRet(result);
+                }
+            } else if (isStringElem) {
                 // String comparator: load two ptr elements, call strcmp on their data.
                 auto* cmpName2 = "bz$strcmp";
                 cmpFn = module_->getFunction(cmpName2);
@@ -2684,7 +2746,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
 
         // per §3 / #472: Array<T>.Sorted() — returns a new sorted Array<T>
-        // (no-comparer form; T must be IComparable<T>: int or string here).
+        // (no-comparer form; T must be IComparable<T>: int, string, or a class
+        // implementing IComparable<T> — #1195).
         // Implementation: shallow-copy, then in-place Sort() on the copy.
         if (m == "Sorted" && call.args.empty() &&
             recvTy && recvTy->astNode && recvTy->astNode->name &&
@@ -2696,10 +2759,62 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                                     "srtd.copy");
             // #429: a copied Array<string> co-owns a +1 per element (see Reversed).
             emitArrayRetainStringsIfStringArray(recvTy, copy);
-            // Re-use the same built-in comparator logic as Sort() no-arg.
-            bool isStringElem2 = (elemTy2 == ptrTy());
+            // #1195: detect class IComparable<T> first — class elements are
+            // ptrTy()-typed just like strings; without this guard they fall into
+            // the strcmp path and are sorted by pointer value.  per §14.2.
+            const sema::TypeRef* elemTR2 = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            sema::MethodSymbol* classCompareMs2 = nullptr;
+            if (elemTR2 && elemTR2->kind == sema::TypeRef::Kind::Named &&
+                elemTR2->declaration &&
+                elemTR2->declaration->kind == ast::TypeDeclKind::Class) {
+                sema::MethodSymbol* cm =
+                    findMethodByName(elemTR2->declaration, "CompareTo");
+                if (cm && cm->params.size() == 1) classCompareMs2 = cm;
+            }
+            bool isStringElem2 = !classCompareMs2 && (elemTy2 == ptrTy());
             llvm::Function* cmpFn2 = nullptr;
-            if (isStringElem2) {
+            if (classCompareMs2) {
+                // Class IComparable<T> comparator thunk (mirrors Sort() path).
+                // per §14.2 / #1195.
+                std::string thunkName2 = std::string("bz$classcmp$") +
+                                         std::string(elemTR2->declaration->name);
+                cmpFn2 = module_->getFunction(thunkName2);
+                if (!cmpFn2) {
+                    auto* thunkTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn2 = llvm::Function::Create(thunkTy,
+                                                    llvm::Function::InternalLinkage,
+                                                    thunkName2, module_.get());
+                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn2);
+                    llvm::IRBuilder<> thunkB(bb);
+                    llvm::Value* aSlot = &*cmpFn2->arg_begin();
+                    llvm::Value* bSlot = &*std::next(cmpFn2->arg_begin());
+                    llvm::Value* aPtr = thunkB.CreateLoad(ptrTy(), aSlot);
+                    llvm::Value* bPtr = thunkB.CreateLoad(ptrTy(), bSlot);
+                    auto* cmpToTy = llvm::FunctionType::get(
+                        i32(), {ptrTy(), ptrTy()}, false);
+                    llvm::Value* result = nullptr;
+                    auto vsIt = vtableSlot_.find(classCompareMs2);
+                    if (vsIt != vtableSlot_.end()) {
+                        unsigned vtSlot = vsIt->second;
+                        llvm::Value* vtable = thunkB.CreateLoad(ptrTy(), aPtr);
+                        llvm::Value* slotPtr = thunkB.CreateGEP(
+                            ptrTy(), vtable, {thunkB.getInt32(vtSlot)});
+                        llvm::Value* fnPtr = thunkB.CreateLoad(ptrTy(), slotPtr);
+                        result = thunkB.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr});
+                    } else {
+                        auto fnIt = methodFns_.find(classCompareMs2);
+                        if (fnIt != methodFns_.end()) {
+                            result = thunkB.CreateCall(
+                                fnIt->second->getFunctionType(),
+                                fnIt->second, {aPtr, bPtr});
+                        } else {
+                            result = llvm::ConstantInt::get(i32(), 0);
+                        }
+                    }
+                    thunkB.CreateRet(result);
+                }
+            } else if (isStringElem2) {
                 auto* cmpName = "bz$strcmp";
                 cmpFn2 = module_->getFunction(cmpName);
                 if (!cmpFn2) {

@@ -412,3 +412,96 @@ BEZEL_TEST(array_reversed_sorted_472, ownedarray_sorted_rejected_spec_3) {
         "  return s.Length; "
         "end Main; end C;"));
 }
+
+// ===========================================================================
+// #1195 / §14.2: Array<T>.Sort() and Array<T>.Sorted() over a class
+// implementing IComparable<T>.  Before the fix, class elements were
+// misclassified as strings and sorted by strcmp on the raw pointer value —
+// producing wrong order.  The fix emits a bz$classcmp$ thunk that dispatches
+// a.CompareTo(b) via vtable or direct compiled call.
+//
+// Box wraps a single int; CompareTo orders by the wrapped value.
+// Spec: §14.2 (IComparable), stdlib §3 (Array.Sort/Sorted), #1195.
+// ===========================================================================
+
+namespace {
+// A class implementing IComparable<Box> — mirrors the kBox fixture in
+// math_convert_test.cpp (§14.2 / #1148 / #1195).
+const char* kBox1195 =
+    "module M; import System; "
+    "class Box(v: int): IComparable<Box> "
+    "  public method CompareTo(other: Box): int => "
+    "    (1 if v > other.v else (-1 if v < other.v else 0)); "
+    "end Box; ";
+std::string boxMain1195(const std::string& body) {
+    return std::string(kBox1195) +
+           "class App public static method Main(): int " + body +
+           " end Main; end App;";
+}
+}  // namespace
+
+// §14.2 / #1195: Array<Box>.Sort() in-place — [Box(30),Box(10),Box(20)]
+// sorted ascending → [Box(10),Box(20),Box(30)].
+// Encode: a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v
+//       = 10*49 + 20*7 + 30 = 490+140+30 = 660.
+BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_inplace_1195) {
+    BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var a := new Array<Box>(); "
+        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  a.Sort(); "
+        "  return a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v;")), 660);
+}
+
+// §14.2 / #1195: Sort() orders in ascending order by CompareTo — largest last.
+// [Box(5),Box(1),Box(3)] → [Box(1),Box(3),Box(5)]: 1*49+3*7+5 = 75.
+BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_ascending_1195) {
+    BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var a := new Array<Box>(); "
+        "  a.Add(new Box(5)); a.Add(new Box(1)); a.Add(new Box(3)); "
+        "  a.Sort(); "
+        "  return a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v;")), 75);
+}
+
+// §14.2 / #1195: Array<Box>.Sorted() copy-form — original unchanged.
+// [Box(30),Box(10),Box(20)] sorted → copy [Box(10),Box(20),Box(30)].
+// Original encode: 30*49 + 10*7 + 20 = 1470+70+20 = 1560. (exit 40 mod 256 = 40)
+// Use simpler encoding: sorted copy Get(0).v = 10.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_copy_1195) {
+    BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var a := new Array<Box>(); "
+        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  using var s := a.Sorted(); "
+        "  return s.Get(0).v;")), 10);
+}
+
+// §14.2 / #1195: Sorted() original array unchanged — first element stays Box(30).
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_original_unchanged_1195) {
+    BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var a := new Array<Box>(); "
+        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  using var s := a.Sorted(); "
+        "  return a.Get(0).v;")), 30);
+}
+
+// §14.2 / #1195: Sorted() full order check — [Box(30),Box(10),Box(20)]
+// sorted → [Box(10),Box(20),Box(30)]: 10*49 + 20*7 + 30 = 660.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_order_1195) {
+    BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var a := new Array<Box>(); "
+        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  using var s := a.Sorted(); "
+        "  return s.Get(0).v * 49 + s.Get(1).v * 7 + s.Get(2).v;")), 660);
+}
+
+// §14.2 / #1195: Sorted() on non-IComparable class still emits a diagnostic.
+// A class without IComparable must still be rejected by sema.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_non_icomparable_class_rejected_1195) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; "
+        "class Widget public v: int; end Widget; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Widget>(); "
+        "  using var s := a.Sorted(); "  // Widget does not implement IComparable
+        "  return s.Length; "
+        "end Main; end C;"));
+}

@@ -2699,11 +2699,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "Array", recvTy->genericArgs[0]));
                         } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
                                    m == "Sorted" && ce.args.empty()) {
-                            // Constraint check: T must be IComparable<T>.  For
-                            // the concrete subset supported (int, string), this is
-                            // trivially satisfied.  For any other T, emit a
-                            // compile-time diagnostic directing the user to the
-                            // explicit-comparer form — per §3 / #472.
+                            // Constraint check: T must be IComparable<T>.  Accepts:
+                            // (a) built-in primitive comparable types (int, string,
+                            //     long, byte, double, float, char — §9.x);
+                            // (b) a class that declares `: IComparable<T>` in its
+                            //     base-type list, satisfying §14.2 / #1195.
+                            // Any other T requires the explicit-comparer form.
+                            // per §3 / #472.
                             const TypeRef* elemTy472 = recvTy->genericArgs[0];
                             bool isComparableElem =
                                 (elemTy472 && elemTy472->kind == TypeRef::Kind::Primitive &&
@@ -2714,6 +2716,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                   elemTy472->primitive == P::Double ||
                                   elemTy472->primitive == P::Float ||
                                   elemTy472->primitive == P::Char));
+                            // #1195 / §14.2: also accept a class implementing
+                            // IComparable<T>.  Scan the AST baseTypes list for
+                            // "IComparable" (same pattern as Min/Max gate ~L2600).
+                            if (!isComparableElem && elemTy472 &&
+                                elemTy472->kind == TypeRef::Kind::Named &&
+                                elemTy472->declaration &&
+                                elemTy472->declaration->kind ==
+                                    ast::TypeDeclKind::Class) {
+                                const auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                    elemTy472->declaration->decl);
+                                if (td) {
+                                    for (const auto& bt : td->baseTypes) {
+                                        if (!bt || !bt->name ||
+                                            bt->name->parts.empty())
+                                            continue;
+                                        if (bt->name->parts.back() == "IComparable") {
+                                            isComparableElem = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                             if (!isComparableElem) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
