@@ -470,6 +470,12 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         }
         for (const auto& p : md->params) {
             if (p.type) resolveType(*p.type, &methodScope);
+            // per §17.11 (#1166): resolve the inner type nodes of a parameter's
+            // default-value expression (e.g. the `T` in `:= default(T)`) so the
+            // §17.11 defaultIllFormed well-formedness check in ExprTypecheck can
+            // run on it — without resolution `resolvedType(de->type)` is null and
+            // an ill-formed `default(R)` param default slips through silently.
+            if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
         if (md->returnType) resolveType(*md->returnType, &methodScope);
         for (const auto& gc : md->genericConstraints) {
@@ -495,6 +501,8 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         methodScope.parent = parent;
         for (const auto& p : od->params) {
             if (p.type) resolveType(*p.type, &methodScope);
+            // per §17.11 (#1166): resolve a parameter default's inner types.
+            if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
         if (od->returnType) resolveType(*od->returnType, &methodScope);
         if (od->bodyKind == ast::MethodBodyKind::Block) {
@@ -509,6 +517,8 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         ctorScope.parent = parent;
         for (const auto& p : cd->params) {
             if (p.type) resolveType(*p.type, &ctorScope);
+            // per §17.11 (#1166): resolve a parameter default's inner types.
+            if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &ctorScope);
         }
         resolveTypesInBody(cd->body, &ctorScope);
     } else if (auto* dd =
@@ -519,6 +529,8 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         if (pd->type) resolveType(*pd->type, parent);
         for (const auto& p : pd->indexerParams) {
             if (p.type) resolveType(*p.type, parent);
+            // per §17.11 (#1166): resolve an indexer parameter default's types.
+            if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, parent);
         }
         // §23.2/§23.3 (FINDING [4]): resolve types embedded in accessor
         // bodies — `new T()`, LocalDecl `: Type`, etc. — exactly as method
