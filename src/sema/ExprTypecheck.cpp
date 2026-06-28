@@ -1904,6 +1904,14 @@ void ExprTC::checkCasePatternConstantRanges(
                 checkConst(re->lo.get());
                 checkConst(re->hi.get());
             }
+        } else if (auto* relp = dynamic_cast<const ast::RelOpPattern*>(p)) {
+            // #1156: a relational pattern (`> EXPR`, `<= EXPR`, …) compares the
+            // scrutinee against a constant operand. If that operand does not fit
+            // the scrutinee's integer type, codegen's litAtWidth() silently
+            // truncates it to the scrutinee width — e.g. `case x (x: byte) > 300`
+            // compiles to `x > 44` (300 → i8 44), a wrong match. Gate the operand
+            // with the same §5.1 narrowing diagnostic as the constant/range bounds.
+            checkConst(relp->expr.get());
         }
     }
 }

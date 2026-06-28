@@ -142,6 +142,50 @@ BEZEL_TEST(sema_case_pattern_range, int_range_in_range_ok_spec_19_1) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- Relational pattern operand (§19 / §5.1) -- issue #1156 -----------------
+
+// A relational pattern's operand is a constant compared against the scrutinee.
+// `case x (x: byte) > 300 => …` does not fit a byte; before #1156 sema never
+// visited the RelOp operand, so codegen's litAtWidth() truncated 300 to i8 44
+// and compiled `x > 44` — a wrong match (matched x in 45..255 instead of
+// never). Reject it with the same §5.1 narrowing diagnostic. #1156.
+BEZEL_TEST(sema_case_pattern_range, byte_relop_operand_over_range_rejected_spec_5_1) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: byte): int "
+        "    return case x > 300 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// An in-range relational operand is accepted and matches correctly at runtime;
+// the fix must not flag ordinary relational patterns (`case x > 5`). #1156.
+BEZEL_TEST(sema_case_pattern_range, byte_relop_operand_in_range_ok_spec_19) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: byte): int "
+        "    return case x > 5 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The other relational operators are gated identically — `<= 5000000000` over
+// an `int` operand overflows i32 and is rejected (§5.1). #1156.
+BEZEL_TEST(sema_case_pattern_range, int_relop_le_operand_over_range_rejected_spec_5_1) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x <= 5000000000 => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
 // --- Statement position is NOT exempt from the range gate (§19.6 / §5.1) ----
 
 // Statement-position `case` is exempt from the exhaustiveness WARNING, but the
