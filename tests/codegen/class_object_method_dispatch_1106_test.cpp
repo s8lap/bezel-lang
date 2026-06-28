@@ -174,3 +174,97 @@ BEZEL_TEST(class_object_method_dispatch_1106, base_call_universal_object_member_
         "  using var a := new A(); return a.ToString().Length; "  // "A" → 1
         "end Main; end C;"), 1);
 }
+
+// ---- #1111 (§12.3 / §8.3): base.Equals / base.GetHashCode non-virtual dispatch
+
+// #1111: base.Equals(o) inside an overriding class where base=Object → §8.3
+// reference-identity (same object → true).  Was: vtable dispatch re-entered the
+// override → wrong value (returned false / infinite recursion).
+BEZEL_TEST(class_object_method_dispatch_1106, base_equals_object_same_ref_true_1111) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A "
+        "  public override method Equals(o: Object?): bool => base.Equals(o); "
+        "  public override method GetHashCode(): int => 1; "
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); "
+        "  return (1 if a.Equals(a) else 0); "  // ref-identity true → 1
+        "end Main; end C;"), 1);
+}
+
+// #1111: base.Equals(o) is false for distinct instances (reference-identity).
+// (same-ref=1, distinct-ref=0 → sum=1; verifies both directions in one shot.)
+BEZEL_TEST(class_object_method_dispatch_1106, base_equals_object_distinct_false_1111) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A "
+        "  public override method Equals(o: Object?): bool => base.Equals(o); "
+        "  public override method GetHashCode(): int => 1; "
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); using var b := new A(); "
+        "  return (1 if a.Equals(a) else 0) + (10 if a.Equals(b) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1111: base.GetHashCode() where base=Object → identity hash is consistent
+// (calling twice on the same object gives the same value).
+BEZEL_TEST(class_object_method_dispatch_1106, base_gethashcode_object_consistent_1111) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A "
+        "  public override method GetHashCode(): int => base.GetHashCode(); "
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); "
+        "  var h1 := a.GetHashCode(); var h2 := a.GetHashCode(); "
+        "  return (1 if h1 = h2 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1111: base.Equals(o) where the explicit base has its own Equals override →
+// calls that base override non-virtually (§12.3), not the most-derived.
+// (Here `base` = B with a user Equals; calleeSym is resolved by sema, so the
+// non-virtual dispatch goes through the ms != null path with baseQualified=true.)
+BEZEL_TEST(class_object_method_dispatch_1106, base_equals_explicit_base_override_1111) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class B "
+        "  public _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public override method Equals(o: Object?): bool "
+        "    var q := o as B; if q = null then return false; end; "
+        "    return _v = q!._v; "
+        "  end Equals; "
+        "  public override method GetHashCode(): int => _v; "
+        "end B; "
+        "class A: B "
+        "  public constructor(v: int) base(v); end constructor; "
+        "  public override method Equals(o: Object?): bool => base.Equals(o); "
+        "  public override method GetHashCode(): int => base.GetHashCode(); "
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(5); using var b := new A(5); "
+        "  return (1 if a.Equals(b) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1111: base.GetHashCode() where explicit base has override → calls base override.
+BEZEL_TEST(class_object_method_dispatch_1106, base_gethashcode_explicit_base_override_1111) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class B "
+        "  public _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public override method GetHashCode(): int => _v * 3; "
+        "end B; "
+        "class A: B "
+        "  public constructor(v: int) base(v); end constructor; "
+        "  public override method GetHashCode(): int => base.GetHashCode(); "
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(7); "
+        "  return a.GetHashCode(); "
+        "end Main; end C;"), 21);
+}

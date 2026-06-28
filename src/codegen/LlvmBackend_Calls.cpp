@@ -9808,6 +9808,134 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             bool isHashCall = ma->member == "GetHashCode" && ma->target &&
                               call.args.empty();
             if (isEqualsCall || isHashCall) {
+                // #1111 (§12.3): `base.Equals(o)` / `base.GetHashCode()` inside
+                // an overriding class must dispatch NON-virtually to the BASE
+                // class's implementation. Without this interception the code falls
+                // through to lowerObjectEquals/lowerObjectGetHashCode below, which
+                // reads vtable[kEqualsSlot/kGetHashCodeSlot] — the slot points at
+                // the most-derived override (the same method we're already in) →
+                // infinite recursion or wrong value (§12.3 requires base.M to call
+                // the base class's impl, never the virtual slot). Mirrors the
+                // base.ToString() fix above (line ~9506).
+                if (auto* btid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get())) {
+                    if (btid->name == "base") {
+                        // Recover the enclosing (derived) class from currentFn_
+                        // via methodFns_ (reliable even when the class has no
+                        // explicit base, where `base` types as Object).
+                        const sema::TypeSymbol* beh_cls = nullptr;
+                        for (auto& kv : methodFns_)
+                            if (kv.second == currentFn_ && kv.first) {
+                                beh_cls = kv.first->parent; break;
+                            }
+                        if (!beh_cls) {
+                            const sema::TypeRef* bty =
+                                ctx_.exprType(*ma->target);
+                            if (bty &&
+                                bty->kind == sema::TypeRef::Kind::Named)
+                                beh_cls = bty->declaration;
+                        }
+                        if (beh_cls) {
+                            // Walk the BASE chain (skip the enclosing class
+                            // itself) for the first ancestor override.
+                            const sema::TypeSymbol* beh_start = nullptr;
+                            for (const sema::TypeSymbol* b : beh_cls->baseTypes)
+                                if (b && b->kind == ast::TypeDeclKind::Class) {
+                                    beh_start = b; break;
+                                }
+                            if (isEqualsCall) {
+                                sema::MethodSymbol* beh_eq = nullptr;
+                                for (const sema::TypeSymbol* cur = beh_start;
+                                     cur && !beh_eq;) {
+                                    for (sema::Symbol* sym : cur->members) {
+                                        auto* m =
+                                            dynamic_cast<sema::MethodSymbol*>(
+                                                sym);
+                                        if (!(m && !isStaticMethod(m) &&
+                                              m->name == "Equals" &&
+                                              m->params.size() == 1))
+                                            continue;
+                                        // #1115/#1151: only a pointer-param
+                                        // Equals is the §8.4 Object.Equals
+                                        // shape; skip a value-typed overload.
+                                        auto fit2 = methodFns_.find(m);
+                                        if (fit2 != methodFns_.end() &&
+                                            fit2->second->getFunctionType()
+                                                    ->getNumParams() >= 2 &&
+                                            !fit2->second->getFunctionType()
+                                                    ->getParamType(1)
+                                                    ->isPointerTy())
+                                            continue;
+                                        beh_eq = m; break;
+                                    }
+                                    const sema::TypeSymbol* nxt = nullptr;
+                                    for (const sema::TypeSymbol* b :
+                                         cur->baseTypes)
+                                        if (b &&
+                                            b->kind == ast::TypeDeclKind::Class)
+                                        { nxt = b; break; }
+                                    cur = nxt;
+                                }
+                                llvm::Value* beh_recv =
+                                    lowerExpr(*ma->target);
+                                llvm::Value* beh_other =
+                                    lowerExpr(*call.args[0].value);
+                                if (beh_eq) {
+                                    auto fit = methodFns_.find(beh_eq);
+                                    if (fit != methodFns_.end() &&
+                                        beh_recv && beh_other)
+                                        return builder_.CreateCall(
+                                            fit->second->getFunctionType(),
+                                            fit->second,
+                                            {beh_recv, beh_other});
+                                }
+                                // No ancestor override → §8.3 reference-identity.
+                                if (beh_recv && beh_other)
+                                    return builder_.CreateICmpEQ(
+                                        beh_recv, beh_other, "base.eq.ref");
+                            } else {
+                                // isHashCall
+                                sema::MethodSymbol* beh_hash = nullptr;
+                                for (const sema::TypeSymbol* cur = beh_start;
+                                     cur && !beh_hash;) {
+                                    for (sema::Symbol* sym : cur->members) {
+                                        auto* m =
+                                            dynamic_cast<sema::MethodSymbol*>(
+                                                sym);
+                                        if (m && !isStaticMethod(m) &&
+                                            m->name == "GetHashCode" &&
+                                            m->params.empty()) {
+                                            beh_hash = m; break;
+                                        }
+                                    }
+                                    const sema::TypeSymbol* nxt = nullptr;
+                                    for (const sema::TypeSymbol* b :
+                                         cur->baseTypes)
+                                        if (b &&
+                                            b->kind == ast::TypeDeclKind::Class)
+                                        { nxt = b; break; }
+                                    cur = nxt;
+                                }
+                                llvm::Value* beh_recv =
+                                    lowerExpr(*ma->target);
+                                if (beh_hash) {
+                                    auto fit = methodFns_.find(beh_hash);
+                                    if (fit != methodFns_.end() && beh_recv)
+                                        return builder_.CreateCall(
+                                            fit->second->getFunctionType(),
+                                            fit->second, {beh_recv});
+                                }
+                                // No ancestor override → §8.3 identity hash
+                                // (pointer bits truncated to i32).
+                                if (beh_recv)
+                                    return builder_.CreateTrunc(
+                                        builder_.CreatePtrToInt(
+                                            beh_recv, i64(), "base.hash.ptr"),
+                                        i32(), "base.hash.r");
+                            }
+                        }
+                    }
+                }
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 using K = sema::TypeRef::Kind;
                 using P = sema::PrimitiveType;
