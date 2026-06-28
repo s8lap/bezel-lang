@@ -3535,6 +3535,16 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         v = wrapNullableValue(formalTy, v);
                     }
                 }
+            } else if (formalTy) {
+                // per §7.4 / §12.7 (#1191): a value-type nullable local that sema
+                // proved non-null by null-flow narrowing is accepted as a
+                // NON-nullable argument (checkAssignable now treats the narrowed
+                // `from` as non-nullable in argument position too). Sema kept its
+                // declared {flag,value} layout, so unwrap the tagged-optional to
+                // the parameter's bare value here — mirroring the unwrap local-init
+                // / return / assignment already apply. A no-op when `v` is not that
+                // struct (reference args and already-scalar values pass through).
+                v = unwrapNarrowedNullable(v, lowerTypeRef(formalTy));
             }
             // §8.6: a value-typed argument bound to an Object/interface
             // parameter is boxed, so a later `is`/`as` or virtual dispatch on

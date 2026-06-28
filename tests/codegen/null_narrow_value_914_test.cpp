@@ -230,3 +230,82 @@ BEZEL_TEST(null_narrow_value_914, reference_genuinely_nullable_rejected_1056) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
 }
+
+// §7.4 / §27.6 (#1191): the narrowing acceptance must also apply in CALL-ARGUMENT
+// position — a narrowed nullable local passed where the parameter is
+// non-nullable. The call-arg compatibility check lost the narrowing context
+// (checkAssignable was invoked without `fromExpr`), so the IDENTICAL local that
+// var-init / return / assignment accept was wrongly REJECTED in argument
+// position. Forwarding `fromExpr` restores the narrowing; codegen unwraps the
+// {flag,value} tagged-optional to the parameter's bare value (the same coercion
+// local-init / return apply via unwrapNarrowedNullable).
+
+// A narrowed VALUE-type (int?) local as a non-nullable `int` argument. `n*2`=42.
+BEZEL_TEST(null_narrow_value_914, narrowed_value_local_in_call_argument_1191) {
+    auto r = runJit(
+        "module M; class C "
+        "  public static method Twice(n: int): int => n * 2; "
+        "  public static method Main(): int "
+        "    var n: int? := 21; "
+        "    if n <> null then return Twice(n); end; return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// A narrowed REFERENCE (string?) local as a non-nullable `string` argument
+// (unwrapNarrowedNullable is a no-op for the bare-pointer nullable string).
+// "hi".Length = 2.
+BEZEL_TEST(null_narrow_value_914, narrowed_reference_local_in_call_argument_1191) {
+    auto r = runJit(
+        "module M; class C "
+        "  public static method Greet(u: string): int => u.Length; "
+        "  public static method Main(): int "
+        "    var u: string? := \"hi\"; "
+        "    if u <> null then return Greet(u); end; return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 2);
+}
+
+// A narrowed local in a `new` CONSTRUCTOR argument (the new-ctor path shares the
+// same checkArgsAgainstParams call-arg site). record Box(v).v.Length = 5.
+BEZEL_TEST(null_narrow_value_914, narrowed_local_in_new_ctor_argument_1191) {
+    auto r = runJit(
+        "module M; record Box(v: string); "
+        "class C public static method Main(): int "
+        "  var u: string? := \"hello\"; "
+        "  if u <> null then var b := new Box(u); return b.v.Length; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+// CONTROL: a GENUINELY-nullable local (conditionally assigned, so NOT narrowed)
+// passed to a non-nullable parameter must STILL be rejected.
+BEZEL_TEST(null_narrow_value_914, genuinely_nullable_call_argument_rejected_1191) {
+    auto r = runJit(
+        "module M; class C "
+        "  public static method Greet(u: string): int => u.Length; "
+        "  public static method Pick(b: bool, s: string): int "
+        "    var u: string? := null; if b then u := s; end; return Greet(u); "
+        "  end Pick; "
+        "  public static method Main(): int => Pick(true, \"hi\"); "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+}
+
+// CONTROL: a type-mismatched argument (int → string parameter) is STILL rejected
+// — forwarding `fromExpr` only adds narrowing/promotion acceptance, never relaxes
+// an ordinary §5.1 type-mismatch.
+BEZEL_TEST(null_narrow_value_914, type_mismatch_call_argument_rejected_1191) {
+    auto r = runJit(
+        "module M; class C "
+        "  public static method Greet(u: string): int => u.Length; "
+        "  public static method Main(): int => Greet(5); "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // clean compile reject
+}

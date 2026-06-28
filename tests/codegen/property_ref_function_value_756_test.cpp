@@ -182,3 +182,40 @@ BEZEL_TEST(property_ref_function_value_756, function_typed_property_read_instanc
         "  end Main; "
         "end C;"), 30);
 }
+
+// §27.6 / §7.4 (#1191): the getter-as-function-value promotion must ALSO fire in
+// CALL-ARGUMENT position — `Apply(C.N)` passes property N's getter as the
+// `() -> int` parameter. Sema lost the promotion context in argument position
+// (checkAssignable was invoked without forwarding `fromExpr`), so the property
+// read stayed an `int` value bound into a function-pointer slot and codegen
+// emitted malformed IR ("Call parameter type does not match function
+// signature"). With `fromExpr` forwarded at the call-arg site, the property
+// reference is target-typed to `() -> int` exactly as at local-decl. `f()` = 7.
+BEZEL_TEST(property_ref_function_value_756, function_value_in_call_argument_1191) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static property N: int => 7; "
+        "  public static method Apply(f: () -> int): int => f(); "
+        "  public static method Main(): int => Apply(C.N); "  // 7
+        "end C;"), 7);
+}
+
+// §27.6 / §7.4 (#1191): the instance-property form in call-argument position —
+// `Apply(b.Count)` passes box b's getter as a `() -> int` argument.
+BEZEL_TEST(property_ref_function_value_756, instance_property_value_in_call_argument_1191) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class Box "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public property Count: int => _n; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class Program "
+        "  public static method Apply(f: () -> int): int => f(); "
+        "  public static method Main(): int "
+        "    using var b := new Box(9); "
+        "    return Apply(b.Count); "  // 9
+        "  end Main; "
+        "end Program;"), 9);
+}

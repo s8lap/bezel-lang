@@ -1535,7 +1535,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ft->funcParams[i].type,
                             ce.args[i].value->span.begin,
                             "argument " + std::to_string(i + 1) +
-                                " of the function call");
+                                " of the function call",
+                            ce.args[i].value.get());  // per §7.4 / §27.6 (#1191)
                     }
                 }
             }
@@ -4602,7 +4603,8 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         if (!a.value) continue;
         checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
                         a.value->span.begin,
-                        desc + ": argument " + std::to_string(j + 1));
+                        desc + ": argument " + std::to_string(j + 1),
+                        a.value.get());  // per §7.4 / §27.6 (#1191)
     }
 }
 
@@ -4718,7 +4720,8 @@ void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
                         paramTy,
                         a.value->span.begin,
                         std::string("argument `") + std::string(p.name) +
-                        "` to " + calleeDesc);
+                        "` to " + calleeDesc,
+                        a.value.get());  // per §7.4 / §27.6 (#1191)
     }
 }
 
@@ -5099,7 +5102,8 @@ void ExprTC::checkImportedNewExprArgs(
         if (!a.value) continue;
         checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
                         a.value->span.begin,
-                        desc + ": argument " + std::to_string(j + 1));
+                        desc + ": argument " + std::to_string(j + 1),
+                        a.value.get());  // per §7.4 / §27.6 (#1191)
     }
 }
 
