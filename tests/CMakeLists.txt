@@ -585,6 +585,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_raise_reentrant_dispose_908_test.cpp
     codegen/case_incompatible_type_pattern_test.cpp
     codegen/case_relop_nullable_1074_test.cpp
+    codegen/case_decimal_pattern_1152_test.cpp
     codegen/interp_default_tostring_1077_test.cpp
     codegen/array_slice_range_var_1079_test.cpp
     codegen/break_continue_in_finally_1083_test.cpp

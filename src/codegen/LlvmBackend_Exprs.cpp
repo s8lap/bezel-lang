@@ -10283,6 +10283,81 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         return llvm::ConstantInt::get(wantTy, bits, /*isSigned=*/true);
     };
 
+    // §19.3 (#1152): a `decimal` scrutinee lowers to decimalStructType() — a
+    // 128-bit struct, neither integer nor floating-point. The comparing-pattern
+    // forms below (relational, range, constant) branch only on isFloatingPointTy
+    // (FCmp) vs else (ICmp); an ICmp on struct operands is illegal IR and aborts
+    // the compiler (ICmpInst::AssertOK). Route a decimal scrutinee through the
+    // runtime comparison bz_decimal_cmp — the same path a plain `x < 2m` or a
+    // `when v < 2m` guard already uses (see lowerBinary, ~L5128). `decCmp`
+    // stores both decimal-struct operands into slots, calls bz_decimal_cmp
+    // (returns -1/0/+1), and reduces it to the i1 pattern result for the op.
+    auto decCmp = [&](llvm::Value* lhs, llvm::Value* rhs,
+                      std::string_view op) -> llvm::Value* {
+        llvm::StructType* dst = decimalStructType();
+        llvm::AllocaInst* aSlot = entryAlloca(dst);
+        llvm::AllocaInst* bSlot = entryAlloca(dst);
+        builder_.CreateStore(lhs, aSlot);
+        builder_.CreateStore(rhs, bSlot);
+        auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* cmp = builder_.CreateCall(cmpFn, {aSlot, bSlot}, "dec.cmp");
+        llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
+        if (op == "=")  return builder_.CreateICmpEQ(cmp, zero);
+        if (op == "<>") return builder_.CreateICmpNE(cmp, zero);
+        if (op == "<")  return builder_.CreateICmpSLT(cmp, zero);
+        if (op == "<=") return builder_.CreateICmpSLE(cmp, zero);
+        if (op == ">")  return builder_.CreateICmpSGT(cmp, zero);
+        /* >= */        return builder_.CreateICmpSGE(cmp, zero);
+    };
+    // §19.3 (#1152): lower a comparing-pattern operand (a range bound, a
+    // relational bound, or a constant) as a `decimal` struct. A decimal LITERAL
+    // in pattern position frequently lacks a sema exprType (pattern operands are
+    // not value-typechecked the way ordinary expressions are), so the generic
+    // lowerExpr path defaults it to `double` (line ~69) — an LLVM type distinct
+    // from decimalStructType(), which would feed a double bit-pattern to
+    // bz_decimal_cmp. Parse a numeric literal DIRECTLY into the decimal struct
+    // (compile-time, lossless — mirrors the FloatLiteralExpr decimal path at
+    // ~L49); for a non-literal operand (a named decimal const) lower normally and
+    // accept the already-decimal value (or promote an integer).
+    auto decOperand = [&](const ast::Expr& e) -> llvm::Value* {
+        const ast::Expr* x = &e;
+        bool neg = false;
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(x))
+            if (un->op == "-" && un->operand) { neg = true; x = un->operand.get(); }
+        std::string digits;
+        bool isNumLit = false;
+        if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(x)) {
+            isNumLit = true;
+            for (char c : fl->text)
+                if (c != '_' && c != 'm' && c != 'M') digits.push_back(c);
+        } else if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(x)) {
+            isNumLit = true;
+            for (char c : il->text)
+                if (c != '_' && c != 'm' && c != 'M') digits.push_back(c);
+        }
+        if (isNumLit) {
+            if (neg) digits.insert(digits.begin(), '-');  // sign via the parser
+            uint32_t d[4] = {0, 0, 0, 0};
+            bz_decimal_parse_cstr(digits.c_str(), d, nullptr, nullptr);
+            llvm::StructType* dst = decimalStructType();
+            return llvm::ConstantStruct::get(dst, {
+                llvm::ConstantInt::get(i32(), d[0]),
+                llvm::ConstantInt::get(i32(), d[1]),
+                llvm::ConstantInt::get(i32(), d[2]),
+                llvm::ConstantInt::get(i32(), d[3])});
+        }
+        // Non-literal operand: lower normally and coerce to a decimal struct.
+        llvm::Value* v = lowerExpr(e);
+        if (!v) return nullptr;
+        if (v->getType() == decimalStructType()) return v;  // already decimal
+        if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(1)) {
+            llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+            emitIntToDecimal(v, sema::PrimitiveType::Int, slot);  // §5.1 widen
+            return builder_.CreateLoad(decimalStructType(), slot, "dec.op");
+        }
+        return v;  // last resort (should not occur for a decimal operand)
+    };
+
     // §7 / §19 / issues #447 + #448: a nullable VALUE type scrutinee is a
     // tagged {i8 hasValue; T value} struct, NOT a pointer. All pointer-based
     // pattern tests (null-check via ConstantPointerNull, emitEquals on the
@@ -10334,6 +10409,18 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             llvm::Value* any = builder_.getInt1(false);
             for (const auto& c : cp->constants) {
                 if (!c) continue;
+                // §19.3 (#1152): a `decimal?` value compares via bz_decimal_cmp;
+                // emitEquals would ICmp two 128-bit structs (illegal IR / abort).
+                // decOperand lowers the constant as a decimal (a decimal literal
+                // lacking a sema exprType would otherwise default to double).
+                if (innerVal->getType() == decimalStructType()) {
+                    llvm::Value* dop = decOperand(*c);
+                    if (!dop) return nullptr;
+                    llvm::Value* match = builder_.CreateAnd(
+                        hasVal, decCmp(innerVal, dop, "="), "nv.val.match");
+                    any = builder_.CreateOr(any, match);
+                    continue;
+                }
                 llvm::Value* cv = litAtWidth(*c, innerVal->getType());  // #836
                 if (!cv) cv = reconcile(lowerExpr(*c), innerVal->getType());
                 if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
@@ -10365,23 +10452,32 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
             if (range && !range->step && (range->lo || range->hi)) {
                 bool fp = innerVal->getType()->isFloatingPointTy();
+                // §19.3 (#1152): a `decimal?` value compares via bz_decimal_cmp;
+                // bounds are lowered via decOperand (a decimal literal lacking a
+                // sema exprType would otherwise default to double).
+                bool dec = innerVal->getType() == decimalStructType();
                 llvm::Value* geL = builder_.getInt1(true);
                 if (range->lo) {
-                    llvm::Value* lo = litAtWidth(*range->lo, innerVal->getType());
-                    if (!lo) lo = reconcile(lowerExpr(*range->lo),
-                                            innerVal->getType());  // #836
+                    llvm::Value* lo = dec ? decOperand(*range->lo)
+                                          : litAtWidth(*range->lo, innerVal->getType());
+                    if (!lo && !dec) lo = reconcile(lowerExpr(*range->lo),
+                                                    innerVal->getType());  // #836
                     if (!lo) return nullptr;
-                    geL = fp ? builder_.CreateFCmpOGE(innerVal, lo)
-                             : (scrutUnsigned ? builder_.CreateICmpUGE(innerVal, lo)
-                                              : builder_.CreateICmpSGE(innerVal, lo));
+                    geL = dec ? decCmp(innerVal, lo, ">=")
+                              : fp ? builder_.CreateFCmpOGE(innerVal, lo)
+                                   : (scrutUnsigned ? builder_.CreateICmpUGE(innerVal, lo)
+                                                    : builder_.CreateICmpSGE(innerVal, lo));
                 }
                 llvm::Value* leH = builder_.getInt1(true);
                 if (range->hi) {
-                    llvm::Value* hi = litAtWidth(*range->hi, innerVal->getType());
-                    if (!hi) hi = reconcile(lowerExpr(*range->hi),
-                                            innerVal->getType());  // #836
+                    llvm::Value* hi = dec ? decOperand(*range->hi)
+                                          : litAtWidth(*range->hi, innerVal->getType());
+                    if (!hi && !dec) hi = reconcile(lowerExpr(*range->hi),
+                                                    innerVal->getType());  // #836
                     if (!hi) return nullptr;
-                    leH = fp
+                    leH = dec
+                        ? decCmp(innerVal, hi, range->inclusive ? "<=" : "<")
+                        : fp
                         ? (range->inclusive ? builder_.CreateFCmpOLE(innerVal, hi)
                                             : builder_.CreateFCmpOLT(innerVal, hi))
                         : (range->inclusive
@@ -10404,6 +10500,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // deferred null return → lowerCaseExpr bailed leaving `case.end`
         // unterminated (the malformed-IR / verification crash).
         if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(pat)) {
+            // §19.3 (#1152): a `decimal?` value compares via bz_decimal_cmp;
+            // ICmp on the 128-bit struct operands would abort the compiler.
+            // decOperand lowers the bound as a decimal (a decimal literal lacking
+            // a sema exprType would otherwise default to double).
+            if (innerVal->getType() == decimalStructType()) {
+                llvm::Value* dop = rp->expr ? decOperand(*rp->expr) : nullptr;
+                if (!dop) return nullptr;
+                return builder_.CreateAnd(hasVal, decCmp(innerVal, dop, rp->op),
+                                          "nv.relop.match");
+            }
             llvm::Value* rv =
                 rp->expr ? litAtWidth(*rp->expr, innerVal->getType()) : nullptr;
             if (!rv && rp->expr)
@@ -10612,6 +10718,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         llvm::Value* any = builder_.getInt1(false);
         for (const auto& c : cp->constants) {
             if (!c) continue;
+            // §19.3 (#1152): a decimal scrutinee compares via bz_decimal_cmp;
+            // emitEquals would ICmp two 128-bit structs (illegal IR / abort).
+            // The constant is lowered via decOperand so a decimal literal that
+            // lacks a sema exprType does not default to double.
+            if (scrut->getType() == decimalStructType()) {
+                llvm::Value* dop = decOperand(*c);
+                if (!dop) return nullptr;
+                any = builder_.CreateOr(any, decCmp(scrut, dop, "="));
+                continue;
+            }
             // #836: lower an integer-literal constant at the scrutinee's width
             // up front (avoids the default-i32 truncation of a wide value).
             llvm::Value* cv = isStr ? nullptr : litAtWidth(*c, scrut->getType());
@@ -10630,6 +10746,15 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         return any;
     }
     if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(pat)) {
+        // §19.3 (#1152): a decimal scrutinee compares via bz_decimal_cmp; ICmp
+        // on the 128-bit struct operands would abort the compiler. decOperand
+        // lowers the bound as a decimal (a decimal literal that lacks a sema
+        // exprType would otherwise default to double).
+        if (scrut->getType() == decimalStructType()) {
+            llvm::Value* dop = rp->expr ? decOperand(*rp->expr) : nullptr;
+            if (!dop) return nullptr;
+            return decCmp(scrut, dop, rp->op);
+        }
         llvm::Value* rv =
             rp->expr ? litAtWidth(*rp->expr, scrut->getType()) : nullptr;  // #836
         if (!rv && rp->expr) rv = reconcile(lowerExpr(*rp->expr), scrut->getType());
@@ -10665,22 +10790,32 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // lower (leH = true). A `..`-only pattern reduces to true.
         if (range && !range->step && (range->lo || range->hi)) {
             bool fp = scrut->getType()->isFloatingPointTy();
+            // §19.3 (#1152): a decimal scrutinee compares via bz_decimal_cmp;
+            // ICmp on the 128-bit struct operands would abort the compiler. The
+            // bounds are lowered via decOperand so a decimal literal that lacks
+            // a sema exprType does not default to double.
+            bool dec = scrut->getType() == decimalStructType();
             // §19.3: range patterns — use FP comparisons for float scrutinees.
             llvm::Value* geL = builder_.getInt1(true);
             if (range->lo) {
-                llvm::Value* lo = litAtWidth(*range->lo, scrut->getType());  // #836
-                if (!lo) lo = reconcile(lowerExpr(*range->lo), scrut->getType());
+                llvm::Value* lo = dec ? decOperand(*range->lo)
+                                      : litAtWidth(*range->lo, scrut->getType());  // #836
+                if (!lo && !dec) lo = reconcile(lowerExpr(*range->lo), scrut->getType());
                 if (!lo) return nullptr;
-                geL = fp ? builder_.CreateFCmpOGE(scrut, lo)
-                         : (scrutUnsigned ? builder_.CreateICmpUGE(scrut, lo)
-                                          : builder_.CreateICmpSGE(scrut, lo));
+                geL = dec ? decCmp(scrut, lo, ">=")
+                          : fp ? builder_.CreateFCmpOGE(scrut, lo)
+                               : (scrutUnsigned ? builder_.CreateICmpUGE(scrut, lo)
+                                                : builder_.CreateICmpSGE(scrut, lo));
             }
             llvm::Value* leH = builder_.getInt1(true);
             if (range->hi) {
-                llvm::Value* hi = litAtWidth(*range->hi, scrut->getType());  // #836
-                if (!hi) hi = reconcile(lowerExpr(*range->hi), scrut->getType());
+                llvm::Value* hi = dec ? decOperand(*range->hi)
+                                      : litAtWidth(*range->hi, scrut->getType());  // #836
+                if (!hi && !dec) hi = reconcile(lowerExpr(*range->hi), scrut->getType());
                 if (!hi) return nullptr;
-                leH = fp
+                leH = dec
+                    ? decCmp(scrut, hi, range->inclusive ? "<=" : "<")
+                    : fp
                     ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
                                         : builder_.CreateFCmpOLT(scrut, hi))
                     : (range->inclusive
