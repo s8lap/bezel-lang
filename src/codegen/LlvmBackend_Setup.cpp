@@ -572,6 +572,9 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
         // class's generic params, from whichever source is active.
         std::vector<llvm::Type*> substTypes;
         std::vector<const void*> substIds;
+        // #1116: also collect the sema TypeRef* for each arg so we can
+        // recompute the concrete LLVM type for the field below.
+        std::vector<const sema::TypeRef*> substSemaTys;
         std::string typeArgMangle;
 
         // §22.12 (#738): mangle one type argument to a name fragment. A Named
@@ -611,11 +614,12 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             return "t";
         };
 
-        // Helper: append one type argument (semaTy) to the three key vectors.
+        // Helper: append one type argument (semaTy) to the four key vectors.
         auto appendTypeArg = [&](const sema::TypeRef* semaTy) {
             llvm::Type* llTy = semaTy ? lowerTypeRef(semaTy) : i32();
             substTypes.push_back(llTy);
             substIds.push_back(typeRefIdentityToken(semaTy));
+            substSemaTys.push_back(semaTy);  // #1116: track sema type for instTy
             if (!typeArgMangle.empty()) typeArgMangle += "_";
             typeArgMangle += mangleTy(semaTy);
         };
@@ -693,6 +697,7 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                 // match the original per-instantiation key scheme.
                 substTypes.push_back(sit->second);
                 substIds.push_back(typeRefIdentityToken(semaTy));
+                substSemaTys.push_back(semaTy);  // #1116: track sema type for instTy
                 if (!typeArgMangle.empty()) typeArgMangle += "_";
                 typeArgMangle += mangleTy(semaTy);  // #738: recursive
             }
@@ -741,9 +746,37 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             std::string fname = std::string(fs->name);
             std::string gname = "bz$" + cls + "$" + typeArgMangle + "$" + fname;
 
-            // Create the per-instantiation global with the same type and
-            // constant initializer as the template-level global (which was
-            // initialized by constInitFor in declareStatics).
+            // Create the per-instantiation global with the correct concrete type.
+            //
+            // §22.12 / #1116: the template-level global's LLVM type was lowered
+            // from the field's UNSPECIALIZED type in declareStatics (no active
+            // substitution there), so e.g. `owned T?` (T class-constrained) maps
+            // to the placeholder {i8,i32} nullable-value-struct instead of the
+            // concrete `ptr` for T=Cell.  Storing a class reference (ptr) into a
+            // {i8,i32} global then loading it as {i8,i32} silently miscompiles
+            // the pointer — the null-check reads the pointer's low byte (zero for
+            // any heap-aligned alloc) as the hasValue tag, and the unwrapped
+            // "value" is a 32-bit fragment of the address.  Recompute the
+            // concrete LLVM type by temporarily installing the type-arg
+            // substitution and calling lowerType, mirroring how a monomorphized
+            // method body would see the field.  Per §22.12 / §28.5.
+            llvm::Type* instTy = base->getValueType();
+            auto* fieldDecl = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (fieldDecl &&
+                substSemaTys.size() == fs->parent->genericParams.size()) {
+                auto savedSubst     = std::move(genericSubst_);
+                auto savedSubstSema = std::move(genericSubstSemaTy_);
+                for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i) {
+                    genericSubst_[fs->parent->genericParams[i]->name] =
+                        substTypes[i];
+                    if (substSemaTys[i])
+                        genericSubstSemaTy_[fs->parent->genericParams[i]->name] =
+                            substSemaTys[i];
+                }
+                instTy = lowerType(fieldDecl->type.get());
+                genericSubst_     = std::move(savedSubst);
+                genericSubstSemaTy_ = std::move(savedSubstSema);
+            }
             //
             // §22.12 / #684: for an imported generic, the template-level global
             // is an external declaration created in declareStatics with nullptr
@@ -755,11 +788,15 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             // has its own static state"). Any non-trivial constant initializer
             // only occurs for locally-defined generics (non-imported), where
             // base->hasInitializer() is always true.
-            llvm::Constant* instInit = base->hasInitializer()
-                ? base->getInitializer()
-                : llvm::Constant::getNullValue(base->getValueType());
+            // When instTy differs from base->getValueType() (e.g. ptr vs
+            // {i8,i32}), the base's typed initializer cannot be reused — use a
+            // fresh null of the concrete type instead.
+            llvm::Constant* instInit =
+                (instTy == base->getValueType() && base->hasInitializer())
+                    ? base->getInitializer()
+                    : llvm::Constant::getNullValue(instTy);
             auto* gv = new llvm::GlobalVariable(
-                *module_, base->getValueType(), /*isConstant=*/false,
+                *module_, instTy, /*isConstant=*/false,
                 llvm::GlobalValue::InternalLinkage,
                 instInit,
                 gname);

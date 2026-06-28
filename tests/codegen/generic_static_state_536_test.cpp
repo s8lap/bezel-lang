@@ -252,3 +252,86 @@ BEZEL_TEST(codegen_generic_static_536, no_error_for_valid_code_22_12) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
+
+// ── §22.12 / §28.5 / #1116: static `owned T?` field in a class-constrained ──
+// generic class must use the CONCRETE LLVM type (ptr) for each per-instantiation
+// global — not the placeholder {i8,i32} nullable-value-struct that declareStatics
+// assigns to the unresolved `T?` template field.  Before the fix, storing a class
+// reference into a {i8,i32} global then loading it as {i8,i32} silently
+// miscompiled: the null-check read the pointer's low byte as the hasValue tag and
+// the unwrapped "value" was a 32-bit fragment of the address — Val() returned 0.
+
+// Minimal repro: `Holder<Cell>.shared := new Cell(4)` followed by
+// `Holder<Cell>.shared!.Val()` must return 4.
+// Per §22.12 (per-instantiation static state) / §28.5 (owned fields).
+BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_field_roundtrip_22_12_28_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Cell "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Val(): int => _v; "
+        "end Cell; "
+        "class Holder<T> where T: class "
+        "  public static owned shared: T?; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    Holder<Cell>.shared := new Cell(4); "
+        "    return Holder<Cell>.shared!.Val(); "
+        "  end Main; "
+        "end C;"), 4);
+}
+
+// Two distinct instantiations of the `static owned T?` field must have
+// independent storage and independent concrete types.  Holder<Cell>.shared and
+// Holder<Dog>.shared must not alias each other's per-instantiation global.
+// Per §22.12 (each instantiation has its own static state) / §28.5 / #1116.
+BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_two_instantiations_22_12_28_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Cell "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Val(): int => _v; "
+        "end Cell; "
+        "class Dog "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Val(): int => _v; "
+        "end Dog; "
+        "class Holder<T> where T: class "
+        "  public static owned shared: T?; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    Holder<Cell>.shared := new Cell(10); "
+        "    Holder<Dog>.shared := new Dog(20); "
+        "    var a := Holder<Cell>.shared!.Val(); "
+        "    var b := Holder<Dog>.shared!.Val(); "
+        "    return a + b; "
+        "  end Main; "
+        "end C;"), 30);
+}
+
+// Concrete non-generic static owned field on a non-generic class must still work
+// after the #1116 change (no regression on the non-generic path).
+// Per §22.8 (static fields) / §28.5 (owned fields).
+BEZEL_TEST(codegen_generic_static_536, concrete_static_owned_field_unaffected_22_8_28_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Cell "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Val(): int => _v; "
+        "end Cell; "
+        "class Store "
+        "  public static owned item: Cell?; "
+        "end Store; "
+        "class C "
+        "  public static method Main(): int "
+        "    Store.item := new Cell(42); "
+        "    return Store.item!.Val(); "
+        "  end Main; "
+        "end C;"), 42);
+}
