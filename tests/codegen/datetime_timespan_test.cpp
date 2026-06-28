@@ -395,3 +395,52 @@ BEZEL_TEST(codegen_datetime_1026, bound_add_days_unchanged) {
         "var d := dt.AddDays(2); "
         "return d.Day; ")), 17);
 }
+
+// ===========================================================================
+// #1114: DateTime.ToString() no-arg — ISO 8601 "yyyy-MM-ddTHH:mm:ss" (stdlib §2.5)
+//
+// The explicit no-arg call `d.ToString()` returned a null/empty bz_string
+// (SIGSEGV on .Length), and `d.ToString().Length` returned 0.  Fix routes
+// the no-arg case to bz_datetime_to_string_fmt with the ISO 8601 default format
+// "yyyy-MM-ddTHH:mm:ss" — the same runtime helper ToString(format) uses.
+// ===========================================================================
+
+// #1114: bound no-arg ToString().Length returns 19 (was SIGSEGV/139).
+BEZEL_TEST(datetime_noarg_tostring_iso_1114, bound_length_19) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15); "
+        "var s := d.ToString(); "
+        "return s.Length; ")), 19);
+}
+
+// #1114: inline no-arg ToString().Length returns 19 (was 0).
+BEZEL_TEST(datetime_noarg_tostring_iso_1114, inline_length_19) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15); "
+        "return d.ToString().Length; ")), 19);
+}
+
+// #1114: content check — char at index 10 is 'T' (code 84) in "2024-03-15T00:00:00".
+BEZEL_TEST(datetime_noarg_tostring_iso_1114, content_T_at_index_10) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15); "
+        "var s := d.ToString(); "
+        "return s[10]; ")), 84);  // 'T' = 84
+}
+
+// #1114: no-arg agrees with explicit format ToString("yyyy-MM-ddTHH:mm:ss").
+BEZEL_TEST(datetime_noarg_tostring_iso_1114, agrees_with_explicit_iso_format) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15); "
+        "var a := d.ToString(); "
+        "var b := d.ToString(\"yyyy-MM-ddTHH:mm:ss\"); "
+        "return 1 if a = b else 0; ")), 1);
+}
+
+// #1114 regression: ToString(format) still works after the fix.
+BEZEL_TEST(datetime_noarg_tostring_iso_1114, tostring_format_still_works) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := new DateTime(2024, 3, 15); "
+        "var s := d.ToString(\"yyyy-MM-dd\"); "
+        "return s.Length; ")), 10);
+}

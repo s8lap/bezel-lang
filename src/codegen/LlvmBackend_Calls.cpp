@@ -6961,6 +6961,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // Deferred: full timezone conversion needs platform TZ APIs.
                     if (mname == "ToUtc" || mname == "ToLocal")
                         return ticks;
+                    // per stdlib §2.5 (#1114): ToString() no-arg — ISO 8601
+                    // default format "yyyy-MM-ddTHH:mm:ss" (19 chars).
+                    // Reuses the same bz_datetime_to_string_fmt helper that
+                    // ToString(format) uses; no new runtime function needed.
+                    if (mname == "ToString" && call.args.empty()) {
+                        llvm::Value* fmtStr = lowerStringLiteral(
+                            "\"yyyy-MM-ddTHH:mm:ss\"", false);
+                        auto* fn = declareC("bz_datetime_to_string_fmt",
+                                            ptrTy(), {i64(), ptrTy()});
+                        return builder_.CreateCall(fn, {ticks, fmtStr},
+                                                   "dt.tostr.default");
+                    }
                     // per §2.5 / #648: ToString(format: string): string —
                     // expand format specifiers via bz_datetime_to_string_fmt.
                     if (mname == "ToString" && call.args.size() == 1 &&
