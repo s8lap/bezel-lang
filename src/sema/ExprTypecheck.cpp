@@ -1908,6 +1908,28 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
 // the existing literal-typing / §19 category checks.
 void ExprTC::checkCasePatternConstantRanges(
     const std::vector<ast::CaseArm>& arms, TypeRef* scrutTy) {
+    // §19.3/§A.7 (#1205): a `case` pattern constant must be a literal, `null`,
+    // an enum constant, or a named `const` — a structurally non-constant
+    // expression (e.g. a `new …` constructor call) is not a valid pattern
+    // constant under §A.7 and would otherwise reach codegen's emitEquals /
+    // CreateICmpEQ, which asserts on aggregate-struct operands (LLVM ICE).
+    // Reject it here, before any codegen path is reached. // per §19.3/§A.7 (#1205)
+    auto rejectNonConstantPatternExpr = [&](const ast::Expr* c) {
+        if (!c) return;
+        if (dynamic_cast<const ast::NewExpr*>(c))
+            ctx_.diagnostics().report(
+                Severity::Error, c->span.begin,
+                "a `case` pattern constant must be a literal, `null`, an enum "
+                "constant, or a named `const` \xe2\x80\x94 a `new \xe2\x80\xa6` "
+                "expression is not a valid pattern constant (\xc2\xa7""A.7/\xc2\xa7""19.3)");
+    };
+    for (const auto& arm : arms) {
+        const ast::Pattern* p = arm.pattern.get();
+        if (!p) continue;
+        if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p))
+            for (const auto& c : cp->constants)
+                rejectNonConstantPatternExpr(c.get());
+    }
     if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive) return;
     long long lo = 0, hi = 0;
     if (!caseIntScrutineeRange(scrutTy->primitive, lo, hi)) return;

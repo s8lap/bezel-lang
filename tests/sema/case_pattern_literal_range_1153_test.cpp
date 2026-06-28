@@ -46,6 +46,17 @@ bool hasCasePatternRangeError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// True iff some error diagnostic mentions the §A.7/§19.3 non-constant pattern
+// reject (the message produced for a `new …` arm constant, issue #1205).
+bool hasCaseNonConstantPatternError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("not a valid pattern constant") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // --- Constant pattern: the issue's exact repro (§19 / §5.1) -----------------
@@ -334,5 +345,68 @@ BEZEL_TEST(sema_case_pattern_range, case_relop_decimal_scrutinee_ok_1202) {
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// --- §A.7/§19.3 non-constant expression as case pattern (#1205) --------------
+//
+// A `new Record(…)` expression is not a valid pattern constant under §A.7 —
+// only literals, `null`, enum constants, and named `const`s are admissible.
+// Before #1205 the parser wrapped the NewExpr in a ConstantPattern, sema did
+// not reject it, and codegen's emitEquals / CreateICmpEQ asserted on the
+// aggregate-struct operand (LLVM ICE, rc 134). The fix rejects it with a clean
+// §A.7/§19.3 diagnostic before any codegen path is reached.
+
+// §A.7/§19.3: `new Record(…)` in a case arm pattern is rejected — a
+// constructor call is not a valid pattern constant. #1205.
+BEZEL_TEST(sema_case_pattern_range, case_new_record_pattern_rejected_1205) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(x: int, y: int); "
+        "class C "
+        "  public static method M(p: Pt): int "
+        "    return case p new Pt(1, 2) => 10, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseNonConstantPatternError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §A.7/§19.3: an integer literal pattern is still valid and must NOT be
+// flagged by the non-constant gate introduced for #1205. #1205.
+BEZEL_TEST(sema_case_pattern_range, case_literal_pattern_still_ok_1205) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(n: int): int "
+        "    return case n 1 => 10, 2 => 20, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §A.7/§19.3: an enum-constant pattern is still valid after the #1205 fix. #1205.
+BEZEL_TEST(sema_case_pattern_range, case_enum_pattern_still_ok_1205) {
+    auto r = parseSemaAll(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "class C "
+        "  public static method M(c: Color): int "
+        "    return case c Red => 1, Green => 2, Blue => 3 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §A.7/§19.3: `null` as a pattern constant is still valid after #1205. #1205.
+BEZEL_TEST(sema_case_pattern_range, case_null_pattern_still_ok_1205) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(n: int?): int "
+        "    return case n null => 0, _ => 1 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
