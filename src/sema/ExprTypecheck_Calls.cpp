@@ -5894,6 +5894,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         "` or just `" + std::string(bm) + "`");
                     return;
                 }
+                // §8.5 / §12.3 (#1110): here `base` is `Object` (no explicit
+                // class base), so the universal `Object.ToString()` member has
+                // no resolvable `targetType` — the `if (!targetType)`
+                // fallthrough below `return`s WITHOUT typing the access, so the
+                // call is left untyped. The user-class path types `ToString` as
+                // `string` (the `if (mm == "ToString")` after the !member
+                // branch), but a null-`targetType` Object base never reaches it.
+                // Result: `"x" + base.ToString()` saw a non-`string` right
+                // operand and was rejected (§4.6) even though `base.ToString()`
+                // yields a string. Type it `string` here so the call is `string`
+                // in every position (`+` operand, var-init, return). per §8.5.
+                else if (bm == "ToString") {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                    return;
+                }
             }
         }
     }

@@ -83,3 +83,47 @@ BEZEL_TEST(base_tostring_1106, default_tostring_nonempty) {
         "  return (1 if s.Length > 0 else 0); "            // "Widget" → 1
         "end Main; end C;"), 1);
 }
+
+// #1110 (§4.6 / §8.5 / §12.3): a `base`-qualified `ToString()` call used
+// directly as a string-`+` operand must type as `string`. When the class has
+// NO explicit class base, `base` is `Object`, so the call had no resolvable
+// receiver TypeSymbol and was left untyped — `"x" + base.ToString()` then saw a
+// non-`string` right operand and was rejected by the §4.6 concat-operand check
+// even though `base.ToString()` (Object.ToString → the runtime type name)
+// yields a string. The result is "x" + "Aa" = "xAa" (length 3).
+BEZEL_TEST(base_tostring_1110, concat_operand_object_base) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Aa public override method ToString(): string => \"x\" + base.ToString(); end Aa; "
+        "class C public static method Main(): int "
+        "  using var a := new Aa(); var s := a.ToString(); "
+        "  return s.Length; "                              // "xAa" → 3
+        "end Main; end C;"), 3);
+}
+
+// #1110 (§4.6 / §8.5 / §12.3): the same for the LEFT `+` operand position,
+// `base.ToString() + "!"` — also rejected before the fix. "Aa" + "!" → 3.
+BEZEL_TEST(base_tostring_1110, concat_left_operand_object_base) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Aa public override method ToString(): string => base.ToString() + \"!\"; end Aa; "
+        "class C public static method Main(): int "
+        "  using var a := new Aa(); var s := a.ToString(); "
+        "  return s.Length; "                              // "Aa!" → 3
+        "end Main; end C;"), 3);
+}
+
+// #1110 (§4.6 / §8.5 / §12.3): an EXPLICIT class base whose override returns a
+// fixed string concatenated as a `+` operand. (This path already typed
+// correctly via the user-class member-access typing, but guard it against
+// regression alongside the Object-base fix.) "x" + "BASE" → 5.
+BEZEL_TEST(base_tostring_1110, concat_operand_explicit_base) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class B public virtual method ToString(): string => \"BASE\"; end B; "
+        "class A: B public override method ToString(): string => \"x\" + base.ToString(); end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); var s := a.ToString(); "
+        "  return s.Length; "                              // "xBASE" → 5
+        "end Main; end C;"), 5);
+}
