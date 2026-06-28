@@ -749,6 +749,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             "type range and cannot be represented (§5.4)");
                 }
             }
+            // per §5.4/§5.1 (#1171): the argument to an enum cast `E(x)` must
+            // be an INTEGER value — §5.4 defines `E(n)` only "for an integer
+            // n", which is range-checked against the underlying type (at
+            // compile time when constant — the fold above — else at runtime
+            // via OverflowException, handled in codegen lowerEnumCast). The
+            // const-range check above validated the VALUE but never the
+            // argument's TYPE, so enum-to-enum casts (`B(a)`) and
+            // `double`/`string`/`bool` arguments were silently accepted and
+            // miscompiled (the source bits were reinterpreted as the enum).
+            // Reject any single argument whose resolved type is not a
+            // non-nullable integer primitive; codegen widens/narrows any
+            // integer width to the underlying type, so the exact width need
+            // not match here. An untyped/error argument keeps its own
+            // diagnostic. (Round-tripping an enum needs `int(e)` first.)
+            if (ce.args.size() == 1 && ce.args[0].value) {
+                const TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                if (argTy) {
+                    auto isIntegerPrim = [](PrimitiveType p) {
+                        switch (p) {
+                            case PrimitiveType::Byte:
+                            case PrimitiveType::SByte:
+                            case PrimitiveType::Short:
+                            case PrimitiveType::UShort:
+                            case PrimitiveType::Int:
+                            case PrimitiveType::UInt:
+                            case PrimitiveType::Long:
+                            case PrimitiveType::ULong:
+                                return true;
+                            default:
+                                return false;
+                        }
+                    };
+                    bool ok = argTy->kind == TypeRef::Kind::Primitive &&
+                              !argTy->nullable && isIntegerPrim(argTy->primitive);
+                    if (!ok)
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "the argument to an enum cast `" +
+                            std::string(ts->name) +
+                            "(...)` must be an integer of the enum's underlying "
+                            "type (use `int(e)` to convert an enum first) "
+                            "(§5.4/§5.1)");
+                }
+            }
             TypeRef* et = ctx_.makeTypeRef();
             et->kind = TypeRef::Kind::Named;
             et->declaration = ts;
