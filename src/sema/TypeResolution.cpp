@@ -134,6 +134,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticIndexers();
     // §25.2 (#746): comparison/equality operators must form a complete group.
     checkOperatorGroups();
+    // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
+    checkEqualsHashCodePairing();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
     // Slice S19: overloads must differ in signature.

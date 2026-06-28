@@ -254,9 +254,12 @@ BEZEL_TEST(codegen_object_equals_946, class_implements_iequatable_int_compiles_1
 // #1151 keep-green: a real `Equals(Object?)` override (pointer param) IS still
 // bound to the Object.Equals slot-4 thunk and dispatches through `=` / `.Equals`.
 BEZEL_TEST(codegen_object_equals_946, object_param_equals_still_overrides_1151) {
+    // A class overriding `Equals` must also override `GetHashCode` (§8.3, #1193),
+    // so the override pair is declared together.
     BEZEL_EXPECT_EQ(run(
         "module M; class P "
         "  public override method Equals(other: Object?): bool => true; "
+        "  public override method GetHashCode(): int => 0; "
         "  public static method Main(): int "
         "    using var a := new P(); using var b := new P(); "
         "    return (7 if a.Equals(b) else 0) + (3 if a = b else 0); "  // 10

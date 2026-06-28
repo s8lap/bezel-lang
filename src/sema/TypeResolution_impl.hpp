@@ -210,6 +210,8 @@ private:
     void checkStaticClassMembers();
     void checkStaticIndexers();  // §23.5: static indexers are not supported
     void checkOperatorGroups();  // §25.2: comparison/equality operator groups
+    // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
+    void checkEqualsHashCodePairing();
 
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 

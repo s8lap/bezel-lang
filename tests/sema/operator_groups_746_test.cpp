@@ -51,6 +51,16 @@ bool hasClassEqError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// §8.3 (#1193): a type overrides `Equals` but not `GetHashCode` diagnostic.
+bool hasEqHashPairingError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("must also override `GetHashCode`") !=
+                std::string::npos &&
+            d.message.find("8.3") != std::string::npos)
+            return true;
+    return false;
+}
+
 const char* kRec = "module M; record V(n: int) ";
 
 }  // namespace
@@ -151,4 +161,83 @@ BEZEL_TEST(operator_groups_746, record_equality_overload_ok) {
         "end V; class F public static method Main(): int return 0; end Main; "
         "end F;");
     BEZEL_EXPECT_FALSE(hasClassEqError(r));
+}
+
+// ---------------------------------------------------------------------------
+// §8.3 (#1193): "A type that overrides `Equals` must also override
+// `GetHashCode`. The compiler enforces this." The rule is one-directional, as
+// the spec states it: overriding `Equals` requires `GetHashCode`; the converse
+// (overriding only `GetHashCode`) is permitted. `Equals(T)` for `IEquatable<T>`
+// is an interface implementation, not an `override`, and does not trigger.
+// ---------------------------------------------------------------------------
+
+// §8.3: a class overriding `Equals` but not `GetHashCode` is rejected.
+BEZEL_TEST(operator_groups_746, equals_without_gethashcode_diagnosed_1193) {
+    auto r = parseSemaAll(
+        "module M; class K "
+        "  public constructor() end constructor; "
+        "  public override method Equals(o: Object?): bool => false; "
+        "end K; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasEqHashPairingError(r));
+}
+
+// §8.3: a class overriding both `Equals` and `GetHashCode` is accepted.
+BEZEL_TEST(operator_groups_746, equals_and_gethashcode_both_ok_1193) {
+    auto r = parseSemaAll(
+        "module M; class K "
+        "  public constructor() end constructor; "
+        "  public override method Equals(o: Object?): bool => false; "
+        "  public override method GetHashCode(): int => 0; "
+        "end K; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasEqHashPairingError(r));
+}
+
+// §8.3: overriding only `GetHashCode` is permitted (the rule is one-directional
+// — overriding `Equals` is what requires the pair).
+BEZEL_TEST(operator_groups_746, gethashcode_only_ok_1193) {
+    auto r = parseSemaAll(
+        "module M; class K "
+        "  public constructor() end constructor; "
+        "  public override method GetHashCode(): int => 0; "
+        "end K; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasEqHashPairingError(r));
+}
+
+// §8.3: overriding an unrelated `Object` method (`ToString`) does not trigger.
+BEZEL_TEST(operator_groups_746, tostring_override_only_ok_1193) {
+    auto r = parseSemaAll(
+        "module M; class K "
+        "  public constructor() end constructor; "
+        "  public override method ToString(): string => \"k\"; "
+        "end K; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasEqHashPairingError(r));
+}
+
+// §8.3: the rule applies to records too — they override via the same `override`
+// form (§9.2). `Equals` without `GetHashCode` is rejected.
+BEZEL_TEST(operator_groups_746, record_equals_without_gethashcode_diagnosed_1193) {
+    auto r = parseSemaAll(
+        "module M; record R "
+        "  public X: int; "
+        "  public override method Equals(o: Object?): bool => false; "
+        "end R; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasEqHashPairingError(r));
+}
+
+// §8.3: an `IEquatable<T>` `Equals(T)` implementation (no `override`) paired with
+// a `GetHashCode` override is not an `Equals(Object?)` override — no error.
+BEZEL_TEST(operator_groups_746, iequatable_equals_t_not_an_override_1193) {
+    auto r = parseSemaAll(
+        "module M; class K : IEquatable<K> "
+        "  public constructor() end constructor; "
+        "  public method Equals(other: K?): bool => false; "
+        "  public override method GetHashCode(): int => 0; "
+        "end K; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasEqHashPairingError(r));
 }

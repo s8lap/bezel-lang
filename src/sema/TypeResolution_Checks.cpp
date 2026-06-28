@@ -1026,6 +1026,37 @@ void Resolver::checkOperatorGroups() {
     }
 }
 
+// §8.3 (#1193): "A type that overrides `Equals` must also override
+// `GetHashCode`. The compiler enforces this." `Object` declares `Equals` and
+// `GetHashCode` as `virtual` (§8.1), so a user override of either carries the
+// `override` modifier; an `IEquatable<T>` `Equals(T)` is an interface
+// *implementation*, not an `override`, so it is not the `Equals(Object?)`
+// override this rule is about. A type overriding `Equals` but not `GetHashCode`
+// would satisfy `=` while leaving the hash inconsistent — the classic
+// dictionary-lookup footgun the rule prevents (rationale §7.3). Records using
+// the same `override` form (§9.2) are covered uniformly. Was accepted silently.
+void Resolver::checkEqualsHashCodePairing() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        MethodSymbol* equalsOverride = nullptr;
+        bool overridesHashCode = false;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || ms->isOperator || !hasMod(ms, "override")) continue;
+            if (ms->name == "Equals" && !equalsOverride) equalsOverride = ms;
+            else if (ms->name == "GetHashCode") overridesHashCode = true;
+        }
+        if (equalsOverride && !overridesHashCode) {
+            ctx_.diagnostics().report(
+                Severity::Error, equalsOverride->declLoc,
+                "a type that overrides `Equals` must also override "
+                "`GetHashCode` (§8.3)");
+        }
+    }
+}
+
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     auto reportInstance = [&](std::string_view kind,
                               std::string_view name) {
