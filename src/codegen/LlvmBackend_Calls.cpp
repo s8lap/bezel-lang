@@ -8464,9 +8464,29 @@ void Emitter::unifyMethodReturnTypeArg(
             // lowerCall loop already skips NullLiteralExpr args, but this guard
             // is a second line of defence for other null-typed sources.
             // per §14.1/§14.2, fixes #885/#886.
+            //
+            // §14.1 / #1162: EXCEPTION — a builtin COLLECTION/runtime type
+            // (Array<int>, Dictionary<…>, Task, …) is also a decl-less Named,
+            // but it is fully concrete: lowerTypeRef gives its real
+            // collection/value type (ptr for heap collections). Inferring
+            // U → Array<int> from `Echo(a)` must bind it (lowering the call's
+            // return/param fnTy to ptr, identical to the explicit
+            // `Echo<Array<int>>(a)` path); skipping it left U unbound, so the
+            // call lowered U → the i32 fallback while the monomorphized body
+            // returned ptr → 'Call parameter type does not match'. Recognise a
+            // builtin name (astNode single name part, or importedName) and bind
+            // it; only a genuine unresolved type-parameter name is skipped.
             if (concreteTy->kind == sema::TypeRef::Kind::Named &&
-                !concreteTy->declaration)
-                return;
+                !concreteTy->declaration) {
+                std::string_view cn;
+                if (concreteTy->astNode && concreteTy->astNode->name &&
+                    concreteTy->astNode->name->parts.size() == 1)
+                    cn = concreteTy->astNode->name->parts[0];
+                else if (!concreteTy->astNode && !concreteTy->importedName.empty())
+                    cn = concreteTy->importedName;
+                if (cn.empty() || !isBuiltinTypeRefName(cn))
+                    return;
+            }
             if (concreteTy->kind == sema::TypeRef::Kind::Primitive &&
                 concreteTy->primitive == sema::PrimitiveType::Object)
                 return;

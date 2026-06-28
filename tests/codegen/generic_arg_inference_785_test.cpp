@@ -90,3 +90,62 @@ BEZEL_TEST(generic_arg_inference_785, bare_param_inference_unaffected) {
         "  end Main; "
         "end C;"), 55);
 }
+
+// §14.1 / #1162: a method type param INFERRED to a builtin COLLECTION
+// (Array<int>) must bind to that collection's lowered type (a heap pointer),
+// exactly as the explicit `Echo<Array<int>>(a)` form does. Before the fix the
+// inferred binding was skipped (a builtin collection is a decl-less Named, like
+// an unresolved type param), so `U` lowered to the i32 placeholder and the call
+// was typed `call i32 @Echo(ptr …)` while the monomorphized body returned ptr →
+// IR verification failure. Here `Echo(a)` returns the Array; `.Count` is 3.
+BEZEL_TEST(generic_arg_inference_785, infers_builtin_collection_array_1162) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Echo<U>(x: U): U => x; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); a.Add(5); a.Add(6); a.Add(7); "
+        "    var r := Echo(a); "
+        "    return r.Count; "  // 3
+        "  end Main; "
+        "end C;"), 3);
+}
+
+// §14.1 / #1162 regression guard: the EXPLICIT type-arg form is the contract the
+// inferred form must match — it must keep returning 3.
+BEZEL_TEST(generic_arg_inference_785, explicit_builtin_collection_array_1162) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Echo<U>(x: U): U => x; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); a.Add(5); a.Add(6); a.Add(7); "
+        "    var r := Echo<Array<int>>(a); "
+        "    return r.Count; "  // 3
+        "  end Main; "
+        "end C;"), 3);
+}
+
+// §14.1 / #1162: a Dictionary is inferred the same way (heap-pointer builtin).
+BEZEL_TEST(generic_arg_inference_785, infers_builtin_collection_dictionary_1162) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Echo<U>(x: U): U => x; "
+        "  public static method Main(): int "
+        "    using var d := new Dictionary<int, int>(); d.Add(1, 10); d.Add(2, 20); "
+        "    var r := Echo(d); "
+        "    return r.Count; "  // 2
+        "  end Main; "
+        "end C;"), 2);
+}
+
+// §14.1 / #1162 regression guard: a NON-collection scalar inference is
+// unaffected — `Echo(5)` still returns 5 (the skip path for genuine type-param /
+// null-typed candidates must remain intact).
+BEZEL_TEST(generic_arg_inference_785, scalar_inference_unaffected_1162) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Echo<U>(x: U): U => x; "
+        "  public static method Main(): int "
+        "    return Echo(5); "  // 5
+        "  end Main; "
+        "end C;"), 5);
+}
