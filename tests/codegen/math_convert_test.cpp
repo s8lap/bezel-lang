@@ -288,3 +288,72 @@ BEZEL_TEST(math_comparable_1141, numeric_double_unaffected) {
         "  var c := Math.Clamp(99.0, 0.0, 10.0); "
         "  return int(lo) * 100 + int(hi) + int(c);")), 217);
 }
+
+// ── #1148 / stdlib §2.2 / §14.2: Math.Min/Max/Clamp<T> over a CLASS ──────────
+// implementing IComparable<T>.  Before the fix, a class operand was sent to the
+// numeric sitofp-to-double path — `sitofp ptr %15 to double` → malformed IR.
+// The comparableCompareTo lambda now accepts Class declarations in addition to
+// Record/Enum and dispatches CompareTo through emitMethodCall (vtable if the
+// method is virtual/override, direct compiled call otherwise). The sema
+// result-type gate likewise accepts Class so that member access on the borrow
+// result resolves to the class's fields.
+namespace {
+// A heap class implementing IComparable<Box> (§14.2 / §11 class declarations).
+const char* kBox =
+    "module M; import System; "
+    "class Box(v: int): IComparable<Box> "
+    "  public method CompareTo(other: Box): int => "
+    "    (1 if v > other.v else (-1 if v < other.v else 0)); "
+    "end Box; ";
+std::string boxMain(const std::string& body) {
+    return std::string(kBox) +
+           "class App public static method Main(): int " + body +
+           " end Main; end App;";
+}
+}  // namespace
+
+// #1148: Math.Min<Box> returns the lesser class instance — Box(99) < Box(150).
+BEZEL_TEST(math_comparable_1148, min_class_explicit_type_arg) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var a := new Box(150); using var b := new Box(99); "
+        "  var lo := Math.Min<Box>(a, b); "
+        "  return lo.v;")), 99);
+}
+
+// #1148: inferred form Math.Min(a, b) also dispatches via CompareTo.
+BEZEL_TEST(math_comparable_1148, min_class_inferred) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var a := new Box(150); using var b := new Box(99); "
+        "  return Math.Min(a, b).v;")), 99);
+}
+
+// #1148: Math.Max<Box> returns the greater class instance — Box(150) > Box(99).
+BEZEL_TEST(math_comparable_1148, max_class) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var a := new Box(150); using var b := new Box(99); "
+        "  return Math.Max<Box>(a, b).v;")), 150);
+}
+
+// #1148: Math.Clamp<Box> — below range clamps to lo (Box(80) → Box(99)).
+BEZEL_TEST(math_comparable_1148, clamp_class_below_range) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var v := new Box(80); "
+        "  using var lo := new Box(99); using var hi := new Box(150); "
+        "  return Math.Clamp<Box>(v, lo, hi).v;")), 99);
+}
+
+// #1148: Math.Clamp<Box> — above range clamps to hi (Box(200) → Box(150)).
+BEZEL_TEST(math_comparable_1148, clamp_class_above_range) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var v := new Box(200); "
+        "  using var lo := new Box(99); using var hi := new Box(150); "
+        "  return Math.Clamp<Box>(v, lo, hi).v;")), 150);
+}
+
+// #1148: Math.Clamp<Box> — in range returns the value unchanged (Box(120)).
+BEZEL_TEST(math_comparable_1148, clamp_class_in_range) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var v := new Box(120); "
+        "  using var lo := new Box(99); using var hi := new Box(150); "
+        "  return Math.Clamp<Box>(v, lo, hi).v;")), 120);
+}

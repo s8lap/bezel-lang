@@ -4609,7 +4609,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 (argTy->declaration->kind ==
                                      ast::TypeDeclKind::Record ||
                                  argTy->declaration->kind ==
-                                     ast::TypeDeclKind::Enum))
+                                     ast::TypeDeclKind::Enum ||
+                                 // #1148: a CLASS that implements IComparable<T>
+                                 // (§14.2 / stdlib §2.2). Type the result as T
+                                 // so member access on the returned borrow
+                                 // resolves to the class's fields/methods.
+                                 argTy->declaration->kind ==
+                                     ast::TypeDeclKind::Class))
                                 ctx_.setExprType(&ce, argTy);
                     }
                 }

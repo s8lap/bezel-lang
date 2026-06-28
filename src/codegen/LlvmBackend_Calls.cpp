@@ -5499,7 +5499,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
             if (t && t->kind == sema::TypeRef::Kind::Named && t->declaration &&
                 (t->declaration->kind == ast::TypeDeclKind::Record ||
-                 t->declaration->kind == ast::TypeDeclKind::Enum)) {
+                 t->declaration->kind == ast::TypeDeclKind::Enum ||
+                 // #1148: a CLASS that implements IComparable<T> (§14.2 / stdlib §2.2).
+                 // Classes are pointer-typed; the CompareTo receiver needs no spill
+                 // (emitCompareToCmp only spills for record value receivers). Virtual
+                 // dispatch is handled by emitMethodCall: if CompareTo is in vtableSlot_
+                 // (override/virtual) it dispatches through the vtable; otherwise the
+                 // concrete class's compiled body is called directly.
+                 t->declaration->kind == ast::TypeDeclKind::Class)) {
                 if (sema::MethodSymbol* cm =
                         findMethodByName(t->declaration, "CompareTo"))
                     if (cm->params.size() == 1) return cm;
