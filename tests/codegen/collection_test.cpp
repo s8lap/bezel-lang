@@ -124,6 +124,52 @@ BEZEL_TEST(collection_dict, set_and_remove) {
         "end Main; end C;"), 1);
 }
 
+// §4.8 / #1201: Dictionary.Add on a duplicate key must throw ArgumentException.
+// The indexer setter `d[k] := v` is the add-or-update (overwrite) path and must
+// not throw.
+BEZEL_TEST(collection_dict, add_duplicate_string_key_throws_arg_exc_spec_4_8_1201) {
+    // String key: duplicate Add caught as ArgumentException → sentinel 42.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d.Add(\"a\", 10); "
+        "  try d.Add(\"a\", 20); return 0; "
+        "  catch ArgumentException => return 42; end; "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(collection_dict, add_duplicate_int_key_throws_arg_exc_spec_4_8_1201) {
+    // Generic (non-string) key: duplicate Add must also throw ArgumentException.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<int, int>(); "
+        "  d.Add(1, 10); "
+        "  try d.Add(1, 20); return 0; "
+        "  catch ArgumentException => return 42; end; "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(collection_dict, add_unique_keys_succeeds_spec_4_8_1201) {
+    // Non-duplicate Add must still work normally (no spurious throw).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<int, int>(); "
+        "  d.Add(1, 10); d.Add(2, 20); "
+        "  return d[1] + d[2] + d.Count; "
+        "end Main; end C;"), 32);  // 10+20+2=32
+}
+
+BEZEL_TEST(collection_dict, indexer_set_overwrites_no_throw_spec_4_8_1201) {
+    // Indexer setter d[k]:=v is the add-or-update path and must NOT throw on dup.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<int, int>(); "
+        "  d.Add(1, 10); "
+        "  d[1] := 99; "
+        "  return d[1] + d.Count; "
+        "end Main; end C;"), 100);  // 99+1=100
+}
+
 // --- LINQ on Array<int> ---
 
 BEZEL_TEST(linq_int, any) {

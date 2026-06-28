@@ -3936,6 +3936,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             llvm::Value* v = lowerExpr(*call.args[1].value);
             if (!k || !v) return nullptr;
+            // §4.8 / #1201: Dictionary.Add must throw ArgumentException when the
+            // key is already present (the indexer setter `d[k] := v` is the
+            // add-or-update / overwrite path).  .Set is sema-rejected per §4.8
+            // v0.148; the m=="Set" branch is dead for borrowing dicts. The probe
+            // fires before the string-value retain so no retain leak occurs on the
+            // throw path.
+            // Residual: OwnedDictionary.Add must also dispose the owned value
+            // argument on the throw path (§28.3 discharge rule), but that requires
+            // calling dictValClassDisposer(v) before emitThrowBuiltin; deferred
+            // under #1201 — OwnedDictionary.Add is left no-worse-than-before.
+            if (m == "Add" && !dictValIsOwning) {
+                if (keyTy) {
+                    auto* cf = declareC("bz_dict_contains_gen",
+                                        i1(), {ptrTy(), ptrTy()});
+                    emitGuardThrow(
+                        builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "add.dup"),
+                        "ArgumentException");
+                } else {
+                    auto [kd0, kl0] = strDataLen(k);
+                    auto* cf = declareC("bz_dict_contains_str",
+                                        i1(), {ptrTy(), ptrTy(), i64()});
+                    emitGuardThrow(
+                        builder_.CreateCall(cf, {recv, kd0, kl0}, "add.dup"),
+                        "ArgumentException");
+                }
+            }
             // #602 / #429 / §28.9 / §28.11 v0.134: retain the string value BEFORE
             // encoding (v is still the raw bz_string* at this point; encodeValue
             // returns it as-is for pointers). dictIsStringValue derived from dictValPol.
