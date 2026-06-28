@@ -1006,6 +1006,37 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     // generic-deferral path returned before reaching here, so generics are
     // unaffected.
     if (from->nullable && !to->nullable) { reportNullable(); return; }
+    // §5.1 / §4.6 (#1178): a mixed pair of a CONCRETE user-declared class /
+    // record / interface and a CONCRETE primitive (incl. `string`, which is a
+    // Primitive in this type model) matches neither the Primitive-Primitive nor
+    // the Named-Named branch above, so it reached the fall-through and was
+    // silently accepted (`var s: string := d`, `var d: Dog := 5`,
+    // `var d: Dog := "hi"`). There is no implicit conversion between a class
+    // reference and a primitive (§4.6 forbids implicit to-string), so reject it.
+    // Stay surgical: only fire when the Named side is a CONCRETE user type
+    // (declaration != null — a generic type-parameter and a builtin both have a
+    // null declaration and must keep flowing through; the monomorphizer / later
+    // slices handle those) and the Primitive side is NOT `Object` (the `null`
+    // literal is typed `Object?`, and Object boxing/unboxing is handled
+    // elsewhere). Enum↔primitive is already rejected by the §5.4/§10 gate above.
+    {
+        bool fromConcreteClass = from->kind == TypeRef::Kind::Named &&
+                                 from->declaration &&
+                                 from->declaration->kind !=
+                                     ast::TypeDeclKind::Enum;
+        bool toConcreteClass = to->kind == TypeRef::Kind::Named &&
+                               to->declaration &&
+                               to->declaration->kind != ast::TypeDeclKind::Enum;
+        bool fromConcretePrim = from->kind == TypeRef::Kind::Primitive &&
+                                from->primitive != PrimitiveType::Object;
+        bool toConcretePrim = to->kind == TypeRef::Kind::Primitive &&
+                              to->primitive != PrimitiveType::Object;
+        if ((fromConcreteClass && toConcretePrim) ||
+            (toConcreteClass && fromConcretePrim)) {
+            reportNotConvertible();
+            return;
+        }
+    }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 
