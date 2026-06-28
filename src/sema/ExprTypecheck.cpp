@@ -4090,6 +4090,41 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
+                // §19.5 (#1203): a typed binding pattern `var n: T` is a
+                // type-test + binding. If T is a reference type (class,
+                // interface, or string) but the scrutinee's static type is a
+                // primitive value type (non-nullable, not string, not Object),
+                // the test can NEVER match — a value-type primitive is never
+                // a reference type. Reject it here rather than miscompiling
+                // (an unconditional wrong-value match for string-typed binding,
+                // or SIGABRT in emitIsA for a class-typed binding on an i32).
+                // per §19.5 (#1203)
+                if (bp->type && scrutTy && lsym->declType) {
+                    bool scrutIsValuePrim =
+                        scrutTy->kind == TypeRef::Kind::Primitive &&
+                        !scrutTy->nullable &&
+                        scrutTy->primitive != PrimitiveType::String &&
+                        scrutTy->primitive != PrimitiveType::Object;
+                    if (scrutIsValuePrim) {
+                        TypeRef* bndTy = lsym->declType;
+                        bool bndIsRefType =
+                            (bndTy->kind == TypeRef::Kind::Primitive &&
+                             bndTy->primitive == PrimitiveType::String) ||
+                            (bndTy->kind == TypeRef::Kind::Named &&
+                             bndTy->declaration &&
+                             (bndTy->declaration->kind ==
+                                  ast::TypeDeclKind::Class ||
+                              bndTy->declaration->kind ==
+                                  ast::TypeDeclKind::Interface));
+                        if (bndIsRefType)
+                            ctx_.diagnostics().report(
+                                Severity::Error, bp->span.begin,
+                                "binding pattern type is incompatible with "
+                                "the scrutinee's static type — a value-type "
+                                "scrutinee can never match a reference-typed "
+                                "binding (§19.5)");
+                    }
+                }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);

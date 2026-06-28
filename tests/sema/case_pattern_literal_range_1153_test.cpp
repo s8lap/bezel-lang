@@ -410,3 +410,127 @@ BEZEL_TEST(sema_case_pattern_range, case_null_pattern_still_ok_1205) {
     BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// --- §19.5 / #1203: binding pattern type incompatible with a value-type scrutinee
+
+namespace {
+// True iff some error diagnostic mentions the §19.5 binding-pattern type
+// incompatibility introduced for #1203.
+bool hasBindingTypeIncompatError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("binding pattern type is incompatible") !=
+                std::string::npos)
+            return true;
+    }
+    return false;
+}
+} // namespace
+
+// §19.5 (#1203): `var s: string` over an `int` scrutinee — a value-type
+// primitive can never be a string (a reference type). Was previously compiled
+// as an unconditional match (rc=1 instead of rc=2), leading to wrong-value
+// results and IR_FAIL when the bound `s` was used as a string.
+BEZEL_TEST(sema_case_pattern_range,
+           binding_string_over_int_scrutinee_rejected_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x var s: string => 1, _ => 2 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.5 (#1203): `var c: SomeClass` over an `int` scrutinee — a value-type
+// primitive is never a class (a heap object). Was previously a SIGABRT in
+// codegen (emitIsA called on an i32, not a pointer).
+BEZEL_TEST(sema_case_pattern_range,
+           binding_class_over_int_scrutinee_rejected_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Dog end Dog; "
+        "class C "
+        "  public static method M(x: int): int "
+        "    return case x var d: Dog => 1, _ => 2 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.5 (#1203): statement-position `case` also rejects the incompatible
+// binding — the CaseStmt handler has the same check.
+BEZEL_TEST(sema_case_pattern_range,
+           binding_string_over_int_stmt_rejected_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int) "
+        "    case x var s: string => do return; end end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.5 (#1203): `var n: int` over `int` scrutinee is VALID (same type) and
+// must not be rejected by the new check.
+BEZEL_TEST(sema_case_pattern_range,
+           binding_int_over_int_scrutinee_ok_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int): int "
+        "    return case x var n: int => n, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.5 (#1203): `var s: string` over a `string` scrutinee is VALID (same
+// type) and must not be rejected.
+BEZEL_TEST(sema_case_pattern_range,
+           binding_string_over_string_scrutinee_ok_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: string): int "
+        "    return case x var s: string => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.5 (#1203): `var d: Dog` over an `Animal` scrutinee is a valid downcast
+// type-test binding and must not be rejected.
+BEZEL_TEST(sema_case_pattern_range,
+           binding_subclass_over_base_ok_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog: Animal end Dog; "
+        "class C "
+        "  public static method M(a: Animal): int "
+        "    return case a var d: Dog => 1, _ => 0 end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.5 (#1203): `var n: int` over an `int?` (nullable) scrutinee is VALID —
+// this is the nullable value-type unbox path (§19.5 / #784) and must not
+// be rejected by the new check (the scrutinee is NULLABLE, not a plain
+// value-type primitive).
+BEZEL_TEST(sema_case_pattern_range,
+           binding_int_over_nullable_int_ok_spec_19_5_1203) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method M(x: int?): int "
+        "    return case x null => 0, var n: int => n end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
