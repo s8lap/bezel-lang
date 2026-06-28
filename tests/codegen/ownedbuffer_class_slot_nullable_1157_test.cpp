@@ -173,3 +173,76 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
     // The program must not compile clean: the double-use of `cell` is an error.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §7.4 / #1208: Span<T> and ReadOnlySpan<T> over an OwnedBuffer<T> store T?
+// in each slot for class/interface T (same semantics as OwnedBuffer<T> itself).
+// ACCEPT-TRAP: bare member access `s[i].member` must be rejected (requires
+// nullable narrowing).  BAD-REJECT: `s[i] := null` must be accepted.
+// ===========================================================================
+
+// §7.4 (#1208 repro): Span<Cell>[i] is typed Cell? — assigning `s[i]` to a
+// local gives a `Cell?` local; a bare member access on it then requires
+// narrowing (§7.4).  Previously the slot was typed non-nullable Cell so the
+// member access compiled clean (accept-trap → null-deref at runtime).
+BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
+           span_class_bare_member_access_rejected_1208) {
+    auto r = parseSemaAll(
+        std::string(kCell) +
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  var s := buf.AsSpan(); "
+        "  var x := s[0]; "  // x is Cell? (slot is null until set)
+        "  return x.v; "     // member access on nullable — must be rejected
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNullableNarrowingError(r));
+}
+
+// §7.4 (#1208): Span<Cell>[i] := null — assigning null to a class-typed slot
+// is the natural §28.8.1 restoration; it must be ACCEPTED.
+// Previously rejected ("target is non-nullable").
+BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
+           span_class_assign_null_accepted_1208) {
+    auto r = parseSemaAll(
+        std::string(kCell) +
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  var s := buf.AsSpan(); "
+        "  s[0] := null; "  // restore slot to null — must be accepted
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1208): ReadOnlySpan<Cell>[i] is also typed Cell? — same fix applies.
+// Assign the indexed slot to a local so the member access is on a nullable
+// local variable (triggering the "nullable value" diagnostic path).
+BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
+           readonly_span_class_bare_member_access_rejected_1208) {
+    auto r = parseSemaAll(
+        std::string(kCell) +
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  var s := buf.AsReadOnlySpan(); "
+        "  var x := s[0]; "  // x is Cell?
+        "  return x.v; "     // must be rejected — nullable narrowing required
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNullableNarrowingError(r));
+}
+
+// §7.4 (#1208 regression guard): Span<int>[i] is `int` (value-typed T) — the
+// indexer must remain NON-nullable, so a bare read needs no guard.
+BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
+           span_value_int_indexer_non_nullable_1208) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(2); "
+        "  var s := buf.AsSpan(); "
+        "  s[0] := 99; "
+        "  var x := s[0]; "  // non-nullable int — no guard required
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

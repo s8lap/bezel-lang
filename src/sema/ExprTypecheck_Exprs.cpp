@@ -866,7 +866,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             // indexer stays non-nullable `T`. A bare generic
                             // param (no declaration) is left non-nullable —
                             // its category is unknown until instantiation.
-                            if (cn == "OwnedBuffer" && elem && !elem->nullable &&
+                            // per §7.4 / #1157 (#1208): Span<T> and
+                            // ReadOnlySpan<T> (owning spans over OwnedBuffer<T>)
+                            // store `T?` in each slot for class/interface T —
+                            // identical semantics to OwnedBuffer<T> itself.
+                            // ArraySpan / ReadOnlyArraySpan (borrowing views of
+                            // Array<T>) store `T` directly (non-nullable) and
+                            // are excluded.
+                            if ((cn == "OwnedBuffer" ||
+                                 cn == "Span" || cn == "ReadOnlySpan") &&
+                                elem && !elem->nullable &&
                                 elem->kind == TypeRef::Kind::Named &&
                                 elem->declaration &&
                                 (elem->declaration->kind ==

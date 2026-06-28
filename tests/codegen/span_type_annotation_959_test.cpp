@@ -74,7 +74,7 @@ BEZEL_TEST(span_type_annotation_959, owning_span_class_parameter) {
         std::string("module M; ") + kR +
         "class C "
         "  private static method First(span: Span<R>): int "
-        "    return span[0].V; "
+        "    return span[0]!.V; "  // span[i] is R? (#1208), narrow with `!`
         "  end First; "
         "  public static method Main(): int "
         "    using var buf := new OwnedBuffer<R>(2); "

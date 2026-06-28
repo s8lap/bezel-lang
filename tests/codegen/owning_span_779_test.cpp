@@ -87,7 +87,7 @@ BEZEL_TEST(owning_span_779, indexer_set_then_get_reads_new_value) {
         "  buf[0] := new R(1); "
         "  var sp := buf.AsSpan(); "
         "  sp[0] := new R(9); "
-        "  return sp[0].V; "  // 9
+        "  return sp[0]!.V; "  // 9 — sp[i] is R? (#1208), narrow with `!`
         "end Main; end C;"), 9);
 }
 
@@ -106,7 +106,7 @@ BEZEL_TEST(owning_span_779, move_slot_value_correct) {
         "  buf[0] := new R(10); buf[1] := new R(11); "
         "  var sp := buf.AsSpan(); "
         "  using var t := move sp[0]; "
-        "  return t.V; "  // 10
+        "  return t!.V; "  // 10 — move sp[i] yields R? (#1208, like move buf[i])
         "end Main; end C;"), 10);
 }
 
@@ -159,7 +159,7 @@ BEZEL_TEST(owning_span_779, movefrom_transfers_and_disposes_dest) {
         "  b[0] := new R(3); b[1] := new R(4); "
         "  var sa := a.AsSpan(); var sb := b.AsSpan(); "
         "  sb.MoveFrom(sa); "
-        "  return sb[0].V + sb[1].V; "  // 1 + 2 == 3
+        "  return sb[0]!.V + sb[1]!.V; "  // 1 + 2 == 3 (sb[i] is R?, #1208)
         "end Main; end C;"), 3);
 }
 
@@ -193,7 +193,7 @@ BEZEL_TEST(owning_span_779, moveto_symmetric) {
         "  b[0] := new R(7); b[1] := new R(8); "
         "  var sa := a.AsSpan(); var sb := b.AsSpan(); "
         "  sa.MoveTo(sb); "
-        "  return sb[0].V + sb[1].V; "  // 5 + 6 == 11
+        "  return sb[0]!.V + sb[1]!.V; "  // 5 + 6 == 11 (sb[i] is R?, #1208)
         "end Main; end C;"), 11);
 }
 
