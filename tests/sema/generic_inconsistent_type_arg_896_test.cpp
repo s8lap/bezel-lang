@@ -123,3 +123,39 @@ BEZEL_TEST(generic_inconsistent_type_arg_896, single_nullable_peel_accepted) {
         "end R;");
     BEZEL_EXPECT_FALSE(hasInconsistentInferenceError(r));
 }
+
+// §22.4 / §14.1 / #1164: a generic method `G<T>(a: T, out o: T)` called with an
+// inline `out var s` must NOT be flagged as inconsistent inference. The inline
+// `out var` has no type of its own — its type is INFERRED FROM the matched out
+// parameter (§22.4), so it must not contribute an independent binding to T
+// (which would clash with T=int from the value argument `5`). ACCEPT.
+BEZEL_TEST(generic_inconsistent_type_arg_896, inline_out_var_not_inconsistent_1164) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class U "
+        "  public static method G<T>(a: T, out o: T): T where T: value "
+        "    o := a; return a; "
+        "  end G; "
+        "  public static method Main(): int "
+        "    var r := U.G<int>(5, out var s); return r + s; "
+        "  end Main; "
+        "end U;");
+    BEZEL_EXPECT_FALSE(hasInconsistentInferenceError(r));
+}
+
+// §22.4 / §14.1 / #1164 negative guard: a GENUINE conflict between two value
+// arguments (`G<T>(a: T, b: T)` called `G(5, "x")`) is STILL correctly rejected
+// — the #1164 fix only skips inline out-var args, not real value arguments.
+BEZEL_TEST(generic_inconsistent_type_arg_896, genuine_conflict_still_rejected_1164) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class U "
+        "  public static method G<T>(a: T, b: T): T where T: value "
+        "    return a; "
+        "  end G; "
+        "  public static method Main(): int "
+        "    var r := U.G(5, \"x\"); return 0; "
+        "  end Main; "
+        "end U;");
+    BEZEL_EXPECT_TRUE(hasInconsistentInferenceError(r));
+}

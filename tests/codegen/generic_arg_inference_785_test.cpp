@@ -91,6 +91,59 @@ BEZEL_TEST(generic_arg_inference_785, bare_param_inference_unaffected) {
         "end C;"), 55);
 }
 
+// §22.4 / §14.1 / #1164: a generic method `G<T>(a: T, out o: T): T` called with
+// an INLINE `out var s` was wrongly rejected ("inconsistent type-argument
+// inference: T cannot be bound to both int and a different type"). The inline
+// `out var` has no type of its own — its type is INFERRED FROM the matched out
+// parameter (§22.4) — so it must NOT contribute an independent binding to T's
+// inference. With explicit <int>, T=int from the value arg `5`; `s` is filled
+// with 5; r + s == 10.
+const char* kOutG =
+    "module M; "
+    "static class U "
+    "  public static method G<T>(a: T, out o: T): T where T: value "
+    "    o := a; return a; "
+    "  end G; ";
+
+BEZEL_TEST(generic_arg_inference_785, inline_out_var_explicit_typearg_1164) {
+    BEZEL_EXPECT_EQ(runFull(std::string(kOutG) +
+        "  public static method Main(): int "
+        "    var r := U.G<int>(5, out var s); return r + s; "  // 10
+        "  end Main; "
+        "end U;"), 10);
+}
+
+// §22.4 / §14.1 / #1164: the FULLY-INFERRED form (no explicit <int>) also works
+// — T=int is inferred from the value argument `5` alone, the `out var s` is
+// skipped during inference, and `s` is then typed `int` from the out parameter.
+BEZEL_TEST(generic_arg_inference_785, inline_out_var_inferred_typearg_1164) {
+    BEZEL_EXPECT_EQ(runFull(std::string(kOutG) +
+        "  public static method Main(): int "
+        "    var r := U.G(5, out var s); return r + s; "  // 10
+        "  end Main; "
+        "end U;"), 10);
+}
+
+// §22.4 / §14.1 / #1164 regression guard: a PRE-DECLARED `out s` (plain `out`,
+// not the inline var-declaring form) DOES carry a concrete declared type and
+// must still participate in inference — here T is inferable ONLY from the out
+// argument `s: int`, so skipping the inline forms must not have broadened to
+// skip plain `out`.
+BEZEL_TEST(generic_arg_inference_785, predeclared_out_arg_still_infers_1164) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "static class U "
+        "  public static method H<T>(out o: T): int where T: value "
+        "    o := 7; return 3; "
+        "  end H; "
+        "  public static method Main(): int "
+        "    var s: int := 0; "
+        "    var r := U.H(out s); return r + s; "  // 10
+        "  end Main; "
+        "end U;"), 10);
+}
+
+
 // §14.1 / #1162: a method type param INFERRED to a builtin COLLECTION
 // (Array<int>) must bind to that collection's lowered type (a heap pointer),
 // exactly as the explicit `Echo<Array<int>>(a)` form does. Before the fix the

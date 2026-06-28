@@ -1097,6 +1097,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     for (std::size_t pi = 0;
                          pi < md->params.size() && pi < ce.args.size(); ++pi) {
                         if (!md->params[pi].type || !ce.args[pi].value) continue;
+                        // §14.1 / §22.4 / #1164: an inline `out var x`
+                        // (and `out using var` / `out owned var`) argument has
+                        // no type of its own — its type is INFERRED FROM the
+                        // matched `out` parameter (§22.4), so its sema type is
+                        // the parameter's still-unbound type parameter itself
+                        // (e.g. `T`). Unifying it here would try to bind `T` to
+                        // `T` and spuriously conflict with the binding produced
+                        // by a real value argument (e.g. `5` binding `T = int`),
+                        // yielding a false "inconsistent type-argument
+                        // inference" reject. Skip it: the parameter binds the
+                        // out-var; the out-var does not constrain the parameter.
+                        // A PRE-DECLARED `out x` (plain `out` / `out owned`)
+                        // carries a concrete declared type and still
+                        // participates in inference, so only the inline
+                        // var-declaring forms are skipped.
+                        {
+                            std::string_view amod = ce.args[pi].modifier;
+                            if (amod == "out var" || amod == "out using var" ||
+                                amod == "out owned var")
+                                continue;
+                        }
                         TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
                         // §14.1 / #885/#886: skip null-literal arguments during
                         // type-parameter inference — a null literal is typed as
