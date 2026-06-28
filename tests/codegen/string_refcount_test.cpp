@@ -677,3 +677,60 @@ const char* kInterpStringPartBorrow_1030 =
 BEZEL_TEST(codegen_string_refcount_1030, interp_string_part_borrow_not_released) {
     expectValueAndLeakFree(kInterpStringPartBorrow_1030, 8);
 }
+
+// --- #1184 (§28.3 / §9.6): `string.Join`'s RESULT string is a +1 producer ---
+// `string.Join(sep, items)` lowers (LlvmBackend_Calls.cpp) to a freshly malloc'd
+// buffer wrapped in a heap `bz.string` at rc := 1 — the SAME +1 single-reference
+// shape as `+`/interpolation. Before the fix isPlusOneStringProducer did not
+// recognise it, so a `var s := string.Join(...)` local was misclassified as a
+// BORROW: RETAINED at bind (rc 1→2) then released at scope end (rc 2→1) → the
+// result string leaked (38 bytes: 32-byte header + "ab,cd\0"). It is now treated
+// as a +1 producer: TRANSFER into the slot (no borrow-retain) + the scope-end
+// release drops rc 1→0 and frees it exactly once. LSan-clean, value still 5.
+const char* kJoinResultReclaimed_1184 =
+    "module M; import System.Collections.Generic; "
+    "class C public static method Main(): int "
+    "  using var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+    "  var s := string.Join(\",\", xs); "
+    "  return s.Length; "                              // "ab,cd" -> 5
+    "end Main; end C;";
+BEZEL_TEST(codegen_string_refcount_1184, join_result_reclaimed) {
+    expectValueAndLeakFree(kJoinResultReclaimed_1184, 5);
+}
+
+// #1184 (lazy items): joining a lazy LINQ query is reclaimed the same way — the
+// Join RESULT, not the materialized item snapshot (that is freed inside the
+// lowering, #1182). The empty middle element is filtered out so the join is
+// still "ab,cd". LSan-clean.
+const char* kJoinLazyResultReclaimed_1184 =
+    "module M; import System.Collections.Generic; "
+    "class C public static method Main(): int "
+    "  using var xs := new Array<string>(); "
+    "  xs.Add(\"ab\"); xs.Add(\"\"); xs.Add(\"cd\"); "
+    "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 0)); "
+    "  return s.Length; "                              // "ab,cd" -> 5
+    "end Main; end C;";
+BEZEL_TEST(codegen_string_refcount_1184, join_lazy_result_reclaimed) {
+    expectValueAndLeakFree(kJoinLazyResultReclaimed_1184, 5);
+}
+
+// #1184 (escape via return — the double-free guard): the Join result returned
+// from a method and re-bound in the caller must be freed EXACTLY ONCE, never
+// twice. The producer classification emits NO extra retain, so the single
+// reference flows return → caller local → scope-end release with no double-free
+// (a double-free here would SIGABRT under ASan). LSan-clean.
+const char* kJoinReturnedNoDoubleFree_1184 =
+    "module M; import System.Collections.Generic; "
+    "class C "
+    "  public static method MakeJoined(): string "
+    "    using var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
+    "    return string.Join(\",\", xs); "
+    "  end MakeJoined; "
+    "  public static method Main(): int "
+    "    var s := MakeJoined(); "
+    "    return s.Length; "                            // "ab,cd" -> 5
+    "  end Main; "
+    "end C;";
+BEZEL_TEST(codegen_string_refcount_1184, join_returned_no_double_free) {
+    expectValueAndLeakFree(kJoinReturnedNoDoubleFree_1184, 5);
+}

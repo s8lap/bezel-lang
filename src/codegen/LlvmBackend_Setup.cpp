@@ -7940,6 +7940,35 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // §9.6 / §28.3 (#1184): `string.Join(separator, items)` lowers (in
+    // LlvmBackend_Calls.cpp) to a freshly malloc'd buffer wrapped in a heap
+    // `bz.string` whose rc := 1 (initStringRc) — exactly the +1 single-reference
+    // shape of `+`/interpolation/range-slice/primitive-ToString. (The borrowed
+    // item snapshot is freed inside the lowering; only the RESULT string is handed
+    // to the caller at +1, and nothing else reclaims it.) Recognise it as a +1
+    // producer so a `var s := string.Join(...)` local TRANSFERS that single
+    // reference into its slot (no borrow-retain) and the scope-end release — when
+    // the escape walk proves the local non-escaping — drops rc 1→0 and frees it
+    // exactly once. No double-free: no extra retain is emitted, and an escaping
+    // local is excluded from the release by the escape walk (its +1 then leaks,
+    // the safe direction). Matched structurally — the callee is a MemberAccess on
+    // the `string`/`String` type keyword with member `Join` and two args — to
+    // mirror the static-call recognition in lowerStaticCall (it is a builtin: no
+    // resolved MethodSymbol, so isUserMethodStringReturnCall below never sees it).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.size() == 2 && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "Join" && ma->target) {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (tid->name == "string" || tid->name == "String")
+                            return true;  // string.Join → rc=1 heap string
+                    }
+                }
+            }
+        }
+    }
     // #429 (RETURN-escape category) / §4.6 / §28.9: a CALL to a user-defined,
     // locally-compiled method whose declared return type is `string` hands the
     // caller EXACTLY +1 (the callee's ReturnStmt lowering mints it). So such a
