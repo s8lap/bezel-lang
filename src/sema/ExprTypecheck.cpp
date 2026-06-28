@@ -32,6 +32,26 @@ static bool fitsInIntType(long long v, PrimitiveType t) {
     }
 }
 
+// §5.1 / §19 (#1153): the closed representable range [lo, hi] of an integer
+// scrutinee type that is NARROWER than the i64 constant-fold width, so a
+// `case` constant / range-bound literal that falls outside it can be rejected
+// instead of being silently truncated to the scrutinee width by codegen's
+// litAtWidth(). Returns false for any type the gate does not apply to: Long /
+// ULong never truncate at i64 (and a >64-bit literal does not fold, so it is
+// already rejected by the literal-typing path), and non-integer primitives have
+// no integer range. Mirrors fitsInIntType (the var-decl / assignment gate).
+static bool caseIntScrutineeRange(PrimitiveType t, long long& lo, long long& hi) {
+    switch (t) {
+        case PrimitiveType::SByte:  lo = -128;          hi = 127;          return true;
+        case PrimitiveType::Byte:   lo = 0;             hi = 255;          return true;
+        case PrimitiveType::Short:  lo = -32768;        hi = 32767;        return true;
+        case PrimitiveType::UShort: lo = 0;             hi = 65535;        return true;
+        case PrimitiveType::Int:    lo = -2147483648LL; hi = 2147483647LL; return true;
+        case PrimitiveType::UInt:   lo = 0;             hi = 4294967295LL; return true;
+        default:                    return false;
+    }
+}
+
 // The ExprTC class is declared in ExprTypecheck_impl.hpp; its method
 // definitions live across this and the sibling ExprTypecheck_*.cpp
 // translation units. This file holds the public entry point, the worker's
@@ -356,6 +376,11 @@ bool hasModifier(const TypeSymbol* t, std::string_view m) {
 // prove exhaustiveness statically." The diagnostic does not fail
 // compilation (DiagnosticEngine::hasErrors counts only errors).
 void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) {
+    // §5.1 / §19 (#1153): range-check integer pattern literals against the
+    // scrutinee FIRST — this is the editable hook the CaseExpr handler reaches
+    // for every expression-position `case` (it runs even when a `_` catch-all
+    // makes the exhaustiveness check below return early).
+    checkCasePatternConstantRanges(ce.arms, scrutTy);
     // An unguarded catch-all (`_` / untyped `var x`) covers everything.
     for (const auto& arm : ce.arms) {
         if (isUnguardedCatchAll(arm)) return;
@@ -1822,6 +1847,51 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
                 Severity::Error, p->span.begin,
                 "the `_` discard pattern must be the last arm of a `case` — "
                 "arms after an unguarded `_` are unreachable (§19.6)");
+    }
+}
+
+// §5.1 / §19 (#1153): a `case` constant or range-bound integer literal that
+// does not fit the scrutinee's integer type was silently truncated to the
+// scrutinee width by codegen's litAtWidth() — so `case x (x: byte) 256 => …`
+// matched x == 0 (256 → i8 0), and a range bound `0..5000000000` over an `int`
+// truncated to a 32-bit value, both producing wrong matches. Sema never
+// range-checked the pattern literal. Reject it here with the same §5.1
+// narrowing diagnostic the language gives for `var b: byte := 256` (which
+// rejects the out-of-range constant rather than truncating it). Only an
+// integer scrutinee narrower than the i64 fold width is gated (Long/ULong
+// never truncate; see caseIntScrutineeRange). A non-constant operand, a
+// non-integer constant, or a >64-bit literal does not fold here and is left to
+// the existing literal-typing / §19 category checks.
+void ExprTC::checkCasePatternConstantRanges(
+    const std::vector<ast::CaseArm>& arms, TypeRef* scrutTy) {
+    if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive) return;
+    long long lo = 0, hi = 0;
+    if (!caseIntScrutineeRange(scrutTy->primitive, lo, hi)) return;
+    auto checkConst = [&](const ast::Expr* c) {
+        if (!c) return;
+        std::optional<long long> v = foldIntConstExprTC(*c);
+        if (!v) return;  // non-constant / non-integer: not gated here
+        if (*v < lo || *v > hi)
+            ctx_.diagnostics().report(
+                Severity::Error, c->span.begin,
+                "the `case` pattern constant `" + std::to_string(*v) +
+                "` has a type that is not implicitly convertible to the "
+                "scrutinee type (§5.1) — the value does not fit the "
+                "scrutinee's integer range and would otherwise be silently "
+                "truncated to its width");
+    };
+    for (const auto& arm : arms) {
+        const ast::Pattern* p = arm.pattern.get();
+        if (!p) continue;
+        if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+            for (const auto& c : cp->constants) checkConst(c.get());
+        } else if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
+            if (auto* re =
+                    dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get())) {
+                checkConst(re->lo.get());
+                checkConst(re->hi.get());
+            }
+        }
     }
 }
 
@@ -3832,6 +3902,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
+        // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
+        // (statement-position `case` is exempt from exhaustiveness but not from
+        // the literal-range gate — codegen would otherwise truncate it).
+        checkCasePatternConstantRanges(cs->arms, scrutTy);
         // §10.6 (#772): bare enum member names may be used throughout a `case`
         // over an enum scrutinee, including arm bodies. Inject the scrutinee
         // enum's constants for the arm bodies (the statement-position analogue

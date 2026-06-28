@@ -262,6 +262,14 @@ private:
     // catch-all that is always exhaustive.
     void checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy);
 
+    // §5.1 / §19 (#1153): range-check each integer `case` pattern constant /
+    // range-bound literal against an integer scrutinee's type. A literal that
+    // does not fit was silently truncated to the scrutinee width at codegen
+    // (litAtWidth) → wrong matches; reject it with the §5.1 narrowing
+    // diagnostic instead. Engaged from both the CaseExpr and CaseStmt handlers.
+    void checkCasePatternConstantRanges(const std::vector<ast::CaseArm>& arms,
+                                        TypeRef* scrutTy);
+
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.

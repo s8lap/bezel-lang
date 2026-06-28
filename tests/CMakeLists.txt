@@ -126,6 +126,7 @@ set(BEZEL_TEST_SOURCES
     sema/sealed_class_test.cpp
     sema/case_exhaustiveness_test.cpp
     sema/case_common_type_nullable_747_test.cpp
+    sema/case_pattern_literal_range_1153_test.cpp
     sema/multi_base_test.cpp
     sema/abstract_instantiation_test.cpp
     sema/inheritance_cycle_test.cpp
