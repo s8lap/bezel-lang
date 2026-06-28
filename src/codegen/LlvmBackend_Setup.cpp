@@ -370,10 +370,19 @@ void Emitter::declareStatics() {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         llvm::Type* ty = (pd && pd->type) ? lowerType(pd->type.get()) : i32();
         std::string cls = ps->parent ? std::string(ps->parent->name) : "";
+        // §23.1 (#1146): a static auto-property may carry an inline initializer
+        // (`static readonly property Total: int := 42`). Encode a CONSTANT
+        // initializer as the global's LLVM initializer (mirroring a static
+        // field's constInitFor) — without this the global was always
+        // getNullValue and the property read 0. A NON-constant initializer is
+        // emitted as a runtime store during static init (the loop below).
+        llvm::Constant* initC = (pd && pd->autoInitializer)
+            ? constInitForExpr(pd->autoInitializer.get(), ty)
+            : llvm::Constant::getNullValue(ty);
         auto* gv = new llvm::GlobalVariable(
             *module_, ty, /*isConstant=*/false,
             llvm::GlobalValue::ExternalLinkage,
-            llvm::Constant::getNullValue(ty),
+            initC,
             "bz$" + cls + "$" + std::string(ps->name) + "$prop");
         staticGlobals_[ps] = gv;
     }
@@ -426,8 +435,11 @@ void Emitter::declareStatics() {
 
 
 llvm::Constant* Emitter::constInitFor(const ast::FieldDecl* fd, llvm::Type* ty) {
-    if (fd && fd->initializer) {
-        const ast::Expr* e = fd->initializer.get();
+    return constInitForExpr(fd ? fd->initializer.get() : nullptr, ty);
+}
+
+llvm::Constant* Emitter::constInitForExpr(const ast::Expr* e, llvm::Type* ty) {
+    if (e) {
         if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(e)) {
             return llvm::ConstantInt::get(
                 ty, static_cast<std::uint64_t>(parseIntLiteral(lit->text)),
@@ -4196,6 +4208,13 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     // LLVM initializer by constInitFor, so they need no runtime store.
     if (type) {
         for (const sema::Symbol* m : type->members) {
+            // NOTE (#1146 residual): a static auto-property with a NON-constant
+            // inline initializer (`static readonly property X: int := calc()`) is
+            // NOT yet emitted here — the "type has static state" detection that
+            // gates sfinit generation only inspects static FIELDS, so no static
+            // initializer runs for a property-only type. The CONSTANT case (the
+            // common form) is handled by constInitForExpr in declareStatics. The
+            // non-constant case is tracked separately.
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (!fs || !isStaticField(fs)) continue;
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);

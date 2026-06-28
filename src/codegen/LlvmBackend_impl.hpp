@@ -2732,6 +2732,10 @@ private:
     // The constant initializer for a static field, or zero if absent or
     // non-literal (non-literal static init is deferred — see declareStatics).
     llvm::Constant* constInitFor(const ast::FieldDecl* fd, llvm::Type* ty);
+    // #1146: the constant-folding core, taking the initializer expression
+    // directly so it serves both a static field's `FieldDecl::initializer` and a
+    // static auto-property's `PropertyDecl::autoInitializer`.
+    llvm::Constant* constInitForExpr(const ast::Expr* e, llvm::Type* ty);
 
     // Version of lowerStringLiteral that only creates globals (no builder
     // instructions), safe to call during declareStatics.

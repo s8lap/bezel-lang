@@ -80,3 +80,32 @@ BEZEL_TEST(static_auto_property_743, string_static_auto_property) {
         "  end Main; "
         "end C;"), 1);
 }
+
+// ── #1146 / §23.1: a static auto-property's CONSTANT inline initializer ───────
+// (`static readonly property Total: int := 42`) is honored — the backing global
+// previously read 0 (the initializer was dropped, always getNullValue).
+BEZEL_TEST(static_auto_property_743, static_auto_property_int_initializer_1146) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static readonly property Total: int := 42; "
+        "  public static method Main(): int return C.Total; end Main; "
+        "end C;"), 42);
+}
+
+// A bool static auto-property initializer.
+BEZEL_TEST(static_auto_property_743, static_auto_property_bool_initializer_1146) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static readonly property Flag: bool := true; "
+        "  public static method Main(): int return (7 if C.Flag else 0); end Main; "
+        "end C;"), 7);
+}
+
+// A string static auto-property initializer.
+BEZEL_TEST(static_auto_property_743, static_auto_property_string_initializer_1146) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static readonly property Name: string := \"hello\"; "
+        "  public static method Main(): int return C.Name.Length; end Main; "
+        "end C;"), 5);
+}
