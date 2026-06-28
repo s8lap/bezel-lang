@@ -2266,11 +2266,29 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
         if (tt->astNode && tt->astNode->name &&
             !tt->astNode->name->parts.empty()) {
             std::string_view cn = tt->astNode->name->parts[0];
-            // #1167: OwnedBuffer<T>'s indexer setter also takes owned (stdlib
-            // §4.14) — it was omitted here, so `buf[i] := <owned local>` never
-            // consumed the RHS → double-free.
-            return cn == "OwnedArray" || cn == "OwnedDictionary" ||
-                   cn == "OwnedBuffer";
+            if (cn != "OwnedArray" && cn != "OwnedDictionary" &&
+                cn != "OwnedBuffer")
+                return false;
+            // per §28.11 / §4.5 / §4.14 (#1209): the indexer setter takes
+            // ownership only when the element (or dictionary value) type is a
+            // class or interface — value-typed elements (primitive, record,
+            // enum) are COPIED into the slot, so the assignment is a copy and
+            // does NOT consume the RHS local (no owned-sink obligation).
+            // For OwnedDictionary<K,V> the stored value is genericArgs[1];
+            // for OwnedArray<T>/OwnedBuffer<T> the element is genericArgs[0].
+            const std::size_t elemIdx = (cn == "OwnedDictionary") ? 1 : 0;
+            if (tt->genericArgs.size() > elemIdx && tt->genericArgs[elemIdx]) {
+                const sema::TypeRef* elemT = tt->genericArgs[elemIdx];
+                return elemT->kind == sema::TypeRef::Kind::Named &&
+                       elemT->declaration &&
+                       (elemT->declaration->kind == ast::TypeDeclKind::Class ||
+                        elemT->declaration->kind ==
+                            ast::TypeDeclKind::Interface);
+            }
+            // Element type unresolved or a generic parameter: fall through to
+            // false (conservative — mirrors ChannelSender's §6.9 gate in
+            // builtinOwnedSinkArg).
+            return false;
         }
         return false;
     }

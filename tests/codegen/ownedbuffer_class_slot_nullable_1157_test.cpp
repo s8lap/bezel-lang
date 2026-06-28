@@ -23,12 +23,14 @@
 #include <string_view>
 
 #include "support/codegen_support.hpp"
+#include "support/ownership_support.hpp"
 #include "support/sema_support.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runJit;
+using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
@@ -130,4 +132,44 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, value_record_indexer_non_nullab
         "  var p := buf[0]; "
         "  return p.x + p.y; "  // 7 — value-typed, no guard
         "end Main; end C;"), 7);
+}
+
+// §28.11 / §4.14 (#1209): OwnedBuffer<int> (value-typed element) indexer-set
+// from a bare local variable must COMPILE (the slot receives a value COPY, not
+// an owned transfer) and the local must remain usable after the assignment.
+// Previously rejected as a BAD_REJECT because indexerSetterTakesOwned returned
+// true unconditionally for all built-in owning collections, regardless of the
+// element type's category.
+BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, owned_value_element_indexer_set_ok_1209) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(2); "
+        "  var x := 4; "
+        "  buf[0] := x; "         // value copy — x must not be consumed
+        "  var y := x; "          // x still usable after the assignment
+        "  return buf[0] + y; "   // 4 + 4 = 8
+        "end Main; end C;"), 8);
+}
+
+// §28.11 / §4.14 (#1209 regression guard): OwnedBuffer<T> with a CLASS element
+// type must still treat the indexer-set as an owned-sink — a bare owned local
+// passed as the RHS is consumed (moved into the slot). A subsequent use of that
+// local is rejected at compile time, preventing a double-dispose.
+BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
+           owned_class_element_indexer_set_still_moves_1209) {
+    // Attempting to use `cell` after `buf[0] := cell` must produce an owned-
+    // already-moved error (§28.3). If it compiles silently, the class element
+    // branch of indexerSetterTakesOwned has regressed to non-consuming.
+    // parseAndCheckOwnership runs the full pipeline including ownership checks.
+    auto r = parseAndCheckOwnership(
+        std::string(kCell) +
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  var cell := new Cell(42); "
+        "  buf[0] := cell; "         // owned-sink: cell is consumed here
+        "  var v := cell.v; "        // must be rejected — cell was moved out
+        "  return v; "
+        "end Main; end C;");
+    // The program must not compile clean: the double-use of `cell` is an error.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
