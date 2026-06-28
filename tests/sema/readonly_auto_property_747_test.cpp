@@ -68,3 +68,56 @@ BEZEL_TEST(readonly_auto_property_747, non_readonly_auto_ok) {
         "end C;");
     BEZEL_EXPECT_FALSE(hasReadonlyPropError(r));
 }
+
+// §23.1 (#1173): an UNQUALIFIED implicit-this self-write `X := 9` to a readonly
+// auto-property inside a regular method is rejected exactly like `this.X := 9`.
+// Previously the readonly guard only fired for a MemberAccessExpr target, so the
+// unqualified NameExpr form slipped through (an ACCEPT_TRAP — `X` was mutated).
+BEZEL_TEST(readonly_auto_property_747, readonly_property_unqualified_write_rejected_1173) {
+    auto r = parseSemaAll(
+        "module M; class A "
+        "  public readonly property X: int := 5; "
+        "  public constructor() end constructor; "
+        "  public method Bad() X := 9; end Bad; "
+        "  public static method Main(): int return 0; end Main; "
+        "end A;");
+    BEZEL_EXPECT_TRUE(hasReadonlyPropError(r));
+}
+
+// §23.1 (#1173): an unqualified write to a readonly auto-property INSIDE the
+// constructor remains allowed (field-initializer-or-constructor context).
+BEZEL_TEST(readonly_auto_property_747, readonly_property_ctor_write_ok_1173) {
+    auto r = parseSemaAll(
+        "module M; class A "
+        "  public readonly property X: int := 5; "
+        "  public constructor() X := 7; end constructor; "
+        "  public static method Main(): int return 0; end Main; "
+        "end A;");
+    BEZEL_EXPECT_FALSE(hasReadonlyPropError(r));
+}
+
+// §23.1 (#1173): an unqualified write to a NON-readonly auto-property inside a
+// regular method must still be accepted (the new branch must not over-reject).
+BEZEL_TEST(readonly_auto_property_747, non_readonly_property_unqualified_write_ok_1173) {
+    auto r = parseSemaAll(
+        "module M; class A "
+        "  public property X: int := 5; "
+        "  public constructor() end constructor; "
+        "  public method Bump() X := 9; end Bump; "
+        "  public static method Main(): int return 0; end Main; "
+        "end A;");
+    BEZEL_EXPECT_FALSE(hasReadonlyPropError(r));
+}
+
+// §23.1 (#1173): a LOCAL variable that shadows a readonly property's name must
+// NOT be falsely flagged — it resolves to a LocalSymbol, not the PropertySymbol.
+BEZEL_TEST(readonly_auto_property_747, local_shadowing_readonly_property_name_ok_1173) {
+    auto r = parseSemaAll(
+        "module M; class A "
+        "  public readonly property X: int := 5; "
+        "  public constructor() end constructor; "
+        "  public method Calc(): int var X: int := 3; X := 8; return X; end Calc; "
+        "  public static method Main(): int return 0; end Main; "
+        "end A;");
+    BEZEL_EXPECT_FALSE(hasReadonlyPropError(r));
+}

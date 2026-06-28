@@ -3326,11 +3326,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // but is assignable only in a field initializer or constructor (like
             // a readonly field), so a write OUTSIDE a constructor is also
             // rejected. Without these the write was silently accepted/dropped.
+            // per §23.1 (#1173): the assignment target may be a qualified
+            // member access (`this.X`, `obj.X`) OR an UNQUALIFIED implicit-this
+            // identifier (`X := 9` inside the declaring class). Both resolve to
+            // the same PropertySymbol and must obey the readonly / no-setter /
+            // setter-visibility rules below. Previously only the
+            // MemberAccessExpr shape was guarded, so an unqualified self-write
+            // to a readonly auto-property slipped through (an ACCEPT_TRAP). A
+            // local variable that shadows the property resolves to a
+            // LocalSymbol, so the dynamic_cast below leaves it untouched.
             if (as->target) {
+                PropertySymbol* ps = nullptr;
+                std::string propName;
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         as->target.get())) {
-                    if (auto* ps = dynamic_cast<PropertySymbol*>(
-                            ctx_.exprSymbol(*as->target))) {
+                    if ((ps = dynamic_cast<PropertySymbol*>(
+                             ctx_.exprSymbol(*as->target))))
+                        propName = std::string(ma->member);
+                } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                               as->target.get())) {
+                    if ((ps = dynamic_cast<PropertySymbol*>(
+                             ctx_.exprSymbol(*as->target))))
+                        propName = std::string(id->name);
+                }
+                if (ps) {
                         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
                                 ps->decl)) {
                             bool hasSetter = true;
@@ -3354,13 +3373,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
                                     "cannot assign to read-only property `" +
-                                    std::string(ma->member) +
+                                    propName +
                                     "` — it has no setter (§23.3)");
                             } else if (isReadonlyAuto && !inConstructor_) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
                                     "cannot assign to readonly property `" +
-                                    std::string(ma->member) +
+                                    propName +
                                     "` outside a field initializer or "
                                     "constructor (§23.1)");
                             } else if (hasSetter) {
@@ -3402,13 +3421,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     ctx_.diagnostics().report(
                                         Severity::Error, as->span.begin,
                                         "cannot assign to property `" +
-                                        std::string(ma->member) +
+                                        propName +
                                         "` — its setter is not accessible "
                                         "here (§13.6)");
                                 }
                             }
                         }
-                    }
                 }
             }
             // Slice S7: readonly field assignment outside a ctor.
