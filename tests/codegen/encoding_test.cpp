@@ -304,6 +304,126 @@ BEZEL_TEST(codegen_encoding, utf8_getstring_empty_spec_3_2) {
         "end Main; end C;", 0);
 }
 
+// === UTF8 strict well-formedness (fix #1144, stdlib §3.2 v0.136) =======
+//
+// §3.2: "All four standard encodings follow one error model: malformed or
+// unrepresentable input is a defined fault, never a silent substitution."
+// For UTF8, GetString must raise FormatException on ill-formed sequences —
+// overlong forms, unpaired-surrogate encodings, truncated tails (and, by the
+// same model, invalid lead bytes, lone continuation bytes, and code points
+// above U+10FFFF). Before #1144 the decoder was lenient: it passed an
+// ill-formed byte through as a literal code point (e.g. a lone 0x80 decoded to
+// U+0080), silently accepting input the spec mandates be rejected.
+
+// §3.2 / #1144: a lone continuation byte (0x80) is ill-formed → FormatException.
+// This is the issue's exact repro (it previously returned 128, no exception).
+BEZEL_TEST(codegen_encoding, utf8_getstring_lone_continuation_raises_format_1144) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0x80)); "  // lone UTF-8 continuation byte
+        "  try "
+        "    using var s: string := Encoding.UTF8.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 / #1144: an overlong 2-byte form (C0 AF = overlong U+002F) → FormatException.
+BEZEL_TEST(codegen_encoding, utf8_getstring_overlong_raises_format_1144) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0xC0)); b.Add(byte(0xAF)); "  // overlong encoding of '/'
+        "  try "
+        "    using var s: string := Encoding.UTF8.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 / #1144: a surrogate encoded in UTF-8 (ED A0 80 = U+D800) → FormatException.
+BEZEL_TEST(codegen_encoding, utf8_getstring_surrogate_raises_format_1144) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0xED)); b.Add(byte(0xA0)); b.Add(byte(0x80)); "  // U+D800
+        "  try "
+        "    using var s: string := Encoding.UTF8.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 / #1144: a truncated 3-byte tail (E2 82, missing 3rd byte) → FormatException.
+BEZEL_TEST(codegen_encoding, utf8_getstring_truncated_raises_format_1144) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0xE2)); b.Add(byte(0x82)); "  // truncated 3-byte sequence
+        "  try "
+        "    using var s: string := Encoding.UTF8.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 / #1144: a code point above U+10FFFF (F4 90 80 80 = U+110000) → FormatException.
+BEZEL_TEST(codegen_encoding, utf8_getstring_above_max_raises_format_1144) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0xF4)); b.Add(byte(0x90)); b.Add(byte(0x80)); b.Add(byte(0x80)); "
+        "  try "
+        "    using var s: string := Encoding.UTF8.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 / #1144: an invalid lead byte (0xFF) → FormatException.
+BEZEL_TEST(codegen_encoding, utf8_getstring_invalid_lead_raises_format_1144) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0xFF)); "  // 0xFF is never a valid UTF-8 byte
+        "  try "
+        "    using var s: string := Encoding.UTF8.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 / #1144: the strict check must NOT reject well-formed multi-byte input.
+// Raw bytes: C3 A9 (é = U+00E9), EF BB BF (BOM, decoded to U+FEFF — NOT stripped,
+// per §3.2 "GetString does not treat a leading EF BB BF specially"), and
+// F0 9F 98 80 (U+1F600, a 4-byte sequence) all decode to their code points.
+BEZEL_TEST(codegen_encoding, utf8_getstring_wellformed_multibyte_decodes_1144) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0xC3)); b.Add(byte(0xA9)); "                 // é = U+00E9
+        "  b.Add(byte(0xEF)); b.Add(byte(0xBB)); b.Add(byte(0xBF)); "  // BOM → U+FEFF
+        "  b.Add(byte(0xF0)); b.Add(byte(0x9F)); b.Add(byte(0x98)); b.Add(byte(0x80)); "  // U+1F600
+        "  using var s: string := Encoding.UTF8.GetString(b); "
+        "  var ok := s.Length = 3 and int(s[0]) = 233 and "
+        "             int(s[1]) = 65279 and int(s[2]) = 128512; "
+        "  return (1 if ok else 0); "
+        "end Main; end C;", 1);
+}
+
 // === Deferred singletons rejected (§3.2 / CLAUDE.md §4) =================
 
 // ===========================================================================

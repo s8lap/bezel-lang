@@ -6927,8 +6927,12 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     const auto& m  = ma->member;     // "GetBytes", "GetString", or "Name"
 
     // Determine runtime function names and whether GetBytes/GetString can fail.
-    // UTF8: lenient decoder (no error); UTF16/UTF32/ASCII: strict, return null.
-    bool canFail = (sg != "UTF8");
+    // All four encodings follow the strict error model (stdlib §3.2 v0.136):
+    // GetString returns null on ill-formed input (incl. UTF8 — fix #1144), and
+    // ASCII GetBytes returns null on unrepresentable code points. The runtimes
+    // that never fail (UTF8/UTF16/UTF32 GetBytes) just never produce a null, so
+    // the null-check guard is dead for them — harmless and uniform.
+    bool canFail = true;
     std::string getBytesName = "bz_encoding_" +
         (sg == "UTF8"  ? std::string("utf8")  :
          sg == "UTF16" ? std::string("utf16") :

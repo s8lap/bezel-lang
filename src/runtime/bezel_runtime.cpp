@@ -6739,8 +6739,9 @@ extern "C" void* bz_encoding_utf8_get_bytes(const void* strp) {
 // bytes via memcmp and is only correct when both operands share a width
 // (LlvmBackend_String.cpp comment at emitStringEquals). Producing the same width
 // the literal emitter would makes `GetString(GetBytes(s)) == s` compare correctly
-// and round-trip exactly. A malformed/truncated UTF-8 sequence decodes its
-// leading byte as a literal code point and advances by one (lenient, no OOB read).
+// and round-trip exactly. A malformed/truncated UTF-8 sequence is a defined fault
+// (stdlib §3.2 v0.136): the decoder returns NULL and the codegen caller raises
+// FormatException — no silent substitution.
 extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
                                               int64_t count) {
     auto* arr = (bz_array_t*)arrp;
@@ -6754,6 +6755,11 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
     int64_t end = count;
 
     // Pass 1: decode into a temporary width-4 code-point buffer; track max cp.
+    // Strict well-formedness per stdlib §3.2 (v0.136): any ill-formed sequence
+    // — invalid lead byte, truncated tail, bad continuation byte, overlong form,
+    // surrogate encoding, or a code point above U+10FFFF — is a defined fault.
+    // The decoder rejects such input by freeing the buffer and returning NULL;
+    // the codegen caller (tryLowerEncodingCall) turns NULL into FormatException.
     uint32_t* cps = (uint32_t*)malloc((size_t)(count > 0 ? count : 1) * 4);
     int64_t ncp = 0;
     uint32_t maxCp = 0;
@@ -6764,26 +6770,33 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
         int64_t adv;
         if (b0 < 0x80) {                       // 1-byte: 0xxxxxxx
             cp = b0; adv = 1;
-        } else if ((b0 & 0xE0) == 0xC0 && i + 1 < end &&
-                   (p[i + 1] & 0xC0) == 0x80) { // 2-byte: 110xxxxx 10xxxxxx
+        } else if ((b0 & 0xE0) == 0xC0) {      // 2-byte: 110xxxxx 10xxxxxx
+            if (i + 1 >= end || (p[i + 1] & 0xC0) != 0x80) { free(cps); return nullptr; }
             cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(p[i + 1] & 0x3F);
+            if (cp < 0x80) { free(cps); return nullptr; }  // overlong (C0/C1 leads)
             adv = 2;
-        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < end &&
-                   (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80) {
+        } else if ((b0 & 0xF0) == 0xE0) {      // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+            if (i + 2 >= end || (p[i + 1] & 0xC0) != 0x80 ||
+                (p[i + 2] & 0xC0) != 0x80) { free(cps); return nullptr; }
             cp = ((uint32_t)(b0 & 0x0F) << 12) |
                  ((uint32_t)(p[i + 1] & 0x3F) << 6) |
                  (uint32_t)(p[i + 2] & 0x3F);
+            if (cp < 0x800) { free(cps); return nullptr; }                  // overlong
+            if (cp >= 0xD800 && cp <= 0xDFFF) { free(cps); return nullptr; } // surrogate
             adv = 3;
-        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < end &&
-                   (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80 &&
-                   (p[i + 3] & 0xC0) == 0x80) {
+        } else if ((b0 & 0xF8) == 0xF0) {      // 4-byte: 11110xxx 10xxxxxx ×3
+            if (i + 3 >= end || (p[i + 1] & 0xC0) != 0x80 ||
+                (p[i + 2] & 0xC0) != 0x80 || (p[i + 3] & 0xC0) != 0x80) {
+                free(cps); return nullptr;
+            }
             cp = ((uint32_t)(b0 & 0x07) << 18) |
                  ((uint32_t)(p[i + 1] & 0x3F) << 12) |
                  ((uint32_t)(p[i + 2] & 0x3F) << 6) |
                  (uint32_t)(p[i + 3] & 0x3F);
+            if (cp < 0x10000 || cp > 0x10FFFF) { free(cps); return nullptr; } // overlong / range
             adv = 4;
         } else {
-            cp = b0; adv = 1;                  // lenient: pass the byte through
+            free(cps); return nullptr;         // invalid lead byte → FormatException
         }
         cps[ncp++] = cp;
         if (cp > maxCp) maxCp = cp;
