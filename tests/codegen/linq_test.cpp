@@ -84,6 +84,43 @@ BEZEL_TEST(linq, sum_min_max) {
         "end Main; end C;"), 1);
 }
 
+// stdlib §5.1 / §8.4 (#1194): no-selector Min()/Max() over an Array<T> whose
+// element T is a PTR-typed IComparable<T> — a user class implementing
+// IComparable<T> (§14.2). Pre-fix the lowering truncated the element pointer to
+// i32 (`trunc ptr … to i32` → malformed IR) and sema mistyped the result as int
+// (so `.amount` folded to 0). The comparison must dispatch through T.CompareTo,
+// and the result is typed as T so member access on it resolves.
+BEZEL_TEST(linq, max_class_icomparable_1194) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class Money: IComparable<Money> "
+        "  public amount: int := 0; "
+        "  public constructor(a: int) amount := a; end constructor; "
+        "  public method CompareTo(other: Money): int => amount - other.amount; "
+        "end Money; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Money>(); "
+        "  a.Add(new Money(3)); a.Add(new Money(9)); a.Add(new Money(5)); "
+        "  var mx := a.Max(); var mn := a.Min(); "
+        "  return int(mx.amount = 9 and mn.amount = 3); "
+        "end Main; end C;"), 1);
+}
+
+// stdlib §5.1 / §9.6 (#1194): no-selector Min()/Max() over an Array<string>
+// dispatches through ordinal string comparison (strcmp on the data pointers,
+// mirroring Sort()) and returns the lexicographic extreme — not the truncated
+// pointer the i32 path produced. Max of {pear, apple, banana} = "pear";
+// Min = "apple".
+BEZEL_TEST(linq, max_string_1194) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); "
+        "  a.Add(\"pear\"); a.Add(\"apple\"); a.Add(\"banana\"); "
+        "  var mx := a.Max(); var mn := a.Min(); "
+        "  return int(mx = \"pear\" and mn = \"apple\"); "
+        "end Main; end C;"), 1);
+}
+
 // --- First (eager element access) ---
 
 BEZEL_TEST(linq, first) {

@@ -1764,6 +1764,106 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
+            // per stdlib §5 / §8.4 (#1194): no-selector Min()/Max() over an
+            // Array whose element is a PTR-typed IComparable<T> — a user class
+            // implementing `IComparable<T>` (§14.2), or `string` (§9.6). The
+            // generic i32 path below loads the element and truncs it to i32
+            // (`trunc ptr … to i32` → malformed IR). Instead, dispatch the
+            // element ordering through the element's `CompareTo` (string:
+            // ordinal strcmp on the data pointers, mirroring the Sort()
+            // comparator), returning the winning element pointer. (Related:
+            // Math.Min/Max IComparable, #1148/#1141.)
+            if (call.args.empty()) {
+                sema::TypeRef* elemTypeRef =
+                    (recvTy && !recvTy->genericArgs.empty())
+                        ? recvTy->genericArgs[0] : nullptr;
+                bool isStrElem = isStringTypeRefNonNull(elemTypeRef);
+                sema::MethodSymbol* cmpMs = nullptr;
+                if (!isStrElem && elemTypeRef &&
+                    elemTypeRef->kind == sema::TypeRef::Kind::Named &&
+                    elemTypeRef->declaration &&
+                    (elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
+                     elemTypeRef->declaration->kind == ast::TypeDeclKind::Interface)) {
+                    if (sema::MethodSymbol* cm =
+                            findMethodByName(elemTypeRef->declaration, "CompareTo"))
+                        if (cm->params.size() == 1) cmpMs = cm;
+                }
+                if (isStrElem || cmpMs) {
+                    // Element is a pointer (string object / class instance) in
+                    // both cases.
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                    // stdlib §5.1: Min()/Max() throw on an empty source.
+                    llvm::Value* isEmpty =
+                        builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                    emitGuardThrow(isEmpty, "InvalidOperationException");
+                    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                           {ptrTy(), i64(), i64()});
+                    // Seed the accumulator with element[0] and scan from index 1
+                    // — this avoids comparing against a null accumulator on the
+                    // first iteration (a CompareTo/strcmp on null would fault).
+                    auto* idxSlot = entryAlloca(i64());
+                    auto* accSlot = entryAlloca(ptrTy());
+                    llvm::Value* p0 = builder_.CreateCall(
+                        ptrFn, {recv, builder_.getInt64(0), builder_.getInt64(esz)});
+                    builder_.CreateStore(builder_.CreateLoad(ptrTy(), p0), accSlot);
+                    builder_.CreateStore(builder_.getInt64(1), idxSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b", currentFn_);
+                    auto* updBB  = llvm::BasicBlock::Create(llvm_, "mm.u", currentFn_);
+                    auto* nextBB = llvm::BasicBlock::Create(llvm_, "mm.n", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mm.e", currentFn_);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                          bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {recv, idx, builder_.getInt64(esz)});
+                    llvm::Value* el  = builder_.CreateLoad(ptrTy(), ep, "mm.el");
+                    llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
+                    // cmp = (el <=> acc): el.CompareTo(acc), or strcmp(el, acc).
+                    llvm::Value* cmp = nullptr;
+                    if (isStrElem) {
+                        llvm::Value* elData = builder_.CreateLoad(ptrTy(),
+                            builder_.CreateStructGEP(stringType(), el, 0));
+                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
+                            builder_.CreateStructGEP(stringType(), acc, 0));
+                        auto* strcmpFn = module_->getFunction("strcmp");
+                        if (!strcmpFn) {
+                            auto* ft = llvm::FunctionType::get(
+                                i32(), {ptrTy(), ptrTy()}, false);
+                            strcmpFn = llvm::Function::Create(
+                                ft, llvm::Function::ExternalLinkage, "strcmp",
+                                module_.get());
+                        }
+                        cmp = builder_.CreateCall(strcmpFn, {elData, accData}, "mm.cmp");
+                    } else {
+                        std::vector<llvm::Value*> cargs{el, acc};
+                        cmp = emitMethodCall(cmpMs, cargs, /*baseQualified=*/false);
+                        if (!cmp) return nullptr;
+                    }
+                    // isMax: replace acc when el > acc (cmp > 0).
+                    // isMin: replace acc when el < acc (cmp < 0).
+                    llvm::Value* zero = llvm::ConstantInt::get(cmp->getType(), 0);
+                    llvm::Value* shouldUpdate = isMax
+                        ? builder_.CreateICmpSGT(cmp, zero)
+                        : builder_.CreateICmpSLT(cmp, zero);
+                    builder_.CreateCondBr(shouldUpdate, updBB, nextBB);
+                    builder_.SetInsertPoint(updBB);
+                    builder_.CreateStore(el, accSlot);
+                    builder_.CreateBr(nextBB);
+                    builder_.SetInsertPoint(nextBB);
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(endBB);
+                    freeLazyTemp();
+                    return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
+                }
+            }
+
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);

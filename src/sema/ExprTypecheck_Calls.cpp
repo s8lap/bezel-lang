@@ -2368,12 +2368,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // whether the selector lambda returns decimal; otherwise
                         // the element type drives the result.
                         else if (m == "Sum" || m == "Min" || m == "Max") {
+                            TypeRef* elem =
+                                (recvTy && !recvTy->genericArgs.empty())
+                                    ? recvTy->genericArgs[0] : nullptr;
+                            // stdlib §5.1 (#1194): no-selector Min()/Max() returns
+                            // the element type T (`public method Max(): T`). For a
+                            // PTR-typed IComparable<T> element — a user class
+                            // implementing IComparable<T> (§14.2), or string (§9.6)
+                            // — the result is that element type, NOT int. Typing it
+                            // here lets member access on the result
+                            // (`arr.Max().field`, `arr.Max().Length`) resolve;
+                            // otherwise it folds to 0 / is dropped. Codegen
+                            // dispatches the comparison via CompareTo/strcmp.
+                            // (Mirrors the Math.Min/Max IComparable fix, #1141.)
+                            // Numeric elements keep the int/decimal result below.
+                            bool ptrComparableElem =
+                                elem &&
+                                ((elem->kind == TypeRef::Kind::Named &&
+                                  elem->declaration &&
+                                  (elem->declaration->kind ==
+                                       ast::TypeDeclKind::Class ||
+                                   elem->declaration->kind ==
+                                       ast::TypeDeclKind::Interface)) ||
+                                 (elem->kind == TypeRef::Kind::Primitive &&
+                                  elem->primitive == P::String &&
+                                  !elem->nullable));
+                            if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                                ptrComparableElem) {
+                                ctx_.setExprType(&ce, elem);
+                            } else {
                             bool elemIsDecimal =
-                                recvTy && !recvTy->genericArgs.empty() &&
-                                recvTy->genericArgs[0] &&
-                                recvTy->genericArgs[0]->kind ==
-                                    TypeRef::Kind::Primitive &&
-                                recvTy->genericArgs[0]->primitive == P::Decimal;
+                                elem && elem->kind == TypeRef::Kind::Primitive &&
+                                elem->primitive == P::Decimal;
                             // Check selector return type (if a lambda arg).
                             if (!elemIsDecimal && !ce.args.empty() &&
                                 ce.args[0].value) {
@@ -2389,6 +2415,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 elemIsDecimal
                                     ? ctx_.primitiveTypeRef(P::Decimal)
                                     : ctx_.primitiveTypeRef(P::Int));
+                            }
                         }
                         // stdlib §5/§5.1: Average → double (int/long/double forms)
                         // or → decimal for Array<decimal>.Average() / selector-decimal.
