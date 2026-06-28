@@ -98,3 +98,77 @@ BEZEL_TEST(nullable_field_narrowing_862, copy_to_local_then_guard_accepted) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// #1161: member access on a nullable INDEX result (`coll[i].member`)
+// ---------------------------------------------------------------------------
+// The §7.4 gate had branches for an identifier target and a member-access
+// target, but none for an index/indexer target — so direct member access on a
+// nullable index result slipped through and null-derefed at runtime. An index
+// result is not a local variable, so it is never narrowable; it must be
+// narrowed with `!`, `?.`, or a copy-to-local-then-guard.
+
+constexpr const char* kCell =
+    "module M; "
+    "class Cell "
+    "  public v: int; "
+    "  public constructor(x: int) this.v := x; end constructor; "
+    "end Cell; ";
+
+// §7.4 (#1161): direct `.member` on an `OwnedBuffer<classT>` index result
+// (typed `Cell?` per #1157) is rejected — narrow to non-null first.
+BEZEL_TEST(nullable_field_narrowing_862, ownedbuffer_index_member_rejected_1161) {
+    auto r = parseAndCheckOwnership(
+        std::string(kCell) +
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  return buf[0].v; "  // §7.4: index result is Cell? — not narrowable
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasFieldNarrowingError(r));
+}
+
+// §7.4 (#1161): a `Dictionary<K, V?>` indexer returns `V?`; direct `.member`
+// on `d[k]` is likewise rejected.
+BEZEL_TEST(nullable_field_narrowing_862, dict_nullable_value_index_member_rejected_1161) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Collections.Generic; "
+        "class Cell "
+        "  public v: int; "
+        "  public constructor(x: int) this.v := x; end constructor; "
+        "end Cell; "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<int, Cell?>(); "
+        "  return d[0].v; "  // §7.4: d[0] is Cell? — not narrowable
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasFieldNarrowingError(r));
+}
+
+// §7.4 (#1161, force-unwrap): `buf[0]!.member` narrows the index result to
+// non-null — it must be ACCEPTED.
+BEZEL_TEST(nullable_field_narrowing_862, ownedbuffer_index_bang_member_accepted_1161) {
+    auto r = parseAndCheckOwnership(
+        std::string(kCell) +
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  buf[0] := new Cell(7); "
+        "  return buf[0]!.v; "  // §7.4: `!` narrows — accepted
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1161, no over-reject): a NON-nullable index result must still admit a
+// bare `.member`. A record-element collection is value-typed, so its indexer is
+// non-nullable — `buf[0].field` is fine and must NOT be flagged.
+BEZEL_TEST(nullable_field_narrowing_862, nonnullable_record_index_member_accepted_1161) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "record Pt(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<Pt>(2); "
+        "  buf[0] := new Pt(3, 4); "
+        "  return buf[0].x; "  // §7.4: record elem is non-nullable — accepted
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

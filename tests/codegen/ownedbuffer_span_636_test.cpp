@@ -253,12 +253,15 @@ BEZEL_TEST(ownedbuffer_span_636, value_element_index_return_not_a_borrow_743_f11
 // §4.14 (#743 f11) regression guard: a class-typed element still works (the
 // indexer reads a borrow of the owned element, accessed in-scope).
 BEZEL_TEST(ownedbuffer_span_636, class_element_index_still_works_743_f11) {
+    // per §7.4 (#1161): `OwnedBuffer<classT>` has a nullable indexer (`Obj?`,
+    // post-#1157), so a direct `buf[0].V` is now a §7.4 error — the index
+    // result must be narrowed to non-null first. Force-unwrap with `!`.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class Obj public V: int; public constructor(v: int) V := v; end constructor; end Obj; "
         "class C public static method Main(): int "
         "  using var buf := new OwnedBuffer<Obj>(1); "
         "  buf[0] := new Obj(5); "
-        "  return buf[0].V; "
+        "  return buf[0]!.V; "
         "end Main; end C;"), 5);
 }

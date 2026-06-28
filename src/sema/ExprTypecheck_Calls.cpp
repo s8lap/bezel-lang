@@ -6036,6 +6036,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     "force-unwrap with `!`, or use `?.`");
                 return;
             }
+        } else if (dynamic_cast<const ast::IndexExpr*>(ma.target.get())) {
+            // per §7.4 (#1161): the target is an index/indexer result
+            // (`coll[i].member`) whose element type is nullable — e.g.
+            // `Dictionary<K, V?>`, `Array<T?>`, or `OwnedBuffer<classT>`
+            // (whose indexer is `T?` per #1157). An index result is not a
+            // local variable, so it is never narrowable; the value could be
+            // null and a direct `.member` null-derefs at runtime. The bare
+            // variable form (`var x := coll[i]; x.member`) routes through the
+            // simple-identifier branch above; only the direct index form
+            // slipped through here. `coll[i]!.member` (PostfixBangExpr) and
+            // `coll[i]?.member` (NullCondMemberExpr) are already non-nullable /
+            // handled elsewhere, so they do not reach this branch.
+            TypeRef* tgt = ctx_.exprType(*ma.target);
+            if (tgt && tgt->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("member access `.") +
+                    std::string(ma.member) +
+                    "` on a nullable index result requires narrowing to "
+                    "non-null first (§7.4): force-unwrap with `coll[i]!`, "
+                    "use the null-conditional `coll[i]?." +
+                    std::string(ma.member) +
+                    "`, or copy to a local and guard with `<> null`");
+                return;
+            }
         }
     }
     // §15.1.2 (#1100): an inline array `[N]T` exposes ONLY `.Length` and the
