@@ -1055,3 +1055,102 @@ BEZEL_TEST(codegen_cg28, neg_range_double_miss_1233) {
         "var x: double := 0.0; "
         "return case x -5.0..-1.0 => 1, _ => 0 end;"), 0);
 }
+
+// ── fix #1234 / §19 / §9.4: DestructuringPattern on an Object/interface ──
+// scrutinee — `Box(var v)` where the scrutinee is statically `Object`
+// (a boxed record). Before the fix, `patternMatches` called
+// `CreateExtractValue(scrut, ...)` directly on the box POINTER, which is
+// illegal IR and aborted the compiler with an LLVM GEP assertion.
+//
+// The fix detects `scrut->getType()->isPointerTy()`, emits an isA type-test
+// against the record's box descriptor, then conditionally unboxes (loads the
+// record struct from the box payload at offset 2 words per §8.6) and runs the
+// sub-pattern checks on the loaded struct value.
+
+// §19 / §9.4 / §8.6: single-field record via `Object`; `var` binding.
+// Expected: Box(42) → v = 42.
+BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_single_field_1234) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Box(v: int); "
+        "class C public static method Main(): int "
+        "  var o: Object := new Box(42); "
+        "  return case o "
+        "    Box(var v) => v, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 42);
+}
+
+// §19 / §9.4: two-field record via Object; bare binding names (no `var`).
+// Expected: Point(3, 4) → x + y = 7.
+BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_two_fields_1234) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var o: Object := new Point(3, 4); "
+        "  return case o "
+        "    Point(x, y) => x + y, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+// §19 / §9.4: non-matching isA — the boxed record is a different type; the
+// wildcard arm must fire.  Verifies the isA false-path in the new code.
+BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_isa_miss_1234) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Box(v: int); "
+        "record Other(v: int); "
+        "class C public static method Main(): int "
+        "  var o: Object := new Other(5); "
+        "  return case o "
+        "    Box(var v) => v, "
+        "    _ => 99 "
+        "  end; "
+        "end Main; end C;"), 99);
+}
+
+// §19 / §9.4: constant sub-pattern inside a boxed record: Box(7) matches
+// an Object holding Box(7) and must NOT match Object holding Box(8).
+BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_const_subpat_match_1234) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Box(v: int); "
+        "class C public static method Main(): int "
+        "  var o: Object := new Box(7); "
+        "  return case o "
+        "    Box(7) => 42, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 42);
+}
+BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_const_subpat_miss_1234) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Box(v: int); "
+        "class C public static method Main(): int "
+        "  var o: Object := new Box(8); "
+        "  return case o "
+        "    Box(7) => 42, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// §19 / §9.4: regression — a directly-typed record scrutinee (not Object)
+// must still work after the fix (the non-pointer path is unchanged).
+BEZEL_TEST(codegen_cg28_destructure, direct_scrutinee_regression_1234) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(10, 20); "
+        "  return case p "
+        "    Point(x, y) => x + y, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 30);
+}

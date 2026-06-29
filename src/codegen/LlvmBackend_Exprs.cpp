@@ -11176,13 +11176,87 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         }
         if (!recTy) return nullptr;
         // Ensure the record struct (and fieldIndex_) is populated.
-        recordStruct(recTy);
+        llvm::StructType* recSt = recordStruct(recTy);
         // Collect positional (non-static) fields in declaration order.
         std::vector<const sema::FieldSymbol*> fields;
         for (const sema::Symbol* m : recTy->members) {
             if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
                 if (!isStaticField(fs)) fields.push_back(fs);
             }
+        }
+        // #1234 / §19 / §9.4: when the scrutinee is a REFERENCE (Object or
+        // interface — `scrut` is a box pointer), the record is heap-boxed;
+        // `CreateExtractValue` on a pointer is illegal IR and aborts the
+        // backend.  Emit an isA type-test to confirm the box holds a `recTy`,
+        // then conditionally load the record struct from the box payload (at
+        // offset 2 pointer-sized words past the box header, per the §8.6 box
+        // layout { vtable*, rc, record-bytes }) and run the sub-pattern checks
+        // on the loaded struct value.
+        if (scrut->getType()->isPointerTy()) {
+            auto dit = descArray_.find(recTy);
+            if (dit == descArray_.end()) return builder_.getInt1(false);
+            // isA check — emitIsA leaves builder insert point at isa.end.
+            llvm::Value* isA = emitIsA(scrut, dit->second);
+            llvm::BasicBlock* afterIsaBB = builder_.GetInsertBlock();
+            auto* unboxBB =
+                llvm::BasicBlock::Create(llvm_, "destr.unbox", currentFn_);
+            auto* joinBB =
+                llvm::BasicBlock::Create(llvm_, "destr.join", currentFn_);
+            builder_.CreateCondBr(isA, unboxBB, joinBB);
+            // Unbox: load the record struct from the box payload (2 words in).
+            builder_.SetInsertPoint(unboxBB);
+            llvm::Value* payload = builder_.CreateGEP(
+                ptrTy(), scrut, {builder_.getInt32(2)}, "destr.payload");
+            llvm::Value* innerVal =
+                builder_.CreateLoad(recSt, payload, "destr.inner");
+            // Field extraction and sub-pattern checks on the loaded struct.
+            llvm::Value* innerMatched = builder_.getInt1(true);
+            for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
+                const auto& sp = dp->subPatterns[i];
+                if (i >= fields.size()) {
+                    innerMatched = builder_.getInt1(false); break;
+                }
+                auto idxIt = fieldIndex_.find(fields[i]);
+                if (idxIt == fieldIndex_.end()) {
+                    innerMatched = builder_.getInt1(false); break;
+                }
+                llvm::Value* fv =
+                    builder_.CreateExtractValue(innerVal, {idxIt->second});
+                if (!sp.nakedBinding.empty()) {
+                    llvm::AllocaInst* slot = entryAlloca(fv->getType());
+                    builder_.CreateStore(fv, slot);
+                    locals_[reinterpret_cast<const ast::Node*>(&sp)] = slot;
+                } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
+                               sp.pattern.get())) {
+                    llvm::AllocaInst* slot = entryAlloca(fv->getType());
+                    builder_.CreateStore(fv, slot);
+                    locals_[vbp] = slot;
+                } else if (sp.pattern) {
+                    const sema::TypeRef* fieldTy = recordMemberType(fields[i]);
+                    const sema::TypeSymbol* subEnumTy = nullptr;
+                    bool subIsStr = false;
+                    if (fieldTy &&
+                        fieldTy->kind == sema::TypeRef::Kind::Named &&
+                        fieldTy->declaration &&
+                        fieldTy->declaration->kind == ast::TypeDeclKind::Enum)
+                        subEnumTy = fieldTy->declaration;
+                    else if (fieldTy &&
+                             fieldTy->kind == sema::TypeRef::Kind::Primitive &&
+                             fieldTy->primitive ==
+                                 sema::PrimitiveType::String)
+                        subIsStr = true;
+                    llvm::Value* sub = patternMatches(
+                        sp.pattern.get(), fv, subEnumTy, subIsStr, fieldTy);
+                    if (sub) innerMatched = builder_.CreateAnd(innerMatched, sub);
+                }
+            }
+            llvm::BasicBlock* unboxEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(joinBB);
+            auto* phi = builder_.CreatePHI(i1(), 2);
+            phi->addIncoming(builder_.getInt1(false), afterIsaBB);
+            phi->addIncoming(innerMatched, unboxEnd);
+            return phi;
         }
         // Extract each field value from the struct and register the slot.
         // Build up a cumulative match condition for constant sub-patterns.
