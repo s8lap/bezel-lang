@@ -2950,6 +2950,9 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
     auto* varSlot = entryAlloca(ptrTy());  // loop var is a string-object pointer
     locals_[&fs] = varSlot;
+    // #1058 / §28/§4.8: initialise to null so the endBB break-path release is
+    // null-safe when the loop body is never entered (cnt == 0).
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "dk.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dk.body", currentFn_);
@@ -2987,6 +2990,14 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
 
     builder_.SetInsertPoint(incBB);
     llvm::Value* idxI = builder_.CreateLoad(i64(), idxSlot);
+    // #1058 / §28/§4.8: release the per-iteration string key object (rc 1→0 →
+    // free dataCpy + strObj header).  Null varSlot so the endBB release below
+    // is a no-op on normal completion (bz_string_release is null-safe).
+    {
+        llvm::Value* so = builder_.CreateLoad(ptrTy(), varSlot);
+        emitStringRelease(so);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
+    }
     // Free this iteration's strndup'd key bytes from bz_dict_keys_str.
     llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idxI);
     llvm::Value* kp2    = builder_.CreateLoad(ptrTy(), kpPtr2);
@@ -2995,6 +3006,13 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);
+    // #1058 / §28/§4.8: on `break` incBB is skipped — release the in-progress
+    // iteration's strObj now.  On normal completion varSlot was nulled by incBB,
+    // so bz_string_release(null) is a no-op (no double-free).
+    {
+        llvm::Value* so = builder_.CreateLoad(ptrTy(), varSlot);
+        emitStringRelease(so);  // null-safe
+    }
     builder_.CreateCall(freeFn, {keysArr});
     builder_.CreateCall(freeFn, {lensArr});
     return true;
@@ -3251,6 +3269,13 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
         llvm::StructType::get(llvm_, {keyLlvm, valLlvm});
     auto* varSlot = entryAlloca(entryStTy);
     locals_[&fs] = varSlot;
+    // #1058 / §28/§4.8: for string keys the key field (field 0) carries a
+    // ref-counted bz_string_t* built per iteration.  Initialise to null so
+    // the endBB break-path release (see below) is null-safe when the loop body
+    // is never entered (cnt == 0).
+    if (isStringKey)
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                             builder_.CreateStructGEP(entryStTy, varSlot, 0));
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "de.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "de.body", currentFn_);
@@ -3351,6 +3376,14 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     {
         llvm::Value* idxI = builder_.CreateLoad(i64(), idxSlot);
         if (isStringKey) {
+            // #1058 / §28/§4.8: release the per-iteration string key object
+            // (rc 1→0 → free dataCpy + strObj header).  Null field 0 so the
+            // endBB release below is a no-op on normal completion.
+            llvm::Value* so = builder_.CreateLoad(
+                ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
+            emitStringRelease(so);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                builder_.CreateStructGEP(entryStTy, varSlot, 0));
             // Free the strndup'd char* data for this iteration (mirrors
             // lowerDictKeysFor's per-slot free in the increment block).
             llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idxI);
@@ -3369,6 +3402,14 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     }
 
     builder_.SetInsertPoint(endBB);
+    // #1058 / §28/§4.8: on `break` incBB is skipped — release the in-progress
+    // iteration's strObj now.  On normal completion field 0 was nulled by incBB,
+    // so bz_string_release(null) is a no-op (no double-free).
+    if (isStringKey) {
+        llvm::Value* so = builder_.CreateLoad(
+            ptrTy(), builder_.CreateStructGEP(entryStTy, varSlot, 0));
+        emitStringRelease(so);  // null-safe
+    }
     // #1057: the increment block frees each per-iteration key box (string /
     // generic keys are separately malloc'd), but a `break` out of the loop skips
     // the boxes from the break index onward — they leak. Free the remaining

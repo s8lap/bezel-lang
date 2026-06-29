@@ -1271,3 +1271,50 @@ BEZEL_TEST(linq_refcount, for_in_dict_break_frees_remaining_key_boxes_1057) {
         "  for var e in d do n := n + 1; if n = 2 then break; end; end; "
         "  return n; end Main; end C;", 2);
 }
+
+// #1058 / §28/§4.8: a string-keyed Dictionary for-in leaks the per-iteration
+// DECODED string key objects (the loop body's malloc'd bz_string_t + dataCpy).
+// Each iteration builds a fresh string object (rc := 1) that is never released.
+// Fix: release in the increment block (normal completion) and at the loop-exit
+// block (break path); null varSlot after each incBB release so the endBB
+// release is a null-safe no-op on normal completion.
+
+// Normal completion: three string key objects (one per dict entry) must be
+// released exactly once.  Before the fix: 3 × ~32 B strObj + 3 × dataCpy =
+// "Direct leak of 96 byte(s) in 3 object(s)" per LSan.  No double-free.
+BEZEL_TEST(linq_refcount,
+           for_in_entry_str_key_releases_decoded_str_obj_normal_1058) {
+    // §4.8: for var e in Dictionary<string, int> — entry iteration.
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d[\"a\"] := 1; d[\"b\"] := 2; d[\"c\"] := 3; var sum := 0; "
+        "  for var e in d do sum := sum + e.Value; end; "
+        "  return sum; end Main; end C;", 6);
+}
+
+// .Keys iteration: lowerDictKeysFor must also release the per-iteration
+// strObj.  Three keys → n == 3.  Before the fix: strObj for each key leaked.
+BEZEL_TEST(linq_refcount,
+           for_in_keys_str_key_releases_decoded_str_obj_normal_1058) {
+    // §4.8: for var k in Dictionary<string, int>.Keys
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d[\"x\"] := 10; d[\"y\"] := 20; d[\"z\"] := 30; var n := 0; "
+        "  for var k in d.Keys do n := n + 1; end; "
+        "  return n; end Main; end C;", 3);
+}
+
+// Break path (entry): the in-progress iteration's strObj must be released at
+// endBB, not lost.  No double-free of strObjs from completed iterations.
+BEZEL_TEST(linq_refcount,
+           for_in_entry_str_key_break_releases_current_str_obj_1058) {
+    // Break after 2 iterations; the 3rd iteration's strObj never reaches incBB.
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d[\"a\"] := 1; d[\"b\"] := 2; d[\"c\"] := 3; var n := 0; "
+        "  for var e in d do n := n + 1; if n = 2 then break; end; end; "
+        "  return n; end Main; end C;", 2);
+}
