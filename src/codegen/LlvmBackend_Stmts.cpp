@@ -4506,7 +4506,19 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     auto* condBB = llvm::BasicBlock::Create(llvm_, "lz.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "lz.body", currentFn_);
     auto* endBB  = llvm::BasicBlock::Create(llvm_, "lz.end",  currentFn_);
-    builder_.CreateBr(condBB);
+    // #1218 / §5: contBB is the join point for both the null-guard short-circuit
+    // and the normal loop-exit/break path.  Code after the for-in continues here.
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "lz.cont", currentFn_);
+
+    // #1218 / §5: null-guard — a bound lazy variable (`var f := a.Where(…)`)
+    // has its slot nulled after each for-loop that consumes it (see endBB below).
+    // On a second iteration of the same bound variable the slot holds null; detect
+    // this here and skip the loop body entirely rather than deref-ing freed memory
+    // (which caused the UAF/SIGSEGV in issue #1218).
+    // A fresh inline lazy (iterable is a call expression) is never null here.
+    llvm::Value* lazyIsNull = builder_.CreateICmpEQ(
+        lazy, llvm::ConstantPointerNull::get(ptrTy()), "lz.isnull");
+    builder_.CreateCondBr(lazyIsNull, contBB, condBB);
 
     // cond: MoveNext (vtable slot 2) → i32 (1 = advanced).
     builder_.SetInsertPoint(condBB);
@@ -4543,6 +4555,20 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     auto* disposeTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                               {ptrTy()}, false);
     builder_.CreateCall(disposeTy, dFn, {dObj});
+    // #1218 / §5: null the bound variable's slot so a subsequent access —
+    // a second for-loop or a chained terminal — safely sees null (the null-guard
+    // above skips the loop body cleanly rather than dereferencing freed memory).
+    // Only fires when the iterable is a named local or parameter (IdentifierExpr);
+    // a fresh inline lazy (CallExpr / chained operator) has no owning slot to null.
+    // Per §29.11 pattern: localSlot handles both unboxed and cell-boxed variables.
+    if (llvm::AllocaInst* boundSlot = localSlot(*fs.iterable)) {
+        llvm::Type* ety = nullptr;
+        llvm::Value* addr = boxedStorage(boundSlot, ety);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+    }
+    builder_.CreateBr(contBB);
+
+    builder_.SetInsertPoint(contBB);
     return true;
 }
 

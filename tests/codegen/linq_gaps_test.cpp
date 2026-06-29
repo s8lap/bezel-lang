@@ -732,3 +732,60 @@ BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
         "  return r.Get(0) * 100 + r.Get(1) * 10 + r.Get(2); "
         "end Main; end C;"), 531);
 }
+
+// ===========================================================================
+// #1218 regression: bound lazy variable iterated twice must not double-free
+// §5 (lazy IEnumerable ownership): the for-loop does NOT own a bound lazy
+// variable; it only owns a fresh inline lazy.  A second for-loop over the
+// same bound variable after the first loop has consumed it must be a no-op
+// (value 0), not a SIGSEGV / ASan double-free.
+// ===========================================================================
+
+// §5: bound lazy `var filtered := a.Where(…)` iterated twice.
+// First loop yields s1=6 (2+4); second loop sees a consumed (nulled) enumerator
+// → s2=0.  Combined return is s1*100 + s2 = 600.
+// Pre-fix this crashed with a UAF / SIGSEGV (double bz_lazy_dispose).
+BEZEL_TEST(linq_gaps_issue1218, bound_lazy_iterated_twice_no_double_free_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
+        "  var s2 := 0; for var x in filtered do s2 := s2 + x; end; "
+        "  return s1 * 100 + s2; "
+        "end Main; end C;"), 600);
+}
+
+// §5: fresh inline lazy `for x in a.Where(…)` — the loop is the sole owner,
+// dispose at loop-end is correct and must not regress.
+BEZEL_TEST(linq_gaps_issue1218, fresh_inline_lazy_still_disposes_correctly_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var s := 0; "
+        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), 6);
+}
+
+// §5: bound lazy passed to a method that iterates it (cross-call case).
+// The method must not double-free the enumerator it receives.
+// Sum iterates the IEnumerable<int> via a for-in; caller then does nothing
+// more with filtered; no double-free expected.
+BEZEL_TEST(linq_gaps_issue1218, bound_lazy_passed_across_call_no_double_free_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  private static method Sum(seq: IEnumerable<int>): int "
+        "    var s := 0; for var x in seq do s := s + x; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "    var filtered := a.Where((x) => x mod 2 = 0); "
+        "    var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
+        "    return s1; "
+        "  end Main; "
+        "end C;"), 6);
+}
