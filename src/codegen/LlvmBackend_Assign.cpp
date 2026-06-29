@@ -1458,8 +1458,24 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         builder_.CreateStore(val, slot);
         locals_[pd] = slot;
     }
-    if (setterExpr) lowerExpr(*setterExpr);
-    else if (setterStmts) lowerScopedBlock(*setterStmts);
+    if (setterExpr) {
+        lowerExpr(*setterExpr);
+    } else if (setterStmts) {
+        // §23.3 / §23.5 (#1236): mirror lowerPropertySetValue (§22.9 / #739) —
+        // set up an accessor-end block so `return;` inside the block body ends
+        // only this setter, not the enclosing method. Without this, `return;`
+        // falls through to the enclosing method's return path, emitting a
+        // second terminator into the same BB (Facet A: IR verification failure)
+        // or disposing the enclosing method's locals early (Facet B: the write
+        // is committed but the object is freed before the subsequent read).
+        llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
+        auto* accEndBB = llvm::BasicBlock::Create(llvm_, "idxset.end", currentFn_);
+        inlinedAccessorEnd_ = accEndBB;
+        bool term = lowerScopedBlock(*setterStmts);
+        inlinedAccessorEnd_ = savedAccEnd;
+        if (!term) builder_.CreateBr(accEndBB);
+        builder_.SetInsertPoint(accEndBB);
+    }
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
