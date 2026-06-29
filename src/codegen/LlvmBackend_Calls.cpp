@@ -5195,7 +5195,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
 
     if (cls == "Convert") {
         if (call.args.size() == 1 && call.args[0].value) {
-            // Convert.ToInt32(s: string): int — atoi / strtol
+            // Convert.ToInt32(s: string): int — §2.3 / #1238
+            // #1238: replaced atoi (silent 0 on bad input) with strtoll +
+            // endptr validation so invalid strings throw FormatException and
+            // out-of-range strings throw OverflowException, matching §2.3 and
+            // the int.Parse strict-fault contract (#1227).
             if (m == "ToInt32") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
@@ -5204,43 +5208,89 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                     argTy->primitive == sema::PrimitiveType::Int)
                     return arg;
-                // For string: call atoi(data_ptr)
-                llvm::Value* strPtr = arg;
-                llvm::Value* data = loadStringData(strPtr);
-                auto* atoiFn = module_->getFunction("atoi");
-                if (!atoiFn) {
-                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
-                    atoiFn = llvm::Function::Create(
-                        ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
-                }
-                return builder_.CreateCall(atoiFn, {data}, "atoi.ret");
+                // For string: strtoll + endptr → FormatException on bad input,
+                // OverflowException on out-of-int32-range (per §2.3 / #1227).
+                llvm::Value* data = loadStringData(arg);
+                auto* strtollC32 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                auto* endSlotC32 = entryAlloca(ptrTy());
+                llvm::Value* v64C32 = builder_.CreateCall(
+                    strtollC32, {data, endSlotC32, builder_.getInt32(10)}, "cvt32.v");
+                auto* i8C32 = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcC32 = builder_.CreateLoad(i8C32, data, "cvt32.fc");
+                llvm::Value* fcWsC32 = builder_.CreateICmpULE(
+                    fcC32, llvm::ConstantInt::get(i8C32, ' '), "cvt32.fws");
+                llvm::Value* epC32 = builder_.CreateLoad(ptrTy(), endSlotC32, "cvt32.ep");
+                llvm::Value* advC32 = builder_.CreateICmpNE(epC32, data, "cvt32.adv");
+                llvm::Value* echC32 = builder_.CreateLoad(i8C32, epC32, "cvt32.ech");
+                llvm::Value* nulC32 = builder_.CreateICmpEQ(
+                    echC32, llvm::ConstantInt::get(i8C32, 0), "cvt32.nul");
+                llvm::Value* validC32 = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsC32),
+                    builder_.CreateAnd(advC32, nulC32), "cvt32.vfmt");
+                emitGuardThrow(builder_.CreateNot(validC32, "cvt32.fmtbad"),
+                               "FormatException");
+                llvm::Value* loC32 = builder_.CreateICmpSLT(
+                    v64C32, llvm::ConstantInt::getSigned(i64(), INT32_MIN), "cvt32.lo");
+                llvm::Value* hiC32 = builder_.CreateICmpSGT(
+                    v64C32, llvm::ConstantInt::getSigned(i64(), INT32_MAX), "cvt32.hi");
+                emitGuardThrow(builder_.CreateOr(loC32, hiC32, "cvt32.ovf"),
+                               "OverflowException");
+                return builder_.CreateTrunc(v64C32, i32());
             }
-            // Convert.ToInt64(s: string): long — atoll
+            // Convert.ToInt64(s: string): long — §2.3 / #1238
+            // #1238: replaced atoll (silent 0 on bad input) with strtoll +
+            // endptr validation → FormatException on invalid input.
             if (m == "ToInt64") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
                 llvm::Value* data = loadStringData(arg);
-                auto* atolFn = module_->getFunction("atoll");
-                if (!atolFn) {
-                    auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
-                    atolFn = llvm::Function::Create(
-                        ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
-                }
-                return builder_.CreateCall(atolFn, {data}, "atoll.ret");
+                auto* strtollC64 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                auto* endSlotC64 = entryAlloca(ptrTy());
+                llvm::Value* v64C64 = builder_.CreateCall(
+                    strtollC64, {data, endSlotC64, builder_.getInt32(10)}, "cvt64.v");
+                auto* i8C64 = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcC64 = builder_.CreateLoad(i8C64, data, "cvt64.fc");
+                llvm::Value* fcWsC64 = builder_.CreateICmpULE(
+                    fcC64, llvm::ConstantInt::get(i8C64, ' '), "cvt64.fws");
+                llvm::Value* epC64 = builder_.CreateLoad(ptrTy(), endSlotC64, "cvt64.ep");
+                llvm::Value* advC64 = builder_.CreateICmpNE(epC64, data, "cvt64.adv");
+                llvm::Value* echC64 = builder_.CreateLoad(i8C64, epC64, "cvt64.ech");
+                llvm::Value* nulC64 = builder_.CreateICmpEQ(
+                    echC64, llvm::ConstantInt::get(i8C64, 0), "cvt64.nul");
+                llvm::Value* validC64 = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsC64),
+                    builder_.CreateAnd(advC64, nulC64), "cvt64.vfmt");
+                emitGuardThrow(builder_.CreateNot(validC64, "cvt64.fmtbad"),
+                               "FormatException");
+                return v64C64;
             }
-            // Convert.ToDouble(s: string): double — atof
+            // Convert.ToDouble(s: string): double — §2.3 / #1238
+            // #1238: replaced atof (silent 0.0 on bad input) with strtod +
+            // endptr validation → FormatException on invalid input.
             if (m == "ToDouble") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
                 llvm::Value* data = loadStringData(arg);
-                auto* atofFn = module_->getFunction("atof");
-                if (!atofFn) {
-                    auto* ft = llvm::FunctionType::get(
-                        llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
-                    atofFn = llvm::Function::Create(
-                        ft, llvm::Function::ExternalLinkage, "atof", module_.get());
-                }
-                return builder_.CreateCall(atofFn, {data}, "atof.ret");
+                auto* strtodCd = declareC("strtod",
+                    llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+                auto* endSlotCd = entryAlloca(ptrTy());
+                llvm::Value* dvCd = builder_.CreateCall(
+                    strtodCd, {data, endSlotCd}, "cvtd.v");
+                auto* i8Cd = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcCd = builder_.CreateLoad(i8Cd, data, "cvtd.fc");
+                llvm::Value* fcWsCd = builder_.CreateICmpULE(
+                    fcCd, llvm::ConstantInt::get(i8Cd, ' '), "cvtd.fws");
+                llvm::Value* epCd = builder_.CreateLoad(ptrTy(), endSlotCd, "cvtd.ep");
+                llvm::Value* advCd = builder_.CreateICmpNE(epCd, data, "cvtd.adv");
+                llvm::Value* echCd = builder_.CreateLoad(i8Cd, epCd, "cvtd.ech");
+                llvm::Value* nulCd = builder_.CreateICmpEQ(
+                    echCd, llvm::ConstantInt::get(i8Cd, 0), "cvtd.nul");
+                llvm::Value* validCd = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsCd),
+                    builder_.CreateAnd(advCd, nulCd), "cvtd.vfmt");
+                emitGuardThrow(builder_.CreateNot(validCd, "cvtd.fmtbad"),
+                               "FormatException");
+                return dvCd;
             }
             // Convert.ToBoolean(s: string): bool — "true"/"1" → true
             if (m == "ToBoolean") {
@@ -5275,9 +5325,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
         }
         // §2.3: Convert.TryToInt32(value: string, out result: int): bool.
-        // Returns true and sets result when `value` is a fully-valid integer;
-        // false and leaves result at its default (0) otherwise. Mirrors the
-        // int.TryParse strtol-with-endptr validation (§5.2).
+        // Returns true and sets result when `value` is a fully-valid integer in
+        // [INT32_MIN, INT32_MAX]; false and sets result=0 otherwise.  Mirrors
+        // int.TryParse strtoll-with-endptr + range-check + whitespace-reject
+        // (#1238 / #1227 / §9.1).
         if (m == "TryToInt32" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
@@ -5287,21 +5338,37 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Type* et = nullptr;
             llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
             if (!outAddr) return nullptr;
-            auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
-            auto* endSlot = entryAlloca(ptrTy());
+            // #1238: use strtoll (not strtol) for unambiguous 64-bit result so
+            // we can range-check to [INT32_MIN, INT32_MAX] before truncating.
+            auto* strtollTry = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+            auto* endSlotT = entryAlloca(ptrTy());
             llvm::Value* val64 = builder_.CreateCall(
-                strtolFn, {strData, endSlot, builder_.getInt32(10)}, "cvt.val");
-            llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
-            // ok = (endPtr advanced past start) && (*endPtr == '\0')
-            llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "cvt.adv");
+                strtollTry, {strData, endSlotT, builder_.getInt32(10)}, "tryc.val");
+            llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlotT, "tryc.ep");
+            // ok1 = first char not whitespace AND (endPtr advanced) AND (*endPtr == '\0')
             auto* i8t = llvm::Type::getInt8Ty(llvm_);
-            llvm::Value* endCh = builder_.CreateLoad(i8t, endPtr, "cvt.end");
+            llvm::Value* fc = builder_.CreateLoad(i8t, strData, "tryc.fc");
+            llvm::Value* fcWs = builder_.CreateICmpULE(
+                fc, llvm::ConstantInt::get(i8t, ' '), "tryc.fws");
+            llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryc.adv");
+            llvm::Value* endCh = builder_.CreateLoad(i8t, endPtr, "tryc.end");
             llvm::Value* atNul = builder_.CreateICmpEQ(
-                endCh, llvm::ConstantInt::get(i8t, 0), "cvt.nul");
-            llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "cvt.ok");
-            // Store the (truncated to i32) parsed value; on failure strtol
-            // returns 0, matching the "default value" contract.
-            builder_.CreateStore(builder_.CreateTrunc(val64, i32()), outAddr);
+                endCh, llvm::ConstantInt::get(i8t, 0), "tryc.nul");
+            llvm::Value* ok = builder_.CreateAnd(
+                builder_.CreateNot(fcWs),
+                builder_.CreateAnd(advanced, atNul), "tryc.ok1");
+            // #1238 / §2.3: range-check to int32 bounds → ok=false for overflow.
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(
+                    val64, llvm::ConstantInt::getSigned(i64(), INT32_MIN), "tryc.lo"),
+                builder_.CreateICmpSLE(
+                    val64, llvm::ConstantInt::getSigned(i64(), INT32_MAX), "tryc.hi"),
+                "tryc.inr");
+            ok = builder_.CreateAnd(ok, inRange, "tryc.ok2");
+            // Store truncated value on success, 0 on failure (default value per §2.3).
+            llvm::Value* trunc32 = builder_.CreateTrunc(val64, i32());
+            llvm::Value* sel32 = builder_.CreateSelect(ok, trunc32, builder_.getInt32(0), "tryc.sel");
+            builder_.CreateStore(sel32, outAddr);
             return ok;
         }
         // Convert.ToString(n, radix: int): string — radix-based conversion.

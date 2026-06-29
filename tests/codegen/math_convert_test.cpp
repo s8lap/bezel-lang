@@ -414,3 +414,149 @@ BEZEL_TEST(math_comparable_1215, min_nonnull_class_still_works) {
         "  using var a := new Box(150); using var b := new Box(99); "
         "  return Math.Min(a, b).v;")), 99);
 }
+
+// ===========================================================================
+// #1238 — Convert.To*/TryTo* strict validation (stdlib §2.3)
+//
+// Before this fix, Convert.ToInt32/ToInt64/ToDouble used atoi/atoll/atof which
+// return 0 silently on invalid input — no exception was thrown even though §2.3
+// mandates the non-Try forms throw FormatException on parse failure.
+// Convert.TryToInt32 used strtol without a range check, so "9999999999"
+// (> INT32_MAX) was silently truncated and returned ok=true.
+//
+// Fix: all three To* methods now use strtoll/strtod with endptr validation
+// (reject empty / leading-whitespace / trailing-garbage → FormatException);
+// ToInt32 also range-checks to [INT32_MIN, INT32_MAX] → OverflowException.
+// TryToInt32 adds a range check and uses CreateSelect (0 on failure) matching
+// int.TryParse (#1227 / §9.1).
+// ===========================================================================
+
+// --- Convert.ToInt32: invalid input must throw (§2.3 / #1238) ---
+// Before the fix: atoi("not a number") → 0 silently; no exception.
+BEZEL_TEST(convert_strict_1238, toint32_invalid_throws_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    var n := Convert.ToInt32(\"not a number\"); "
+        "    return 99; "
+        "  catch Exception => return 0; "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.ToInt32: empty string must throw (§2.3 / #1238) ---
+BEZEL_TEST(convert_strict_1238, toint32_empty_throws_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    var n := Convert.ToInt32(\"\"); "
+        "    return 99; "
+        "  catch Exception => return 0; "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.ToInt32: trailing garbage must throw (§2.3 / #1238) ---
+// "12abc" is not a valid integer — FormatException expected.
+BEZEL_TEST(convert_strict_1238, toint32_trailing_garbage_throws_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    var n := Convert.ToInt32(\"12abc\"); "
+        "    return 99; "
+        "  catch Exception => return 0; "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.ToInt32: valid input still works — regression (§2.3 / #1238) ---
+BEZEL_TEST(convert_strict_1238, toint32_valid_regression_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(mainBody("return Convert.ToInt32(\"42\");")), 42);
+}
+
+// --- Convert.ToInt64: invalid input must throw (§2.3 / #1238) ---
+// Before the fix: atoll("bad") → 0 silently.
+BEZEL_TEST(convert_strict_1238, toint64_invalid_throws_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    var n := Convert.ToInt64(\"bad\"); "
+        "    return 99; "
+        "  catch Exception => return 0; "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.ToInt64: valid large long still works — regression (§2.3 / #1238) ---
+// 9999999999 > INT32_MAX but fits in long; result must equal 9999999999L.
+BEZEL_TEST(convert_strict_1238, toint64_valid_large_regression_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n := Convert.ToInt64(\"9999999999\"); "
+        "  return (1 if n = 9999999999L else 0); "
+        "end Main; end C;"), 1);
+}
+
+// --- Convert.ToDouble: invalid input must throw (§2.3 / #1238) ---
+// Before the fix: atof("abc") → 0.0 silently.
+BEZEL_TEST(convert_strict_1238, todouble_invalid_throws_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    var d := Convert.ToDouble(\"abc\"); "
+        "    return 99; "
+        "  catch Exception => return 0; "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.ToDouble: valid input still works — regression (§2.3 / #1238) ---
+BEZEL_TEST(convert_strict_1238, todouble_valid_regression_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var d := Convert.ToDouble(\"3.5\"); "
+        "  return (1 if d > 3.4 and d < 3.6 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// --- Convert.TryToInt32: overflow (> INT32_MAX) must return false (§2.3 / #1238) ---
+// Before the fix: strtol truncated to i32 → ok=true, result=garbage (1410065407).
+BEZEL_TEST(convert_strict_1238, tryto_int32_overflow_returns_false_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var result: int := 99; "
+        "  var ok := Convert.TryToInt32(\"9999999999\", out result); "
+        "  return (1 if ok else 0); "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.TryToInt32: overflow result must be 0 (default) (§2.3 / #1238) ---
+BEZEL_TEST(convert_strict_1238, tryto_int32_overflow_result_zero_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var result: int := 99; "
+        "  var ok := Convert.TryToInt32(\"9999999999\", out result); "
+        "  return result; "
+        "end Main; end C;"), 0);
+}
+
+// --- Convert.TryToInt32: leading whitespace rejected (§2.3 / #1238) ---
+// Matches int.TryParse whitespace policy (#1227 / §9.1).
+BEZEL_TEST(convert_strict_1238, tryto_int32_leading_space_returns_false_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var result: int := 0; "
+        "  var ok := Convert.TryToInt32(\" 42\", out result); "
+        "  return (1 if not ok else 0); "
+        "end Main; end C;"), 1);
+}
+
+// --- Convert.TryToInt32: valid regression — ok=true, result=42 (§2.3 / #1238) ---
+BEZEL_TEST(convert_strict_1238, tryto_int32_valid_regression_spec_2_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r: int := 0; "
+        "  var ok := Convert.TryToInt32(\"42\", out r); "
+        "  return (1 if ok and r = 42 else 0); "
+        "end Main; end C;"), 1);
+}
