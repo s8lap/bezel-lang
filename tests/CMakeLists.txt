@@ -196,6 +196,7 @@ set(BEZEL_TEST_SOURCES
     sema/extension_resolution_test.cpp
     sema/generic_extension_698_test.cpp
     sema/variance_position_test.cpp
+    sema/generic_variance_assign_1180_test.cpp  # fix #1180: §12.9 variance assignment enforcement
     sema/return_in_finally_test.cpp
     sema/untyped_collection_literal_test.cpp
     sema/class_destructuring_pattern_test.cpp

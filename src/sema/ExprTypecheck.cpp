@@ -811,6 +811,13 @@ bool ExprTC::primitiveWidens(PrimitiveType from, PrimitiveType to) {
     }
 }
 
+// §12.9 (issue #1180): forward declarations for variance-check helpers.
+// All are defined after builtinInterfaceAncestorsOf (the §26.5 hierarchy
+// section), which they depend on.
+static std::string_view namedTypeSimpleName(const TypeRef*);
+static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
+                                      bool (*)(TypeSymbol*, TypeSymbol*));
+
 // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
 // `from`'s transitive base-type chain (base class or implemented
 // interface)? BFS, cycle-guarded.
@@ -948,8 +955,23 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     if (from->kind == TypeRef::Kind::Named &&
         to->kind == TypeRef::Kind::Named &&
         from->declaration && to->declaration) {
-        // Defer generic types to the variance slice.
+        // §12.9 (issue #1180): for SAME-declaration generics, check variance.
+        // Cross-declaration generics (from->declaration != to->declaration)
+        // fall through to the isSubtype check below (conservative — no per-arg
+        // check; full cross-type user-declared variance is a residual).
         if (!from->genericArgs.empty() || !to->genericArgs.empty()) {
+            if (from->declaration == to->declaration &&
+                !from->genericArgs.empty() &&
+                from->genericArgs.size() == to->genericArgs.size()) {
+                // Same-declaration: enforce declared variance per §12.9.
+                if (!variantGenericAssignable(from, to, isSubtype)) {
+                    reportNotConvertible();
+                    return;
+                }
+                if (from->nullable && !to->nullable) { reportNullable(); return; }
+                return;
+            }
+            // Cross-declaration or arity mismatch: conservative skip.
             return;
         }
         if (from->nullable && !to->nullable) { reportNullable(); return; }
@@ -957,6 +979,20 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         if (isSubtype(from->declaration, to->declaration)) return;
         reportNotConvertible();
         return;
+    }
+    // §12.9 (issue #1180): variance check for builtin (null-declaration) Named
+    // generic types. The Named-Named branch above requires both sides to have
+    // non-null declarations; builtins like Array<T>, IEnumerable<T>, IList<T>
+    // have null declarations and fall through to here. When `to` is a builtin
+    // generic interface, verify that `from`'s matching ancestor's type args
+    // satisfy `to`'s declared variance (§12.9 / Appendix C invariant).
+    if (from->kind == TypeRef::Kind::Named &&
+        to->kind == TypeRef::Kind::Named &&
+        !to->genericArgs.empty() && !to->declaration) {
+        if (!variantGenericAssignable(from, to, isSubtype)) {
+            reportNotConvertible();
+            return;
+        }
     }
     // §27.6 (#756): a target-typed PROPERTY REFERENCE. `var f: () -> T := b.P`
     // where P is a property whose getter returns T — a property read is a value
@@ -1611,6 +1647,215 @@ static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
     if (name.empty()) return {};
     return builtinInterfaceAncestors(name,
         const_cast<std::vector<TypeRef*>&>(recv->genericArgs), owned);
+}
+
+// ---------------------------------------------------------------------------
+// §12.9 (issue #1180) — generic variance helpers
+// ---------------------------------------------------------------------------
+
+// Variance annotation of the i-th type parameter of a known BUILTIN generic
+// interface (those with null TypeSymbol declarations).  Returns "out"
+// (covariant), "in" (contravariant), or "" (invariant).
+// Per §12.9 and the language-primitives table in §2.1:
+//   covariant (out T): IEnumerable, IEnumerator, IAsync*, IReadOnlyCollection,
+//                      IReadOnlyList, IEvent, IAsyncEvent.
+//   invariant: IList, ICollection, IOwnedList, IOwnedCollection, Array,
+//              OwnedArray, Stack, Queue, Set, LinkedList, etc.
+static std::string_view builtinParamVariance(std::string_view name,
+                                              std::size_t /*i*/) {
+    if (name == "IEnumerable" || name == "IEnumerator" ||
+        name == "IAsyncEnumerable" || name == "IAsyncEnumerator" ||
+        name == "IReadOnlyCollection" || name == "IReadOnlyList" ||
+        name == "IEvent" || name == "IAsyncEvent")
+        return "out";
+    return "";  // invariant
+}
+
+// §12.9 / L1592: is a TypeRef a VALUE type that cannot participate in a
+// covariant/contravariant generic conversion?
+// Value types in Bezel: numeric primitives, bool, char (PrimitiveType except
+// Object and String), enums, and records.  String and Object are reference types.
+static bool isValueTypeArg(const TypeRef* t) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::Primitive)
+        return t->primitive != PrimitiveType::Object &&
+               t->primitive != PrimitiveType::String;
+    if (t->kind == TypeRef::Kind::Named && t->declaration)
+        return t->declaration->kind == ast::TypeDeclKind::Enum ||
+               t->declaration->kind == ast::TypeDeclKind::Record;
+    return false;
+}
+
+// §12.9: shallow base-type equality for a single generic argument.
+// Two TypeRefs share the "same base type" when both are the same primitive,
+// both are Named user-declared with the same TypeSymbol pointer, or both are
+// Named builtins with the same importedName (arity not recursively checked;
+// deeper nesting is left to the recursive variance walk if ever implemented).
+// Nullability is intentionally ignored — variance operates on the base type.
+static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
+    if (!a || !b) return a == b;
+    if (a->kind != b->kind) return false;
+    if (a->kind == TypeRef::Kind::Primitive) return a->primitive == b->primitive;
+    if (a->kind == TypeRef::Kind::Named) {
+        if (a->declaration && b->declaration)
+            return a->declaration == b->declaration;
+        if (!a->declaration && !b->declaration) {
+            std::string_view an = namedTypeSimpleName(a);
+            std::string_view bn = namedTypeSimpleName(b);
+            return !an.empty() && an == bn;
+        }
+    }
+    return false;
+}
+
+// §12.9: for a COVARIANT position, is `fromArg` a reference-type subtype of
+// `toArg`?  Exact match is always a subtype; PrimitiveType::Object is the
+// universal root; otherwise both must be Named with non-null declarations and
+// `isSubtypeFn(from, to)` must hold.
+static bool typeArgRefSubtype(const TypeRef* fromArg, const TypeRef* toArg,
+                               bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    if (!fromArg || !toArg) return false;
+    if (typeArgSameBase(fromArg, toArg)) return true;
+    // PrimitiveType::Object is the universal root type.
+    if (toArg->kind == TypeRef::Kind::Primitive &&
+        toArg->primitive == PrimitiveType::Object)
+        return true;
+    // Both Named with user declarations: walk the subtype chain.
+    if (fromArg->kind == TypeRef::Kind::Named &&
+        toArg->kind == TypeRef::Kind::Named &&
+        fromArg->declaration && toArg->declaration)
+        return isSubtypeFn(fromArg->declaration, toArg->declaration);
+    return false;
+}
+
+// §12.9 (issue #1180): check whether the generic assignment `from → to` is
+// sound under §12.9 variance rules.  Returns true (compatible) or false
+// (unsound — caller should report §5.1 error).
+//
+// Two cases handled:
+//   A) Same base type (same TypeSymbol, or same importedName for builtins):
+//      compare args pairwise under the declared/hardcoded variance.
+//   B) Different base types where `from` is a builtin subtype of `to`:
+//      walk builtinInterfaceAncestorsOf to find the matching ancestor, then
+//      apply case A on that pair.
+//      User-declared cross-type generics are conservatively accepted
+//      (residual — deferred to the full §12.9 milestone).
+static bool variantGenericAssignable(
+    const TypeRef* from, const TypeRef* to,
+    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    if (!from || !to) return true;
+    if (from->kind != TypeRef::Kind::Named ||
+        to->kind != TypeRef::Kind::Named) return true;
+    if (to->genericArgs.empty()) return true;  // non-generic target → accept
+
+    std::string_view toName = namedTypeSimpleName(to);
+
+    // Find `candidate`: the instantiation of `to`'s base that `from` produces.
+    const TypeRef* candidate = nullptr;
+    std::vector<std::unique_ptr<TypeRef>> owned;
+
+    if (!to->declaration) {
+        // `to` is a builtin generic interface (null declaration).
+        if (!from->declaration && !from->genericArgs.empty()) {
+            // `from` is also a builtin.
+            std::string_view fromName = namedTypeSimpleName(from);
+            if (fromName == toName) {
+                candidate = from;   // same builtin — compare args directly
+            } else {
+                // Walk the builtin interface hierarchy to find the matching ancestor.
+                auto ancs = builtinInterfaceAncestorsOf(from, owned);
+                for (const TypeRef* anc : ancs) {
+                    if (namedTypeSimpleName(anc) == toName) {
+                        candidate = anc;
+                        break;
+                    }
+                }
+            }
+        }
+        // `from` has a user declaration: user-declared → builtin is a residual
+        // (would need baseTypeRefs walk with substitution).  Accept conservatively.
+    } else {
+        // `to` is a user-declared generic type (has declaration).
+        if (from->declaration == to->declaration) {
+            candidate = from;  // same declaration — compare args directly
+        }
+        // Cross-declaration user generics: conservatively accept (residual).
+    }
+
+    if (!candidate) return true;  // no matching ancestor → conservative accept
+    if (candidate->genericArgs.size() != to->genericArgs.size()) return true;
+
+    for (std::size_t i = 0; i < to->genericArgs.size(); ++i) {
+        const TypeRef* fromArg = candidate->genericArgs[i];
+        const TypeRef* toArg = to->genericArgs[i];
+        if (!fromArg || !toArg) continue;  // conservative skip on unresolved
+
+        // §14.1 (issue #1180): a Named TypeRef with null declaration and no
+        // genericArgs is a free type variable (generic method/type parameter
+        // like A, B, T). Free variables accept any binding without variance
+        // restriction — the only constraint is the concrete substitution, which
+        // is enforced at the call site, not here.
+        {
+            bool toArgFree = toArg->kind == TypeRef::Kind::Named &&
+                             !toArg->declaration &&
+                             toArg->genericArgs.empty() &&
+                             !namedTypeSimpleName(toArg).empty();
+            bool fromArgFree = fromArg->kind == TypeRef::Kind::Named &&
+                               !fromArg->declaration &&
+                               fromArg->genericArgs.empty() &&
+                               !namedTypeSimpleName(fromArg).empty();
+            if (toArgFree || fromArgFree) continue;
+        }
+
+        // Determine variance of `to`'s i-th parameter.
+        std::string_view variance;
+        if (!to->declaration) {
+            // Builtin: use the hardcoded variance table.
+            variance = builtinParamVariance(toName, i);
+        } else {
+            // User-declared: read from the GenericParam annotations.
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                    to->declaration->decl)) {
+                if (i < td->genericParams.size())
+                    variance = td->genericParams[i].variance;
+            }
+            // §12.9 L1590: classes and records are always invariant.
+            if (to->declaration->kind == ast::TypeDeclKind::Class ||
+                to->declaration->kind == ast::TypeDeclKind::Record)
+                variance = "";
+        }
+
+        bool ok;
+        if (variance == "out") {
+            // Covariant: exact match is always OK; otherwise both args must be
+            // reference types and fromArg must be a subtype of toArg.
+            // §12.9 L1592: value-typed T → variant assignment is forbidden even
+            // for covariant interfaces; only exact-match is permitted.
+            if (typeArgSameBase(fromArg, toArg)) {
+                ok = true;
+            } else if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
+                ok = false;  // per §12.9 L1592
+            } else {
+                ok = typeArgRefSubtype(fromArg, toArg, isSubtypeFn);
+            }
+        } else if (variance == "in") {
+            // Contravariant: exact match OK; otherwise toArg must be a
+            // reference-type subtype of fromArg.
+            if (typeArgSameBase(fromArg, toArg)) {
+                ok = true;
+            } else if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
+                ok = false;
+            } else {
+                ok = typeArgRefSubtype(toArg, fromArg, isSubtypeFn);
+            }
+        } else {
+            // Invariant (or unknown variance): exact base match required.
+            ok = typeArgSameBase(fromArg, toArg);
+        }
+
+        if (!ok) return false;
+    }
+    return true;
 }
 
 // §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that
