@@ -234,3 +234,91 @@ BEZEL_TEST(codegen_cg45, ctor_default_forward_param_ref_rejected_spec_22_5) {
         "end Main; end C;",
         "§22.5"));
 }
+
+// ── issue #1235 / §22.5 / §22.7: bare `null` literal default for nullable
+// value-type parameters must materialise the tagged {i8,T} zero struct, not
+// emit ptr null (which fails LLVM IR verification).  Three cases: int?,
+// nullable enum, nullable record.
+
+BEZEL_TEST(codegen_cg45, null_default_nullable_int_omitted_spec_22_5_issue1235) {
+    // §22.5 / §22.7 (#1235): `n: int? := null` — omitted argument must
+    // compile and produce the nullable-null value; the method returns 0.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method F(n: int? := null): int "
+        "    => (n! if n <> null else 0); "
+        "  public static method Main(): int => F(); "
+        "end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg45, null_default_nullable_int_explicit_null_spec_22_5_issue1235) {
+    // §22.5 / §22.7 (#1235): explicit `F(null)` on a nullable-int param must
+    // still compile and return 0 (regression guard — this path worked before
+    // the fix and must continue to work).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method F(n: int? := null): int "
+        "    => (n! if n <> null else 0); "
+        "  public static method Main(): int => F(null); "
+        "end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg45, null_default_nullable_int_explicit_value_spec_22_5_issue1235) {
+    // §22.5 / §22.7 (#1235): explicit `F(5)` on a nullable-int param must
+    // propagate the value (regression guard for the non-null branch).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method F(n: int? := null): int "
+        "    => (n! if n <> null else 0); "
+        "  public static method Main(): int => F(5); "
+        "end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg45, null_default_nullable_enum_omitted_spec_22_5_issue1235) {
+    // §22.5 / §22.7 (#1235): `c: Color? := null` — omitted enum? default
+    // must materialise as nullable-null (tagged {i8,i32} zero), not ptr null.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum Color Red := 1, Green := 2, Blue := 3; end Color; "
+        "class C "
+        "  public static method F(c: Color? := null): int "
+        "    => (1 if c <> null else 0); "
+        "  public static method Main(): int => F(); "
+        "end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg45, null_default_nullable_record_omitted_spec_22_5_issue1235) {
+    // §22.5 / §22.7 (#1235): `p: Point? := null` — omitted nullable-record
+    // default must materialise as the tagged {i8,{i32,i32}} zero struct.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method F(p: Point? := null): int "
+        "    => (p!.X + p!.Y if p <> null else 0); "
+        "  public static method Main(): int => F(); "
+        "end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg45, null_default_non_nullable_regression_spec_22_7_issue1235) {
+    // §22.7 (#1235 regression): a non-nullable default like `x: int := 7`
+    // must be unaffected by the #1235 fix — still produces 7.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method F(x: int := 7): int => x; "
+        "  public static method Main(): int => F(); "
+        "end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg45, default_expr_nullable_int_regression_spec_22_5_issue1235) {
+    // §22.5 (#1235 regression): `default(int?)` as a default must still
+    // materialise the nullable zero value and return 11 (pre-existing fix
+    // #1163 must be unbroken).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "static class U public static method P(x: int? := default(int?)): int "
+        "  if x = null then return 11; end; return x!; "
+        "end P; end U; "
+        "class C public static method Main(): int => U.P(); "
+        "end C;"), 11);
+}

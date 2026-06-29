@@ -3757,6 +3757,29 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     lowerType(params[j].type.get()));
             } else {
                 ordered[j] = lowerExpr(*dv);
+                // fix #1235 / §22.5 / §22.7: a bare `null` literal default
+                // for a nullable VALUE param (int?, enum?, nullable record)
+                // lowers as ptr null but the param's LLVM type is {i8,T}.
+                // Apply the same coercion the explicit-arg path uses
+                // (CG-nullable, see L3523): ptr null → nullableValueNull.
+                if (ordered[j] && params[j].type) {
+                    sema::TypeRef* formalTy =
+                        ctx_.resolvedType(*params[j].type);
+                    if (isNullableValueTy(formalTy)) {
+                        auto* expectedSt = nullableValueStructTy(formalTy);
+                        if (ordered[j]->getType() != expectedSt) {
+                            if (ordered[j]->getType()->isPointerTy() &&
+                                llvm::isa<llvm::ConstantPointerNull>(
+                                    ordered[j])) {
+                                ordered[j] = nullableValueNull(formalTy);
+                            } else if (ordered[j]->getType() ==
+                                       expectedSt->getElementType(1)) {
+                                ordered[j] =
+                                    wrapNullableValue(formalTy, ordered[j]);
+                            }
+                        }
+                    }
+                }
             }
             paramSlots_ = std::move(savedParams);
             if (!ordered[j]) return false;
