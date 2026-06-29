@@ -514,6 +514,141 @@ BEZEL_TEST(codegen_json_550, write_null_roundtrip_spec_2_15) {
 }
 
 // ===========================================================================
+// §2.15 / fix #1229: WriteFloat on a JsonSerializer raises SerializationException
+// for NaN / ±Infinity (JSON has no representation for non-finite floats).
+// The synthesized Serialize must check bz_exc after bz_binser_write_float and
+// propagate the exception rather than falling through to EndObject.
+// ===========================================================================
+
+// §2.15 / fix #1229: NaN in a double field → SerializationException caught.
+// Bug A: before the fix, no exception was raised; malformed `{"V":}` was produced.
+BEZEL_TEST(codegen_json_1229,
+           nan_double_field_to_json_raises_spec_2_15) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record DVal(V: double): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var nan := double.NaN; "
+        "  using var s := new JsonSerializer(); "
+        "  var r := new DVal(nan); "
+        "  try "
+        "    r.Serialize(s); "
+        "    return 0; "
+        "  catch SerializationException => return 1; "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §2.15 / fix #1229: PositiveInfinity in a double field → SerializationException.
+BEZEL_TEST(codegen_json_1229,
+           positive_infinity_double_field_to_json_raises_spec_2_15) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record DVal(V: double): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var inf := double.PositiveInfinity; "
+        "  using var s := new JsonSerializer(); "
+        "  var r := new DVal(inf); "
+        "  try "
+        "    r.Serialize(s); "
+        "    return 0; "
+        "  catch SerializationException => return 1; "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// §2.15 / fix #1229 Bug B: a SECOND serialize call after catching the exception
+// must work correctly; bz_exc must be clear after the catch.
+// Before the fix, the stale bz_exc left by the first Serialize caused the next
+// synthesized-Serialize entry check (bz_binser_begin_object emitPendingCheck) to
+// abort with "Unhandled exception".
+BEZEL_TEST(codegen_json_1229,
+           second_serialize_after_caught_nan_works_spec_2_15) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record DVal(V: double): ISerializable, IDeserializable; "
+        "record Good(X: int): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var nan := double.NaN; "
+        "  var caught := 0; "
+        "  using var s := new JsonSerializer(); "
+        "  var bad := new DVal(nan); "
+        "  try "
+        "    bad.Serialize(s); "
+        "  catch SerializationException => caught := 1; "
+        "  end; "
+        "  if caught = 0 then return 0; end; "  // exception must have been caught
+        "  using var s2 := new JsonSerializer(); "
+        "  var g := new Good(42); "
+        "  g.Serialize(s2); "
+        "  using var bytes := s2.ToBytes(); "
+        "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
+        "  var g2 := Good.Deserialize(d); "
+        "  return (1 if g2.X = 42 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §2.15 / fix #1229: binary serialization of NaN is ALLOWED (§2.15 restricts
+// only JSON); BinarySerializer must round-trip NaN without raising.
+BEZEL_TEST(codegen_json_1229,
+           nan_double_field_to_binary_allowed_spec_2_15) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record DVal(V: double): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var nan := double.NaN; "
+        "  using var s := new BinarySerializer(); "
+        "  var r := new DVal(nan); "
+        "  r.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var r2 := DVal.Deserialize(d); "
+        "  return (1 if double.IsNaN(r2.V) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §2.15 / fix #1229: finite double still serializes to JSON correctly (regression).
+BEZEL_TEST(codegen_json_1229,
+           finite_double_field_to_json_works_spec_2_15) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record DVal(V: double): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  using var s := new JsonSerializer(); "
+        "  var r := new DVal(3.14); "
+        "  r.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
+        "  var r2 := DVal.Deserialize(d); "
+        "  return (1 if r2.V = 3.14 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §2.15 / fix #1229: ASan — caught SerializationException from NaN must be freed
+// exactly once (no leak, no double-free).
+BEZEL_TEST(codegen_json_1229,
+           asan_nan_json_exception_freed_once_spec_2_15) {
+    int rc = runUnderLeakSanitizerJson(
+        std::string("module M; ") + kImport +
+        "record DVal(V: double): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var nan := double.NaN; "
+        "  using var s := new JsonSerializer(); "
+        "  var r := new DVal(nan); "
+        "  try "
+        "    r.Serialize(s); "
+        "    return 0; "
+        "  catch SerializationException => return 1; "
+        "  end; "
+        "end Main; end C;",
+        /*detectLeaks=*/true);
+    // rc == -1 → toolchain unavailable (SKIP).
+    // rc == 0 or 1 → exit + no leaks (also clean; exit 1 = Bezel success return).
+    // rc == 99 → ASan/leak triggered → FAIL.
+    BEZEL_EXPECT_TRUE(rc == 0 || rc == 1 || rc == -1);
+}
+
+// ===========================================================================
 // AOT / ASan tests — detect_leaks=1 on round-trip and malformed-input probes.
 // These test with the lane-local rt_asan.o (per mandatory memory discipline).
 // ===========================================================================

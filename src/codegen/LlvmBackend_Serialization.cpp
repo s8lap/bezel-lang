@@ -517,6 +517,11 @@ void Emitter::emitSerializeField(llvm::Value* val,
             auto* fn = declareC("bz_binser_write_float", voidTy,
                                 {ptrTy(), llvm::Type::getDoubleTy(llvm_)});
             builder_.CreateCall(fn, {serPtr, d});
+            // §2.15 / fix #1229: bz_binser_write_float sets bz_exc for NaN/±Infinity
+            // on a JsonSerializer; propagate via emitPendingCheck so the
+            // SerializationException unwinds rather than falling through to
+            // EndObject and leaving bz_exc stale (which crashes the next call).
+            emitPendingCheck();
             break;
         }
         case sema::PrimitiveType::Decimal: {
@@ -2907,6 +2912,9 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 auto* fn = declareC("bz_binser_write_float", voidTy,
                     {ptrTy(), llvm::Type::getDoubleTy(llvm_)});
                 builder_.CreateCall(fn, {ser, v});
+                // §2.15 / fix #1229: bz_binser_write_float sets bz_exc for NaN/±Infinity
+                // on a JsonSerializer; propagate so the caller's try/catch can handle it.
+                emitPendingCheck();
                 return nullptr;
             }
             if (methodName == "WriteBool" && call.args.size() == 1 && call.args[0].value) {
