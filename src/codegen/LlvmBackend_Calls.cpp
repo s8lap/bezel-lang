@@ -8588,6 +8588,132 @@ void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
     builder_.SetInsertPoint(endBB);
 }
 
+// per §24.5 / §30 (#1176): the async-event raise loop for `RaiseAsync`. Each
+// subscribed handler closure has type `(env_ptr, payload?) -> ptr` (returning a
+// Task*). We call each in subscription order and await its task synchronously
+// (bz_task_await_sync) before invoking the next — "each handler's task is awaited
+// before the next is invoked" (§24.5). If a handler's task faults, subsequent
+// handlers are not invoked and the fault is carried in the returned outer Task.
+// The outer Task is always already-done when we return, so the caller's
+// `await E.RaiseAsync(...)` takes the already-done fast path (bz_task_is_done →
+// true, no state-machine suspend required for already-completed tasks).
+llvm::Value* Emitter::emitAsyncEventRaise(llvm::Value* srcPtr,
+                                          llvm::Value* payloadLL,
+                                          llvm::Type* payloadTy) {
+    if (!srcPtr) return nullptr;
+
+    // Allocate the outer Task representing RaiseAsync's sequential completion.
+    auto* allocFn    = declareC("bz_task_alloc", ptrTy(), {});
+    llvm::Value* outerTask = builder_.CreateCall(allocFn, {}, "raiseasync.task");
+
+    auto* countFn = declareC("bz_event_count",      i64(),   {ptrTy()});
+    auto* atFn    = declareC("bz_event_handler_at", ptrTy(), {ptrTy(), i64()});
+    llvm::Value* n = builder_.CreateCall(countFn, {srcPtr}, "event.n");
+
+    // Async handler function type: (env_ptr, payload?) -> ptr (Task*).
+    std::vector<llvm::Type*> handlerArgTys;
+    handlerArgTys.push_back(ptrTy());  // env_ptr
+    if (payloadLL) handlerArgTys.push_back(payloadTy);
+    auto* handlerFnTy = llvm::FunctionType::get(ptrTy(), handlerArgTys, false);
+
+    llvm::Function* fn = currentFn_;
+    auto* loopBB    = llvm::BasicBlock::Create(llvm_, "raiseasync.loop",    fn);
+    auto* bodyBB    = llvm::BasicBlock::Create(llvm_, "raiseasync.body",    fn);
+    auto* invokeBB  = llvm::BasicBlock::Create(llvm_, "raiseasync.invoke",  fn);
+    auto* freeBB    = llvm::BasicBlock::Create(llvm_, "raiseasync.free",    fn);
+    auto* faultBB   = llvm::BasicBlock::Create(llvm_, "raiseasync.fault",   fn);
+    auto* skipBB    = llvm::BasicBlock::Create(llvm_, "raiseasync.skip",    fn);
+    auto* contBB    = llvm::BasicBlock::Create(llvm_, "raiseasync.cont",    fn);
+    auto* successBB = llvm::BasicBlock::Create(llvm_, "raiseasync.success", fn);
+    auto* afterBB   = llvm::BasicBlock::Create(llvm_, "raiseasync.after",   fn);
+
+    // Loop index stored in a frame slot (survives across the async boundary if
+    // the caller awaits the returned task, though in practice it is always
+    // already-done; entryAlloca keeps it in the entry block).
+    auto* iSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), iSlot);
+    builder_.CreateBr(loopBB);
+
+    // Loop header: if i < n → body; else all handlers done → success.
+    builder_.SetInsertPoint(loopBB);
+    llvm::Value* i = builder_.CreateLoad(i64(), iSlot);
+    builder_.CreateCondBr(builder_.CreateICmpSLT(i, n), bodyBB, successBB);
+
+    // Body: fetch handler closure; skip null (deactivated mid-raise, §24.5 #908).
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* iv      = builder_.CreateLoad(i64(), iSlot);
+    llvm::Value* closure = builder_.CreateCall(atFn, {srcPtr, iv}, "event.h");
+    llvm::Value* closNull = builder_.CreateICmpEQ(
+        closure, llvm::ConstantPointerNull::get(ptrTy()), "h.null");
+    builder_.CreateCondBr(closNull, skipBB, invokeBB);
+
+    // Invoke: call the async handler → Task*; await it synchronously.
+    builder_.SetInsertPoint(invokeBB);
+    llvm::Value* fnPtr  = builder_.CreateLoad(ptrTy(), closure, "h.fn");
+    llvm::Value* envSlot =
+        builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "h.env");
+    std::vector<llvm::Value*> callArgs;
+    callArgs.push_back(envPtr);
+    if (payloadLL) callArgs.push_back(payloadLL);
+    llvm::Value* handlerTask =
+        builder_.CreateCall(handlerFnTy, fnPtr, callArgs, "h.task");
+
+    // §24.5: block until the handler's task completes, then check for a fault.
+    auto* awaitFn = declareC("bz_task_await_sync", ptrTy(), {ptrTy()});
+    auto* isErrFn = declareC("bz_task_is_error",   i1(),    {ptrTy()});
+    builder_.CreateCall(awaitFn, {handlerTask});  // drain; result unused (Task)
+    llvm::Value* faulted =
+        builder_.CreateCall(isErrFn, {handlerTask}, "h.faulted");
+    builder_.CreateCondBr(faulted, faultBB, freeBB);
+
+    // Free handler task after a successful await, then continue the loop.
+    builder_.SetInsertPoint(freeBB);
+    auto* freeTaskFn =
+        declareC("bz_task_free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(freeTaskFn, {handlerTask});
+    builder_.CreateBr(contBB);
+
+    // §24.5: handler faulted — propagate the error through the outer task and
+    // stop (subsequent handlers are NOT invoked). bz_task_error_obj returns the
+    // raw exception-object pointer; the outer task does not own it (ownership
+    // transfers to the catching handler / unhandled boundary per the task ABI).
+    builder_.SetInsertPoint(faultBB);
+    auto* errObjFn   = declareC("bz_task_error_obj",
+                                 ptrTy(), {ptrTy()});
+    auto* complErrFn = declareC("bz_task_complete_error_obj",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+    llvm::Value* errObj =
+        builder_.CreateCall(errObjFn, {handlerTask}, "h.errobj");
+    builder_.CreateCall(complErrFn, {outerTask, errObj});
+    builder_.CreateCall(freeTaskFn, {handlerTask});
+    builder_.CreateBr(afterBB);  // outer task already completed with error
+
+    // Skip: null closure (deactivated mid-raise) — advance index, continue.
+    builder_.SetInsertPoint(skipBB);
+    builder_.CreateBr(contBB);
+
+    // Cont: advance the loop index.
+    builder_.SetInsertPoint(contBB);
+    llvm::Value* iv2 = builder_.CreateLoad(i64(), iSlot);
+    builder_.CreateStore(builder_.CreateAdd(iv2, builder_.getInt64(1)), iSlot);
+    builder_.CreateBr(loopBB);
+
+    // Success: all handlers invoked without fault; complete the outer Task.
+    builder_.SetInsertPoint(successBB);
+    auto* completeFn = declareC("bz_task_complete",
+                                 llvm::Type::getVoidTy(llvm_),
+                                 {ptrTy(), ptrTy(), i64()});
+    builder_.CreateCall(completeFn, {outerTask,
+                                     llvm::ConstantPointerNull::get(ptrTy()),
+                                     builder_.getInt64(0)});
+    builder_.CreateBr(afterBB);
+
+    // After: outer task is now complete (success or fault); return it.
+    builder_.SetInsertPoint(afterBB);
+    return outerTask;
+}
+
 bool Emitter::isIEventTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
@@ -8656,11 +8782,12 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         return std::nullopt;
     }
     const auto& method = ma->member;
-    const bool isSubscribe = method == "Subscribe" && call.args.size() == 1;
-    const bool isAdd       = method == "Add"       && call.args.size() == 1;
-    const bool isRemove    = method == "Remove"    && call.args.size() == 1;
-    const bool isRaise     = method == "Raise";
-    if (!isSubscribe && !isAdd && !isRemove && !isRaise)
+    const bool isSubscribe  = method == "Subscribe"  && call.args.size() == 1;
+    const bool isAdd        = method == "Add"        && call.args.size() == 1;
+    const bool isRemove     = method == "Remove"     && call.args.size() == 1;
+    const bool isRaise      = method == "Raise";
+    const bool isRaiseAsync = method == "RaiseAsync";
+    if (!isSubscribe && !isAdd && !isRemove && !isRaise && !isRaiseAsync)
         return std::nullopt;
 
     llvm::Value* src = eventSourcePtr(*ma->target);
@@ -8691,7 +8818,8 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         return std::optional<llvm::Value*>(nullptr);  // Remove returns unit
     }
 
-    // isRaise — per §24.5: invoke each subscribed handler with the payload.
+    // isRaise / isRaiseAsync — per §24.5: invoke each subscribed handler with
+    // the payload.
     // #737: gate payload lowering on the event's payload TYPE, not on the call
     // args being non-empty. For a no-payload event the explicit `Raise(())`
     // form passes the unit literal `()` as an arg — non-empty, but lowerExpr
@@ -8708,6 +8836,14 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         payloadLL = lowerExpr(*call.args[0].value);
         if (!payloadLL) return std::optional<llvm::Value*>(nullptr);
         payloadTy = payloadLL->getType();
+    }
+    if (isRaiseAsync) {
+        // §24.5 / §30: RaiseAsync returns a Task* (awaited by the caller).
+        // emitAsyncEventRaise calls each handler (which returns Task*), awaits
+        // each synchronously via bz_task_await_sync in order, and returns an
+        // already-done Task carrying either success or the first fault.
+        llvm::Value* task = emitAsyncEventRaise(src, payloadLL, payloadTy);
+        return std::optional<llvm::Value*>(task);
     }
     emitEventRaise(src, payloadLL, payloadTy);
     return std::optional<llvm::Value*>(nullptr);  // Raise returns unit

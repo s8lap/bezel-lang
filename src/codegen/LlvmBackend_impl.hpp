@@ -2618,14 +2618,14 @@ private:
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
             if (isAutoProperty(m)) out.push_back(m);
-            // per §24.1: each (instance, synchronous) event declaration gets a
-            // compiler-generated owned backing field of type EventSource<T>,
-            // laid out as a plain `ptr` slot. Static events (static owned field)
-            // and async events (AsyncEventSource<T>) are deferred — async isn't
-            // implemented and static-field events would need static-init.
+            // per §24.1 / §24.5 (#1176): each INSTANCE event declaration (sync
+            // or async) gets a compiler-generated owned backing field of type
+            // EventSource<T> / AsyncEventSource<T>, laid out as a plain `ptr`
+            // slot. Static events (static-init backed) are handled separately in
+            // the staticEventGlobals_ path and must not appear here.
             if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
                 if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                    if (!ed->isStatic && !ed->isAsync) out.push_back(m);
+                    if (!ed->isStatic) out.push_back(m);
                 }
             }
         }
@@ -6390,6 +6390,18 @@ private:
     // the no-payload unit form). `payloadLL`/`payloadTy` describe the argument.
     void emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
                         llvm::Type* payloadTy);
+
+    // per §24.5 / §30: emit the async-event raise sequence for `RaiseAsync` —
+    // invoke each subscribed handler closure (which returns a Task*) in
+    // subscription order, awaiting each handler's task synchronously before
+    // invoking the next (per §24.5: "each handler's task is awaited before the
+    // next is invoked"). If any handler's task faults, subsequent handlers are
+    // not invoked and the fault is carried in the returned Task. Returns a
+    // Task* that is always already-done on return (enabling the caller's
+    // `await E.RaiseAsync(...)` to take the already-done fast path). The Task*
+    // is single-use (bz_task_free'd by the await site's freeTaskAfter path).
+    llvm::Value* emitAsyncEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
+                                     llvm::Type* payloadTy);
 
     // CG17/CG18/CG35: emit a call to `ms` with fully-built `args` (receiver
     // first for instance methods). Dynamic dispatch loads the receiver's

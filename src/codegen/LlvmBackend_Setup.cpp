@@ -2735,16 +2735,17 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
-    // #480 / §24.1 / §28: free each instance event's backing EventSource.
-    // emitInstanceInit allocated one bz_event_source_new per instance EventSymbol;
-    // those allocations are NOT visited by the FieldSymbol loop above because
-    // EventSymbol does not inherit from FieldSymbol and the dynamic_cast returns
-    // null.  Collect all instance-event symbols that have a fieldIndex_ entry
-    // (synchronous non-static events, the same predicate as collectInstanceStorage)
-    // and emit a null-guarded bz_event_source_free call for each, then store null
-    // back so a re-entrant dispose is a no-op.  Ordering relative to FieldSymbol
-    // disposals is not safety-critical: EventSource.free (handler array + struct)
-    // does not cascade into any owned sub-objects tracked by this class.
+    // #480 / §24.1 / §24.5 / §28 (#1176): free each instance event's backing
+    // EventSource. emitInstanceInit allocated one bz_event_source_new per
+    // instance EventSymbol (sync and async); those allocations are NOT visited
+    // by the FieldSymbol loop above because EventSymbol does not inherit from
+    // FieldSymbol and the dynamic_cast returns null.  Collect all instance-event
+    // symbols that have a fieldIndex_ entry (non-static events, the same
+    // predicate as collectInstanceStorage) and emit a null-guarded
+    // bz_event_source_free call for each, then store null back so a re-entrant
+    // dispose is a no-op.  Ordering relative to FieldSymbol disposals is not
+    // safety-critical: EventSource.free (handler array + struct) does not
+    // cascade into any owned sub-objects tracked by this class.
     llvm::StructType* st = classStruct(ts);
     auto* freeFn = declareC("bz_event_source_free",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -2752,7 +2753,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         auto* es = dynamic_cast<const sema::EventSymbol*>(m);
         if (!es) continue;
         auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-        if (!ed || ed->isStatic || ed->isAsync) continue;  // instance sync only
+        if (!ed || ed->isStatic) continue;  // instance events (sync + async)
         auto idxIt = fieldIndex_.find(es);
         if (idxIt == fieldIndex_.end()) continue;
         unsigned idx = idxIt->second;
@@ -4915,7 +4916,7 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         // emitted even when the class has only events and no other owned fields.
         if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
             if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                if (!ed->isStatic && !ed->isAsync &&
+                if (!ed->isStatic &&
                     fieldIndex_.find(es) != fieldIndex_.end()) {
                     hasOwnedToClean = true;
                     break;
@@ -5014,9 +5015,9 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
 void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                                llvm::StructType* st) {
     // Own (non-inherited) instance storage only: `t`'s own non-static fields,
-    // auto-properties, and instance/sync event backing fields — in declaration
-    // order (the same per-member shape collectInstanceStorage records, minus the
-    // base-first recursion).
+    // auto-properties, and instance event backing fields (sync + async per
+    // §24.5 / #1176) — in declaration order (the same per-member shape
+    // collectInstanceStorage records, minus the base-first recursion).
     std::vector<const sema::Symbol*> storage;
     for (const sema::Symbol* m : t->members) {
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
@@ -5024,7 +5025,7 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         if (isAutoProperty(m)) { storage.push_back(m); continue; }
         if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
             if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                if (!ed->isStatic && !ed->isAsync) storage.push_back(m);
+                if (!ed->isStatic) storage.push_back(m);
             }
         }
     }
