@@ -122,3 +122,193 @@ BEZEL_TEST(parse_overloads_747, int_tryparse_in_range_unaffected_1134) {
         "  return (v if ok else 0); "                          // 123
         "end Main; end F;"), 123);
 }
+
+// ── #1227 / §9.1: int.Parse / int.TryParse reject invalid input ───────────────
+// Parse("abc") / ("") / ("123abc") raise FormatException; TryParse leaves
+// out=0 (the default) on failure, not the partial-parse value.
+// Authority: stdlib §9.1 + §9.3 strict-fault model ("no surrounding whitespace;
+// callers trim explicitly").
+
+// int.Parse("abc") — leading non-numeric → FormatException.
+BEZEL_TEST(parse_overloads_747, int_parse_non_numeric_throws_1227) {
+    // stdlib §9.1: Parse raises FormatException for non-numeric input.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := int.Parse(\"abc\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// int.Parse("") — empty string → FormatException.
+BEZEL_TEST(parse_overloads_747, int_parse_empty_throws_1227) {
+    // stdlib §9.1: empty string is not a valid integer representation.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := int.Parse(\"\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// int.Parse("123abc") — trailing garbage → FormatException.
+BEZEL_TEST(parse_overloads_747, int_parse_trailing_garbage_throws_1227) {
+    // stdlib §9.1: every character in the string must be part of the numeric
+    // representation; trailing non-numeric chars raise FormatException.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := int.Parse(\"123abc\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// int.TryParse("123abc", out v): false, v=0 (not the partial value 123).
+BEZEL_TEST(parse_overloads_747, int_tryparse_trailing_garbage_zeroes_out_1227) {
+    // stdlib §9.1/§9.3: TryParse returns false in every case where Parse
+    // would raise; the out parameter receives the default (0).
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var v: int := 99; "
+        "  var ok: bool := int.TryParse(\"123abc\", out v); "
+        "  return (v if not ok else 1); "  // ok=false, v must be 0
+        "end Main; end F;"), 0);
+}
+
+// long.Parse("abc") — non-numeric → FormatException.
+BEZEL_TEST(parse_overloads_747, long_parse_non_numeric_throws_1227) {
+    // stdlib §9.1: same strict-fault model applies to long.Parse.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := long.Parse(\"abc\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// long.Parse("123abc") — trailing garbage → FormatException.
+BEZEL_TEST(parse_overloads_747, long_parse_trailing_garbage_throws_1227) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := long.Parse(\"123abc\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// long.Parse("9223372036854775807") (Int64.MaxValue) — valid, no throw.
+BEZEL_TEST(parse_overloads_747, long_parse_maxvalue_valid_1227) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var x := long.Parse(\"9223372036854775807\"); return 42; "
+        "end Main; end F;"), 42);
+}
+
+// ── #1227 / §9.2: double.Parse / double.TryParse reject invalid input ─────────
+
+// double.Parse("abc") → FormatException.
+BEZEL_TEST(parse_overloads_747, double_parse_non_numeric_throws_1227) {
+    // stdlib §9.2: Parse raises FormatException for non-numeric input.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := double.Parse(\"abc\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// double.Parse("") — empty string → FormatException.
+BEZEL_TEST(parse_overloads_747, double_parse_empty_throws_1227) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := double.Parse(\"\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// double.Parse("1.5abc") — trailing garbage → FormatException.
+BEZEL_TEST(parse_overloads_747, double_parse_trailing_garbage_throws_1227) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var x := double.Parse(\"1.5abc\"); return 0; "
+        "  catch var e: FormatException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// double.Parse("1.5") — valid, no throw.
+BEZEL_TEST(parse_overloads_747, double_parse_valid_unaffected_1227) {
+    // stdlib §9.2: valid numeric strings still parse correctly.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var x := double.Parse(\"1.5\"); return 42; "
+        "end Main; end F;"), 42);
+}
+
+// double.TryParse("1.5abc", out v): false, v=0.0 (not 1.5).
+BEZEL_TEST(parse_overloads_747, double_tryparse_trailing_garbage_zeroes_out_1227) {
+    // stdlib §9.2/§9.3: TryParse out param receives 0.0 on failure.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var v: double := 99.0; "
+        "  var ok: bool := double.TryParse(\"1.5abc\", out v); "
+        "  return (int(v) if not ok else 1); "  // ok=false, v must be 0.0
+        "end Main; end F;"), 0);
+}
+
+// ── #1231 / §6.1: Math.Abs(MinValue) raises OverflowException ─────────────────
+// |int.MinValue| = 2147483648 is not representable as int (max is 2147483647).
+// |long.MinValue| similarly. Per §6.1: operations whose result is not in range
+// raise OverflowException.
+
+// Math.Abs(int.MinValue) → OverflowException.
+BEZEL_TEST(parse_overloads_747, math_abs_int_minvalue_throws_1231) {
+    // stdlib §2.2 Abs(x: int): int, §6.1: overflow raises OverflowException.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var r := Math.Abs(int.MinValue); return 0; "
+        "  catch var e: OverflowException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// Math.Abs(long.MinValue) → OverflowException.
+BEZEL_TEST(parse_overloads_747, math_abs_long_minvalue_throws_1231) {
+    // stdlib §2.2 Abs(x: long): long, §6.1: overflow raises OverflowException.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  try "
+        "    var r := Math.Abs(long.MinValue); return 0; "
+        "  catch var e: OverflowException => return 1; "
+        "  end; "
+        "end Main; end F;"), 1);
+}
+
+// Math.Abs(-5) → 5 (unchanged — non-MinValue inputs still work).
+BEZEL_TEST(parse_overloads_747, math_abs_neg5_unaffected_1231) {
+    // stdlib §2.2: Abs(-5) = 5; OverflowException guard must not fire here.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  return Math.Abs(0 - 5); "  // 5
+        "end Main; end F;"), 5);
+}
+
+// Math.Abs(-2147483647) = 2147483647 (MaxValue, representable, no throw).
+BEZEL_TEST(parse_overloads_747, math_abs_near_minvalue_unaffected_1231) {
+    // stdlib §2.2: Abs(MinValue + 1) = MaxValue, no overflow.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F public static method Main(): int "
+        "  var r := Math.Abs(int.MinValue + 1); "  // 2147483647 = MaxValue
+        "  return (42 if r = int.MaxValue else 0); "
+        "end Main; end F;"), 42);
+}

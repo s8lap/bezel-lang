@@ -5665,7 +5665,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         {arg->getType()});
                     return builder_.CreateCall(fabsFn, {arg}, "abs.result");
                 }
-                // Abs for int — select(n<0, -n, n)
+                // Abs for int/long — check MinValue first (#1231 / §6.1):
+                // |int.MinValue| and |long.MinValue| are not representable as
+                // int/long respectively, so raise OverflowException per the
+                // checked-arithmetic rule (same as integer overflow in §6.1).
+                {
+                    bool isL = arg->getType()->isIntegerTy(64);
+                    int64_t minV = isL ? INT64_MIN : INT32_MIN;
+                    llvm::Value* minConst = llvm::ConstantInt::getSigned(
+                        arg->getType(), minV);
+                    llvm::Value* isMin = builder_.CreateICmpEQ(
+                        arg, minConst, "abs.ismin");
+                    emitGuardThrow(isMin, "OverflowException");
+                }
                 llvm::Value* neg = builder_.CreateNeg(arg, "abs.neg");
                 llvm::Value* isNeg = builder_.CreateICmpSLT(
                     arg, llvm::ConstantInt::get(arg->getType(), 0));
@@ -7728,7 +7740,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return builder_.CreateICmpEQ(ai, bi, "bw.eq");
     }
 
-    // double.TryParse / float.TryParse(s, out result): bool — stdlib §5.2
+    // double.TryParse / float.TryParse(s, out result): bool — stdlib §9.2
+    // #1227: on failure, out result receives the default (0.0), not the partial
+    // parse value (e.g. 1.5 for "1.5abc"). Per §9.3: "TryParse returns false
+    // in every case where Parse would raise"; the out param gets the default.
     if (m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value &&
         (pt == P::Double || pt == P::Float)) {
@@ -7741,28 +7756,43 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // strtod(data, &endptr)
         auto* strtodFn = declareC("strtod",
             llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
-        auto* endSlot = entryAlloca(ptrTy());
+        auto* endSlotD = entryAlloca(ptrTy());
         llvm::Value* valD = builder_.CreateCall(
-            strtodFn, {strData, endSlot}, "tryp.d");
-        llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
-        llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryp.adv");
-        auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* endCh = builder_.CreateLoad(i8Ty3, endPtr, "tryp.end");
-        llvm::Value* atNul = builder_.CreateICmpEQ(
-            endCh, llvm::ConstantInt::get(i8Ty3, 0), "tryp.nul");
-        llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "tryp.ok");
+            strtodFn, {strData, endSlotD}, "tryp.d");
+        llvm::Value* endPtrD = builder_.CreateLoad(ptrTy(), endSlotD);
+        // ok = (endPtr != strData) AND (*endPtr == '\0') AND first char not whitespace
+        // per §9.3: no surrounding whitespace is accepted.
+        auto* i8TyD = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* fcD = builder_.CreateLoad(i8TyD, strData, "tryp.fc");
+        llvm::Value* fcWsD = builder_.CreateICmpULE(
+            fcD, llvm::ConstantInt::get(i8TyD, ' '), "tryp.fws");
+        llvm::Value* advD = builder_.CreateICmpNE(endPtrD, strData, "tryp.adv");
+        llvm::Value* endChD = builder_.CreateLoad(i8TyD, endPtrD, "tryp.end");
+        llvm::Value* atNulD = builder_.CreateICmpEQ(
+            endChD, llvm::ConstantInt::get(i8TyD, 0), "tryp.nul");
+        llvm::Value* okD = builder_.CreateAnd(
+            builder_.CreateNot(fcWsD),
+            builder_.CreateAnd(advD, atNulD), "tryp.ok");
+        // Store 0.0 on failure, parsed value on success (§9.3: out = default on false).
+        auto* dblTy = llvm::Type::getDoubleTy(llvm_);
+        llvm::Value* zeroD = llvm::ConstantFP::get(dblTy, 0.0);
+        llvm::Value* selD = builder_.CreateSelect(okD, valD, zeroD, "tryp.sel");
         if (pt == P::Float) {
+            auto* fltTy = llvm::Type::getFloatTy(llvm_);
             builder_.CreateStore(
-                builder_.CreateFPTrunc(valD, llvm::Type::getFloatTy(llvm_)), outAddr);
+                builder_.CreateFPTrunc(selD, fltTy), outAddr);
         } else {
-            builder_.CreateStore(valD, outAddr);
+            builder_.CreateStore(selD, outAddr);
         }
-        return ok;
+        return okD;
     }
 
-    // int.TryParse(s, out result): bool — stdlib §5.2
-    // Returns true and sets result if s is a valid integer; false and sets
-    // result to 0 otherwise.
+    // int.TryParse / long.TryParse(s, out result): bool — stdlib §9.1
+    // Returns true and sets result if s is a valid integer in range;
+    // false and sets result to 0 (default) otherwise.
+    // #1227: on failure, out result receives 0, not the partial parse value.
+    // Per §9.3: "TryParse returns false in every case where Parse would raise";
+    // the out param gets the default.  No surrounding whitespace is accepted.
     if (m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value &&
         (pt == P::Int || pt == P::Long)) {
@@ -7773,25 +7803,32 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Type* et = nullptr;
         llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
         if (!outAddr) return nullptr;
-        // strtol(data, &endptr, 10) for validation.
-        auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
-        auto* endSlot = entryAlloca(ptrTy());
+        // strtoll(data, &endptr, 10) for validation.
+        auto* strtollFnT = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        auto* endSlotI = entryAlloca(ptrTy());
         llvm::Value* val64 = builder_.CreateCall(
-            strtolFn, {strData, endSlot, builder_.getInt32(10)}, "tryp.val");
-        llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
-        // ok = (endPtr != strData) && (*endPtr == '\0')
-        llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryp.adv");
-        auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* endCh = builder_.CreateLoad(i8Ty2, endPtr, "tryp.end");
-        llvm::Value* atNul = builder_.CreateICmpEQ(
-            endCh, llvm::ConstantInt::get(i8Ty2, 0), "tryp.nul");
-        llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "tryp.ok");
-        // Store result.
+            strtollFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
+        llvm::Value* endPtrI = builder_.CreateLoad(ptrTy(), endSlotI);
+        // ok = first-char not whitespace AND (endPtr != strData) AND (*endPtr == '\0')
+        auto* i8TyI = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* fcI = builder_.CreateLoad(i8TyI, strData, "tryp.fc");
+        llvm::Value* fcWsI = builder_.CreateICmpULE(
+            fcI, llvm::ConstantInt::get(i8TyI, ' '), "tryp.fws");
+        llvm::Value* advI = builder_.CreateICmpNE(endPtrI, strData, "tryp.adv");
+        llvm::Value* endChI = builder_.CreateLoad(i8TyI, endPtrI, "tryp.end");
+        llvm::Value* atNulI = builder_.CreateICmpEQ(
+            endChI, llvm::ConstantInt::get(i8TyI, 0), "tryp.nul");
+        llvm::Value* ok = builder_.CreateAnd(
+            builder_.CreateNot(fcWsI),
+            builder_.CreateAnd(advI, atNulI), "tryp.ok");
+        // Store result: 0 on failure, parsed value on success.
         if (pt == P::Long) {
-            builder_.CreateStore(val64, outAddr);
+            llvm::Value* zero64 = builder_.getInt64(0);
+            llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
+            builder_.CreateStore(sel64, outAddr);
         } else {
-            // #1134 / stdlib §5.2: int.TryParse must return FALSE for an
-            // out-of-range value, not silently wrap the low 32 bits. strtol on a
+            // #1134 / stdlib §9.1: int.TryParse must return FALSE for an
+            // out-of-range value, not silently wrap the low 32 bits. strtoll on a
             // 64-bit platform returns the full magnitude, so range-check it.
             llvm::Value* inRange = builder_.CreateAnd(
                 builder_.CreateICmpSGE(
@@ -7800,7 +7837,11 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     val64, llvm::ConstantInt::getSigned(i64(), INT32_MAX)),
                 "tryp.inrange");
             ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
-            builder_.CreateStore(builder_.CreateTrunc(val64, i32()), outAddr);
+            // On failure, store 0; on success store the truncated value.
+            llvm::Value* trunc32 = builder_.CreateTrunc(val64, i32());
+            llvm::Value* zero32 = builder_.getInt32(0);
+            llvm::Value* sel32 = builder_.CreateSelect(ok, trunc32, zero32, "tryp.sel");
+            builder_.CreateStore(sel32, outAddr);
         }
         return ok;
     }
@@ -7933,15 +7974,38 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             llvm::Value* data = loadStringData(arg);
             if (pt == P::Int || pt == P::UInt || pt == P::Short ||
                 pt == P::UShort || pt == P::Byte || pt == P::SByte) {
-                // #1134 / stdlib §5.2: parse at full 64-bit width via strtoll,
+                // #1134 / stdlib §9.1: parse at full 64-bit width via strtoll,
                 // then OverflowException if the value is outside the target
                 // type's range — `atoi` silently truncated an out-of-range string
                 // to the low 32 bits (e.g. int.Parse("99999999999") → garbage).
-                auto* strtollFn =
+                // #1227 / §9.1: also reject empty, non-numeric, trailing-garbage,
+                // and leading-whitespace input → FormatException.  Per §9.3 (the
+                // normative "strict-fault model" that applies throughout §9.1):
+                // surrounding whitespace is not accepted; callers that mean to
+                // accept padded input trim explicitly.
+                auto* strtollFnP =
                     declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
-                auto* endSlot = entryAlloca(ptrTy());
+                auto* endSlotP = entryAlloca(ptrTy());
                 llvm::Value* v64 = builder_.CreateCall(
-                    strtollFn, {data, endSlot, builder_.getInt32(10)}, "parse.v");
+                    strtollFnP, {data, endSlotP, builder_.getInt32(10)}, "parse.v");
+                // FormatException guard: first char must not be whitespace, the
+                // conversion must have advanced the pointer (at least one char
+                // consumed), and there must be no trailing garbage.
+                auto* i8TyP = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcP = builder_.CreateLoad(i8TyP, data, "parse.fc");
+                llvm::Value* fcWsP = builder_.CreateICmpULE(
+                    fcP, llvm::ConstantInt::get(i8TyP, ' '), "parse.fws");
+                llvm::Value* endPtrP = builder_.CreateLoad(ptrTy(), endSlotP, "parse.ep");
+                llvm::Value* advP = builder_.CreateICmpNE(endPtrP, data, "parse.adv");
+                llvm::Value* endChP = builder_.CreateLoad(i8TyP, endPtrP, "parse.ech");
+                llvm::Value* atNulP = builder_.CreateICmpEQ(
+                    endChP, llvm::ConstantInt::get(i8TyP, 0), "parse.nul");
+                llvm::Value* validFmt = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsP),
+                    builder_.CreateAnd(advP, atNulP), "parse.vfmt");
+                emitGuardThrow(builder_.CreateNot(validFmt, "parse.fmt.bad"),
+                               "FormatException");
+                // Range check → OverflowException.
                 int64_t lo, hi;
                 switch (pt) {
                     case P::Int:    lo = INT32_MIN; hi = INT32_MAX;   break;
@@ -7962,22 +8026,57 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                            : builder_.CreateTrunc(v64, lowerPrimitive(pt));
             }
             if (pt == P::Long || pt == P::ULong) {
-                auto* atollFn = module_->getFunction("atoll");
-                if (!atollFn) {
-                    auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
-                    atollFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
-                }
-                return builder_.CreateCall(atollFn, {data});
+                // #1227 / §9.1: use strtoll (not atoll) so we can validate the
+                // input.  Reject empty, non-numeric leading chars, trailing
+                // garbage, and leading whitespace → FormatException.
+                auto* strtollFnL =
+                    declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                auto* endSlotL = entryAlloca(ptrTy());
+                llvm::Value* v64L = builder_.CreateCall(
+                    strtollFnL, {data, endSlotL, builder_.getInt32(10)}, "parse.vL");
+                auto* i8TyL = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcL = builder_.CreateLoad(i8TyL, data, "parse.fcL");
+                llvm::Value* fcWsL = builder_.CreateICmpULE(
+                    fcL, llvm::ConstantInt::get(i8TyL, ' '), "parse.fwsL");
+                llvm::Value* endPtrL = builder_.CreateLoad(ptrTy(), endSlotL, "parse.epL");
+                llvm::Value* advL = builder_.CreateICmpNE(endPtrL, data, "parse.advL");
+                llvm::Value* endChL = builder_.CreateLoad(i8TyL, endPtrL, "parse.echL");
+                llvm::Value* atNulL = builder_.CreateICmpEQ(
+                    endChL, llvm::ConstantInt::get(i8TyL, 0), "parse.nulL");
+                llvm::Value* validL = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsL),
+                    builder_.CreateAnd(advL, atNulL), "parse.vfmtL");
+                emitGuardThrow(builder_.CreateNot(validL, "parse.fmtbadL"),
+                               "FormatException");
+                return v64L;
             }
             if (pt == P::Double || pt == P::Float) {
-                auto* atofFn = module_->getFunction("atof");
-                if (!atofFn) {
-                    auto* ft = llvm::FunctionType::get(llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
-                    atofFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atof", module_.get());
-                }
-                llvm::Value* d = builder_.CreateCall(atofFn, {data});
-                if (pt == P::Float) d = builder_.CreateFPTrunc(d, llvm::Type::getFloatTy(llvm_));
-                return d;
+                // #1227 / §9.2: use strtod (not atof) so we can validate the
+                // input.  Reject empty, non-numeric leading chars, trailing
+                // garbage, and leading whitespace → FormatException (per the
+                // strict-fault model in §9.3 which applies to all §9 Parse).
+                auto* strtodFnP = declareC("strtod",
+                    llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+                auto* endSlotF = entryAlloca(ptrTy());
+                llvm::Value* dVal = builder_.CreateCall(
+                    strtodFnP, {data, endSlotF}, "parse.dv");
+                auto* i8TyF = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcF = builder_.CreateLoad(i8TyF, data, "parse.fcF");
+                llvm::Value* fcWsF = builder_.CreateICmpULE(
+                    fcF, llvm::ConstantInt::get(i8TyF, ' '), "parse.fwsF");
+                llvm::Value* endPtrF = builder_.CreateLoad(ptrTy(), endSlotF, "parse.epF");
+                llvm::Value* advF = builder_.CreateICmpNE(endPtrF, data, "parse.advF");
+                llvm::Value* endChF = builder_.CreateLoad(i8TyF, endPtrF, "parse.echF");
+                llvm::Value* atNulF = builder_.CreateICmpEQ(
+                    endChF, llvm::ConstantInt::get(i8TyF, 0), "parse.nulF");
+                llvm::Value* validF = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsF),
+                    builder_.CreateAnd(advF, atNulF), "parse.vfmtF");
+                emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
+                               "FormatException");
+                if (pt == P::Float)
+                    dVal = builder_.CreateFPTrunc(dVal, llvm::Type::getFloatTy(llvm_));
+                return dVal;
             }
         }
         // If already the right type, just return it.
