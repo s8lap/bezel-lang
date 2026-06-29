@@ -4734,6 +4734,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // result folded to 0. Type the call as the operand's type so member
         // access on the result resolves. (Codegen routes the comparison through
         // the operand type's `CompareTo` — see tryLowerBuiltinClassCall.)
+        //
+        // #1215: nullable types are explicitly excluded. §14.2 states that a
+        // type-bound constraint (here `where T: IComparable<T>`) admits only
+        // non-nullable types — "nullable types do not themselves implement the
+        // interfaces of their non-nullable counterparts: a null value satisfies
+        // no interface contract." So `Math.Min(a, b)` where a,b: Box? is
+        // rejected with a §14.2 diagnostic (same rule as generic constraint
+        // enforcement elsewhere). The numeric primitive path above is unaffected
+        // (primitives are never nullable in these calls).
         if (auto* ma =
                 dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             if ((ma->member == "Min" || ma->member == "Max" ||
@@ -4754,8 +4763,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  // so member access on the returned borrow
                                  // resolves to the class's fields/methods.
                                  argTy->declaration->kind ==
-                                     ast::TypeDeclKind::Class))
-                                ctx_.setExprType(&ce, argTy);
+                                     ast::TypeDeclKind::Class)) {
+                                // #1215 / §14.2: nullable types do not satisfy
+                                // interface constraints — reject with a clean
+                                // diagnostic so the call never reaches codegen.
+                                if (argTy->nullable) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "nullable type `" +
+                                        std::string(argTy->declaration->name) +
+                                        "?` does not satisfy the `where T: "
+                                        "IComparable<T>` constraint — nullable "
+                                        "types do not implement interface "
+                                        "constraints (§14.2)");
+                                } else {
+                                    ctx_.setExprType(&ce, argTy);
+                                }
+                            }
                     }
                 }
             }

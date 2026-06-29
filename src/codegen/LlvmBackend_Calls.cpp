@@ -5612,7 +5612,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         auto comparableCompareTo =
             [&](const ast::Expr* e) -> sema::MethodSymbol* {
             const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
-            if (t && t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+            // #1215 / §14.2: nullable types do not satisfy IComparable<T> —
+            // sema already rejects them; guard here defensively so a nullable
+            // pointer is never passed as a CompareTo receiver (null deref).
+            if (t && !t->nullable &&
+                t->kind == sema::TypeRef::Kind::Named && t->declaration &&
                 (t->declaration->kind == ast::TypeDeclKind::Record ||
                  t->declaration->kind == ast::TypeDeclKind::Enum ||
                  // #1148: a CLASS that implements IComparable<T> (§14.2 / stdlib §2.2).

@@ -357,3 +357,60 @@ BEZEL_TEST(math_comparable_1148, clamp_class_in_range) {
         "  using var lo := new Box(99); using var hi := new Box(150); "
         "  return Math.Clamp<Box>(v, lo, hi).v;")), 120);
 }
+
+// ── #1215 / §14.2: Math.Min/Max/Clamp over a NULLABLE class IComparable ──────
+// §14.2 states that a type-bound constraint (e.g. `where T: IComparable<T>`)
+// admits only NON-NULLABLE types: "nullable types do not themselves implement
+// the interfaces of their non-nullable counterparts: a null value satisfies no
+// interface contract." So `Math.Min(a, b)` where a,b: Box? must be rejected at
+// sema with a §14.2 diagnostic — it must not silently reach codegen and produce
+// a null-pointer CompareTo dispatch. The three operations Min/Max/Clamp all go
+// through the same comparableCompareTo path so all three are tested.
+
+// #1215: Math.Min with nullable class args → sema error (§14.2).
+BEZEL_TEST(math_comparable_1215, min_nullable_class_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(
+        std::string(kBox) +
+        "class App public static method Main(): int "
+        "  using var a: Box? := new Box(150); using var b: Box? := new Box(99); "
+        "  return Math.Min(a, b).v;"
+        " end Main; end App;"));
+}
+
+// #1215: Math.Max with nullable class args → sema error (§14.2).
+BEZEL_TEST(math_comparable_1215, max_nullable_class_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(
+        std::string(kBox) +
+        "class App public static method Main(): int "
+        "  using var a: Box? := new Box(150); using var b: Box? := new Box(99); "
+        "  return Math.Max(a, b).v;"
+        " end Main; end App;"));
+}
+
+// #1215: Math.Clamp with nullable class args → sema error (§14.2).
+BEZEL_TEST(math_comparable_1215, clamp_nullable_class_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(
+        std::string(kBox) +
+        "class App public static method Main(): int "
+        "  using var v: Box? := new Box(120); "
+        "  using var lo: Box? := new Box(99); using var hi: Box? := new Box(150); "
+        "  return Math.Clamp(v, lo, hi).v;"
+        " end Main; end App;"));
+}
+
+// #1215: explicit type arg Box? (nullable) also rejected (§14.2).
+BEZEL_TEST(math_comparable_1215, min_nullable_explicit_type_arg_rejected) {
+    BEZEL_EXPECT_TRUE(hasSemaError(
+        std::string(kBox) +
+        "class App public static method Main(): int "
+        "  using var a: Box? := new Box(150); using var b: Box? := new Box(99); "
+        "  return Math.Min<Box?>(a, b).v;"
+        " end Main; end App;"));
+}
+
+// #1215: non-nullable class args are still accepted — regression control.
+BEZEL_TEST(math_comparable_1215, min_nonnull_class_still_works) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var a := new Box(150); using var b := new Box(99); "
+        "  return Math.Min(a, b).v;")), 99);
+}
