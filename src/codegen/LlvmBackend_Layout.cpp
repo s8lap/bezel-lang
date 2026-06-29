@@ -769,6 +769,24 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             if (rt->declaration &&
                 rt->declaration->kind == ast::TypeDeclKind::Enum)
                 return enumLlvmType(rt->declaration);
+            // fix #1220 (residual) / stdlib §4.8 / §5: DictionaryEntry<K,V> is
+            // the element type for a Dictionary LINQ pipeline. It is a synthetic
+            // Named TypeRef (importedName="DictionaryEntry", no declaration/astNode)
+            // with genericArgs=[K,V]. Lower it as a 2-field struct {K, V} — the
+            // same layout lowerDictEntryFor and lowerExpr's DictionaryEntry GEP
+            // path expect. Without this it fell to `i32`, so lowerLazyLinqFor
+            // allocated a 4-byte slot and the loop-body GEP on the DictionaryEntry
+            // fields crashed or loaded garbage.
+            if (!rt->declaration && !rt->astNode &&
+                (rt->importedName == "DictionaryEntry" ||
+                 rt->importedName == "DrainedEntry") &&
+                rt->genericArgs.size() >= 2 &&
+                rt->genericArgs[0] && rt->genericArgs[1]) {
+                llvm::Type* kTy = lowerTypeRef(rt->genericArgs[0]);
+                llvm::Type* vTy = lowerTypeRef(rt->genericArgs[1]);
+                if (kTy && vTy)
+                    return llvm::StructType::get(llvm_, {kTy, vTy});
+            }
             // stdlib §5 (#758): a lazy-LINQ enumerable sentinel TypeRef (Named
             // kind, null declaration/astNode, empty importedName, non-empty
             // genericArgs) is a heap `bz_lazy_t*`, not a value type — it falls

@@ -2968,6 +2968,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
                     }
+                    // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V>
+                    // is ICollection<DictionaryEntry<K,V>>, so LINQ operators
+                    // on a Dictionary receiver have DictionaryEntry<K,V> as the
+                    // source element type (same synthetic TypeRef the for-in sema
+                    // path builds).  Without this block, `d.Where(...)` was left
+                    // untyped, so the for-in over its result had a null iterable
+                    // type and the loop variable `kv` stayed untyped → codegen
+                    // fault.  Note: the lambda param seeding is handled separately
+                    // in linqLambdaElementType (also patched for this bug).
+                    if (colName == "Dictionary" &&
+                        recvTy && recvTy->genericArgs.size() >= 2 &&
+                        recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
+                        // Build DictionaryEntry<K,V> (same synthetic repr as
+                        // ExprTypecheck.cpp §4.8 for-in case).
+                        static const char kDictEntryLINQName[] = "DictionaryEntry";
+                        auto* entryTy = ctx_.makeTypeRef();
+                        entryTy->kind = TypeRef::Kind::Named;
+                        entryTy->declaration = nullptr;
+                        entryTy->astNode = nullptr;
+                        entryTy->importedName = kDictEntryLINQName;
+                        entryTy->genericArgs.push_back(recvTy->genericArgs[0]); // K
+                        entryTy->genericArgs.push_back(recvTy->genericArgs[1]); // V
+                        if (m == "Any" || m == "All")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        else if (m == "Count")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "First" || m == "Last" || m == "Single" ||
+                                 m == "ElementAt")
+                            ctx_.setExprType(&ce, entryTy);
+                        else if (m == "ToArray" || m == "ToSet")
+                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                m == "ToSet" ? "Set" : "Array", entryTy));
+                        else if (m == "Select" && !ce.args.empty() && ce.args[0].value) {
+                            TypeRef* outElem = entryTy;
+                            if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
+                                if (lamTy->kind == TypeRef::Kind::Function &&
+                                    lamTy->funcReturn)
+                                    outElem = lamTy->funcReturn;
+                            ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
+                        }
+                        // Where/Skip/Take/TakeWhile/SkipWhile/Distinct/OrderBy/
+                        // OrderByDescending/ThenBy/Concat/… → lazy IEnumerable<DictionaryEntry<K,V>>.
+                        else typeLinqOperator(entryTy);
+                    }
                     // §4.15 (#549): Array<T>.AsSpan() / AsSpan(start) /
                     // AsSpan(start,length) / AsSpan(range) → ArraySpan<T>.
                     // Array<T>.AsReadOnlySpan() and overloads → ReadOnlyArraySpan<T>.
@@ -5614,6 +5658,37 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     // genericArgs[0]. Without this seeding, a Range LINQ lambda's untyped param
     // (`(1L..n).Select((x) => x * 2L)`) was left untyped → codegen compiled the
     // selector with an i32 param while the body produced i64 → an IR mismatch.
+    //
+    // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> is
+    // ICollection<DictionaryEntry<K,V>> — its LINQ element type (and thus the
+    // predicate/selector lambda param) is DictionaryEntry<K,V>, NOT the key
+    // type K (genericArgs[0]).  Dictionary TypeRef has no declaration (it uses
+    // astNode->name->parts[0] == "Dictionary"); falling through to
+    // `return genericArgs[0]` below produces K (string), causing a dict .Where()
+    // lambda `(kv) => kv.Value > 2` to mis-type `kv` as string → the body's
+    // `.Value` access fails with "string member `.Value` is not supported".
+    // Build the same synthetic DictionaryEntry TypeRef the `for var e in d` sema
+    // path constructs (ExprTypecheck.cpp §4.8 case).
+    auto dictColName = [&]() -> std::string_view {
+        if (!recvTy->declaration && recvTy->astNode &&
+            recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty())
+            return recvTy->astNode->name->parts[0];
+        if (!recvTy->importedName.empty()) return recvTy->importedName;
+        return {};
+    }();
+    if ((dictColName == "Dictionary" || dictColName == "SortedDictionary") &&
+        recvTy->genericArgs.size() >= 2 && recvTy->genericArgs[1]) {
+        static const char kDictEntryName[] = "DictionaryEntry";
+        auto* entryTy = ctx_.makeTypeRef();
+        entryTy->kind = TypeRef::Kind::Named;
+        entryTy->declaration = nullptr;
+        entryTy->astNode = nullptr;
+        entryTy->importedName = kDictEntryName;
+        entryTy->genericArgs.push_back(recvTy->genericArgs[0]); // K
+        entryTy->genericArgs.push_back(recvTy->genericArgs[1]); // V
+        return entryTy;
+    }
     if (recvTy->declaration && recvTy->declaration->name != "Range")
         return nullptr;
     return recvTy->genericArgs[0];

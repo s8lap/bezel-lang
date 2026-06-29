@@ -13925,6 +13925,222 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     }
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
+    // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> LINQ source.
+    // Materialize the dictionary's entries into a fresh owned bz_array_t of
+    // {K,V} structs (same layout as lowerDictEntryFor), then wrap it as an
+    // owning lazy array source. `recv` is the dict ptr (already lowered above).
+    if (isDictTypeName(recvTy) && recvTy && recvTy->genericArgs.size() >= 2 &&
+        recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
+        const sema::TypeRef* keyTy = recvTy->genericArgs[0];
+        const sema::TypeRef* valTy = recvTy->genericArgs[1];
+
+        // Determine record / nullable-val flags for value (mirrors lowerDictEntryFor).
+        const sema::TypeSymbol* valRec =
+            (valTy->kind == sema::TypeRef::Kind::Named &&
+             valTy->declaration &&
+             valTy->declaration->kind == ast::TypeDeclKind::Record)
+                ? valTy->declaration : nullptr;
+        bool valNullableVal = isNullableValueTy(valTy);
+
+        llvm::Type* keyLlvm = lowerTypeRef(keyTy);
+        llvm::Type* valLlvm = lowerTypeRef(valTy);
+        if (keyLlvm && valLlvm) {
+            llvm::StructType* entryStTy =
+                llvm::StructType::get(llvm_, {keyLlvm, valLlvm});
+            const llvm::DataLayout& dl = module_->getDataLayout();
+            int64_t esz = (int64_t)dl.getTypeAllocSize(entryStTy);
+
+            bool useGen = genericBackingType(recvTy, 0, /*isSet=*/false, nullptr) != nullptr;
+            using K = sema::TypeRef::Kind;
+            bool isStringKey = keyTy->kind == K::Primitive &&
+                               keyTy->primitive == sema::PrimitiveType::String;
+
+            // Build element TypeRef for the lazy pipeline's element tracking.
+            {
+                auto* entryTy = ctx_.makeTypeRef();
+                entryTy->kind = sema::TypeRef::Kind::Named;
+                entryTy->declaration = nullptr;
+                entryTy->astNode = nullptr;
+                static const char kDictEntryMat[] = "DictionaryEntry";
+                entryTy->importedName = kDictEntryMat;
+                entryTy->genericArgs.push_back(
+                    const_cast<sema::TypeRef*>(keyTy));
+                entryTy->genericArgs.push_back(
+                    const_cast<sema::TypeRef*>(valTy));
+                elemRef = entryTy;
+            }
+
+            // --- snapshot keys + values ---
+            auto* keysOutSlot = entryAlloca(ptrTy());
+            auto* lensOutSlot = entryAlloca(ptrTy());
+            auto* cntSlot     = entryAlloca(i64());
+            auto* valsOutSlot = entryAlloca(ptrTy());
+
+            if (useGen) {
+                auto* kfn = declareC("bz_dict_keys_gen",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfn, {recv, keysOutSlot, cntSlot});
+                auto* vfn = declareC("bz_dict_values_gen",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(vfn, {recv, valsOutSlot, entryAlloca(i64())});
+            } else {
+                auto* kfn = declareC("bz_dict_keys_str",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfn,
+                    {recv, keysOutSlot, lensOutSlot, cntSlot});
+                auto* vfn = declareC("bz_dict_values_str",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(vfn, {recv, valsOutSlot, entryAlloca(i64())});
+            }
+
+            llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+            llvm::Value* lensArr = isStringKey
+                                       ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                                       : nullptr;
+            llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
+            llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+            // Allocate the result bz_array_t.
+            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* arr = builder_.CreateCall(
+                allocFn,
+                {builder_.getInt64(esz), builder_.getInt64(8)},
+                "dmat.arr");
+
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()});
+
+            // Decode loop — build entry structs and append to arr.
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* entrySlot = entryAlloca(entryStTy);
+
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "dmat.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dmat.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "dmat.end",  currentFn_);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(condBB);
+            {
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+            }
+
+            builder_.SetInsertPoint(bodyBB);
+            {
+                llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+
+                // --- decode key (mirrors lowerDictEntryFor) ---
+                llvm::Value* keyDecoded;
+                if (isStringKey) {
+                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                    auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                              {ptrTy(), ptrTy(), i64()});
+                    auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                    uint64_t strSz =
+                        dl.getTypeAllocSize(stringType());
+                    llvm::Value* kpPtr =
+                        builder_.CreateGEP(ptrTy(), keysArr, idxB);
+                    llvm::Value* kp   = builder_.CreateLoad(ptrTy(), kpPtr);
+                    llvm::Value* lpPtr =
+                        builder_.CreateGEP(i64(), lensArr, idxB);
+                    llvm::Value* kl   = builder_.CreateLoad(i64(), lpPtr);
+                    llvm::Value* dataSz =
+                        builder_.CreateAdd(kl, builder_.getInt64(1));
+                    llvm::Value* dataCpy =
+                        builder_.CreateCall(mallocFn, {dataSz});
+                    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
+                    llvm::Value* nulPtr =
+                        builder_.CreateGEP(i8Ty, dataCpy, kl);
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+                    llvm::Value* strObj = builder_.CreateCall(
+                        callocFn,
+                        {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+                    builder_.CreateStore(
+                        dataCpy,
+                        builder_.CreateStructGEP(stringType(), strObj, 0));
+                    builder_.CreateStore(
+                        kl,
+                        builder_.CreateStructGEP(stringType(), strObj, 1));
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(i8Ty, 1),
+                        builder_.CreateStructGEP(stringType(), strObj, 2));
+                    initStringRc(strObj);
+                    // Free the raw key bytes from bz_dict_keys_str (same as
+                    // lowerDictEntryFor's incBB per-slot free).
+                    builder_.CreateCall(freeFn, {kp});
+                    keyDecoded = strObj;
+                } else if (useGen) {
+                    llvm::Value* kpPtr =
+                        builder_.CreateGEP(ptrTy(), keysArr, idxB);
+                    llvm::Value* keyPtr =
+                        builder_.CreateLoad(ptrTy(), kpPtr);
+                    keyDecoded =
+                        builder_.CreateLoad(keyLlvm, keyPtr, "dmat.kgen");
+                    // Free the malloc'd raw-bytes key copy (same as
+                    // lowerDictEntryFor's incBB per-slot free for useGen).
+                    builder_.CreateCall(freeFn, {keyPtr});
+                } else {
+                    keyDecoded = llvm::Constant::getNullValue(keyLlvm);
+                }
+
+                // --- decode value (mirrors lowerDictEntryFor) ---
+                llvm::Value* vpPtr =
+                    builder_.CreateGEP(ptrTy(), valsArr, idxB);
+                llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
+                llvm::Value* valDecoded;
+                if (valRec) {
+                    valDecoded = builder_.CreateLoad(valLlvm, slotV, "dmat.vrec");
+                } else if (valNullableVal && valLlvm->isStructTy()) {
+                    valDecoded = builder_.CreateLoad(valLlvm, slotV, "dmat.vnv");
+                } else if (!valLlvm->isPointerTy()) {
+                    llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+                    if (valLlvm->isDoubleTy())
+                        valDecoded = builder_.CreateBitCast(asI64, valLlvm);
+                    else if (valLlvm->isFloatTy())
+                        valDecoded = builder_.CreateBitCast(
+                            builder_.CreateTrunc(asI64, i32()), valLlvm);
+                    else if (valLlvm->isIntegerTy(64))
+                        valDecoded = asI64;
+                    else
+                        valDecoded = builder_.CreateTrunc(asI64, valLlvm);
+                } else {
+                    valDecoded = slotV;
+                }
+
+                // Store key at field 0, value at field 1 and append.
+                builder_.CreateStore(
+                    keyDecoded,
+                    builder_.CreateStructGEP(entryStTy, entrySlot, 0));
+                builder_.CreateStore(
+                    valDecoded,
+                    builder_.CreateStructGEP(entryStTy, entrySlot, 1));
+                builder_.CreateCall(addFn,
+                    {arr, entrySlot, builder_.getInt64(esz)});
+                builder_.CreateStore(
+                    builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+            }
+
+            builder_.SetInsertPoint(endBB);
+            builder_.CreateCall(freeFn, {keysArr});
+            if (isStringKey)
+                builder_.CreateCall(freeFn, {lensArr});
+            builder_.CreateCall(freeFn, {valsArr});
+
+            auto* ownFn =
+                declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+            return builder_.CreateCall(ownFn,
+                {arr, builder_.getInt64(esz)}, "lazy.dict");
+        }
+    }
     // issue #775 / §16.3: a `Range<T>` is IEnumerable<T>. Wrap its value struct
     // { i64 start, i64 end, i64 step, i8 flags } as a lazy range source so the
     // receiver-position operators (Count/Where/Select/Sum/…) enumerate it. An
@@ -14049,7 +14265,15 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // materializes it via bz_str_to_char_array so LINQ operators can enumerate it.
     bool strRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Primitive &&
                    recvTy->primitive == sema::PrimitiveType::String;
-    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv)
+    // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> is
+    // ICollection<DictionaryEntry<K,V>> — LINQ operators on a Dictionary
+    // materialize its entries into a lazy array of {K,V} structs via
+    // lowerToLazyEnumerator's Dictionary branch (see below).
+    bool dictRecv = isDictTypeName(recvTy) &&
+                    recvTy && recvTy->genericArgs.size() >= 2 &&
+                    recvTy->genericArgs[0] && recvTy->genericArgs[1];
+    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv &&
+        !dictRecv)
         return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.

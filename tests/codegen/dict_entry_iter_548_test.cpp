@@ -236,3 +236,47 @@ BEZEL_TEST(dict_entry_iter_548, owned_dict_still_rejected) {
         BEZEL_EXPECT_TRUE(r.exitCode != 42);
     }
 }
+
+// ---------------------------------------------------------------------------
+// fix #1220 (residual) / stdlib §4.8 / §5: Dictionary LINQ predicate lambda
+// param must be DictionaryEntry<K,V>, not the key type K.
+// ---------------------------------------------------------------------------
+
+// #1220 / stdlib §4.8 / §5: d.Where((kv) => kv.Value > 2) on a
+// Dictionary<string,int>.  "a"→1, "b"→5 — only "b" matches, count = 1.
+BEZEL_TEST(dict_entry_iter_548, linq_where_value_predicate_1220) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d[\"a\"] := 1; d[\"b\"] := 5; "
+        "  var n := 0; "
+        "  for var kv in d.Where((kv) => kv.Value > 2) do n := n + 1; end; "
+        "  return n; "
+        "end Main; end C;"), 1);
+}
+
+// #1220 / stdlib §4.8 / §5: d.Where((kv) => kv.Key = "a") on a
+// Dictionary<string,int>.  "a"→1, "b"→5 — only "a" matches, count = 1.
+BEZEL_TEST(dict_entry_iter_548, linq_where_key_predicate_1220) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d[\"a\"] := 1; d[\"b\"] := 5; "
+        "  var n := 0; "
+        "  for var kv in d.Where((kv) => kv.Key = \"a\") do n := n + 1; end; "
+        "  return n; "
+        "end Main; end C;"), 1);
+}
+
+// #1220 / stdlib §4.8 / §5: verify plain `for var kv in d` (no LINQ) still
+// works after the fix — regression guard (entry elem type must not be affected).
+BEZEL_TEST(dict_entry_iter_548, plain_forin_unaffected_1220) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d[\"x\"] := 3; d[\"y\"] := 7; "
+        "  var sum := 0; "
+        "  for var kv in d do sum := sum + kv.Value; end; "
+        "  return sum; "
+        "end Main; end C;"), 10);
+}
