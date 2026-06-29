@@ -179,3 +179,55 @@ BEZEL_TEST(send_600_runtime,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
+
+// ---------------------------------------------------------------------------
+// §30.14 / fix #1228: Domain.Spawn with a non-capturing lambda entry.
+//
+// The spec (§30.14) lists non-capturing lambdas as valid spawn entries:
+//   Domain.Spawn(entry: () -> ()): owned Task
+// A codegen bug caused SIGSEGV at runtime: the lambda closure cell was not
+// passed as the adapter arg, so the spawned domain's call dereferenced a null
+// closure. Fix: build a spawn adapter that loads fn+env from the closure cell
+// and calls fn(env); release the closure in the spawned domain.
+// ---------------------------------------------------------------------------
+
+// §30.14 / #1228: expression-body non-capturing lambda spawn runs without crash.
+// The lambda calls Console.WriteLine — a void-returning spawn-entry pattern.
+BEZEL_TEST(send_600_runtime,
+           spawn_noncapturing_lambda_expr_body_runs_1228) {
+    // spawn entry is a non-capturing expression-body lambda.
+    // The spawned domain must complete without SIGSEGV/SIGABRT (exit 139/134).
+    auto r = runJit(
+        "module M; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Domain.Spawn(() => Console.WriteLine(\"hi\")); "
+        "    await t; "
+        "    return 42; "
+        "  end Main; "
+        "end Program;");
+    // §30.14: entry ran in spawned domain; join completed; exit code = 42.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// §30.14 / #1228: block-body non-capturing lambda spawn runs without crash.
+// The block body performs a side-effect; the spawning domain returns a value.
+BEZEL_TEST(send_600_runtime,
+           spawn_noncapturing_lambda_block_body_runs_1228) {
+    // spawn entry is a non-capturing block-body lambda.
+    auto r = runJit(
+        "module M; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Domain.Spawn(() => do "
+        "      Console.WriteLine(\"block\"); "
+        "    end); "
+        "    await t; "
+        "    return 7; "
+        "  end Main; "
+        "end Program;");
+    // §30.14: block-body lambda entry ran; join completed; exit code = 7.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}

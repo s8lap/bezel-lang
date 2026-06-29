@@ -16332,7 +16332,123 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // Resolve the entry method symbol.
             sema::MethodSymbol* entryMs =
                 dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*entryExpr));
-            if (!entryMs) return nullptr;
+
+            // §30.14 / fix #1228: non-capturing lambda as Domain.Spawn entry.
+            // The spec allows `() => expr` and block-body lambdas as spawn entries
+            // alongside static method refs. A non-capturing lambda lowers to a
+            // closure cell { fn_ptr, env_ptr=null, rc=1, envdtor=null }. We build a
+            // spawn adapter that loads fn+env from the cell, calls fn(env), releases
+            // the closure, and returns null. The cell is the bz_domain_spawn arg
+            // (ownership transferred — no caller-side release). per §30.14 / §27.5.
+            if (!entryMs) {
+                if (auto* lamExpr =
+                        dynamic_cast<const ast::LambdaExpr*>(entryExpr)) {
+                    // Only handle zero-extra-arg form: Domain.Spawn(() => …).
+                    // Lambda-with-param-plus-extra-arg entries not yet handled.
+                    if (call.args.size() == 1) {
+                        // 1. Lower the lambda → closure cell (inline transient).
+                        llvm::Value* closureCell = lowerLambda(*lamExpr);
+                        if (!closureCell) return nullptr;
+
+                        // 2. Compute the lambda fn's LLVM return type, mirroring
+                        //    lowerLambda's retTy logic so the indirect call type-
+                        //    checks in IR. fn signature: (ptr env_ptr) -> lamRetTy.
+                        llvm::Type* lamRetTy = i32();  // default (unresolved)
+                        if (lamExpr->isAsync) {
+                            // async lambda: state machine wraps into Task → ptr.
+                            lamRetTy = ptrTy();
+                        } else if (lamExpr->exprBody) {
+                            if (sema::TypeRef* rt =
+                                    ctx_.exprType(*lamExpr->exprBody))
+                                lamRetTy = lowerTypeRef(rt);
+                            else if (isLambdaExprBodyVoidBuiltin(*lamExpr))
+                                lamRetTy = llvm::Type::getVoidTy(llvm_);
+                        } else {
+                            // Block-body: use the sema-inferred funcReturn.
+                            if (sema::TypeRef* lamTy =
+                                    ctx_.exprType(*lamExpr)) {
+                                if (lamTy->kind ==
+                                        sema::TypeRef::Kind::Function &&
+                                        lamTy->funcReturn) {
+                                    llvm::Type* inf =
+                                        lowerTypeRef(lamTy->funcReturn);
+                                    if (inf != i32()) lamRetTy = inf;
+                                }
+                            }
+                        }
+                        // Lambda fn LLVM type: (ptr env_ptr) -> lamRetTy.
+                        auto* lamFnTy = llvm::FunctionType::get(
+                            lamRetTy, {ptrTy()}, false);
+
+                        // 3. Build spawn adapter: void* adapter(void* arg)
+                        //    where arg = closure cell. Loads fn+env from the cell,
+                        //    calls fn(env), releases the closure, returns null.
+                        static std::atomic<unsigned> spawnLamCtr{0};
+                        std::string aName = "spawn.lam$" +
+                            std::to_string(spawnLamCtr.fetch_add(1));
+                        auto* aTy = llvm::FunctionType::get(
+                            ptrTy(), {ptrTy()}, false);
+                        auto* adapter = llvm::Function::Create(
+                            aTy, llvm::Function::InternalLinkage,
+                            aName, module_.get());
+
+                        {
+                            llvm::Function*   svFn   = currentFn_;
+                            llvm::Value*      svThis = currentThis_;
+                            llvm::BasicBlock* svBB   = builder_.GetInsertBlock();
+
+                            currentFn_   = adapter;
+                            currentThis_ = nullptr;
+                            auto* aBB = llvm::BasicBlock::Create(
+                                llvm_, "entry", adapter);
+                            builder_.SetInsertPoint(aBB);
+
+                            llvm::Value* cellArg = adapter->getArg(0);
+
+                            // Load fn_ptr from closure cell slot 0.
+                            llvm::Value* fnPtr = builder_.CreateLoad(
+                                ptrTy(), cellArg, "spawn.lam.fn");
+                            // Load env_ptr from closure cell slot 1 (offset 8).
+                            llvm::Value* envSlot = builder_.CreateGEP(
+                                ptrTy(), cellArg,
+                                {builder_.getInt32(1)},
+                                "spawn.lam.env.slot");
+                            llvm::Value* envPtr = builder_.CreateLoad(
+                                ptrTy(), envSlot, "spawn.lam.env");
+
+                            // Invoke lambda: fn_ptr(env_ptr).
+                            builder_.CreateCall(lamFnTy, fnPtr, {envPtr});
+
+                            // Release closure cell in the spawned domain.
+                            // Non-capturing lambda: rc=1→0, env=null, envdtor=null
+                            // → free(cell). Caller transfers ownership on spawn;
+                            // no caller-side release → no double-free. §28.9/§27.5.
+                            auto* relFn = declareC(
+                                "bz_closure_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(relFn, {cellArg});
+
+                            builder_.CreateRet(
+                                llvm::ConstantPointerNull::get(ptrTy()));
+
+                            currentFn_   = svFn;
+                            currentThis_ = svThis;
+                            if (svBB) builder_.SetInsertPoint(svBB);
+                        }
+
+                        // 4. bz_domain_spawn(adapter, closureCell, dfe_vtable).
+                        //    closureCell is the arg; ownership transferred to the
+                        //    spawned domain's adapter — no caller-side release.
+                        auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
+                                                 {ptrTy(), ptrTy(), ptrTy()});
+                        return builder_.CreateCall(
+                            spawnFn,
+                            {adapter, closureCell, getDFEVtable()},
+                            "domain.spawn");
+                    }
+                }
+                return nullptr;
+            }
 
             // Find the actual LLVM function for the method.
             auto mfIt = methodFns_.find(entryMs);
