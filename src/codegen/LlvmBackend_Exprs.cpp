@@ -2598,6 +2598,29 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
                     llvm::Value* excObj = builder_.CreateCall(
                         errObjFn, {task}, "result.errobj");
+                    // §30.4 / §30.9 (#1196): for a BOUND task (`t.Result` where
+                    // `t` is a local variable, not an anonymous CallExpr producer)
+                    // the error_obj is BORROWED from the task — the task still holds
+                    // a reference and disposes error_obj when its own scope ends
+                    // (emitDisposals §30.5 task-disposal path, LlvmBackend_Setup.cpp
+                    // ~L12534). Mark it borrowed so the catching handler
+                    // (caughtException path in emitDisposals, ~L12140) skips reclaim
+                    // and only unmarks it. Without this mark, the catch arm frees
+                    // error_obj first, then the task scope-end disposes it again →
+                    // double-free (SIGSEGV/heap-UAF at the vtable read on second
+                    // Dispose). Mirrors the freeTaskAfter==false mark in lowerAwait
+                    // (LlvmBackend_Async.cpp ~L1889). An anonymous producer
+                    // (`C.Boom().Result`) has no binder that will free error_obj, so
+                    // do NOT mark it — the lone catch arm must reclaim it exactly once.
+                    bool isBoundTask =
+                        dynamic_cast<const ast::CallExpr*>(ma->target.get()) ==
+                        nullptr;
+                    if (isBoundTask) {
+                        auto* markFn = declareC("bz_mark_exc_borrowed",
+                                                llvm::Type::getVoidTy(llvm_),
+                                                {ptrTy()});
+                        builder_.CreateCall(markFn, {excObj});
+                    }
                     // Re-raise the original exception object through the
                     // synchronous-throw path (stores bz$exc, runs unwind
                     // disposals, branches to the unwind boundary).

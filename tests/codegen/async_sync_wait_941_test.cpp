@@ -248,3 +248,56 @@ BEZEL_TEST(async_sync_wait_941, iscompleted_isfaulted_iscancelled_typed_1175) {
         "  end Main; end C;",
         77);
 }
+
+// ---------------------------------------------------------------------------
+// §30.3 / §30.9 (#1196): reading .Result on a faulted BOUND Task<T> inside
+// a try/catch must NOT double-free the exception object. Pre-fix: the catch
+// arm's caughtException disposal freed error_obj, then the task-local's
+// scope-end disposal freed it again → SIGSEGV (vtable read on a freed object).
+// Post-fix: bz_mark_exc_borrowed marks the error_obj borrowed before the
+// synchronous re-raise, so the catch arm skips reclaim (just unmarks) and the
+// task-local scope-end disposes it exactly once.
+// The program catches the exception and returns 7; the task local is disposed
+// cleanly at scope end. Both must happen without a crash.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_sync_wait_941, result_on_faulted_bound_task_no_double_free_1196) {
+    expectValue941(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new Exception(\"boom\"); "
+        "  end Boom; "
+        "  public static method Main(): int "
+        "    var got: int := 0; "
+        "    var t: Task<int> := C.Boom(); "
+        "    try "
+        "      got := t.Result; "
+        "    catch Exception => got := 7; "
+        "    end; "
+        "    return got; "
+        "  end Main; end C;",
+        7);
+}
+
+// ---------------------------------------------------------------------------
+// §30.3 / §30.9 (#1196): variant — re-read .Result via IsFaulted guard after
+// a first failed .Result attempt (exception caught); the second call raises
+// again from the SAME error_obj that the task still owns. Both calls must
+// complete without crash (the borrowed-mark + unmark cycle repeats correctly).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_sync_wait_941, result_on_faulted_bound_task_isFaulted_variant_1196) {
+    expectValue941(
+        "module M; class C "
+        "  public static async method Fault(): Task<int> "
+        "    throw new Exception(\"oops\"); "
+        "  end Fault; "
+        "  public static method Main(): int "
+        "    var t: Task<int> := C.Fault(); "
+        "    var r: int := 0; "
+        "    try "
+        "      r := t.Result; "
+        "    catch Exception => r := 42; "
+        "    end; "
+        "    return r; "
+        "  end Main; end C;",
+        42);
+}
