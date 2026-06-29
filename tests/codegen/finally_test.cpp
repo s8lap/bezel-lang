@@ -246,3 +246,51 @@ BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_repeated_no_corruptio
         "  return total; "                               // 100
         "end Main; end C;"), 100);
 }
+
+// ── #1216 / §31.2: a finally that throws VIA A CALL supersedes E1 ──────────
+// Residual of #1149: #1149 exposed E1 as currentCaughtExc_ so emitThrowValue
+// (direct `throw`) would free it. But a call that propagates via
+// emitPendingCheck (NOT emitThrowValue) never consulted currentCaughtExc_.
+// Fix: add the same throwLeavesArm guard to emitPendingCheck /
+// emitNewPendingCheck so the captured E1 is freed exactly once on the
+// call-propagation unwind edge.
+
+// #1216: the basic repro — `var x := Boom()` in the finally, Boom() throws.
+// E1 must be freed, E2 must reach the outer `catch E2` (rc=6).
+BEZEL_TEST(finally_supersede_1216, finally_call_throw_supersedes_outer_catches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; class E2 end E2; "
+        "class C "
+        "  private static method Boom(): int  throw new E2();  end Boom; "
+        "  public static method Main(): int "
+        "    try "
+        "      try throw new E1(); finally var x := Boom(); end; "
+        "    catch E2 => return 6; "                     // superseding E2 caught
+        "    catch E1 => return 1; "                     // E1 must NOT be seen
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 6);
+}
+
+// #1216: call-throw-in-finally repeated 100x — each iteration's superseded E1
+// must be freed exactly once. A double-free crashes the in-process JIT; a leak
+// accumulates (caught by the ASan harness). rc=100.
+BEZEL_TEST(finally_supersede_1216, finally_call_throw_supersede_repeated_no_corruption) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E1 end E1; class E2 end E2; "
+        "class C "
+        "  private static method Boom(): int  throw new E2();  end Boom; "
+        "  public static method Main(): int "
+        "    var total := 0; var i := 0; "
+        "    while i < 100 do "
+        "      try "
+        "        try throw new E1(); finally var x := Boom(); end; "
+        "      catch E2 => total := total + 1; "
+        "      end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "                             // 100
+        "  end Main; "
+        "end C;"), 100);
+}

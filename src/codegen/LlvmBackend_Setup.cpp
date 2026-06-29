@@ -3324,6 +3324,23 @@ void Emitter::emitPendingCheck() {
     auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
     builder_.CreateCondBr(pending, unwind, cont);
     builder_.SetInsertPoint(unwind);
+    // #1216 (sibling of #1149 / §31.2): if a call inside a finally body (or
+    // catch arm) propagates an exception E2 via this pending-check, and there
+    // is a captured in-flight exception E1 exposed as currentCaughtExc_ (set by
+    // the #1149 / #1108 finally / catch-guard supersede fix), E1 is SUPERSEDED
+    // by E2 and must be freed exactly once HERE — the #1149 emitThrowValue path
+    // handles direct `throw` but is never reached on a call-propagation edge.
+    // Guard mirrors emitThrowValue's #397/#866 logic: throwLeavesArm ensures we
+    // only free when this unwind target is the arm/finally's own outer boundary
+    // (a throw caught by an INNER try within the finally must not free E1 —
+    // the finally continues and E1 stays in flight). No isDirectRethrow guard
+    // is needed: a call-propagated exception (bz$exc set by the callee) is
+    // never the same object as currentCaughtExc_; they are distinct heap objects.
+    bool throwLeavesArm =
+        caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
+    if (currentCaughtExc_ && throwLeavesArm) {
+        emitDisposeAndReclaim(currentCaughtExc_);
+    }
     emitUnwindDisposals();
     builder_.CreateBr(unwindBB());
     builder_.SetInsertPoint(cont);
@@ -3347,6 +3364,14 @@ void Emitter::emitNewPendingCheck(llvm::Value* obj) {
     builder_.CreateCondBr(pending, unwind, cont);
     builder_.SetInsertPoint(unwind);
     builder_.CreateCall(freeFn(), {obj});  // reclaim the instance block once
+    // #1216: same as emitPendingCheck — if a constructor inside a finally body
+    // (or catch arm) throws and supersedes E1, free E1 exactly once here.
+    // See emitPendingCheck for the full rationale and double-free guards.
+    bool throwLeavesArm =
+        caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
+    if (currentCaughtExc_ && throwLeavesArm) {
+        emitDisposeAndReclaim(currentCaughtExc_);
+    }
     emitUnwindDisposals();
     builder_.CreateBr(unwindBB());
     builder_.SetInsertPoint(cont);
