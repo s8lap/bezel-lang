@@ -859,6 +859,7 @@ set(BEZEL_TEST_SOURCES
     module/xmod_enum_method_735_test.cpp  # #735: imported enum instance method i32 receiver ABI
     module/xmod_static_init_798_test.cpp  # #798: imported type's static init runs cross-module
     module/xmod_generic_method_783_test.cpp  # #783: imported generic-class method body monomorphized per instantiation
+    module/xmod_const_string_1225_test.cpp  # #1225: imported const string not truncated (§2.5/§22.12)
 
     runtime/event_subscription_test.cpp
     runtime/concurrent_dispose_706_test.cpp

@@ -310,11 +310,12 @@ llvm::Value* Emitter::foldImportedConstText(const std::string& text,
         }
         case sema::PrimitiveType::String:
             // A string-literal const value is rendered with its surrounding
-            // quotes by renderConstExpr; lowerStringLiteralConst takes the inner
-            // text, so strip the delimiters when present.
-            if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
-                return lowerStringLiteralConst(
-                    std::string_view(text).substr(1, text.size() - 2), false);
+            // quotes by renderConstExpr (e.g. "hello" → text = `"hello"`).
+            // lowerStringLiteralConst calls processStringCodePoints which
+            // itself strips the surrounding delimiter pair (§2.5/§22.12).
+            // Do NOT pre-strip the quotes here — doing so causes
+            // processStringCodePoints to then strip the first/last VALUE
+            // characters, truncating "hello"→"ell" and "ab"→"" (fix #1225).
             return lowerStringLiteralConst(text, false);
         default:
             // All integer primitives (§4): width comes from the const's type.
