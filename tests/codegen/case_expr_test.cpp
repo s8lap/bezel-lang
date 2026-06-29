@@ -935,3 +935,123 @@ BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_null_738) {
         "var r := case x null => 0, 5..10 => 1, _ => 2 end; "
         "return r;"), 0);  // null arm wins
 }
+
+// ── fix #1233 / §19.3: range patterns with NEGATIVE lower bound ───────────
+// Before the fix the parser parsed `case x -10..-6` with the scrutinee as
+// the BINARY expression `x - 10` (additive prec 13 ≥ old threshold 12), so
+// the actual range seen at codegen was `..-6` (only an upper bound). The
+// fix raises the scrutinee parsing threshold to 14 (multiplicative) so that
+// the unary-minus on the lower bound is NOT consumed as a binary minus with
+// the scrutinee.
+
+// §19.3 regression: positive range still works after the threshold change.
+BEZEL_TEST(codegen_cg28, neg_range_pos_range_regression_1233) {
+    // 7 ∈ [6..10] → 1
+    BEZEL_EXPECT_EQ(run(
+        "var x := 7; "
+        "return case x 6..10 => 1, _ => 0 end;"), 1);
+}
+BEZEL_TEST(codegen_cg28, neg_range_pos_range_regression_miss_1233) {
+    // 5 ∉ [6..10] → 0
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "return case x 6..10 => 1, _ => 0 end;"), 0);
+}
+
+// §19.3: closed negative range `lo..hi`; scrutinee -8 ∈ [-10..-6].
+BEZEL_TEST(codegen_cg28, neg_range_inside_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -8; "
+        "return case x -10..-6 => 1, _ => 0 end;"), 1);
+}
+
+// §19.3: lower bound inclusive: -10 ∈ [-10..-6].
+BEZEL_TEST(codegen_cg28, neg_range_at_lower_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -10; "
+        "return case x -10..-6 => 1, _ => 0 end;"), 1);
+}
+
+// §19.3: upper bound inclusive: -6 ∈ [-10..-6].
+BEZEL_TEST(codegen_cg28, neg_range_at_upper_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -6; "
+        "return case x -10..-6 => 1, _ => 0 end;"), 1);
+}
+
+// §19.3: value just above upper bound: -5 ∉ [-10..-6] → 0.
+BEZEL_TEST(codegen_cg28, neg_range_above_upper_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -5; "
+        "return case x -10..-6 => 1, _ => 0 end;"), 0);
+}
+
+// §19.3: positive value outside a negative range: 2 ∉ [-10..-6] → 0.
+BEZEL_TEST(codegen_cg28, neg_range_pos_value_miss_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; "
+        "return case x -10..-6 => 1, _ => 0 end;"), 0);
+}
+
+// §19.3: half-open `..<`: upper bound is exclusive, so -6 ∉ [-10..<-6].
+BEZEL_TEST(codegen_cg28, neg_range_half_open_upper_excluded_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -6; "
+        "return case x -10..<-6 => 1, _ => 0 end;"), 0);
+}
+
+// §19.3: -7 ∈ [-10..<-6] (below exclusive upper).
+BEZEL_TEST(codegen_cg28, neg_range_half_open_inside_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -7; "
+        "return case x -10..<-6 => 1, _ => 0 end;"), 1);
+}
+
+// §19.3: multiple arms spanning negative and positive ranges; verify all
+// selectors route correctly (multi-arm sum encoded as described in issue #1233).
+// Arms: -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0.
+BEZEL_TEST(codegen_cg28, neg_range_multi_arm_neg_arm_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -8; "
+        "return case x -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 1);
+}
+BEZEL_TEST(codegen_cg28, neg_range_multi_arm_mid_arm_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 0; "
+        "return case x -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 2);
+}
+BEZEL_TEST(codegen_cg28, neg_range_multi_arm_pos_arm_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 7; "
+        "return case x -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 3);
+}
+BEZEL_TEST(codegen_cg28, neg_range_multi_arm_wildcard_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 11; "
+        "return case x -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 0);
+}
+
+// §19.3: negative range on a `long` scrutinee (fix #1233 must apply at
+// every integer width; litAtWidth must handle negative long literal bounds).
+BEZEL_TEST(codegen_cg28, neg_range_long_inside_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: long := -8L; "
+        "return case x -10L..-6L => 1, _ => 0 end;"), 1);
+}
+BEZEL_TEST(codegen_cg28, neg_range_long_miss_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: long := -5L; "
+        "return case x -10L..-6L => 1, _ => 0 end;"), 0);
+}
+
+// §19.3: negative range on a `double` scrutinee.
+BEZEL_TEST(codegen_cg28, neg_range_double_inside_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: double := -3.0; "
+        "return case x -5.0..-1.0 => 1, _ => 0 end;"), 1);
+}
+BEZEL_TEST(codegen_cg28, neg_range_double_miss_1233) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: double := 0.0; "
+        "return case x -5.0..-1.0 => 1, _ => 0 end;"), 0);
+}

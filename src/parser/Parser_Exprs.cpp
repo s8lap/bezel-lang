@@ -1073,13 +1073,14 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     // #744 / §19: `case` ALWAYS takes a scrutinee; the scrutinee-less
     // condition-dispatch form is now spelled `when` (parseWhenExpr), so the
     // newline-significant `isScruntineeLessCase` heuristic is gone. The
-    // scrutinee is parsed above the range level (precedence ≥ 12) so that
-    // relational patterns (`>= 90`, `< 0`), range patterns (`90..100`), and
-    // the §19.3 leading-open range patterns (`..<0`, `..5`) are recognised as
-    // arm patterns rather than consumed into the scrutinee. A scrutinee that
-    // is itself a bitwise/range/relational expression must be parenthesised.
+    // scrutinee is parsed ABOVE the additive level (precedence ≥ 14, i.e.
+    // multiplicative and postfix only) so that negative range patterns
+    // (`-10..-6`), relational patterns (`>= 90`, `< 0`), and leading-open
+    // range patterns (`..<0`, `..5`) are recognised as arm patterns and NOT
+    // consumed into the scrutinee (fix #1233). A scrutinee that is itself an
+    // additive, bitwise, range, or relational expression must be parenthesised.
     SourceLocation start = current_.location;
-    ce->scrutinee = stampSpan(parseBinaryExpression(12), start, current_.location);
+    ce->scrutinee = stampSpan(parseBinaryExpression(14), start, current_.location);
 
     ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     while (consumePunctuator(",")) {
