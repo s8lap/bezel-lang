@@ -142,6 +142,11 @@ void bz_array_retain_strings(void* arr);
 // Only valid until the next mutation; used for zero-copy access in codegen.
 void* bz_array_ptr_at(void* arr, int64_t idx, int64_t elem_size);
 
+// §29.12 / issue #1232: return the current modification epoch of the array.
+// Codegen captures this at for-in loop start; checks it each iteration.
+// Mismatch → codegen throws InvalidOperationException (per §29.12).
+int64_t bz_array_get_mod(void* arr);
+
 // Ensure capacity for at least `cap` elements without changing the length.
 void bz_array_reserve(void* arr, int64_t elem_size, int64_t cap);
 
@@ -164,6 +169,11 @@ void* bz_llist_alloc(int64_t elem_size);
 
 // Return the number of elements in the list.
 int64_t bz_llist_count(void* list);
+
+// §29.12 / issue #1232: return the current modification epoch of the linked list.
+// Codegen captures this at for-in loop start; checks it each iteration.
+// Mismatch → codegen throws InvalidOperationException (per §29.12).
+int64_t bz_llist_get_mod(void* list);
 
 // Prepend a new node (copies elem_size bytes from `elem`). Returns the new node*.
 void* bz_llist_add_first(void* list, const void* elem, int64_t elem_size);
@@ -247,6 +257,11 @@ bool    bz_dict_remove_str_disposing(void* d, const char* k, int64_t k_len,
                                      void (*dispose_val)(void*));
 bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len);
 int64_t bz_dict_count(void* d);
+
+// §29.12 / issue #1232: return the current modification epoch of the dict/set.
+// Codegen captures this at for-in loop start; checks it each iteration.
+// Mismatch → codegen throws InvalidOperationException (per §29.12).
+int64_t bz_dict_get_mod(void* d);
 
 // Enumerate all keys as (char*, int64_t len) pairs. The caller must free the
 // returned arrays with free(). `*keys_out` and `*lens_out` are malloc'd arrays.

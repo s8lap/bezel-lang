@@ -50,6 +50,10 @@ struct bz_array_t {
     // header is NOT freed in that path (quarantine), keeping this byte valid.
     // Calloc-zeroed on alloc — 0 means live, 1 means disposed.
     int8_t  disposed;
+    // §29.12 / issue #1232: modification epoch. Bumped on every structural
+    // mutation (Add, Remove, Insert, Clear). Captured by for-in codegen at loop
+    // start; checked on each iteration — mismatch → InvalidOperationException.
+    int64_t mod_count;
 };
 
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
@@ -100,6 +104,7 @@ void bz_array_add(void* arrp, const void* elem, int64_t elem_size) {
     if (arr->count >= arr->capacity) bz_array_grow(arr, elem_size, arr->count + 1);
     memcpy((char*)arr->data + arr->count * elem_size, elem, (size_t)elem_size);
     arr->count++;
+    arr->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
 void bz_array_get(void* arrp, int64_t idx, void* out, int64_t elem_size) {
@@ -137,6 +142,7 @@ void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
                 (char*)arr->data + (idx + 1) * elem_size,
                 (size_t)(tail * elem_size));
     }
+    arr->mod_count++;  // §29.12 / #1232: structural mutation (also covers pop_at and remove_at_disposing which delegate here)
     arr->count--;
 }
 
@@ -156,10 +162,15 @@ void bz_array_insert_at(void* arrp, int64_t idx, const void* elem,
     }
     memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
     arr->count++;
+    arr->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
 void bz_array_clear(void* arrp) {
-    if (arrp) ((bz_array_t*)arrp)->count = 0;
+    if (arrp) {
+        auto* arr = (bz_array_t*)arrp;
+        arr->count = 0;
+        arr->mod_count++;  // §29.12 / #1232: structural mutation
+    }
 }
 
 // stdlib §4.5: dispose every non-null class-typed element, then empty.
@@ -176,6 +187,7 @@ void bz_array_clear_disposing(void* arrp, void (*dispose_elem)(void*)) {
         }
     }
     arr->count = 0;
+    arr->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
 // stdlib §4.5: dispose the non-null element at idx, then remove it.
@@ -386,6 +398,10 @@ struct bz_dict_t {
     // Set by bz_dict_mark_disposed (called instead of bz_dict_free in checked
     // builds); tested by bz_dict_is_disposed for method guards.
     int8_t      disposed;
+    // §29.12 / issue #1232: modification epoch. Bumped on every mutation
+    // (Add/Update/Remove/Clear). Captured by for-in codegen at loop start;
+    // checked on each iteration — mismatch → InvalidOperationException.
+    int64_t     mod_count;
 };
 
 static uint32_t fnv1a(const char* s, int64_t len) {
@@ -555,6 +571,7 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
     if (idx >= 0) {
         // Key already present: update value, no order change (§4.8).
         d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
@@ -566,6 +583,7 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
     d->buckets[ins].deleted = false;
     dict_order_append(d, ins);
     d->count++;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
 // issue #388 / stdlib §4.9: OwnedDictionary<string,V>'s `set(owned)` indexer.
@@ -580,9 +598,10 @@ void bz_dict_set_str_disposing(void* dp, const char* k, int64_t k_len,
     if (idx >= 0) {
         if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
         d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
-    bz_dict_set_str(dp, k, k_len, val);   // fresh key: nothing to dispose
+    bz_dict_set_str(dp, k, k_len, val);   // fresh key: bz_dict_set_str bumps mod_count
 }
 
 bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
@@ -595,6 +614,7 @@ bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
     d->buckets[idx].key = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
     return true;
 }
 
@@ -615,6 +635,7 @@ bool bz_dict_remove_str_disposing(void* dp, const char* k, int64_t k_len,
     d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
     return true;
 }
 
@@ -710,6 +731,7 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     if (idx >= 0) {
         // Key already present: update value, no order change (§4.8).
         d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
     // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
@@ -723,6 +745,7 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     d->buckets[ins].deleted = false;
     dict_order_append(d, ins);
     d->count++;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
 // issue #388 / stdlib §4.9: generic-key counterpart to
@@ -737,9 +760,10 @@ void bz_dict_set_gen_disposing(void* dp, const void* key, void* val,
     if (idx >= 0) {
         if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
         d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
         return;
     }
-    bz_dict_set_gen(dp, key, val);        // fresh key: nothing to dispose
+    bz_dict_set_gen(dp, key, val);        // fresh key: bz_dict_set_gen bumps mod_count
 }
 
 bool bz_dict_remove_gen(void* dp, const void* key) {
@@ -753,6 +777,7 @@ bool bz_dict_remove_gen(void* dp, const void* key) {
     d->buckets[idx].key = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
     return true;
 }
 
@@ -774,6 +799,7 @@ bool bz_dict_remove_gen_disposing(void* dp, const void* key,
     d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
     return true;
 }
 
@@ -799,6 +825,7 @@ bool bz_dict_pop_value_str(void* dp, const char* k, int64_t k_len,
     d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
     return true;
 }
 
@@ -816,6 +843,7 @@ bool bz_dict_pop_value_gen(void* dp, const void* key, void** out) {
     d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
     return true;
 }
 
@@ -841,6 +869,7 @@ void bz_dict_clear(void* dp, void (*dispose_val)(void*)) {
     // issue #622 / stdlib §4.8: Clear() resets insertion order (§4.8: "Clear()
     // resets the order"). Reuse the allocated order buffer but set count to 0.
     d->order_count = 0;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
 // Enumerate the generic table's keys (issue #370, §4.8 Dictionary.Keys /
@@ -994,6 +1023,25 @@ bool bz_dict_drain_next_gen(void* dp, int64_t* cursor,
 // issue #639 / stdlib §4.5/§4.7/§4.11 v0.135: OwnedArray<T> / OwnedLinkedList<T>
 // / OwnedStack<T> / OwnedQueue<T> .Drain() per-element pop.
 //
+// ---------------------------------------------------------------------------
+// §29.12 / issue #1232: modification-epoch accessors.
+// These are called by codegen at the START of a for-in loop (to capture the
+// epoch) and at the start of EACH ITERATION (to check for mutations).
+// A mismatch → codegen calls emitGuardThrow("InvalidOperationException").
+// ---------------------------------------------------------------------------
+
+int64_t bz_array_get_mod(void* arrp) {
+    return arrp ? ((bz_array_t*)arrp)->mod_count : 0;
+}
+
+int64_t bz_dict_get_mod(void* dp) {
+    return dp ? ((bz_dict_t*)dp)->mod_count : 0;
+}
+
+// bz_llist_get_mod is placed after the bz_llist_t struct definition below
+// (forward reference — the struct is declared at that point in the file).
+
+// ---------------------------------------------------------------------------
 // bz_array_drain_next — pops index 0 (front-to-back).
 // Used by OwnedArray<T>.Drain() (front-to-back per §28.11 "iteration order")
 // and OwnedQueue<T>.Drain() (FIFO, also front-to-back).
@@ -1176,6 +1224,10 @@ struct bz_llist_t {
     int64_t          count;
     int64_t          elem_size;
     int64_t          next_seq;  // #869: next insertion sequence to assign.
+    // §29.12 / issue #1232: modification epoch. Bumped on every structural
+    // mutation (AddFirst/Last/Before/After, Remove*, Pop*). Captured by
+    // lowerLinkedListFor at loop start; checked per iteration.
+    int64_t          mod_count;
 };
 
 // Allocate a node with elem_size bytes of value storage, stamping it with the
@@ -1187,6 +1239,7 @@ static bz_llist_node_t* llist_node_alloc(bz_llist_t* l, int64_t elem_size,
     if (elem && elem_size > 0)
         memcpy((char*)n + sizeof(bz_llist_node_t), elem, (size_t)elem_size);
     n->seq = l->next_seq++;  // #869: monotonic insertion order
+    l->mod_count++;  // §29.12 / #1232: structural mutation (covers all Add*)
     return n;
 }
 
@@ -1198,6 +1251,10 @@ void* bz_llist_alloc(int64_t elem_size) {
 
 int64_t bz_llist_count(void* listp) {
     return listp ? ((bz_llist_t*)listp)->count : 0;
+}
+
+int64_t bz_llist_get_mod(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->mod_count : 0;
 }
 
 void* bz_llist_add_first(void* listp, const void* elem, int64_t elem_size) {
@@ -1264,6 +1321,7 @@ static void llist_unlink(bz_llist_t* l, bz_llist_node_t* node,
     if (node->next) node->next->prev = node->prev;
     else l->tail = node->prev;
     l->count--;
+    l->mod_count++;  // §29.12 / #1232: structural mutation (covers all Remove*/Pop*)
     if (dispose_elem) {
         void* vp = (char*)node + sizeof(bz_llist_node_t);
         // For OwnedLinkedList<T: class>, element bytes hold a pointer; load it.

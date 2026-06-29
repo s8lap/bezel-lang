@@ -2518,16 +2518,31 @@ bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
     auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
     auto* valFn = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
     auto* nextFn = declareC("bz_llist_node_next", ptrTy(), {ptrTy()});
+    // §29.12 / issue #1232: capture modification epoch before first node fetch.
+    auto* getModLlistFn = declareC("bz_llist_get_mod", i64(), {ptrTy()});
+    llvm::Value* llEpochVal = builder_.CreateCall(getModLlistFn, {listObj}, "ll.epoch");
+    auto* llEpochSlot = entryAlloca(i64());
+    builder_.CreateStore(llEpochVal, llEpochSlot);
     auto* nodeSlot = entryAlloca(ptrTy());
     builder_.CreateStore(builder_.CreateCall(firstFn, {listObj}), nodeSlot);
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
+    // #747 R42 + §29.12/#1232: spill node, loop-var, and epoch into the async
+    // frame so they survive a yield/await suspend in the body.
+    registerForLoopSpillSlots(fs, {nodeSlot, varSlot, llEpochSlot});
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ll.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ll.body", currentFn_);
     auto* incBB = llvm::BasicBlock::Create(llvm_, "ll.inc", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "ll.end", currentFn_);
     builder_.CreateBr(condBB);
     builder_.SetInsertPoint(condBB);
+    // §29.12 / issue #1232: check epoch on every MoveNext — mismatch → InvalidOperationException.
+    {
+        llvm::Value* curMod = builder_.CreateCall(getModLlistFn, {listObj}, "ll.curmod");
+        llvm::Value* epV    = builder_.CreateLoad(i64(), llEpochSlot, "ll.epv");
+        emitGuardThrow(builder_.CreateICmpNE(curMod, epV, "ll.modchk"),
+                       "InvalidOperationException");
+    }
     llvm::Value* node = builder_.CreateLoad(ptrTy(), nodeSlot);
     builder_.CreateCondBr(
         builder_.CreateICmpNE(node, llvm::ConstantPointerNull::get(ptrTy())),
@@ -2691,20 +2706,37 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             }
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            // §29.12 / #1232: capture mod epoch before the loop starts.
+            auto* getModFn = declareC("bz_array_get_mod", i64(), {ptrTy()});
+            llvm::Value* epochVal = builder_.CreateCall(getModFn, {arrObj}, "arr.epoch");
+            auto* epochSlot = entryAlloca(i64());
+            builder_.CreateStore(epochVal, epochSlot);
             llvm::Value* len = builder_.CreateCall(lenFn, {arrObj});
             auto* idxSlotR = entryAlloca(i64());
             builder_.CreateStore(builder_.getInt64(0), idxSlotR);
             auto* varSlotR = entryAlloca(elemTy);
             locals_[&fs] = varSlotR;
-            // #747 R42: spill the index + loop-var into the async frame so they
-            // survive a yield/await suspend in the body (else garbage on resume).
-            registerForLoopSpillSlots(fs, {idxSlotR, varSlotR});
+            // #747 R42: spill the index + loop-var + epoch into the async frame
+            // so they survive a yield/await suspend in the body (else garbage on
+            // resume). epochSlot must also be spilled: if a resume reads a stale
+            // epoch, it would spuriously throw InvalidOperationException (§29.12).
+            registerForLoopSpillSlots(fs, {idxSlotR, varSlotR, epochSlot});
             auto* condBBR = llvm::BasicBlock::Create(llvm_, "rt.cond", currentFn_);
             auto* bodyBBR = llvm::BasicBlock::Create(llvm_, "rt.body", currentFn_);
             auto* incBBR  = llvm::BasicBlock::Create(llvm_, "rt.inc",  currentFn_);
             auto* endBBR  = llvm::BasicBlock::Create(llvm_, "rt.end",  currentFn_);
             builder_.CreateBr(condBBR);
             builder_.SetInsertPoint(condBBR);
+            // §29.12 / #1232: check for concurrent modification on every MoveNext.
+            // If the collection was mutated since the loop started, throw
+            // InvalidOperationException before reading the next element.
+            {
+                llvm::Value* curMod = builder_.CreateCall(getModFn, {arrObj}, "arr.curmod");
+                llvm::Value* epV    = builder_.CreateLoad(i64(), epochSlot, "arr.epv");
+                emitGuardThrow(builder_.CreateICmpNE(curMod, epV, "arr.modchk"),
+                               "InvalidOperationException");
+                // After emitGuardThrow the insert point is the continuation block.
+            }
             llvm::Value* idxR = builder_.CreateLoad(i64(), idxSlotR);
             builder_.CreateCondBr(builder_.CreateICmpSLT(idxR, len), bodyBBR, endBBR);
             builder_.SetInsertPoint(bodyBBR);
@@ -2826,6 +2858,12 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
     llvm::Type* elemTy = lowerTypeRef(elemTyRef);
     if (!elemTy) return false;
 
+    // §29.12 / #1232: capture the dict/set's mod epoch before taking the snapshot.
+    auto* getModDictFn = declareC("bz_dict_get_mod", i64(), {ptrTy()});
+    llvm::Value* dictEpochVal = builder_.CreateCall(getModDictFn, {tableObj}, "dk.epoch");
+    auto* dictEpochSlot = entryAlloca(i64());
+    builder_.CreateStore(dictEpochVal, dictEpochSlot);
+
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* cntSlot     = entryAlloca(i64());
     auto* keysFn = declareC("bz_dict_keys_gen", llvm::Type::getVoidTy(llvm_),
@@ -2847,6 +2885,13 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(condBB);
+    // §29.12 / #1232: check for concurrent modification on every MoveNext.
+    {
+        llvm::Value* curMod = builder_.CreateCall(getModDictFn, {tableObj}, "dk.curmod");
+        llvm::Value* epV    = builder_.CreateLoad(i64(), dictEpochSlot, "dk.epv");
+        emitGuardThrow(builder_.CreateICmpNE(curMod, epV, "dk.modchk"),
+                       "InvalidOperationException");
+    }
     llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
 
@@ -2930,6 +2975,12 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
                     keyTy->primitive == sema::PrimitiveType::String;
     if (!isString) return false;  // other shapes not wired
 
+    // §29.12 / #1232: capture dict mod epoch before taking the string-key snapshot.
+    auto* getModDictFnDk = declareC("bz_dict_get_mod", i64(), {ptrTy()});
+    llvm::Value* dkEpochVal = builder_.CreateCall(getModDictFnDk, {dictObj}, "dks.epoch");
+    auto* dkEpochSlot = entryAlloca(i64());
+    builder_.CreateStore(dkEpochVal, dkEpochSlot);
+
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* lensOutSlot = entryAlloca(ptrTy());
     auto* cntSlot     = entryAlloca(i64());
@@ -2961,6 +3012,13 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(condBB);
+    // §29.12 / #1232: check for concurrent modification on every MoveNext.
+    {
+        llvm::Value* curMod = builder_.CreateCall(getModDictFnDk, {dictObj}, "dks.curmod");
+        llvm::Value* epV    = builder_.CreateLoad(i64(), dkEpochSlot, "dks.epv");
+        emitGuardThrow(builder_.CreateICmpNE(curMod, epV, "dks.modchk"),
+                       "InvalidOperationException");
+    }
     llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
 
@@ -3055,6 +3113,12 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     llvm::Value* dictObj = lowerExpr(*ma->target);
     if (!dictObj) return false;
 
+    // §29.12 / #1232: capture dict mod epoch before taking the values snapshot.
+    auto* getModDictFnDv = declareC("bz_dict_get_mod", i64(), {ptrTy()});
+    llvm::Value* dvEpochVal = builder_.CreateCall(getModDictFnDv, {dictObj}, "dv.epoch");
+    auto* dvEpochSlot = entryAlloca(i64());
+    builder_.CreateStore(dvEpochVal, dvEpochSlot);
+
     // Snapshot the values array.  Choose the string-key or generic-key helper
     // based on whether the key (genericArgs[0]) routes through the generic table.
     auto* valsOutSlot = entryAlloca(ptrTy());
@@ -3097,6 +3161,13 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(condBB);
+    // §29.12 / #1232: check for concurrent modification on every MoveNext.
+    {
+        llvm::Value* curMod = builder_.CreateCall(getModDictFnDv, {dictObj}, "dv.curmod");
+        llvm::Value* epV    = builder_.CreateLoad(i64(), dvEpochSlot, "dv.epv");
+        emitGuardThrow(builder_.CreateICmpNE(curMod, epV, "dv.modchk"),
+                       "InvalidOperationException");
+    }
     llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
 
@@ -3218,6 +3289,12 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     llvm::Value* dictObj = lowerExpr(*fs.iterable);
     if (!dictObj) return false;
 
+    // §29.12 / #1232: capture dict mod epoch before taking the key+value snapshot.
+    auto* getModDictFnDe = declareC("bz_dict_get_mod", i64(), {ptrTy()});
+    llvm::Value* deEpochVal = builder_.CreateCall(getModDictFnDe, {dictObj}, "de.epoch");
+    auto* deEpochSlot = entryAlloca(i64());
+    builder_.CreateStore(deEpochVal, deEpochSlot);
+
     // Snapshot keys + values in parallel.
     auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
     bool useGen = genericBackingType(dictTy, 0, /*isSet=*/false, nullptr) != nullptr;
@@ -3285,6 +3362,13 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
 
     builder_.SetInsertPoint(condBB);
     {
+        // §29.12 / #1232: check for concurrent modification on every MoveNext.
+        {
+            llvm::Value* curMod = builder_.CreateCall(getModDictFnDe, {dictObj}, "de.curmod");
+            llvm::Value* epV    = builder_.CreateLoad(i64(), deEpochSlot, "de.epv");
+            emitGuardThrow(builder_.CreateICmpNE(curMod, epV, "de.modchk"),
+                           "InvalidOperationException");
+        }
         llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
         builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
     }

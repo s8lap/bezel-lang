@@ -894,6 +894,7 @@ set(BEZEL_TEST_SOURCES
     ownership/using_var_return_762_test.cpp
     ownership/destructor_field_move_763_test.cpp
     ownership/destructor_owned_field_dispose_1230_test.cpp
+    codegen/collection_concurrent_mod_1232_test.cpp
     ownership/owned_field_assign_test.cpp
     ownership/fresh_owned_into_borrow_field_1020_test.cpp
     ownership/borrow_into_bare_field_1082_test.cpp
