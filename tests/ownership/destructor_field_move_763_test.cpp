@@ -84,6 +84,8 @@ BEZEL_TEST(destructor_field_move_763, destructor_move_into_using_var_accepted) {
 // §28.8.1: a regular METHOD that moves an owned field out and does not restore
 // it leaves the field's invariant broken on exit — STILL REJECTED (the
 // destructor exemption must not leak into ordinary methods).
+// Note: the destructor is left empty (§28.5 auto-disposes _inner); an explicit
+// `_inner.Dispose()` in the destructor is a separate error caught by #1230.
 BEZEL_TEST(destructor_field_move_763, regular_method_field_not_restored_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; "
@@ -94,7 +96,7 @@ BEZEL_TEST(destructor_field_move_763, regular_method_field_not_restored_rejected
         "  public method Take(): () "
         "    using var u := move this._inner; "
         "  end Take; "
-        "  destructor this._inner.Dispose(); end destructor; "
+        "  destructor end destructor; "
         "  public static method Main(): int return 0; end Main; "
         "end Outer;");
     BEZEL_EXPECT_TRUE(hasFieldMovedFromError(r));

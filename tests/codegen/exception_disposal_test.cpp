@@ -283,16 +283,16 @@ BEZEL_TEST(codegen_excdisp_02, explicit_dispose_then_scope_end_no_double_free) {
 }
 
 // --------------------------------------------------------------------------
-// [03] §28.2 / §28.4 / §28.5 — destructor explicitly disposes an owned field,
-// then §28.4-step-2 auto-disposes the same field: the field's destructor runs
-// exactly once; the field's block is freed exactly once.
+// [03] §28.4 / §28.5 — destructor body omits explicit dispose; §28.4-step-2
+// auto-disposes the owned field after the destructor body runs: the field's
+// destructor fires exactly once; the block is freed exactly once.
+// (The old pattern `destructor _p.Dispose(); end destructor;` was a double-free
+// and is now a sema error per §28.5 / #1230; the correct pattern is to omit the
+// explicit call and rely on the auto-cleanup.)
 // --------------------------------------------------------------------------
 
-// MyError's destructor calls `_p.Dispose()` (disposes Payload — Payload._n == 1)
-// and the generated MyError Dispose then auto-disposes `_p` (§28.4 step 2). Per
-// §28.2 the second disposal is a no-op. Pre-fix: re-ran Payload's destructor on
-// the freed Payload (double-free, SIGSEGV). The counter is read after `e` is
-// disposed at scope end.
+// MyError's destructor body is empty; §28.4 auto-disposes `_p` after the body,
+// running Payload's destructor exactly once → Payload._n == 1 at scope end.
 const char* kDtorDisposesFieldCount =
     "module M; "
     "class Payload "
@@ -303,7 +303,7 @@ const char* kDtorDisposesFieldCount =
     "class MyError "
     "  public owned _p: Payload; "
     "  public constructor(owned p: Payload) _p := p; end constructor; "
-    "  destructor _p.Dispose(); end destructor; "
+    "  destructor end destructor; "
     "end MyError; "
     "class R "
     "  public static method Main(): int "
@@ -316,8 +316,9 @@ BEZEL_TEST(codegen_excdisp_03, dtor_field_dispose_plus_autodispose_runs_once) {
     BEZEL_EXPECT_EQ(run(kDtorDisposesFieldCount), 1);
 }
 
-// The original finding [03] minimal repro: `using var e := new MyError(new
-// Payload()); return 0;` — no counter accessor, just exit 0 with no crash.
+// §28.5 auto-cleanup minimal repro: `using var e := new MyError(new Payload());
+// return 0;` — destructor body is empty, auto-dispose handles `_p`.
+// Exit 0 AND ASan/LSan-clean: no double-free / UAF.
 const char* kDtorDisposesFieldRepro =
     "module M; "
     "class Payload "
@@ -328,7 +329,7 @@ const char* kDtorDisposesFieldRepro =
     "class MyError "
     "  public owned _p: Payload; "
     "  public constructor(owned p: Payload) _p := p; end constructor; "
-    "  destructor _p.Dispose(); end destructor; "
+    "  destructor end destructor; "
     "end MyError; "
     "class R "
     "  public static method Main(): int "
@@ -338,8 +339,8 @@ const char* kDtorDisposesFieldRepro =
     "end R;";
 
 BEZEL_TEST(codegen_excdisp_03, dtor_field_dispose_plus_autodispose_no_double_free) {
-    // Exit 0 AND ASan/LSan-clean: Payload disposed exactly once, both blocks
-    // (MyError and Payload) reclaimed exactly once, no double-free / UAF.
+    // Exit 0 AND ASan/LSan-clean: Payload disposed exactly once via §28.5
+    // auto-cleanup, both blocks (MyError and Payload) reclaimed exactly once.
     expectExitAndLeakFree(kDtorDisposesFieldRepro, 0);
 }
 

@@ -342,6 +342,54 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             if (auto* fma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call->callee.get()))
                 checkBorrowedOwningCollectionCapability(*fma);
+        // §28.4 / §28.5 (#1230): explicit `.Dispose()` of an owned field of
+        // THIS object inside a destructor body double-frees: the compiler-
+        // generated Dispose() runs the destructor body first and then
+        // auto-disposes all owned-bearing fields (§28.4). Reject this pattern
+        // with a sema error so it never reaches codegen.
+        //
+        // Scope: bare `_f.Dispose()` (IdentifierExpr resolving to a
+        // FieldSymbol) or `this._f.Dispose()` (MemberAccessExpr whose target
+        // is the identifier `this`) — own fields only. A `.Dispose()` on a
+        // local (`using var x := …; x.Dispose();`), a using-var, a parameter,
+        // or a field of another object are NOT rejected here; neither is a
+        // `.Dispose()` on an owned field in a normal (non-destructor) method.
+        // per §28.4 / §28.5
+        if (isDestructor_ && call->callee) {
+            if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call->callee.get())) {
+                if (cma->member == "Dispose" && cma->target) {
+                    const ast::Expr* recv = cma->target.get();
+                    bool isOwnedThisField = false;
+                    if (exprIsOwnedFieldRead(*recv)) {
+                        if (dynamic_cast<const ast::IdentifierExpr*>(recv)) {
+                            // Bare `_f` — implicit `this`.
+                            isOwnedThisField = true;
+                        } else if (auto* fma2 =
+                                       dynamic_cast<const ast::MemberAccessExpr*>(
+                                           recv)) {
+                            if (auto* tid =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        fma2->target.get()))
+                                isOwnedThisField = (tid->name == "this");
+                        }
+                    }
+                    if (isOwnedThisField) {
+                        report(
+                            Severity::Error, cma->span.begin,
+                            "explicit `.Dispose()` of an owned field inside a "
+                            "destructor double-frees: the compiler-generated "
+                            "Dispose() runs the destructor body and then "
+                            "auto-disposes all owned fields (§28.4). Remove the "
+                            "explicit call — the field is disposed automatically "
+                            "(§28.5). To take ownership of the field early and "
+                            "suppress the auto-cleanup, move it out first: "
+                            "`using var t := move _field;`");
+                        return;
+                    }
+                }
+            }
+        }
         // §28.2: a further Dispose() call on an already-disposed instance is
         // handled by markDisposedByName (further below), which emits the
         // "already disposed" error.  We must NOT also fire the §28.2
