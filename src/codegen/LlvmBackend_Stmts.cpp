@@ -658,8 +658,49 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // call the operator method, store the result back.
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     std::vector<llvm::Value*> args{cur};
+                    // #1219 (per #1059 / §25.2 / §14 / §9.5): operator ++/-- on a
+                    // GENERIC record is a static method whose parameter and return
+                    // types reference the declaring type's type parameter T.  Set
+                    // up the per-instantiation substitution from the target's
+                    // concrete generic args (e.g. Box<string> → T=string) so
+                    // emitMethodCall specializes the operator, emitting/calling the
+                    // specialized form whose param type matches the already-
+                    // specialized struct (record.Box$spec0).  Without this the
+                    // unspecialized bz$Box$op$++ (param type record.Box) is called
+                    // with a record.Box$spec0 argument → LLVM IR verifier:
+                    // "Call parameter type does not match function signature".
+                    auto savedOpSubst = genericSubst_;
+                    auto savedOpSema  = genericSubstSemaTy_;
+                    if (const sema::TypeRef* tgtTy =
+                            ctx_.exprType(*inc->target)) {
+                        if (tgtTy->kind == sema::TypeRef::Kind::Named &&
+                            tgtTy->declaration == opMethod->parent &&
+                            !tgtTy->genericArgs.empty()) {
+                            auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                tgtTy->declaration->decl);
+                            if (td && td->genericParams.size() ==
+                                          tgtTy->genericArgs.size()) {
+                                std::unordered_map<std::string_view,
+                                                   llvm::Type*> ns;
+                                std::unordered_map<std::string_view,
+                                    const sema::TypeRef*> nsem;
+                                for (std::size_t gi = 0;
+                                     gi < td->genericParams.size(); ++gi) {
+                                    ns[td->genericParams[gi].name] =
+                                        lowerTypeRef(tgtTy->genericArgs[gi]);
+                                    nsem[td->genericParams[gi].name] =
+                                        resolveTypeParamRef(
+                                            tgtTy->genericArgs[gi]);
+                                }
+                                genericSubst_       = std::move(ns);
+                                genericSubstSemaTy_ = std::move(nsem);
+                            }
+                        }
+                    }
                     llvm::Value* res =
                         emitMethodCall(opMethod, args, /*baseQualified=*/false);
+                    genericSubst_       = std::move(savedOpSubst);
+                    genericSubstSemaTy_ = std::move(savedOpSema);
                     if (res) {
                         // §28.7 (#913): `c++` ≡ `c := T.operator++(c)` — reassigning
                         // an owned class local disposes the displaced old value

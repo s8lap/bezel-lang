@@ -5974,7 +5974,42 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             llvm::Value* ov = lowerExpr(*un.operand);
             if (!ov) return nullptr;
             std::vector<llvm::Value*> args{ov};
-            return emitMethodCall(opm, args, /*baseQualified=*/false);
+            // #1219 (per #1059 / §25.2 / §14): a unary operator overload
+            // (+/-/~) on a GENERIC record uses the declaring type's T in its
+            // parameter/return types.  Set up the per-instantiation
+            // substitution from the operand's concrete generic args so
+            // emitMethodCall emits the specialized form.  Without this the
+            // unspecialized function (record.Box) is called with a
+            // specialized-struct (record.Box$spec0) argument → IR_FAIL.
+            auto savedOpSubst = genericSubst_;
+            auto savedOpSema  = genericSubstSemaTy_;
+            const sema::TypeRef* opTy = ctx_.exprType(*un.operand);
+            if (opTy && opTy->kind == sema::TypeRef::Kind::Named &&
+                opTy->declaration == opm->parent &&
+                !opTy->genericArgs.empty()) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(
+                    opTy->declaration->decl);
+                if (td && td->genericParams.size() ==
+                               opTy->genericArgs.size()) {
+                    std::unordered_map<std::string_view, llvm::Type*> ns;
+                    std::unordered_map<std::string_view,
+                        const sema::TypeRef*> nsem;
+                    for (std::size_t gi = 0;
+                         gi < td->genericParams.size(); ++gi) {
+                        ns[td->genericParams[gi].name] =
+                            lowerTypeRef(opTy->genericArgs[gi]);
+                        nsem[td->genericParams[gi].name] =
+                            resolveTypeParamRef(opTy->genericArgs[gi]);
+                    }
+                    genericSubst_       = std::move(ns);
+                    genericSubstSemaTy_ = std::move(nsem);
+                }
+            }
+            llvm::Value* result =
+                emitMethodCall(opm, args, /*baseQualified=*/false);
+            genericSubst_       = std::move(savedOpSubst);
+            genericSubstSemaTy_ = std::move(savedOpSema);
+            return result;
         }
     }
     // issue #409 / §28.8.1 / §28.11: `move coll[i]` is the slot-take form on an

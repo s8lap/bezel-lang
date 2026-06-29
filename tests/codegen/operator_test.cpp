@@ -165,3 +165,46 @@ BEZEL_TEST(codegen_cg48, generic_class_operator_1059) {
         "  using var c: Vec<int> := new Vec<int>(3) + new Vec<int>(4); return c.X; "
         "end Main; end C;"), 7);
 }
+
+// #1219 / §25.2 / §14 / §9.5: `++` on a GENERIC record with a `new`-body operator.
+// Before the fix: call site loaded record.Box$spec0 but called unspecialized
+// bz$Box$op$++ (expects record.Box) → LLVM IR_FAIL.  After the fix: the per-
+// instantiation substitution is established before emitMethodCall so the operator
+// is specialized to match the concrete struct → clean IR, exit 6.
+BEZEL_TEST(codegen_cg48, generic_record_increment_new_body_1219) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Box<T>(V: int) "
+        "  public static method operator ++(b: Box<T>): Box<T> => new Box<T>(b.V + 1); "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var b: Box<string> := new Box<string>(5); b++; return b.V; "
+        "end Main; end C;"), 6);
+}
+
+// #1219 / §25.2 / §9.5: `++` on a generic record with a `with`-body operator.
+// The `with` expression copies the struct with one field changed; before the fix
+// the operator was called unspecialized → IR_FAIL (and when the JIT ran anyway
+// the `with` reinit path returned 0).  After the fix: 10 + 3×1 = 13.
+BEZEL_TEST(codegen_cg48, generic_record_increment_with_body_1219) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Cnt<T>(V: int) "
+        "  public static method operator ++(c: Cnt<T>): Cnt<T> => c with V := c.V + 1 end; "
+        "end Cnt; "
+        "class C public static method Main(): int "
+        "  var c: Cnt<string> := new Cnt<string>(10); c++; c++; c++; return c.V; "
+        "end Main; end C;"), 13);
+}
+
+// #1219 / §25.2: `--` on a generic record — same fix path as `++`.
+BEZEL_TEST(codegen_cg48, generic_record_decrement_new_body_1219) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Box<T>(V: int) "
+        "  public static method operator --(b: Box<T>): Box<T> => new Box<T>(b.V - 1); "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var b: Box<string> := new Box<string>(20); b--; b--; return b.V; "
+        "end Main; end C;"), 18);
+}
