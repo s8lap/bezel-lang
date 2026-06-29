@@ -748,8 +748,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // eliminates the #995 silent miscompile where Count/Sum/Any/First/… returned
     // garbage on such a receiver.
     bool vtIEnum = isVtableBackedIEnumerableType(recvTy);
+    // fix #1220 / §5 / §9.6: string is IEnumerable<char> — route its aggregate
+    // terminals (Count/Any/Sum/First/…) through the same materialize-then-run
+    // path. lowerToLazyEnumerator materializes via bz_str_to_char_array.
+    bool isStringRecvTerm = recvTy &&
+        recvTy->kind == sema::TypeRef::Kind::Primitive &&
+        recvTy->primitive == sema::PrimitiveType::String;
     bool lazyTerminal =
-        (lazyRecv || isLinkedList || isRangeRecv || vtIEnum) && isArrTerminal;
+        (lazyRecv || isLinkedList || isRangeRecv || vtIEnum ||
+         isStringRecvTerm) && isArrTerminal;
 
     // fix #853 / stdlib §4.1–§4.3: a built-in collection member invoked through a
     // POLYMORPHIC collection interface (IReadOnlyCollection<T> / ICollection<T> /
@@ -820,7 +827,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // read the element TypeRef (genericArgs[0]). The lazy sentinel carries
         // it too, so collectionElemSize(recvTy) yields the same value the lazy
         // operators used when they were built (matching bz_lazy_to_array's esz).
-        int64_t esz = collectionElemSize(recvTy);
+        // Exception: for a string receiver, recvTy carries no genericArgs so
+        // collectionElemSize returns 8 (wrong). char is always i32 = 4 bytes.
+        int64_t esz = isStringRecvTerm ? 4 : collectionElemSize(recvTy);
         auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
         recv = builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)},
                                    "linq.term.mat");
@@ -13978,6 +13987,23 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         auto* fn = declareC("bz_lazy_from_llist", ptrTy(), {ptrTy(), i64()});
         return builder_.CreateCall(fn, {recv, builder_.getInt64(esz)}, "lazy.llist");
     }
+    // fix #1220 / §5 / §9.6: string is IEnumerable<char>. Materialize it into
+    // a fresh owned Array<char> (elem_size=4, one i32 code-point per slot) via
+    // bz_str_to_char_array (already lowered to `recv` above), then wrap as an
+    // OWNING lazy ARRAY source so the lazy pipeline (Where/Select/Count/…) owns
+    // and frees it on drain. `recv` is the string pointer (already evaluated).
+    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Primitive &&
+        recvTy->primitive == sema::PrimitiveType::String) {
+        auto* toArrFn = declareC("bz_str_to_char_array", ptrTy(), {ptrTy()});
+        llvm::Value* charArr =
+            builder_.CreateCall(toArrFn, {recv}, "str.chararray");
+        // Element type for char is i32 (code point); size = 4.
+        elemRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Char);
+        auto* ownFn =
+            declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(ownFn,
+            {charArr, builder_.getInt64(4)}, "lazy.str");
+    }
     // fix #449: only Array<T>-family (isCollectionTypeName) collections are
     // bz_array_t*-backed.  Do NOT fall through for an unrecognised receiver type
     // (e.g. the i32(0) produced by in-place Array.Reverse()) — that would pass
@@ -14019,7 +14045,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // LINQ operators (Where/Select/Take/…) can enumerate it. Without this they
     // silently fell through (the #995 Where/Select garbage/NYI).
     bool vtRecv = isVtableBackedIEnumerableType(recvTy);
-    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv) return nullptr;
+    // fix #1220 / §5 / §9.6: string is IEnumerable<char> — lowerToLazyEnumerator
+    // materializes it via bz_str_to_char_array so LINQ operators can enumerate it.
+    bool strRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Primitive &&
+                   recvTy->primitive == sema::PrimitiveType::String;
+    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv)
+        return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
     auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {
@@ -14200,7 +14231,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  // materialize-then-yield-backwards form — without rangeRecv it
                  // fell through to the Array in-place handler (Count/Sum = 0;
                  // ToArray SIGABRT on the bz.range struct read as an array).
-                 (m == "Reverse" && (lazyRecv || rangeRecv)) ||
+                 // fix #1220: string is IEnumerable<char> — admit Reverse on it.
+                 (m == "Reverse" && (lazyRecv || rangeRecv || strRecv)) ||
                  // stdlib §5 (#651): OfType<U>() — lazy identity/type-filter.
                  m == "OfType");
     if (!isOp) return nullptr;

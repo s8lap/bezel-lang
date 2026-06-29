@@ -79,4 +79,81 @@ BEZEL_TEST(codegen_cg27g, string_for_in_break) {
         "end Main; end C;"), 2);  // 'H', 'e' before first 'l'
 }
 
+// ===== fix #1220 / §5 / §9.6: LINQ operators on string =====
+// string is IEnumerable<char>; Where/Select/Count/Skip/Take and other LINQ
+// operators must resolve via the IEnumerable<char> extension path rather than
+// the "not yet supported in codegen" catch-all.
+
+// §9.6 / §5: s.Where((c) => ...) filters chars and iterates the result.
+// "aAbBcC".Where(c='A') = one match → expect 1.
+BEZEL_TEST(codegen_string_linq_1220, string_where_char_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"aAbBcC\"; var n := 0; "
+        "  for var c in s.Where((c) => c = 'A') do n := n + 1; end; "
+        "  return n; "
+        "end Main; end C;"), 1);
+}
+
+// §9.6 / §5: s.Where(...) with multiple matches.
+// "Hello".Where(c='l') = two 'l' chars → expect 2.
+BEZEL_TEST(codegen_string_linq_1220, string_where_multiple) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; var n := 0; "
+        "  for var c in s.Where((c) => c = 'l') do n := n + 1; end; "
+        "  return n; "
+        "end Main; end C;"), 2);
+}
+
+// §9.6 / §5: s.Count() — no-arg Count() returns string Length.
+// "Hello" has 5 chars.
+BEZEL_TEST(codegen_string_linq_1220, string_count_noarg) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  return s.Count(); "
+        "end Main; end C;"), 5);
+}
+
+// §9.6 / §5: s.Any((c)=>...) — quantifier over chars.
+// "Hello".Any(c='x') = false → 0.
+BEZEL_TEST(codegen_string_linq_1220, string_any_pred) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  return int(s.Any((c) => c = 'x')); "
+        "end Main; end C;"), 0);
+}
+
+// §9.6 / §5: s.ToArray() materializes string to Array<char>.
+// "ABC".ToArray().Length = 3.
+BEZEL_TEST(codegen_string_linq_1220, string_toarray_length) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"ABC\"; "
+        "  using var a := s.ToArray(); "
+        "  return a.Length; "
+        "end Main; end C;"), 3);
+}
+
+// Anti-regression: intrinsic string member Length still resolves as before.
+BEZEL_TEST(codegen_string_linq_1220, string_length_still_works) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello World\"; "
+        "  return s.Length; "
+        "end Main; end C;"), 11);
+}
+
+// Anti-regression: for-in on a string still works (direct string iter, not LINQ).
+BEZEL_TEST(codegen_string_linq_1220, string_for_in_anti_regression) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hi\"; var cnt := 0; "
+        "  for var c in s do cnt := cnt + 1; end; "
+        "  return cnt; "
+        "end Main; end C;"), 2);
+}
+
 }  // namespace

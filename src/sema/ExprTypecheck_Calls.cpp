@@ -2229,6 +2229,58 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // Array<T> that the lazy operator then enumerates.
                     else if (typeLinqOperator(srcElem2)) { /* typed */ }
                 }
+                // fix #1220 / §5 / §9.6: string is IEnumerable<char> — LINQ
+                // operators resolve with char as the source element type, using
+                // the same pipeline as a lazy IEnumerable<T> receiver. The
+                // receiver type is Primitive(String); codegen materializes it
+                // to an Array<char> via bz_str_to_char_array then runs the
+                // lazy LINQ machinery. Every LINQ terminal/lazy-op that can
+                // reach a string receiver is typed here; typeLinqOperator covers
+                // the lazy operators (Where/Select/Skip/Take/…).
+                bool isStringLinqRecv =
+                    recvTy && recvTy->kind == TypeRef::Kind::Primitive &&
+                    recvTy->primitive == P::String;
+                if (isStringLinqRecv) {
+                    TypeRef* charTy = ctx_.primitiveTypeRef(P::Char);
+                    if (m == "Any" || m == "All")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                    else if (m == "Count")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    else if (m == "First" || m == "Last" || m == "Single" ||
+                             m == "ElementAt")
+                        ctx_.setExprType(&ce, charTy);
+                    else if ((m == "FirstOrNull" || m == "LastOrNull" ||
+                              m == "SingleOrNull") && ce.args.empty()) {
+                        auto* nullTy = ctx_.makeTypeRef();
+                        *nullTy = *charTy;
+                        nullTy->nullable = true;
+                        ctx_.setExprType(&ce, nullTy);
+                    }
+                    else if (m == "ToArray" || m == "ToSet")
+                        ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                            m == "ToSet" ? "Set" : "Array", charTy));
+                    else if (m == "ToDictionary" && !ce.args.empty()) {
+                        TypeRef* keyTy = nullptr;
+                        if (ce.args[0].value)
+                            if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                if (lt->kind == TypeRef::Kind::Function &&
+                                    lt->funcReturn)
+                                    keyTy = lt->funcReturn;
+                        ctx_.setExprType(&ce, makeDictResult(keyTy, charTy));
+                    }
+                    else if (m == "Reverse" && ce.args.empty())
+                        ctx_.setExprType(&ce, makeLazyEnumerable(charTy));
+                    else if (m == "Aggregate" && !ce.args.empty() &&
+                             ce.args[0].value) {
+                        if (auto* st = ctx_.exprType(*ce.args[0].value))
+                            ctx_.setExprType(&ce, st);
+                    }
+                    else if (m == "Sum" || m == "Min" || m == "Max")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    else if (m == "Average")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                    else typeLinqOperator(charTy);
+                }
                 // stdlib §3.2: a method call on an `Encoding` receiver
                 // (`Encoding.Utf8.GetBytes(s)` / `.GetString(b[,i,c])` / `.Name`).
                 // The receiver's type is the Encoding TypeSymbol (set in
@@ -5544,7 +5596,14 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
         m == "ThenBy" || m == "ThenByDescending";
     if (!elemLambda) return nullptr;
     auto* recvTy = ctx_.exprType(*ma->target);
-    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+    if (!recvTy) return nullptr;
+    // fix #1220 / §9.6: string is IEnumerable<char> — seed the LINQ lambda
+    // param with char so `s.Where((c) => c = 'A')` types `c` as char and the
+    // body's char comparison resolves correctly.
+    if (recvTy->kind == TypeRef::Kind::Primitive &&
+        recvTy->primitive == PrimitiveType::String)
+        return ctx_.primitiveTypeRef(PrimitiveType::Char);
+    if (recvTy->kind != TypeRef::Kind::Named ||
         recvTy->genericArgs.empty() || !recvTy->genericArgs[0])
         return nullptr;
     // A collection (Array/Set/… — Named with astNode, no declaration) or a lazy
@@ -7716,12 +7775,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         resolveExtensionMember(ma, ext);
                         return;
                     }
-                    // Emit a diagnostic for unrecognized string members.
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        std::string("string member `.") +
-                        std::string(ma.member) +
-                        "` is not yet supported in codegen");
+                    // fix #1220 / §5 / §9.6: string is IEnumerable<char>, so
+                    // LINQ operators (Where/Select/Skip/Take/…) resolve via the
+                    // IEnumerable<char> extension path. For those names, do NOT
+                    // emit the catch-all diagnostic here — typeCall() will type
+                    // the call expression with char as the element type. Only
+                    // emit the error for truly unrecognised (non-LINQ) members.
+                    bool isLinqOp =
+                        ma.member == "Where"     || ma.member == "Select"    ||
+                        ma.member == "SelectMany" || ma.member == "Skip"      ||
+                        ma.member == "Take"       || ma.member == "TakeWhile" ||
+                        ma.member == "SkipWhile"  || ma.member == "Distinct"  ||
+                        ma.member == "OrderBy"    || ma.member == "OrderByDescending" ||
+                        ma.member == "ThenBy"     || ma.member == "ThenByDescending"  ||
+                        ma.member == "Concat"     || ma.member == "Zip"       ||
+                        ma.member == "Union"      || ma.member == "Intersect" ||
+                        ma.member == "Except"     || ma.member == "Reverse"   ||
+                        ma.member == "Any"        || ma.member == "All"       ||
+                        ma.member == "Count"      || ma.member == "Sum"       ||
+                        ma.member == "Min"        || ma.member == "Max"       ||
+                        ma.member == "Average"    || ma.member == "First"     ||
+                        ma.member == "Last"       || ma.member == "Single"    ||
+                        ma.member == "ElementAt"  || ma.member == "FirstOrNull"  ||
+                        ma.member == "LastOrNull"  || ma.member == "SingleOrNull" ||
+                        ma.member == "ToArray"    || ma.member == "ToSet"     ||
+                        ma.member == "ToDictionary" || ma.member == "GroupBy" ||
+                        ma.member == "Aggregate"  || ma.member == "ForEach";
+                    if (!isLinqOp) {
+                        // Emit a diagnostic for unrecognized string members.
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("string member `.") +
+                            std::string(ma.member) +
+                            "` is not yet supported in codegen");
+                    }
+                    // For LINQ operators typeCall() types the call expression
+                    // treating string as IEnumerable<char> (§9.6).
                 } else if (ma.member == "ToString") {
                     // CG27c: ToString() is an intrinsic on all primitive
                     // types (§5) — returns the string representation.
