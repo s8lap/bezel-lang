@@ -11350,6 +11350,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 return nullptr;
             }
         } else {
+            // §22.3 / #1221: for an imported method (ms->decl is not an
+            // ast::MethodDecl) the formal param modifier lives on the
+            // ParameterSymbol in ms->params.  Mirror buildOrderedArgs: pass the
+            // variable's ADDRESS for ref/out params instead of its loaded value.
+            std::size_t pi = 0;
             for (const auto& a : call.args) {
                 if (!a.value) {
                     if (didPrePass) {
@@ -11358,7 +11363,22 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     }
                     return nullptr;
                 }
-                llvm::Value* v = lowerExpr(*a.value);
+                // Determine the formal parameter's ref/out modifier from the
+                // imported ParameterSymbol; also honour the call-site modifier
+                // (a.modifier carries "ref"/"out" written at the call site).
+                std::string_view formalMod;
+                if (pi < ms->params.size())
+                    if (auto* ps =
+                            dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]))
+                        formalMod = ps->modifier;
+                bool byRef = isByRefMod(a.modifier) || isByRefMod(formalMod);
+                llvm::Value* v;
+                if (byRef) {
+                    llvm::Type* et = nullptr;
+                    v = lvalueAddr(*a.value, et);
+                } else {
+                    v = lowerExpr(*a.value);
+                }
                 if (!v) {
                     if (didPrePass) {
                         genericSubst_ = std::move(preSavedSubst);
@@ -11368,6 +11388,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
                 args.push_back(v);
                 argExprs.push_back(a.value.get());
+                ++pi;
             }
         }
         // Restore genericSubst_ to original state after the lambda compilation

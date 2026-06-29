@@ -3776,4 +3776,104 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
+// §22.3 / issue #1221: a `ref` or `out` parameter of an IMPORTED method must be
+// passed by ADDRESS at the call site (not by loaded value). Before the fix the
+// else-branch (for ms->decl not an ast::MethodDecl) called lowerExpr for every
+// argument, producing an IR type-mismatch (i32 passed where ptr expected) and
+// LLVM verifier failure. After the fix the call-site modifier and the imported
+// ParameterSymbol's modifier are honoured, exactly as buildOrderedArgs does for
+// local methods.
+//
+// Test A: ref int — both params ref, swap must succeed (a == 20 after swap).
+BEZEL_TEST(cross_module_import,
+           imported_ref_param_passes_address_not_value_spec_22_3_1221_A) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bz1221_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module RefLib; "
+        "public static class Ops "
+        "  public static method SwapInts(ref a: int, ref b: int) "
+        "    var t := a; a := b; b := t; "
+        "  end SwapInts; "
+        "end Ops;");
+    writeSource(bSrc.path,
+        "module App; import RefLib; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var a := 10; var b := 20; "
+        "    Ops.SwapInts(ref a, ref b); "
+        "    return a; "   // a should be 20 after swap
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 20);  // a == 20 after swap
+}
+
+// Test B: out int — callee writes back via out param; caller must observe it.
+BEZEL_TEST(cross_module_import,
+           imported_out_param_writes_back_spec_22_3_1221_B) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bz1221b_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module OutLib; "
+        "public static class Adder "
+        "  public static method Add(a: int, b: int, out result: int) "
+        "    result := a + b; "
+        "  end Add; "
+        "end Adder;");
+    writeSource(bSrc.path,
+        "module App2; import OutLib; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var result := 0; "
+        "    Adder.Add(3, 7, out result); "
+        "    return result; "   // should be 10
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 10);  // Add(3, 7) == 10
+}
+
 }  // namespace bezel::module
