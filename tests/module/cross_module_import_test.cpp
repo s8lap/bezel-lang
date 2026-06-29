@@ -3093,6 +3093,85 @@ BEZEL_TEST(cross_module_import,
 }
 
 // ---------------------------------------------------------------------------
+// §22.12 / #1224: imported generic class with PRIVATE static field accessed
+// in a static method — per-instantiation statics are independent.
+// ---------------------------------------------------------------------------
+// Root cause: private fields were not exported in the generic-class metadata, so
+// the synthetic method source built by buildSyntheticMethodSource lacked the field
+// declaration. Sema then rejected the re-parsed body (unresolved `_count`),
+// parseAndAttachMethodBody returned false, and the imported MethodSymbol kept a
+// null decl — blocking the per-instantiation inline monomorphization path.
+// Without inlining, both Registry<int>.Register() and Registry<string>.Register()
+// called the SAME compiled template function bz$Registry$Register, which operates
+// on the single shared template-level global bz$Registry$_count — violating §22.12.
+// Fix: export private/internal fields for generic classes (ModuleMetadataBuilder,
+// `includeForMethodBody`), mirroring the existing private-method export (#695).
+// ---------------------------------------------------------------------------
+
+// §22.12 / #1224: a generic class with a PRIVATE static field accessed by bare
+// name in a static method must give each distinct type-arg instantiation an
+// INDEPENDENT counter when called cross-module.
+// Registry<int>.Register() called twice and Registry<string>.Register() called
+// twice should return 1,2 for int and 1,2 for string (not share one global).
+BEZEL_TEST(cross_module_import,
+           imported_generic_private_static_field_per_instantiation_spec_22_12_1224) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1224_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    // Module A: generic class Registry<T> with private static counter
+    // accessed via bare name in a static method (the exact bug pattern for
+    // #1224 — qualified access Registry._count was already correct, but
+    // bare `_count` failed because the private field was not in the metadata).
+    writeSource(aSrc.path,
+        "module RegLib; "
+        "public class Registry<T> "
+        "  private static _count: int := 0; "
+        "  public static method Register(): int "
+        "    _count := _count + 1; "
+        "    return _count; "
+        "  end Register; "
+        "end Registry; ");
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    // Module B: call Registry<int>.Register() twice then Registry<string>.Register()
+    // twice. §22.12: each instantiation has its own static state, so the int
+    // counter returns 1,2 and the string counter independently returns 1,2.
+    // The sum b + d must be 4 (2 + 2). If statics are shared it would be 6 (2 + 4).
+    writeSource(bSrc.path,
+        "module App; "
+        "import RegLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    Registry<int>.Register(); "
+        "    var b := Registry<int>.Register(); "
+        "    Registry<string>.Register(); "
+        "    var d := Registry<string>.Register(); "
+        "    return b + d; "
+        "  end Main; "
+        "end Program; ");
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency dep;
+    dep.metadataPath = aObj.path;
+    dep.objectPath = aObj.path;
+    deps.push_back(dep);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // §22.12: isolated counters → b=2, d=2, sum=4.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 4);
+}
+
+// ---------------------------------------------------------------------------
 // §14 / #662c / #695: imported generic-class ctor/dtor body self-method calls
 // ---------------------------------------------------------------------------
 // Root cause: private methods were not exported in the generic-class metadata,

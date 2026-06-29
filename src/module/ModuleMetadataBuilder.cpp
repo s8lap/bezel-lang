@@ -542,6 +542,8 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         auto* member = dynamic_cast<const sema::MemberSymbol*>(ms);
         if (member == nullptr) continue;
         bool isMethod = dynamic_cast<const sema::MethodSymbol*>(ms) != nullptr;
+        bool isField  = !isMethod &&
+            dynamic_cast<const sema::FieldSymbol*>(ms) != nullptr;
         bool exported = isExportedMember(member->visibility, inInterface);
         // For generic classes, also include private/internal METHODS so the
         // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
@@ -549,7 +551,24 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
-        if (!exported && !includeForCtorBody) continue;
+        // §14.1 / #1224: for generic classes, also include private/internal
+        // FIELDS so that the importer's method body re-parsing
+        // (parseAndAttachMethodBody / buildSyntheticMethodSource) can resolve
+        // bare field references such as `_count` inside a static method.
+        // Without this, a method body that accesses a private field fails to
+        // sema-check in the synthetic fresh context → parseAndAttachMethodBody
+        // returns false → ms->decl stays null → the per-instantiation inline
+        // monomorphization path is not taken → all instantiations silently
+        // share the template-level global, violating §22.12 ("each distinct
+        // instantiation has its own static state"). Only name + type is
+        // exported — no initializer, no ABI change. Mirrors the private-method
+        // rationale (#695): the field is not accessible outside the class;
+        // the stub is used solely for sema name-resolution in re-parsed bodies.
+        bool includeForMethodBody = isGenericClass && isField &&
+            !exported &&
+            (member->visibility == ast::Visibility::Private ||
+             member->visibility == ast::Visibility::Internal);
+        if (!exported && !includeForCtorBody && !includeForMethodBody) continue;
         MetaMember mm;
         if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source))
             out.members.push_back(std::move(mm));
