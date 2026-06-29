@@ -3876,4 +3876,209 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 10);  // Add(3, 7) == 10
 }
 
+
+// --- §11.3 / §12.1 cross-module base-chain reconstruction (issue #1223) ----
+//
+// When Base is in module A and Extended : Base is in module B, loading B's
+// metadata into a SemaContext that already has A's types must reconstruct
+// Extended.baseTypes → [Base] so that member lookup and field-offset layout
+// both work.
+//
+// Root cause: Loader::lookupNamed only searched localTypes (the current
+// module's own exported types). The comment above that function described the
+// intended behaviour — "first local, then any type already loaded into the
+// context" — but the second step was missing. Fix: fall back to
+// SemaContext::lookupImportedTypeByName when localTypes misses.
+
+// (27) §11.3 / §12.1 / #1223 sema: loading B's metadata after A's correctly
+// links Extended.baseTypes → Base and exposes GetX() via member lookup.
+//
+// Key: B must be compiled WITH A loaded so that Extended.baseTypeRefs is
+// populated (TypeResolution only sets baseTypes/baseTypeRefs when the base
+// resolves to a TypeSymbol — §TypeResolution_Names.cpp).  We use a local
+// helper that mirrors buildMetaFor but loads the dependency before resolving.
+BEZEL_TEST(cross_module_import,
+           cross_module_base_chain_member_lookup_sema_spec_11_3_12_1_1223) {
+    static const std::string kASrc =
+        "module BaseLib1223; "
+        "public class Base "
+        "  public _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  public method GetX(): int => _x; "
+        "  destructor end destructor; "
+        "end Base;";
+    static const std::string kBSrc =
+        "module ExtLib1223; "
+        "import BaseLib1223; "
+        "public class Extended : Base "
+        "  public _y: int; "
+        "  public constructor(x: int, y: int) base(x); _y := y; end constructor; "
+        "  public method GetY(): int => _y; "
+        "  public method Sum(): int => GetX() + _y; "
+        "  destructor end destructor; "
+        "end Extended;";
+
+    // Build A's metadata stand-alone (no deps).
+    ModuleMetadata depA = buildMetaFor(kASrc);
+
+    // Build B's metadata with A loaded into its sema context, so that
+    // Extended.baseTypeRefs is populated (Base resolves, §TypeResolution_Names).
+    ModuleMetadata depB;
+    {
+        DiagnosticEngine bDiags;
+        Lexer bLex(kBSrc, bDiags);
+        Parser bPar(bLex, bDiags);
+        auto bSf = bPar.parseCompilationUnit();
+        if (bSf) {
+            sema::SemaContext bCtx(bDiags);
+            sema::collectSymbols(*bSf, bCtx);
+            loadMetadata(depA, bCtx);          // A types visible during B's resolve
+            sema::resolveTypes(*bSf, bCtx);
+            sema::typecheckExpressions(*bSf, bCtx);
+            depB = buildModuleMetadata(bCtx, kBSrc);
+        }
+    }
+
+    // Main context: load A then B.  B's Extended.baseTypes["Base"] should
+    // be resolved by lookupNamed falling back to ctx.lookupImportedTypeByName.
+    DiagnosticEngine diags;
+    sema::SemaContext ctx(diags);
+    BEZEL_EXPECT_TRUE(loadMetadata(depA, ctx));
+    BEZEL_EXPECT_TRUE(loadMetadata(depB, ctx));
+
+    // Find the Extended TypeSymbol in B's exports.
+    const std::vector<sema::TypeSymbol*>* bTypes = ctx.importedTypesOf("ExtLib1223");
+    BEZEL_EXPECT_TRUE(bTypes != nullptr);
+    if (!bTypes) return;
+    sema::TypeSymbol* extSym = nullptr;
+    for (sema::TypeSymbol* t : *bTypes)
+        if (t->name == "Extended") extSym = t;
+    BEZEL_EXPECT_TRUE(extSym != nullptr);
+    if (!extSym) return;
+
+    // §11.3 / §12.1: Extended.baseTypes must link to Base (from A) — not empty.
+    // Without the fix, lookupNamed("Base") during B's load returns nullptr
+    // (Base is not in B's localTypes), so baseTypes stays empty.
+    BEZEL_EXPECT_TRUE(!extSym->baseTypes.empty());
+    if (extSym->baseTypes.empty()) return;
+    BEZEL_EXPECT_TRUE(extSym->baseTypes[0] != nullptr);
+    if (extSym->baseTypes[0])
+        BEZEL_EXPECT_TRUE(extSym->baseTypes[0]->name == "Base");
+
+    // §11.3: lookupMember on Extended must find the inherited GetX().
+    sema::Symbol* getX = nullptr;
+    {
+        // BFS walk mirroring ExprTC::lookupMember.
+        std::vector<sema::TypeSymbol*> frontier{extSym};
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            sema::TypeSymbol* t = frontier[i++];
+            for (sema::Symbol* m : t->members)
+                if (m && m->name == "GetX") { getX = m; break; }
+            if (getX) break;
+            for (sema::TypeSymbol* b : t->baseTypes)
+                if (b) frontier.push_back(b);
+        }
+    }
+    BEZEL_EXPECT_TRUE(getX != nullptr);
+}
+
+// (28) §11.3 / §12.1 / #1223 AOT runtime: Base in module A, Extended : Base
+// in module B, main imports both.  ext.GetX() must return the base field (100
+// not 200), ext.Sum() = GetX() + GetY() = 300 not 400.  Compile A → A.o,
+// B (--import A.o) → B.o, main (--import A.o B.o) → exe.
+BEZEL_TEST(cross_module_import,
+           cross_module_base_chain_field_layout_aot_spec_11_3_12_1_1223) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1223_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bObj((dir / (stem + "_b.o")).string());
+    TempFile cSrc((dir / (stem + "_c.bzl")).string());
+    TempFile cExe((dir / (stem + "_c")).string());
+
+    // Module A: Base with _x field, GetX() method.
+    writeSource(aSrc.path,
+        "module BaseLib1223N; "
+        "public class Base "
+        "  public _x: int; "
+        "  public constructor(x: int) _x := x; end constructor; "
+        "  public method GetX(): int => _x; "
+        "  destructor end destructor; "
+        "end Base;");
+    // Module B: Extended : Base (cross-module base) + Factory.
+    writeSource(bSrc.path,
+        "module ExtLib1223N; "
+        "import BaseLib1223N; "
+        "public class Extended : Base "
+        "  public _y: int; "
+        "  public constructor(x: int, y: int) base(x); _y := y; end constructor; "
+        "  public method GetY(): int => _y; "
+        "  public method Sum(): int => GetX() + _y; "
+        "  destructor end destructor; "
+        "end Extended; "
+        "public class Factory "
+        "  public static method Create(x: int, y: int): owned Extended "
+        "    return new Extended(x, y); "
+        "  end Create; "
+        "end Factory;");
+    // Main: imports A and B, creates Extended(100, 200) via Factory.Create,
+    // checks GetX()==100, GetY()==200, Sum()==300.  Returns 0 on success.
+    writeSource(cSrc.path,
+        "module Main1223N; "
+        "import BaseLib1223N; "
+        "import ExtLib1223N; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var ext := Factory.Create(100, 200); "
+        "    var gx := ext.GetX(); "
+        "    var gy := ext.GetY(); "
+        "    var s := ext.Sum(); "
+        "    if gx <> 100 then return 1; end; "
+        "    if gy <> 200 then return 2; end; "
+        "    if s <> 300 then return 3; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    // Step 1: compile A → A.o (no dependencies).
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    // Step 2: compile B → B.o (imports A).
+    std::vector<bezel::Dependency> depsB;
+    {
+        bezel::Dependency d;
+        d.metadataPath = aObj.path;
+        d.objectPath   = aObj.path;
+        depsB.push_back(d);
+    }
+    bezel::CompileResult rb = driver.compileObject(bSrc.path, bObj.path, depsB);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Step 3: compile main → executable (imports A and B).
+    std::vector<bezel::Dependency> depsC;
+    {
+        bezel::Dependency dA, dB;
+        dA.metadataPath = aObj.path; dA.objectPath = aObj.path;
+        dB.metadataPath = bObj.path; dB.objectPath = bObj.path;
+        depsC.push_back(dA);
+        depsC.push_back(dB);
+    }
+    bezel::CompileResult rc = driver.compileFile(cSrc.path, cExe.path, depsC);
+    BEZEL_EXPECT_TRUE(rc.success);
+    if (!rc.success) return;
+
+    int status = std::system(cExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 0 = GetX()==100, GetY()==200, Sum()==300 (all correct).
+    // 1 = GetX() returned wrong field; 2 = GetY() wrong; 3 = Sum() wrong.
+    BEZEL_EXPECT_EQ(code, 0);
+}
+
+
 }  // namespace bezel::module

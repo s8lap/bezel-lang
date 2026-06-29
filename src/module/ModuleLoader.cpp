@@ -201,9 +201,17 @@ struct Loader {
 
     sema::TypeSymbol* lookupNamed(const std::string& name) {
         if (name.empty()) return nullptr;
+        // Local types (the current module's own exported types) take priority.
         auto it = localTypes.find(name);
         if (it != localTypes.end()) return it->second;
-        return nullptr;  // unresolved (generic param / external) — Named w/o decl
+        // §2.5 / §12 / §11.3 (issue #1223): fall back to types already loaded
+        // from OTHER modules (e.g. a base class from a dependency when
+        // reconstructing a cross-module `Extended: Base` inheritance chain).
+        // Without this, `Extended.baseTypes` stays empty → lookupMember cannot
+        // walk up to `Base`'s members (BAD_REJECT on GetX()) AND
+        // collectInstanceStorage misses the base-subobject prefix → wrong
+        // field offsets (Sum() returns 400 instead of 300).
+        return ctx.lookupImportedTypeByName(name);
     }
 
     std::vector<std::string_view> intern(const std::vector<std::string>& in) {

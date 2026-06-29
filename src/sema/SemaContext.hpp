@@ -221,6 +221,24 @@ public:
         return it == importedByModule_.end() ? nullptr : &it->second;
     }
 
+    // §2.5 / §12 / §11.3 (issue #1223): resolve a short type name across ALL
+    // already-loaded modules. Used by the module loader when a MetaType::Named
+    // refers to a type from a different module (e.g. a base class exported by
+    // module A, referenced in module B's `Extended: Base` metadata). The local
+    // `localTypes` map only covers the current module being loaded; cross-module
+    // base references must fall back to this search. Returns the first match; in
+    // a well-formed program each public type name is unique across the import
+    // closure (the spec forbids ambiguous top-level names within a module, and
+    // inter-module conflicts are a separate error), so first-match is correct.
+    TypeSymbol* lookupImportedTypeByName(std::string_view name) const {
+        for (const auto& [modName, types] : importedByModule_) {
+            for (TypeSymbol* t : types) {
+                if (t && t->name == name) return t;
+            }
+        }
+        return nullptr;
+    }
+
     // Every imported symbol (across all loaded modules), in load order. Codegen
     // walks this to emit external declarations for imported callables.
     std::vector<Symbol*> importedSymbols() const {
