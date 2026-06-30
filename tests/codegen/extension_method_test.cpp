@@ -380,3 +380,145 @@ BEZEL_TEST(codegen_extension, method_on_interface_via_impl_spec_26_5_927) {
         "  return s.Describe(); "  // 4*4 + 1 = 17
         "end Main; end C;"), 17);
 }
+
+// ===========================================================================
+// §26.5 / #1237 — Facet A: extension on an INTERFACE called with a RECORD
+// receiver.  The record implements the interface; calling the extension via
+// the record value requires boxing the record into a proper interface
+// reference (vtable + itable) so `this.M()` inside the extension dispatches
+// through the itable.  Before the fix this SIGSEGV'd because the receiver was
+// spilled to a raw stack pointer with no vtable, which itable_lookup derefs.
+// ===========================================================================
+
+// §26.5 / #1237 Facet A – basic repro: record receiver → extension boxing →
+// `this.Get()` itable dispatch.  r is record R(7); r.Wrap() must return 7.
+BEZEL_TEST(codegen_extension,
+           iface_extension_record_receiver_boxes_for_this_dispatch_1237_A) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IFoo method Get(): int; end IFoo; "
+        "record R(X: int): IFoo "
+        "  public method Get(): int => X; "
+        "end R; "
+        "extension IFoo "
+        "  public method Wrap(): int => this.Get(); "
+        "end; "
+        "class C public static method Main(): int "
+        "  var r := new R(7); "
+        "  return r.Wrap(); "   // 7
+        "end Main; end C;"), 7);
+}
+
+// §26.5 / #1237 Facet A – variant: extension takes an arg AND calls two
+// interface methods via `this`, both dispatched through the itable.
+BEZEL_TEST(codegen_extension,
+           iface_extension_record_receiver_two_this_calls_1237_A) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IFoo method Get(): int; method Add(n: int): int; end IFoo; "
+        "record R(X: int): IFoo "
+        "  public method Get(): int => X; "
+        "  public method Add(n: int): int => X + n; "
+        "end R; "
+        "extension IFoo "
+        "  public method WrapTwo(): int => this.Get() + this.Add(10); "
+        "end; "
+        "class C public static method Main(): int "
+        "  var r := new R(5); "
+        "  return r.WrapTwo(); "   // 5 + (5+10) = 20
+        "end Main; end C;"), 20);
+}
+
+// §26.5 / #1237 Facet A – regression: CLASS receiver for extension on the
+// same interface must still work (class is already a pointer, no boxing).
+BEZEL_TEST(codegen_extension,
+           iface_extension_class_receiver_regression_1237_A) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IFoo method Get(): int; end IFoo; "
+        "class Impl: IFoo "
+        "  private _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Get(): int => _v; "
+        "  destructor end destructor; "
+        "end Impl; "
+        "extension IFoo "
+        "  public method Wrap(): int => this.Get(); "
+        "end; "
+        "class C public static method Main(): int "
+        "  using var c := new Impl(99); "
+        "  return c.Wrap(); "   // 99
+        "end Main; end C;"), 99);
+}
+
+// §26.5 / #1237 Facet A – regression: interface-VARIABLE receiver must still
+// work (the interface variable already holds a properly boxed/classed pointer).
+BEZEL_TEST(codegen_extension,
+           iface_extension_iface_var_receiver_regression_1237_A) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IFoo method Get(): int; end IFoo; "
+        "record R(X: int): IFoo "
+        "  public method Get(): int => X; "
+        "end R; "
+        "extension IFoo "
+        "  public method Wrap(): int => this.Get(); "
+        "end; "
+        "class C public static method Main(): int "
+        "  var r := new R(55); "
+        "  var ri: IFoo := r; "
+        "  return ri.Wrap(); "   // 55
+        "end Main; end C;"), 55);
+}
+
+// ===========================================================================
+// §26.5 / #1237 — Facet B: `this[i]` indexer dispatch inside an extension
+// body on an INDEXER INTERFACE.  Before the fix, indexReceiverDecl returned
+// null for `this` inside an extension method (extension methods have no
+// parent TypeSymbol), so lowerIndexerGet returned null → caller got 0.
+// ===========================================================================
+
+// §26.5 / #1237 Facet B – basic repro: `this[0]` inside an extension on an
+// indexer interface, called through an interface-variable receiver → 42.
+BEZEL_TEST(codegen_extension,
+           iface_extension_this_indexer_dispatch_1237_B) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IIdx property [i: int]: int; end IIdx; "
+        "class Arr: IIdx "
+        "  private _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public property [i: int]: int => _v + i; "
+        "  destructor end destructor; "
+        "end Arr; "
+        "extension IIdx "
+        "  public method First(): int => this[0]; "
+        "end; "
+        "class C public static method Main(): int "
+        "  using var a := new Arr(42); "
+        "  var ip: IIdx := a; "
+        "  return ip.First(); "   // 42 + 0 = 42
+        "end Main; end C;"), 42);
+}
+
+// §26.5 / #1237 Facet B – regression: direct `ip[i]` from a regular (non-
+// extension) method must still dispatch correctly through the itable.
+BEZEL_TEST(codegen_extension,
+           iface_indexer_direct_dispatch_regression_1237_B) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "interface IIdx property [i: int]: int; end IIdx; "
+        "class Arr: IIdx "
+        "  private _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public property [i: int]: int => _v + i; "
+        "  destructor end destructor; "
+        "end Arr; "
+        "class C "
+        "  private static method GetAt(arr: IIdx, i: int): int => arr[i]; "
+        "  public static method Main(): int "
+        "    using var a := new Arr(40); "
+        "    return GetAt(a, 2); "   // 42
+        "  end Main; "
+        "end C;"), 42);
+}

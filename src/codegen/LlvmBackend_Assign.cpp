@@ -1073,10 +1073,33 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
     // lowerWith's reverse-lookup of currentFn_ in methodFns_).
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
         if ((id->name == "this" || id->name == "base") && currentFn_) {
-            for (const auto& [ms, fn] : methodFns_)
-                if (fn == currentFn_ && ms->parent) return ms->parent;
+            for (const auto& [ms, fn] : methodFns_) {
+                if (fn != currentFn_) continue;
+                if (ms->parent) return ms->parent;
+                // #1237 / §26.5: extension methods have no parent TypeSymbol.
+                // The extension's targetType is the receiver's declared type,
+                // so `this[i]` inside an extension on an interface dispatches
+                // through the itable just like a direct interface-variable
+                // indexer read.
+                if (isExtensionMethod(ms) && ms->extensionDecl->targetType) {
+                    const sema::TypeRef* t =
+                        ctx_.resolvedType(*ms->extensionDecl->targetType);
+                    if (t && t->kind == sema::TypeRef::Kind::Named &&
+                        t->declaration)
+                        return t->declaration;
+                }
+            }
             if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent)
                 return currentSpecMethodSymbol_->parent;
+            // #1237: same for a specialised extension method body.
+            if (currentSpecMethodSymbol_ &&
+                isExtensionMethod(currentSpecMethodSymbol_) &&
+                currentSpecMethodSymbol_->extensionDecl->targetType) {
+                const sema::TypeRef* t = ctx_.resolvedType(
+                    *currentSpecMethodSymbol_->extensionDecl->targetType);
+                if (t && t->kind == sema::TypeRef::Kind::Named && t->declaration)
+                    return t->declaration;
+            }
         }
     }
     return nullptr;

@@ -11265,15 +11265,47 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // the value (recv already is one). For a RECORD receiver `this` is a
         // pointer to a spilled copy of the value (so the body's `this.field`
         // reuses record field access) — spill if recv came through as a value.
+        // §26.5 / #1237: when the extension targets an INTERFACE and the actual
+        // receiver is a value type (record/enum), box it into a proper interface
+        // reference ({ vtable*, i64 rc, record-bytes }) so the extension body's
+        // `this.M()` / `this[i]` dispatches through the correct itable.
         if (isExtensionMethod(ms)) {
             bool byPtr = false;
             llvm::Type* thisTy = extensionThisType(ms, &byPtr);
             if (byPtr && thisTy && !recv->getType()->isPointerTy()) {
-                // Record receiver passed as a value — spill to a stack slot
-                // and hand over its address (the declared `this` is a ptr).
-                llvm::Value* tmp = entryAlloca(recv->getType());
-                builder_.CreateStore(recv, tmp);
-                recv = tmp;
+                // Determine whether the declared extension target is an interface.
+                const sema::TypeRef* extTgt = ms->extensionDecl->targetType
+                    ? ctx_.resolvedType(*ms->extensionDecl->targetType)
+                    : nullptr;
+                bool targetIsIface = extTgt &&
+                    extTgt->kind == sema::TypeRef::Kind::Named &&
+                    extTgt->declaration &&
+                    extTgt->declaration->kind == ast::TypeDeclKind::Interface;
+                if (targetIsIface) {
+                    // Box the record/value receiver into an interface reference
+                    // so the extension body's itable dispatch (`this.M()` /
+                    // `this[i]`) reaches the correct vtable / itable map.
+                    // Simply spilling to a stack slot leaves a raw struct with
+                    // no vtable header → SIGSEGV on itable lookup (§26.5/#1237).
+                    const sema::TypeRef* recvSemaTy = nullptr;
+                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            call.callee.get())) {
+                        if (ma->target)
+                            recvSemaTy = ctx_.exprType(*ma->target);
+                    }
+                    if (recvSemaTy && isBoxableValueType(recvSemaTy))
+                        recv = boxValue(recv, recvSemaTy);
+                    // If the sema type could not be recovered (unusual) or the
+                    // value is not a boxable type, leave recv as-is; the callee
+                    // will guard via the non-pointer check if needed.
+                } else {
+                    // Record (or other value) receiver: spill to a stack slot
+                    // and pass its address so `this.field` in the body uses the
+                    // record field-access machinery (§26.1 / #433 behaviour).
+                    llvm::Value* tmp = entryAlloca(recv->getType());
+                    builder_.CreateStore(recv, tmp);
+                    recv = tmp;
+                }
             }
         } else
         // CG29: a record method receives `this` as a pointer to the record
