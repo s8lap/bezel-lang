@@ -48,6 +48,7 @@ PrimitiveType primitiveFromName(std::string_view name) {
     if (name == "Int64")   return PrimitiveType::Long;
     if (name == "UInt64")  return PrimitiveType::ULong;
     if (name == "Single")  return PrimitiveType::Float;
+    if (name == "Float")   return PrimitiveType::Float;   // §3.4 / stdlib §9.2 (#1241)
     if (name == "Double")  return PrimitiveType::Double;
     if (name == "Decimal") return PrimitiveType::Decimal;
     return PrimitiveType::None;

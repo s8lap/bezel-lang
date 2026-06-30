@@ -646,6 +646,7 @@ set(BEZEL_TEST_SOURCES
     codegen/bug_464_test.cpp
     codegen/bug_465_test.cpp
     codegen/bug_475_fp_predicates_test.cpp
+    codegen/float_pascal_alias_1241_test.cpp             # fix #1241: §3.4/stdlib §9.2 PascalCase `Float` alias for `float` (mirrors `Double`)
     codegen/bug_474_string_slice_test.cpp
     codegen/async_451_test.cpp
     codegen/primary_ctor_param_init_478_test.cpp

@@ -34,7 +34,7 @@ std::string_view moduleSymbolName(const ast::QualifiedName* qn) {
 bool isReservedPrimitiveAliasName(std::string_view n) {
     return n == "Boolean" || n == "Byte" || n == "SByte" || n == "Int16" ||
            n == "UInt16"  || n == "Int32" || n == "UInt32" || n == "Int64" ||
-           n == "UInt64"  || n == "Single" || n == "Double" ||
+           n == "UInt64"  || n == "Single" || n == "Float" || n == "Double" ||
            n == "Decimal" || n == "Char"  || n == "String";
 }
 
