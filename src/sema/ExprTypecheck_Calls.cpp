@@ -7673,26 +7673,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                     return;
                 }
-                // §30.3: Result is T (the task's value type), declared ONLY on
-                // Task<T>. OwnedTask<T> does not expose Result — the result is
-                // single-consumer and ownership-transferring; consumers must `await`
-                // an OwnedTask<T> in an owned-consuming position (§30.5 Pattern B).
-                // Emit a clean diagnostic for OwnedTask<T>.Result and type Task<T>.Result → T.
+                // §30.3 / §30.5 (#1127): Result is T (the task's value type).
+                // Task<T>.Result — the synchronous blocking escape hatch: blocks
+                // the calling thread until the task completes and returns T.
+                // OwnedTask<T>.Result — the same synchronous form for an ownership-
+                // transferring result: blocks until complete, then materializes the
+                // owned T pointer (loaded from the task's result buffer) and transfers
+                // ownership to the caller; the caller must `using var`-bind the result.
+                // Both forms type the expression as T (genericArgs[0]).
+                // A bare `Task` (no type argument) has no value to read; leave it
+                // untyped and let codegen handle or reject it.
                 if (mbr == "Result") {
-                    if (tn == "OwnedTask") {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ma.span.begin,
-                            "`OwnedTask<T>` does not expose a `Result` property "
-                            "(\xC2\xA7""30.3): the result is single-consumer and "
-                            "ownership-transferring; consume it via `await` in an "
-                            "owned-consuming position (\xC2\xA7""30.5 Pattern B)");
-                        return;
-                    }
-                    // Task<T>.Result → T (genericArgs[0]).  A bare `Task` (no type
-                    // argument) has no value to read; leave it untyped and let codegen
-                    // handle or reject it (there is no `Task.Result` in the spec).
-                    if (tn == "Task" && tt && !tt->genericArgs.empty() &&
-                        tt->genericArgs[0]) {
+                    if ((tn == "Task" || tn == "OwnedTask") && tt &&
+                        !tt->genericArgs.empty() && tt->genericArgs[0]) {
                         ctx_.setExprType(&ma, tt->genericArgs[0]);
                         return;
                     }

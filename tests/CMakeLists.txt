@@ -629,6 +629,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_using_var_await_dispose_910_test.cpp
     codegen/async_from_owned_result_939_940_test.cpp
     codegen/async_sync_wait_941_test.cpp
+    codegen/async_owned_task_result_1127_test.cpp
     codegen/using_var_operator_owned_911_test.cpp
     codegen/operator_chain_temp_dispose_912_test.cpp
     codegen/operator_owned_temp_operand_965_test.cpp

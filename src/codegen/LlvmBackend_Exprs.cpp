@@ -2555,20 +2555,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
-    // §30.3 (#941): `t.Result` — the synchronous escape hatch on a Task<T>
-    // receiver (the readonly property; a builtin class with no MethodSymbol).
+    // §30.3 / §30.5 (#941 / #1127): `t.Result` — the synchronous escape hatch
+    // on a Task<T> or OwnedTask<T> receiver (a builtin class, no MethodSymbol).
     // This is the SYNCHRONOUS read used from non-async code (e.g. inside a
     // plain `method Main()`): it blocks the calling thread until the task
     // completes (bz_task_await_sync — the same blocking primitive Wait() uses),
-    // then loads the result buffer by value at the Task<T> element type. It
-    // must NOT route through emitAwaitSuspend, which builds state-machine
-    // suspend/resume blocks valid only inside an async resume function.
+    // then loads the result buffer by value at the element type T. It must NOT
+    // route through emitAwaitSuspend, which builds state-machine suspend/resume
+    // blocks valid only inside an async resume function.
+    // For Task<T>: T is a value/reference type; the buffer holds T directly.
+    // For OwnedTask<T>: T is an owned heap pointer (class/collection);
+    // the buffer holds the T* pointer (8 bytes); loading it transfers ownership
+    // to the caller. The task's result buffer (the malloc'd 8-byte slot) is
+    // freed by bz_task_free when the task is disposed — it frees only the slot,
+    // not the owned T itself, so there is no double-dispose with the caller.
     // Spec §30.3: "Reading Result on a faulted task re-raises the exception" —
     // we re-raise the ORIGINAL exception object (bz_task_error_obj) through the
     // ordinary synchronous-throw machinery (emitThrowValue), so an enclosing
     // try/catch sees the real exception type and the function's unwind boundary
-    // propagates it otherwise. OwnedTask<T> does not expose Result (rejected in
-    // sema), so this only fires for Task<T>.
+    // propagates it otherwise. Both Task<T> and OwnedTask<T> are handled here;
+    // isTaskTypeName fires for both names.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Result") {
             auto* tt = ctx_.exprType(*ma->target);
@@ -2621,15 +2627,37 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                                 {ptrTy()});
                         builder_.CreateCall(markFn, {excObj});
                     }
+                    // §30.5 (#1127): anonymous producer (`C.Method().Result`)
+                    // has no binder that will dispose the task struct; reclaim
+                    // it here on the fault path before re-throwing. (excObj is
+                    // already in a register and survives the task free.)
+                    if (!isBoundTask) {
+                        auto* freeTaskFn =
+                            declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy()});
+                        builder_.CreateCall(freeTaskFn, {task});
+                    }
                     // Re-raise the original exception object through the
                     // synchronous-throw path (stores bz$exc, runs unwind
                     // disposals, branches to the unwind boundary).
                     emitThrowValue(excObj, nullptr);
                     builder_.SetInsertPoint(okBB);
-                    // Load the result by value (the task's buffer lives until
-                    // the task is disposed by its binder; the value is copied
-                    // out here).
-                    return builder_.CreateLoad(resTy, resPtr, "result.value");
+                    // Load the result by value. For a bound task the buffer
+                    // lives until the task is disposed by its binder. For an
+                    // anonymous producer the buffer was malloc'd by
+                    // bz_task_complete and freed when we call bz_task_free
+                    // below — but the value is already in a register at that
+                    // point so the freed buffer does not alias the returned val.
+                    llvm::Value* resultVal =
+                        builder_.CreateLoad(resTy, resPtr, "result.value");
+                    // §30.5 (#1127): reclaim anonymous task on the ok path too.
+                    if (!isBoundTask) {
+                        auto* freeTaskFn =
+                            declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy()});
+                        builder_.CreateCall(freeTaskFn, {task});
+                    }
+                    return resultVal;
                 }
             }
         }
