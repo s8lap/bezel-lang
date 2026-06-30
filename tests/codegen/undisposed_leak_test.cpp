@@ -625,20 +625,94 @@ BEZEL_TEST(undisposed_leak, discard_trivial_class_and_int_allowed_724) {
         "end Main; end C;"), 0);
 }
 
-// §17.13 (#1009): a discard of a MOVE-ONLY owning inline array stays a reject —
-// end-of-statement disposal of its owned slots is a deferred follow-up (its
-// slot-disposal codegen differs from the class/interface vtable path).
-BEZEL_TEST(undisposed_leak, discard_move_only_array_still_rejected_1009) {
-    auto r = runJit(
+// §17.13 / §15.3 (#1016): a discard `_ := a` of a move-only owning inline array
+// is now LEGAL — it disposes each slot at end-of-statement (previously rejected
+// as deferred; #1016 implements the slot-disposal codegen path). The dtor
+// counter Cell.n increments once per disposed Cell, so returning Cell.n after
+// the discard yields 2 — both Cells disposed exactly once. The test was renamed
+// from the #1009 form that asserted hasErrors() (the deferred reject); that
+// assertion is now inverted to confirm acceptance and correct disposal.
+// per §17.13 bullet 2, §15.3, #1016
+BEZEL_TEST(undisposed_leak, discard_move_only_array_disposed_slots_1016) {
+    // Formerly discard_move_only_array_still_rejected_1009: was BEZEL_EXPECT_TRUE
+    // (r.diagnostics.hasErrors()). Now accepted — slots disposed at statement end.
+    const char* src =
         "module M; "
-        "class Cell public constructor() end constructor; "
-        "  destructor end destructor; end Cell; "
+        "class Cell public static n: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Cell.n := Cell.n + 1; end destructor; end Cell; "
         "class C public static method Main(): int "
         "  var a: [2 owned]Cell? := [new Cell(), new Cell()]; "
         "  _ := a; "
-        "  return 0; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+        "  return Cell.n; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 2);   // both Cells disposed before return
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);  // clean: no leak, no double-free
+}
+
+// §17.13 / §15.3 (#1016): non-nullable `[N owned]T` discard also disposes all
+// slots. Three Cells created; `_ := a` disposes all three at statement end.
+// Cell.n = 3 at return. ASan-clean (no leak, no double-free). per §17.13, #1016
+BEZEL_TEST(undisposed_leak, discard_nonnullable_inline_owned_all_slots_1016) {
+    const char* src =
+        "module M; "
+        "class Cell public static n: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Cell.n := Cell.n + 1; end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var a: [3 owned]Cell := [new Cell(), new Cell(), new Cell()]; "
+        "  _ := a; "
+        "  return Cell.n; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 3);   // all 3 slots disposed before return
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §17.13 / §15.3 (#1016) SOUNDNESS: the moved-from array `a` is NOT disposed
+// again at scope end (no double-free). After `_ := a`, `a` is consumed — the
+// MoveOnlyArrayTransferWalker marks it as transferred, so
+// registerInlineOwnedArrayDisposal skips the scope-end path. Cell.n = 2, not 4.
+// ASan confirms no double-free. per §17.13, §15.3, #1016
+BEZEL_TEST(undisposed_leak, discard_inline_owned_no_double_free_1016) {
+    const char* src =
+        "module M; "
+        "class Cell public static n: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Cell.n := Cell.n + 1; end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var a: [2 owned]Cell? := [new Cell(), new Cell()]; "
+        "  _ := a; "
+        "  return Cell.n; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 2);    // 2, not 4 — no double-dispose
+    int lsan = runUnderLeakSanitizer(src, /*detectLeaks=*/false);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);  // ASan: no double-free / UAF
+}
+
+// §17.13 / §15.3 (#1016): when a slot has already been moved out before the
+// discard, only the remaining non-null slots are disposed. Three Cells created;
+// `move a[1]` takes one out (bound to `using var c`), `_ := a` disposes a[0]
+// and a[2] at statement end — 2 disposals by the discard. The return statement
+// captures Cell.n = 2 (pre-scope-exit); `c` is disposed at scope end (after
+// return captures the value). All 3 objects eventually freed — no leak.
+// per §17.13, §15.3, #1016
+BEZEL_TEST(undisposed_leak, discard_inline_owned_partial_null_slots_1016) {
+    const char* src =
+        "module M; "
+        "class Cell public static n: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Cell.n := Cell.n + 1; end destructor; end Cell; "
+        "class C public static method Main(): int "
+        "  var a: [3 owned]Cell? := [new Cell(), new Cell(), new Cell()]; "
+        "  using var c := move a[1]; "
+        "  _ := a; "
+        "  return Cell.n; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runOwn(src), 2);  // a[0]+a[2] disposed by discard; c after return
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);  // no leak (all 3 cells freed total)
 }
 
 // §25 / §28.3 (#965): a user-defined BINARY operator overload declared with an

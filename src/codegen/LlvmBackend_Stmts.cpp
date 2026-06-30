@@ -1260,6 +1260,35 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 if (!diverged_) emitDisposals(disposeStack_.back());
                 disposeStack_.pop_back();
+            } else if (ds->disposeInlineOwnedArray) {
+                // §17.13 / §15.3 (#1016): a discard `_ := expr` of a move-only
+                // owning inline array. Dispose each non-null slot at end-of-
+                // statement, mirroring the scope-end inlineOwnedArray disposal
+                // path in emitDisposals. MoveOnlyArrayTransferWalker already
+                // marked the source as transferred so registerInlineOwnedArray-
+                // Disposal skips the scope-end disposal — no double-free.
+                // Reach the [N x ptr] alloca through the source expression:
+                // unwrap `move expr` to the bare identifier, then use localSlot
+                // to find the alloca (the only valid form for an owning inline
+                // array expression). // per §17.13, §15.3
+                const ast::Expr* src = ds->value.get();
+                if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(src))
+                    if (ue->op == "move" && ue->operand)
+                        src = ue->operand.get();
+                llvm::AllocaInst* arrSlot = src ? localSlot(*src) : nullptr;
+                if (arrSlot) {
+                    if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(
+                            arrSlot->getAllocatedType())) {
+                        unsigned N = static_cast<unsigned>(arrTy->getNumElements());
+                        disposeStack_.emplace_back();
+                        Disposal d{arrSlot, nullptr};
+                        d.inlineOwnedArray = true;
+                        d.inlineSlotCount = N;
+                        disposeStack_.back().push_back(d);
+                        emitDisposals(disposeStack_.back());
+                        disposeStack_.pop_back();
+                    }
+                }
             } else {
                 // §17.13 / stdlib §5 / §28 (#1015): a discard of a FRESH-ownerless
                 // collection materializer (`_ := items.ToArray()` / `.Sorted()` /

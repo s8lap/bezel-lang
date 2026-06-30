@@ -8248,8 +8248,12 @@ struct MoveOnlyArrayTransferWalker {
             expr(inc->target.get(), /*borrow=*/true); return;
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
-            // `_ := arr` is a §17.13 compile error for a move-only array, so this
-            // never carries a real transfer; walk conservatively anyway.
+            // §17.13 / §15.3 (#1016): `_ := arr` is now LEGAL for a move-only
+            // owning array — it disposes the slots at statement end. The source
+            // identifier `arr` is walked as a transfer (borrow=false) so it is
+            // marked in moveOnlyArrayTransferred_, causing
+            // registerInlineOwnedArrayDisposal to skip the scope-end disposal
+            // (the discard takes ownership; no double-free).
             expr(ds->value.get(), /*borrow=*/false); return;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {

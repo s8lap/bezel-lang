@@ -3892,10 +3892,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // The ownership pass marks an owned-PRODUCER class/interface discard
         // (DiscardStmt::disposeOwnedValue) and codegen emits the end-of-statement
         // disposal; a borrow discard carries no obligation. So this site no longer
-        // rejects class/interface discards. Two cases stay rejected:
-        //   * a move-only OWNING inline array (`[N owned]T`) — §17.13 bullet 2;
-        //     end-of-statement disposal of a discarded move-only array is a
-        //     deferred follow-up (its slot-disposal codegen differs).
+        // rejects class/interface discards.
+        // §17.13 / §15.3 (#1016): a discard `_ := expr;` of a move-only OWNING
+        // INLINE ARRAY (`[N owned]T` / `[N owned]T?`) is now also PERMITTED —
+        // the ownership pass sets DiscardStmt::disposeInlineOwnedArray and codegen
+        // emits end-of-statement slot disposal via the inlineOwnedArray path.
+        // Remaining case that stays rejected:
         //   * `_ := <event>.Subscribe(...)` — the owned Subscription's discard is
         //     a likely bug (immediate unsubscribe) and stays an error (§2.11 /
         //     #949); the result is untyped, so it is recognized structurally.
@@ -3918,16 +3920,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     "scope end (§17.13 / §30.10)");
             }
             bool reject = isEventSubscribeDrop(ds->value.get());
-            if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
-                reject = true;
-            }
             if (reject) {
                 ctx_.diagnostics().report(
                     Severity::Error, ds->value->span.begin,
-                    "cannot discard this value (a move-only owning array, or an "
-                    "event subscription whose discard would immediately "
-                    "unsubscribe); bind it (`using var _ := expr;`), call "
-                    "`.Dispose()`, or transfer it (`move`/`return`) (§17.13)");
+                    "cannot discard an event subscription value — the subscription "
+                    "would immediately unsubscribe; bind it (`using var _ := "
+                    "expr;`) or store it (`var sub := expr;`) to keep it alive "
+                    "(§17.13 / §2.11)");
             }
         }
         // per §14.1 + §A.7 (issue #391): `_ := Generic.Create();` discards the

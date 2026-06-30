@@ -241,6 +241,13 @@ struct DiscardStmt : Stmt {
     // collections and builtin handles (Task, Subscription, Shared, …) are also
     // left false — they need their own free paths and are not handled here.
     bool disposeOwnedValue = false;
+    // §17.13 / §15.3 (#1016): set by the ownership pass when `value` is a
+    // move-only owning inline array (`[N owned]T` / `[N owned]T?`). Codegen
+    // emits end-of-statement disposal for each non-null slot, mirroring the
+    // scope-end inlineOwnedArray disposal path. MoveOnlyArrayTransferWalker
+    // marks the source as transferred so its scope-end disposal is skipped
+    // (no double-free).
+    bool disposeInlineOwnedArray = false;
 };
 
 // A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.

@@ -1175,6 +1175,17 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         rt->declaration->decl != nullptr)
                         const_cast<ast::DiscardStmt*>(ds)->disposeOwnedValue = true;
             }
+            // §17.13 / §15.3 (#1016): a discard `_ := expr` of a move-only
+            // owning inline array (`[N owned]T` / `[N owned]T?`). Permitted per
+            // §17.13 bullet 2 — disposes each non-null slot at end-of-statement.
+            // MoveOnlyArrayTransferWalker walks the DiscardStmt value with
+            // borrow=false and marks the source local as transferred, so
+            // registerInlineOwnedArrayDisposal skips the scope-end disposal
+            // (no double-free). Mark the discard here so codegen emits the
+            // slot disposal. // per §17.13, §15.3
+            if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                if (rt->kind == sema::TypeRef::Kind::InlineArray && rt->arrayOwned)
+                    const_cast<ast::DiscardStmt*>(ds)->disposeInlineOwnedArray = true;
         }
         return;
     }
