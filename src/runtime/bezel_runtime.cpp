@@ -5877,7 +5877,30 @@ extern "C" void bz_subscription_dispose(void* subp) {
     }
     auto* sub = (bz_subscription_t*)subp;
     sub->disposed = true;
-    if (sub->src) bz_event_remove_token(sub->src, sub->token);
+    if (sub->src) {
+        // §24 / §27.5 / #841: the handler closure is a transferred +1 — codegen
+        // (lowerEventHandlerClosure → bz_event_subscribe) hands the event source
+        // the SOLE reference with no separate retain.  The source owns exactly one
+        // reference and must release it exactly once on unsubscribe.  Find the
+        // handler by token, release its closure (bz_closure_release is null-safe so
+        // non-capturing lambdas with a null env-pointer are handled correctly), and
+        // null the slot before deactivating — this prevents any stale pointer read
+        // should bz_event_handler_at or the raise loop ever see the inactive entry.
+        // The idempotency guard (bz_sub_live_set erase == 0) above ensures this
+        // path runs AT MOST ONCE per subscription, so no double-release is possible.
+        bz_event_source_t* s = sub->src;
+        for (int64_t i = 0; i < s->count; ++i) {
+            if (s->handlers[i].token == sub->token) {
+                void* cl = s->handlers[i].closure;
+                s->handlers[i].closure = nullptr;  // null before release (defensive)
+                s->handlers[i].active  = false;    // deactivate (tombstone)
+                bz_closure_release(cl);             // release the transferred +1
+                break;
+            }
+        }
+        // bz_event_remove_token is a no-op now (already deactivated above), but
+        // calling it here would be redundant — skip it.
+    }
     sub->src = nullptr;  // null the back-pointer before freeing
     free(sub);           // fixes #372: the node was previously never freed
 }

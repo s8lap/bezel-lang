@@ -547,6 +547,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_event_1176_test.cpp      # issue #1176: RaiseAsync on async event §24.5/§30
     codegen/event_leak_480_test.cpp
     codegen/static_owned_field_disposal_1212_test.cpp  # issue #1212: static owned fields disposed at exit §22.13
+    codegen/event_subscription_closure_841_test.cpp  # §24/§27.5 #841: release handler closure env on sub dispose
     codegen/cancellation_token_test.cpp
     codegen/mutex_lock_647_test.cpp             # §6.2 Mutex + Lock, issue #647
     codegen/semaphore_647_test.cpp              # §6.3 Semaphore + SemaphoreToken, issue #647
