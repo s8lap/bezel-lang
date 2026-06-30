@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.155 — June 2026**
+**Companion to the Bezel Language Specification, v0.156 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -458,7 +458,7 @@ A structural difference from the `OwnedBuffer<T>`-backed spans is worth noting: 
 
 **Unifying read-only spans through an interface (v0.108).** With v0.107, the span family contained six concrete types. Methods that wanted to accept "any read-only span" had no way to express that — they had to declare per-source overloads, accept one form and require callers to convert, or duplicate their implementation. v0.108 introduces `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)), an interface implemented by all six concrete span types, that unifies the read-only access surface.
 
-The mechanism is straightforward and uses existing language machinery. Spans are records, records may implement interfaces (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)), and the borrow-bearing-record boxing rule (language spec [§9.7.1](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)) tracks the borrow's lifetime through the boxed value. A span passed as an `IReadOnlySpan<TElement>` parameter boxes; the boxed value's lifetime is bounded by the source of the underlying borrow; the parameter cannot be stored in a long-lived location, returned from a method without lifetime evidence, or captured by an escaping closure. These are the standard borrow-bearing-record constraints, not new rules.
+The mechanism is straightforward and uses existing language machinery. Spans are records, records may implement interfaces (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)), and the borrow-bearing-record boxing rule (language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)) tracks the borrow's lifetime through the boxed value. A span passed as an `IReadOnlySpan<TElement>` parameter boxes; the boxed value's lifetime is bounded by the source of the underlying borrow; the parameter cannot be stored in a long-lived location, returned from a method without lifetime evidence, or captured by an escaping closure. These are the standard borrow-bearing-record constraints, not new rules.
 
 The element-type parameterization is exact and explicit. Each concrete span implements `IReadOnlySpan<TElement>` with `TElement` set to whatever the concrete indexer actually returns: `Span<MyClass>` (which has `[i: int]: MyClass?`) implements `IReadOnlySpan<MyClass?>`; `ArraySpan<MyClass>` (which has `[i: int]: MyClass`) implements `IReadOnlySpan<MyClass>`; `ReadOnlyStringSpan` implements `IReadOnlySpan<char>`; and so on. There is no implicit conversion across nullability or element types — the interface parameter must match exactly. Authors who want full breadth provide two overloads (one for `IReadOnlySpan<T>`, one for `IReadOnlySpan<T?>`); the friction is real but localized at API boundaries.
 
@@ -7196,6 +7196,29 @@ v0.155 settles two standard-library surface questions surfaced by the implementa
 #### Touched
 
 Standard library: §2.5 (the `DateTime` no-argument `ToString()` declaration and its ISO 8601 default); §4.8 (the dictionary write-surface paragraph, covering §4.9 by the same convention). Language spec: §28.6 (the owning-collection-borrow read-operation list no longer lists the materializers). No grammar or semantic rule changes. Compiler (implementation, following this revision): the no-argument `DateTime.ToString()` lowers to the runtime default-format formatter (ISO 8601) (#1114); collection method-surface validation rejects a `.Set` call and other non-surface members (#1112 / #920). The §28.6 correction needs no code — the implementation already rejects the materializers on `Owned*` receivers. Version headers bumped to v0.155.
+
+<a id="sec-v0-155-to-v0-156-changelog"></a>
+### v0.156 changelog (v0.155 → v0.156)
+
+v0.156 settles four standard-library and language questions surfaced by the implementation and corrects one stale cross-reference. It changes no capability; it pins down behaviours the foundations already implied and makes loud what was silent.
+
+#### The questions
+
+- **Lazy LINQ queries are single-consumption, not re-enumerable (#1226).** §29.11 left repeat enumeration of a lazy iterable "a property of the specific implementation," which the implementation realised as a silent empty second enumeration — a silent wrong result. The resolution states that a lazy query is single-consumption: the first enumeration (a `for` loop or a terminal operator) consumes it as `move` consumes an owned value; a second use is a compile error where statically visible, or `InvalidOperationException` where only dynamically reachable; `ToArray()` materializes an owned, re-enumerable `Array<T>`. This is stricter than C#'s deferred re-execution (which the C# ecosystem itself flags as a likely defect via analyzer CA1851), and it falls out of the existing affine/move machinery — a lazy query is a single-use producer that borrows its source, so re-execution would re-run over a possibly-disposed source. No new mechanism: the query reuses the consume/move analysis, and the dynamic guard reuses the §29.12 mutation-during-iteration failure mode.
+
+- **A span boxes into `IReadOnlySpan<T>` for a call-bounded use (#970).** Stdlib §4.14's iteration paragraph read as a categorical ban on boxing a span into an interface, contradicting language spec §8.6 (which permits a short-lived box of a borrow-bearing record) and the stdlib's own §4.16 `IReadOnlySpan<TElement>` parameter surface. There is no design conflict — §8.6's rule already sanctions the call-bounded box and rejects escape, and the `IReadOnlySpan` interface is escape-free by construction (no `GetEnumerator`, `Slice`, or borrow-retaining handle). §4.14's parenthetical is reworded to name the *escaping* enumerator as the forbidden case (which is why spans do not implement `IEnumerable`) and defer to §8.6 for the call-bounded box, and §8.6 gains the `IReadOnlySpan` example. No semantic change.
+
+- **`string.LastIndexOf(value: string)` (#1249-B).** §9.6 declared only the `char` overload, but the natural counterpart to the existing `IndexOf(value: string)` was implemented and useful; the `string` overload is now documented.
+
+- **Equality/formatting overrides disqualify auto-equality (#1249-A).** §9.2's "not auto-equality-bearing" list named explicit fields, side-effecting computed properties, and non-trivial constructor bodies, but not the case of a record that declares its own `override Equals`, `GetHashCode`, or `ToString` (without the `operator =`/`<>` overloads) — under which the synthesized structural `=` would silently ignore the author's override. The disqualifier is added to the list; `=`/`<>` and the direct `.Equals`/`.GetHashCode` calls are a compile error on such a record unless the operators are also declared.
+
+#### The clarification
+
+- **A `for` loop variable is freshly bound — body assignment never changes the iteration count (#1243).** §21.4 already specified fresh per-iteration binding; a clause is added making explicit that assigning to the loop variable inside the body affects only that iteration, even when the source is a `Range<T>` the compiler optimizes into a counted loop. No rule change; the counted-loop optimization must preserve the fresh-binding observable.
+
+#### Touched
+
+Language spec: §29.11 (single-consumption lazy queries); §8.6 (the `IReadOnlySpan` boxing example + escaping-vs-call-bounded distinction); §9.2 (the equality/formatting-override disqualifier); §21.4 (the fresh-binding/body-assignment clause); §29.2 (the stale `§9.7.1`→`§8.6` boxing cross-reference). Standard library: §4.14 (the iteration parenthetical reworded), §4.16 (the stale `§9.7.1`→`§8.6` reference), §9.6 (`LastIndexOf(string)`), §5 (the single-consumption LINQ note). Design rationale: §5.15 (the stale `§9.7.1`→`§8.6` reference). Compiler (implementation, following this revision): a lazy-query second enumeration becomes a compile error / `InvalidOperationException` (#1226); the span→`IReadOnlySpan` non-escaping box is permitted (#970); `LastIndexOf(string)` accepted (#1249-B); a body record with an equality/formatting override rejects `=` (#1249-A); the counted-loop codegen preserves fresh-binding under body assignment (#1243). (`AppendFormat`'s composite-format grammar, #1179, is deferred to a following revision.) Version headers bumped to v0.156.
 
 #### Migration
 
