@@ -334,3 +334,120 @@ BEZEL_TEST(codegen_closures_27_5, ref_param_capture_visible_to_caller_1207) {
         "  end Main; "
         "end C;"), 110);
 }
+
+// §27.5 / #1135: grandparent-scope local escaped by a nested lambda
+// (two-level nesting). The outer lambda captures x and returns an inner
+// lambda that also captures x. The inner lambda escapes Make() — but x must
+// be heap-promoted into a cell that stays live until the inner lambda dies.
+// Before the fix: cellFreeEligible_ incorrectly treated x as non-escaping
+// (the outer lambda is released at Make()'s scope exit, but the same cell is
+// held by the inner lambda's env) → bz_box_free on the cell while the inner
+// lambda still referenced it → UAF / WRONG_VALUE.
+BEZEL_TEST(codegen_closures_27_5_1135,
+           nested_lambda_grandparent_local_escapes_2level) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Make(): () -> int "
+        "    var x := 3; "
+        "    var outer := () => () => x; "   // inner captures grandparent x
+        "    return outer(); "               // inner lambda escapes Make
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var inner := Make(); "
+        "    return inner(); "               // expected 3 (stable, not UAF garbage)
+        "  end Main; "
+        "end C;"), 3);
+}
+
+// §27.5 / #1135: three-level nest — innermost lambda escapes through two
+// enclosing lambdas. The grandparent local x must stay live until the
+// innermost lambda is released.
+BEZEL_TEST(codegen_closures_27_5_1135,
+           nested_lambda_grandparent_local_escapes_3level) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Make(): () -> int "
+        "    var x := 7; "
+        "    var a := () => () => () => x; "  // 3-level nest; x is grandgrand-parent
+        "    var b := a(); "                  // b = () => () => x
+        "    return b(); "                    // returns inner () => x, escapes
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var f := Make(); "
+        "    return f(); "                    // expected 7
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// §27.5 / #1135: two grandparent locals both captured by escaped nested
+// lambda. Both cells must remain live.
+BEZEL_TEST(codegen_closures_27_5_1135,
+           nested_lambda_two_grandparent_locals_escape) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Make(): () -> int "
+        "    var a := 10; "
+        "    var b := 5; "
+        "    var outer := () => () => a - b; "
+        "    return outer(); "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var f := Make(); "
+        "    return f(); "                    // expected 5
+        "  end Main; "
+        "end C;"), 5);
+}
+
+// §27.5 / #1135: regression — single-level escaping capture still works.
+// A lambda directly capturing a local and being returned must read the
+// correct value (this worked before the fix and must continue to work).
+BEZEL_TEST(codegen_closures_27_5_1135,
+           single_level_escaping_capture_regression) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Make(): () -> int "
+        "    var x := 42; "
+        "    var f := () => x; "
+        "    return f; "           // single-level escape — pre-existing, must work
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var f := Make(); "
+        "    return f(); "         // expected 42
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §27.5 / #1135: non-escaping nested lambda (invoked locally, not escaped)
+// must return the correct value. This tests that the fix does not break the
+// working non-escaping nested-lambda case.
+BEZEL_TEST(codegen_closures_27_5_1135,
+           nested_lambda_non_escaping_regression) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var x := 9; "
+        "    var outer := () => do "
+        "      var inner := () => x; "
+        "      return inner(); "    // inner is invoked locally, not escaped
+        "    end; "
+        "    return outer(); "      // expected 9
+        "  end Main; "
+        "end C;"), 9);
+}
+
+// §27.5 / #1135: grandparent outer PARAM (not a local) captured by escaped
+// inner lambda must read the correct value.
+BEZEL_TEST(codegen_closures_27_5_1135,
+           nested_lambda_grandparent_param_escapes) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Make(n: int): () -> int "
+        "    var outer := () => () => n; "
+        "    return outer(); "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var f := Make(13); "
+        "    return f(); "          // expected 13
+        "  end Main; "
+        "end C;"), 13);
+}

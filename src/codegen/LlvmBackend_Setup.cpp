@@ -10753,16 +10753,141 @@ void Emitter::collectCellFreeEligible(
                     }
                 }
             }
-            // Recursively scan the BODY of the lambda for nested lambdas —
-            // they are all in an escaping context (from the outer scope's
-            // perspective, any lambda inside another lambda's body captures
-            // the outer local through the outer lambda's env, so the inner
-            // lambda does NOT have a direct fresh cell from the outer scope).
-            // We can safely treat nested lambdas as escaping from the
-            // outer scope's perspective (they do not box the outer scope's
-            // locals directly — the outer lambda already boxed them).
-            // Nothing to do: the outer lambda's CaptureWalker already
-            // collected all referenced outer symbols transitively.
+            // §27.5 / #1135: any outer local referenced through a NESTED lambda
+            // inside this body must also be classified as ESCAPING, even when this
+            // outer lambda is non-escaping.  A nested lambda may itself escape the
+            // outer lambda (e.g. returned from it); outer and inner lambdas share
+            // the SAME heap cell for the grandparent local.  If cellFreeEligible_
+            // were to free that cell when the outer lambda's env is released, any
+            // escaped inner lambda would hold a dangling pointer → use-after-free.
+            //
+            // Fix: walk the outer lambda's body to find direct nested lambdas
+            // (stopping at their boundaries), then collect ALL symbols inside
+            // each nested lambda (full descent via walkExpr/walkStmt) and add
+            // them to capturedByEscaping.  This prevents cellFreeEligible_ from
+            // including such locals, so the cell is never freed at outer-scope exit.
+            // Trade-off: a conservative leak (8 bytes/cell) when the inner lambda
+            // is provably non-escaping — accepted per the PRIME DIRECTIVE.
+            {
+                std::unordered_set<const sema::Symbol*> nestedBodySyms;
+                std::function<void(const ast::Expr*)> findLamsE;
+                std::function<void(const ast::Stmt*)> findLamsS;
+                findLamsE = [&](const ast::Expr* e) {
+                    if (!e) return;
+                    if (auto* nl = dynamic_cast<const ast::LambdaExpr*>(e)) {
+                        // Found a nested lambda: collect all symbols in its body.
+                        if (nl->exprBody)
+                            walkExpr(ctx, nl->exprBody.get(), nestedBodySyms);
+                        for (auto& ns : nl->stmts)
+                            walkStmt(ctx, ns.get(), nestedBodySyms);
+                        return;  // walkExpr descends into deeper nesting levels
+                    }
+                    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+                        findLamsE(b->left.get()); findLamsE(b->right.get()); return; }
+                    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+                        findLamsE(u->operand.get()); return; }
+                    if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                        findLamsE(p->operand.get()); return; }
+                    if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+                        findLamsE(m->target.get()); return; }
+                    if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+                        findLamsE(m->target.get()); return; }
+                    if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+                        findLamsE(c->callee.get());
+                        for (auto& a : c->args) findLamsE(a.value.get()); return; }
+                    if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+                        findLamsE(c->callee.get());
+                        for (auto& a : c->args) findLamsE(a.value.get()); return; }
+                    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+                        findLamsE(ix->target.get());
+                        for (auto& a : ix->indices) findLamsE(a.value.get()); return; }
+                    if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+                        findLamsE(t->operand.get()); return; }
+                    if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                        findLamsE(co->condition.get()); findLamsE(co->thenValue.get());
+                        findLamsE(co->elseValue.get()); return; }
+                    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+                        findLamsE(th->operand.get()); return; }
+                    if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+                        findLamsE(r->lo.get()); findLamsE(r->hi.get());
+                        findLamsE(r->step.get()); return; }
+                    if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+                        for (auto& a : n->args) findLamsE(a.value.get()); return; }
+                    if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+                        findLamsE(w->source.get());
+                        for (auto& a : w->assigns) findLamsE(a.value.get()); return; }
+                    if (auto* cl =
+                            dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+                        for (auto& el : cl->elements) findLamsE(el.get());
+                        for (auto& k : cl->keys) findLamsE(k.get()); return; }
+                    if (auto* is2 =
+                            dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+                        for (auto& part : is2->parts) findLamsE(part.expr.get());
+                        return; }
+                    if (auto* ce2 = dynamic_cast<const ast::CaseExpr*>(e)) {
+                        findLamsE(ce2->scrutinee.get());
+                        for (auto& arm : ce2->arms) {
+                            findLamsE(arm.guard.get());
+                            findLamsE(arm.exprBody.get()); }
+                        return; }
+                };
+                findLamsS = [&](const ast::Stmt* s) {
+                    if (!s) return;
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+                        findLamsE(ld->initializer.get()); return; }
+                    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                        findLamsE(as->target.get()); findLamsE(as->value.get());
+                        return; }
+                    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                        findLamsE(rs->value.get()); return; }
+                    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+                        findLamsE(ts->value.get()); return; }
+                    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+                        findLamsE(es->expr.get()); return; }
+                    if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                        findLamsE(is->ifBranch.condition.get());
+                        for (auto& b : is->ifBranch.body) findLamsS(b.get());
+                        for (auto& br : is->elifBranches) {
+                            findLamsE(br.condition.get());
+                            for (auto& b : br.body) findLamsS(b.get()); }
+                        for (auto& b : is->elseBody) findLamsS(b.get()); return; }
+                    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                        findLamsE(ws->condition.get());
+                        for (auto& b : ws->body) findLamsS(b.get()); return; }
+                    if (auto* frs = dynamic_cast<const ast::ForStmt*>(s)) {
+                        if (frs->iterable) findLamsE(frs->iterable.get());
+                        for (auto& b : frs->body) findLamsS(b.get()); return; }
+                    if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                        for (auto& b : d->body) findLamsS(b.get()); return; }
+                    if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+                        for (auto& b : ts2->body) findLamsS(b.get());
+                        for (auto& c : ts2->catches) {
+                            findLamsE(c.guard.get());
+                            if (c.body) findLamsS(c.body.get()); }
+                        for (auto& b : ts2->finallyBody) findLamsS(b.get());
+                        return; }
+                    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                        findLamsE(cs->scrutinee.get());
+                        for (auto& arm : cs->arms) {
+                            findLamsE(arm.guard.get());
+                            findLamsE(arm.exprBody.get());
+                            for (auto& b : arm.stmts) findLamsS(b.get()); }
+                        return; }
+                };
+                if (lam->exprBody) findLamsE(lam->exprBody.get());
+                for (auto& s : lam->stmts) findLamsS(s.get());
+                // Classify all symbols found in nested lambda bodies as escaping.
+                for (const sema::Symbol* s : nestedBodySyms) {
+                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                        if (loc->decl)
+                            capturedByEscaping.insert(
+                                static_cast<const void*>(loc->decl));
+                    } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
+                        capturedByEscaping.insert(
+                            static_cast<const void*>(s));
+                    }
+                }
+            }
         }
 
         void expr(const ast::Expr* e, bool topPos) {
