@@ -4525,6 +4525,16 @@ private:
     // element struct `{i8,T}` (an `IEnumerable<T?>` iterator). Without it the
     // bare payload's LLVM type != iterElemTy_ and the store was silently dropped.
     const sema::TypeRef* iterElemSemaTy_ = nullptr;
+    // §29 (#1120): true when the element type is an owned class or interface (its
+    // TypeSymbol is a Class or Interface TypeDecl). The enumerator then owns the
+    // most-recently-yielded value and must dispose it on next MoveNext + on Dispose.
+    bool iterElemIsOwnedClass_ = false;
+    // §29 (#1120): frame field index for the `current_val_owned` i8 flag (1 = the
+    // enumerator owns the value in current_val, 0 = it is a borrowed reference to a
+    // using-var local or an owned param — another mechanism disposes it).  Only
+    // meaningful when iterElemIsOwnedClass_ is true.  Set alongside
+    // iterCurrentValField_ in emitIteratorMethod; cleared to 0 after MoveNext.
+    unsigned iterCurrentValOwnedField_ = 0;
 
     // ---- Async-specific live state (used only when smKind_ == Await) ----
     // Frame field indices for the two trailing async slots (see emitAsyncMethod):

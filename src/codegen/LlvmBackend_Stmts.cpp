@@ -1488,6 +1488,62 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (v->getType() == iterElemTy_) {
                         llvm::Value* cvField = builder_.CreateStructGEP(
                             smStateStruct_, smSelf_, iterCurrentValField_);
+                        // §29 (#1120): before storing the new yielded value,
+                        // dispose the PREVIOUS one — but only if the enumerator
+                        // owned it (current_val_owned == 1, set when the previous
+                        // yield was a `new` expression).  Using-var locals (owned
+                        // == 0) are disposed by their own scope mechanisms; owned
+                        // params (owned == 0) by disposeOwnedParams at iterator-
+                        // Dispose.  Null-guard: first yield is a no-op (calloc 0).
+                        // After handling the previous value, set the owned flag for
+                        // the new value: 1 if the expression is a `new`, else 0.
+                        if (smKind_ == SuspendKind::Yield && iterElemIsOwnedClass_) {
+                            llvm::Value* ownedFld = builder_.CreateStructGEP(
+                                smStateStruct_, smSelf_, iterCurrentValOwnedField_);
+                            // --- dispose previous if owned ---
+                            llvm::Value* prevVal = builder_.CreateLoad(
+                                iterElemTy_, cvField, "ity.prev");
+                            llvm::Value* prevIsNull = builder_.CreateICmpEQ(
+                                prevVal,
+                                llvm::ConstantPointerNull::get(ptrTy()),
+                                "ity.prevnull");
+                            auto* prevNonNullBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.prev.nonnull", currentFn_);
+                            auto* prevContBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.prev.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                prevIsNull, prevContBB, prevNonNullBB);
+                            builder_.SetInsertPoint(prevNonNullBB);
+                            llvm::Value* prevOwned = builder_.CreateLoad(
+                                i8(), ownedFld, "ity.prevowned");
+                            llvm::Value* prevIsOwned = builder_.CreateICmpNE(
+                                prevOwned, builder_.getInt8(0), "ity.previso");
+                            auto* dispBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.prev.disp", currentFn_);
+                            auto* skipBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.prev.skip", currentFn_);
+                            auto* afterDispBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.prev.after", currentFn_);
+                            builder_.CreateCondBr(prevIsOwned, dispBB, skipBB);
+                            builder_.SetInsertPoint(dispBB);
+                            emitDisposeAndReclaim(prevVal);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(skipBB);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(afterDispBB);
+                            builder_.CreateBr(prevContBB);
+                            builder_.SetInsertPoint(prevContBB);
+                            // --- set owned flag for new value ---
+                            // Enumerator owns it only when the expression is a
+                            // direct `new` allocation (a fresh, unattached object).
+                            // Variable references (using-var locals, params, etc.)
+                            // are borrowed — their existing disposal handles them.
+                            bool yieldIsNew =
+                                dynamic_cast<const ast::NewExpr*>(
+                                    ys->value.get()) != nullptr;
+                            builder_.CreateStore(
+                                builder_.getInt8(yieldIsNew ? 1 : 0), ownedFld);
+                        }
                         builder_.CreateStore(v, cvField);
                     }
                 }

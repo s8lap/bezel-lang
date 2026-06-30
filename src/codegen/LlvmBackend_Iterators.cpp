@@ -465,6 +465,37 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         }
     }
 
+    // §29 (#1120): true when T is an owned class or interface AND the return type
+    // is IEnumerable<T> (or a related non-owning interface) — meaning the
+    // enumerator frame RETAINS ownership of the most-recently-yielded value.
+    // The enumerator must dispose it on MoveNext advance (before storing the next)
+    // and on Dispose (break / exhaustion / free).  Records/enums/primitives are
+    // value types and never need this.
+    //
+    // Excluded: OwnedEnumerable<T> iterators transfer ownership of each yielded
+    // value to the consumer loop variable on each MoveNext call — the consumer
+    // (not the enumerator) is responsible for disposing it; the enumerator must
+    // NOT also dispose current_val or the result is a double-free.
+    bool elemIsOwnedClass = false;
+    if (elemSemaTy &&
+        elemSemaTy->kind == sema::TypeRef::Kind::Named &&
+        elemSemaTy->declaration != nullptr &&
+        (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
+         elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
+        // Check the return type name is NOT OwnedEnumerable.
+        std::string_view retName;
+        if (ci.returnType) {
+            auto* retRef = ctx_.resolvedType(*ci.returnType);
+            if (retRef && retRef->astNode && retRef->astNode->name &&
+                !retRef->astNode->name->parts.empty())
+                retName = retRef->astNode->name->parts[0];
+            else if (retRef && !retRef->importedName.empty())
+                retName = retRef->importedName;
+        }
+        if (retName != "OwnedEnumerable")
+            elemIsOwnedClass = true;
+    }
+
     // Build the kind-agnostic frame; the yield driver's extra trailing fields are
     // the `current_val` of element type T, then (#747) a spill-area pointer for a
     // suspending for-loop's implicit locals — promoteDemotedSlotsToFrame heap-
@@ -473,14 +504,19 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // and stays null (and free(null) is a no-op) for iterators that never spill.
     // Layout: { ptr vtable, i32 state, captures..., locals..., T current_val,
     //           ptr spill }
+    // Trailing frame fields (after captures + locals):
+    //   [currentValField+0] T          current_val      — last yielded value
+    //   [currentValField+1] i8         current_val_owned — 1=enumerator owns it, 0=borrow
+    //   [currentValField+2] ptr        spill            — #747 for-loop spill area
     StateMachineFrame frame = buildStateMachineFrame(
-        ms, *ci.stmts, {elemTy, ptrTy()},
+        ms, *ci.stmts, {elemTy, i8(), ptrTy()},
         std::string("iter.") + std::string(ms->name));
     auto* stateStructTy = frame.structTy;
     const unsigned VTABLE_FIELD = frame.vtableField;
     const unsigned STATE_FIELD = frame.stateField;
     const unsigned CURRENT_VAL_FIELD = frame.currentValField;
-    const unsigned SPILL_PTR_FIELD = CURRENT_VAL_FIELD + 1;  // #747
+    const unsigned CURRENT_VAL_OWNED_FIELD = CURRENT_VAL_FIELD + 1;  // §29 (#1120)
+    const unsigned SPILL_PTR_FIELD = CURRENT_VAL_FIELD + 2;          // #747
 
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$iter$") + std::string(ms->name) + "$";
@@ -620,11 +656,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         auto* memcpyFn = declareC("memcpy", ptrTy(),
             {ptrTy(), ptrTy(), i64()});
         gb.CreateCall(memcpyFn, {clone, self, gb.getInt64(stSz)});
-        // Reset to the start state: state = 0, current_val = 0, spill ptr = null.
+        // Reset to the start state: state = 0, current_val = 0,
+        // current_val_owned = 0, spill ptr = null.
         gb.CreateStore(gb.getInt32(0),
             gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
         gb.CreateStore(llvm::Constant::getNullValue(elemTy),
             gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
+        gb.CreateStore(gb.getInt8(0),  // §29 (#1120): not-owned
+            gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_OWNED_FIELD));
         gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
             gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
         // Install the clone vtable so disposing the enumerator frees it without
@@ -685,8 +724,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // Yield-specific live state for the YieldStmt handler in lowerStmt.
         iterCurrentValField_ = CURRENT_VAL_FIELD;
+        iterCurrentValOwnedField_ = CURRENT_VAL_OWNED_FIELD;  // §29 (#1120)
         iterElemTy_ = elemTy;
         iterElemSemaTy_ = elemSemaTy;  // #1102B (nullable-value element coercion)
+        iterElemIsOwnedClass_ = elemIsOwnedClass;  // §29 (#1120)
         // #747: enable for-loop frame-spill for THIS MoveNext, reusing the async
         // spill-area mechanism. registerForLoopSpillSlots records a suspending
         // for-loop's implicit allocas (index / array-ptr / enumerator) into
@@ -711,6 +752,50 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // Dispose function below.) State is set to -1, so the consumer's
             // subsequent Dispose() is a no-op → each resource is disposed once.
             emitDisposals(disposeStack_.back());
+            // §29 (#1120): on exhaustion, dispose the last outstanding yielded
+            // owned value if (and only if) the enumerator owns it (it was produced
+            // by a `new` expression, not borrowed from a using-var local or param).
+            // Null current_val and current_val_owned either way so the subsequent
+            // for-loop Dispose's null-guard makes it a no-op.
+            if (elemIsOwnedClass) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* lastVal =
+                    builder_.CreateLoad(elemTy, cvField, "ity.last");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    lastVal, llvm::ConstantPointerNull::get(ptrTy()),
+                    "ity.lastnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.last.nonnull", moveNextFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.last.cont", moveNextFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                llvm::Value* ownedFld = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
+                llvm::Value* ownedByte =
+                    builder_.CreateLoad(i8(), ownedFld, "ity.lastowned");
+                llvm::Value* isOwned = builder_.CreateICmpNE(
+                    ownedByte, builder_.getInt8(0), "ity.lastisowned");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.last.disp", moveNextFn);
+                auto* skipBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.last.skip", moveNextFn);
+                auto* afterBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.last.after", moveNextFn);
+                builder_.CreateCondBr(isOwned, dispBB, skipBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(lastVal);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(skipBB);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(afterBB);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateStore(builder_.getInt8(0), ownedFld);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRet(builder_.getFalse());
         }
@@ -749,6 +834,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smLocalFields_.clear();
         smForInSrcFields_.clear();  // §29.7 (#944)
         smAllocaToField_.clear();
+        iterElemIsOwnedClass_ = false;      // §29 (#1120)
+        iterCurrentValOwnedField_ = 0;      // §29 (#1120)
     }
 
     // --- Dispose(ptr self) -> void (real body, §29.7 #623) ---
@@ -838,6 +925,54 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
         };
 
+        // §29 (#1120): dispose the outstanding yielded owned value stored in the
+        // current_val frame field — BUT ONLY if the enumerator actually owns it
+        // (current_val_owned == 1, set when the yielded expression was a `new`).
+        // Using-var locals and owned params carry owned==0 and are disposed by
+        // their own mechanisms (smIterDisposalsAtState_ / disposeOwnedParams).
+        // Null-guarded: current_val==null ⟹ never yielded / already cleaned up.
+        // Runs for BOTH source (disposeOwned=true) and clone (disposeOwned=false)
+        // Dispose: the source's current_val is always null (GetEnumerator resets
+        // it) so it's a guaranteed no-op for the source.
+        auto disposeYieldedVal = [&]() {
+            if (!elemIsOwnedClass) return;
+            llvm::Value* cvField = builder_.CreateStructGEP(
+                stateStructTy, self, CURRENT_VAL_FIELD);
+            llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "ity.yv");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                yv, llvm::ConstantPointerNull::get(ptrTy()), "ity.yvnull");
+            auto* nonNullBB = llvm::BasicBlock::Create(
+                llvm_, "ity.yv.nonnull", targetFn);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "ity.yv.cont", targetFn);
+            builder_.CreateCondBr(isNull, contBB, nonNullBB);
+            builder_.SetInsertPoint(nonNullBB);
+            llvm::Value* ownedFld = builder_.CreateStructGEP(
+                stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
+            llvm::Value* ownedByte =
+                builder_.CreateLoad(i8(), ownedFld, "ity.yvowned");
+            llvm::Value* isOwned = builder_.CreateICmpNE(
+                ownedByte, builder_.getInt8(0), "ity.yvisowned");
+            auto* dispBB = llvm::BasicBlock::Create(
+                llvm_, "ity.yv.disp", targetFn);
+            auto* skipBB = llvm::BasicBlock::Create(
+                llvm_, "ity.yv.skip", targetFn);
+            auto* afterBB = llvm::BasicBlock::Create(
+                llvm_, "ity.yv.after", targetFn);
+            builder_.CreateCondBr(isOwned, dispBB, skipBB);
+            builder_.SetInsertPoint(dispBB);
+            emitDisposeAndReclaim(yv);
+            builder_.CreateBr(afterBB);
+            builder_.SetInsertPoint(skipBB);
+            builder_.CreateBr(afterBB);
+            builder_.SetInsertPoint(afterBB);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), cvField);
+            builder_.CreateStore(builder_.getInt8(0), ownedFld);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        };
+
         // If no yield was ever inside a try/finally AND no `using var` was active
         // at any yield (#821) AND no for-in enumerator/source frame was live at a
         // yield (#944), emit a simple free + return.
@@ -848,6 +983,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945)
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
@@ -950,6 +1086,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
 
             builder_.SetInsertPoint(doneBB);
+            disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945): after the finally chains
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});

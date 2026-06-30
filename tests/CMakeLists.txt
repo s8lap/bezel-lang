@@ -760,6 +760,8 @@ set(BEZEL_TEST_SOURCES
     codegen/span_type_annotation_959_test.cpp
     codegen/string_span_883_test.cpp
     codegen/iterator_owned_param_945_test.cpp
+    # --- fix #1120: iterator disposes outstanding yielded owned value on MoveNext advance and Dispose (§29) ---
+    codegen/iter_yield_owned_dispose_1120_test.cpp
     # --- fix #943: re-enumeration of a yield-method IEnumerable<T> (§29.11) ---
     codegen/iterator_reenum_943_test.cpp
     # --- fix #944: nested-iterator suspension disposal — inner enumerator/source
