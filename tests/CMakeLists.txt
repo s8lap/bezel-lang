@@ -549,6 +549,7 @@ set(BEZEL_TEST_SOURCES
     codegen/cancellation_token_test.cpp
     codegen/mutex_lock_647_test.cpp             # §6.2 Mutex + Lock, issue #647
     codegen/semaphore_647_test.cpp              # §6.3 Semaphore + SemaphoreToken, issue #647
+    codegen/tcs_974_test.cpp                    # §6.6 TaskCompletionSource<T>, issue #974
     codegen/atomic_647_test.cpp                 # §6.4 Atomic<T>/AtomicInteger<T>, issue #647
     codegen/buffer_545_test.cpp                 # issue #545: Buffer<T> groundwork — value-element compiler primitive
     codegen/datetime_timespan_test.cpp

@@ -4494,6 +4494,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // §6.6 / issue #974: TaskCompletionSource<T> /
+                    // OwnedTaskCompletionSource<T> / TaskCompletionSource
+                    // (non-generic) instance methods.
+                    // Method set per stdlib §6.6:
+                    //   SetResult(result: T) / TrySetResult(result: T): bool
+                    //   SetException(exception: Exception) / TrySetException: bool
+                    //   SetCancelled() / TrySetCancelled(): bool
+                    //   Dispose(): unit (handled by using-var machinery)
+                    if ((rcn == "TaskCompletionSource" ||
+                         rcn == "OwnedTaskCompletionSource") && recvTy) {
+                        if (m == "TrySetResult" || m == "TrySetException" ||
+                            m == "TrySetCancelled") {
+                            // TrySet* → bool return.
+                            ctx_.setExprType(
+                                &ce, ctx_.primitiveTypeRef(P::Bool));
+                        } else if (m == "SetResult" || m == "SetException" ||
+                                   m == "SetCancelled" || m == "Dispose") {
+                            // Set* / Dispose → unit; no return type set.
+                        } else {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `" + std::string(rcn) + "`; documented "
+                                "surface: SetResult, SetException, "
+                                "SetCancelled, TrySetResult, TrySetException, "
+                                "TrySetCancelled, Dispose (stdlib \xC2\xA7""6.6)");
+                        }
+                    }
                     // issue #545: Buffer<T> instance methods.
                     // Receiver: Named, no declaration, name "Buffer", genericArgs[0]=T.
                     // Surface: [i] (indexer), Length (property), Dispose().
@@ -7690,6 +7718,45 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+            }
+        }
+        // §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T>
+        // / TaskCompletionSource (non-generic) — readonly property `Task`.
+        //   TaskCompletionSource<T>.Task   → Task<T>
+        //   OwnedTaskCompletionSource<T>.Task → OwnedTask<T>
+        //   TaskCompletionSource.Task       → Task
+        if (ma.target && ma.member == "Task") {
+            auto* tt = ctx_.exprType(*ma.target);
+            auto getTcsName = [](const TypeRef* tr) -> std::string_view {
+                if (!tr || tr->kind != TypeRef::Kind::Named || tr->declaration)
+                    return {};
+                if (tr->astNode && tr->astNode->name &&
+                    !tr->astNode->name->parts.empty())
+                    return tr->astNode->name->parts[0];
+                return {};
+            };
+            std::string_view tcsn = getTcsName(tt);
+            if (tcsn == "TaskCompletionSource" ||
+                tcsn == "OwnedTaskCompletionSource") {
+                // Build a Task<T>/OwnedTask<T>/Task TypeRef.
+                const char* taskName =
+                    (tcsn == "OwnedTaskCompletionSource") ? "OwnedTask" : "Task";
+                auto* ann = new ast::Type();
+                ann->kind = ast::TypeKind::Named;
+                auto* nm = new ast::QualifiedName();
+                nm->parts.push_back(taskName);
+                ann->name.reset(nm);
+                auto* tr = ctx_.makeTypeRef();
+                tr->kind = TypeRef::Kind::Named;
+                tr->nullable = false;
+                tr->declaration = nullptr;
+                tr->astNode = ann;
+                // Propagate the generic arg: TaskCompletionSource<T>.Task → Task<T>.
+                if (tt && !tt->genericArgs.empty() && tt->genericArgs[0])
+                    tr->genericArgs.push_back(
+                        const_cast<TypeRef*>(tt->genericArgs[0]));
+                ctx_.setExprType(&ma, tr);
+                return;
             }
         }
         // CG27a (§4.6): handle known intrinsic string members directly —

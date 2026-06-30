@@ -2662,6 +2662,27 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // §6.6 / issue #974: tcs.Task — readonly property on
+    // TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+    // TaskCompletionSource. Returns the inner task pointer (borrowed).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "Task") {
+            auto* tt = ctx_.exprType(*ma->target);
+            bool isTcs = (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                          !tt->declaration && tt->astNode &&
+                          tt->astNode->name &&
+                          !tt->astNode->name->parts.empty() &&
+                          (tt->astNode->name->parts[0] == "TaskCompletionSource" ||
+                           tt->astNode->name->parts[0] == "OwnedTaskCompletionSource"));
+            if (isTcs) {
+                llvm::Value* tcsPtr = lowerExpr(*ma->target);
+                if (tcsPtr) {
+                    auto* fn = declareC("bz_tcs_task", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {tcsPtr}, "tcs.task");
+                }
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.
@@ -8235,6 +8256,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     ptrTy(), {i32(), i32()});
                 return builder_.CreateCall(allocFn,
                     {initCount, maxCount}, "sem.new");
+            }
+            // §6.6 / issue #974: new TaskCompletionSource<T>() /
+            // new OwnedTaskCompletionSource<T>() / new TaskCompletionSource().
+            // Allocate via bz_tcs_new() — zero arguments (constructor takes none).
+            if (colName == "TaskCompletionSource" ||
+                colName == "OwnedTaskCompletionSource") {
+                auto* allocFn = declareC("bz_tcs_new", ptrTy(), {});
+                return builder_.CreateCall(allocFn, {}, "tcs.new");
             }
             // §6.4 / issue #647: new Atomic<T>(initial) / new AtomicInteger<T>(initial).
             // Allocate via bz_atomic_new(cell_size, initial).

@@ -11641,3 +11641,106 @@ void bz_buffer_free(void* buf) {
 }
 
 } // extern "C" (Buffer<T>)
+
+// ---------------------------------------------------------------------------
+// §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+// TaskCompletionSource (non-generic).
+// bz_tcs_t: holds a pre-allocated inner task and an atomic completion flag.
+// ---------------------------------------------------------------------------
+
+struct bz_tcs_t {
+    void*                inner_task; // bz_task_t* owned by this TCS
+    std::atomic<int32_t> completed;  // 0 = pending, 1 = terminal state set
+    bz_tcs_t() : inner_task(nullptr), completed(0) {}
+};
+
+extern "C" {
+
+// Allocate a new TCS struct and its inner task.
+void* bz_tcs_new(void) {
+    auto* tcs = new bz_tcs_t();
+    tcs->inner_task = bz_task_alloc();
+    return tcs;
+}
+
+// Return the inner task pointer (borrowed — TCS still owns it).
+void* bz_tcs_task(void* t) {
+    if (!t) return nullptr;
+    return static_cast<bz_tcs_t*>(t)->inner_task;
+}
+
+// Attempt to complete with a result. Returns 1 on success, 0 if already done.
+int32_t bz_tcs_try_set_result(void* t, const void* result, int64_t result_size) {
+    if (!t) return 0;
+    auto* tcs = static_cast<bz_tcs_t*>(t);
+    int32_t expected = 0;
+    if (!tcs->completed.compare_exchange_strong(expected, 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return 0;
+    bz_task_complete(tcs->inner_task, result, result_size);
+    return 1;
+}
+
+// Attempt to complete with an exception object. Returns 1 on success, 0 if done.
+int32_t bz_tcs_try_set_exception(void* t, void* exc_obj) {
+    if (!t) return 0;
+    auto* tcs = static_cast<bz_tcs_t*>(t);
+    int32_t expected = 0;
+    if (!tcs->completed.compare_exchange_strong(expected, 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return 0;
+    bz_task_complete_error_obj(tcs->inner_task, exc_obj);
+    return 1;
+}
+
+// Attempt to complete with OperationCanceledException. Returns 1/0.
+int32_t bz_tcs_try_set_cancelled(void* t, void* oce_vtable) {
+    if (!t) return 0;
+    auto* tcs = static_cast<bz_tcs_t*>(t);
+    int32_t expected = 0;
+    if (!tcs->completed.compare_exchange_strong(expected, 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return 0;
+    // Build an OperationCanceledException object: 16-byte {vtable, null-msg}.
+    if (oce_vtable) {
+        void* exc = calloc(1, 16);
+        if (exc) {
+            *(void**)exc = oce_vtable;
+            bz_task_complete_error_obj(tcs->inner_task, exc);
+            return 1;
+        }
+    }
+    // Fallback: plain error message (no typed exception object).
+    bz_task_complete_error(tcs->inner_task, "OperationCanceledException");
+    return 1;
+}
+
+// Fault the inner task with InvalidOperationException if not yet completed.
+void bz_tcs_fault_if_pending(void* t, void* ioe_vtable) {
+    if (!t) return;
+    auto* tcs = static_cast<bz_tcs_t*>(t);
+    int32_t expected = 0;
+    if (!tcs->completed.compare_exchange_strong(expected, 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return;
+    // Build an InvalidOperationException: 16-byte {vtable, null-msg}.
+    if (ioe_vtable) {
+        void* exc = calloc(1, 16);
+        if (exc) {
+            *(void**)exc = ioe_vtable;
+            bz_task_complete_error_obj(tcs->inner_task, exc);
+            return;
+        }
+    }
+    bz_task_complete_error(tcs->inner_task,
+        "source disposed before completion");
+}
+
+// Free the TCS struct itself. The inner task must have already been
+// dealt with (fire-and-forget'd) before this call.
+void bz_tcs_free(void* t) {
+    if (!t) return;
+    delete static_cast<bz_tcs_t*>(t);
+}
+
+} // extern "C" (TCS)

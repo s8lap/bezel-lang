@@ -565,6 +565,11 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §6.3 / #647: Semaphore (bz_semaphore_t*) and SemaphoreToken
                     // (bz_semaphore_token_t*) — same fix applied proactively.
                     n == "Semaphore" || n == "SemaphoreToken" ||
+                    // §6.6 / issue #974: TaskCompletionSource<T> /
+                    // OwnedTaskCompletionSource<T> / TaskCompletionSource are
+                    // opaque heap-pointer builtins (bz_tcs_t*). Without this
+                    // entry lowerTypeRef would fall through to the i32 default.
+                    n == "TaskCompletionSource" || n == "OwnedTaskCompletionSource" ||
                     // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
                     // heap-pointer builtins (bz_atomic_t*).  Same ptrTy treatment as
                     // Mutex/Semaphore so lowerTypeRef returns ptrTy() not i32.
@@ -650,6 +655,8 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Mutex" || n == "Lock" ||
                     // §6.3 / #647: imported Semaphore / SemaphoreToken.
                     n == "Semaphore" || n == "SemaphoreToken" ||
+                    // §6.6 / issue #974: imported TCS types.
+                    n == "TaskCompletionSource" || n == "OwnedTaskCompletionSource" ||
                     // §6.4 / #647: imported Atomic<T> and AtomicInteger<T>.
                     n == "Atomic" || n == "AtomicInteger" ||
                     // issue #545: imported Buffer<T> (bz_buffer_hdr_t*).

@@ -7187,6 +7187,45 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // §6.6 / issue #974: a `using var` bound to a TaskCompletionSource<T>,
+    // OwnedTaskCompletionSource<T>, or TaskCompletionSource (non-generic).
+    // No user TypeSymbol; recognised by builtin type name. At scope end:
+    //   1. bz_tcs_fault_if_pending(tcs, ioe_vtable) — faults the inner task with
+    //      InvalidOperationException if not yet completed (so no awaiter hangs).
+    //   2. Error-object cleanup on the inner task (mirrors d.task path).
+    //   3. bz_task_fire_and_forget(inner_task) — releases the task when done.
+    //   4. bz_tcs_free(tcs) — frees the TCS struct itself.
+    // Detection: declared type OR NewExpr type name (both forms appear in practice).
+    {
+        bool isTcs = false;
+        auto isTcsTypeName = [](const sema::TypeRef* rt) {
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+            if (rt->declaration) return false;
+            if (!rt->astNode || !rt->astNode->name ||
+                rt->astNode->name->parts.empty()) return false;
+            std::string_view n = rt->astNode->name->parts[0];
+            return n == "TaskCompletionSource" ||
+                   n == "OwnedTaskCompletionSource";
+        };
+        if (ld->type)
+            isTcs = isTcsTypeName(ctx_.resolvedType(*ld->type));
+        if (!isTcs && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isTcs = ne->type && ne->type->name &&
+                        !ne->type->name->parts.empty() &&
+                        (ne->type->name->parts[0] == "TaskCompletionSource" ||
+                         ne->type->name->parts[0] == "OwnedTaskCompletionSource");
+        }
+        if (!isTcs && ld->initializer)
+            isTcs = isTcsTypeName(ctx_.exprType(*ld->initializer));
+        if (isTcs) {
+            Disposal d{it->second, nullptr};
+            d.tcs = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T> / OwnedTask<T>.
     // Tasks have no user TypeSymbol; at scope end the task is freed via bz_task_free.
     // Double-free safety: lowerAwait only frees tasks whose operand is an anonymous
@@ -12897,6 +12936,79 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {t});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §6.6 / issue #974: a `using var` TaskCompletionSource<T> /
+        // OwnedTaskCompletionSource<T> / TaskCompletionSource.
+        // Disposal sequence (all null-guarded; runs on both normal and unwind):
+        //   1. bz_tcs_fault_if_pending(tcs, ioe_vtable): if the inner task has not
+        //      been completed yet, fault it with InvalidOperationException so that
+        //      any awaiter wakes up with an error rather than hanging indefinitely.
+        //   2. Error-obj cleanup on the inner task (mirrors the d.task arm above):
+        //      if the task is faulted, dispose the error object exactly once.
+        //   3. bz_task_fire_and_forget(inner_task): release the task struct when it
+        //      has finished running (immediate if already done, deferred if running).
+        //   4. bz_tcs_free(tcs): free the bz_tcs_t wrapper itself.
+        if (it->tcs) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* tcs = builder_.CreateLoad(ptrTy(), addr, "tcs.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                tcs, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB  = llvm::BasicBlock::Create(llvm_, "tcs.dispose",  currentFn_);
+            auto* contBB  = llvm::BasicBlock::Create(llvm_, "tcs.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+
+            // Step 1: fault the inner task if not yet completed.
+            llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
+            {   auto vit = builtinVtable_.find("InvalidOperationException");
+                if (vit != builtinVtable_.end()) ioeVt = vit->second;
+            }
+            auto* faultFn = declareC("bz_tcs_fault_if_pending",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(faultFn, {tcs, ioeVt});
+
+            // Step 2: get the inner task pointer and clean up its error object.
+            auto* innerFn = declareC("bz_tcs_task", ptrTy(), {ptrTy()});
+            llvm::Value* t = builder_.CreateCall(innerFn, {tcs}, "tcs.inner");
+            {
+                auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
+                llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "tcs.task.err");
+                auto* edBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errdisp",
+                                                       currentFn_);
+                auto* eaBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errcont",
+                                                       currentFn_);
+                builder_.CreateCondBr(err, edBB, eaBB);
+                builder_.SetInsertPoint(edBB);
+                auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+                llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "tcs.task.errobj");
+                llvm::Value* eoNull = builder_.CreateICmpEQ(
+                    eo, llvm::ConstantPointerNull::get(ptrTy()));
+                auto* doBB = llvm::BasicBlock::Create(llvm_, "tcs.task.eodisp",
+                                                       currentFn_);
+                builder_.CreateCondBr(eoNull, eaBB, doBB);
+                builder_.SetInsertPoint(doBB);
+                auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
+                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(unmarkFn, {eo});
+                emitDisposeAndReclaim(eo);
+                builder_.CreateBr(eaBB);
+                builder_.SetInsertPoint(eaBB);
+            }
+
+            // Step 3: fire-and-forget the inner task.
+            auto* fafFn = declareC("bz_task_fire_and_forget",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fafFn, {t});
+
+            // Step 4: free the TCS struct itself.
+            auto* freeFn2 = declareC("bz_tcs_free",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeFn2, {tcs});
+
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

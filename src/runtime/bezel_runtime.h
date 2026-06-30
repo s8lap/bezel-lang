@@ -1665,6 +1665,62 @@ void* bz_buffer_get_ptr(void* buf, int64_t idx);
 // carry no ownership, so no per-element disposal is performed.
 void  bz_buffer_free(void* buf);
 
+// ---------------------------------------------------------------------------
+// §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+// TaskCompletionSource (non-generic). A TCS is a heap-allocated struct that
+// holds a pre-allocated inner task and an atomic completion flag. The producer
+// calls TrySet* to complete the inner task; the consumer awaits the .Task
+// property. The TCS OWNS the inner task; bz_tcs_dispose releases it.
+// ---------------------------------------------------------------------------
+
+// Allocate a new TCS struct (bz_tcs_t*). Internally calls bz_task_alloc()
+// to create the inner task. The returned pointer is owned by the caller
+// (typically via `using var tcs := new TaskCompletionSource<T>()`).
+void* bz_tcs_new(void);
+
+// Return the inner task pointer (borrowed — ownership stays with the TCS).
+// The caller MUST NOT call bz_task_free on the returned pointer; the TCS's
+// own disposal (bz_tcs_dispose / bz_tcs_free) releases it.
+void* bz_tcs_task(void* tcs);
+
+// Attempt to complete the inner task with a result.
+// Atomically checks and sets the completed flag.
+// Returns 1 if the task was completed by this call, 0 if already in a terminal
+// state. `result` is the bytes to copy into the task's result buffer;
+// `result_size` is 0 for a void Task, sizeof(ptr) for a class result, or
+// sizeof(T) for a value type result.
+// If this returns 0, the result bytes have no effect; the caller has given up
+// ownership and must not use the result further (for class T, the caller must
+// dispose the object separately when TrySetResult returns 0).
+int32_t bz_tcs_try_set_result(void* tcs, const void* result, int64_t result_size);
+
+// Attempt to complete the inner task with an exception object.
+// Returns 1 if this call completed the task, 0 if already done.
+// exc_obj must be a heap-allocated Bezel exception (vtable + message fields).
+// Ownership of exc_obj transfers to the task on success; on failure (return 0)
+// exc_obj is NOT freed by this function — the caller is responsible.
+int32_t bz_tcs_try_set_exception(void* tcs, void* exc_obj);
+
+// Attempt to complete the inner task with an OperationCanceledException.
+// Returns 1 if this call completed the task, 0 if already done.
+// oce_vtable is the Bezel vtable* for OperationCanceledException, supplied by
+// codegen. If null, falls back to bz_task_complete_error (string only).
+int32_t bz_tcs_try_set_cancelled(void* tcs, void* oce_vtable);
+
+// If the task is not yet in a terminal state, complete it with an
+// InvalidOperationException("source disposed before completion").
+// ioe_vtable is the Bezel vtable* for InvalidOperationException, supplied by
+// codegen. If null, falls back to bz_task_complete_error.
+// Does NOT free the TCS struct or the inner task; call bz_tcs_free after.
+void bz_tcs_fault_if_pending(void* tcs, void* ioe_vtable);
+
+// Release the TCS struct (and its ownership of the inner task) without
+// faulting the task first. Call bz_tcs_fault_if_pending first if needed,
+// then handle the inner task's error_obj, then call bz_task_fire_and_forget
+// on the inner task, then call bz_tcs_free.
+// This just frees the bz_tcs_t struct itself.
+void bz_tcs_free(void* tcs);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

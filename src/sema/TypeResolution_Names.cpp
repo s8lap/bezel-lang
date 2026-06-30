@@ -65,6 +65,14 @@ int Resolver::builtinTypeArity(std::string_view n) {
         return 0;
     }
     if (n == "Task") return kBuiltinTaskLike;
+    // §6.6 / issue #974: TaskCompletionSource (non-generic, arity 0) and
+    // TaskCompletionSource<T> (arity 1) share the same base name. Use
+    // kBuiltinTaskLike so both arities (0 and 1) are accepted. The
+    // distinction between the two is resolved at method-call time via
+    // the presence or absence of a generic argument.
+    if (n == "TaskCompletionSource") return kBuiltinTaskLike;
+    // §6.6 / issue #974: OwnedTaskCompletionSource<T> — always arity 1.
+    if (n == "OwnedTaskCompletionSource") return 1;
     if (n == "Array" || n == "OwnedArray" || n == "OwnedTask" ||
         n == "IEnumerable" || n == "IEnumerator" ||
         n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||

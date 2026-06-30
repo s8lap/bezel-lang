@@ -9427,6 +9427,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerMutexLockCall(call)) return v;
     // §6.3 / issue #647: Semaphore.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.
     if (auto* v = tryLowerSemaphoreTokenCall(call)) return v;
+    // §6.6 / issue #974: TaskCompletionSource / OwnedTaskCompletionSource methods.
+    if (auto* v = tryLowerTcsCall(call)) return v;
     // §6.4 / issue #647: Atomic<T> / AtomicInteger<T> instance methods.
     if (auto* v = tryLowerAtomicCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
@@ -17201,6 +17203,128 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
             emitPendingCheck();
             return truncResult(res, "atom.add.v");
         }
+    }
+
+    return nullptr;
+}
+
+
+// §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+// TaskCompletionSource (non-generic) instance method lowering.
+//
+// Handled methods:
+//   TrySetResult(result: T): bool  → bz_tcs_try_set_result(tcs, &val, sizeof(T)) → i1
+//   SetResult(result: T)           → same + emitGuardThrow(IOE) if already done
+//   TrySetException(exc): bool     → bz_tcs_try_set_exception(tcs, exc_obj)      → i1
+//   SetException(exc)              → same + emitGuardThrow(IOE) if already done
+//   TrySetCancelled(): bool        → bz_tcs_try_set_cancelled(tcs, oce_vtable)   → i1
+//   SetCancelled()                 → same + emitGuardThrow(IOE) if already done
+//   Dispose()                      → no-op here; real work done by emitDisposals
+//
+// Detection: receiver builtin type name "TaskCompletionSource" or
+// "OwnedTaskCompletionSource" (both map to a bz_tcs_t* opaque pointer).
+llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    std::string_view rcn = builtinTypeName(recvTy);
+    if (rcn != "TaskCompletionSource" && rcn != "OwnedTaskCompletionSource")
+        return nullptr;
+
+    llvm::Value* tcs = lowerExpr(*ma->target);
+    if (!tcs) return nullptr;
+
+    // Helper: get InvalidOperationException vtable for Set* guard throws.
+    auto getIoeVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+    (void)getIoeVtable;  // used only in SetCancelled via emitGuardThrow
+
+    // Helper: get OperationCanceledException vtable for TrySetCancelled.
+    auto getOceVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    // TrySetResult / SetResult — pass the value through a stack slot.
+    // Pattern mirrors Task.FromResult (LlvmBackend_Calls.cpp §6.7 arm above).
+    // For OwnedTaskCompletionSource<T>, T is a class pointer — same layout as
+    // any other pointer-width value; ownership transfer is the caller's concern.
+    if ((mname == "TrySetResult" || mname == "SetResult") &&
+        !call.args.empty() && call.args[0].value) {
+        llvm::Value* val = lowerExpr(*call.args[0].value);
+        if (!val) return nullptr;
+        llvm::Type* valTy = val->getType();
+        llvm::AllocaInst* slot = builder_.CreateAlloca(valTy, nullptr,
+                                                        "tcs.setres.slot");
+        builder_.CreateStore(val, slot);
+        int64_t sz = static_cast<int64_t>(
+            module_->getDataLayout().getTypeAllocSize(valTy));
+        auto* tryFn = declareC("bz_tcs_try_set_result", i32(),
+                                {ptrTy(), ptrTy(), i64()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn,
+            {tcs, builder_.CreateBitCast(slot, ptrTy()), builder_.getInt64(sz)},
+            "tcs.trysetres");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetres.b");
+        if (mname == "SetResult") {
+            // SetResult: throw InvalidOperationException if already completed.
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setres.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;  // unit return
+        }
+        return ok1;
+    }
+
+    // TrySetException / SetException — pass the exception object directly.
+    if ((mname == "TrySetException" || mname == "SetException") &&
+        !call.args.empty() && call.args[0].value) {
+        llvm::Value* exc = lowerExpr(*call.args[0].value);
+        if (!exc) return nullptr;
+        auto* tryFn = declareC("bz_tcs_try_set_exception", i32(),
+                                {ptrTy(), ptrTy()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn, {tcs, exc},
+                                                 "tcs.trysetexc");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetexc.b");
+        if (mname == "SetException") {
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setexc.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;
+        }
+        return ok1;
+    }
+
+    // TrySetCancelled / SetCancelled — build OCE from vtable in the runtime.
+    if (mname == "TrySetCancelled" || mname == "SetCancelled") {
+        auto* tryFn = declareC("bz_tcs_try_set_cancelled", i32(),
+                                {ptrTy(), ptrTy()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn, {tcs, getOceVtable()},
+                                                 "tcs.trysetcxl");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetcxl.b");
+        if (mname == "SetCancelled") {
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setcxl.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;
+        }
+        return ok1;
+    }
+
+    // Dispose() — real work is done by the using-var emitDisposals path.
+    // An explicit tcs.Dispose() call in user code is a no-op here; the
+    // disposal contract (bz_tcs_fault_if_pending + inner task fire-and-forget +
+    // bz_tcs_free) is enforced by the Disposal.tcs emitDisposals arm.
+    if (mname == "Dispose") {
+        return nullptr;
     }
 
     return nullptr;

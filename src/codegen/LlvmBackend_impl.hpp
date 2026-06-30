@@ -724,6 +724,16 @@ private:
         // receivers with ChannelClosedException). No user TypeSymbol; recognised
         // by the builtin type name "ChannelSender".
         bool channelSender = false;
+        // §6.6 / issue #974: a `using var` bound to a TaskCompletionSource<T>,
+        // OwnedTaskCompletionSource<T>, or TaskCompletionSource (non-generic).
+        // At scope end:
+        //   1. bz_tcs_fault_if_pending(tcs, ioe_vtable) — faults the inner
+        //      task with InvalidOperationException if not already completed.
+        //   2. Error_obj cleanup on the inner task (same as d.task path).
+        //   3. bz_task_fire_and_forget(inner_task) — releases TCS's task ref.
+        //   4. bz_tcs_free(tcs) — frees the TCS struct itself.
+        // No user TypeSymbol; recognised by the builtin type name.
+        bool tcs = false;
         // #628 / stdlib §4.9 v0.135: a `using var` bound to a DrainedEntry<K,V>
         // obtained from `for var entry in d.Drain() do … end`. The loop variable
         // `entry` is a struct {K key; V* value}; `using var e := entry` transfers
@@ -6044,6 +6054,9 @@ private:
             // type-parameter and the nullable-type-param branch lowered it to
             // {i8,i32} instead of ptr → emitStructEquality crash on `tok <> null`.
             "Semaphore", "SemaphoreToken",
+            // §6.6 / issue #974: TaskCompletionSource<T>/OwnedTaskCompletionSource<T>/
+            // TaskCompletionSource — compiler-known heap-pointer builtins (bz_tcs_t*).
+            "TaskCompletionSource", "OwnedTaskCompletionSource",
             // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
             // heap-pointer builtins (bz_atomic_t*).  Without these entries a
             // nullable `Atomic<T>?` was mis-classified as a bare generic
@@ -6299,6 +6312,10 @@ private:
     llvm::Value* tryLowerMutexLockCall(const ast::CallExpr& call);
     // §6.3 / issue #647: Semaphore.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
     llvm::Value* tryLowerSemaphoreTokenCall(const ast::CallExpr& call);
+    // §6.6 / issue #974: TaskCompletionSource<T>/OwnedTaskCompletionSource<T>/
+    //   TaskCompletionSource instance methods: TrySetResult, SetResult,
+    //   TrySetException, SetException, TrySetCancelled, SetCancelled, Dispose.
+    llvm::Value* tryLowerTcsCall(const ast::CallExpr& call);
     // §6.4 / issue #647: Atomic<T>/AtomicInteger<T> Exchange, CompareExchange,
     //   Increment, Decrement, Add; also Value setter (a.Value := v) via call shape.
     llvm::Value* tryLowerAtomicCall(const ast::CallExpr& call);
