@@ -8,6 +8,15 @@
 // runs on a null/zero payload (a record with a reference-typed field would
 // otherwise dereference a null field).
 //
+// fix #1248 / §25.2 / §8.4: when BOTH operands are nullable (`T? = T?`), the
+// custom `operator =`/`<>` declared on the bare record type `T` was not dispatched
+// — sema's operandMatchesParam rejected a `T?` operand against a non-nullable `T`
+// parameter, so findBinaryOperator returned null and codegen fell through to
+// structural equality.  For `=`/`<>` the nullable gate is now exempted (the
+// null-safe equality wrapper unwraps T? → T before the call), so the user operator
+// is correctly resolved and invoked for any combination of nullable / non-nullable
+// T? / T operands.
+//
 // Value tests — runJit returns the raw int (kept in 0..255).
 
 #include "support/codegen_support.hpp"
@@ -29,6 +38,16 @@ const char* kPoint =
     "  public static method operator <>(a: Point, b: Point): bool => "
     "    a.X <> b.X or a.Y <> b.Y; "
     "end Point; ";
+// #1248: Pt overloads `=`/`<>` comparing ONLY X (ignoring Y) so tests can
+// distinguish the custom operator from structural field-by-field equality: two
+// Pt values with the same X but different Y compare equal by the custom operator
+// but NOT equal structurally.  Both operators are declared per §25.2.
+const char* kPt =
+    "module M; "
+    "record Pt(X: int, Y: int) "
+    "  public static method operator =(a: Pt, b: Pt): bool => a.X = b.X; "
+    "  public static method operator <>(a: Pt, b: Pt): bool => a.X <> b.X; "
+    "end Pt; ";
 }  // namespace
 
 // bug06: `Point? = Point?` — present-vs-null is false, null-vs-null is true (was
@@ -105,4 +124,92 @@ BEZEL_TEST(nullable_record_user_equality_848, reference_field_record_vs_null) {
         "  if not (b = b) then return 21; end; "  // b=b is true (null vs null)
         "  return 5; "
         "end Main; end C;"), 5);
+}
+
+// ── fix #1248 / §25.2 / §8.4: T? = T? must dispatch the user operator ─────────
+//
+// Core regression: two Pt? values with the same X but different Y must compare
+// equal via the custom X-only `operator =` (not structural equality which would
+// see different Y and return false).
+BEZEL_TEST(nullable_record_user_equality_1248, both_nullable_eq_custom_op_dispatched) {
+    // §25.2 / §8.4 (#1248): a = Pt(1,99), b = Pt(1,42) — same X, different Y.
+    // Custom operator = compares X only → equal (true). Structural equality would
+    // compare both fields → not equal (false). Expected rc=1.
+    BEZEL_EXPECT_EQ(run(std::string(kPt) +
+        "class C public static method Main(): int "
+        "  var a: Pt? := new Pt(1, 99); "
+        "  var b: Pt? := new Pt(1, 42); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// Custom `operator <>` dispatched for T? <> T?: same X → not different → false.
+// Structural <> would see different Y → true. So the discriminating value is 0.
+BEZEL_TEST(nullable_record_user_equality_1248, both_nullable_neq_custom_op_dispatched) {
+    // §25.2 / §8.4 (#1248): custom <> compares X only; same X=1 → false.
+    // Structural would see different Y → true. Expected rc=0 (operator returns false).
+    BEZEL_EXPECT_EQ(run(std::string(kPt) +
+        "class C public static method Main(): int "
+        "  var a: Pt? := new Pt(1, 99); "
+        "  var b: Pt? := new Pt(1, 42); "
+        "  return (1 if a <> b else 0); "
+        "end Main; end C;"), 0);
+}
+
+// Different X → custom = gives false, custom <> gives true.
+BEZEL_TEST(nullable_record_user_equality_1248, both_nullable_different_x) {
+    // §25.2 / §8.4 (#1248): a.X=1, b.X=2 → a = b is false; a <> b is true.
+    BEZEL_EXPECT_EQ(run(std::string(kPt) +
+        "class C public static method Main(): int "
+        "  var a: Pt? := new Pt(1, 99); "
+        "  var b: Pt? := new Pt(2, 99); "
+        "  if not (a = b) and (a <> b) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// Null-operand cases: null = non-null → false; null = null → true;
+// null <> non-null → true.  The user operator is never invoked on a null side.
+BEZEL_TEST(nullable_record_user_equality_1248, null_operand_handling) {
+    // §8.4 (#1248): null-safe: (n = a) is false, (n = null) is true, (n <> a) is 1.
+    BEZEL_EXPECT_EQ(run(std::string(kPt) +
+        "class C public static method Main(): int "
+        "  var n: Pt? := null; "
+        "  var a: Pt? := new Pt(1, 99); "
+        "  if n = a then return 10; end; "   // false: null vs non-null
+        "  if not (n = null) then return 11; end; "  // true: null vs null
+        "  if not (n <> a) then return 12; end; "    // true: null vs non-null
+        "  return 1; "
+        "end Main; end C;"), 1);
+}
+
+// Regression: a record WITHOUT a custom operator still uses structural equality
+// for nullable comparison (not broken by the fix).
+BEZEL_TEST(nullable_record_user_equality_1248, structural_record_nullable_regression) {
+    // §9.1 / §8.4 (#1248 regression): no custom operator → structural equality.
+    // Two Pt? with identical fields → equal; differing field → not equal.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pair(A: int, B: int) end Pair; "
+        "class C public static method Main(): int "
+        "  var p: Pair? := new Pair(3, 7); "
+        "  var q: Pair? := new Pair(3, 7); "
+        "  var r: Pair? := new Pair(3, 8); "
+        "  if p = q and not (p = r) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// Regression: the non-nullable `Pt = Pt` custom-operator path still works.
+BEZEL_TEST(nullable_record_user_equality_1248, nonnullable_regression) {
+    // §25.2 (#1248 regression): non-nullable T = T must still invoke the operator.
+    // Same X different Y → equal via custom op; different X → not equal.
+    BEZEL_EXPECT_EQ(run(std::string(kPt) +
+        "class C public static method Main(): int "
+        "  var a := new Pt(1, 99); "
+        "  var b := new Pt(1, 42); "
+        "  var c := new Pt(2, 42); "
+        "  if a = b and not (a = c) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
 }

@@ -1841,10 +1841,17 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         // codegen passed the `{i8, Vec}` wrapper struct to a function expecting a
         // bare `Vec` (malformed IR). Requiring nullability agreement makes the
         // operator not resolve, so the use is cleanly rejected below.
+        // §8.4 (#1248): `=`/`<>` are exempt from the nullability gate — a `T?`
+        // operand IS allowed to match a non-nullable `T` parameter for these two
+        // operators because codegen wraps the call in the null-safe equality
+        // protocol (lowerNullSafeRecordEquality), which unwraps the `{i8, T}`
+        // payload to bare `T` before invoking the user operator. All other
+        // operators remain gated (§7.11: lifting over `T?` is deferred).
         if (pt->kind == TypeRef::Kind::Named)
             return at->kind == TypeRef::Kind::Named &&
                    pt->declaration == at->declaration &&
-                   (pt->nullable || !at->nullable);
+                   (pt->nullable || !at->nullable ||
+                    be.op == "=" || be.op == "<>");
         // A primitive parameter accepts a primitive operand (numeric widening /
         // coercion is handled downstream); the kinds must still agree.
         if (pt->kind == TypeRef::Kind::Primitive)
