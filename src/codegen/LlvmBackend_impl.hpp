@@ -1650,6 +1650,21 @@ private:
                n == "Span" || n == "ReadOnlySpan";
     }
 
+    // §4.16 / §29.2 (#970/#1262): the synthesized IReadOnlySpan<T> builtin
+    // interface — a span boxed into { vtable, rc, bz.arrayspan } (arrayspan at
+    // box+16). Recognised by the IReadOnlySpan TypeSymbol declaration or, for a
+    // not-yet-resolved ref, the leading name part.
+    static bool isIReadOnlySpanType(const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        if (rt->declaration && rt->declaration->name == "IReadOnlySpan")
+            return true;
+        if (rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty() &&
+            rt->astNode->name->parts[0] == "IReadOnlySpan")
+            return true;
+        return false;
+    }
+
     // §4.14 (#779): test whether a TypeRef is the OWNING `Span<T>` over an
     // OwnedBuffer<T> (its slots own their class-typed elements). `ReadOnlySpan<T>`
     // is a read-only view (no set/move/clear), so it is NOT matched here.

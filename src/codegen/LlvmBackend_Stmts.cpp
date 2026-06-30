@@ -2750,9 +2750,26 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     // span.Start .. span.Start+span.Length with bz_array_ptr_at on Source).
     {
         auto* iterTy = ctx_.exprType(*fs.iterable);
-        if (isSpanLikeTypeName(iterTy)) {
-            llvm::Value* spanVal = lowerExpr(*fs.iterable);
-            if (!spanVal) return false;
+        if (isSpanLikeTypeName(iterTy) || isIReadOnlySpanType(iterTy)) {
+            llvm::Value* spanVal = nullptr;
+            if (isIReadOnlySpanType(iterTy)) {
+                // §29.2 / §4.16 (#1262): an IReadOnlySpan<T> value is a box
+                // { vtable, rc, bz.arrayspan } with the span struct at byte
+                // offset 16 (#970). Unbox it and iterate it with the SAME direct
+                // indexed loop as a concrete span (spec §29.2 mandates the
+                // indexed-loop desugaring). The unboxed `src` field is the same
+                // bz_array_t* the concrete path uses, so bz_array_ptr_at applies.
+                llvm::Value* boxPtr = lowerExpr(*fs.iterable);
+                if (!boxPtr) return false;
+                llvm::Value* spanGep = builder_.CreateGEP(
+                    llvm::Type::getInt8Ty(llvm_), boxPtr,
+                    builder_.getInt64(16), "irs.spanp");
+                spanVal = builder_.CreateLoad(arraySpanStructType(), spanGep,
+                                              "irs.span");
+            } else {
+                spanVal = lowerExpr(*fs.iterable);
+                if (!spanVal) return false;
+            }
             auto* spanSt = arraySpanStructType();
             auto* spanSlot = entryAlloca(spanSt);
             builder_.CreateStore(spanVal, spanSlot);

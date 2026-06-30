@@ -252,4 +252,47 @@ BEZEL_TEST(ireadonlyspan_970, local_annotation_ireadonly_spec_4_16) {
         10);
 }
 
+// §29.2 / §4.16 (#1262): `for var x in sp` over an IReadOnlySpan<T> parameter
+// desugars to a direct indexed loop (the box's arrayspan is unboxed and iterated
+// like a concrete span). 10+20+30+40 = 100.
+BEZEL_TEST(ireadonlyspan_970, for_in_over_ireadonly_span_1262) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C "
+        "  public static method Sum(sp: IReadOnlySpan<int>): int "
+        "    var t := 0; "
+        "    for var x in sp do t := t + x; end; "
+        "    return t; "
+        "  end; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(4); "
+        "    a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "    return C.Sum(a.AsReadOnlySpan()); "
+        "  end; "
+        "end C;"),
+        100);
+}
+
+// §29.2 / §4.16 (#1262): for-in over IReadOnlySpan<T> honours `break`.
+BEZEL_TEST(ireadonlyspan_970, for_in_over_ireadonly_span_break_1262) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C "
+        "  public static method First2(sp: IReadOnlySpan<int>): int "
+        "    var t := 0; var n := 0; "
+        "    for var x in sp do "
+        "      if n >= 2 then break; end; "
+        "      t := t + x; n := n + 1; "
+        "    end; "
+        "    return t; "
+        "  end; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(4); "
+        "    a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "    return C.First2(a.AsReadOnlySpan()); "
+        "  end; "
+        "end C;"),
+        30);
+}
+
 }  // namespace
