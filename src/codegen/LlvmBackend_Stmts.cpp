@@ -2392,9 +2392,15 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         llvm::Value* stepNeg =
             builder_.CreateICmpSLT(step, builder_.getInt32(0), "rfv.desc");
 
-        llvm::AllocaInst* slot = entryAlloca(i32());
-        locals_[&fs] = slot;
-        builder_.CreateStore(lo, slot);
+        // #1243 §21.4: use a hidden counter (rfvCounter) so that assignment to
+        // the loop variable in the body does not alter the iteration count.
+        // rfvVar is the body-visible slot; it is reloaded from rfvCounter at
+        // the top of each iteration so each iteration starts with the correct
+        // value regardless of what the body wrote to i.
+        llvm::AllocaInst* rfvCounter = entryAlloca(i32());
+        llvm::AllocaInst* rfvVar     = entryAlloca(i32());
+        locals_[&fs] = rfvVar;
+        builder_.CreateStore(lo, rfvCounter);
 
         auto* condBB = llvm::BasicBlock::Create(llvm_, "rfv.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rfv.body", currentFn_);
@@ -2403,7 +2409,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(condBB);
-        llvm::Value* cur = builder_.CreateLoad(i32(), slot);
+        llvm::Value* cur = builder_.CreateLoad(i32(), rfvCounter);
         // Direction-aware bound check: pick the ascending (cur <=/< hi) or
         // descending (cur >=/> hi) comparison by the runtime step sign, using
         // the incl flag from the struct for the </<= vs <=/>= choice.
@@ -2417,14 +2423,18 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         builder_.CreateCondBr(cond, bodyBB, endBB);
 
         builder_.SetInsertPoint(bodyBB);
+        // #1243: copy hidden counter into the per-iteration loop variable so
+        // the body starts each iteration with the right value of i.
+        builder_.CreateStore(
+            builder_.CreateLoad(i32(), rfvCounter, "rfv.iv"), rfvVar);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
         bool term = lowerForBody(fs);
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
 
         builder_.SetInsertPoint(incBB);
-        llvm::Value* v = builder_.CreateLoad(i32(), slot);
-        builder_.CreateStore(builder_.CreateAdd(v, step), slot);
+        llvm::Value* v = builder_.CreateLoad(i32(), rfvCounter);
+        builder_.CreateStore(builder_.CreateAdd(v, step), rfvCounter);
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(endBB);
@@ -2454,16 +2464,18 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
                 s = builder_.CreateSExtOrTrunc(s, lo->getType());
             llvm::Value* stepNeg = builder_.CreateICmpSLT(
                 s, llvm::ConstantInt::get(lo->getType(), 0), "rf.desc");
-            llvm::AllocaInst* rslot = entryAlloca(lo->getType());
-            locals_[&fs] = rslot;
-            builder_.CreateStore(lo, rslot);
+            // #1243 §21.4: hidden counter + body-visible var (per rfv path above).
+            llvm::AllocaInst* rfCounter = entryAlloca(lo->getType());
+            llvm::AllocaInst* rfVar     = entryAlloca(lo->getType());
+            locals_[&fs] = rfVar;
+            builder_.CreateStore(lo, rfCounter);
             auto* condBB = llvm::BasicBlock::Create(llvm_, "rf.cond", currentFn_);
             auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rf.body", currentFn_);
             auto* incBB  = llvm::BasicBlock::Create(llvm_, "rf.inc",  currentFn_);
             auto* endBB  = llvm::BasicBlock::Create(llvm_, "rf.end",  currentFn_);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(condBB);
-            llvm::Value* cur = builder_.CreateLoad(lo->getType(), rslot);
+            llvm::Value* cur = builder_.CreateLoad(lo->getType(), rfCounter);
             llvm::Value* asc = range->inclusive
                 ? builder_.CreateICmpSLE(cur, hi)
                 : builder_.CreateICmpSLT(cur, hi);
@@ -2474,13 +2486,16 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
                 builder_.CreateSelect(stepNeg, desc, asc, "rf.cnd");
             builder_.CreateCondBr(cond, bodyBB, endBB);
             builder_.SetInsertPoint(bodyBB);
+            // #1243: copy hidden counter into the per-iteration loop variable.
+            builder_.CreateStore(
+                builder_.CreateLoad(lo->getType(), rfCounter, "rf.iv"), rfVar);
             loopStack_.push_back({incBB, endBB, disposeStack_.size()});
             bool term = lowerForBody(fs);
             loopStack_.pop_back();
             if (!term) builder_.CreateBr(incBB);
             builder_.SetInsertPoint(incBB);
-            llvm::Value* v = builder_.CreateLoad(lo->getType(), rslot);
-            builder_.CreateStore(builder_.CreateAdd(v, s), rslot);
+            llvm::Value* v = builder_.CreateLoad(lo->getType(), rfCounter);
+            builder_.CreateStore(builder_.CreateAdd(v, s), rfCounter);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             return true;
@@ -2542,6 +2557,15 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         return true;
     }
 
+    // #1243 §21.4: introduce a separate body-visible loop variable (varSlot)
+    // so that assignment to i in the body does not alter the hidden counter
+    // (slot).  The SM path above already returned; that path keeps using
+    // 'slot' directly because it must survive yield via smAllocaToField_ and
+    // adding a second frame field would require smLocalFields_ to reserve an
+    // extra entry per range ForStmt (deferred to a follow-up).
+    llvm::AllocaInst* varSlot = entryAlloca(lo->getType());
+    locals_[&fs] = varSlot;
+
     auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
     auto* incBB  = llvm::BasicBlock::Create(llvm_, "for.inc",  currentFn_);
@@ -2567,12 +2591,16 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
 
     // body: `continue` targets incBB, `break` targets endBB.
     builder_.SetInsertPoint(bodyBB);
+    // #1243: copy hidden counter into the per-iteration loop variable so the
+    // body sees the correct value of i and its mutations stay local.
+    builder_.CreateStore(
+        builder_.CreateLoad(slot->getAllocatedType(), slot, "for.iv"), varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(incBB);
 
-    // inc: i := i + step.
+    // inc: counter := counter + step (body mutations to varSlot are ignored).
     builder_.SetInsertPoint(incBB);
     llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
     llvm::Value* next = builder_.CreateAdd(v, stepVal);

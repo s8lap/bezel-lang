@@ -231,3 +231,92 @@ BEZEL_TEST(codegen_in_range, in_used_as_filter_in_for) {
         "  return count; "
         "end Main; end C;"), 11);
 }
+
+// fix #1243 / §21.4: assigning to the loop variable inside the body must NOT
+// alter the iteration count or the next iteration's starting value.  The
+// counted-loop optimization must iterate a HIDDEN counter and copy it into a
+// fresh body-visible binding each iteration; body writes go to that binding only.
+
+// §21.4 canonical repro: `i := 1000` in body must not kill the counter.
+// Before the fix: rc=1 (loop exited after first iteration).
+BEZEL_TEST(codegen_range_for_1243, body_assign_does_not_shorten_loop) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var cnt := 0; "
+        "  for var i in 1..5 do "
+        "    cnt := cnt + 1; "
+        "    i := 1000; "
+        "  end; "
+        "  return cnt; "
+        "end Main; end C;"), 5);
+}
+
+// §21.4: each iteration starts with the counter value, not a value written by
+// the previous iteration.  Sum must be 1+2+3+4+5 = 15 even though body also
+// does `i := i + 10`.
+BEZEL_TEST(codegen_range_for_1243, each_iteration_starts_with_counter_value) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; "
+        "  for var i in 1..5 do "
+        "    s := s + i; "
+        "    i := i + 10; "
+        "  end; "
+        "  return s; "
+        "end Main; end C;"), 15);
+}
+
+// §21.4: half-open range with body mutation — 0..<5 must run 5 iterations.
+BEZEL_TEST(codegen_range_for_1243, half_open_body_assign_does_not_shorten_loop) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var cnt := 0; "
+        "  for var i in 0..<5 do "
+        "    cnt := cnt + 1; "
+        "    i := 99; "
+        "  end; "
+        "  return cnt; "
+        "end Main; end C;"), 5);
+}
+
+// §21.4: step-2 range with body mutation — 0,2,4,6,8,10 → 6 iterations.
+BEZEL_TEST(codegen_range_for_1243, step2_body_assign_does_not_shorten_loop) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var cnt := 0; "
+        "  for var i in 0..10 step 2 do "
+        "    cnt := cnt + 1; "
+        "    i := 999; "
+        "  end; "
+        "  return cnt; "
+        "end Main; end C;"), 6);
+}
+
+// §21.4: nested loops with body mutation of both loop vars — 3 × 4 = 12.
+BEZEL_TEST(codegen_range_for_1243, nested_loops_with_body_assign) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var cnt := 0; "
+        "  for var i in 1..3 do "
+        "    i := 99; "
+        "    for var j in 1..4 do "
+        "      j := 77; "
+        "      cnt := cnt + 1; "
+        "    end; "
+        "  end; "
+        "  return cnt; "
+        "end Main; end C;"), 12);
+}
+
+// §21.4: runtime step with body mutation — 0,2,4,6,8,10 → 6 iterations.
+BEZEL_TEST(codegen_range_for_1243, runtime_step_body_assign_does_not_shorten_loop) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var cnt := 0; var s := 2; "
+        "  for var i in 0..10 step s do "
+        "    cnt := cnt + 1; "
+        "    i := 999; "
+        "  end; "
+        "  return cnt; "
+        "end Main; end C;"), 6);
+}
