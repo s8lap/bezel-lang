@@ -313,3 +313,59 @@ BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_of_owned_field_in_destructor
     // disposer) → 0. LSan leg: no leak, no double-free.
     expectDisposedAndLeakFree(kDictFieldDestructorDispose, 1);
 }
+
+// ---- #1214: OwnedDictionary.Add disposes the rejected value on dup-key throw -
+//
+// §4.8 / §28.3: when OwnedDictionary.Add is called with a key that is already
+// present it must (a) throw ArgumentException and (b) dispose the transferred
+// owned value — ownership was transferred to the call site and the value will
+// not be inserted, so the disposer must run on the throw path or the value leaks.
+//
+// Encoding: `inside_throw * 10 + R._n` where `inside_throw` is R._n captured
+// inside the catch arm (≥1 iff the rejected value was disposed on the throw
+// path) and `R._n` is the final count after the using-var scope ends.
+//
+// Correct outcome: inside_throw == 1 (rejected R disposed), R._n == 2 (surviving
+// first R disposed at scope end) → 12.
+// Before #1214: the rejected R leaked, inside_throw == 0 → return 2 or crash.
+// The LSan leg is load-bearing: it confirms exactly-once disposal with no leak.
+
+const char* kOwnedDictStrDupKeyDisposesValue =
+    "var inside_throw := -1; "
+    "do "
+    "  using var d := new OwnedDictionary<string, R>(); "
+    "  d.Add(\"a\", move (new R())); "
+    "  try d.Add(\"a\", move (new R())); "
+    "  catch ArgumentException => inside_throw := R._n; end; "
+    "end; "
+    "return inside_throw * 10 + R._n;";
+
+// Same scenario with a generic (non-string) int key — exercises the
+// bz_dict_contains_gen probe path instead of bz_dict_contains_str.
+const char* kOwnedDictIntDupKeyDisposesValue =
+    "var inside_throw := -1; "
+    "do "
+    "  using var d := new OwnedDictionary<int, R>(); "
+    "  d.Add(1, move (new R())); "
+    "  try d.Add(1, move (new R())); "
+    "  catch ArgumentException => inside_throw := R._n; end; "
+    "end; "
+    "return inside_throw * 10 + R._n;";
+
+BEZEL_TEST(codegen_owned_dict_1214,
+           str_key_dup_add_disposes_rejected_value_spec_4_8_28_3) {
+    // String key: the rejected second R is disposed on the throw path
+    // (inside_throw == 1 inside the catch), the surviving first R is disposed
+    // at scope end (R._n == 2 after the block) → 12.
+    // LSan leg: no leak (rejected value freed), no double-free (surviving value
+    // freed exactly once at scope end).
+    expectDisposedAndLeakFree(prog(kOwnedDictStrDupKeyDisposesValue), 12);
+}
+
+BEZEL_TEST(codegen_owned_dict_1214,
+           int_key_dup_add_disposes_rejected_value_spec_4_8_28_3) {
+    // Generic int key: same ownership guarantee via the bz_dict_contains_gen
+    // probe path → inside_throw == 1, R._n == 2 after scope → 12.
+    // LSan leg: load-bearing for the generic-key probe path.
+    expectDisposedAndLeakFree(prog(kOwnedDictIntDupKeyDisposesValue), 12);
+}
