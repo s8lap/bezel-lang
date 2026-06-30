@@ -907,6 +907,7 @@ set(BEZEL_TEST_SOURCES
     ownership/move_interface_slot_test.cpp
     ownership/move_borrowing_span_slot_871_test.cpp
     ownership/closure_escape_outer_local_861_test.cpp
+    ownership/ref_out_lambda_escape_1217_test.cpp
     ownership/value_builtin_ownership_test.cpp
     ownership/use_after_dispose_warn_601_test.cpp
     ownership/channel_spawn_sink_692_693_test.cpp

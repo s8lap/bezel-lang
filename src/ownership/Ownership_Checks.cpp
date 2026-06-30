@@ -1196,6 +1196,30 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
                     "instead)");
                 return;  // one diagnostic per return is enough
             }
+            // §27.5 / §28.6 (#1217): a `ref` or `out` parameter is a pointer
+            // into the CALLER's stack frame (§22.3). The pointer is valid only
+            // for the duration of this method call. A closure that captures a
+            // ref/out param by pointer and ESCAPES (is returned) will hold a
+            // dangling pointer once the call returns — a use-after-free on the
+            // next invocation. Reject here. A non-escaping ref/out-capturing
+            // closure invoked locally (per #1207) is not in this return path
+            // and remains accepted.
+            if (isRefOutParam(sym)) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned closure captures `") +
+                    std::string(sym->name) +
+                    "` which is a `" + std::string(ps->modifier) + "` parameter"
+                    " — a ref/out parameter is a pointer into the caller's stack"
+                    " frame; a closure that captures it and escapes the method"
+                    " holds a dangling pointer once the call returns"
+                    " (use-after-free). (§27.5 / §28.6 / #1217; pass the value"
+                    " by copy into the closure instead, e.g."
+                    " `var snap := " +
+                    std::string(sym->name) + "; () => snap`)");
+                return;  // one diagnostic per return is enough
+            }
             // Resolve against the dataflow-tracked method-scope locals. A
             // captured lambda parameter is not in `states_`, so it is
             // naturally excluded; only an enclosing-method local/owned-param
@@ -1362,6 +1386,112 @@ bool MethodOwnership::isEscapeBoundLocal(sema::Symbol* sym) const {
     // local is disposed at scope end; the caught exception is disposed by the
     // runtime when the arm completes. A borrow of either may not escape.
     return isOwnedTrackedLocal(sym) || isCatchBorrow(sym);
+}
+
+bool MethodOwnership::isRefOutParam(sema::Symbol* sym) const {
+    // §27.5 / §28.6 (#1217): a plain ref/out parameter (not "out owned" —
+    // that is an ownership-transfer parameter handled separately). A ref/out
+    // param is a pointer into the CALLER's stack frame; capturing it in a
+    // closure that escapes the call produces a dangling pointer. // per §22.3
+    if (!sym) return false;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+    return ps && (ps->modifier == "ref" || ps->modifier == "out");
+}
+
+// §27.5 / §28.6 (#1217): when a lambda is stored into a FIELD or written
+// through an OUT-PARAM assignment target, and the lambda captures a ref/out
+// parameter, the captured pointer lives on the caller's stack; the field or
+// out-param location outlives the call — a use-after-free on the next
+// invocation. Reports the first offending ref/out capture found. // per §27.5
+void MethodOwnership::checkRefOutLambdaCaptureOnStore(
+    const ast::AssignmentStmt& as) {
+    if (as.op != ":=" || !as.target || !as.value) return;
+
+    // Identify whether the target is an escaping location (field or out-param).
+    // Mirrors the Dest classification in checkBorrowStoreEscape, restricted to
+    // the two locations that truly outlive the method call.
+    enum class Dest { None, Field, OutParam };
+    Dest dest = Dest::None;
+    std::string_view destName;
+
+    if (dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
+        // `obj.f := …` / `this.f := …` — the field outlives the method.
+        dest = Dest::Field;
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(as.target.get()))
+            destName = ma->member;
+    } else if (const auto* id =
+                   dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+            // Bare unqualified field name (implicit `this._field` form, §1082).
+            dest = Dest::Field;
+            destName = id->name;
+        } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (ps->modifier == "out" || ps->modifier == "ref" ||
+                ps->modifier == "out owned") {
+                // `p := …` — the out/ref param's storage is the CALLER's frame,
+                // which also outlives this method.
+                dest = Dest::OutParam;
+                destName = id->name;
+            }
+        }
+    }
+    if (dest == Dest::None) return;
+
+    // Find lambdas in the RHS.
+    std::vector<const ast::LambdaExpr*> lambdas;
+    std::function<void(const ast::Expr&)> findLambdas =
+        [&](const ast::Expr& x) {
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&x)) {
+                lambdas.push_back(lam);
+                return;
+            }
+            if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&x)) {
+                if (cd->thenValue) findLambdas(*cd->thenValue);
+                if (cd->elseValue) findLambdas(*cd->elseValue);
+                return;
+            }
+        };
+    findLambdas(*as.value);
+    if (lambdas.empty()) return;
+
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!isRefOutParam(sym)) continue;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (dest == Dest::Field) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("closure stored in field `") +
+                    std::string(destName) +
+                    "` captures `" + std::string(sym->name) +
+                    "` which is a `" + std::string(ps->modifier) + "` parameter"
+                    " — a ref/out parameter is a pointer into the caller's stack"
+                    " frame; storing the closure in a field lets it outlive the"
+                    " call and dereference a dangling pointer (use-after-free)."
+                    " (§27.5 / §28.6 / #1217; pass the value by copy into the"
+                    " closure instead, e.g. `var snap := " +
+                    std::string(sym->name) + "; () => snap`)");
+            } else {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("closure written through `") +
+                    std::string(destName) +
+                    "` captures `" + std::string(sym->name) +
+                    "` which is a `" + std::string(ps->modifier) + "` parameter"
+                    " — a ref/out parameter is a pointer into the caller's stack"
+                    " frame; writing the closure through an out/ref parameter"
+                    " lets it outlive the call and dereference a dangling pointer"
+                    " (use-after-free)."
+                    " (§27.5 / §28.6 / #1217; pass the value by copy instead)");
+            }
+            return;  // one diagnostic per assignment is enough
+        }
+    }
 }
 
 sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {

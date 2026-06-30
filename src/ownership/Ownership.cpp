@@ -1599,6 +1599,16 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // feeds the #402 owned-field check below so the same store is not reported
     // by both. // per §28.3, §31.1
     bool flagged386 = checkBorrowStoreEscape(as);
+    // §27.5 / §28.6 (#1217): a lambda stored into a field or written through an
+    // out/ref parameter that captures a ref/out parameter — the captured pointer
+    // is to the caller's stack frame and is valid only for the duration of the
+    // call; storing the closure in an escaping location lets it dereference a
+    // dangling pointer after the call returns (use-after-free). Runs after
+    // checkBorrowStoreEscape so any earlier §28.3 / §31.1 diagnostic is not
+    // duplicated (checkBorrowStoreEscape returns true = error already reported,
+    // but ref/out captures are a SEPARATE source not covered by §28.3 scope-
+    // bound locals, so we always run this check regardless of flagged386). // per §27.5, §28.6
+    checkRefOutLambdaCaptureOnStore(as);
     // §28.3 / §28.5 / §28.8 (issue #402): an `owned` FIELD is an owned storage
     // location and may only receive an OWNED value. A BORROW RHS is the
     // double-free hazard (the field's owner and the borrow's real owner both

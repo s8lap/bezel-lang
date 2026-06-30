@@ -574,6 +574,26 @@ private:
     void checkCatchBorrowEscapesViaNewExpr(const ast::NewExpr& ne,
                                            SourceLocation loc);
 
+    // §27.5 / §28.6 (#1217): true when `sym` is a plain `ref` or `out`
+    // parameter (ParameterSymbol with modifier "ref" or "out", excluding
+    // "out owned" — that is an ownership-transfer parameter and is already
+    // handled by the owned-parameter escape machinery). A ref/out param is
+    // stored as a pointer to the CALLER's stack frame; capturing it in a
+    // closure that escapes the method produces a dangling pointer. // per §27.5
+    bool isRefOutParam(sema::Symbol* sym) const;
+
+    // §27.5 / §28.6 (#1217): reject a lambda stored to a FIELD or OUT-PARAM
+    // (both escaping locations that outlive the method call) when the lambda
+    // captures a ref/out parameter. The captured pointer is to the caller's
+    // stack frame and is valid only for the duration of the call; storing
+    // the closure in a field or through an out-param lets it outlive that
+    // frame — a use-after-free. Called from handleAssignment AFTER the
+    // existing checkBorrowStoreEscape, so it fires ONLY when the target is a
+    // field or out-param (field = any MemberAccessExpr or bare FieldSymbol
+    // identifier; out-param = the "p := …" assignment through an out/ref
+    // parameter that is itself the destination). // per §27.5, §28.6
+    void checkRefOutLambdaCaptureOnStore(const ast::AssignmentStmt& as);
+
     // §9.7: true when `rt` is a record type that holds at least one
     // borrow-carrying field of a non-runtime-managed type (a class/
     // interface reference field, an inline array of reference elements,
