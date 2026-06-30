@@ -388,4 +388,73 @@ BEZEL_TEST(codegen_string_741, trim_char_set_content) {
         "end Main; end C;"), 1);
 }
 
+// -------------------------------------------------------------------------
+// §9.6 (#1244): string.Equals(other, ignoreCase: bool): bool
+//   — null-safe in the ignoreCase=true branch (was SIGSEGV before fix).
+//   — case-insensitive match still works for non-null operands.
+// -------------------------------------------------------------------------
+
+// #1244: Equals(null, true) must return false, not SIGSEGV.
+BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
+           equals_null_ignorecase_true_returns_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  var other: string? := null; "
+        "  return (1 if not s.Equals(other, true) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1244 regression: Equals(null, false) still returns false (null-safe path
+// was already correct, confirming no regression from the fix).
+BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
+           equals_null_ignorecase_false_returns_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  var other: string? := null; "
+        "  return (1 if not s.Equals(other, false) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1244: case-insensitive match between non-null strings still works.
+BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
+           equals_nonnull_ignorecase_true_match) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  return (0 if s.Equals(\"HELLO\", true) else 1); "
+        "end Main; end C;"), 0);
+}
+
+// #1244: case-insensitive non-match between non-null strings returns false.
+BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
+           equals_nonnull_ignorecase_true_no_match) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  return (1 if not s.Equals(\"world\", true) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1244 regression: case-sensitive match (ignoreCase=false) still correct.
+BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
+           equals_nonnull_ignorecase_false_exact_match) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  return (0 if s.Equals(\"hello\", false) else 1); "
+        "end Main; end C;"), 0);
+}
+
+// #1244 regression: case-sensitive mismatch on differing case returns false.
+BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
+           equals_nonnull_ignorecase_false_case_mismatch) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  return (1 if not s.Equals(\"HELLO\", false) else 0); "
+        "end Main; end C;"), 1);
+}
+
 }  // namespace

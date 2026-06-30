@@ -1166,7 +1166,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* planEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(icBB);
-        // ToLower both, then compare.
+        // #1244 / §9.6: null-guard for `other` in the case-insensitive branch.
+        // emitToLower calls loadStringLen which dereferences the string pointer;
+        // if `other` is null that is a SIGSEGV.  A non-null `self` can never
+        // equal null, so the result is false without dereferencing anything.
+        auto* icNull_ = llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* otherIsNull = builder_.CreateICmpEQ(other, icNull_, "eq.ic.onull");
+        auto* icNullBranch = builder_.GetInsertBlock();
+        auto* icNonNullBB = llvm::BasicBlock::Create(llvm_, "eq.ic.cmp", currentFn_);
+        builder_.CreateCondBr(otherIsNull, endBB, icNonNullBB);
+        // Non-null path: ToLower both, then compare.
+        builder_.SetInsertPoint(icNonNullBB);
         auto emitToLower = [&](llvm::Value* s) -> llvm::Value* {
             auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
             auto* tolowerFn = module_->getFunction("tolower");
@@ -1214,8 +1224,9 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* icEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(i1(), 2, "eq.result");
+        auto* phi = builder_.CreatePHI(i1(), 3, "eq.result");
         phi->addIncoming(plainEq, planEnd);
+        phi->addIncoming(builder_.getFalse(), icNullBranch);  // other==null → false
         phi->addIncoming(icEq, icEnd);
         return phi;
     }
