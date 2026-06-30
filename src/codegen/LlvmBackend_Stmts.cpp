@@ -3995,10 +3995,14 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // - IdentifierExpr typed as concrete user class → vtable dispatch
     // - Everything else → array protocol (assumes bz_array_t*)
     //
-    // Limitation: `for x in items` where items: IEnumerable<T> and the actual
-    // value is a user class (not Array<T>) does not work correctly. Full
-    // IEnumerable<T> interface dispatch requires vtable registration of
-    // GetEnumerator which is not yet implemented for builtin interfaces.
+    // Invariant (fix #1177 / §4.5 / §12.1): lowerLocalDecl wraps ANY
+    // bz_array_t-backed collection (Array, OwnedArray, OwnedBuffer,
+    // Stack/OwnedStack, Queue/OwnedQueue) and (Owned)LinkedList with
+    // a vtable-backed IEnumerable object whenever the local is declared as
+    // IEnumerable<T> (see LlvmBackend_Setup.cpp).  So when this path reaches
+    // the vtable-dispatch branch below for an IEnumerable<T> local, the slot
+    // already holds a proper vtable-backed wrapper and slot 4 (GetEnumerator)
+    // is always valid — no longer limited to yield-iterator results.
     bool isArrayBacked = true;  // default: array protocol
     if (dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) {
         isArrayBacked = false;  // iterator method call → vtable
@@ -4011,12 +4015,14 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             return rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration;
         };
         // §29.2 (#437): a parameter/local typed as the pure `IEnumerable<T>`
-        // interface uses vtable dispatch. buildOrderedArgs wraps any Array<T>
-        // argument in a vtable-backed enumerator at the call site, so the
-        // callee sees a uniform vtable-backed object regardless of whether
-        // the caller passed an Array or an iterator state machine. Richer
-        // interfaces (IReadOnlyList etc.) also support indexer access and are
-        // NOT wrapped at the call site; they keep the array-backed protocol.
+        // interface uses vtable dispatch. buildOrderedArgs wraps any array-
+        // backed collection argument (Array, OwnedArray, OwnedBuffer,
+        // Stack/OwnedStack, Queue/OwnedQueue, LinkedList/OwnedLinkedList)
+        // at the call site, and lowerLocalDecl (#1177) wraps them at the
+        // local-variable initializer site, so every IEnumerable<T>-typed
+        // identifier always holds a proper vtable-backed wrapper object.
+        // Richer interfaces (IReadOnlyList etc.) also support indexer access
+        // and are NOT wrapped; they keep the array-backed protocol.
         auto checkPureIEnumerable = [&](sema::TypeRef* rt) -> bool {
             if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
             if (rt->declaration) return false;  // user class → handled by checkNamed

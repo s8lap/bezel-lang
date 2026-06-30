@@ -5955,13 +5955,37 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // array layout as a vtable → SIGSEGV. Mirrors the call-site wrapping
             // in buildOrderedArgs. Richer interfaces (IList/IReadOnlyList) keep
             // the array-backed protocol and are not wrapped.
+            //
+            // fix #1177 / §4.5 / §12.1: extend from Array-only to ALL
+            // bz_array_t-backed owning collections — OwnedArray, OwnedBuffer,
+            // Stack/OwnedStack, Queue/OwnedQueue. A local declared as
+            // `IEnumerable<T>` and initialized from any of these previously
+            // stored the raw bz_array_t* rather than a vtable-backed wrapper,
+            // so lowerIEnumerableBuiltinFor's vtable-dispatch path read a
+            // non-existent vtable slot 4 → SIGSEGV even on an empty collection.
+            // Also handles (Owned)LinkedList<T> via the node-walking wrapper,
+            // mirroring the same split in buildOrderedArgs. The fix is here
+            // (at the local-variable initializer site) rather than in
+            // lowerIEnumerableBuiltinFor because by the time for-in lowering
+            // runs the slot already holds the unwrapped value; wrapping here
+            // keeps every IEnumerable<T> local holding a proper vtable object.
             bool initIsArray = initTR &&
                 initTR->kind == sema::TypeRef::Kind::Named &&
                 initTR->astNode && initTR->astNode->name &&
                 !initTR->astNode->name->parts.empty() &&
-                initTR->astNode->name->parts[0] == "Array";
+                (initTR->astNode->name->parts[0] == "Array" ||
+                 initTR->astNode->name->parts[0] == "OwnedArray" ||
+                 initTR->astNode->name->parts[0] == "OwnedBuffer" ||
+                 initTR->astNode->name->parts[0] == "Stack" ||
+                 initTR->astNode->name->parts[0] == "OwnedStack" ||
+                 initTR->astNode->name->parts[0] == "Queue" ||
+                 initTR->astNode->name->parts[0] == "OwnedQueue");
             if (initIsArray) {
                 v = wrapArrayAsIEnumerable(v, declTR);
+            } else if (initTR && isLinkedListTypeName(initTR)) {
+                // #1177: (Owned)LinkedList<T> is node-based (bz_llist) — wrap
+                // with the node-walking enumerator, mirroring buildOrderedArgs.
+                v = wrapLinkedListAsIEnumerable(v, declTR);
             } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
                        initTR->declaration) {
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR);

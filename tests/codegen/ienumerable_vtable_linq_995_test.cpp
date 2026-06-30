@@ -367,3 +367,85 @@ BEZEL_TEST(ienumerable_vtable_linq_995, empty_linkedlist_as_ienumerable_param_10
         "    using var c: OwnedLinkedList<Item> := []; return Sum(c); "
         "  end Main; end C;"), 99);
 }
+
+// #1177 / §4.5 / §12.1: a LOCAL variable declared as IEnumerable<T> and bound
+// to an owning collection (OwnedArray, OwnedStack, OwnedQueue, OwnedLinkedList)
+// must iterate correctly. Pre-fix: the local initializer wrapped only Array<T>,
+// so OwnedArray etc. stored the raw bz_array_t* or bz_llist* in the
+// IEnumerable<T> slot; lowerIEnumerableBuiltinFor then read vtable slot 4 off
+// the raw pointer (non-existent for owning collections) → SIGSEGV even on an
+// empty collection. Fix in LlvmBackend_Setup.cpp: extend the local-initializer
+// wrapping to all bz_array_t-backed collections (array wrapper) and to
+// (Owned)LinkedList (node-walking wrapper), mirroring buildOrderedArgs.
+namespace {
+std::string ifaceLocalSum(const std::string& collDecl) {
+    return
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var c: " + collDecl + " := [new Item(3), new Item(4)]; "
+        "    var e: IEnumerable<Item> := c; "
+        "    var s: int := 0; for var a in e do s := s + a.V; end; return s; "
+        "  end Main; end C;";
+}
+}  // anonymous namespace
+
+// §4.5 / §12.1 / #1177: empty OwnedArray via IEnumerable local — no crash (was
+// SIGSEGV on HEAD before fix; the vtable-slot-4 read fired even on 0 elements).
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           empty_owned_array_as_ienumerable_local_no_crash_1177) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var c := new OwnedArray<Item>(); "
+        "    var e: IEnumerable<Item> := c; "
+        "    var s: int := 0; for var a in e do s := s + a.V; end; return s + 99; "
+        "  end Main; end C;"), 99);
+}
+
+// §4.5 / §12.1 / #1177: OwnedArray<Item> bound to IEnumerable<Item> local —
+// for-in sees all elements and sums correctly (was SIGSEGV).
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_array_as_ienumerable_local_sum_1177) {
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedArray<Item>")), 7);
+}
+
+// §4.5 / §12.1 / #1177: other bz_array_t-backed owning collections via
+// IEnumerable<T> local — same fix, same wrapper (wrapArrayAsIEnumerable).
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_stack_as_ienumerable_local_sum_1177) {
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedStack<Item>")), 7);
+}
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_queue_as_ienumerable_local_sum_1177) {
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedQueue<Item>")), 7);
+}
+
+// §4.5 / §12.1 / #1177: (Owned)LinkedList<T> via IEnumerable<T> local —
+// uses wrapLinkedListAsIEnumerable (node-walking), mirroring buildOrderedArgs.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_linkedlist_as_ienumerable_local_sum_1177) {
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedLinkedList<Item>")), 7);
+}
+
+// §4.5 / §12.1 / #1177 disposal: the IEnumerable wrapper SHARES the collection
+// (does not own it), so after iterating via the local the OwnedArray still
+// disposes its elements exactly once at scope close (Cell.n net 0 — no leak,
+// no double-free). Covers the ownership-safety invariant of the #1177 fix.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_array_as_ienumerable_local_disposed_once_1177) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Cell public static n: int := 0; public V: int := 0; "
+        "  public constructor(v: int) this.V := v; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
+        "class C "
+        "  public static method Main(): int "
+        "    do using var items: OwnedArray<Cell> := [new Cell(3), new Cell(4)]; "
+        "       var e: IEnumerable<Cell> := items; "
+        "       var s: int := 0; for var a in e do s := s + a.V; end; end; "
+        "    return Cell.n; "
+        "  end Main; end C;"), 0);
+}
