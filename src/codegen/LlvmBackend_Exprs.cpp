@@ -10253,6 +10253,18 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 locals_[bp] = slot;
             }
         }
+        // fix #1254 / §19.3 / §14.1: for a destructuring arm over a concrete
+        // generic record (e.g. `Wrapper(x) => x.v` where w: Wrapper<Item>),
+        // install the concrete type-param substitution so fieldAddr can resolve
+        // T-typed member accesses in the arm guard and body. Without this,
+        // sema's declType for the bound name `x` is the bare generic param `T`
+        // (not the concrete `Item`), so `x.v` finds no sema symbol and
+        // fieldAddr returns null — lowerExpr returns null — case.end is left
+        // unterminated (IR verification failure). The guard is destroyed at the
+        // end of the arm iteration, restoring the outer substitution.
+        RecordSubstGuard armSubst(this,
+            dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get())
+                ? scrutTy : nullptr);
         if (arm.guard) {
             auto* guardBB =
                 llvm::BasicBlock::Create(llvm_, "case.guard", currentFn_);
@@ -11290,6 +11302,13 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             }
         }
         if (!recTy) return nullptr;
+        // fix #1254 / §19.3 / §14.1: for a concrete generic-record scrutinee
+        // (e.g. Wrapper<Item>), install the concrete type-param substitution
+        // (T→ptr for Item) so recordStruct returns the specialized layout and
+        // field GEPs use the correct concrete element types. Without this the
+        // unspecialized placeholder struct (T→i32) is used, which can mismatch
+        // the actual runtime struct layout for non-int type arguments.
+        RecordSubstGuard destrSubst(this, scrutTy);
         // Ensure the record struct (and fieldIndex_) is populated.
         llvm::StructType* recSt = recordStruct(recTy);
         // Collect positional (non-static) fields in declaration order.
