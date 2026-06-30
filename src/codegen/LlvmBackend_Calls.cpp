@@ -823,6 +823,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         sema::TypeRef* elemRef = nullptr;
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
+        // #1252 / §29.11: a bound lazy var consumed by a prior for-loop or
+        // terminal op holds null in its slot (the affine single-consumption null).
+        // Guard the materialize so a terminal op on an already-consumed lazy raises
+        // InvalidOperationException — matching the for-loop guard (#1226) — rather
+        // than calling bz_lazy_to_array(null) (a crash) or draining freed memory.
+        // ONLY for a genuine lazy receiver: LinkedList/Range/string/vtable sources
+        // are wrapped fresh by lowerToLazyEnumerator and are never the null slot.
+        if (lazyRecv) {
+            llvm::Value* termIsNull = builder_.CreateICmpEQ(
+                lazy, llvm::ConstantPointerNull::get(ptrTy()), "lz.term.isnull");
+            emitGuardThrow(termIsNull, "InvalidOperationException");
+        }
         // The materialized element byte size mirrors collectionElemSize: both
         // read the element TypeRef (genericArgs[0]). The lazy sentinel carries
         // it too, so collectionElemSize(recvTy) yields the same value the lazy
@@ -835,6 +847,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                    "linq.term.mat");
         lazyTempArr = recv;
         isArr = true;  // route through the concrete-array terminal lowerings
+        // #1252 / §29.11: a TERMINAL op (Count/Sum/First/…) on a BOUND lazy var
+        // drains and DISPOSES the lazy (bz_lazy_to_array), so the bound slot now
+        // holds a freed bz_lazy_t*. Null the slot — exactly as the for-loop does
+        // (#1226, LlvmBackend_Stmts) — so a subsequent for-loop or chained terminal
+        // sees null and raises InvalidOperationException via the null-guard instead
+        // of a use-after-free. ONLY for a genuine LAZY receiver: LinkedList / Range /
+        // string / vtable-IEnumerable materializers do NOT free their source, so
+        // their bound slots must stay valid for reuse. A fresh inline lazy
+        // (chained CallExpr, no owning slot) has no localSlot → no-op.
+        if (lazyRecv) {
+            if (llvm::AllocaInst* boundSlot = localSlot(*ma->target)) {
+                llvm::Type* ety = nullptr;
+                llvm::Value* addr = boxedStorage(boundSlot, ety);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+            }
+        }
     } else {
         recv = lowerExpr(*ma->target);
     }

@@ -258,3 +258,72 @@ BEZEL_TEST(linq_single_consumption_1226,
         "  return s; "
         "end Main; end C;"), true);
 }
+
+// ── #1252: a TERMINAL op consumes a bound lazy too (UAF → IOE) ─────────────
+
+// §29.11 / #1252: a terminal op (Count) consumes the bound lazy; a subsequent
+// for-loop must raise InvalidOperationException (the affine null-guard), not a
+// use-after-free of the exhausted bz_lazy.  n=Count=2, caught=1 → rc=201.
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_then_forin_raises_ioe_1252_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 1); "
+        "  var n := q.Count(); "
+        "  var caught := 0; "
+        "  try "
+        "    for var x in q do caught := caught + x; end; "
+        "  catch InvalidOperationException => "
+        "    caught := 1; "
+        "  end; "
+        "  return n * 100 + caught; "
+        "end Main; end C;"), 201);
+}
+
+// §29.11 / #1252: a SECOND terminal op on a consumed bound lazy also raises
+// InvalidOperationException (the terminal-materialize null-guard), not a
+// bz_lazy_to_array(null) crash.  n=2, r=1 → rc=201.
+BEZEL_TEST(linq_single_consumption_1226,
+           second_terminal_raises_ioe_1252_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 1); "
+        "  var n := q.Count(); "
+        "  var r := 0; "
+        "  try "
+        "    r := q.Sum(); "
+        "  catch InvalidOperationException => "
+        "    r := 1; "
+        "  end; "
+        "  return n * 100 + r; "
+        "end Main; end C;"), 201);
+}
+
+// §29.11 / #1252: a single terminal op on a bound lazy is correct (no spurious
+// throw) — Count over {2,3} of a.Where(x>1) = 2.
+BEZEL_TEST(linq_single_consumption_1226,
+           single_terminal_bound_lazy_correct_1252_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 1); "
+        "  return q.Count(); "
+        "end Main; end C;"), 2);
+}
+
+// §29.11 / #1252: a fresh inline lazy terminal (no bound slot) is unaffected by
+// the null-guard — Count = 2.
+BEZEL_TEST(linq_single_consumption_1226,
+           fresh_inline_terminal_unaffected_1252_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Where((x) => x > 1).Count(); "
+        "end Main; end C;"), 2);
+}
