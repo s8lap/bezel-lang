@@ -734,27 +734,35 @@ BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
 }
 
 // ===========================================================================
-// #1218 regression: bound lazy variable iterated twice must not double-free
-// §5 (lazy IEnumerable ownership): the for-loop does NOT own a bound lazy
-// variable; it only owns a fresh inline lazy.  A second for-loop over the
-// same bound variable after the first loop has consumed it must be a no-op
-// (value 0), not a SIGSEGV / ASan double-free.
+// #1218 / #1226 regression: bound lazy variable iterated twice.
+// §29.11 v0.156: a bound lazy LINQ query is single-consumption (affine).
+// The first for-loop consumes it (yields s1=6 for {2,4}).
+// A second for-loop over the same bound var must raise InvalidOperationException
+// (§29.11 — not silent-empty, not a SIGSEGV/double-free).
 // ===========================================================================
 
-// §5: bound lazy `var filtered := a.Where(…)` iterated twice.
-// First loop yields s1=6 (2+4); second loop sees a consumed (nulled) enumerator
-// → s2=0.  Combined return is s1*100 + s2 = 600.
-// Pre-fix this crashed with a UAF / SIGSEGV (double bz_lazy_dispose).
-BEZEL_TEST(linq_gaps_issue1218, bound_lazy_iterated_twice_no_double_free_spec_5) {
+// §29.11 / #1226: second for-loop over a consumed bound lazy raises IOE.
+// First loop: s1=6 (2+4, consumed).  Second loop: caught=1 (IOE raised).
+// Return s1*100+caught = 601.
+// Migrated from #1218 test (was: silent-empty s2=0, rc=600) —
+// the silent-empty was unsound; IOE is the correct behaviour per §29.11.
+// NOTE: the DA static error fires only in the full compiler (not JIT mode);
+// JIT mode sees the runtime guard (InvalidOperationException).
+BEZEL_TEST(linq_gaps_issue1218, bound_lazy_iterated_twice_raises_ioe_spec_29_11) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  var filtered := a.Where((x) => x mod 2 = 0); "
         "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
-        "  var s2 := 0; for var x in filtered do s2 := s2 + x; end; "
-        "  return s1 * 100 + s2; "
-        "end Main; end C;"), 600);
+        "  var caught := 0; "
+        "  try "
+        "    for var x in filtered do caught := caught + x; end; "
+        "  catch InvalidOperationException => "
+        "    caught := 1; "
+        "  end; "
+        "  return s1 * 100 + caught; "
+        "end Main; end C;"), 601);
 }
 
 // §5: fresh inline lazy `for x in a.Where(…)` — the loop is the sole owner,

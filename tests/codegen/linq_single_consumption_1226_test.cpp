@@ -1,0 +1,260 @@
+// #1226 / §29.11 v0.156: a bound lazy LINQ query is single-consumption
+// (affine).  The first for-loop (or terminal op) CONSUMES the lazy pipeline;
+// a second enumeration must be:
+//   (a) a COMPILE ERROR where statically detectable (DA pass, §29.11), or
+//   (b) a runtime InvalidOperationException (the slot is nulled after the
+//       first loop, detected by the null-guard in lowerLazyLinqFor).
+//
+// Previously (pre-#1226, post-#1218 fix) the second enumeration yielded
+// silently-empty — wrong value, no signal to the programmer.
+//
+// These tests verify:
+//   1. RUNTIME: second for-loop over consumed bound lazy → InvalidOperationException
+//   2. RUNTIME: first enumeration still yields the correct result (s1 = 6)
+//   3. RUNTIME: fresh inline lazy (`for x in a.Where(…)`) still works once
+//   4. RUNTIME: `var ys := a.Where(…).ToArray()` materialises → re-enumerable
+//   5. STATIC: DA detects sequential double-enumeration in full-compiler path
+//   6. STATIC: DA accepts single-enumeration (no false positive)
+//   7. STATIC: DA accepts if-branch conditional (no false positive)
+//   8. RUNTIME: multiple independent bound lazies, each enumerated once → OK
+//
+// Spec citations: §29.11, §5 stdlib lazy IEnumerable semantics.
+
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+// Run via JIT; return the int return value, or -999 on compile/JIT failure.
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Run the FULL sema pipeline (including checkDefiniteAssignment) and return
+// true iff at least one error diagnostic was reported.
+// The standard `runJit` helper skips DA; this function exercises the full
+// pipeline that the `bezelc` driver runs, so DA-based static errors are visible.
+bool rejectedByDA(const std::string& src) {
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(src, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return diags.hasErrors();
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    if (diags.hasErrors()) return true; // earlier sema errors
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    return diags.hasErrors();
+}
+
+// True iff at least one diagnostic message contains `needle`.
+bool daErrorContains(const std::string& src, const std::string& needle) {
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(src, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return false;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    for (const auto& d : diags.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+} // namespace
+
+// ── RUNTIME: second for-loop raises InvalidOperationException ──────────────
+
+// §29.11 / #1226: first loop consumes `filtered` (s1=6); second loop must
+// raise InvalidOperationException, not silently yield 0.
+// Verify via try/catch: caught=1 means the exception was thrown.
+// rc = s1*100 + caught = 601.
+BEZEL_TEST(linq_single_consumption_1226,
+           second_forin_raises_ioe_not_silent_empty_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
+        "  var caught := 0; "
+        "  try "
+        "    for var x in filtered do caught := caught + x; end; "
+        "  catch InvalidOperationException => "
+        "    caught := 1; "
+        "  end; "
+        "  return s1 * 100 + caught; "
+        "end Main; end C;"), 601);
+}
+
+// §29.11: the first enumeration must still yield the correct value (s=6).
+BEZEL_TEST(linq_single_consumption_1226,
+           first_enumeration_correct_value_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s := 0; for var x in filtered do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), 6);
+}
+
+// ── RUNTIME: fresh inline lazy still works ─────────────────────────────────
+
+// §29.11: a fresh inline lazy (not bound to a var) is never null — it can
+// be enumerated normally.  The null-guard does not fire.
+BEZEL_TEST(linq_single_consumption_1226,
+           fresh_inline_lazy_unaffected_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var s := 0; "
+        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), 6);
+}
+
+// ── RUNTIME: .ToArray() materialises → re-enumerable ──────────────────────
+
+// §29.11: `var ys := a.Where(…).ToArray()` produces an owned Array<int> that
+// is re-enumerable any number of times.  Both for-loops must yield s=6.
+BEZEL_TEST(linq_single_consumption_1226,
+           toarray_materializes_reenumerable_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  using var ys: Array<int> := a.Where((x) => x mod 2 = 0).ToArray(); "
+        "  var s1 := 0; for var x in ys do s1 := s1 + x; end; "
+        "  var s2 := 0; for var x in ys do s2 := s2 + x; end; "
+        "  return s1 * 100 + s2; "
+        "end Main; end C;"), 606);
+}
+
+// ── RUNTIME: two independent bound lazies, each enumerated once → OK ───────
+
+// §29.11: two distinct bound lazies may each be enumerated once without error.
+// f1 yields {2,4}→s1=6; f2 yields {1,3}→s2=4; rc=s1*10+s2=64.
+BEZEL_TEST(linq_single_consumption_1226,
+           two_independent_lazies_each_enumerated_once_spec_29_11) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var f1 := a.Where((x) => x mod 2 = 0); "
+        "  var f2 := a.Where((x) => x mod 2 = 1); "
+        "  var s1 := 0; for var x in f1 do s1 := s1 + x; end; "
+        "  var s2 := 0; for var x in f2 do s2 := s2 + x; end; "
+        "  return s1 * 10 + s2; "
+        "end Main; end C;"), 64);
+}
+
+// ── STATIC: DA detects sequential double-enumeration ──────────────────────
+
+// §29.11 / #1226: the DA pass (called by the full compiler, not JIT) must
+// emit a compile error when `filtered` is enumerated a second time in
+// straight-line code.
+BEZEL_TEST(linq_single_consumption_1226,
+           da_rejects_sequential_double_enumeration_spec_29_11) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
+        "  var s2 := 0; for var x in filtered do s2 := s2 + x; end; "
+        "  return s1 * 100 + s2; "
+        "end Main; end C;"), true);
+}
+
+// §29.11 / #1226: the error message should mention the variable name and §29.11.
+BEZEL_TEST(linq_single_consumption_1226,
+           da_error_cites_variable_name_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); "
+        "  var filtered := a.Where((x) => x > 0); "
+        "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
+        "  var s2 := 0; for var x in filtered do s2 := s2 + x; end; "
+        "  return s1 + s2; "
+        "end Main; end C;", "filtered"), true);
+}
+
+// ── STATIC: DA accepts single enumeration (no false positive) ─────────────
+
+// §29.11: a single enumeration of a bound lazy must NOT be rejected.
+BEZEL_TEST(linq_single_consumption_1226,
+           da_accepts_single_enumeration_spec_29_11) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s := 0; for var x in filtered do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), false);
+}
+
+// ── STATIC: DA is conservative for conditional enumerations ───────────────
+
+// §29.11: a lazy var enumerated only in one branch of an if (without else)
+// is NOT definitely consumed — the second for-loop is reachable and must NOT
+// be flagged as a compile error (the runtime guard handles dynamic cases).
+BEZEL_TEST(linq_single_consumption_1226,
+           da_conservative_for_conditional_enumeration_spec_29_11) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s1 := 0; "
+        "  if a.Length > 0 then "
+        "    for var x in filtered do s1 := s1 + x; end; "
+        "  end; "
+        "  var s2 := 0; "
+        "  for var x in filtered do s2 := s2 + x; end; "
+        "  return s1 + s2; "
+        "end Main; end C;"), false);
+}
+
+// ── STATIC: DA detects double consumption in both branches of if-else ──────
+
+// §29.11: if `filtered` is consumed in BOTH branches of an if-else, it is
+// definitely consumed after the if — a subsequent for-loop is a compile error.
+BEZEL_TEST(linq_single_consumption_1226,
+           da_rejects_both_branches_then_use_spec_29_11) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var s := 0; "
+        "  if a.Length > 2 then "
+        "    for var x in filtered do s := s + x; end; "
+        "  else "
+        "    for var x in filtered do s := s + x; end; "
+        "  end; "
+        "  for var x in filtered do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), true);
+}

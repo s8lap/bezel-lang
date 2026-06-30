@@ -4791,19 +4791,21 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     auto* condBB = llvm::BasicBlock::Create(llvm_, "lz.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "lz.body", currentFn_);
     auto* endBB  = llvm::BasicBlock::Create(llvm_, "lz.end",  currentFn_);
-    // #1218 / §5: contBB is the join point for both the null-guard short-circuit
-    // and the normal loop-exit/break path.  Code after the for-in continues here.
+    // contBB: join point for the normal loop-exit path (endBB → contBB).
+    // Code after the for-in continues here.
     auto* contBB = llvm::BasicBlock::Create(llvm_, "lz.cont", currentFn_);
 
-    // #1218 / §5: null-guard — a bound lazy variable (`var f := a.Where(…)`)
-    // has its slot nulled after each for-loop that consumes it (see endBB below).
-    // On a second iteration of the same bound variable the slot holds null; detect
-    // this here and skip the loop body entirely rather than deref-ing freed memory
-    // (which caused the UAF/SIGSEGV in issue #1218).
-    // A fresh inline lazy (iterable is a call expression) is never null here.
+    // #1226 / §29.11: a bound lazy LINQ var is single-consumption (affine).
+    // After the first for-loop the slot is nulled (see endBB).  On a second
+    // for-loop over the same bound variable the slot holds null; detect this
+    // and throw InvalidOperationException — a silent-empty second iteration
+    // (the prior #1218 behaviour) is unsound: it masks the programming error
+    // without a useful signal.  A fresh inline lazy (iterable is a call
+    // expression, not a named local) can never be null here.
     llvm::Value* lazyIsNull = builder_.CreateICmpEQ(
         lazy, llvm::ConstantPointerNull::get(ptrTy()), "lz.isnull");
-    builder_.CreateCondBr(lazyIsNull, contBB, condBB);
+    emitGuardThrow(lazyIsNull, "InvalidOperationException");
+    builder_.CreateBr(condBB);
 
     // cond: MoveNext (vtable slot 2) → i32 (1 = advanced).
     builder_.SetInsertPoint(condBB);

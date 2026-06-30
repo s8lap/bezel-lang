@@ -80,12 +80,28 @@ private:
     std::unordered_set<std::string_view> assigned_;
     // out-parameter names that must be assigned on every exit path (§22.3).
     std::unordered_set<std::string_view> outParams_;
+    // #1226 / §29.11: lazy LINQ bound vars that are definitely consumed at
+    // the current program point (consumed = enumerated by a for-in or a
+    // terminal op).  A second for-in over a definitely-consumed lazy var is
+    // a compile error.  Tracking uses intersection semantics at branch joins
+    // (parallel to assigned_): a var is "definitely consumed" only when it
+    // is consumed on every path reaching the current point.
+    std::unordered_set<std::string_view> consumedLazy_;
     // terminated_ = true when the current path ends unconditionally via
     // return/throw — used to suppress the fall-off out-param check on
     // unreachable tails (conservative: only set for top-level or all-
     // branch termination; partial-branch termination leaves it false so
     // the fall-off check runs on the live path).
     bool terminated_ = false;
+
+    // §29.11 / #1226: true when `e`'s resolved type is the lazy LINQ
+    // sentinel (Named TypeRef, no declaration, no astNode, no importedName,
+    // at least one genericArg).  Must match isLazyEnumerableType() in codegen.
+    bool isLazyEnumerableExprType(const ast::Expr& e) const {
+        const TypeRef* ty = ctx_.exprType(e);
+        return ty && ty->kind == TypeRef::Kind::Named && !ty->declaration &&
+               !ty->astNode && !ty->genericArgs.empty() && ty->importedName.empty();
+    }
 
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
@@ -157,8 +173,11 @@ private:
         if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
             // Each branch starts from the entry-assigned set; at join
             // the intersection becomes the new assigned set.
+            // consumedLazy_ uses the same intersection semantics (#1226/§29.11):
+            // a var is "definitely consumed" only when consumed on every path.
             if (ifs->ifBranch.condition) visitExpr(*ifs->ifBranch.condition);
             auto entry = assigned_;
+            auto consumedLazyEntry = consumedLazy_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             for (const auto& bs : ifs->ifBranch.body) {
@@ -166,29 +185,36 @@ private:
             }
             std::vector<std::unordered_set<std::string_view>> branchOuts;
             branchOuts.push_back(std::move(assigned_));
+            std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
+            consumedLazyOuts.push_back(std::move(consumedLazy_));
             std::vector<bool> branchTerminated;
             branchTerminated.push_back(terminated_);
             for (const auto& el : ifs->elifBranches) {
                 assigned_ = entry;
+                consumedLazy_ = consumedLazyEntry;
                 terminated_ = false;
                 if (el.condition) visitExpr(*el.condition);
                 for (const auto& bs : el.body) {
                     if (bs) visitStmt(*bs);
                 }
                 branchOuts.push_back(std::move(assigned_));
+                consumedLazyOuts.push_back(std::move(consumedLazy_));
                 branchTerminated.push_back(terminated_);
             }
             if (ifs->hasElse) {
                 assigned_ = entry;
+                consumedLazy_ = consumedLazyEntry;
                 terminated_ = false;
                 for (const auto& bs : ifs->elseBody) {
                     if (bs) visitStmt(*bs);
                 }
                 branchOuts.push_back(std::move(assigned_));
+                consumedLazyOuts.push_back(std::move(consumedLazy_));
                 branchTerminated.push_back(terminated_);
             } else {
-                branchOuts.push_back(entry);  // no-else fall-through
-                branchTerminated.push_back(false); // no-else = path live
+                branchOuts.push_back(entry);           // no-else fall-through
+                consumedLazyOuts.push_back(consumedLazyEntry); // no-else: no new consumption
+                branchTerminated.push_back(false);     // no-else = path live
             }
             // Intersect assigned sets.
             auto out = branchOuts.front();
@@ -200,6 +226,16 @@ private:
                 out = std::move(tmp);
             }
             assigned_ = std::move(out);
+            // Intersect consumedLazy_ sets (#1226).
+            auto consumedOut = consumedLazyOuts.front();
+            for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
+                std::unordered_set<std::string_view> tmp;
+                for (auto n : consumedOut) {
+                    if (consumedLazyOuts[i].count(n)) tmp.insert(n);
+                }
+                consumedOut = std::move(tmp);
+            }
+            consumedLazy_ = std::move(consumedOut);
             // Post-if path is terminated only if all branches terminated.
             bool allTerminated = true;
             for (bool t : branchTerminated) {
@@ -213,20 +249,52 @@ private:
             // Conservative: body may not execute (zero-trip), so any
             // assignments inside don't propagate to post-loop. Walk to
             // diagnose reads but restore the entry set afterwards.
+            // consumedLazy_ (#1226) is also restored: the loop may run 0
+            // times, so we cannot claim a lazy var inside the body is
+            // definitely consumed after the loop.
             auto entry = assigned_;
+            auto consumedLazyEntry = consumedLazy_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             for (const auto& bs : ws->body) {
                 if (bs) visitStmt(*bs);
             }
             assigned_ = std::move(entry);
+            consumedLazy_ = std::move(consumedLazyEntry);
             terminated_ = entryTerminated; // loop may not execute
             return;
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-            if (fs->iterable) visitExpr(*fs->iterable);
+            // #1226 / §29.11: check and mark lazy-enumerable iterable as
+            // consumed.  A second for-in over the same bound lazy local is
+            // a compile error (the runtime would raise InvalidOperationException
+            // — the static check surfaces it earlier with a better message).
+            if (fs->iterable) {
+                if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        fs->iterable.get())) {
+                    if (isLazyEnumerableExprType(*fs->iterable)) {
+                        if (consumedLazy_.count(id->name)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, id->span.begin,
+                                std::string("second enumeration of bound lazy "
+                                    "query `") + std::string(id->name) +
+                                "` — a lazy LINQ pipeline is single-consumption "
+                                "(§29.11); use `.ToArray()` to materialise it "
+                                "for multiple enumerations");
+                        } else {
+                            consumedLazy_.insert(id->name);
+                        }
+                    }
+                }
+                visitExpr(*fs->iterable);
+            }
             if (fs->withExpr) visitExpr(*fs->withExpr);
             auto entry = assigned_;
+            // Save consumedLazy_ AFTER marking the iterable (so the iterable
+            // mark persists after the loop) but BEFORE entering the body (so
+            // body-internal lazy consumptions are rolled back conservatively —
+            // a body that runs 0 times does not consume any inner lazy vars).
+            auto consumedLazyEntry = consumedLazy_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             if (!fs->varName.empty()) {
@@ -237,6 +305,7 @@ private:
                 if (bs) visitStmt(*bs);
             }
             assigned_ = std::move(entry);
+            consumedLazy_ = std::move(consumedLazyEntry); // body-marks removed
             terminated_ = entryTerminated; // loop may not execute
             return;
         }
@@ -250,6 +319,7 @@ private:
         }
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
             auto entry = assigned_;
+            auto consumedLazyEntry = consumedLazy_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             for (const auto& bs : ts->body) {
@@ -259,13 +329,17 @@ private:
             // the post-try set; catch arms each start from entry.
             std::vector<std::unordered_set<std::string_view>> outs;
             outs.push_back(std::move(assigned_));
+            std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
+            consumedLazyOuts.push_back(std::move(consumedLazy_));
             std::vector<bool> armTerminated;
             armTerminated.push_back(terminated_);
             for (const auto& arm : ts->catches) {
                 assigned_ = entry;
+                consumedLazy_ = consumedLazyEntry;
                 terminated_ = false;
                 if (arm.body) visitStmt(*arm.body);
                 outs.push_back(std::move(assigned_));
+                consumedLazyOuts.push_back(std::move(consumedLazy_));
                 armTerminated.push_back(terminated_);
             }
             auto post = outs.front();
@@ -277,6 +351,16 @@ private:
                 post = std::move(tmp);
             }
             assigned_ = std::move(post);
+            // Intersect consumedLazy_ sets (#1226).
+            auto consumedPost = consumedLazyOuts.front();
+            for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
+                std::unordered_set<std::string_view> tmp;
+                for (auto n : consumedPost) {
+                    if (consumedLazyOuts[i].count(n)) tmp.insert(n);
+                }
+                consumedPost = std::move(tmp);
+            }
+            consumedLazy_ = std::move(consumedPost);
             // Post-try path is terminated only if all arms terminated.
             bool allTerminated = true;
             for (bool t : armTerminated) {

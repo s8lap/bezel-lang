@@ -538,6 +538,7 @@ set(BEZEL_TEST_SOURCES
     codegen/linq_completeness_test.cpp
     codegen/linq_gaps_test.cpp
     codegen/linq_throw_469_test.cpp
+    codegen/linq_single_consumption_1226_test.cpp  # issue #1226: §29.11 single-consumption
     codegen/toarray_inference_test.cpp
     codegen/array_reverse_chain_466_test.cpp
     codegen/event_test.cpp
