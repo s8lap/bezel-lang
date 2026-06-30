@@ -9183,6 +9183,39 @@ void Emitter::unifyMethodReturnTypeArg(
             semaTy[nm] = concreteTy;
             added = true;
         }
+        // §12 / §14.2 / #1246: when `nm` is a BUILTIN GENERIC TYPE name (e.g.
+        // "OwnedArray", "Array", "LinkedList") and NOT a type-parameter name,
+        // the user-type branch below (both declaration=non-null) never fires for
+        // builtin collections (declaration=null). Without this block the function
+        // returns here and the generic args are discarded unseen, leaving T
+        // unbound. That causes the method body to execute as the i32-erased
+        // compiled template rather than the per-instantiation specialisation, so
+        // any virtual/interface call on a collection element (`x.V()` in
+        // `for var x in arr`) dispatches to the constraint-base stub (returning
+        // 0) instead of the most-derived override — a soundness bug (§12/§14).
+        //
+        // Fix: if the declared type is a builtin (no declaration) with generic
+        // args and the actual type has the SAME builtin name, recurse pairwise
+        // so that `OwnedArray<T>` vs `OwnedArray<B>` produces T=B. The binding
+        // then triggers the force-specialisation check at the call site (see
+        // ~line 12343) which inlines the method body under the concrete subst.
+        if (!isParam && !declRet->genericArgs.empty() &&
+            resultTy->kind == sema::TypeRef::Kind::Named &&
+            !resultTy->declaration &&
+            declRet->genericArgs.size() == resultTy->genericArgs.size()) {
+            std::string_view rn;
+            if (resultTy->astNode && resultTy->astNode->name &&
+                !resultTy->astNode->name->parts.empty())
+                rn = resultTy->astNode->name->parts[0];
+            else if (!resultTy->importedName.empty())
+                rn = resultTy->importedName;
+            if (!rn.empty() && rn == nm) {
+                for (std::size_t i = 0; i < declRet->genericArgs.size(); ++i)
+                    unifyMethodReturnTypeArg(declRet->genericArgs[i],
+                                             resultTy->genericArgs[i],
+                                             genericParams, subst, semaTy, added);
+            }
+        }
         return;
     }
     // A constructed generic return type (`Box<T>`) unifies against a
