@@ -3089,7 +3089,16 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     llvm::GlobalVariable* shared = vtableOf(ts);
     if (!shared || genericSubst_.empty()) return shared;
 
-    bool needsSpecDispose = classHasOwnedTypeParamField(ts);
+    // #1247 (§28.3/§28.4): a generic class whose user-defined destructor body
+    // references instantiation-dependent symbols (e.g. a static field of
+    // GBox<T>: `GBox<T>._m := GBox<T>._m - 1`) must also get a specialized
+    // disposer.  The shared type-erased disposer runs WITHOUT an active
+    // genericSubst_, so staticFieldGlobal() resolves the access to the
+    // TEMPLATE-LEVEL global (bz$GBox$_m) instead of the per-instantiation one
+    // (bz$GBox$int$_m).  Emitting a specialized disposer (with genericSubst_
+    // active) ensures the correct per-instantiation symbol is referenced.
+    bool needsSpecDispose = classHasOwnedTypeParamField(ts)
+                         || findDestructor(ts) != nullptr;
 
     // #1240 (§12/§14): detect when the concrete struct layout under the active
     // genericSubst_ differs from the template layout (built with T→i32 erasing).

@@ -583,6 +583,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_record_as_type_arg_847_test.cpp
     codegen/generic_concrete_return_817_test.cpp
     codegen/generic_owned_field_disposal_816_test.cpp
+    codegen/generic_dtor_static_field_1247_test.cpp
     codegen/primitive_equals_constraint_863_test.cpp
     codegen/case_nullable_record_destructure_887_test.cpp
     codegen/owned_llist_dispose_order_869_test.cpp
