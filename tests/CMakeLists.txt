@@ -912,7 +912,9 @@ set(BEZEL_TEST_SOURCES
     ownership/value_builtin_ownership_test.cpp
     ownership/use_after_dispose_warn_601_test.cpp
     ownership/channel_spawn_sink_692_693_test.cpp
-    ownership/nested_new_owned_arg_835_test.cpp)
+    ownership/nested_new_owned_arg_835_test.cpp
+    # --- fix #1029: null-coalescing owned-class disposal — both operand paths, no double-free (§28.3) ---
+    codegen/null_coalesce_owned_disposal_1029_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

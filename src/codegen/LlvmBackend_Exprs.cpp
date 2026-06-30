@@ -5988,6 +5988,24 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     auto* endBB = llvm::BasicBlock::Create(llvm_, "coalesce.end", currentFn_);
     llvm::Value* isNull = builder_.CreateICmpEQ(
         l, llvm::ConstantPointerNull::get(ptrTy()));
+    // #1029 / §28.3: when the RHS is a fresh owned-class producer (so the ?? result
+    // is owned by the binding variable), transfer ownership from the LHS slot to the
+    // result by nulling the LHS slot HERE (before the branch) so that the LHS's own
+    // null-guarded scope-end disposal is a no-op.  This prevents a double-dispose:
+    //   • Non-null path: l is already in a register; storing null to the LHS slot
+    //     does not affect l, but the LHS variable's disposal (if any) sees null and
+    //     skips — the binding's disposal runs instead (exactly once).
+    //   • Null path: the LHS slot was already null; the null-store is a no-op.
+    // Skipped for captured (cell-boxed) locals because their alloca is a cell-HOLDER
+    // pointer — nulling it would corrupt cell tracking; those cases remain a
+    // potential double-dispose until a separate owning-capture fix. // per §28.3
+    if (bin.right && isFreshOwnedClassProducer(bin.right.get())) {
+        if (llvm::AllocaInst* lhsSlot = localSlot(*bin.left)) {
+            if (!cellVars_.count(lhsSlot))
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), lhsSlot);
+        }
+    }
     builder_.CreateCondBr(isNull, rhsBB, endBB);
 
     builder_.SetInsertPoint(rhsBB);

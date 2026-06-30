@@ -1466,6 +1466,23 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                                      ast::TypeDeclKind::Interface) &&
                                 !rt->declaration->isValueBuiltin)
                                 return OwnershipState::Owned;
+        // #1029 / §28.3: built-in `??` (NullCoalescing) with an Owned-producing
+        // RHS. The caller owns whichever branch's value is taken: LHS non-null →
+        // ownership transfers from the LHS (codegen nulls the LHS slot); LHS null
+        // → freshly-allocated RHS. Only fires for a reference-type result (value-
+        // type `??` uses the nullable-struct path with no disposal obligation).
+        // A user-defined `operator ??` with `owned` return is already handled
+        // above (the sym/ms/od chain); we only reach here when there is no such
+        // operator symbol attached (the built-in). // per §28.3
+        if (be->op == "??" && be->right &&
+            producerState(*be->right) == OwnershipState::Owned) {
+            if (const sema::TypeRef* rt = ctx_.exprType(e))
+                if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+                    (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                     rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                    !rt->declaration->isValueBuiltin)
+                    return OwnershipState::Owned;
+        }
     }
     // Default: Borrowed.
     return OwnershipState::Borrowed;

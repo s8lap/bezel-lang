@@ -7450,7 +7450,7 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     // through registerUsingDisposal, and a local that is explicitly discharged is
     // NOT flagged autoDropAtScopeEnd, so the unwind-only registration added here
     // does not double with it (the `else if`/`else` in lowerLocalDecl is exclusive).
-    if (dynamic_cast<const ast::BinaryExpr*>(ld->initializer.get())) {
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(ld->initializer.get())) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
                 ctx_.exprSymbol(*ld->initializer))) {
             auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
@@ -7459,6 +7459,24 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                 (isClassOrInterfaceRef(initTy) ||
                  isClassOrInterfaceRef(resolveTypeParamRef(initTy)))) {
                 if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                    initTy->declaration &&
+                    initTy->declaration->kind == ast::TypeDeclKind::Class)
+                    return initTy->declaration;
+                return reinterpret_cast<const sema::TypeSymbol*>(1);
+            }
+        }
+        // #1029 / §28.3: built-in `??` (NullCoalescing) with a fresh owned-class
+        // RHS — mirrors the producerState counterpart in Ownership.cpp. Needed for
+        // the unwind-only disposal path (everDischarged > 0 → autoDropAtScopeEnd
+        // false → registerUnwindOwnedLocal called here). The disposal is dynamic
+        // (vtable) and null-guarded; the concrete class is returned when available
+        // so the disposerFns_ gate (emitDisposals) finds it; otherwise a sentinel
+        // triggers dynamic dispatch. // per §28.3
+        if (be->op == "??" && be->right &&
+            isFreshOwnedClassProducer(be->right.get())) {
+            const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+            if (isClassOrInterfaceRef(initTy)) {
+                if (initTy->kind == sema::TypeRef::Kind::Named &&
                     initTy->declaration &&
                     initTy->declaration->kind == ast::TypeDeclKind::Class)
                     return initTy->declaration;
@@ -11084,6 +11102,21 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                 if (od && od->returnOwned &&
                     (isClassOrInterfaceRef(initTy) ||
                      isClassOrInterfaceRef(resolveTypeParamRef(initTy))))
+                    return true;
+            }
+        }
+        // (b0c) #1029 / §28.3: built-in `??` (NullCoalescing) with a fresh
+        // owned-class RHS — mirrors producerState/unwindOwnedLocalClass. The
+        // BinaryExpr has no sema MethodSymbol (built-in `??`) so (b0b) missed it.
+        // Gated on isFreshOwnedClassProducer(RHS) so a borrow-RHS `??` (no owned
+        // result) never registers a disposal. // per §28.3
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(
+                ld->initializer.get())) {
+            if (be->op == "??" && be->right &&
+                isFreshOwnedClassProducer(be->right.get())) {
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (isClassOrInterfaceRef(initTy) ||
+                    isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
                     return true;
             }
         }
