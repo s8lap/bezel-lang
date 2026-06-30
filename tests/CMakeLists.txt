@@ -719,6 +719,7 @@ set(BEZEL_TEST_SOURCES
     codegen/virtual_generic_override_580_test.cpp
     codegen/generic_iface_ref_return_1143_test.cpp
     codegen/generic_iface_non_t_method_layout_1240_test.cpp
+    codegen/generic_ctor_throw_1239_test.cpp               # fix #1239: generic ctor throw emits well-formed IR (§14/§31)
     codegen/indexer_incdec_587_test.cpp
     codegen/catch_expr_body_588_test.cpp
     codegen/console_write_unicode_592_test.cpp

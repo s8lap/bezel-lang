@@ -5681,7 +5681,24 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     // already ran them, §22.8 step 1).
     if (!isThis)
         emitOwnFieldInit(cs->parent, obj, classStruct(cs->parent));
-    lowerScopedBlock(cd->body, startIdx);
+    bool bodyTerminated = lowerScopedBlock(cd->body, startIdx);
+    // fix #1239 / §14/§31: if the inlined constructor body diverged — e.g.
+    // because it ends with an unconditional `throw` — the current basic block
+    // already has a terminator (the `br` to ctor.inline.cleanup).  The
+    // non-generic standalone path (emitConstructorBody) handles divergence by
+    // omitting the trailing RetVoid; but here the body is inlined INTO the
+    // caller's function, so after we return the caller continues emitting
+    // instructions into whatever block the builder points at.  If that block
+    // already has a terminator, those instructions land AFTER the terminator
+    // and produce "Terminator found in the middle of a basic block" (IR_FAIL).
+    // Fix: when the body terminated the current block, move the builder to a
+    // fresh dead block so the caller's continuation code stays IR-valid
+    // (unreachable but well-formed — LLVM's DCE will prune it).
+    if (bodyTerminated) {
+        auto* deadBB = llvm::BasicBlock::Create(
+            llvm_, "ctor.inline.unreachable", currentFn_);
+        builder_.SetInsertPoint(deadBB);
+    }
 }
 
 
