@@ -4610,6 +4610,17 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     gvIt->second->getValueType());
                 if (cl && !cl->isDict && !cl->elements.empty() && arrTy) {
                     llvm::Type* elemTy = arrTy->getElementType();
+                    // §22.13 (#1212): detect [N owned]T fields so each stored
+                    // slot can be registered for atexit disposal below.
+                    const sema::TypeRef* ft =
+                        fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+                    bool isOwnedInlineArr =
+                        ft && ft->kind == sema::TypeRef::Kind::InlineArray &&
+                        ft->arrayOwned;
+                    llvm::Function* regFn = nullptr;
+                    if (isOwnedInlineArr)
+                        regFn = declareC("bz_register_static_owned",
+                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
                     for (std::size_t i = 0; i < cl->elements.size(); ++i) {
                         if (!cl->elements[i]) continue;
                         llvm::Value* ev = lowerExpr(*cl->elements[i]);
@@ -4628,6 +4639,11 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                              builder_.getInt32(static_cast<unsigned>(i))});
                         builder_.CreateStore(coerceToNullableSlot(elemTy, ev),
                                              gep);
+                        // §22.13 (#1212): register each owned slot for atexit
+                        // disposal (reverse init order). Only class-typed slots
+                        // have a vtable and a bz_register_static_owned call.
+                        if (regFn && ev->getType()->isPointerTy())
+                            builder_.CreateCall(regFn, {ev});
                     }
                     continue;  // inline-array literal stored element-wise
                 }
@@ -4635,6 +4651,18 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             if (!val) val = lowerExpr(*initExpr);
             if (!val) continue;
             builder_.CreateStore(val, gvIt->second);
+            // §22.13 (#1212): a static OWNED class/interface field is disposed
+            // at program exit in reverse init order (bz_dispose_static_owned,
+            // installed via atexit on first registration).  Register the value
+            // right after the store so the atexit handler holds a fully-
+            // initialized pointer.  Only owned class/interface fields have a
+            // vtable Dispose; collections, Shared/Weak, and Subscription fields
+            // have separate runtime free paths and are excluded by the predicate.
+            if (isOwnedReferenceField(fs) || isOwnedBuiltinExceptionField(fs)) {
+                auto* regFn = declareC("bz_register_static_owned",
+                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(regFn, {val});
+            }
             // fix #709 / §22.12: also store into every per-instantiation global
             // for this field that was created lazily by staticFieldGlobal().
             // Per-instantiation globals are created on FIRST ACCESS (method body

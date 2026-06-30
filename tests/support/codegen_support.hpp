@@ -28,6 +28,13 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
+// §22.13 / #1212: flush any static owned objects registered by this JIT run
+// while the LLJIT is still alive.  Defined in bezel_runtime.cpp; linked into
+// the test binary via DynamicLibrarySearchGenerator (the JIT resolves it from
+// the host process).  Without calling this, the process-exit atexit handler
+// runs after the LLJIT is destroyed and vtable pointers are dangling.
+extern "C" void bz_flush_static_owned(void);
+
 namespace bezel::test {
 
 struct JitResult {
@@ -100,6 +107,11 @@ inline JitResult runJitWithOptions(std::string_view source,
     }
     auto fn = sym->toPtr<int (*)()>();
     r.exitCode = fn();
+    // §22.13 / #1212: dispose any static owned fields registered during this
+    // JIT run while the LLJIT is still alive (vtable pointers valid).  The
+    // atexit handler installed by bz_register_static_owned would otherwise
+    // fire after the LLJIT is destroyed → dangling vtable → SIGSEGV.
+    bz_flush_static_owned();
     r.ran = true;
     return r;
 }

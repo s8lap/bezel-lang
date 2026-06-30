@@ -5602,6 +5602,73 @@ extern "C" void bz_set_collect_enumerator(void* lazy, int64_t esz,
 }
 
 // ---------------------------------------------------------------------------
+// §22.13 / #1212: static owned class/interface fields are disposed at program
+// exit in REVERSE initialization order (last-init first-disposed).
+//
+// bz_register_static_owned(obj) is called at the point each static owned
+// field is first written (inside the synthesized sfinit / user cctor body).
+// An atexit handler installed on first registration iterates the list in
+// reverse, dispatches each object's idempotent vtable Dispose (slot 2,
+// CG35-itable, same slot as for `using var` / owned-field auto-dispose), then
+// frees the block. The vtable Dispose is the SAME call path as normal owned-
+// field disposal; calling free() afterward is the companion to emitDisposeAndReclaim.
+//
+// Double-free safety: a static owned field is the sole ownership root of its
+// object — no other site auto-disposes it (it is not a local `using var`, not
+// an instance field of some other owner). The vtable Dispose is idempotent
+// (§28.6 run-once flag inside), so an explicit earlier `.Dispose()` call just
+// marks it done — the atexit free still reclaims the block exactly once.
+//
+// Static owning-inline-array slots ([N owned]T fields): each slot that was
+// written at static init is registered individually; they appear in the list
+// in slot order and are disposed in reverse slot-registration order.
+// ---------------------------------------------------------------------------
+
+struct bz_static_owned_entry_t {
+    void* obj;  // static owned class/interface instance pointer
+};
+
+static std::vector<bz_static_owned_entry_t>* g_static_owned = nullptr;
+
+static void bz_dispose_static_owned(void) {
+    if (!g_static_owned) return;
+    // Reverse init order (§22.13): last-initialized is first-disposed.
+    for (int i = (int)g_static_owned->size() - 1; i >= 0; --i) {
+        void* obj = (*g_static_owned)[i].obj;
+        if (!obj) continue;
+        // vtable layout (CG35-itable): [0]=td$, [1]=itmap$, [2]=Dispose.
+        // Dispose is idempotent — a prior explicit .Dispose() is a no-op here.
+        void** vtable = *(void***)obj;
+        if (vtable && vtable[2]) {
+            typedef void (*dispose_fn_t)(void*);
+            ((dispose_fn_t)vtable[2])(obj);
+        }
+        free(obj);
+    }
+    delete g_static_owned;
+    g_static_owned = nullptr;
+}
+
+extern "C" void bz_register_static_owned(void* obj) {
+    if (!obj) return;
+    if (!g_static_owned) {
+        g_static_owned = new std::vector<bz_static_owned_entry_t>();
+        atexit(bz_dispose_static_owned);
+    }
+    g_static_owned->push_back({obj});
+}
+
+// Called by the in-process JIT test harness immediately after the JIT
+// main() returns (while the LLJIT is still alive and vtable pointers are
+// valid).  Disposes everything registered in this JIT run and clears the
+// list so the process-exit atexit handler is a no-op.  Without this,
+// atexit runs after the LLJIT is destroyed and vtable[2] is a dangling
+// pointer → SIGSEGV.
+extern "C" void bz_flush_static_owned(void) {
+    bz_dispose_static_owned();
+}
+
+// ---------------------------------------------------------------------------
 // Events (language spec §24). An EventSource holds an ordered handler list.
 // Each handler is a Bezel closure value (a { fn_ptr, env_ptr } struct pointer).
 // Raise is lowered in codegen; the runtime only stores/produces the list.
