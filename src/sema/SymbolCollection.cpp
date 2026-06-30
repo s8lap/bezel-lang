@@ -436,25 +436,24 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
     return true;
 }
 
-// §9.2/§8.4: a record outside the auto-equality-bearing set may still carry
-// valid equality if the author hand-wrote it. Per §9.2 "Authors who want
-// explicit equality on a record outside the auto-equality-bearing set declare
-// `=` and `<>` overloads in the body, along with `Equals(Object?)`,
-// `Equals(T)`, and `GetHashCode` overrides as needed." Detect any such member:
-// an `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`
-// method. The presence of any one of these means `=`/`<>`/`.Equals`/
-// `.GetHashCode` dispatch to the user's code, so the §9.2 non-auto-equality
-// compile error must NOT fire.
+// §9.2 (v0.156)/§8.4: returns true only when the record has declared an
+// explicit `operator =` or `operator <>` overload.  Per §9.2 v0.156 the
+// complete form is: "Authors who want explicit equality on a record outside the
+// auto-equality-bearing set declare `=` and `<>` overloads in the body, along
+// with `Equals(Object?)`, `Equals(T)`, and `GetHashCode` overrides as needed."
+// Only the operator overloads bypass the §9.2 compile error on `=`/`<>`: a
+// record that declares `override Equals`/`override GetHashCode` WITHOUT the
+// operators is NOT auto-equality-bearing (those overrides are themselves
+// disqualifiers per isAutoEqualityBearingBodyRecord above), and `=`/`<>` on
+// it remains a compile error (#1249).  The `.Equals`/`.GetHashCode` call path
+// is separately gated: lookupMember finds the user method and dispatches
+// directly, so that path does not reach this function.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
     if (!rec) return false;
     for (const Symbol* m : rec->members) {
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
-            if (meth->isOperator) {
-                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
-                    return true;
-                continue;
-            }
-            if (meth->name == "Equals" || meth->name == "GetHashCode")
+            if (meth->isOperator &&
+                (meth->operatorToken == "=" || meth->operatorToken == "<>"))
                 return true;
         }
     }

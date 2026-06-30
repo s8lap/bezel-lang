@@ -2027,16 +2027,16 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return;
         }
     }
-    // §9.2/§8.3: `=` / `<>` on a body record that is not auto-equality-bearing
-    // and that declares no equality of its own is a compile error at the use
-    // site. "A body record is **not** auto-equality-bearing — and `=` on it
-    // without an explicit overload is a compile error — when it contains [an
-    // explicit field, a side-effecting computed property, or a non-trivial
-    // constructor body]." A user `=`/`<>` overload would already have been
-    // selected by findBinaryOperator above (so we never reach here for those);
-    // a record carrying a hand-written `Equals`/`GetHashCode` (but no operator)
-    // is likewise excluded via recordHasUserDeclaredEquality. Positional
-    // records, enums, and eligible body records are unaffected.
+    // §9.2 (v0.156)/§8.3: `=` / `<>` on a body record that is not auto-equality-
+    // bearing and that declares no explicit operator is a compile error at the
+    // use site.  Disqualifiers include an explicit field, a side-effecting
+    // computed property, a non-trivial constructor body, and — per §9.2 v0.156
+    // — an `override` of `Equals`, `GetHashCode`, or `ToString`.  A user
+    // `=`/`<>` overload would already have been selected by findBinaryOperator
+    // above (so we never reach here for those); recordHasUserDeclaredEquality
+    // only returns true for operator overloads now (not bare Equals/GetHashCode
+    // — see #1249).  Positional records, enums, and eligible body records are
+    // unaffected.
     if (op == "=" || op == "<>") {
         for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
             TypeSymbol* ts = memberTargetType(operand);

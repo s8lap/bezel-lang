@@ -253,3 +253,100 @@ BEZEL_TEST(sema_record_equality, trivial_ctor_eq_accepted_770) {
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ─── #1249: §9.2 v0.156 — override Equals/GetHashCode disqualifies ──────────
+
+// §9.2 v0.156 / #1249: a body record that declares `override Equals`
+// (with its required companion `override GetHashCode`) WITHOUT `operator =`/`<>`
+// is NOT auto-equality-bearing — `=` is a compile error.
+BEZEL_TEST(sema_record_equality, override_equals_gethashcode_eq_diagnosed_1249) {
+    auto r = parseSema(
+        "module M; "
+        "record R "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public override method Equals(other: Object?): bool => true; "
+        "  public override method GetHashCode(): int => 0; "
+        "end R; "
+        "class C public method M() "
+        "  var a := new R(1); var b := new R(9); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.2 v0.156 / #1249: a body record with `override Equals` alone (without
+// `operator =`/`<>`) is not auto-equality-bearing — `=` is a compile error.
+// (The §8.3 eq+hash pairing error is also expected, but the §9.2 `=` reject
+// is the load-bearing assertion here.)
+BEZEL_TEST(sema_record_equality, override_equals_only_eq_diagnosed_1249) {
+    auto r = parseSema(
+        "module M; "
+        "record R "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public override method Equals(other: Object?): bool => true; "
+        "end R; "
+        "class C public method M() "
+        "  var a := new R(1); var b := new R(9); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.2 v0.156 / #1249: a body record with `override GetHashCode` alone
+// (without `operator =`/`<>`) is not auto-equality-bearing — `=` is a
+// compile error.
+BEZEL_TEST(sema_record_equality, override_gethashcode_only_eq_diagnosed_1249) {
+    auto r = parseSema(
+        "module M; "
+        "record R "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public override method GetHashCode(): int => 0; "
+        "end R; "
+        "class C public method M() "
+        "  var a := new R(1); var b := new R(9); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.2 v0.156 / #1249: a body record with BOTH `override Equals`/`GetHashCode`
+// AND explicit `operator =`/`<>` is valid — the author opted in (§9.2 "Authors
+// who want explicit equality … declare `=` and `<>`").  `=` compiles.
+BEZEL_TEST(sema_record_equality, override_equals_plus_operator_eq_accepted_1249) {
+    auto r = parseSema(
+        "module M; "
+        "record R "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public override method Equals(other: Object?): bool => true; "
+        "  public override method GetHashCode(): int => 0; "
+        "  public static method operator =(a: R, b: R): bool => a.V = b.V; "
+        "  public static method operator <>(a: R, b: R): bool => a.V <> b.V; "
+        "end R; "
+        "class C public method M() "
+        "  var a := new R(1); var b := new R(9); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.2 v0.156 / #1249 regression: a plain auto-equality body record (only
+// auto-properties and a trivial constructor) still gets auto-equality — `=`
+// must NOT be rejected.
+BEZEL_TEST(sema_record_equality, plain_auto_eq_unaffected_1249) {
+    auto r = parseSema(
+        "module M; "
+        "record Pt "
+        "  public property X: int; "
+        "  public property Y: int; "
+        "  public constructor(x: int, y: int) X := x; Y := y; end constructor; "
+        "end Pt; "
+        "class C public method M() "
+        "  var a := new Pt(1, 2); var b := new Pt(1, 2); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
