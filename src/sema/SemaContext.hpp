@@ -470,7 +470,21 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         PrimitiveType retPrim;
         std::vector<const char*> paramNames;  // each parameter has type `T`
     };
+    // PropSpec: a named property or read-only indexer on a builtin interface.
+    // retPrim == PrimitiveType::None means generic T return (indexer); the
+    // pre-resolution step is skipped and lowerIndexerGet recovers the concrete
+    // element type from the receiver's genericArgs at use time.
+    // propName == nullptr signals the indexer form; indexParamName is the index
+    // parameter name (type fixed to `int`).
+    struct PropSpec {
+        const char* propName;       // null for the indexer form
+        const char* retName;        // "int", "bool", or "T" for indexer
+        PrimitiveType retPrim;      // PrimitiveType::None for generic T
+        bool isIndexer;
+        const char* indexParamName; // "i" for the indexer; nullptr otherwise
+    };
     std::vector<MethodSpec> methods;
+    std::vector<PropSpec>   props;
     const char* ifaceName = nullptr;
     if (name == "IComparable") {
         ifaceName = "IComparable";
@@ -482,6 +496,20 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         ifaceName = "IEqualityComparer";
         methods = {{"Equals", "bool", PrimitiveType::Bool, {"a", "b"}},
                    {"GetHashCode", "int", PrimitiveType::Int, {"value"}}};
+    } else if (name == "IReadOnlySpan") {
+        // §4.16 (#970): read-only span interface. Methods use generic T params
+        // (erased to i32 in the itable ABI); the span box thunk ABI and the
+        // needsConcrete fix in lowerCallOnInterface reconcile the i32↔ptr
+        // mismatch for non-int element types at dispatch time. SequenceEqual
+        // uses T as well — the caller always passes a boxed IReadOnlySpan<T>
+        // (ptr), which needsConcrete adjusts from the declared i32 width.
+        ifaceName = "IReadOnlySpan";
+        methods = {{"IndexOf",       "int",  PrimitiveType::Int,  {"item"}},
+                   {"Contains",      "bool", PrimitiveType::Bool, {"item"}},
+                   {"SequenceEqual", "bool", PrimitiveType::Bool, {"other"}}};
+        props   = {{"Length",  "int",  PrimitiveType::Int,  /*isIndexer=*/false, nullptr},
+                   {"IsEmpty", "bool", PrimitiveType::Bool, /*isIndexer=*/false, nullptr},
+                   {nullptr,   "T",    PrimitiveType::None, /*isIndexer=*/true,  "i"}};
     } else {
         return nullptr;
     }
@@ -533,6 +561,44 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         raws.push_back(std::move(rm));
         typeDecl->members.push_back(std::move(methodDecl));
     }
+    // Build one PropertyDecl per PropSpec (following the MethodDecls so the
+    // member order matches the itable ordering: methods first, properties after).
+    struct RawProp {
+        ast::PropertyDecl* pd;
+        ast::Type* ret;        // return-type node to pre-resolve (null = generic T)
+        ast::Type* indexParam; // non-null for indexer: the `i: int` param type
+    };
+    std::vector<RawProp> rawProps;
+    for (const auto& pspec : props) {
+        auto propDecl = std::make_unique<ast::PropertyDecl>();
+        propDecl->visibility = ast::Visibility::Public;
+        if (pspec.propName) propDecl->name = pspec.propName;
+        propDecl->bodyKind = ast::PropertyBodyKind::Auto; // placeholder; interface has no body
+        propDecl->modifiers.push_back("readonly"); // per §4.16: all IReadOnlySpan props are read-only
+        auto retType = std::make_unique<ast::Type>();
+        retType->kind = ast::TypeKind::Named;
+        retType->name = std::make_unique<ast::QualifiedName>();
+        retType->name->parts.push_back(pspec.retName);  // "int"/"bool"/"T"
+        propDecl->type = std::move(retType);
+        propDecl->isIndexer = pspec.isIndexer;
+        RawProp rp;
+        rp.ret = propDecl->type.get();
+        rp.indexParam = nullptr;
+        if (pspec.isIndexer && pspec.indexParamName) {
+            ast::Param idxPar;
+            idxPar.name = pspec.indexParamName;
+            auto idxTy = std::make_unique<ast::Type>();
+            idxTy->kind = ast::TypeKind::Named;
+            idxTy->name = std::make_unique<ast::QualifiedName>();
+            idxTy->name->parts.push_back("int");
+            rp.indexParam = idxTy.get();
+            idxPar.type = std::move(idxTy);
+            propDecl->indexerParams.push_back(std::move(idxPar));
+        }
+        rp.pd = propDecl.get();
+        rawProps.push_back(rp);
+        typeDecl->members.push_back(std::move(propDecl));
+    }
     ast::TypeDecl* tdRaw = typeDecl.get();
     builtinInterfaceAst_.push_back(std::move(typeDecl));
 
@@ -565,6 +631,33 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         // lowerType(returnType) yields i32/i1, matching the implementing class's
         // method signature (else the itable fnTy disagrees — risk #3).
         setResolvedType(rm.ret, primitiveTypeRef(spec.retPrim, false));
+    }
+    // Build one PropertySymbol per PropSpec. These land in ts->members after the
+    // MethodSymbols so the itable ordering (methods, then properties) matches
+    // declareVtables Pass 0 which walks members in the same order.
+    for (std::size_t j = 0; j < props.size(); ++j) {
+        const PropSpec& pspec = props[j];
+        const RawProp&  rp    = rawProps[j];
+        auto* ps = makeSymbol<PropertySymbol>();
+        ps->name = pspec.propName ? std::string_view(pspec.propName)
+                                  : std::string_view();
+        ps->visibility = ast::Visibility::Public;
+        ps->parent = ts;
+        ps->decl   = rp.pd;
+        ps->isIndexer = pspec.isIndexer;
+        if (pspec.isIndexer && pspec.indexParamName && rp.indexParam) {
+            auto* ip = makeSymbol<ParameterSymbol>();
+            ip->name = pspec.indexParamName;
+            ip->declType = rp.indexParam;
+            ps->indexerParams.push_back(ip);
+        }
+        ts->members.push_back(ps);
+        // Pre-resolve non-generic property return types to their concrete LLVM
+        // type. PrimitiveType::None signals generic T (indexer); that stays
+        // unresolved so lowerIndexerGet can recover the concrete element type
+        // from the receiver's genericArgs[0] at each use site.
+        if (pspec.retPrim != PrimitiveType::None)
+            setResolvedType(rp.ret, primitiveTypeRef(pspec.retPrim, false));
     }
 
     builtinInterfaceCache_[key] = ts;

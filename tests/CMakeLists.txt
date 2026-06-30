@@ -858,6 +858,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #678: lambda void return type — inferred-param/untyped-var void body ---
     codegen/lambda_void_return_678_test.cpp
     # --- end #678 ---
+    # --- fix #970: IReadOnlySpan<T> interface for span types (§4.16/§8.6) ---
+    codegen/ireadonlyspan_970_test.cpp
+    # --- end #970 ---
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

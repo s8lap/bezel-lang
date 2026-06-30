@@ -14488,6 +14488,298 @@ llvm::Value* Emitter::vtableTablePtr() {
 }
 
 
+// §4.16 / §8.6 (#970): synthesize (or return cached) the box vtable for a span
+// boxed into IReadOnlySpan<T>. `elemTy` is the concrete LLVM element type
+// (i32 for int, ptr for string/class, i64 for long, etc.).
+//
+// Box layout (inherited from §8.6 record boxing):
+//   { vtable*, i64 rc, bz.arrayspan{ptr,i32,i32} }
+//   GEP(box, 2) → bz.arrayspan slot.
+//
+// Itable slot order (must match declareVtables Pass 0 for IReadOnlySpan):
+//   [0] IndexOf       (ptr box, elemTy item) → i32
+//   [1] Contains      (ptr box, elemTy item) → i1
+//   [2] SequenceEqual (ptr box, ptr other)   → i1
+//   [3] Length getter (ptr box) → i32
+//   [4] IsEmpty getter (ptr box) → i1
+//   [5] Indexer getter (ptr box, i32 i) → elemTy
+//
+// Each thunk loads the bz.arrayspan from `box+16`, extracts src/start/len.
+// `src` is a bz_array_t* (NOT a raw element pointer). For element access,
+// load src->data (the first field of bz_array_t, at offset 0) to get the
+// raw element buffer, then GEP into that buffer. Length/IsEmpty use `len`
+// directly from the span struct (pre-computed by AsReadOnlySpan/AsSpan).
+llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy) {
+    auto cached = spanBoxVtables_.find(elemTy);
+    if (cached != spanBoxVtables_.end()) return cached->second;
+
+    // Locate the IReadOnlySpan TypeSymbol and its descriptor.
+    sema::TypeSymbol* irsSym = ctx_.builtinInterfaceSym("IReadOnlySpan");
+    auto descIt = irsSym ? descArray_.find(irsSym) : descArray_.end();
+    if (!irsSym || descIt == descArray_.end()) {
+        spanBoxVtables_[elemTy] = nullptr;
+        return nullptr;
+    }
+    llvm::GlobalVariable* irsDesc = descIt->second;
+
+    auto* spanSt = arraySpanStructType();  // {ptr, i32, i32}
+
+    // Helper: build a standalone function body. Receives a builder already
+    // positioned at the entry BB. Returns {src, start, len} from box arg 0.
+    // `tb` is the builder; `boxArg` is the first arg (the box ptr).
+    auto loadSpan = [&](llvm::IRBuilder<>& tb,
+                        llvm::Value* boxArg) -> std::tuple<llvm::Value*,
+                                                           llvm::Value*,
+                                                           llvm::Value*> {
+        // GEP past vtable*/rc to the span struct slot (offset = 2 pointers = 16B).
+        llvm::Value* spanPtr = tb.CreateGEP(
+            ptrTy(), boxArg, {llvm::ConstantInt::get(i32(), 2)}, "span.ptr");
+        llvm::Value* spanVal = tb.CreateLoad(spanSt, spanPtr, "span");
+        llvm::Value* src   = tb.CreateExtractValue(spanVal, {0u}, "src");
+        llvm::Value* start = tb.CreateExtractValue(spanVal, {1u}, "start");
+        llvm::Value* len   = tb.CreateExtractValue(spanVal, {2u}, "len");
+        return {src, start, len};
+    };
+
+    // Helper: build an element-comparison predicate. For pointer elements
+    // (class/interface/string) compare as pointers; for integers compare as
+    // integers. Returns an i1.
+    auto elemEq = [&](llvm::IRBuilder<>& tb,
+                      llvm::Value* a, llvm::Value* b) -> llvm::Value* {
+        if (elemTy->isPointerTy())
+            return tb.CreateICmpEQ(a, b, "eq");
+        return tb.CreateICmpEQ(a, b, "eq");
+    };
+
+    // --- [0] IndexOf(ptr box, elemTy item) → i32 ---
+    // Linear scan: return k where src[start+k] == item, else -1.
+    // src is bz_array_t*; its first field (offset 0) is the data pointer
+    // (void* data = the raw element buffer). Load it once at entry.
+    llvm::Function* indexOfFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy}, false);
+        indexOfFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                           "bzspan$IndexOf", module_.get());
+        auto ai = indexOfFn->arg_begin();
+        llvm::Value* boxArg  = &*ai++;
+        llvm::Value* itemArg = &*ai;
+
+        auto* entryBB   = llvm::BasicBlock::Create(llvm_, "entry",   indexOfFn);
+        auto* loopBB    = llvm::BasicBlock::Create(llvm_, "loop",    indexOfFn);
+        auto* bodyBB    = llvm::BasicBlock::Create(llvm_, "body",    indexOfFn);
+        auto* contBB    = llvm::BasicBlock::Create(llvm_, "cont",    indexOfFn);
+        auto* foundBB   = llvm::BasicBlock::Create(llvm_, "found",   indexOfFn);
+        auto* notFndBB  = llvm::BasicBlock::Create(llvm_, "notfnd",  indexOfFn);
+
+        llvm::IRBuilder<> tb(entryBB);
+        auto [src, start, len] = loadSpan(tb, boxArg);
+        // src = bz_array_t*; data = src->data (element buffer, offset 0).
+        llvm::Value* data = tb.CreateLoad(ptrTy(), src, "data");
+        tb.CreateBr(loopBB);
+
+        tb.SetInsertPoint(loopBB);
+        auto* kPhi = tb.CreatePHI(i32(), 2, "k");
+        kPhi->addIncoming(tb.getInt32(0), entryBB);
+        llvm::Value* inRange = tb.CreateICmpULT(kPhi, len, "inrange");
+        tb.CreateCondBr(inRange, bodyBB, notFndBB);
+
+        tb.SetInsertPoint(bodyBB);
+        llvm::Value* offset = tb.CreateAdd(start, kPhi, "off");
+        llvm::Value* ptr    = tb.CreateGEP(elemTy, data, {offset}, "ep");
+        llvm::Value* val    = tb.CreateLoad(elemTy, ptr, "v");
+        llvm::Value* match  = elemEq(tb, val, itemArg);
+        tb.CreateCondBr(match, foundBB, contBB);
+
+        tb.SetInsertPoint(contBB);
+        llvm::Value* k1 = tb.CreateAdd(kPhi, tb.getInt32(1), "k1");
+        kPhi->addIncoming(k1, contBB);
+        tb.CreateBr(loopBB);
+
+        tb.SetInsertPoint(foundBB);
+        tb.CreateRet(kPhi);
+
+        tb.SetInsertPoint(notFndBB);
+        tb.CreateRet(llvm::ConstantInt::get(i32(), -1));
+    }
+
+    // --- [1] Contains(ptr box, elemTy item) → i1 ---
+    llvm::Function* containsFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), elemTy}, false);
+        containsFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                            "bzspan$Contains", module_.get());
+        auto ai = containsFn->arg_begin();
+        llvm::Value* boxArg  = &*ai++;
+        llvm::Value* itemArg = &*ai;
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", containsFn);
+        llvm::IRBuilder<> tb(bb);
+        // call IndexOf: result != -1
+        auto* ioFnTy = indexOfFn->getFunctionType();
+        llvm::Value* idx = tb.CreateCall(ioFnTy, indexOfFn, {boxArg, itemArg},
+                                         "idx");
+        llvm::Value* found = tb.CreateICmpNE(idx,
+            llvm::ConstantInt::get(i32(), -1), "found");
+        tb.CreateRet(found);
+    }
+
+    // --- [2] SequenceEqual(ptr box, ptr other_box) → i1 ---
+    // Caller passes `other` as a ptr (IReadOnlySpan<T> box); needsConcrete
+    // reconciles the i32-erased itable signature at dispatch time.
+    llvm::Function* seqEqFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+        seqEqFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                         "bzspan$SequenceEqual", module_.get());
+        auto ai = seqEqFn->arg_begin();
+        llvm::Value* selfBox  = &*ai++;
+        llvm::Value* otherBox = &*ai;
+
+        auto* entryBB  = llvm::BasicBlock::Create(llvm_, "entry",  seqEqFn);
+        auto* loopBB   = llvm::BasicBlock::Create(llvm_, "loop",   seqEqFn);
+        auto* bodyBB   = llvm::BasicBlock::Create(llvm_, "body",   seqEqFn);
+        auto* trueBB   = llvm::BasicBlock::Create(llvm_, "ret1",   seqEqFn);
+        auto* falseBB  = llvm::BasicBlock::Create(llvm_, "ret0",   seqEqFn);
+
+        llvm::IRBuilder<> tb(entryBB);
+        auto [sSrc, sStart, sLen] = loadSpan(tb, selfBox);
+        auto [oSrc, oStart, oLen] = loadSpan(tb, otherBox);
+        // src = bz_array_t*; data = src->data (element buffer, offset 0).
+        llvm::Value* sData = tb.CreateLoad(ptrTy(), sSrc, "sdata");
+        llvm::Value* oData = tb.CreateLoad(ptrTy(), oSrc, "odata");
+        llvm::Value* lenEq = tb.CreateICmpEQ(sLen, oLen, "leneq");
+        tb.CreateCondBr(lenEq, loopBB, falseBB);
+
+        tb.SetInsertPoint(loopBB);
+        auto* kPhi = tb.CreatePHI(i32(), 2, "k");
+        kPhi->addIncoming(tb.getInt32(0), entryBB);
+        llvm::Value* inRange = tb.CreateICmpULT(kPhi, sLen, "inrange");
+        tb.CreateCondBr(inRange, bodyBB, trueBB);
+
+        tb.SetInsertPoint(bodyBB);
+        llvm::Value* sOff = tb.CreateAdd(sStart, kPhi, "soff");
+        llvm::Value* oOff = tb.CreateAdd(oStart, kPhi, "ooff");
+        llvm::Value* sEp  = tb.CreateGEP(elemTy, sData, {sOff}, "sep");
+        llvm::Value* oEp  = tb.CreateGEP(elemTy, oData, {oOff}, "oep");
+        llvm::Value* sV   = tb.CreateLoad(elemTy, sEp, "sv");
+        llvm::Value* oV   = tb.CreateLoad(elemTy, oEp, "ov");
+        llvm::Value* same = elemEq(tb, sV, oV);
+        llvm::Value* k1   = tb.CreateAdd(kPhi, tb.getInt32(1), "k1");
+        kPhi->addIncoming(k1, bodyBB);  // loop back when same
+        tb.CreateCondBr(same, loopBB, falseBB);
+
+        tb.SetInsertPoint(trueBB);
+        tb.CreateRet(llvm::ConstantInt::get(i1(), 1));
+
+        tb.SetInsertPoint(falseBB);
+        tb.CreateRet(llvm::ConstantInt::get(i1(), 0));
+    }
+
+    // --- [3] Length getter (ptr box) → i32 ---
+    llvm::Function* lenGetFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+        lenGetFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          "bzspan$getLength", module_.get());
+        auto ai = lenGetFn->arg_begin();
+        llvm::Value* boxArg = &*ai;
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", lenGetFn);
+        llvm::IRBuilder<> tb(bb);
+        auto [src, start, len] = loadSpan(tb, boxArg);
+        (void)src; (void)start;
+        tb.CreateRet(len);
+    }
+
+    // --- [4] IsEmpty getter (ptr box) → i1 ---
+    llvm::Function* isEmptyFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+        isEmptyFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                           "bzspan$getIsEmpty", module_.get());
+        auto ai = isEmptyFn->arg_begin();
+        llvm::Value* boxArg = &*ai;
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", isEmptyFn);
+        llvm::IRBuilder<> tb(bb);
+        auto [src, start, len] = loadSpan(tb, boxArg);
+        (void)src; (void)start;
+        llvm::Value* empty = tb.CreateICmpEQ(len, tb.getInt32(0), "empty");
+        tb.CreateRet(empty);
+    }
+
+    // --- [5] Indexer getter (ptr box, i32 i) → elemTy ---
+    // src = bz_array_t*; its first field (offset 0) is the data pointer
+    // (void* data = the raw element buffer). Read data, then GEP into it.
+    llvm::Function* idxGetFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(elemTy, {ptrTy(), i32()}, false);
+        idxGetFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          "bzspan$getAt", module_.get());
+        auto ai = idxGetFn->arg_begin();
+        llvm::Value* boxArg = &*ai++;
+        llvm::Value* idxArg = &*ai;
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", idxGetFn);
+        llvm::IRBuilder<> tb(bb);
+        auto [src, start, len] = loadSpan(tb, boxArg);
+        (void)len;
+        llvm::Value* data   = tb.CreateLoad(ptrTy(), src, "data");
+        llvm::Value* offset = tb.CreateAdd(start, idxArg, "off");
+        llvm::Value* ep     = tb.CreateGEP(elemTy, data, {offset}, "ep");
+        llvm::Value* val    = tb.CreateLoad(elemTy, ep, "v");
+        tb.CreateRet(val);
+    }
+
+    // --- Build itable [IndexOf, Contains, SequenceEqual, Length, IsEmpty, Indexer] ---
+    std::vector<llvm::Constant*> itabElems = {
+        indexOfFn, containsFn, seqEqFn, lenGetFn, isEmptyFn, idxGetFn
+    };
+    auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
+    auto* itabGV = new llvm::GlobalVariable(
+        *module_, itabArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(itabArrTy, itabElems),
+        "itab$spanbox$irs");
+
+    // --- Build itmap: [td$IReadOnlySpan, itab, null] ---
+    std::vector<llvm::Constant*> itmapElems = {
+        llvm::cast<llvm::Constant>(irsDesc),
+        llvm::ConstantExpr::getPointerCast(itabGV, ptrTy()),
+        llvm::ConstantPointerNull::get(ptrTy())
+    };
+    auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), itmapElems.size());
+    auto* itmapGV = new llvm::GlobalVariable(
+        *module_, itmapArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(itmapArrTy, itmapElems),
+        "itmap$spanbox");
+
+    // --- Build a minimal span-box descriptor: [self, null] ---
+    auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
+    auto* boxDesc = new llvm::GlobalVariable(
+        *module_, descArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, nullptr, "btd$spanbox");
+    boxDesc->setInitializer(llvm::ConstantArray::get(
+        descArrTy, {boxDesc, llvm::ConstantPointerNull::get(ptrTy())}));
+
+    // --- Build box vtable ---
+    std::vector<llvm::Constant*> vtElems(kVirtualMethodsBase,
+                                          llvm::ConstantPointerNull::get(ptrTy()));
+    vtElems[0] = boxDesc;
+    vtElems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
+    if (builtinDisposeFn_) vtElems[2] = builtinDisposeFn_;
+    vtElems[kEqualsSlot]      = boxDefaultEqualsThunk();
+    vtElems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
+    auto* vtArrTy = llvm::ArrayType::get(ptrTy(), vtElems.size());
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtArrTy, vtElems),
+        "bvt$spanbox");
+    allVtables_.push_back(vtGV);
+
+    spanBoxVtables_[elemTy] = vtGV;
+    return vtGV;
+}
+
+
 // §8.6: is `rt` a value type that boxes when coerced to Object/interface?
 bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     if (!rt) return false;
@@ -14502,6 +14794,8 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     if (rt->kind == K::Named && rt->declaration)
         return rt->declaration->kind == ast::TypeDeclKind::Record ||
                rt->declaration->kind == ast::TypeDeclKind::Enum;
+    // §4.16 / §8.6 (#970): span value structs box into IReadOnlySpan<T>.
+    if (isSpanLikeTypeName(rt)) return true;
     return false;  // inline arrays / unit: deferred (not among the findings)
 }
 
@@ -14549,6 +14843,15 @@ llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
         if (!nm) return nullptr;
         auto it = primBoxVtable_.find(nm);
         return it != primBoxVtable_.end() ? it->second : nullptr;
+    }
+    // §4.16 / §8.6 (#970): span types box into IReadOnlySpan<T>.
+    if (isSpanLikeTypeName(rt)) {
+        llvm::Type* elemTy = i32();  // fallback: int element
+        if (!rt->genericArgs.empty()) {
+            llvm::Type* et = lowerTypeRef(rt->genericArgs[0]);
+            if (et) elemTy = et;
+        }
+        return ensureSpanBoxVtable(elemTy);
     }
     return nullptr;
 }

@@ -15,10 +15,9 @@
 // semantics across a call boundary (a `Clear()` through a Span<classT> parameter
 // nulls the shared underlying buffer slots → no double-free).
 //
-// The IReadOnlySpan<T> INTERFACE (§4.16) is intentionally NOT made resolvable:
-// a span value struct cannot be boxed into a heap-bound interface reference
-// (§4.14), so a `: IReadOnlySpan<int>` parameter would emit malformed IR. It
-// stays an "unresolved type name" reject (a clean reject beats an accept-trap).
+// The IReadOnlySpan<T> INTERFACE (§4.16) was not resolvable in #959, but #970
+// synthesized it as a proper builtin interface with box vtable support, so
+// `: IReadOnlySpan<T>` is now a valid type annotation (see ireadonlyspan_970_test.cpp).
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -129,11 +128,11 @@ BEZEL_TEST(span_type_annotation_959, clear_through_owning_span_parameter_no_doub
         "  end Main; end C;"), 0);
 }
 
-// §4.16 (#959): the IReadOnlySpan<T> INTERFACE is NOT resolvable as a parameter
-// type — a span value cannot be boxed into a heap-bound interface reference
-// (§4.14). It stays an "unresolved type name" reject (no accept-trap).
-BEZEL_TEST(span_type_annotation_959, ireadonlyspan_interface_param_rejected) {
-    BEZEL_EXPECT_EQ(rejectedAtCompile(
+// §4.16 / #970: IReadOnlySpan<T> IS now resolvable as a parameter type.
+// Updated from pre-#970 "rejected" guard to acceptance + value check.
+// arr.Add(0) → count=1 → span.Length=1 → Len returns 1.
+BEZEL_TEST(span_type_annotation_959, ireadonlyspan_interface_param_accepted) {
+    BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  private static method Len(span: IReadOnlySpan<int>): int "
         "    return span.Length; "
@@ -142,5 +141,5 @@ BEZEL_TEST(span_type_annotation_959, ireadonlyspan_interface_param_rejected) {
         "    using var arr := new Array<int>(); "
         "    arr.Add(0); "
         "    return Len(arr.AsReadOnlySpan()); "
-        "  end Main; end C;"), true);
+        "  end Main; end C;"), 1);
 }

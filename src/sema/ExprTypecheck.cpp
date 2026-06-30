@@ -980,6 +980,22 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         reportNotConvertible();
         return;
     }
+    // §4.16 / §8.6 (#970): a span type (ArraySpan<T>/ReadOnlyArraySpan<T>/
+    // Span<T>/ReadOnlySpan<T>) is implicitly coercible to IReadOnlySpan<T>
+    // for call-bounded parameter passing. The span is boxed into a heap-managed
+    // {vtable*, rc, span_bytes} object at the call site; the callee receives a
+    // pointer and dispatches through the IReadOnlySpan itable.
+    if (from->kind == TypeRef::Kind::Named && !from->declaration &&
+        to->kind   == TypeRef::Kind::Named &&  to->declaration &&
+        to->declaration->kind == ast::TypeDeclKind::Interface &&
+        to->declaration->name == "IReadOnlySpan") {
+        std::string_view fromN = namedTypeSimpleName(from);
+        if (fromN == "ArraySpan" || fromN == "ReadOnlyArraySpan" ||
+            fromN == "Span"      || fromN == "ReadOnlySpan") {
+            if (from->nullable && !to->nullable) { reportNullable(); return; }
+            return;  // accepted — codegen boxes the span at the call site
+        }
+    }
     // §4.14/§4.15 (#1245): a ReadOnly span is NOT assignable to its writable
     // counterpart — ReadOnlyArraySpan<T>→ArraySpan<T> would allow writes
     // through a read-only borrow (§4.15), and ReadOnlySpan<T>→Span<T> would

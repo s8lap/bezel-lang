@@ -111,14 +111,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // Registering them lets a span be used as a parameter type, local
         // annotation, or record field type — not just inferred from `.AsSpan()`.
         //
-        // The IReadOnlySpan<T> INTERFACE (§4.16) is deliberately NOT registered:
-        // a span is a value struct, and passing it where an interface reference
-        // is expected emits malformed IR (a span "carrying a borrow cannot be
-        // boxed into a heap-bound interface reference" — §4.14). It stays an
-        // "unresolved type name" reject; see the follow-up issue for the
-        // struct-backed-interface lowering it would require.
+        // §4.16 / issue #970: IReadOnlySpan<T> is the read-only interface over
+        // any span. Spans can be implicitly boxed into it for call-bounded
+        // parameter use (§8.6 call-bounded boxing). The synthesized TypeSymbol is
+        // produced by ctx_.builtinInterfaceSym("IReadOnlySpan") below.
         n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
-        n == "Span" || n == "ReadOnlySpan") {
+        n == "Span" || n == "ReadOnlySpan" ||
+        n == "IReadOnlySpan") {
         return 1;
     }
     // §3 stdlib two-parameter collection types (arity 2):
@@ -841,7 +840,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // a `where` bound. The arity check above (still) diagnoses wrong
                 // arity; this only attaches the declaration when name+arity valid.
                 if (first == "IComparable" || first == "IEquatable" ||
-                    first == "IEqualityComparer") {
+                    first == "IEqualityComparer" || first == "IReadOnlySpan") {
                     ref.declaration = ctx_.builtinInterfaceSym(first);
                 }
                 return;

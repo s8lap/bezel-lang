@@ -52,6 +52,25 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
         // §22.6 ranks subtype → supertype as a conversion (not exact).
         return isSubtype(from->declaration, to->declaration);
     }
+    // §4.16 / §8.6 (#970): a span value type is implicitly convertible to
+    // IReadOnlySpan<T> for call-bounded parameter passing (span is boxed at
+    // the call site). Recognised by: from has no declaration (span builtin)
+    // and its simple name is a span; to has declaration = IReadOnlySpan.
+    if (from->kind == TypeRef::Kind::Named && !from->declaration &&
+        to->kind   == TypeRef::Kind::Named &&  to->declaration &&
+        to->declaration->kind == ast::TypeDeclKind::Interface &&
+        to->declaration->name == "IReadOnlySpan") {
+        // Inline name extraction (callsNamedTypeSimpleName is defined later).
+        std::string_view fromN;
+        if (from->astNode && from->astNode->name &&
+            !from->astNode->name->parts.empty())
+            fromN = from->astNode->name->parts.back();
+        if (fromN == "ArraySpan" || fromN == "ReadOnlyArraySpan" ||
+            fromN == "Span"      || fromN == "ReadOnlySpan") {
+            if (from->nullable && !to->nullable) return false;
+            return true;
+        }
+    }
     return false;
 }
 

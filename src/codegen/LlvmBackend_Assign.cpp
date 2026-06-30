@@ -1125,7 +1125,14 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         if (ifIt == ifacePropertyGetIndex_.end() || descIt == descArray_.end())
             return nullptr;
         llvm::Type* retTy = lowerType(pd->type.get());
-        if (!retTy) retTy = i32();
+        if (!retTy) {
+            // Generic T return (e.g. IReadOnlySpan<T> indexer): recover the
+            // concrete element type from the receiver's first generic arg. // per §4.16
+            const sema::TypeRef* recvTy = ctx_.exprType(*ix.target);
+            if (recvTy && !recvTy->genericArgs.empty())
+                retTy = lowerTypeRef(recvTy->genericArgs[0]);
+            if (!retTy) retTy = i32();
+        }
         std::vector<llvm::Type*> paramTys;
         paramTys.push_back(ptrTy());
         for (const auto& p : pd->indexerParams) {

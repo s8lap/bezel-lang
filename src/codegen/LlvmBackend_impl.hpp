@@ -1371,6 +1371,13 @@ private:
     // by catch type-matching (CG20).
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         descArray_;
+    // §4.16 / §8.6 (#970): per-element-LLVM-type span box vtable. A span
+    // value boxed into IReadOnlySpan<T> uses this vtable + a synthesized itable.
+    // Keyed by the concrete element LLVM type (i32 for int, ptr for string, etc.)
+    // so each element-specialization shares one vtable even when the four span
+    // names differ.  Populated lazily by ensureSpanBoxVtable().
+    std::unordered_map<llvm::Type*, llvm::GlobalVariable*> spanBoxVtables_;
+    llvm::GlobalVariable* ensureSpanBoxVtable(llvm::Type* elemTy);
 
     llvm::Type* i8() { return llvm::Type::getInt8Ty(llvm_); }
     llvm::Type* i16() { return llvm::Type::getInt16Ty(llvm_); }
