@@ -11472,6 +11472,36 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
             }
         }
     }
+    // (b0d) §28.3 / #1250: `using var r := t.Result` where `t : OwnedTask<T:class>`.
+    // The synchronous .Result property on OwnedTask<T> extracts the owned T from the
+    // task's result buffer and transfers ownership to the caller (§30.3 / §30.5).
+    // The initializer is a MemberAccessExpr (not a CallExpr or UnaryExpr await), so
+    // cases (b0)/(b1) above missed it; no type annotation, so (a) missed it too.
+    // Dispose dynamically through the object's vtable (concrete type may differ from
+    // the declared T if T is an interface). This is safe: the alloca is stored with
+    // the loaded class pointer in the `result.ok` basic block (established by
+    // lowerExpr(tcs.Task.Result) before lowerLocalDecl registers the disposal), and
+    // the dynamic dispose null-guards the load — the `result.fault` path bypasses
+    // the inner `do` block entirely and never triggers this disposal.
+    if (!ld->type) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ld->initializer.get())) {
+            if (ma->member == "Result" && ma->target) {
+                const sema::TypeRef* targetTy = ctx_.exprType(*ma->target);
+                if (targetTy && targetTy->kind == sema::TypeRef::Kind::Named &&
+                    !targetTy->declaration && targetTy->astNode &&
+                    targetTy->astNode->name &&
+                    !targetTy->astNode->name->parts.empty() &&
+                    targetTy->astNode->name->parts[0] == "OwnedTask" &&
+                    !targetTy->genericArgs.empty() && targetTy->genericArgs[0]) {
+                    const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                    if (isClassOrInterfaceRef(initTy) ||
+                        isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
+                        return true;
+                }
+            }
+        }
+    }
     return false;
 }
 
@@ -12997,6 +13027,19 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 emitDisposeAndReclaim(eo);
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);
+            }
+
+            // Step 2.5: §28.3 / #1250: for OwnedTaskCompletionSource<T:class>, dispose
+            // the inner task's owned result if set but never consumed via .Result/await.
+            // bz_tcs_dispose_owned_result is safe on all paths:
+            //   • owned_result_disposer == null → plain TCS or value-type; no-op.
+            //   • task->is_error → TrySetException or fault_if_pending fired; no result.
+            //   • task->result == null → bz_task_take_result already consumed it; no-op.
+            // Must run BEFORE fire-and-forget while inner_task is still alive.
+            {
+                auto* dispOwnedFn = declareC("bz_tcs_dispose_owned_result",
+                                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(dispOwnedFn, {tcs});
             }
 
             // Step 3: fire-and-forget the inner task.

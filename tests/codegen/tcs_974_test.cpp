@@ -174,3 +174,94 @@ BEZEL_TEST(tcs_974, tcs_task_property_bound_then_completed) {
         "  end Main; "
         "end C;"), 77);
 }
+
+// ---------------------------------------------------------------------------
+// §28.3 / issue #1250: OwnedTaskCompletionSource<T:class> disposal soundness.
+// Owned results must be disposed exactly once (§28.3).
+// The Res class uses a static counter: ctor increments, dtor decrements.
+// After all scopes close the counter must be 0 (each Res disposed once).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Res class used for disposal-counting in #1250 tests.
+// static n: starts at 0, ctor n += 1, dtor n -= 1.
+const char* kRes =
+    "class Res "
+    "  public static n: int := 0; "
+    "  public v: int := 0; "
+    "  public constructor(x: int) v := x; Res.n := Res.n + 1; end constructor; "
+    "  destructor Res.n := Res.n - 1; end destructor; "
+    "end Res; ";
+
+}  // namespace
+
+// §28.3 / #1250 test 1: TCS set but result never consumed — TCS disposal must
+// dispose the owned result exactly once (Res.n drops from 1 to 0; exit 1 = n==0).
+BEZEL_TEST(tcs_974, owned_tcs_unconsumed_result_disposed_on_tcs_disposal) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kRes +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      _ := tcs.TrySetResult(new Res(7)); "
+        "    end; "
+        "    if Res.n = 0 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §28.3 / #1250 test 2: result consumed via .Task.Result — TCS disposal must NOT
+// re-dispose (Res.n = 0 after r's scope ends; TCS scope end is a no-op; exit 1).
+BEZEL_TEST(tcs_974, owned_tcs_consumed_via_result_not_disposed_again) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kRes +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      _ := tcs.TrySetResult(new Res(7)); "
+        "      do "
+        "        using var r := tcs.Task.Result; "
+        "      end; "
+        "    end; "
+        "    if Res.n = 0 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §28.3 / #1250 test 3: never set — TCS disposal must NOT spuriously call the
+// disposer (no Res created → Res.n stays 0; exit 1 = n==0; no crash).
+BEZEL_TEST(tcs_974, owned_tcs_never_set_no_spurious_dispose) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kRes +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "    end; "
+        "    if Res.n = 0 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §28.3 / #1250 test 4: TrySetException then dispose — error path has no result;
+// no disposer should fire (no Res created → Res.n stays 0; exit 1; no crash).
+BEZEL_TEST(tcs_974, owned_tcs_setexception_no_result_dispose) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kRes +
+        "class C "
+        "  public static method Main(): int "
+        "    do "
+        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      _ := tcs.TrySetException(new InvalidOperationException()); "
+        "    end; "
+        "    if Res.n = 0 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 1);
+}

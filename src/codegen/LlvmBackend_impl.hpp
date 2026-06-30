@@ -4433,8 +4433,11 @@ private:
     // Emits the already-done fast path inline, the slow path (register the resume
     // continuation + return), and the resume / fast-path convergence that reads
     // the result and re-raises a faulted task (§30.9). Returns the result value.
+    // takeResultAfter=true: after loading the result, call bz_task_take_result to
+    // null the task's result buffer (§28.3/#1250: consumed-tracking for owned results).
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
-                                  bool freeTaskAfter);
+                                  bool freeTaskAfter,
+                                  bool takeResultAfter = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // via `disposeAsyncFn` (the direct LLVM function pointer resolved at

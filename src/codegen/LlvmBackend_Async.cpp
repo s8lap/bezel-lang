@@ -1768,7 +1768,24 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // other owner. A task bound to a local is left to its binder's disposal.
     bool freeTaskAfter =
         dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr;
-    return emitAwaitSuspend(task, resultTy, freeTaskAfter);
+    // §28.3 / #1250: for a BOUND OwnedTask<T:class> await, null the result buffer
+    // after loading so bz_tcs_dispose_owned_result (called at TCS disposal) sees no
+    // result and skips the dispose — preventing a double-free of the caller-owned obj.
+    // Only fires for OwnedTask (not plain Task) with a ClassOwned element type.
+    bool takeResultAfter = false;
+    if (!freeTaskAfter) {
+        const sema::TypeRef* taskTy = ctx_.exprType(*un.operand);
+        if (taskTy && taskTy->kind == sema::TypeRef::Kind::Named &&
+            !taskTy->declaration && taskTy->astNode && taskTy->astNode->name &&
+            !taskTy->astNode->name->parts.empty() &&
+            taskTy->astNode->name->parts[0] == "OwnedTask" &&
+            !taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {
+            takeResultAfter =
+                (elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true).cat ==
+                 ElementPolicy::Category::ClassOwned);
+        }
+    }
+    return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter);
 }
 
 
@@ -1782,7 +1799,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
 // that registers the resume continuation + returns; the resume / fast-path
 // convergence reads the result and re-raises a faulted task (§30.9).
 llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
-                                       bool freeTaskAfter) {
+                                       bool freeTaskAfter, bool takeResultAfter) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -1926,6 +1943,14 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // The result is loaded BY VALUE into the await site before the task is
         // freed below, so the value (and the task's freed result buffer) do not
         // alias afterwards.
+        // §28.3 / #1250: for a BOUND OwnedTask<T:class> await, null the result
+        // buffer after loading (consumed-tracking). bz_tcs_dispose_owned_result
+        // checks task->result; a null here tells it the result was already taken.
+        if (takeResultAfter) {
+            auto* takeResultFn = declareC("bz_task_take_result",
+                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(takeResultFn, {awaitedTask});
+        }
     }
     // §30.5 (minimal): reclaim the awaited task when its operand is an anonymous
     // producer result (`await Producer()`) — a single-use task with no other

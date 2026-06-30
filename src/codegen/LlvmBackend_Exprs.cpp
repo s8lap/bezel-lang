@@ -2657,6 +2657,30 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                      {ptrTy()});
                         builder_.CreateCall(freeTaskFn, {task});
                     }
+                    // §28.3 / #1250: for a BOUND OwnedTask<T:class> .Result read,
+                    // null the task's result buffer after loading so the TCS
+                    // disposal (bz_tcs_dispose_owned_result) sees no result and
+                    // skips dispose — preventing a double-free of the caller-owned
+                    // class object.  Check: OwnedTask (not plain Task) + ClassOwned.
+                    if (isBoundTask) {
+                        bool isOwnedClass = false;
+                        if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                            !tt->declaration && tt->astNode && tt->astNode->name &&
+                            !tt->astNode->name->parts.empty() &&
+                            tt->astNode->name->parts[0] == "OwnedTask" &&
+                            !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                            isOwnedClass =
+                                (elementPolicyFor(tt->genericArgs[0],
+                                                  /*owningFamily=*/true).cat ==
+                                 ElementPolicy::Category::ClassOwned);
+                        }
+                        if (isOwnedClass) {
+                            auto* takeResultFn = declareC(
+                                "bz_task_take_result",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(takeResultFn, {task});
+                        }
+                    }
                     return resultVal;
                 }
             }
@@ -8260,10 +8284,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // §6.6 / issue #974: new TaskCompletionSource<T>() /
             // new OwnedTaskCompletionSource<T>() / new TaskCompletionSource().
             // Allocate via bz_tcs_new() — zero arguments (constructor takes none).
+            // §28.3 / #1250: for OwnedTaskCompletionSource<T:class>, wire the element
+            // disposer via bz_tcs_set_owned_disposer so TCS disposal can run the
+            // destructor of a set-but-unconsumed owned result (exactly-once, §28.3).
             if (colName == "TaskCompletionSource" ||
                 colName == "OwnedTaskCompletionSource") {
                 auto* allocFn = declareC("bz_tcs_new", ptrTy(), {});
-                return builder_.CreateCall(allocFn, {}, "tcs.new");
+                llvm::Value* tcs = builder_.CreateCall(allocFn, {}, "tcs.new");
+                if (colName == "OwnedTaskCompletionSource" && rt &&
+                    !rt->genericArgs.empty() && rt->genericArgs[0]) {
+                    llvm::Function* dispThunk =
+                        elementPolicyFor(rt->genericArgs[0],
+                                         /*owningFamily=*/true).disposerThunk;
+                    if (dispThunk) {
+                        auto* setFn = declareC("bz_tcs_set_owned_disposer",
+                                               llvm::Type::getVoidTy(llvm_),
+                                               {ptrTy(), ptrTy()});
+                        builder_.CreateCall(setFn, {tcs, dispThunk});
+                    }
+                }
+                return tcs;
             }
             // §6.4 / issue #647: new Atomic<T>(initial) / new AtomicInteger<T>(initial).
             // Allocate via bz_atomic_new(cell_size, initial).

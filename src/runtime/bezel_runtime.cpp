@@ -11651,7 +11651,12 @@ void bz_buffer_free(void* buf) {
 struct bz_tcs_t {
     void*                inner_task; // bz_task_t* owned by this TCS
     std::atomic<int32_t> completed;  // 0 = pending, 1 = terminal state set
-    bz_tcs_t() : inner_task(nullptr), completed(0) {}
+    // §28.3 / #1250: disposer for the owned result stored inside the inner task.
+    // Non-null only for OwnedTaskCompletionSource<T:class>. Called by
+    // bz_tcs_dispose_owned_result when the TCS is disposed with a completed,
+    // unconsumed owned result (the inner task's result buffer holds the class ptr).
+    void (*owned_result_disposer)(void*) = nullptr;
+    bz_tcs_t() : inner_task(nullptr), completed(0), owned_result_disposer(nullptr) {}
 };
 
 extern "C" {
@@ -11743,4 +11748,74 @@ void bz_tcs_free(void* t) {
     delete static_cast<bz_tcs_t*>(t);
 }
 
+// §28.3 / #1250: register the owned-result disposer for OwnedTaskCompletionSource<T:class>.
+// `disposer` is a JIT/AOT thunk: void(*)(void*) that calls vtable Dispose and frees
+// the Bezel class object.  Called immediately after bz_tcs_new() for every
+// OwnedTaskCompletionSource<T:class> allocation; no-op for value-type variants.
+void bz_tcs_set_owned_disposer(void* t, void (*disposer)(void*)) {
+    if (!t || !disposer) return;
+    static_cast<bz_tcs_t*>(t)->owned_result_disposer = disposer;
+}
+
+// §28.3 / #1250: dispose the inner task's owned class result exactly once if it was
+// set but never consumed via .Task.Result or await.
+// Called just before bz_task_fire_and_forget in the TCS disposal sequence (while the
+// inner task is still alive and accessible via tcs->inner_task).
+// Guards:
+//   • owned_result_disposer == null → not an OwnedTaskCompletionSource<T:class>; skip.
+//   • task->is_error == true       → result was never set (TrySetException / fault); skip.
+//   • task->result == null          → result was already consumed (bz_task_take_result
+//                                     zeroed the buffer at the consume site); skip.
+// On dispose: extracts the class pointer, frees the malloc'd result buffer, calls the
+// disposer (runs the class destructor + frees the object), leaves task->result null so
+// the subsequent bz_task_free calls free(nullptr) harmlessly.
+void bz_tcs_dispose_owned_result(void* t) {
+    if (!t) return;
+    auto* tcs = static_cast<bz_tcs_t*>(t);
+    if (!tcs->owned_result_disposer) return;
+    auto* task = static_cast<bz_task_t*>(tcs->inner_task);
+    if (!task) return;
+    void* result_to_dispose = nullptr;
+    void* buf_to_free = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(task->mtx);
+        if (!task->is_error && task->result &&
+            task->result_size >= static_cast<int64_t>(sizeof(void*))) {
+            // The result buffer holds the owned class pointer (written by bz_task_complete).
+            result_to_dispose = *static_cast<void**>(task->result);
+            buf_to_free = task->result;
+            // Null the slot so bz_task_free's free(task->result) becomes free(nullptr).
+            task->result = nullptr;
+            task->result_size = 0;
+        }
+    }
+    free(buf_to_free);
+    if (result_to_dispose)
+        tcs->owned_result_disposer(result_to_dispose);
+}
+
 } // extern "C" (TCS)
+
+extern "C" {
+
+// §28.3 / #1250: called after loading an owned class result from a BOUND task's result
+// buffer (.Task.Result or await <bound-task>) to mark the result as consumed.
+// Frees and nulls the task's result buffer so bz_tcs_dispose_owned_result (invoked at
+// TCS disposal) sees null and skips disposal — avoiding a double-free of the
+// now-caller-owned class object.
+// Safe on any bz_task_t regardless of whether it came from a TCS: if result is already
+// null (no result, or already consumed) free(nullptr) is a no-op.
+void bz_task_take_result(void* tp) {
+    if (!tp) return;
+    auto* task = static_cast<bz_task_t*>(tp);
+    void* buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(task->mtx);
+        buf = task->result;
+        task->result = nullptr;
+        task->result_size = 0;
+    }
+    free(buf);
+}
+
+} // extern "C" (bz_task_take_result)
