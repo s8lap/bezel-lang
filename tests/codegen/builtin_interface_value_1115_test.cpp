@@ -164,3 +164,98 @@ BEZEL_TEST(builtin_interface_value_1115, iequalitycomparer_as_field_type) {
         "    return (8 if b.cmp.Equals(2, 2) else 0) + b.cmp.GetHashCode(3); " // 8 + 6
         "  end Main; end Box;"), 14);
 }
+
+// ── #1183 / §11.2 / §12.1: builtin generic-interface itable thunks must use
+// the substituted T's real ABI, not the i32 placeholder. Previously when T is
+// not int (e.g. a record struct, string ptr, or wide primitive), the itable
+// thunk built by ensureNullableWideningThunk used ifaceTy (i32 placeholder)
+// as the external signature and tried to forward that i32 to the concrete-T
+// parameter — producing "Call parameter type does not match" IR-verify failure.
+// The fix: (1) ensureNullableWideningThunk returns nullptr for non-widening
+// mismatches so the itable slot holds the concrete function directly; (2) the
+// call site rebuilds fnTy from the actual arg types when a mismatch is found.
+
+// #1183: IComparable<Pt> where Pt is a record ({i32,i32} — struct T).
+BEZEL_TEST(builtin_interface_value_1183, icomparable_record_t_dispatches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pt(x: int, y: int); "
+        "class PtC: IComparable<Pt> "
+        "  public method CompareTo(other: Pt): int => other.x; "
+        "end PtC; "
+        "class App public static method Main(): int "
+        "  using var p := new PtC(); var c: IComparable<Pt> := p; "
+        "  return c.CompareTo(new Pt(42, 0)); "  // 42
+        "end Main; end App;"), 42);
+}
+
+// #1183: IEquatable<string> where string lowers to ptr.
+BEZEL_TEST(builtin_interface_value_1183, iequatable_string_t_dispatches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class SC: IEquatable<string> "
+        "  public method Equals(other: string): bool => other = \"hello\"; "
+        "end SC; "
+        "class App public static method Main(): int "
+        "  using var s := new SC(); var e: IEquatable<string> := s; "
+        "  return (7 if e.Equals(\"hello\") else 0) "  // 7
+        "       + (3 if e.Equals(\"world\") else 0); "  // +0 → 7
+        "end Main; end App;"), 7);
+}
+
+// #1183: IComparable<long> where long lowers to i64 (wide primitive T).
+BEZEL_TEST(builtin_interface_value_1183, icomparable_long_t_dispatches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class LC: IComparable<long> "
+        "  private _v: long; "
+        "  public constructor(v: long) _v := v; end constructor; "
+        "  public method CompareTo(other: long): int => "
+        "    (5 if _v > other else (-1 if _v < other else 0)); "
+        "end LC; "
+        "class App public static method Main(): int "
+        "  using var c := new LC(100L); var x: IComparable<long> := c; "
+        "  return x.CompareTo(50L) + x.CompareTo(100L); "  // 5 + 0 = 5
+        "end Main; end App;"), 5);
+}
+
+// #1183: IEqualityComparer<Pt> where both T params are record structs.
+BEZEL_TEST(builtin_interface_value_1183, iequalitycomparer_record_t_dispatches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pt(x: int, y: int); "
+        "class PtCmp: IEqualityComparer<Pt> "
+        "  public method Equals(a: Pt, b: Pt): bool => a.x = b.x; "
+        "  public method GetHashCode(value: Pt): int => value.x; "
+        "end PtCmp; "
+        "class App public static method Main(): int "
+        "  using var cmp := new PtCmp(); var c: IEqualityComparer<Pt> := cmp; "
+        "  return (10 if c.Equals(new Pt(3, 0), new Pt(3, 9)) else 0) "  // 10
+        "       + c.GetHashCode(new Pt(7, 0)); "                          // + 7 = 17
+        "end Main; end App;"), 17);
+}
+
+// #1183: IEqualityComparer<string> where both T params are string (ptr).
+BEZEL_TEST(builtin_interface_value_1183, iequalitycomparer_string_t_dispatches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class SCmp: IEqualityComparer<string> "
+        "  public method Equals(a: string, b: string): bool => a = b; "
+        "  public method GetHashCode(value: string): int => 42; "
+        "end SCmp; "
+        "class App public static method Main(): int "
+        "  using var cmp := new SCmp(); var c: IEqualityComparer<string> := cmp; "
+        "  return (10 if c.Equals(\"x\", \"x\") else 0) "  // 10
+        "       + c.GetHashCode(\"z\"); "                   // + 42 = 52
+        "end Main; end App;"), 52);
+}
+
+// #1183 keep-green: IComparable<int> (the existing T=i32 case) is unchanged.
+BEZEL_TEST(builtin_interface_value_1183, icomparable_int_unchanged) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(CMP) +
+        "class App public static method Main(): int "
+        "  using var c := new C(5); var x: IComparable<int> := c; "
+        "  return x.CompareTo(3); "  // 5 > 3 → 2
+        "end Main; end App;"), 2);
+}

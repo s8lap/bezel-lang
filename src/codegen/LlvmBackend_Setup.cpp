@@ -1397,6 +1397,38 @@ llvm::Function* Emitter::ensureNullableWideningThunk(
             { needsThunk = true; break; }
     if (!needsThunk) return nullptr;
 
+    // #1183 / §11.2 / §12.1: only emit a thunk for NULLABLE-WIDENING
+    // mismatches (impl declares T? where iface declares T, e.g. {i8,T}
+    // vs T). For GENERIC-T erasure mismatches (iface has i32 as the T
+    // placeholder, impl has the substituted concrete T — e.g. a record
+    // struct or ptr for string) the call-site fix in emitMethodCall
+    // rebuilds the concrete call type from the actual argument types.
+    // A thunk here would emit a malformed forwarding call (passing an
+    // i32 thunk-arg to a concrete-T parameter). Skip the thunk whenever
+    // any mismatch is not a nullable-value widening.
+    for (unsigned ci = 1; ci < ifaceTy->getNumParams(); ++ci) {
+        if (ifaceTy->getParamType(ci) == implTy->getParamType(ci)) continue;
+        unsigned pIdx = ci - 1;
+        sema::TypeRef* pr = nullptr;
+        if (pIdx < implMs->params.size()) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                           implMs->params[pIdx]);
+            if (ps) pr = ps->resolvedDeclType
+                          ? ps->resolvedDeclType
+                          : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                          : nullptr);
+        }
+        if (!pr) {
+            auto* md = dynamic_cast<const ast::MethodDecl*>(implMs->decl);
+            if (md && pIdx < md->params.size() && md->params[pIdx].type)
+                pr = ctx_.resolvedType(*md->params[pIdx].type);
+        }
+        // If the mismatch is not a nullable-value widening (impl param is
+        // not T?), a thunk cannot be correctly generated — return nullptr
+        // so the itable slot holds the direct concrete function.
+        if (!pr || !isNullableValueTy(pr)) return nullptr;
+    }
+
     // Cache lookup.
     auto key = std::make_pair(ifaceMs, implMs);
     if (auto it = nullableWideningThunks_.find(key);

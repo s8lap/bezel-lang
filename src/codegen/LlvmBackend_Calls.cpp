@@ -12167,6 +12167,31 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 ptrTy(), vptr, {builder_.getInt32(vtSlot)});
             fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
         }
+        // #1183 / §11.2 / §12.1: builtin generic interfaces
+        // (IComparable<T>/IEquatable<T>/IEqualityComparer<T>) compile
+        // their template method with T erased to i32; when the substituted
+        // T's ABI differs (a record struct, ptr for string, i64 for long),
+        // fnTy's parameter types don't match the actual args. Build a
+        // concrete fnTy from the real arg types so the call instruction is
+        // well-typed. The itable slot holds the concrete function directly
+        // (ensureNullableWideningThunk skips thunk-generation for
+        // non-widening mismatches), so the call dispatches correctly.
+        // Only applied to interface dispatch (isIfaceMethod) where the
+        // generic-T erasure mismatch can arise.
+        if (isIfaceMethod) {
+            bool needsConcrete = false;
+            for (std::size_t ai = 0; ai < args.size(); ++ai)
+                if (args[ai]->getType() != fnTy->getParamType(ai))
+                    { needsConcrete = true; break; }
+            if (needsConcrete) {
+                std::vector<llvm::Type*> concParamTys;
+                concParamTys.reserve(args.size());
+                for (llvm::Value* a : args)
+                    concParamTys.push_back(a->getType());
+                fnTy = llvm::FunctionType::get(
+                    fnTy->getReturnType(), concParamTys, /*isVarArg=*/false);
+            }
+        }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         emitPendingCheck();  // CG20: a callee may have thrown
         return r;
