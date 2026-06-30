@@ -758,6 +758,8 @@ set(BEZEL_TEST_SOURCES
     codegen/ownedbuffer_class_slot_nullable_1157_test.cpp
     codegen/owning_span_779_test.cpp
     codegen/span_type_annotation_959_test.cpp
+    # --- fix #1245: ReadOnly spans not assignable to writable counterparts (§4.14/§4.15) ---
+    sema/span_readonly_assignability_1245_test.cpp
     codegen/string_span_883_test.cpp
     codegen/iterator_owned_param_945_test.cpp
     # --- fix #1120: iterator disposes outstanding yielded owned value on MoveNext advance and Dispose (§29) ---

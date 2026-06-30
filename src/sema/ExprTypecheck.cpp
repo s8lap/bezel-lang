@@ -980,6 +980,24 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         reportNotConvertible();
         return;
     }
+    // §4.14/§4.15 (#1245): a ReadOnly span is NOT assignable to its writable
+    // counterpart — ReadOnlyArraySpan<T>→ArraySpan<T> would allow writes
+    // through a read-only borrow (§4.15), and ReadOnlySpan<T>→Span<T> would
+    // allow disposal/mutation through a read-only owning view (§4.14).
+    // Both families are null-declaration Named builtins; namedTypeSimpleName
+    // recovers the name from either an annotation-resolved ref (astNode set by
+    // TypeResolution) or a synthesised ref (astNode built by ExprTC_Calls for
+    // AsSpan / AsReadOnlySpan return types).
+    if (from->kind == TypeRef::Kind::Named && !from->declaration &&
+        to->kind   == TypeRef::Kind::Named && !to->declaration) {
+        std::string_view fromN = namedTypeSimpleName(from);
+        std::string_view toN   = namedTypeSimpleName(to);
+        if ((fromN == "ReadOnlyArraySpan" && toN == "ArraySpan") ||
+            (fromN == "ReadOnlySpan"      && toN == "Span")) {
+            reportNotConvertible();
+            return;
+        }
+    }
     // §12.9 (issue #1180): variance check for builtin (null-declaration) Named
     // generic types. The Named-Named branch above requires both sides to have
     // non-null declarations; builtins like Array<T>, IEnumerable<T>, IList<T>
