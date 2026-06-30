@@ -4190,7 +4190,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 "`continue` is not allowed outside a loop (§21.5)");
         }
     } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        // per §21.6 (#1242): a do…end block introduces a lexical scope;
+        // locals declared inside are NOT visible after the matching end.
+        // Mirror the ForStmt pattern: push a child scope, visit the body,
+        // then pop — exactly as codegen already does via lowerScopedBlock.
+        Scope doScope;
+        doScope.parent = currentScope_;
+        Scope* saveScope = currentScope_;
+        currentScope_ = &doScope;
         for (const auto& bs : dob->body) if (bs) visitStmt(*bs);
+        currentScope_ = saveScope;
     } else if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
         for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
         for (const auto& arm : trys->catches) {

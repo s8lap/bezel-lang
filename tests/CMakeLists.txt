@@ -258,6 +258,7 @@ set(BEZEL_TEST_SOURCES
     sema/pascalcase_type_aliases_884_test.cpp            # fix #884: §3.4 PascalCase System type-name aliases (String/Int32/…) resolve
     sema/generic_inconsistent_type_arg_896_test.cpp     # fix #896: §14.1 inconsistent type-arg inference (Merge<T>(int?,bool?)) rejected cleanly — no crash
     sema/new_type_param_constraint_992_test.cpp         # fix #992: §14.1 reject new T() in generic body without where T: new() (FALSE_ACCEPT/zero-init)
+    sema/do_end_block_scope_1242_test.cpp               # fix #1242: §21.6 do…end block locals not visible after the matching end
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
