@@ -7233,9 +7233,30 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // using-var-bound task is freed exactly once here at scope end.
     // Recognised by the initializer's inferred expression type name "Task" or
     // "OwnedTask", or by the declared type name.
-    if (taskTypeOfLocal(ld)) {
+    if (const sema::TypeRef* tt = taskTypeOfLocal(ld)) {
         Disposal d{it->second, nullptr};
         d.task = true;
+        // §30.5 / #1258: an OwnedTask<T:class> owns its produced result. If the
+        // task is dropped at scope end without an intervening await taking the
+        // result (bz_task_take_result zeros it on consume), the produced owned
+        // class result would leak. Capture the per-T disposer here (the caller
+        // knows the static OwnedTask<T> type) and dispose it at scope end.
+        auto taskName = [](const sema::TypeRef* rt) -> std::string_view {
+            if (!rt->declaration) {
+                if (rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty())
+                    return rt->astNode->name->parts[0];
+            } else if (!rt->declaration->decl) {
+                return rt->declaration->name;
+            }
+            return {};
+        };
+        if (taskName(tt) == "OwnedTask" && !tt->genericArgs.empty() &&
+            isClassOrInterfaceRef(tt->genericArgs[0])) {
+            d.taskOwnedResultDisposer =
+                elementPolicyFor(tt->genericArgs[0], /*owningFamily=*/true)
+                    .disposerThunk;
+        }
         disposeStack_.back().push_back(d);
         return;
     }
@@ -12962,6 +12983,17 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 emitDisposeAndReclaim(eo);
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);
+            }
+            // §30.5 / #1258: dispose the produced-but-unconsumed owned class
+            // result of an OwnedTask<T:class> before the task is freed. The
+            // runtime guard (result null after a consuming await, or is_error)
+            // makes this a no-op when there is nothing to dispose, so it never
+            // double-frees a result an awaiter already took.
+            if (it->taskOwnedResultDisposer) {
+                auto* dispFn = declareC("bz_task_dispose_owned_result",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(dispFn, {t, it->taskOwnedResultDisposer});
             }
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});

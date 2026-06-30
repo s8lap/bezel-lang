@@ -11841,4 +11841,36 @@ void bz_task_take_result(void* tp) {
     free(buf);
 }
 
+// §30.5 / #1258: dispose an UNCONSUMED owned class result of an OwnedTask<T:class>
+// at the task's using-var scope-end disposal, BEFORE bz_task_fire_and_forget /
+// bz_task_free frees the task struct. Mirrors bz_tcs_dispose_owned_result, but the
+// per-type disposer is passed in by codegen (bz_task_t carries no disposer field).
+// Guards:
+//   • disposer == null   → not an OwnedTask<T:class> (Task<T> / no-value task); skip.
+//   • task->is_error     → the async body faulted; no result was produced; skip.
+//   • task->result == null → the result was already consumed (bz_task_take_result
+//                            zeroed the buffer at the await consume site); skip → no
+//                            double-free of the now-caller-owned object.
+// On dispose: extract the class pointer from the result buffer, free the buffer, null
+// the slot (so the subsequent bz_task_free's free(task->result) is free(nullptr)), then
+// run the disposer (the class destructor + object free).
+void bz_task_dispose_owned_result(void* tp, void (*disposer)(void*)) {
+    if (!tp || !disposer) return;
+    auto* task = static_cast<bz_task_t*>(tp);
+    void* result_to_dispose = nullptr;
+    void* buf_to_free = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(task->mtx);
+        if (!task->is_error && task->result &&
+            task->result_size >= static_cast<int64_t>(sizeof(void*))) {
+            result_to_dispose = *static_cast<void**>(task->result);
+            buf_to_free = task->result;
+            task->result = nullptr;
+            task->result_size = 0;
+        }
+    }
+    free(buf_to_free);
+    if (result_to_dispose) disposer(result_to_dispose);
+}
+
 } // extern "C" (bz_task_take_result)

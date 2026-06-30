@@ -146,3 +146,43 @@ BEZEL_TEST(async_owned_task_result_1127, task_int_result_regression) {
         "  end Main; "
         "end C;"), 42);
 }
+
+// ---------------------------------------------------------------------------
+// §30.5 / #1258: an OwnedTask<T:class> DROPPED at scope end (using var, never
+// awaited) must dispose its produced owned class result — bz_task_dispose_owned_result
+// runs the result's destructor before the task is freed. Cell.n must be 0.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_owned_task_result_1127, owned_task_dropped_disposes_result_1258) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; " + std::string(kCell) +
+        "class C "
+        "  public static async method ProduceCell(): OwnedTask<Cell> "
+        "    return new Cell(); "
+        "  end ProduceCell; "
+        "  public static method Main(): int "
+        "    do using var t := ProduceCell(); end; "  // dropped, never awaited
+        "    return Cell.n; "                          // 0 (result disposed)
+        "end Main; end C;"), 0);
+}
+
+// §30.5 / #1258: when the OwnedTask result IS consumed by an await, the task's
+// scope-end disposal must NOT double-dispose it (bz_task_take_result zeroed the
+// result on consume; the disposer sees null and skips). The awaited `c` disposes
+// the Cell exactly once. Cell.n must be 0 — a double-free would crash/underflow.
+BEZEL_TEST(async_owned_task_result_1127, owned_task_awaited_result_single_dispose_1258) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; " + std::string(kCell) +
+        "class C "
+        "  public static async method ProduceCell(): OwnedTask<Cell> "
+        "    return new Cell(); "
+        "  end ProduceCell; "
+        "  public static async method Consume(): Task<int> "
+        "    using var t := ProduceCell(); "
+        "    using var c := await t; "   // consume — transfers the Cell into c
+        "    return 7; "
+        "  end Consume; "
+        "  public static method Main(): int "
+        "    do using var rt := Consume(); end; "  // drives Consume synchronously
+        "    return Cell.n; "                       // 0 (disposed once via c)
+        "end Main; end C;"), 0);
+}

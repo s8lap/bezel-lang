@@ -674,6 +674,11 @@ private:
         // frees anonymous CallExpr operands), so the sole free is via the faf
         // continuation — exactly once.
         bool task = false;
+        // §30.5 / #1258: for a `using var` bound to an OwnedTask<T:class>, the
+        // per-T disposer that disposes the produced-but-unconsumed owned class
+        // result at scope end (passed to bz_task_dispose_owned_result before the
+        // task is freed). Null for a Task<T> / value-result / no-value task.
+        llvm::Value* taskOwnedResultDisposer = nullptr;
         // §28.12 / §30 (`await using var`): the resource implements
         // IAsyncDisposable. On the NORMAL exit path (not unwind) we call
         // DisposeAsync() and await the returned Task (a proper suspend point),
