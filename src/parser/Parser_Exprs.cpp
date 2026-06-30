@@ -334,6 +334,13 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
+    // §19.4/§17 (#1256): consume the flag immediately so only the outermost
+    // primary of the when-guard is affected; nested sub-expressions (e.g.
+    // lambda arguments inside a call) enter this function with the flag
+    // already cleared and therefore parse lambdas normally.
+    const bool suppressLambda = suppressTopLevelLambda_;
+    suppressTopLevelLambda_ = false;
+
     // Literals from the lexer (§18 forms covered in lexer slices 3 and 4).
     if (current_.kind == TokenKind::IntLiteral) {
         auto e = std::make_unique<ast::IntLiteralExpr>();
@@ -609,12 +616,17 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
     // anything else means parenthesised expression. We need to scan past the
     // matching `)` before deciding — that is the parser's one use of
     // unbounded buffered lookahead (peekAt).
+    // per §19.4/§17 (#1256): if suppressLambda is set, the `(…)=>` pattern
+    // at this level is the guard-expression followed by the case-arm `=>`
+    // separator, not a lambda — skip lambda detection so `(t > 0)` is parsed
+    // as a parenthesised guard and `=>` remains available to parseCaseArm.
     const bool asyncLambdaCandidate =
+        !suppressLambda &&
         isKeyword("async") &&
         peekAt(1).kind == TokenKind::Punctuator && peekAt(1).text == "(" &&
         tokensLookLikeLambda(1);
     const bool plainLambdaCandidate =
-        isPunctuator("(") && tokensLookLikeLambda(0);
+        !suppressLambda && isPunctuator("(") && tokensLookLikeLambda(0);
 
     if (asyncLambdaCandidate || plainLambdaCandidate) {
         auto lam = std::make_unique<ast::LambdaExpr>();
@@ -1047,7 +1059,17 @@ ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
         arm.pattern = parsePattern();
     }
     if (consumeKeyword("when")) {
+        // per §19.4/§17 (#1256): a parenthesised guard like `(t > 0)` must
+        // not be mistaken for a lambda-parameter list even though the token
+        // sequence `(…)=>` matches the lambda pattern — the `=>` here is the
+        // case-arm separator, not a lambda arrow.  The flag is consumed
+        // (cleared) on the very first entry to parsePrimaryExpressionImpl, so
+        // lambdas nested inside a call arg (e.g. `xs.Any((y) => y > 0)`) are
+        // unaffected.
+        const bool prevSuppress = suppressTopLevelLambda_;
+        suppressTopLevelLambda_ = true;
         arm.guard = parseExpression();
+        suppressTopLevelLambda_ = prevSuppress;
     }
     if (!consumePunctuator("=>")) {
         diagnostics_.report(Severity::Error, current_.location,

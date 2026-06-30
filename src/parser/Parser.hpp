@@ -203,6 +203,13 @@ private:
     // `with EXPR` cancellation-token clause (§30.7) stays available to the
     // for-statement parser.
     bool disableWithSuffix_ = false;
+    // §19.4/§17 (#1256): when true, the very next call to
+    // parsePrimaryExpressionImpl suppresses top-level `(…)=>` lambda
+    // detection.  The flag is consumed (cleared) immediately on entry to
+    // parsePrimaryExpressionImpl so that nested lambdas in call-argument
+    // position (e.g. `xs.Any((y) => y > 0)` inside a when-guard) are
+    // unaffected.  Set by parseCaseArm while parsing a when-guard expression.
+    bool suppressTopLevelLambda_ = false;
 };
 
 } // namespace bezel

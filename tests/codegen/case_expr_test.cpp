@@ -1154,3 +1154,38 @@ BEZEL_TEST(codegen_cg28_destructure, direct_scrutinee_regression_1234) {
         "  end; "
         "end Main; end C;"), 30);
 }
+
+// ── fix #1256 / §19.4 / §17: parenthesised when-guard ────────────────────────
+// A when-guard whose expression is parenthesised — `var t when (t > 0)` —
+// was mis-parsed: the `(…)=>` token sequence triggered the lambda-detection
+// lookahead (tokensLookLikeLambda), which returned true because the matching
+// `)` is followed by the case-arm `=>` separator.  The parser then committed
+// to a lambda parse and cascaded into errors.  The fix sets
+// suppressTopLevelLambda_ before parsing the guard expression so only the
+// outermost primary is affected; nested lambdas in call-arg position are
+// unaffected (they enter parsePrimaryExpressionImpl with the flag cleared).
+
+// §19.4/§17 (#1256): binding pattern + parenthesised guard — guard is true.
+// `var t when (t > 0)` must parse as a binding pattern with guard `(t > 0)`.
+// Scrutinee 5 > 0 → arm body `t` → returns 5.
+BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_1256) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "return case x var t when (t > 0) => t, _ => -1 end;"), 5);
+}
+
+// §19.4/§17 (#1256): parenthesised guard is false — falls through to `_`.
+// Scrutinee -3 is not > 0; guard fails; wildcard yields -1.
+BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_false_1256) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := -3; "
+        "return case x var t when (t > 0) => t, _ => -1 end;"), -1);
+}
+
+// §19.4/§17 (#1256): more complex parenthesised guard: `(t >= 1 and t <= 9)`.
+// Exercises a compound boolean in parens — still a guard, not a lambda.
+BEZEL_TEST(codegen_cg28b, parenthesized_compound_when_guard_1256) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "return case x var t when (t >= 1 and t <= 9) => t * 2, _ => 0 end;"), 10);
+}
