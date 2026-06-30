@@ -250,3 +250,68 @@ BEZEL_TEST(generic_constraint_dispatch_484, method_constraint_conforming_ok_729)
         "  end Main; "
         "end C;"), 42);
 }
+
+// ── #1255 / §27.5 / §14.2: constraint method call inside a lambda ────────────
+
+// §27.5 / §14.2 (fix #1255): a lambda `() => x.Val()` inside a generic method
+// `GenLambdaCall<T>(x: T) where T: INum` captures the generic param `x`.  The
+// unspecialized template body lowers `x` as an i32 placeholder; the non-pointer
+// receiver guard in emitMethodCall then returns nullptr for `x.Val()`, which
+// previously fell through to `CreateRetVoid()` in an i32-returning lambda
+// function → LLVM IR verifier error "Function return type does not match operand
+// type of return inst! ret void / i32".
+//
+// The fix (lowerLambda expr-body terminator): when `lowerExpr(body)` returns
+// null and retTy is non-void, emit `ret <zero>` (a valid stub for the
+// unspecialized template) instead of `ret void`.  The specialized invocation
+// (buildSpecializedMethodFn, T=Num) re-lowers the lambda with a concrete ptr
+// receiver and returns the real value.
+BEZEL_TEST(generic_constraint_dispatch_484,
+           lambda_captures_generic_constraint_param_1255) {
+    // Basic: `() => x.Val()` returned from a generic-constrained method.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface INum  method Val(): int; end INum; "
+        "class Num : INum "
+        "  public _n: int := 0; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Val(): int => _n; "
+        "  destructor end destructor; "
+        "end Num; "
+        "static class Utils "
+        "  public static method GenLambdaCall<T>(x: T): int where T: INum "
+        "    var f := () => x.Val(); "
+        "    return f(); "
+        "  end GenLambdaCall; "
+        "end Utils; "
+        "class C public static method Main(): int "
+        "  using var n := new Num(42); "
+        "  return Utils.GenLambdaCall(n); "
+        "end Main; end C;"), 42);
+}
+
+// §27.5 / §14.2 (fix #1255): arithmetic on the constraint method result inside
+// the lambda body.  Same root cause — the placeholder i32 receiver nulled the
+// body; with the fix the specialized body returns x.Val()+1 = 43.
+BEZEL_TEST(generic_constraint_dispatch_484,
+           lambda_constraint_method_result_in_arithmetic_1255) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface INum  method Val(): int; end INum; "
+        "class Num : INum "
+        "  public _n: int := 0; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Val(): int => _n; "
+        "  destructor end destructor; "
+        "end Num; "
+        "static class Utils "
+        "  public static method GenLambdaPlus1<T>(x: T): int where T: INum "
+        "    var f := () => x.Val() + 1; "
+        "    return f(); "
+        "  end GenLambdaPlus1; "
+        "end Utils; "
+        "class C public static method Main(): int "
+        "  using var n := new Num(41); "
+        "  return Utils.GenLambdaPlus1(n); "
+        "end Main; end C;"), 42);
+}

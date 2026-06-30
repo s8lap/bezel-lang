@@ -7278,7 +7278,26 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     emitClosureRetain(v);
                 builder_.CreateRet(v);
             } else {
-                builder_.CreateRetVoid();
+                // fix #1255 / §27.5 / §14.2: when the expression body lowered
+                // to null (e.g. `x.Val()` where x: T with T erased to i32 in
+                // the unspecialized generic template — the non-pointer receiver
+                // guard in emitMethodCall returns null) AND the declared return
+                // type is NON-VOID, emitting `ret void` produces malformed IR
+                // that the LLVM verifier rejects ("Function return type does
+                // not match operand type of return inst! ret void / i32").
+                // Mirror emitImplicitReturn and the block-body fall-through
+                // below: emit a zero-value stub for non-void return types.
+                // The unspecialized template stub is never called in practice
+                // (only the per-T specialization built by
+                // buildSpecializedMethodFn is called, and that re-lowers the
+                // lambda with the concrete T so lowerExpr(x.Val()) returns a
+                // real value); for a real codegen error the diagnostic system
+                // already reported it and any value is equally "wrong".
+                // per §27.5 / §14.2.
+                if (retTy->isVoidTy())
+                    builder_.CreateRetVoid();
+                else
+                    builder_.CreateRet(llvm::Constant::getNullValue(retTy));
             }
         }
     } else {
