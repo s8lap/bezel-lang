@@ -12404,7 +12404,13 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             // logic is wrong. Force specialization so the monomorphized body
             // is emitted with the active genericSubst_ and can correctly
             // dispatch any Object methods on the concrete type.
-            if (!typesMismatch && !md->genericParams.empty()) {
+            // #1253: `md` is null when ms->decl is non-null but NOT an
+            // ast::MethodDecl — e.g. a user-defined record/class `operator`
+            // declaration. Such a decl carries no method-level generic params,
+            // so there is nothing to force-specialize; guard the deref (the
+            // unguarded `md->genericParams` here SIGSEGV'd the compiler when a
+            // generic method body invoked a record operator, §14/§25.3).
+            if (!typesMismatch && md && !md->genericParams.empty()) {
                 // At least one of the method's type params is bound in the
                 // current substitution — force specialization.
                 for (const auto& gp : md->genericParams) {

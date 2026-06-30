@@ -160,3 +160,19 @@ BEZEL_TEST(operator_operand_order_1096, non_nullable_record_operator_unaffected_
         "  return c.X + c.Y; "                             // 10
         "end Main; end Mn;"), 10);
 }
+
+// #1253 (§14/§25.3): a GENERIC method whose body invokes a user-defined record
+// operator must not crash the compiler. emitMethodCall dereferenced `md` (the
+// operator's ast decl, which is NOT an ast::MethodDecl → null) unguarded while
+// deciding whether to force-specialize. Now null-guarded. Add<int>(Vec(3,4),
+// Vec(7,6)) => Vec(10,10) => 20.
+BEZEL_TEST(operator_operand_order_1096, record_operator_in_generic_method_no_crash_1253) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(VEC) +
+        "class C "
+        "  public static method Add<T>(a: Vec, b: Vec): Vec => a + b; "
+        "  public static method Main(): int "
+        "    var r := Add<int>(new Vec(3, 4), new Vec(7, 6)); "
+        "    return r.X + r.Y; "
+        "end Main; end C;"), 20);
+}
