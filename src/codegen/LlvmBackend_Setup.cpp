@@ -3063,21 +3063,25 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
 }
 
 
-// §28.5 / §14 / #1143: the per-instantiation vtable to install in a freshly-
-// constructed instance of the active monomorphization of `ts`, in place of the
-// shared `vt$<T>`. Specialized when:
+// §28.5 / §14 / #1143 / #1240: the per-instantiation vtable to install in a
+// freshly-constructed instance of the active monomorphization of `ts`, in
+// place of the shared `vt$<T>`. Specialized when:
 //
 // (a) The class has an owned type-parameter field: the shared (type-erased)
 //     disposer cannot classify the owned field — a per-instantiation Dispose
 //     (slot 2) must use the concrete substituted type. This is the §28.5 case.
 //
-// (b) The class implements a generic interface whose itable contains method(s)
-//     with a class-typed return or param (T bound to a reference type). The
-//     shared itable stores the i32-placeholder template function — it reads
-//     fields at the wrong struct offset and returns a truncated i32 instead of
-//     the full class pointer, producing a corrupted reference (SIGSEGV on any
-//     vtable access through the returned value). A per-instantiation itable
-//     with concrete-typed functions must replace slot 1 (itmap). §12/§13/§14.
+// (b) The class implements an interface and either:
+//     (b1) an interface method has a class-typed return or param (T bound to a
+//          reference type): the shared itable stores the i32-placeholder template
+//          function which truncates the pointer to 32 bits (SIGSEGV on any
+//          vtable access through the returned value). §12/§13/§14 (#1143).
+//     (b2) the concrete struct layout differs from the template layout — any
+//          field's LLVM type changes under the substitution (e.g. T→ptr vs
+//          T→i32): template methods have GEP indices compiled against the
+//          template struct, so they land at the wrong byte offsets in the
+//          concrete object's memory even when the method's own signature
+//          doesn't involve T at all. §12/§14 (#1240).
 //
 // Falls back to the shared vtable when neither condition holds. Cached per
 // (class, spec-field-type vector) so each distinct instantiation builds once.
@@ -3087,15 +3091,32 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
 
     bool needsSpecDispose = classHasOwnedTypeParamField(ts);
 
+    // #1240 (§12/§14): detect when the concrete struct layout under the active
+    // genericSubst_ differs from the template layout (built with T→i32 erasing).
+    // structs_[ts] is the template struct created without a substitution active;
+    // classStruct(ts) with genericSubst_ active returns the concrete specialised
+    // struct. If they are different struct types, at least one field's LLVM type
+    // changed — every itable method slot must be re-emitted so its body uses GEP
+    // offsets against the correct (concrete) struct type, not the template struct.
+    bool layoutDiffers = false;
+    {
+        auto sit = structs_.find(ts);
+        if (sit != structs_.end() && classStruct(ts) != sit->second)
+            layoutDiffers = true;
+    }
+
     // Condition (b): scan the class's interfaces for any method whose concrete
     // function type (under the active genericSubst_) differs from the compiled
-    // template function's type.
+    // template function's type, OR when the struct layout itself changed (#1240).
     bool needsSpecItable = false;
     {
         std::vector<const sema::TypeSymbol*> supers;
         collectTypeAndBases(ts, supers);
         for (const sema::TypeSymbol* iface : supers) {
             if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            // #1240: if the struct layout changed, every itable slot needs
+            // re-emitting — trigger rebuild on the first interface we find.
+            if (layoutDiffers) { needsSpecItable = true; break; }
             for (sema::Symbol* m : iface->members) {
                 auto* im = dynamic_cast<sema::MethodSymbol*>(m);
                 if (!im || isStaticMethod(im)) continue;
@@ -3168,7 +3189,16 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 auto mit = methodFns_.find(impl);
                 if (mit == methodFns_.end()) continue;
                 llvm::FunctionType* concFnTy = methodFnType(impl);
-                if (!concFnTy || concFnTy == mit->second->getFunctionType()) continue;
+                if (!concFnTy) continue;
+                // #1240: when the struct layout differs from the template,
+                // rebuild every slot — not only those whose function type
+                // changed — because the template body has GEP indices computed
+                // against the template struct type (wrong byte offsets for the
+                // concrete instantiation). buildSpecializedMethodFn re-emits
+                // the body under the active genericSubst_, using classStruct(ts)
+                // which returns the concrete struct type with correct offsets.
+                if (!layoutDiffers && concFnTy == mit->second->getFunctionType())
+                    continue;
                 CallableInfo ci;
                 if (!callableInfo(impl, ci)) continue;
                 std::vector<llvm::Type*> paramTys;
