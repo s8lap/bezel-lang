@@ -156,3 +156,44 @@ BEZEL_TEST(codegen_string_length_528, interp_prefix_nonascii_length) {
         "var s := \"\xc3\xa9\"; "
         "var r := $\"Caf{s}\"; return r.Length;"), 4);
 }
+
+// ── §9.6 / #1295: PadLeft/PadRight preserve wide code points (> U+00FF) ──────
+// The prior inline lowering assumed 1 byte per code point (memcpy'd the code-
+// point COUNT as a byte count, hard-stored width=1), corrupting any cp > U+00FF.
+// The result is compared at the code-point level (`int(p[i]) = <cp>`) because an
+// 8-bit exit code cannot distinguish the corruption (20013 & 255 == 45, the very
+// low byte the bug produced).
+
+// §9.6 (#1295): "中" (U+4E2D=20013).PadLeft(4) → "   中"; the tail code point is
+// preserved (20013), the pad is a space (32), Length is 4.
+BEZEL_TEST(codegen_string_length_528, padleft_wide_codepoint_1295) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var p := \"\xe4\xb8\xad\".PadLeft(4); "
+        "return (1 if (p.Length = 4) and (int(p[3]) = 20013) "
+        "and (int(p[0]) = 32) else 0);"), 1);
+}
+
+// §9.6 (#1295): "中".PadRight(3) → "中  "; the head code point is preserved.
+BEZEL_TEST(codegen_string_length_528, padright_wide_codepoint_1295) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var p := \"\xe4\xb8\xad\".PadRight(3); "
+        "return (1 if (p.Length = 3) and (int(p[0]) = 20013) "
+        "and (int(p[2]) = 32) else 0);"), 1);
+}
+
+// §9.6 (#1295): a WIDE pad char widens the result — "x".PadLeft(3, '★'
+// U+2605=9733) keeps the pad code point AND the ASCII 'x' (widened).
+BEZEL_TEST(codegen_string_length_528, pad_widens_for_wide_padchar_1295) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var p := \"x\".PadLeft(3, '\xe2\x98\x85'); "
+        "return (1 if (p.Length = 3) and (int(p[0]) = 9733) "
+        "and (int(p[2]) = 120) else 0);"), 1);
+}
+
+// §9.6 (#1295) control: pure-ASCII PadLeft/PadRight are unchanged.
+BEZEL_TEST(codegen_string_length_528, pad_ascii_unchanged_1295) {
+    BEZEL_EXPECT_EQ(runBody(
+        "var a := \"ab\".PadLeft(5); "
+        "var b := \"ab\".PadRight(4, '*'); "
+        "return (1 if (a = \"   ab\") and (b = \"ab**\") else 0);"), 1);
+}

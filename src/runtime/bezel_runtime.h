@@ -970,6 +970,11 @@ void*   bz_str_substring(const void* self, int64_t start, int64_t count);
 // #1282: char.ToString() / char interpolation — a single-code-point string at
 // the narrowest storage width (preserves the full Unicode scalar, no truncation).
 void*   bz_char_to_string(int32_t cp);
+// §9.6 / #1295: PadLeft/PadRight — width-aware padding to `totalWidth` code
+// points with `padChar` (leftAlign=1 for PadRight, self-then-pad; 0 for PadLeft,
+// pad-then-self). Preserves code points > U+00FF (fixed-width storage, §4.6).
+void*   bz_str_pad(const void* self, int64_t totalWidth,
+                   int32_t padChar, int8_t leftAlign);
 // Replace(old, new): fresh string with all occurrences of `old` replaced.
 void*   bz_str_replace(const void* self, const void* old_str, const void* new_str);
 // Split(sep: char): fresh Array<string> split at every code point equal to sep.

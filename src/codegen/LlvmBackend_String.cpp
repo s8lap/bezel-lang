@@ -1721,67 +1721,32 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return newStr;
     }
 
-    // §9.6: PadLeft(totalWidth[, padChar])/PadRight(totalWidth[, padChar]): string
-    // Pads with the given character (default: space) to reach totalWidth.
+    // §9.6 / #1295: PadLeft(totalWidth[, padChar]) / PadRight(totalWidth[, padChar]).
+    // Delegate to the width-aware runtime helper bz_str_pad. The prior inline
+    // lowering assumed 1 byte per code point (allocated totalWidth+1 bytes,
+    // memcpy'd the code-point COUNT as a byte count, and hard-stored width=1),
+    // so any code point > U+00FF was corrupted. Strings store fixed-width code
+    // points (§4.6); the runtime builds the padded result at the correct width
+    // (widest of self's width and the pad char's), widening self's code points.
     if ((method == "PadLeft" || method == "PadRight") &&
         !call.args.empty() && call.args[0].value) {
         llvm::Value* widthArg = lowerExpr(*call.args[0].value);
         if (!widthArg) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
         llvm::Value* width64 = builder_.CreateSExt(widthArg, i64(), "pad.width");
-        // If selfLen >= totalWidth, return self unchanged.
-        llvm::Value* needPad = builder_.CreateICmpSGT(width64, selfLen, "pad.need");
-        auto* padBB = llvm::BasicBlock::Create(llvm_, "pad.do",  currentFn_);
-        auto* endBB = llvm::BasicBlock::Create(llvm_, "pad.end", currentFn_);
-        auto* entBB = builder_.GetInsertBlock();
-        builder_.CreateCondBr(needPad, padBB, endBB);
-        builder_.SetInsertPoint(padBB);
-        llvm::Value* padLen = builder_.CreateSub(width64, selfLen, "pad.len");
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        auto* memsetFn = module_->getFunction("memset");
-        if (!memsetFn) {
-            auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i32(), i64()}, false);
-            memsetFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memset", module_.get());
-        }
-        llvm::Value* dataSz = builder_.CreateAdd(width64, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "pad.data");
-        // Get the pad character (default: space, or 2nd arg if provided).
+        // Pad character: default space, or the 2nd arg (a code point, i32).
         llvm::Value* padCharI32 = builder_.getInt32(' ');
         if (call.args.size() >= 2 && call.args[1].value) {
             llvm::Value* pc = lowerExpr(*call.args[1].value);
             if (pc && pc->getType()->isIntegerTy(32)) padCharI32 = pc;
-            else if (pc) padCharI32 = builder_.CreateSExt(pc, i32());
+            else if (pc) padCharI32 = builder_.CreateZExtOrTrunc(pc, i32());
         }
-        // Fill with pad character.
-        builder_.CreateCall(memsetFn, {newData, padCharI32, width64});
-        if (method == "PadLeft") {
-            // Self goes after the spaces.
-            llvm::Value* dst = builder_.CreateGEP(i8Ty, newData, padLen);
-            builder_.CreateCall(memcpyFn, {dst, selfData, selfLen});
-        } else {
-            // Self goes at the start.
-            builder_.CreateCall(memcpyFn, {newData, selfData, selfLen});
-        }
-        // Null-terminate.
-        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, width64);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "pad.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
-        builder_.CreateStore(width64, builder_.CreateStructGEP(stringType(), newStr, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), newStr, 2));
-            initStringRc(newStr);  // #422: producer's reference, rc := 1
-        auto* padEnd = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(ptrTy(), 2, "pad.result");
-        phi->addIncoming(self, entBB);    // no padding needed
-        phi->addIncoming(newStr, padEnd); // padded result
-        return phi;
+        // leftAlign = 1 for PadRight (self first, pad after); 0 for PadLeft.
+        llvm::Value* leftAlign =
+            builder_.getInt8(method == "PadRight" ? 1 : 0);
+        auto* fn = declareC("bz_str_pad", ptrTy(),
+                            {ptrTy(), i64(), i32(), llvm::Type::getInt8Ty(llvm_)});
+        return builder_.CreateCall(fn, {self, width64, padCharI32, leftAlign},
+                                   "pad.result");
     }
 
     // §9.6: Repeat(n: int): string — repeat self n times.

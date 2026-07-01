@@ -6089,6 +6089,53 @@ static void* bz_str_slice_cp(const bz_string_struct* s, int64_t start, int64_t c
     return strObj;
 }
 
+// §9.6 / #1295: PadLeft/PadRight — build a fresh +1 bz_string of `totalWidth`
+// code points by padding `self` with `padChar` (a code point). `leftAlign`
+// selects PadRight (self at the front, pad after) vs PadLeft (pad first, self
+// at the end). Strings store FIXED-WIDTH code points (width 1/2/4 bytes/cp,
+// §4.6); the result width is the widest of self's width and the pad char's
+// width, and self's code points are widened into it. The previous inline
+// codegen assumed 1 byte per code point (memcpy'd the code-point COUNT as a
+// byte count and hard-stored width=1), corrupting any code point > U+00FF.
+extern "C" void* bz_str_pad(const void* self_p, int64_t totalWidth,
+                            int32_t padChar, int8_t leftAlign) {
+    const bz_string_struct* s = (const bz_string_struct*)self_p;
+    int64_t selfLen = s ? s->len : 0;
+    // No padding needed: return a fresh copy of the whole string (own +1),
+    // matching the "return self unchanged" contract in a copy-returning form.
+    if (totalWidth <= selfLen)
+        return bz_str_slice_cp(s, 0, selfLen);
+    int64_t padCount = totalWidth - selfLen;
+    uint32_t pc = (uint32_t)padChar;
+    int8_t padW  = (pc <= 0xFF) ? 1 : (pc <= 0xFFFF ? 2 : 4);
+    int8_t selfW = s ? s->width : 1;
+    int8_t w = padW > selfW ? padW : selfW;
+    size_t byte_count = (size_t)totalWidth * (size_t)w;
+    void* data = calloc(byte_count + (size_t)w, 1);  // + width-sized NUL slot
+    #define BZ_PAD_PUT(idx, cp)                                       \
+        do {                                                          \
+            if (w == 1)      ((uint8_t*)data)[(idx)]  = (uint8_t)(cp);\
+            else if (w == 2) ((uint16_t*)data)[(idx)] = (uint16_t)(cp);\
+            else             ((uint32_t*)data)[(idx)] = (uint32_t)(cp);\
+        } while (0)
+    if (leftAlign) {
+        // PadRight: self at [0, selfLen), pad char fills [selfLen, totalWidth).
+        for (int64_t i = 0; i < selfLen; ++i)   BZ_PAD_PUT(i, bz_str_cp(s, i));
+        for (int64_t i = selfLen; i < totalWidth; ++i) BZ_PAD_PUT(i, pc);
+    } else {
+        // PadLeft: pad char fills [0, padCount), self at [padCount, totalWidth).
+        for (int64_t i = 0; i < padCount; ++i)  BZ_PAD_PUT(i, pc);
+        for (int64_t i = 0; i < selfLen; ++i)   BZ_PAD_PUT(padCount + i, bz_str_cp(s, i));
+    }
+    #undef BZ_PAD_PUT
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    memcpy(strObj + 8, &totalWidth, sizeof(int64_t));
+    strObj[16] = (uint8_t)w;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    return strObj;
+}
+
 // Helper: compare two code-point sequences for equality.
 // Returns 1 if they have the same length and the same code point at every
 // position, 0 otherwise. Width of each may differ.
