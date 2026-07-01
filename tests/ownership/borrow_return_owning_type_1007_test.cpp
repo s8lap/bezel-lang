@@ -191,3 +191,27 @@ BEZEL_TEST(borrow_return_1007, array_int_borrow_return_clean) {
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §28.11 / #1264: a plain `var b := move a` of an OWNING COLLECTION must flag `b`
+// for affine auto-drop — the move transfers the CONTAINER ownership `a` held, so
+// `b` owns the collection and auto-drops at scope end (cascading to its elements,
+// §28.11). Before the fix, producerState classified `move <owning-collection>` as
+// Borrowed (the owning-collection name-head fallback denotes ELEMENT ownership for
+// method RETURNS), so `b` got no auto-drop flag and was never disposed → its
+// elements leaked. The runtime cascade is verified AOT + ASan-clean; here we
+// assert the sema flag: the auto-drop warning fires for `b` (checkOwnership is
+// omitted by the codegen_support runJit harness, so this is tested at the
+// ownership-pass level).
+BEZEL_TEST(borrow_return_1007, move_owning_collection_local_auto_dropped_1264) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Cell end Cell; "
+        "class P public static method Main(): int "
+        "  do "
+        "    var a := new OwnedArray<Cell>(); a.Add(new Cell()); "
+        "    var b := move a; "
+        "  end; "
+        "  return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "b"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

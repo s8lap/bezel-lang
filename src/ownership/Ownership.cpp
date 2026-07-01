@@ -1362,6 +1362,28 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             }
         }
     }
+    // §28.6 / §28.11 (#1107 finding D): a `move X` whose value is an OWNING
+    // COLLECTION (OwnedArray/OwnedStack/OwnedQueue/OwnedSet/OwnedDictionary/
+    // OwnedLinkedList) transfers the CONTAINER ownership the source local holds
+    // to the result — the result is Owned (the target must dispose the container
+    // and cascade to its elements, §28.11). Without this, `var arr2 := move arr1`
+    // falls through to the owning-collection name-head fallback below, which
+    // classifies a non-`owned` owning-collection-typed expr as Borrowed (§28.6:
+    // the `Owned*` name denotes ELEMENT ownership for method returns) — so arr2
+    // is never flagged Owned, never auto-dropped, and its elements leak. A `move`
+    // of a plain class already classifies Owned via the fallback (which masked
+    // this for classes). The moved-from source is marked moved-from by the
+    // LocalDecl move handling, so exactly one owner (the target) disposes — no
+    // double-free. // per §28.6, §28.11
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->op == "move") {
+            if (const sema::TypeRef* rt = ctx_.exprType(e))
+                if (rt->kind == sema::TypeRef::Kind::Named && rt->astNode &&
+                    rt->astNode->name && !rt->astNode->name->parts.empty() &&
+                    isOwningCollectionNameHead(rt->astNode->name->parts.front()))
+                    return OwnershipState::Owned;
+        }
+    }
     // Slice O13: a call to a method with an `owned T` return type
     // produces an Owned value. The callee MethodSymbol resolution
     // comes from sema; we look at its MethodDecl::returnOwned to
