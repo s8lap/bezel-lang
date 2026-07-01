@@ -3382,7 +3382,39 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             if (!isBuiltinEx && tt &&
                 tt->kind == sema::TypeRef::Kind::Named && tt->declaration)
                 isUserDerivedEx = hasBuiltinExceptionBase(tt->declaration);
-            if (isBuiltinEx || isUserDerivedEx) {
+            // #1266 / stdlib §2.17 / §31.4: `ex.InnerException!.Message` (a DIRECT
+            // chain). sema does not type `ex.InnerException` (the builtin
+            // TypeInitializationException carries no PropertyDecl for it), so `tt`
+            // is null here and the two checks above miss — the access then fell to
+            // a generic getter that returned the empty string. Recognise the chain
+            // structurally: unwrap the postfix `!` and check the target is an
+            // `InnerException` access on a TypeInitializationException. lowering
+            // `ma->target` runs the InnerException handler below (offset 16 → the
+            // inner exception ptr), whose message sits at offset 8 like any builtin
+            // exception. (The local-bind form `var ie: Exception? := ex.Inner…;
+            // ie!.Message` already works because the explicit type restores `tt`.)
+            bool isInnerExcChain = false;
+            if (!isBuiltinEx && !isUserDerivedEx) {
+                const ast::Expr* t = ma->target.get();
+                if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(t))
+                    t = pb->operand.get();
+                if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(t)) {
+                    if (inner->member == "InnerException" && inner->target) {
+                        auto* itt = ctx_.exprType(*inner->target);
+                        isInnerExcChain =
+                            itt && itt->kind == sema::TypeRef::Kind::Named &&
+                            ((itt->declaration &&
+                              itt->declaration->name ==
+                                  "TypeInitializationException") ||
+                             (!itt->declaration && itt->astNode &&
+                              itt->astNode->name &&
+                              !itt->astNode->name->parts.empty() &&
+                              itt->astNode->name->parts[0] ==
+                                  "TypeInitializationException"));
+                    }
+                }
+            }
+            if (isBuiltinEx || isUserDerivedEx || isInnerExcChain) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
                 // The message ptr is always at byte offset 8 — slot 1 of the

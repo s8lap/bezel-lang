@@ -82,10 +82,28 @@ BEZEL_TEST(type_init_inner_exception_1107, inner_as_cast_and_message) {
         "  catch var ex: TypeInitializationException => do "
         "    var inner: Exception? := ex.InnerException; "
         "    if inner <> null then "
-        "      var ae := inner! as ArgumentException; "
+        "      var ae := inner! as ArgumentException; "  // #1266-sibling: local-bind path
         "      if ae <> null then return ae!.Message.Length; end; "  // "inner-msg" = 9
         "    end; "
         "  end end; "
         "  return 0; "
+        "end Main; end C;"), 9);
+}
+
+// #1266: the DIRECT chained form `ex.InnerException!.Message` (no explicitly-typed
+// local bind) must also read the inner exception's message. sema does not type
+// `ex.InnerException` (the builtin TypeInitializationException has no PropertyDecl),
+// so the codegen Message handler recognises the InnerException chain structurally.
+// Before the fix this returned 0 (empty), while the local-bind form above worked.
+// "inner-msg" = 9.
+BEZEL_TEST(type_init_inner_exception_1107, inner_message_direct_chain_1266) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kFailingInit +
+        "class C public static method Main(): int "
+        "  try var _ := FS._v; "
+        "  catch var ex: TypeInitializationException => do "
+        "    return ex.InnerException!.Message.Length; "  // 9 (was 0)
+        "  end end; "
+        "  return -1; "
         "end Main; end C;"), 9);
 }
