@@ -1566,4 +1566,58 @@ BEZEL_TEST(codegen_excdisp_1291, no_ctor_field_init_throw_disposes_base_and_deri
         "end Main; end C;", 0);
 }
 
+// --------------------------------------------------------------------------
+// [1292] §15.4 L2170 — an exception thrown while evaluating an OWNING collection
+// literal element disposes the already-evaluated owned elements and the
+// partially-filled temporary array on the exception path (§28.3).
+// --------------------------------------------------------------------------
+
+// #1292: `[Helpers.Mk(), Helpers.Boom()]` — Mk() creates Res#1 and adds it to
+// the temp array, then Boom() throws; Res#1 (and the partial array) must be
+// disposed on the unwind. created - disposed == 0 (both 1); LSan-clean.
+BEZEL_TEST(codegen_excdisp_1292, owning_literal_element_throw_disposes_earlier) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class Res "
+        "  public static created: int := 0; "
+        "  public static disposed: int := 0; "
+        "  public constructor() Res.created := Res.created + 1; end constructor; "
+        "  destructor Res.disposed := Res.disposed + 1; end destructor; "
+        "end Res; "
+        "class Helpers "
+        "  public static method Mk(): owned Res return new Res(); end Mk; "
+        "  public static method Boom(): owned Res "
+        "    throw new InvalidOperationException(\"boom\"); end Boom; "
+        "end Helpers; "
+        "class C public static method Main(): int "
+        "  try using var arr: OwnedArray<Res> := [Helpers.Mk(), Helpers.Boom()]; "
+        "  catch InvalidOperationException => Console.WriteLine(\"caught\") end; "
+        "  return Res.created - Res.disposed; "  // 1 - 1 = 0
+        "end Main; end C;", 0);
+}
+
+// #1292: two elements evaluate before the third throws — both earlier owned
+// elements are disposed (created - disposed == 0, both 2); LSan-clean.
+BEZEL_TEST(codegen_excdisp_1292, owning_literal_two_before_throw_both_disposed) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class Res "
+        "  public static created: int := 0; "
+        "  public static disposed: int := 0; "
+        "  public constructor() Res.created := Res.created + 1; end constructor; "
+        "  destructor Res.disposed := Res.disposed + 1; end destructor; "
+        "end Res; "
+        "class Helpers "
+        "  public static method Mk(): owned Res return new Res(); end Mk; "
+        "  public static method Boom(): owned Res "
+        "    throw new InvalidOperationException(\"boom\"); end Boom; "
+        "end Helpers; "
+        "class C public static method Main(): int "
+        "  try using var arr: OwnedArray<Res> := "
+        "    [Helpers.Mk(), Helpers.Mk(), Helpers.Boom()]; "
+        "  catch InvalidOperationException => Console.WriteLine(\"caught\") end; "
+        "  return Res.created - Res.disposed; "  // 2 - 2 = 0
+        "end Main; end C;", 0);
+}
+
 }  // namespace

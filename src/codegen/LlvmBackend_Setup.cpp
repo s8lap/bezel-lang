@@ -11756,6 +11756,36 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // Store each element in textual order via bz_array_add (same as `.Add`).
     auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                            {ptrTy(), ptrTy(), i64()});
+    // §15.4 L2170 (#1292): if an element expression throws partway, the
+    // already-added owned elements and the partially-filled temporary array must
+    // be disposed on the exception path (§28.3), exactly as the scope-end
+    // disposal would — "as for an OwnedArray<U> literal". Route a throwing
+    // element eval through a cleanup that frees `arr` with the element disposer
+    // matching this collection's ownership (an owning collection's class elements
+    // cascade-dispose; an Array<string> releases its co-owned +1; a value array
+    // just frees the backing — elementDisposerArg mirrors the scope-end choice),
+    // then re-raise. Without this the partial owning array (and its elements)
+    // leaked. On the NORMAL path `arr` is returned to the caller, which disposes
+    // it; the throw path takes this cleanup instead, so there is no double-free.
+    // Installed only around the element-eval loop.
+    llvm::BasicBlock* clitSavedUnwind = unwindTarget_;
+    std::size_t clitSavedDepth = unwindScopeDepth_;
+    {
+        auto* clitSavedInsert = builder_.GetInsertBlock();
+        llvm::BasicBlock* clitEnclosing = unwindBB();
+        bool clitOwnsElems = name.rfind("Owned", 0) == 0;
+        auto* clitCleanup =
+            llvm::BasicBlock::Create(llvm_, "clit.elem.cleanup", currentFn_);
+        builder_.SetInsertPoint(clitCleanup);
+        auto* clitFreeFn = declareC("bz_array_free",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(clitFreeFn,
+            {arr, elementDisposerArg(elemRef, clitOwnsElems)});
+        builder_.CreateBr(clitEnclosing);
+        builder_.SetInsertPoint(clitSavedInsert);
+        unwindTarget_ = clitCleanup;
+        unwindScopeDepth_ = disposeStack_.size();
+    }
     for (const auto& elemPtr : cl->elements) {
         if (!elemPtr) continue;
         llvm::Value* ev = nullptr;
@@ -11812,6 +11842,9 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         builder_.CreateStore(ev, slot);
         builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
     }
+    // #1292: restore the enclosing unwind target now the element evals are done.
+    unwindTarget_ = clitSavedUnwind;
+    unwindScopeDepth_ = clitSavedDepth;
     return arr;
 }
 
