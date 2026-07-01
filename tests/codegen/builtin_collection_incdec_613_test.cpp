@@ -241,3 +241,50 @@ BEZEL_TEST(builtin_collection_incdec_613, inline_array_increment_regression_15_1
         "  end Main; "
         "end C;"), 6);
 }
+
+// ---------------------------------------------------------------------------
+// §17.6 (#1299): the index subexpression of `arr[i]++` / `arr[i]--` is
+// evaluated EXACTLY ONCE. lowerCollectionIndexerIncrDecr read via
+// lowerCollectionIndexerGet then wrote via lowerCollectionIndexerSet(*ix, …),
+// each re-lowering ix->target and ix->indices[0].value — so a side-effecting
+// index (`arr[Idx()]++`) fired twice: the get read one slot, the set
+// incremented another. Idx() counts its calls via the static N.
+// ---------------------------------------------------------------------------
+
+// `arr[Idx()]++`: Idx() must fire once (returns 0) → arr[0] becomes 11,
+// arr[1] stays 20, N == 1. 11*1000 + 20*10 + 1 = 11201.
+BEZEL_TEST(builtin_collection_incdec_613, array_increment_index_evaluated_once_17_6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static N: int; "
+        "  public static method Idx(): int "
+        "    var r := N; N := N + 1; return r; "
+        "  end Idx; "
+        "  public static method Main(): int "
+        "    N := 0; "
+        "    var arr := new Array<int>(); "
+        "    arr.Add(10); arr.Add(20); "
+        "    arr[Idx()]++; "
+        "    return arr[0] * 1000 + arr[1] * 10 + N; "  // 11201
+        "  end Main; "
+        "end C;"), 11201);
+}
+
+// `arr[Idx()]--`: single evaluation → arr[0] becomes 9, arr[1] stays 20,
+// N == 1. 9*1000 + 20*10 + 1 = 9201.
+BEZEL_TEST(builtin_collection_incdec_613, array_decrement_index_evaluated_once_17_6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static N: int; "
+        "  public static method Idx(): int "
+        "    var r := N; N := N + 1; return r; "
+        "  end Idx; "
+        "  public static method Main(): int "
+        "    N := 0; "
+        "    var arr := new Array<int>(); "
+        "    arr.Add(10); arr.Add(20); "
+        "    arr[Idx()]--; "
+        "    return arr[0] * 1000 + arr[1] * 10 + N; "  // 9201
+        "  end Main; "
+        "end C;"), 9201);
+}

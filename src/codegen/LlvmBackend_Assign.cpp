@@ -1941,12 +1941,79 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return false;
 
-    // Read the current element value (with bounds/key check).
+    const std::string binOp = (inc.op == "++") ? "+" : "-";
+
+    // --- Array<T> path: single-evaluation get → ±1 → set (§17.6, #1299). ---
+    // Evaluate the receiver AND the index ONCE and reuse them for both the read
+    // and the write-back — going through lowerCollectionIndexerGet then
+    // lowerCollectionIndexerSet(*ix, …) re-lowers ix->target and
+    // ix->indices[0].value twice, double-evaluating a side-effecting index
+    // (`arr[Idx()]++`): the get read one slot and the set incremented another.
+    // (The dict path below still uses the helpers — sema disallows a
+    // side-effecting dict key in a read-modify-write position, matching the
+    // compound-assign path.)
+    if (isArr) {
+        llvm::Value* recv = lowerExpr(*ix->target);
+        if (!recv) return false;
+        llvm::Value* idx = lowerExpr(*ix->indices[0].value);
+        if (!idx) return false;
+        idx = idx->getType()->isIntegerTy(64) ? idx
+            : builder_.CreateSExt(idx, i64());
+
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+        emitGuardThrow(builder_.CreateICmpUGE(idx, len, "cid.oor"),
+                       "IndexOutOfRangeException");
+
+        int64_t esz = collectionElemSize(recvTy);
+        llvm::Type* elemTy = i32();
+        if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) elemTy = et;
+
+        llvm::AllocaInst* getSlot = entryAlloca(elemTy);
+        auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(getFn, {recv, idx, getSlot, builder_.getInt64(esz)});
+        llvm::Value* cur = builder_.CreateLoad(elemTy, getSlot, "cid.cur");
+
+        bool fp = cur->getType()->isFloatingPointTy();
+        llvm::Value* one = fp
+            ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
+            : llvm::cast<llvm::Value>(llvm::ConstantInt::get(cur->getType(), 1));
+        llvm::Value* newVal = emitCompoundOp(
+            binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target));
+        if (!newVal) return false;
+
+        llvm::AllocaInst* setSlot = entryAlloca(newVal->getType());
+        builder_.CreateStore(newVal, setSlot);
+        bool listIfaceOwning = false;
+        isListInterfaceName(recvTy, &listIfaceOwning);
+        const sema::TypeRef* ixEl =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        bool ixIsOwning =
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+        llvm::Function* elemDisp = elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
+        if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
+        if (elemDisp) {
+            auto* setFn = declareC("bz_array_set_disposing",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(setFn, {recv, idx, setSlot,
+                                        builder_.getInt64(esz), elemDisp});
+        } else {
+            auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(setFn, {recv, idx, setSlot,
+                                        builder_.getInt64(esz)});
+        }
+        return true;
+    }
+
+    // --- Dictionary<K,V> path: read, ±1, write via the helpers. ---
     llvm::Value* cur = lowerCollectionIndexerGet(*ix);
     if (!cur) return false;
-
-    // Compute ±1.
-    const std::string binOp = (inc.op == "++") ? "+" : "-";
     bool fp = cur->getType()->isFloatingPointTy();
     llvm::Value* one = fp
         ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
@@ -1954,9 +2021,6 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
     llvm::Value* newVal = emitCompoundOp(
         binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target));
     if (!newVal) return false;
-
-    // Write the incremented value back (encodes scalars, handles disposal for
-    // owning collections — same path as a plain `arr[i] := newVal`).
     return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
 }
 
