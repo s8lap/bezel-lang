@@ -293,3 +293,59 @@ BEZEL_TEST(user_indexer_record_23_4, value_indexer_whole_set_and_read_unaffected
         "  return d[\"a\"].x + d[\"a\"].y; "        // field read — OK → 15
         "end Main; end C;"), 15);
 }
+
+// ── #1312/#1313 / §23.5: the same reject on a value-typed PROPERTY result ──────
+// A property GET returns a COPY of a value type, so `h.P.X := …` modifies a
+// discarded copy — the write is lost (a block property never sees its setter; an
+// auto-property mutates in place, bypassing value-copy). Now a clean §23.5 error.
+
+// #1313: a BLOCK-form value-typed property — member-assign on its result rejected.
+BEZEL_TEST(user_indexer_record_23_4, value_block_property_result_member_assign_rejected_1313) {
+    auto r = runJit(
+        "module M; record Point public property X: int; "
+        "  public constructor(x: int) X := x; end constructor; end Point; "
+        "class Holder "
+        "  private property _p: Point; "
+        "  public property P: Point get => _p; set => _p := value; end P; "
+        "  public constructor() _p := new Point(1); end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var h := new Holder(); "
+        "  h.P.X := 99; "                          // §23.5 — write to a discarded copy
+        "  return h.P.X; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #1312: an AUTO value-typed property — member-assign on its result rejected.
+BEZEL_TEST(user_indexer_record_23_4, value_auto_property_result_member_assign_rejected_1312) {
+    auto r = runJit(
+        "module M; record Point public property X: int; "
+        "  public constructor(x: int) X := x; end constructor; end Point; "
+        "class Holder public property P: Point; "
+        "  public constructor(p: Point) P := p; end constructor; end Holder; "
+        "class C public static method Main(): int "
+        "  var h := new Holder(new Point(1)); "
+        "  h.P.X := 99; "                          // §23.5
+        "  return h.P.X; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #1312/#1313 CONTROL: a value-typed FIELD is an lvalue stored inline — `h.f.X :=
+// 99` writes through and MUST stay accepted (and mutate). Reading a property
+// member and assigning the whole property are also unaffected.
+BEZEL_TEST(user_indexer_record_23_4, value_field_member_assign_accepted_1312) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point public property X: int; "
+        "  public constructor(x: int) X := x; end constructor; end Point; "
+        "class Holder public f: Point; "
+        "  public constructor() f := new Point(1); end constructor; end Holder; "
+        "class C public static method Main(): int "
+        "  var h := new Holder(); "
+        "  h.f.X := 99; "                          // field is an lvalue — OK
+        "  return h.f.X; "                         // 99
+        "end Main; end C;"), 99);
+}

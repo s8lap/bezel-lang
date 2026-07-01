@@ -3529,6 +3529,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "value back through the indexer setter (§23.5)");
                 }
             }
+            // §23.5 (#1312/#1313): the same rule for a value-typed PROPERTY
+            // result. A property GET returns a COPY of a value type
+            // (records/enums are value types, §9), so `h.P.X := …` modifies a
+            // discarded copy — the write is lost (a block property never sees
+            // its setter; an auto-property mutates in place, bypassing value-copy
+            // semantics). Reject when the target is `<propertyAccess>.member` and
+            // the property's result is value-typed. A value-typed FIELD is an
+            // lvalue stored inline, so `h.f.X := …` writes through and stays
+            // accepted — only a PROPERTY get (auto or block) returns a copy.
+            else if (auto* innerMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                         ma->target.get())) {
+                if (dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*innerMa))) {
+                    if (TypeRef* rt = ctx_.exprType(*innerMa)) {
+                        bool valueTyped =
+                            rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                            (rt->declaration->kind == ast::TypeDeclKind::Record ||
+                             rt->declaration->kind == ast::TypeDeclKind::Enum);
+                        if (valueTyped)
+                            ctx_.diagnostics().report(
+                                Severity::Error, as->target->span.begin,
+                                "assigning to a member of a value-typed property "
+                                "result modifies a discarded copy — the property "
+                                "get returns a value, so the write is lost (and "
+                                "bypasses the setter); read it into a local, "
+                                "modify it, then assign the whole value back "
+                                "through the property setter (§23.5)");
+                    }
+                }
+            }
         }
         // §6.5: a compound bitwise/shift assignment (`&= |= ^= <<= >>=`) carries
         // the same operand-type restriction as the binary bitwise operators — it
