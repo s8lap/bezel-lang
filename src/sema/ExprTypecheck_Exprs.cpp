@@ -3867,7 +3867,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                         lsym->name = sp.nakedBinding;
-                        lsym->decl = reinterpret_cast<const ast::Node*>(&sp);
+                        lsym->decl = sp.nakedAnchor.get();  // #1271 real Node anchor
                         lsym->declType = fieldTy;
                         armScope.names[sp.nakedBinding] = lsym;
                     } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
@@ -3906,8 +3906,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             if (!s.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = s.nakedBinding;
-                                lsym->decl =
-                                    reinterpret_cast<const ast::Node*>(&s);
+                                lsym->decl = s.nakedAnchor.get();  // #1271 real Node anchor
                                 armScope.names[s.nakedBinding] = lsym;
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(

@@ -210,3 +210,23 @@ BEZEL_TEST(codegen_577_var_destructure, nested_destructuring_case_stmt_726) {
         "  return r; "  // 8 * 4 = 32
         "end Main; end C;"), 32);
 }
+
+// #1271: calling a METHOD on a NAKED destructure binding (`Box(a) => a.M()`)
+// must not crash the compiler. The naked binding's LocalSymbol previously had
+// its `decl` set to a `reinterpret_cast<Node*>(&PositionalPattern)` — a non-Node
+// pointer — so any `dynamic_cast<...>(loc->decl)` in codegen (e.g. the
+// Subscription-disposal check on a `.Dispose()` call) read a bogus vtable and
+// SIGSEGV'd. The naked binding now anchors on a real BindingPattern Node. Here a
+// plain method call on the binding compiles and runs (returns the field value).
+BEZEL_TEST(codegen_577_var_destructure, method_call_on_naked_binding_no_crash_1271) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Box(V: int); "
+        "class C public static method Main(): int "
+        "  var b := new Box(41); "
+        "  return case b "
+        "    Box(a) => a.ToString().Length + a, "  // "41".Length(2) + 41 = 43
+        "    _ => 0, "
+        "  end; "
+        "end Main; end C;"), 43);
+}

@@ -1030,6 +1030,12 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
         if (nxt.kind == TokenKind::Punctuator &&
             (nxt.text == "," || nxt.text == ")")) {
             pp.nakedBinding = current_.text;
+            // #1271: mint a real BindingPattern Node as the naked binding's
+            // dynamic_cast-safe anchor (sema/codegen key its slot on this).
+            pp.nakedAnchor = std::make_unique<ast::BindingPattern>();
+            pp.nakedAnchor->name = current_.text;
+            pp.nakedAnchor->span.begin = current_.location;
+            pp.nakedAnchor->span.end = current_.location;
             advance();
             return pp;
         }

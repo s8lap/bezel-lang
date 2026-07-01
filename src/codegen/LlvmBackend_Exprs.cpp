@@ -11341,9 +11341,10 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // static type already determines which record it is). Extract each
     // positional field from the struct value and store it in a local alloca
     // so the arm body (and guard) can read the bound names.  The alloca is
-    // keyed on the PositionalPattern's address, mirroring the sema anchor
-    // (`lsym->decl = reinterpret_cast<const ast::Node*>(&sp)`) so that
-    // `localSlot()` resolves the identifier to the right slot.
+    // keyed on the naked binding's BindingPattern anchor (#1271:
+    // `sp.nakedAnchor.get()`), mirroring the sema anchor (`lsym->decl =
+    // sp.nakedAnchor.get()`), so `localSlot()` resolves the identifier to the
+    // right slot.
     if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(pat)) {
         if (!dp->typeName) return nullptr;
         // Find the record TypeSymbol by the pattern's last name part.
@@ -11416,7 +11417,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 if (!sp.nakedBinding.empty()) {
                     llvm::AllocaInst* slot = entryAlloca(fv->getType());
                     builder_.CreateStore(fv, slot);
-                    locals_[reinterpret_cast<const ast::Node*>(&sp)] = slot;
+                    locals_[sp.nakedAnchor.get()] = slot;  // #1271 real Node anchor
                 } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                                sp.pattern.get())) {
                     llvm::AllocaInst* slot = entryAlloca(fv->getType());
@@ -11465,7 +11466,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // anchor (`lsym->decl = reinterpret_cast<...>(&sp)`).
                 llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
                 builder_.CreateStore(fieldVal, slot);
-                const auto* key = reinterpret_cast<const ast::Node*>(&sp);
+                const auto* key = sp.nakedAnchor.get();  // #1271 real Node anchor
                 locals_[key] = slot;
             } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                            sp.pattern.get())) {

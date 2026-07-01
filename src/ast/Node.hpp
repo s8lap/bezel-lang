@@ -898,6 +898,15 @@ struct PositionalPattern {
     // names a binding of the matched component).
     std::unique_ptr<Pattern> pattern;
     std::string_view nakedBinding;
+    // #1271: a real, per-binding polymorphic Node anchor for a NAKED binding
+    // (`Box(a)`). The naked binding has no dedicated Pattern node of its own, so
+    // sema/codegen previously keyed its LocalSymbol/`locals_` slot on
+    // `reinterpret_cast<Node*>(&this)` — a non-Node pointer that CRASHED any
+    // `dynamic_cast<...>(loc->decl)` (e.g. isSubscriptionExpr) by reading a bogus
+    // vtable. The parser now mints a BindingPattern here (name == nakedBinding) so
+    // the anchor is a genuine dynamic_cast-safe Node. Null for a non-naked
+    // PositionalPattern (which anchors on its own `pattern` BindingPattern).
+    std::unique_ptr<BindingPattern> nakedAnchor;
 };
 
 struct DestructuringPattern : Pattern {             // `QualifiedName ( ... )`
