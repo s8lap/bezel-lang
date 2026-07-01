@@ -4138,6 +4138,58 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                    dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
         for (const auto& k : cl->keys) if (k) visitExpr(*k);
         for (const auto& v : cl->elements) if (v) visitExpr(*v);
+        // §15.4 (#1297): a Dictionary<K,V> / OwnedDictionary<K,V> literal (the
+        // dict form has a non-empty `keys` vector) with DUPLICATE keys is a
+        // compile error when all the duplicates are compile-time constants;
+        // only when duplicates are not statically detectable does the last
+        // value win at runtime. Detect duplicates among the literal-constant
+        // keys (int/string/char/bool) — the common case — and report the second
+        // occurrence. Non-constant / not-yet-handled keys are skipped (they fall
+        // back to the runtime last-wins path, never a false positive).
+        if (!cl->keys.empty()) {
+            auto constKeyCanon =
+                [](const ast::Expr* k) -> std::optional<std::string> {
+                if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(k)) {
+                    std::string s;
+                    for (char c : il->text) if (c != '_') s += c;
+                    if (s.empty()) return std::nullopt;
+                    bool neg = false;
+                    if (s[0] == '+' || s[0] == '-') { neg = (s[0]=='-'); s = s.substr(1); }
+                    int base = 10;
+                    if (s.size() > 2 && s[0] == '0' &&
+                        (s[1] == 'x' || s[1] == 'X')) { base = 16; s = s.substr(2); }
+                    else if (s.size() > 2 && s[0] == '0' &&
+                        (s[1] == 'b' || s[1] == 'B')) { base = 2; s = s.substr(2); }
+                    else if (s.size() > 2 && s[0] == '0' &&
+                        (s[1] == 'o' || s[1] == 'O')) { base = 8; s = s.substr(2); }
+                    try {
+                        long long v = std::stoll(s, nullptr, base);
+                        return std::string("i:") + std::to_string(neg ? -v : v);
+                    } catch (...) { return std::nullopt; }
+                }
+                if (auto* sl = dynamic_cast<const ast::StringLiteralExpr*>(k))
+                    return std::string("s:") + std::string(sl->text);
+                if (auto* cl2 = dynamic_cast<const ast::CharLiteralExpr*>(k))
+                    return std::string("c:") + std::string(cl2->text);
+                if (auto* bl = dynamic_cast<const ast::BoolLiteralExpr*>(k))
+                    return std::string("b:") + (bl->value ? "1" : "0");
+                return std::nullopt;
+            };
+            std::unordered_set<std::string> seenKeys;
+            for (const auto& k : cl->keys) {
+                if (!k) continue;
+                auto canon = constKeyCanon(k.get());
+                if (!canon) continue;
+                if (!seenKeys.insert(*canon).second) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, k->span.begin,
+                        "duplicate key in this dictionary literal \xE2\x80\x94 "
+                        "the same compile-time-constant key appears more than "
+                        "once, which is a compile error (\xC2\xA7""15.4); remove "
+                        "the redundant entry (the earlier value would be dead)");
+                }
+            }
+        }
     } else if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
         // §16: visit lo, hi, and step so that identifiers inside range
         // bounds (e.g. `1..n`) get their symbols resolved.

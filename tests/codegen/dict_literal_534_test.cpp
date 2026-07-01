@@ -30,6 +30,12 @@ int run(const std::string& src) {
     auto r = runJit(src);
     return r.ran ? r.exitCode : -999;
 }
+// #1297: a program that must be rejected by the front-end (typecheck) — it does
+// not run and reports at least one diagnostic.
+bool rejectedAtCompile(const std::string& src) {
+    auto r = runJit(src);
+    return !r.ran && r.diagnostics.hasErrors();
+}
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -199,4 +205,57 @@ BEZEL_TEST(dict_literal_534, empty_array_literal_still_array_r39) {
         "  using var a: Array<int> := []; a.Add(9); "
         "  return a.Get(0) + a.Length; "  // 9 + 1
         "end Main; end C;"), 10);
+}
+
+// ---------------------------------------------------------------------------
+// §15.4 (#1297): duplicate compile-time-constant keys in a dictionary literal
+// are a compile error (not silent runtime last-wins). Only non-statically-
+// detectable duplicates fall back to last-wins.
+// ---------------------------------------------------------------------------
+
+// §15.4: duplicate int-literal keys are rejected at compile time.
+BEZEL_TEST(dict_literal_534, duplicate_int_const_key_rejected_1297) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<int, int> := [1: 10, 2: 20, 1: 99]; "
+        "  return d.Count; "
+        "end Main; end C;"));
+}
+
+// §15.4: duplicate string-literal keys are rejected.
+BEZEL_TEST(dict_literal_534, duplicate_string_const_key_rejected_1297) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<string, int> := [\"a\": 1, \"b\": 2, \"a\": 3]; "
+        "  return d.Count; "
+        "end Main; end C;"));
+}
+
+// §15.4: the numeric value is compared, so `0x1` duplicates `1`.
+BEZEL_TEST(dict_literal_534, duplicate_int_key_hex_vs_dec_rejected_1297) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<int, int> := [1: 10, 0x1: 99]; "
+        "  return d.Count; "
+        "end Main; end C;"));
+}
+
+// §15.4: distinct constant keys are NOT rejected (control) — Count == 2.
+BEZEL_TEST(dict_literal_534, distinct_const_keys_accepted_1297) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<int, int> := [1: 10, 2: 99]; "
+        "  return d.Count; "  // 2
+        "end Main; end C;"), 2);
+}
+
+// §15.4: NON-constant duplicate keys are NOT statically detectable, so the
+// literal is accepted and runtime last-wins applies (control) — Count == 1.
+BEZEL_TEST(dict_literal_534, nonconst_duplicate_keys_last_wins_1297) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var k1 := 1; var k2 := 1; "
+        "  using var d: Dictionary<int, int> := [k1: 10, k2: 99]; "
+        "  return d.Count; "  // 1 (runtime last-wins)
+        "end Main; end C;"), 1);
 }
