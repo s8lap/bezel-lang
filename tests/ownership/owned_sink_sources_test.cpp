@@ -344,3 +344,62 @@ BEZEL_TEST(owned_sink_sources, move_owned_local_into_owned_arg_accepted_28_3) {
         "end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §19.3 / §28.8 (#1280): a record-DESTRUCTURING pattern binding is a
+// non-destructive BORROW of the matched field (the scrutinee's owner still owns
+// the value). Passing it to an `owned` sink lets the sink dispose a value the
+// real owner also disposes — a double-free. It must be rejected exactly as a
+// plain borrow local is. (Before the fix the ownership pass did not walk case-arm
+// bodies at all, so the §28.8 check never fired there.) REJECTED.
+BEZEL_TEST(owned_sink_sources, destructure_binding_into_owned_arg_rejected_1280) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Widget end Widget; record Box(A: Widget); "
+        "class Prog "
+        "  public static method Sink(owned w: Widget) end Sink; "
+        "  public static method Use(b: Box) "
+        "    case b Box(a) => Prog.Sink(a) end; "
+        "  end Use; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.8 (#1280) broader: a borrowed PARAMETER passed to an `owned` sink INSIDE a
+// case-statement arm is now caught (case-arm bodies are walked). REJECTED.
+BEZEL_TEST(owned_sink_sources, borrow_param_into_owned_arg_in_case_arm_rejected_1280) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Widget end Widget; "
+        "class Prog "
+        "  public static method Sink(owned w: Widget) end Sink; "
+        "  public static method Use(p: Widget, n: int) "
+        "    case n 0 => Prog.Sink(p), _ => do end, end; "
+        "  end Use; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1280) control: merely READING a destructure binding in the arm (not
+// handing it to an `owned` sink) is a legal borrow use. ACCEPTED.
+BEZEL_TEST(owned_sink_sources, destructure_binding_read_in_arm_accepted_1280) {
+    auto r = parseAndCheckOwnership(
+        "module M; record Inner(v: int); record Outer(i: Inner); "
+        "class C public static method Main(): int "
+        "  var o := new Outer(new Inner(9)); "
+        "  return case o Outer(Inner(x)) => x, _ => 0, end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.8 (#1280) control: a genuine owned transfer (`move` of an owned local)
+// INSIDE a case arm still compiles — the new case-arm walk does not over-reject.
+BEZEL_TEST(owned_sink_sources, owned_move_into_owned_arg_in_case_arm_accepted_1280) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Widget end Widget; "
+        "class Prog "
+        "  public static method Sink(owned w: Widget) end Sink; "
+        "  public static method Use(n: int) "
+        "    case n 0 => do var w := new Widget(); Prog.Sink(move w); end, "
+        "           _ => do end, end; "
+        "  end Use; "
+        "end Prog;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

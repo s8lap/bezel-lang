@@ -2788,6 +2788,21 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     if (dynamic_cast<sema::FieldSymbol*>(sym)) {
         return isBorrowableType(ctx_.exprType(*id));
     }
+    // §19.3 / §28.8 (#1280): a record-DESTRUCTURING pattern binding (`case b
+    // Box(a) => Prog.Sink(a)`) is a non-destructive BORROW of the matched field —
+    // the scrutinee's owner still owns the value; the binding does not. Its
+    // LocalSymbol's `decl` is a `BindingPattern` (the naked binding's synthesized
+    // anchor per #1271, or an explicit `var x`), which distinguishes it from a
+    // `var`-declared local (decl = LocalDecl, tracked in `states_` above). It is
+    // NOT tracked in `states_`, so the `lookupState` Borrowed branch missed it and
+    // it fell through to "not a borrow" — letting an `owned` sink dispose a value
+    // the real owner also disposes (a double-free). Flag it as a borrow when the
+    // bound field is a reference type (a record field is always non-owning, §9.7).
+    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        if (loc->decl &&
+            dynamic_cast<const ast::BindingPattern*>(loc->decl))
+            return isBorrowableType(ctx_.exprType(*id));
+    }
     // Anything else we cannot positively classify as a borrow: conservatively
     // NOT flagged, so a valid transfer is never over-rejected. // per §28.8
     return false;

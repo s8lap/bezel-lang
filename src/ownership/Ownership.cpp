@@ -1188,6 +1188,30 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         if (es->expr) handleDischarge(*es->expr);
         return;
     }
+    // §19 / §28.8 (#1280): a `case` STATEMENT. The CFG appends a CaseStmt as a
+    // single opaque node (flow/CFG.cpp visitStmt has no case handler), so this
+    // transfer must walk the scrutinee, each arm's guard, and each arm body
+    // itself — otherwise the ownership checks (notably the §28.8 borrow→`owned`
+    // argument check) never fire on a call inside a case arm (`Box(a) =>
+    // Prog.Sink(a)` handed the borrowed destructure binding `a` to an `owned`
+    // sink undetected → double-free). Each arm is a mutually-exclusive branch;
+    // visit it from the pre-case state and restore afterward (conservative — the
+    // arm-local discharge tracking does not leak into the post-case state).
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) checkRead(*cs->scrutinee, /*selfTarget=*/false);
+        BlockState saved = states_;
+        for (const auto& arm : cs->arms) {
+            states_ = saved;
+            if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody) handleDischarge(*arm.exprBody);
+            } else {
+                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+            }
+        }
+        states_ = std::move(saved);
+        return;
+    }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
             handleDischarge(*ds->value);
