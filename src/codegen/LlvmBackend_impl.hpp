@@ -3371,6 +3371,19 @@ private:
     llvm::Value* wrapArrayAsIEnumerable(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
 
+    // §29.2 / §4.3 (#1310): if `targetTy` is the pure declaration-less
+    // `IEnumerable<T>` and the source value `srcExpr` is a dense array-backed
+    // collection / a (Owned)LinkedList / a user class implementing IEnumerable,
+    // wrap `v` into the vtable-backed enumerator (wrapArrayAsIEnumerable /
+    // wrapLinkedListAsIEnumerable / wrapUserClassAsIEnumerable). Otherwise
+    // return `v` unchanged. Shared by the call-argument path (buildOrderedArgs),
+    // the local-decl init path, and the method-RETURN coercion so a value
+    // coerced to IEnumerable<T> is ALWAYS a real vtable object (a raw
+    // bz_array_t* returned as IEnumerable would SIGSEGV on iteration/disposal).
+    llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
+                                            const sema::TypeRef* targetTy,
+                                            const ast::Expr* srcExpr);
+
     // #1069: wrap a (Owned)LinkedList<T> — node-based bz_llist, NOT array-backed —
     // in the same vtable-backed enumerator the array wrapper produces, but walking
     // nodes (bz_llist_first_node / node_next / node_value_ptr) instead of an index.

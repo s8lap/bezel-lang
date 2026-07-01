@@ -1111,6 +1111,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (v && rs->value && currentReturnTypeNode_)
             v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
                              rs->value.get());
+        // §29.2 / §4.3 (#1310): a value returned as `IEnumerable<T>` must be a
+        // vtable-backed enumerator, not a raw bz_array_t* / class instance — the
+        // caller's for-in and its scope-end iterEnumDispose both dispatch through
+        // the value's vtable (a raw array → SIGSEGV). Wrap it here as the
+        // call-argument and local-decl init paths already do.
+        if (v && rs->value && currentReturnTypeNode_)
+            v = wrapAsIEnumerableForTarget(
+                v, ctx_.resolvedType(*currentReturnTypeNode_), rs->value.get());
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the

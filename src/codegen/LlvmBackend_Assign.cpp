@@ -2883,6 +2883,49 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 }
 
 
+// §29.2 / §4.3 (#1310): shared array/user-class → IEnumerable<T> wrapping. When
+// a value is coerced to the pure declaration-less `IEnumerable<T>` (a call
+// argument, a local-decl init, or — the #1310 gap — a method RETURN), the value
+// must become a real vtable-backed enumerator, because the IEnumerable dispatch
+// paths (for-in via lowerIEnumerableBuiltinFor, and the scope-end iterEnumDispose
+// via vtable slot 1) read the value's first word as a vtable pointer. A raw
+// bz_array_t* / user-class instance has no such vtable → SIGSEGV on iteration or
+// disposal. The wrapper SHARES the source (borrowed pointer, no ownership
+// transfer), so an owning collection still disposes its elements once at its own
+// binder's scope end (no double-free). Mirrors the buildOrderedArgs argument
+// path (#1067/#1068/#552).
+llvm::Value* Emitter::wrapAsIEnumerableForTarget(
+        llvm::Value* v, const sema::TypeRef* targetTy,
+        const ast::Expr* srcExpr) {
+    if (!v || !targetTy || !srcExpr) return v;
+    if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
+          !targetTy->declaration && targetTy->astNode &&
+          targetTy->astNode->name && !targetTy->astNode->name->parts.empty() &&
+          targetTy->astNode->name->parts[0] == "IEnumerable"))
+        return v;
+    sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
+    std::string_view an;
+    if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
+        actualTy->astNode && actualTy->astNode->name &&
+        !actualTy->astNode->name->parts.empty())
+        an = actualTy->astNode->name->parts[0];
+    bool actualIsArray =
+        (an == "Array" || an == "OwnedArray" || an == "OwnedBuffer" ||
+         an == "Stack" || an == "OwnedStack" ||
+         an == "Queue" || an == "OwnedQueue");
+    if (actualIsArray)
+        return wrapArrayAsIEnumerable(v, targetTy);
+    if (actualTy && isLinkedListTypeName(actualTy))
+        return wrapLinkedListAsIEnumerable(v, targetTy);
+    // A user class implementing IEnumerable<T> (declaration-carrying). A source
+    // whose type is ALREADY a declaration-less IEnumerable (an alias / another
+    // wrapped value) has no declaration and passes through unchanged.
+    if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
+        actualTy->declaration)
+        return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy);
+    return v;
+}
+
 // §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
 // Layout:  { ptr vtable, ptr arr, i64 idx, i64 esz }
 // Vtable:  [0]=td(self), [1]=Dispose, [2]=MoveNext→i1, [3]=Current→T
@@ -3685,69 +3728,16 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // object's first word) sees a real box rather than the raw value
             // bytes. boxForTarget is a no-op for reference arguments (#399).
             v = boxForTarget(v, formalTy, a.value.get());
-            // §29.2 (#437): when an Array<T> is passed to a formal parameter
-            // typed as `IEnumerable<T>` (the pure iteration-only interface),
-            // wrap the raw bz_array_t* in a type-specific vtable-backed
-            // enumerator whose MoveNext/Current have the SAME protocol as an
-            // iterator state machine (Current returns elemTy directly, not a
-            // void* pointer).  Only `IEnumerable<T>` is wrapped — the richer
-            // interfaces (IReadOnlyList, ICollection, etc.) also support
-            // indexer access, which the wrapped enumerator does NOT provide,
-            // so wrapping them would break callee indexer operations.
-            // Without wrapping, a callee iterating an IEnumerable<T> parameter
-            // with vtable dispatch would interpret the bz_array_t layout as a
-            // vtable-backed object → crash.
-            if (formalTy && formalTy->kind == sema::TypeRef::Kind::Named &&
-                !formalTy->declaration &&
-                formalTy->astNode && formalTy->astNode->name &&
-                !formalTy->astNode->name->parts.empty() &&
-                formalTy->astNode->name->parts[0] == "IEnumerable") {
-                // Check if the ACTUAL argument type is a DENSE bz_array_t-backed
-                // collection whose index-order walk (bz_array_len /
-                // bz_array_ptr_at, used by wrapArrayAsIEnumerable) matches its
-                // iteration — exactly the set lowerArrayFor iterates directly:
-                // Array, OwnedArray, OwnedBuffer, Stack/OwnedStack, Queue/
-                // OwnedQueue. #1067 / #1068: without wrapping, the callee
-                // iterating the IEnumerable<T> parameter interprets the
-                // bz_array_t layout as a vtable-backed object and calls a null
-                // slot (SIGSEGV). The wrapper SHARES the collection (its
-                // GetEnumerator clones over a borrowed pointer — no ownership
-                // transfer), so an owning collection still disposes its elements
-                // exactly once at its binder's scope end (no double-free).
-                // EXCLUDED: Set/OwnedSet (bz_array_t "collection" but the dense
-                // walk does not yield its logical elements — its for-in codegen
-                // is itself unimplemented, #1069) and LinkedList/OwnedLinkedList
-                // (node-based bz_llist, not array-backed, #1068-followup).
-                sema::TypeRef* actualTy = ctx_.exprType(*a.value);
-                std::string_view an;
-                if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
-                    actualTy->astNode && actualTy->astNode->name &&
-                    !actualTy->astNode->name->parts.empty())
-                    an = actualTy->astNode->name->parts[0];
-                bool actualIsArray =
-                    (an == "Array" || an == "OwnedArray" || an == "OwnedBuffer" ||
-                     an == "Stack" || an == "OwnedStack" ||
-                     an == "Queue" || an == "OwnedQueue");
-                if (actualIsArray) {
-                    v = wrapArrayAsIEnumerable(v, formalTy);
-                }
-                // #1069: (Owned)LinkedList<T> is node-based (bz_llist), not
-                // array-backed — it needs the node-walking wrapper instead.
-                else if (actualTy && isLinkedListTypeName(actualTy)) {
-                    v = wrapLinkedListAsIEnumerable(v, formalTy);
-                }
-                // §29.2 (#552): when a user class (implementing IEnumerable<T>)
-                // is passed to an IEnumerable<T> parameter, wrap it in a thin
-                // sm-compatible enumerator that eagerly calls GetEnumerator() and
-                // delegates MoveNext/Current/Dispose to the concrete enumerator
-                // class. Without this the callee's vtable-dispatch path would
-                // call vtable[2] (Dispose on the class) instead of MoveNext.
-                else if (actualTy &&
-                         actualTy->kind == sema::TypeRef::Kind::Named &&
-                         actualTy->declaration) {
-                    v = wrapUserClassAsIEnumerable(v, actualTy->declaration, formalTy);
-                }
-            }
+            // §29.2 (#437/#1067/#1068/#552): when an Array<T> / (Owned)LinkedList
+            // / user class is passed to a formal `IEnumerable<T>` parameter, wrap
+            // it in the vtable-backed enumerator so the callee's vtable dispatch
+            // does not misread a raw bz_array_t* / class instance (SIGSEGV). The
+            // wrapper SHARES the source (borrowed), so an owning collection still
+            // disposes its elements once at its own binder's scope end. Only the
+            // pure `IEnumerable<T>` is wrapped — richer interfaces keep the
+            // array-backed protocol. Shared with the local-decl init and the
+            // method-RETURN coercion (#1310).
+            v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get());
         }
         ordered[idx] = v;
         orderedExprs[idx] = a.value.get();

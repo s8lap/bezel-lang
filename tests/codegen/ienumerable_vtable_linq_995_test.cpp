@@ -449,3 +449,96 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "    return Cell.n; "
         "  end Main; end C;"), 0);
 }
+
+// §29.2 / §4.3 / #1310: a method RETURNING an owned OwnedArray<T> field coerced
+// to its `IEnumerable<T>` view — binding the result then letting it leave scope
+// SIGSEGV'd (no iteration required): the raw bz_array_t* was returned unwrapped,
+// and the caller's scope-end disposal dispatched through the array's first word
+// as if it were a vtable (null-fn-pointer call). The return-coercion sites
+// (ReturnStmt, `=> expr` body) now route through wrapAsIEnumerableForTarget like
+// the argument and local-decl paths.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_field_returned_as_ienumerable_bind_only_1310) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Dog end Dog; "
+        "class Holder "
+        "  private owned arr: OwnedArray<Dog>; "
+        "  public constructor() arr := new OwnedArray<Dog>(); end constructor; "
+        "  public method Items(): IEnumerable<Dog> => arr; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var h := new Holder(); "
+        "    var e := h.Items(); "
+        "    return 7; "
+        "  end Main; end C;"), 7);
+}
+
+// §29.2 / #1310: iterating the IEnumerable<T>-typed return (`=> expr` body)
+// walks the shared array through the wrapper's vtable protocol.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_field_returned_as_ienumerable_iterated_1310) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Holder "
+        "  private owned arr: OwnedArray<int>; "
+        "  public constructor() "
+        "    arr := new OwnedArray<int>(); arr.Add(3); arr.Add(4); "
+        "  end constructor; "
+        "  public method Items(): IEnumerable<int> => arr; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var h := new Holder(); "
+        "    var s := 0; for var x in h.Items() do s := s + x; end; "
+        "    return s; "
+        "  end Main; end C;"), 7);
+}
+
+// §29.2 / #1310: the explicit-ReturnStmt path (LlvmBackend_Stmts.cpp) wraps the
+// same way as the `=> expr` path; two independent coerced returns (one iterated,
+// one bind-only) from the same owned field are both safe.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_field_returned_as_ienumerable_return_stmt_1310) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Holder "
+        "  private owned arr: OwnedArray<int>; "
+        "  public constructor() "
+        "    arr := new OwnedArray<int>(); arr.Add(5); "
+        "  end constructor; "
+        "  public method Items(): IEnumerable<int> "
+        "    return arr; "
+        "  end Items; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var h := new Holder(); "
+        "    var s := 0; for var x in h.Items() do s := s + x; end; "
+        "    var e := h.Items(); "
+        "    return s; "
+        "  end Main; end C;"), 5);
+}
+
+// §29.2 / §28.3 / #1310 disposal: the returned view SHARES the owned field's
+// array — binding it disposes NO elements, and the Holder's disposal at scope
+// end disposes each element exactly once (n=0 while the view is live inside the
+// block, 2 disposals after → rc 0*10+2).
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           owned_field_returned_as_ienumerable_disposed_once_1310) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Dog public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end Dog; "
+        "class Holder "
+        "  private owned arr: OwnedArray<Dog>; "
+        "  public constructor() "
+        "    arr := new OwnedArray<Dog>(); arr.Add(new Dog()); arr.Add(new Dog()); "
+        "  end constructor; "
+        "  public method Items(): IEnumerable<Dog> => arr; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    var n := 0; "
+        "    do using var h := new Holder(); "
+        "       var e := h.Items(); n := Dog._n; end; "
+        "    return n * 10 + Dog._n; "
+        "  end Main; end C;"), 2);
+}

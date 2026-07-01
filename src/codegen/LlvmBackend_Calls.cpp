@@ -12797,6 +12797,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
             if (rv && ci.returnType)
                 rv = boxForTarget(rv, ctx_.resolvedType(*ci.returnType),
                                   ci.exprBody);
+            // §29.2 / §4.3 (#1310): wrap an array/user-class result returned as
+            // IEnumerable<T> into the vtable-backed enumerator (raw array → the
+            // caller's for-in / iterEnumDispose SIGSEGVs). Mirrors the other
+            // return-coercion sites.
+            if (rv && ci.returnType)
+                rv = wrapAsIEnumerableForTarget(
+                    rv, ctx_.resolvedType(*ci.returnType), ci.exprBody);
             if (!emitReturn(specFn, rv)) emitImplicitReturn(specFn);
         }
     } else {
