@@ -442,3 +442,34 @@ BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
         "  return (1 if a < b else 0); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §25 / §14.1 (#1270): a binary user-operator on a GENERIC type
+// (`operator +(a,b: Box<T>)`) matched its operands by DECLARATION only, so a
+// MISMATCHED instantiation (`Box<int> + Box<bool>`) was wrongly accepted — the
+// single type parameter `T` cannot unify to both `int` and `bool`. The operator
+// must not apply; the use is rejected.
+BEZEL_TEST(generic_operator_mismatched_instantiation_1270,
+           box_int_plus_box_bool_rejected) {
+    auto r = parseSema(
+        "module M; record Box<T>(value: T) "
+        "  public static method operator +(a: Box<T>, b: Box<T>): Box<T> => "
+        "    new Box<T>(a.value); end Box; "
+        "class C public static method Main(): int "
+        "  var a := new Box<int>(3); var b := new Box<bool>(true); "
+        "  var r := a + b; return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Control: the MATCHING instantiation (`Box<int> + Box<int>`) still resolves —
+// `T` unifies to `int` on both operands. Must NOT be rejected.
+BEZEL_TEST(generic_operator_mismatched_instantiation_1270,
+           box_int_plus_box_int_not_rejected) {
+    auto r = parseSema(
+        "module M; record Box<T>(value: T) "
+        "  public static method operator +(a: Box<T>, b: Box<T>): Box<T> => "
+        "    new Box<T>(a.value); end Box; "
+        "class C public static method Main(): int "
+        "  var a := new Box<int>(3); var b := new Box<int>(4); "
+        "  var r := a + b; return r.value; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

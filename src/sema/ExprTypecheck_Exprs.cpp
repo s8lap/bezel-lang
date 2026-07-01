@@ -1858,12 +1858,45 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             return at->kind == TypeRef::Kind::Primitive;
         return false;
     };
+    // #1270 (§25 / §14.1): `operandMatchesParam` matches a Named operand against a
+    // Named parameter by DECLARATION only, ignoring generic type args — so a binary
+    // operator on a generic type (`operator +(a,b: Box<T>)`) wrongly accepted
+    // MISMATCHED instantiations (`Box<int> + Box<bool>`, where the single param `T`
+    // cannot unify to both). When the operator's declaring type is generic, unify
+    // both parameter types against their operands into ONE binding map: a
+    // type-parameter name bound to two conflicting concrete types fails
+    // (unifyReturnAgainstTarget checks consistency), so the operator does not apply.
+    // Non-generic operators (empty genericParams) and consistent instantiations are
+    // unaffected.
+    auto genericArgsConsistent = [&](MethodSymbol* m) -> bool {
+        if (!m->parent || m->parent->genericParams.empty()) return true;
+        std::unordered_set<std::string_view> paramNames;
+        for (Symbol* gp : m->parent->genericParams)
+            if (gp) paramNames.insert(gp->name);
+        auto declTypeOf = [&](Symbol* paramSym) -> TypeRef* {
+            auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
+            if (!ps) return nullptr;
+            return ps->declType ? ctx_.resolvedType(*ps->declType)
+                                : ps->resolvedDeclType;
+        };
+        std::unordered_map<std::string_view, TypeRef*> solved;
+        TypeRef* p0 = declTypeOf(m->params[0]);
+        TypeRef* p1 = declTypeOf(m->params[1]);
+        TypeRef* a0 = be.left ? ctx_.exprType(*be.left) : nullptr;
+        TypeRef* a1 = be.right ? ctx_.exprType(*be.right) : nullptr;
+        if (p0 && a0 && !unifyReturnAgainstTarget(p0, a0, paramNames, solved))
+            return false;
+        if (p1 && a1 && !unifyReturnAgainstTarget(p1, a1, paramNames, solved))
+            return false;
+        return true;
+    };
     auto tryOperand = [&](const ast::Expr* operand) -> MethodSymbol* {
         // #1131: examine EVERY overload of the operator declared on `operand`'s
         // type and return the first whose parameters match the operands in order.
         for (MethodSymbol* m : candidatesOn(operand)) {
             if (operandMatchesParam(be.left.get(), m->params[0]) &&
-                operandMatchesParam(be.right.get(), m->params[1]))
+                operandMatchesParam(be.right.get(), m->params[1]) &&
+                genericArgsConsistent(m))
                 return m;
         }
         return nullptr;
