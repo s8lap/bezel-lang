@@ -1659,6 +1659,24 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
     if (!isObjectOrInterfaceTarget(declTy)) return v;
     const sema::TypeRef* srcTy = ctx_.exprType(*init);
     if (!srcTy) return v;
+    // #1279 / §8.6 / §14.1: a generic value-type parameter `T` / `T?` (declared
+    // `where T: value`) returned where `Object`/`Object?` is expected must be
+    // boxed like its CONCRETE monomorphized type. Under an active
+    // monomorphization the source's sema type is still the bare type-parameter
+    // ref (declaration == null), which isBoxableValueType / isNullableValueTy do
+    // not recognise as a value type — so the box was skipped and the raw
+    // `{i8, T}` / `T` value was `ret`'d into the `ptr` (Object) return (IR-verify
+    // failure). Resolve the parameter to its concrete value type first (reusing
+    // the #567/#568 substitution helpers), then box that.
+    sema::TypeRef concrHolder;
+    if (srcTy->kind == sema::TypeRef::Kind::Named && !srcTy->declaration) {
+        if (srcTy->nullable) {
+            if (nullableTypeParamConcrete(srcTy, concrHolder)) srcTy = &concrHolder;
+        } else if (const sema::TypeRef* c = resolveTypeParamRef(srcTy);
+                   c && c != srcTy) {
+            srcTy = c;
+        }
+    }
     // Only box a value-typed source. A reference source (class/interface/
     // string/Object) already lowers to a pointer and reaches Object directly.
     if (!isBoxableValueType(srcTy) && !isNullableValueTy(srcTy)) return v;

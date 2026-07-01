@@ -229,3 +229,36 @@ BEZEL_TEST(codegen_boxing_regress, ref_interface_dispatch_class) {
         "using var s: IShape := new Square(); return s.Area(); "
         "end Main; end C;"), 9);
 }
+
+// #1279 (§8.6 / §14.1): a generic value-type parameter returned where Object /
+// Object? is expected (`Box<T>(x: T?): Object? where T: value  return x;`) must
+// be boxed like its concrete monomorphized type. Under monomorphization the
+// source's sema type is still the bare parameter `T?` (declaration null), which
+// the box guard did not recognise as a value type — so the box was skipped and
+// the raw `{i8, int}` value was returned into the `ptr` return (IR-verify fail).
+// The parameter is now resolved to its concrete value type before boxing; the
+// result is a genuine box that round-trips through `is`/`as`.
+BEZEL_TEST(codegen_boxing_regress, generic_nullable_value_param_boxed_return_1279) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class U "
+        "  public static method Box<T>(x: T?): Object? where T: value "
+        "    return x; end Box; end U; "
+        "class C public static method Main(): int "
+        "  var x: int? := 33; var o := U.Box<int>(x); "
+        "  return (33 if o is not null else -1); "
+        "end Main; end C;"), 33);
+}
+
+// #1279 non-nullable variant: `Box<T>(x: T): Object where T: value` boxes a bare
+// generic value, and the box round-trips (unbox via `as int`).
+BEZEL_TEST(codegen_boxing_regress, generic_value_param_boxed_return_roundtrips_1279) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class U "
+        "  public static method Box<T>(x: T): Object where T: value "
+        "    return x; end Box; end U; "
+        "class C public static method Main(): int "
+        "  var o := U.Box<int>(41); "
+        "  if o is int then var n := o as int; return n! + 1; end; "  // 42
+        "  return -1; "
+        "end Main; end C;"), 42);
+}
