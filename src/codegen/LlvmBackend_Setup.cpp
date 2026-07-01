@@ -6654,6 +6654,29 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
                 dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
                 wrappedHere;
+            // §29.11 (#1294): `using var e := src.GetEnumerator()` where `src` is a
+            // NAMED value (IdentifierExpr) and GetEnumerator on a vtable-backed
+            // IEnumerable returns the RECEIVER IDENTITY (LlvmBackend_Calls.cpp
+            // #1102C) — so `e` ALIASES `src`. If `src` is a separately-disposed
+            // owned local, registering a second disposal here double-frees the
+            // same struct (SIGSEGV). Treat it as a bare alias — the named receiver
+            // is the sole disposer. The receiver-is-a-TEMPORARY form
+            // `Gen().GetEnumerator()` has no named owner, so `e` still owns it (its
+            // receiver is a CallExpr, not an IdentifierExpr) and is unaffected.
+            if (ownsSource) {
+                if (auto* ce = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get())) {
+                    if (auto* gma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get())) {
+                        if (gma->member == "GetEnumerator" && gma->target &&
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                gma->target.get()) &&
+                            isVtableBackedIEnumerableType(
+                                ctx_.exprType(*gma->target)))
+                            ownsSource = false;
+                    }
+                }
+            }
             if (ownsSource) {
                 Disposal d{it->second, nullptr};
                 d.iterEnumDispose = true;

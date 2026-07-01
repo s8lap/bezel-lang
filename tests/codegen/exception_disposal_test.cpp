@@ -1620,4 +1620,50 @@ BEZEL_TEST(codegen_excdisp_1292, owning_literal_two_before_throw_both_disposed) 
         "end Main; end C;", 0);
 }
 
+// --------------------------------------------------------------------------
+// [1294] §29.7/§29.11 — manual `using var e := src.GetEnumerator()` where `src`
+// is a NAMED owned local holding a vtable-backed IEnumerable. GetEnumerator
+// returns the receiver identity, so `e` aliases `src`; registering a second
+// disposal double-freed the same struct (SIGSEGV). Now `e` is a bare alias — the
+// named receiver `src` is the sole disposer (disposed exactly once).
+// --------------------------------------------------------------------------
+
+// #1294: the exact §29.7 idiom, with the IEnumerable held in a named local `src`.
+// Runs to completion (5) and is LSan-clean (the enumerator struct is disposed
+// exactly once, by `src`'s scope-end disposal — no double-free).
+BEZEL_TEST(codegen_excdisp_1294, manual_getenumerator_on_named_local_no_double_free) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class C "
+        "  public static method Gen(): IEnumerable<int> "
+        "    yield return 1; yield return 2; "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    var src := Gen(); "
+        "    using var e := src.GetEnumerator(); "
+        "    while e.MoveNext() do end; "
+        "    return 5; "
+        "  end Main; "
+        "end C;", 5);
+}
+
+// #1294 regression guard: the TEMPORARY form `Gen().GetEnumerator()` (no named
+// owner) still owns and disposes its enumerator exactly once — 2 elements
+// drained, LSan-clean.
+BEZEL_TEST(codegen_excdisp_1294, manual_getenumerator_on_temporary_still_disposes) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class C "
+        "  public static method Gen(): IEnumerable<int> "
+        "    yield return 1; yield return 2; "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    using var e := C.Gen().GetEnumerator(); "
+        "    var n := 0; "
+        "    while e.MoveNext() do n := n + 1; end; "
+        "    return n; "  // 2
+        "  end Main; "
+        "end C;", 2);
+}
+
 }  // namespace
