@@ -181,3 +181,80 @@ BEZEL_TEST(builtin_collection_compound_overload_626, dict_str_int_plus_regressio
         "end C;"),
         15);
 }
+
+// ---------------------------------------------------------------------------
+// §17.6 (#1299): the index subexpression is evaluated EXACTLY ONCE
+// ---------------------------------------------------------------------------
+//
+// When the element type has a user-defined `operator +`, the array OP= path
+// desugared to get → overload → set, but the write-back went through
+// lowerCollectionIndexerSet(*ix, …), which RE-lowers ix->target AND
+// ix->indices[0].value — so a side-effecting index (`arr[Idx()] += …`) was
+// evaluated twice: the getter read one slot and the setter wrote a different
+// one, silently corrupting data. §17.6 requires each LHS subexpression to be
+// "evaluated exactly once". The fix reuses the already-evaluated recv/idx for
+// the write-back (matching the non-overload path). Idx() counts its calls via
+// the static N.
+
+// The side-effecting index must fire exactly once → getter and setter target
+// the SAME slot. Idx() returns 0 on its (single) call, so arr[0] becomes
+// Money(10+100)=110 and arr[1] stays 20.  110*1000 + 20 = 110020.
+BEZEL_TEST(builtin_collection_compound_overload_626, array_overload_index_evaluated_once_17_6) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kMoneyRecord +
+        "class C "
+        "  public static N: int; "
+        "  public static method Idx(): int "
+        "    var r := N; N := N + 1; return r; "
+        "  end Idx; "
+        "  public static method Main(): int "
+        "    N := 0; "
+        "    using var arr := new Array<Money>(); "
+        "    arr.Add(new Money(10)); arr.Add(new Money(20)); "
+        "    arr[Idx()] += new Money(100); "
+        "    return arr[0].Amount * 1000 + arr[1].Amount; "  // 110020
+        "  end Main; "
+        "end C;"),
+        110020);
+}
+
+// Direct assertion that Idx() is called exactly once (§17.6): Main returns N,
+// the call count, which must be 1 (was 2 before the fix).
+BEZEL_TEST(builtin_collection_compound_overload_626, array_overload_index_call_count_is_one_17_6) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kMoneyRecord +
+        "class C "
+        "  public static N: int; "
+        "  public static method Idx(): int "
+        "    var r := N; N := N + 1; return r; "
+        "  end Idx; "
+        "  public static method Main(): int "
+        "    N := 0; "
+        "    using var arr := new Array<Money>(); "
+        "    arr.Add(new Money(10)); arr.Add(new Money(20)); "
+        "    arr[Idx()] += new Money(100); "
+        "    return N; "  // exactly one call
+        "  end Main; "
+        "end C;"),
+        1);
+}
+
+// The non-overload (intrinsic int) path was already single-evaluation; guard it
+// stays so — Idx() fires once, arr[0] becomes 110, arr[1] stays 20.
+BEZEL_TEST(builtin_collection_compound_overload_626, array_int_index_evaluated_once_17_6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static N: int; "
+        "  public static method Idx(): int "
+        "    var r := N; N := N + 1; return r; "
+        "  end Idx; "
+        "  public static method Main(): int "
+        "    N := 0; "
+        "    using var arr := new Array<int>(); "
+        "    arr.Add(10); arr.Add(20); "
+        "    arr[Idx()] += 100; "
+        "    return arr[0] * 1000 + arr[1] + N; "  // 110020 + 1 = 110021
+        "  end Main; "
+        "end C;"),
+        110021);
+}

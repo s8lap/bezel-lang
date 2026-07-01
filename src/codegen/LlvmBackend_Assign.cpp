@@ -1821,6 +1821,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     // mirrors the #610 overload check in lowerStmt and the dict branch above.
     // emitCompoundOp cannot handle struct operands (LLVM rejects
     // sadd.with.overflow on struct types), so this must be checked FIRST.
+    llvm::Value* newVal = nullptr;
     {
         const sema::TypeRef* elemTyRef =
             (recvTy && !recvTy->genericArgs.empty())
@@ -1838,21 +1839,26 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             }
         }
         if (opMethod) {
-            // §25.1: desugar to get → overload call → set.
-            // Use lowerCollectionIndexerSet to write back (handles
-            // bz_array_set / bz_array_set_disposing uniformly).
+            // §25.1: desugar to get → overload call → set. The write-back MUST
+            // reuse the already-evaluated recv/idx (the shared block below)
+            // rather than re-lowering `*ix` via lowerCollectionIndexerSet —
+            // that helper re-evaluates BOTH ix->target and ix->indices[0].value,
+            // double-evaluating a side-effecting index subexpression
+            // (`arr[Idx()] += …`) and violating §17.6 "evaluated exactly once"
+            // (#1299): the get read one slot and the set wrote another.
             std::vector<llvm::Value*> args{cur, rhs};
-            llvm::Value* res =
-                emitMethodCall(opMethod, args, /*baseQualified=*/false);
-            if (!res) return false;
-            return lowerCollectionIndexerSet(*ix, res, /*valueExpr=*/nullptr);
+            newVal = emitMethodCall(opMethod, args, /*baseQualified=*/false);
+            if (!newVal) return false;
         }
     }
 
-    llvm::Value* newVal = emitCompoundOp(
-        op, cur, rhs, elemTy->isFloatingPointTy(),
-        isUnsignedTargetExpr(*as.target));
-    if (!newVal) return false;
+    // Non-overload path: compute the new value with the built-in operator.
+    if (!newVal) {
+        newVal = emitCompoundOp(
+            op, cur, rhs, elemTy->isFloatingPointTy(),
+            isUnsignedTargetExpr(*as.target));
+        if (!newVal) return false;
+    }
 
     // --- Lift nullable-value-typed result (mirrors lowerCollectionIndexerSet
     //     fix #455 / §4.5). ---
