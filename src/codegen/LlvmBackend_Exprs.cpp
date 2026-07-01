@@ -7605,6 +7605,24 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     // classStruct routes records to recordStruct (no vtable), so this is
     // the right layout for both forms.
     llvm::StructType* st = classStruct(t);
+    // #1273 (§9.5 / §7.5): a `with` on a NULLABLE record source (`p: P?`). `src`
+    // is the tagged `{i8, P}` nullable struct value, but the record-copy below
+    // needs the BARE record `P`. Unwrap the payload (field 1) for the copy and
+    // remember the tag; re-wrap the result with that tag at the return (so a null
+    // source propagates to a null result). Without this the copy treated the
+    // `{i8, P}` value as a bare `P` — mismatched GEP/store layout — and a later
+    // `q!.A` hit nullablePrimHasValue on a wrongly-shaped value (LLVM ICmp
+    // type-mismatch → SIGABRT).
+    const bool srcNullableRecord =
+        isRecord && rt && rt->nullable &&
+        rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+        rt->declaration->kind == ast::TypeDeclKind::Record &&
+        !src->getType()->isPointerTy();
+    llvm::Value* nullableTag = nullptr;
+    if (srcNullableRecord) {
+        nullableTag = builder_.CreateExtractValue(src, {0u}, "with.nul.tag");
+        src = builder_.CreateExtractValue(src, {1u}, "with.nul.payload");
+    }
     // The GEP base: a spilled copy for a record, the instance pointer for
     // a class.
     llvm::Value* base = src;
@@ -7800,7 +7818,18 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     }
     // Record: return the modified copy by value. Class: return the mutated
     // instance pointer.
-    return isRecord ? builder_.CreateLoad(st, base) : base;
+    llvm::Value* result = isRecord ? builder_.CreateLoad(st, base) : base;
+    // #1273: re-wrap the copied record into the tagged `{i8, P}` nullable struct,
+    // carrying the source's tag so a null source stays null.
+    if (srcNullableRecord && nullableTag) {
+        llvm::StructType* nst =
+            llvm::StructType::get(llvm_, {nullablePrimHasValTy(), st});
+        llvm::Value* wrapped = llvm::UndefValue::get(nst);
+        wrapped = builder_.CreateInsertValue(wrapped, nullableTag, {0u});
+        wrapped = builder_.CreateInsertValue(wrapped, result, {1u});
+        return wrapped;
+    }
+    return result;
 }
 
 

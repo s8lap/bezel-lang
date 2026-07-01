@@ -78,3 +78,31 @@ BEZEL_TEST(codegen_cg29c, with_override_nullable_record_field_to_null) {
         "  return o2.i!.v; "
         "end Main; end C;"), 42);
 }
+
+// #1273 (§9.5 / §7.5): a `with` on a NULLABLE record source (`p: P?`). The source
+// lowers to the tagged `{i8, P}` nullable struct; the with-copy must unwrap its
+// payload for the field-override copy and re-wrap the result with the source's
+// tag. Before the fix the copy treated the `{i8, P}` value as a bare `P`, and a
+// later `q!.A` hit nullablePrimHasValue on a wrongly-shaped value → LLVM ICmp
+// type-mismatch SIGABRT. Here A is overridden and B is preserved (1→9, 2 kept).
+BEZEL_TEST(codegen_cg29c, with_on_nullable_record_source_1273) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p: P? := new P(1, 2); "
+        "  var q := p with A := 9 end; "
+        "  return q!.A * 10 + q!.B; "  // 9*10 + 2 = 92
+        "end Main; end C;"), 92);
+}
+
+// #1273: a `with` on a NULL nullable-record source propagates null (the source's
+// tag rides through), so the result is null — not a crash and not a stale copy.
+BEZEL_TEST(codegen_cg29c, with_on_null_record_source_propagates_null_1273) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p: P? := null; "
+        "  var q := p with A := 9 end; "
+        "  return (1 if q is null else 0); "
+        "end Main; end C;"), 1);
+}
