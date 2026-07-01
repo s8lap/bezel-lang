@@ -403,3 +403,33 @@ BEZEL_TEST(owned_sink_sources, owned_move_into_owned_arg_in_case_arm_accepted_12
         "end Prog;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §19.3 / §28.8 (#1284, expression-position sibling of #1280): a borrow handed to
+// an `owned` sink inside a case-EXPRESSION arm (`return case b Box(a) =>
+// Prog.Sink(a), _ => -1 end`) must be rejected too — the ownership pass now walks
+// CaseExpr arm bodies (handleDischarge), not only CaseStmt arms. REJECTED.
+BEZEL_TEST(owned_sink_sources, destructure_binding_into_owned_arg_case_expr_rejected_1284) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Widget end Widget; record Box(A: Widget); "
+        "class Prog "
+        "  public static method Sink(owned w: Widget): int return 0; end Sink; "
+        "  public static method Use(b: Box): int "
+        "    return case b Box(a) => Prog.Sink(a), _ => -1, end; "
+        "  end Use; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.8 (#1284) control: a genuine owned producer (`new`) passed to an `owned`
+// sink inside a case-EXPRESSION arm still compiles — no over-rejection. ACCEPTED.
+BEZEL_TEST(owned_sink_sources, owned_new_into_owned_arg_case_expr_accepted_1284) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Widget end Widget; "
+        "class Prog "
+        "  public static method Sink(owned w: Widget): int return 0; end Sink; "
+        "  public static method Use(n: int): int "
+        "    return case n 0 => Prog.Sink(new Widget()), _ => -1, end; "
+        "  end Use; "
+        "end Prog;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

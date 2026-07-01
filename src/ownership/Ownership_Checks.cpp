@@ -332,6 +332,29 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         }
         return;
     }
+    // §19 / §28.8 (#1284): a `case` EXPRESSION (`var r := case b Box(a) => …`,
+    // `return case … end`). The expression-position counterpart of the CaseStmt
+    // handler in visitStmt (#1280): walk the scrutinee, each arm's guard, and each
+    // arm's value expression, so a borrow handed to an `owned` sink inside a
+    // case-expression arm (`Box(a) => Prog.Sink(a)`) is caught (§28.8 double-free).
+    // Each arm is a mutually-exclusive branch: visit it from the pre-case state and
+    // restore afterward (arm-local discharge does not leak into the post-case
+    // state). Nothing else here consumes the CaseExpr as an owned value.
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (ce->scrutinee) checkRead(*ce->scrutinee, /*selfTarget=*/false);
+        BlockState saved = states_;
+        for (const auto& arm : ce->arms) {
+            states_ = saved;
+            if (arm.guard) checkRead(*arm.guard, /*selfTarget=*/false);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody) handleDischarge(*arm.exprBody);
+            } else {
+                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+            }
+        }
+        states_ = std::move(saved);
+        return;
+    }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         // §28.6 *Borrowed owning collections* (#1008 Part C): reject an
         // ownership-transferring / disposing op (Dispose/Drain/Pop*/Add/…) on a
