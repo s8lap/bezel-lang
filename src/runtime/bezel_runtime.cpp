@@ -6199,6 +6199,28 @@ extern "C" int32_t bz_str_lastindexof(const void* self_p, const void* sub_p) {
 // Returns a fresh +1 string of `count` code points starting at code-point
 // index `start`. Clamps `count` to the available tail if needed.
 // Preserves the source string's width (§4.6 per-string storage width).
+// #1282 (§9.5 / §4.6): char.ToString() / interpolation of a char. A Bezel char
+// is a Unicode scalar (up to U+10FFFF); build a single-code-point string at the
+// narrowest storage width (1/2/4 bytes per §4.6 adaptive storage) so the full
+// code point survives — the old codegen truncated it to its low byte (`%c`),
+// corrupting any char above U+00FF. On output the string is UTF-8-encoded by
+// bz_string_to_utf8z, so `char(0x0141)` renders as its UTF-8 form.
+extern "C" void* bz_char_to_string(int32_t cp) {
+    uint32_t u = (uint32_t)cp;
+    int8_t w = (u <= 0xFF) ? 1 : (u <= 0xFFFF ? 2 : 4);
+    void* data = calloc((size_t)w * 2u, 1);  // one code point + a width-sized NUL
+    if (w == 1)      ((uint8_t*)data)[0]  = (uint8_t)u;
+    else if (w == 2) ((uint16_t*)data)[0] = (uint16_t)u;
+    else             ((uint32_t*)data)[0] = u;
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    int64_t one = 1;
+    memcpy(strObj + 8, &one, sizeof(int64_t));
+    strObj[16] = (uint8_t)w;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    return strObj;
+}
+
 extern "C" void* bz_str_substring(const void* self_p, int64_t start, int64_t count) {
     if (!self_p) {
         // Return empty string.

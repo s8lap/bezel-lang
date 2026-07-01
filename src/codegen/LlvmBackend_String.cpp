@@ -865,6 +865,16 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
     // Special case: string.ToString() → identity (return itself).
     if (prim == P::String) return val;
 
+    // #1282 (§9.5 / §4.6): char.ToString() / char interpolation. A char is a
+    // Unicode scalar (i32 code point up to U+10FFFF); the snprintf `%c` path
+    // below truncated it to its low byte, corrupting any char above U+00FF.
+    // Build a single-code-point string at the narrowest storage width via the
+    // runtime, preserving the full code point (output UTF-8-encodes it).
+    if (prim == P::Char) {
+        auto* fn = declareC("bz_char_to_string", ptrTy(), {i32()});
+        return builder_.CreateCall(fn, {val}, "char.tostr");
+    }
+
     // Numeric types: snprintf into a stack buffer, then heap-copy.
     // Buffer of 64 bytes is ample for any numeric type.
     const unsigned BUF = 64;
@@ -902,14 +912,8 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
             fmt = "%.7g"; break;  // 7 significant digits for float (f32)
         case P::Double:
             fmt = "%.15g"; break;  // 15 significant digits for double (f64)
-        case P::Char: {
-            // Char is i32 code point → build a 1-char string directly.
-            // Use snprintf with %c (ASCII, fast path) for code points 0-127.
-            // For code points > 127, use %lc (wide char).
-            // For simplicity, always use %c and truncate to 1 byte.
-            // TODO: proper UTF-8 encoding for non-ASCII chars.
-            fmt = "%c"; break;
-        }
+        // P::Char is handled by the bz_char_to_string short-circuit above
+        // (#1282) — it never reaches this snprintf path.
         default:
             fmt = "%d"; break;
     }

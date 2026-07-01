@@ -74,3 +74,33 @@ BEZEL_TEST(codegen_cg32, char_passed_to_putchar) {
         "end Main; end C;");
     BEZEL_EXPECT_EQ(out, std::string("Hi\n"));
 }
+
+// #1282 (§9.5 / §4.6): char.ToString() / char interpolation must preserve the
+// full Unicode scalar, not truncate the code point to its low byte. Before the
+// fix a char above U+00FF was rendered via snprintf `%c` (low byte only), so
+// `char(0x141)` ('Ł') collided with `char(0x41)` ('A'). The char→string path now
+// stores the full code point at the narrowest width. The rendered string's first
+// code point round-trips back to the original char.
+BEZEL_TEST(codegen_cg32, char_tostring_high_codepoint_roundtrips_1282) {
+    // 'Ł' == U+0141 (321). s[0] read back as a char must equal char(321), not
+    // char(321 & 0xFF)==char(65)=='A'. Return 1 on success.
+    BEZEL_EXPECT_EQ(run(
+        "var c := char(321); var s := c.ToString(); "
+        "return (1 if s[0] = c else 0);"), 1);
+}
+
+// #1282: two chars whose code points differ only above the low byte must NOT
+// produce equal strings (the truncation-collision the fix removes).
+BEZEL_TEST(codegen_cg32, char_tostring_no_low_byte_collision_1282) {
+    // char(321) low byte == 65 == 'A'. Their ToString()s must now differ.
+    BEZEL_EXPECT_EQ(run(
+        "var hi := char(321).ToString(); var lo := char(65).ToString(); "
+        "return (1 if hi <> lo else 0);"), 1);
+}
+
+// #1282: a char above the BMP (U+1F600) round-trips its single code point.
+BEZEL_TEST(codegen_cg32, char_tostring_astral_codepoint_roundtrips_1282) {
+    BEZEL_EXPECT_EQ(run(
+        "var c := char(128512); var s := c.ToString(); "
+        "return (s.Length * 10 + (1 if s[0] = c else 0));"), 11);  // Length 1, s[0]==c
+}
