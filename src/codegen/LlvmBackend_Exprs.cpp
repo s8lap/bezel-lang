@@ -8053,6 +8053,52 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     else elemSize = 8;  // ptr, i64, double
                 }
             }
+            // §4.14 (#1275): direct span constructors —
+            //   new Span<T>(buffer, start, length)
+            //   new ReadOnlySpan<T>(buffer, start, length)
+            //   new ArraySpan<T>(source, start, length)
+            //   new ReadOnlyArraySpan<T>(source, start, length)
+            // These records lower to the { ptr source, i32 start, i32 length }
+            // arrayspan struct (isSpanLikeTypeName). Constructing them via the
+            // generic record path built a value-layout struct with i64
+            // Start/Length, so the later i32 span reads picked up garbage and
+            // indexed out of bounds (SIGSEGV). Lower the buffer/array arg to its
+            // bz_array_t* backing and build the span directly, bounds-checking
+            // start/length against the backing Count (IndexOutOfRangeException,
+            // per §4.14 L1940 / L2179 — the documented supported constructor).
+            if ((colName == "Span" || colName == "ReadOnlySpan" ||
+                 colName == "ArraySpan" || colName == "ReadOnlyArraySpan") &&
+                ne.args.size() == 3 &&
+                ne.args[0].value && ne.args[1].value && ne.args[2].value) {
+                llvm::Value* src = lowerExpr(*ne.args[0].value);  // → bz_array_t*
+                if (!src) return nullptr;
+                llvm::Value* start = lowerExpr(*ne.args[1].value);
+                llvm::Value* len   = lowerExpr(*ne.args[2].value);
+                if (!start || !len) return nullptr;
+                if (!start->getType()->isIntegerTy(32))
+                    start = builder_.CreateTrunc(start, i32(), "span.ctor.st");
+                if (!len->getType()->isIntegerTy(32))
+                    len = builder_.CreateTrunc(len, i32(), "span.ctor.len");
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* count64 =
+                    builder_.CreateCall(lenFn, {src}, "span.ctor.cnt");
+                llvm::Value* count =
+                    builder_.CreateTrunc(count64, i32(), "span.ctor.cnt32");
+                // Start ∈ [0, Count]; Length ∈ [0, Count-Start].
+                llvm::Value* startNeg =
+                    builder_.CreateICmpSLT(start, builder_.getInt32(0));
+                llvm::Value* startOOB = builder_.CreateICmpSGT(start, count);
+                emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                               "IndexOutOfRangeException");
+                llvm::Value* avail =
+                    builder_.CreateSub(count, start, "span.ctor.avail");
+                llvm::Value* lenNeg =
+                    builder_.CreateICmpSLT(len, builder_.getInt32(0));
+                llvm::Value* lenOOB = builder_.CreateICmpSGT(len, avail);
+                emitGuardThrow(builder_.CreateOr(lenNeg, lenOOB),
+                               "IndexOutOfRangeException");
+                return buildArraySpan(src, start, len);
+            }
             // issues #343 / D8 / §4.10: a Set<T> (or OwnedSet<T>) is backed by
             // the generic-key hash table so equality and hashing follow T's
             // contract (§8.3) — real set semantics (dedup by content). This

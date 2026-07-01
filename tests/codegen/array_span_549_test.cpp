@@ -1005,3 +1005,73 @@ BEZEL_TEST(codegen_span549, readonly_span_start_field_read_1277) {
         "  return sp.Start + sp.Length; "  // 2 + 3 = 5
         "end Main; end C;"), 5);
 }
+
+// ===========================================================================
+// §4.14 (#1275): direct span constructors —
+//   new Span<T>(buffer, start, length) / new ReadOnlySpan<T>(...) /
+//   new ArraySpan<T>(source, ...) / new ReadOnlyArraySpan<T>(...)
+// are documented supported constructors (stdlib §4.14 L2179). They lower to the
+// { ptr source, i32 start, i32 length } arrayspan struct. Previously they fell
+// through to the generic record path (i64 Start/Length), so later i32 span reads
+// picked up garbage and indexed out of bounds → SIGSEGV. Now the buffer/array
+// arg is lowered to its bz_array_t* backing and the span is built directly with
+// bounds checks (IndexOutOfRangeException per §4.14 L1940).
+// ===========================================================================
+
+// §4.14 (#1275): a valid direct `new Span<T>(buf, 0, 4)` reads/writes correctly
+// and does not free the borrowed buffer (ASan-clean; buf disposed by `using`).
+// (Plain-capacity buffer — the closure-init form leaks its env pre-existingly,
+// see #1286, unrelated to the span-ctor path.)
+BEZEL_TEST(codegen_span549, span_ctor_direct_valid_read_1275) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(4); "
+        "  var sp := new Span<int>(buf, 0, 4); "
+        "  sp[3] := 4; "
+        "  return sp[3]; "  // 4
+        "end Main; end C;", 4);
+}
+
+// §4.14 (#1275): direct `new ReadOnlySpan<T>(buf, start, length)` over a range
+// reads through the buffer written via a writable span.
+BEZEL_TEST(codegen_span549, readonly_span_ctor_direct_1275) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(5); "
+        "  var w := new Span<int>(buf, 0, 5); w[2] := 3; "
+        "  var sp := new ReadOnlySpan<int>(buf, 1, 3); "
+        "  return sp[1]; "  // buf[2] = 3
+        "end Main; end C;", 3);
+}
+
+// §4.14 (#1275): direct `new ArraySpan<T>(arr, start, length)` over an Array<T>.
+BEZEL_TEST(codegen_span549, arrayspan_ctor_direct_1275) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := new ArraySpan<int>(a, 1, 2); "
+        "  return sp[1]; "  // arr[2] = 30
+        "end Main; end C;", 30);
+}
+
+// §4.14 (#1275): length out of range against the buffer Count throws
+// IndexOutOfRangeException at construction (was a SIGSEGV on later indexing).
+BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(4, (i) => i + 1); "
+        "  try var sp := new Span<int>(buf, 0, 100); return sp[50]; "
+        "  catch IndexOutOfRangeException => return 88; end; "
+        "end Main; end C;"), 88);
+}
+
+// §4.14 (#1275): start out of range throws IndexOutOfRangeException.
+BEZEL_TEST(codegen_span549, span_ctor_start_oob_throws_1275) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(4, (i) => i + 1); "
+        "  try var sp := new Span<int>(buf, 9, 1); return sp[0]; "
+        "  catch IndexOutOfRangeException => return 77; end; "
+        "end Main; end C;"), 77);
+}
