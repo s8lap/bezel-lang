@@ -4333,13 +4333,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // .TryGetValue(k, out v): bool
         // (Note: the out-var slot is pre-created by ensureOutVarSlots)
         if (m == "TryGetValue" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value &&
+            (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
-            // Get the address of the out parameter
+            // Get the address of the out parameter.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
-            if (!outAddr) return nullptr;
+            llvm::Value* outAddr;
+            if (call.args[1].isDiscard) {
+                // §22.4 (#1301): `dict.TryGetValue(key, out _)` — the discard has
+                // no destination lvalue (the spec's canonical form: the receiving
+                // slot "is internal to the compiler and is not observable").
+                // Allocate a throwaway scratch slot of the value type V so the
+                // decode below has somewhere to write; the value is never read.
+                outTy = valTy ? lowerTypeRef(valTy) : ptrTy();
+                if (!outTy) outTy = ptrTy();
+                outAddr = entryAlloca(outTy);
+            } else {
+                outAddr = lvalueAddr(*call.args[1].value, outTy);
+                if (!outAddr) return nullptr;
+            }
             // bz_dict_try_get_* writes the stored void* into *tmpSlot.
             // For pointer values: the void* IS the string/object pointer.
             // For integer/float values: the void* encodes the value via

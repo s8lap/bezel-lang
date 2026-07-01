@@ -149,3 +149,67 @@ BEZEL_TEST(codegen_cg50, value_lambda_param_unchanged_747) {
         "  return x; "  // 7 — unchanged
         "end Main; end C;"), 7);
 }
+
+// §22.4 (#1301): an `out _` discard must not affect the call's return value.
+// buildOrderedArgs bailed on the null discard argument, so the whole call was
+// never emitted and the method's return value was lost (evaluated to 0/false).
+// The fix allocates a throwaway scratch slot for the discard and proceeds.
+
+BEZEL_TEST(codegen_cg50, out_discard_preserves_int_return_1301) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Try(out n: int): int "
+        "    n := 5; return 42; "
+        "  end Try; "
+        "  public static method Main(): int "
+        "    return C.Try(out _); "  // 42, not 0
+        "  end Main; "
+        "end C;"), 42);
+}
+
+BEZEL_TEST(codegen_cg50, out_discard_preserves_bool_return_1301) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Try(out n: int): bool "
+        "    n := 5; return true; "
+        "  end Try; "
+        "  public static method Main(): int "
+        "    return (1 if C.Try(out _) else 0); "  // 1, not 0
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// `out _` alongside ordinary value arguments — the discard occupies its
+// positional slot without disturbing the others or the return value.
+BEZEL_TEST(codegen_cg50, out_discard_with_value_args_1301) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Div(a: int, b: int, out rem: int): int "
+        "    rem := a - (a / b) * b; return a / b; "
+        "  end Div; "
+        "  public static method Main(): int "
+        "    return C.Div(17, 5, out _); "  // 3
+        "  end Main; "
+        "end C;"), 3);
+}
+
+// §22.4 canonical form: `dict.TryGetValue(key, out _)` — the builtin path
+// guarded on a non-null argument expression and skipped the discard entirely,
+// returning false even for a present key. It must return the real found flag.
+BEZEL_TEST(codegen_cg50, dict_trygetvalue_out_discard_found_1301) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d.Add(\"k\", 9); "
+        "  return (1 if d.TryGetValue(\"k\", out _) else 2); "  // 1 — present
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_cg50, dict_trygetvalue_out_discard_missing_1301) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d.Add(\"k\", 9); "
+        "  return (1 if d.TryGetValue(\"nope\", out _) else 2); "  // 2 — absent
+        "end Main; end C;"), 2);
+}

@@ -3573,7 +3573,6 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // call to be disposed at the enclosing scope's end) are left intact.
     std::vector<llvm::AllocaInst*> argTempSlots;
     for (const auto& a : args) {
-        if (!a.value) return false;
         std::size_t idx = params.size();
         if (a.name.empty()) {
             idx = pos++;
@@ -3582,6 +3581,24 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 if (params[j].name == a.name) { idx = j; break; }
         }
         if (idx >= params.size() || ordered[idx]) return false;
+        // §22.4 (#1301): an `out _` / `ref _` discard has no destination lvalue —
+        // the parser leaves a.value null with a.isDiscard set. Allocate a
+        // throwaway scratch slot of the parameter's type and pass its address so
+        // the callee has a valid by-ref destination to write; the written value
+        // is never read back ("the receiving slot is internal to the compiler
+        // and is not observable", §22.4). This MUST precede the `!a.value` guard
+        // below — otherwise that guard aborted the whole call, which then lowered
+        // to null and the method's RETURN value was silently dropped (rc 0).
+        if (a.isDiscard) {
+            const sema::TypeRef* pt = params[idx].type
+                ? ctx_.resolvedType(*params[idx].type) : nullptr;
+            llvm::Type* slotTy = pt ? lowerTypeRef(pt) : nullptr;
+            if (!slotTy) slotTy = i32();
+            ordered[idx] = entryAlloca(slotTy);
+            orderedExprs[idx] = nullptr;
+            continue;
+        }
+        if (!a.value) return false;
         // CG50: a ref/out parameter receives the address of its argument
         // lvalue; an ordinary parameter receives the argument's value.
         // §22.4: `out var x` — ensureOutVarSlots already allocated the
