@@ -658,6 +658,21 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
             if (formatted) strVal = formatted;
         }
         using P = sema::PrimitiveType;
+        // §8.5/§9.1 (#1283): a Named operand (enum / class / record / interface,
+        // or a generic-T that resolves to one) formats via the general
+        // value-to-string converter — the SAME path the non-alignment
+        // interpolation and record-field formatting use: an enum renders its
+        // type name (§8.5), a class its ToString override (else type name), a
+        // record its structural ToString, an interface its dynamic ToString.
+        // Previously an enum fell to the integer branch below (rendering its
+        // underlying value, not its name) and a class/record/interface produced
+        // no strVal at all, so the whole alignment was dropped. DateTime/Decimal
+        // with an inner `:FORMAT` are handled above; a bare-alignment DateTime
+        // (i64) flows through emitValueToString to the same numeric fallback it
+        // used before, so this does not change those paths.
+        if (!strVal && rt && rt->kind == sema::TypeRef::Kind::Named) {
+            strVal = emitValueToString(val, rt);
+        }
         if (!strVal) {
             // Default string conversion.
             bool isStr = rt && rt->kind == sema::TypeRef::Kind::Primitive &&

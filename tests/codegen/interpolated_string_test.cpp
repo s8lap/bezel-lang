@@ -268,4 +268,61 @@ BEZEL_TEST(codegen_cg27d, interp_wide_format_spec_no_overread_1186) {
         "end Main; end C;"), 1);
 }
 
+// #1283 / §18.5 + §8.5: an alignment specifier `{x,N}` on a NON-primitive
+// operand pads that operand's default ToString — it must NOT change the
+// formatter. Previously an enum with alignment rendered its underlying integer
+// (Green→"1", not the §8.5 type name) and a class/record/interface with
+// alignment dropped the padding entirely (the operand produced no aligned
+// string). The fix routes any Named operand through emitValueToString before
+// padding.
+
+// #1283 Defect A: an enum + alignment renders the §8.5 type name, padded — not
+// the underlying integer. (Default enum ToString is the type name "Color".)
+BEZEL_TEST(codegen_cg27d, enum_alignment_renders_type_name_1283) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var col := Color.Green; "
+        "  var s := $\"[{col,8}]\"; "        // "[   Color]" (5-char name in width 8)
+        "  return (1 if s = \"[   Color]\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1283 Defect A (left-align): a negative width left-aligns the enum name.
+BEZEL_TEST(codegen_cg27d, enum_alignment_left_1283) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var col := Color.Green; "
+        "  var s := $\"[{col,-8}]\"; "       // "[Color   ]"
+        "  return (1 if s = \"[Color   ]\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1283 Defect B: a record + alignment right-aligns its structural ToString
+// ("Point(x: 1, y: 2)" = 17 chars) in the field width — padding is applied,
+// not dropped.
+BEZEL_TEST(codegen_cg27d, record_alignment_padded_1283) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(1, 2); "
+        "  var s := $\"[{p,22}]\"; "         // 5 leading spaces + 17-char ToString
+        "  return (1 if s = \"[     Point(x: 1, y: 2)]\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #1283 Defect B (class ToString override + alignment): the override's result
+// ("WW") is padded, not dropped.
+BEZEL_TEST(codegen_cg27d, class_override_alignment_padded_1283) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class W public method ToString(): string return \"WW\"; end ToString; end W; "
+        "class C public static method Main(): int "
+        "  using var w := new W(); "
+        "  var s := $\"[{w,8}]\"; "          // "[      WW]" (6 spaces + "WW")
+        "  return (1 if s = \"[      WW]\" else 0); "
+        "end Main; end C;"), 1);
+}
+
 }  // namespace
