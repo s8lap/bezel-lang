@@ -249,6 +249,17 @@ private:
     // MethodDecl has an Abstract body.
     static bool hasMod(MemberSymbol* m, std::string_view want);
 
+    // #1272 (§9): true when the value-type record `start` transitively contains
+    // itself BY VALUE (a self-referential record has infinite inline size and
+    // cannot be laid out). Walks the value-containment graph from `cur` — record
+    // fields, nullable-record fields (`T?` for a value type is still inline),
+    // and inline-array-of-record fields — following only value-typed records; a
+    // class/interface field (a heap reference) breaks the cycle. `seen` guards
+    // against unbounded recursion through other records. A recursive record must
+    // use a class (heap reference) instead.
+    bool recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
+                                 std::unordered_set<TypeSymbol*>& seen);
+
     // Slice S15: a base member is overridable when it is `virtual`,
     // `abstract`, or `override` — but not `sealed override` (which
     // seals it against further overriding, §12.4).

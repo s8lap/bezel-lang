@@ -5,8 +5,49 @@
 #include "sema/TypeResolution.hpp"
 
 #include <cctype>
+#include <unordered_set>
 
 namespace bezel::sema {
+
+// #1272 (§9): value-containment-cycle detection for records. Returns true when
+// `start` is transitively reachable from `cur` by following value-typed record
+// fields (record, nullable-record, and inline-array-of-record fields — all
+// stored inline). A class/interface field is a heap reference and breaks the
+// cycle; a bare generic type-parameter field (declaration == null) is opaque and
+// conservatively ignored. `seen` prevents unbounded recursion through unrelated
+// cycles.
+bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
+                                       std::unordered_set<TypeSymbol*>& seen) {
+    if (!cur) return false;
+    // Unwrap an inline-array element (possibly nested) to the record it stores.
+    auto valueRecordOf = [](TypeRef* rt) -> TypeSymbol* {
+        while (rt && rt->kind == TypeRef::Kind::InlineArray) rt = rt->arrayElement;
+        if (rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
+            rt->declaration->kind == ast::TypeDeclKind::Record)
+            return rt->declaration;
+        return nullptr;
+    };
+    for (Symbol* m : cur->members) {
+        auto* fs = dynamic_cast<FieldSymbol*>(m);
+        if (!fs || hasMod(fs, "static")) continue;
+        // A record field's type comes from its positional param (`posParam`) or,
+        // for a body field, its FieldDecl. (`fs->decl` of a positional field is
+        // the owning TypeDecl, not a FieldDecl — §9.1.)
+        const ast::Type* ftype = nullptr;
+        if (fs->posParam && fs->posParam->type)
+            ftype = fs->posParam->type.get();
+        else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+            ftype = fd->type.get();
+        if (!ftype) continue;
+        TypeSymbol* contained = valueRecordOf(ctx_.resolvedType(*ftype));
+        if (!contained) continue;
+        if (contained == start) return true;
+        if (seen.insert(contained).second &&
+            recordValueContainsSelf(start, contained, seen))
+            return true;
+    }
+    return false;
+}
 
 // Free-function wrapper exposing the resolver's structural type equality
 // for reuse by other passes (§22.6 overload resolution). Single source of
@@ -748,6 +789,25 @@ void Resolver::checkRecordRestrictions() {
                         std::string("record `") + std::string(t->name) +
                         "` may not implement `IDisposable` (§9.7)");
                 }
+            }
+        }
+        // #1272 (§9): a record is a VALUE type stored inline, so a record that
+        // transitively contains itself by value (`record Node(Next: Node?)`,
+        // mutual recursion, or an inline-array-of-self) has infinite size and
+        // cannot be laid out. Left unchecked this crashed codegen (unbounded
+        // record-struct layout recursion → LLVM setBody). Reject it here with a
+        // clean diagnostic; a recursive structure must use a class (heap ref).
+        {
+            std::unordered_set<TypeSymbol*> seen;
+            if (recordValueContainsSelf(t, t, seen)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("record `") + std::string(t->name) +
+                    "` cannot recursively contain itself by value — a record is "
+                    "stored inline, so a self-referential record has infinite "
+                    "size (a nullable `" + std::string(t->name) +
+                    "?` field is still stored inline); use a `class` (a heap "
+                    "reference) for a recursive structure (§9)");
             }
         }
     }
