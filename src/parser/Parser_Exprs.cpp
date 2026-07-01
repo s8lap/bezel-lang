@@ -977,7 +977,15 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
             }
             return std::unique_ptr<ast::Pattern>(dp.release());
         }
-        if (isPunctuator(",") && isConstantStart(peekAt(1))) {
+        // §A.7 (#1300): a `,`-separated Constant-alternatives list is valid only
+        // at the case-arm level, NOT inside a DestructuringPattern positional
+        // slot — there the `,` is the positional separator. Guard on
+        // !inPositional, mirroring the catch-all path below. Without this a
+        // QualifiedName constant (`Color.Red`) in a non-final positional slot
+        // greedily absorbed the positional comma (`Pair(Color.Red, Color.Blue)`
+        // collapsed to one alternatives slot → spurious binding-count reject);
+        // int-literal constants already went through the guarded catch-all path.
+        if (!inPositional && isPunctuator(",") && isConstantStart(peekAt(1))) {
             // Convert qn → IdentifierExpr/MemberAccess chain and continue
             // as ConstantPattern alternatives.
             auto cp = std::make_unique<ast::ConstantPattern>();

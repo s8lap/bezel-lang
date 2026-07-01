@@ -213,3 +213,111 @@ BEZEL_TEST(record_pattern_constants_615, nested_record_enum_subpat) {
         "  end; "
         "end Main; end C;"), 13);
 }
+
+// ── §A.7 / §19.3 (#1300): a QualifiedName constant in a NON-FINAL slot ────
+//
+// The tests above always place the enum constant in the FINAL positional slot
+// (`Colored(n, Color.Red)`), so the constant is never followed by a `,`. Bug
+// #1300: when a QualifiedName constant sub-pattern (`Color.Red`) sits in a
+// non-final slot (`TwoColor(Color.Red, Color.Blue)`), the parser's QualifiedName
+// branch greedily absorbed the positional separator `,` as ConstantPattern
+// alternatives — collapsing two sub-patterns into one → a spurious "binds 1
+// value but record has 2 fields" reject (BAD_REJECT). Int-literal constants
+// already went through the guarded catch-all path, so `IntPair(0, b)` worked;
+// only QualifiedNames were affected. The fix guards the QualifiedName
+// alternatives loop on `!inPositional`, mirroring the catch-all path.
+
+BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_slot_matches) {
+    // §A.7/§19.3: TwoColor(Color.Red, Color.Blue) — QN constant in the
+    // non-final slot must parse as two sub-patterns and match.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "record TwoColor(a: Color, b: Color); "
+        "class C public static method Main(): int "
+        "  var p := new TwoColor(Color.Red, Color.Blue); "
+        "  return case p "
+        "    TwoColor(Color.Red, Color.Blue) => 1, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_slot_no_match) {
+    // §A.7/§19.3: a differing first (non-final) QN constant → falls to _.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "record TwoColor(a: Color, b: Color); "
+        "class C public static method Main(): int "
+        "  var p := new TwoColor(Color.Green, Color.Blue); "
+        "  return case p "
+        "    TwoColor(Color.Red, Color.Blue) => 1, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_then_binding) {
+    // §A.7/§19.3: a QN constant in the non-final slot followed by a binding —
+    // the binding exposes the trailing field when the constant matches.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "record ColorInt(c: Color, n: int); "
+        "class C public static method Main(): int "
+        "  var p := new ColorInt(Color.Red, 42); "
+        "  return case p "
+        "    ColorInt(Color.Red, n) => n, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_then_binding_no_match) {
+    // §A.7/§19.3: non-final QN constant that doesn't match → discard arm
+    // (the binding arm must NOT fire).
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "record ColorInt(c: Color, n: int); "
+        "class C public static method Main(): int "
+        "  var p := new ColorInt(Color.Green, 42); "
+        "  return case p "
+        "    ColorInt(Color.Red, n) => n, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), -1);
+}
+
+BEZEL_TEST(record_pattern_constants_615, qualified_const_two_nonfinal_slots) {
+    // §A.7/§19.3: THREE-field record with QN constants in slots 1 AND 2 (both
+    // non-final) plus a final QN constant — all three must parse distinctly.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "record Triple(a: Color, b: Color, c: Color); "
+        "class C public static method Main(): int "
+        "  var p := new Triple(Color.Red, Color.Green, Color.Blue); "
+        "  return case p "
+        "    Triple(Color.Red, Color.Green, Color.Blue) => 7, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(record_pattern_constants_615, qualified_const_arm_alternatives_still_parse) {
+    // §A.7 control: at the CASE-ARM level (inPositional=false) a `,`-separated
+    // list of QualifiedName constants is a valid alternatives pattern — the
+    // #1300 fix must NOT suppress it (it only guards positional slots).
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var c := Color.Green; "
+        "  return case c "
+        "    Color.Red, Color.Green => 5, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 5);
+}
