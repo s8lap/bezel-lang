@@ -384,3 +384,46 @@ BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
     if (rc == -1) return;
     BEZEL_EXPECT_EQ(rc, 1);
 }
+
+// ---- (f) §27.1 (#1290): owned result of a function-typed-value call -----------
+
+// §27.1 / §28.3 (#1290): `mk: () -> owned Res; using var made := mk()` — a call
+// through a FUNCTION-TYPED VALUE whose return slot carries `owned` produces a
+// fresh owned value; binding it to a `using var` disposes it exactly once. The
+// callee is an ordinary value (not a MethodSymbol), so the owned-return was
+// previously undetected and the object leaked (Res.D stayed 0). Now the
+// producerState/dynamic-dispose paths key on the callee function type's
+// funcReturnOwned flag → disposed once (Res.D == 1). Verified on the AOT path
+// (ASan-clean; the plain-var auto-drop leg needs checkOwnership, which runJit
+// omits).
+BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
+           using_var_of_fn_value_owned_result_disposed_1290) {
+    int rc = runAotExit(
+        "module M; "
+        "class Res public static D: int := 0; "
+        "  destructor Res.D := Res.D + 1; end destructor; end Res; "
+        "class C public static method Main(): int "
+        "  var mk: () -> owned Res := () => new Res(); "
+        "  do using var made := mk(); end; "
+        "  return Res.D; end Main; "
+        "end C;");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 1);
+}
+
+// §27.1 / §28.3 (#1290): the plain-`var` auto-drop path also disposes the owned
+// result of a function-typed-value call exactly once (Res.D == 1).
+BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
+           plain_var_of_fn_value_owned_result_autodropped_1290) {
+    int rc = runAotExit(
+        "module M; "
+        "class Res public static D: int := 0; "
+        "  destructor Res.D := Res.D + 1; end destructor; end Res; "
+        "class C public static method Main(): int "
+        "  var mk: () -> owned Res := () => new Res(); "
+        "  do var made := mk(); end; "
+        "  return Res.D; end Main; "
+        "end C;");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 1);
+}

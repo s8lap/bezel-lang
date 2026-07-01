@@ -1484,6 +1484,23 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                 }
             }
         }
+        // #1290 / §27.1 / §28.3: a call through a FUNCTION-TYPED VALUE whose
+        // declared return slot carries `owned` (`mk: () -> owned Res; mk()`)
+        // produces a fresh owned value, exactly like an owned-returning method
+        // call. The callee is an ordinary value (a LocalSymbol / field, not a
+        // MethodSymbol), so the returnOwned check above does not fire; classify
+        // it Owned from the callee's function type's funcReturnOwned flag.
+        // Without this the owned result carried no disposal obligation and
+        // leaked even under `using var` (§27.1 admits `owned` in a function-type
+        // return slot). (A bare inline lambda with no `owned`-annotated context
+        // does not set funcReturnOwned, so its result is not owned here.)
+        if (ce->callee) {
+            if (const sema::TypeRef* calleeTy = ctx_.exprType(*ce->callee)) {
+                if (calleeTy->kind == sema::TypeRef::Kind::Function &&
+                    calleeTy->funcReturnOwned)
+                    return OwnershipState::Owned;
+            }
+        }
         // Slice O13 / §28.13 / §30.14 (#693): builtin owned-returning calls.
         // Several stdlib builtin methods return `owned T` but have no user
         // MethodDecl (so returnOwned is unavailable): Shared<T>.Clone(),

@@ -11425,6 +11425,25 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                          isClassOrInterfaceRef(resolveTypeParamRef(initTy))))
                         return true;
                 }
+                // (b1f) #1290 / §27.1: the callee may be a FUNCTION-TYPED VALUE
+                // (a local or field) whose declared return slot carries `owned`
+                // — `mk: () -> owned Res; using var x := mk()`. Its callee is an
+                // ordinary value, not a MethodSymbol, so (b1) missed it and the
+                // owned result leaked even under `using var`. Detect it by the
+                // callee's function type's funcReturnOwned flag; register a
+                // dynamic dispose when the result is a class/interface (a
+                // value-typed owned return has no heap disposal obligation and
+                // stays unregistered).
+                if (const sema::TypeRef* cty = ctx_.exprType(*call->callee)) {
+                    if (cty->kind == sema::TypeRef::Kind::Function &&
+                        cty->funcReturnOwned) {
+                        const sema::TypeRef* initTy =
+                            ctx_.exprType(*ld->initializer);
+                        if (isClassOrInterfaceRef(initTy) ||
+                            isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
+                            return true;
+                    }
+                }
                 // (b2) fix #642/#643: builtin collection Pop* methods (PopLast,
                 // PopFirst, PopAt, PopValue) transfer ownership of a class element
                 // to the caller (§4.5/§4.7/§4.9).  These are BUILTIN methods —
