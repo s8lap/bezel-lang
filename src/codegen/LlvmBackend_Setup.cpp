@@ -12417,6 +12417,22 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
     // static disposal entry (destructor runs at scope end).
     if (!ld->type &&
         dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+        // §28.10 (#1274): a `using var` initialized from a bare identifier that
+        // resolves to a BORROW — a non-`owned` parameter — does NOT assume a
+        // disposal obligation: the value is owned elsewhere (the caller), which
+        // disposes it. Returning the class here would register a SECOND disposal
+        // at this scope's end → a double-free (the borrowed object is freed here
+        // and again by its real owner). Only an OWNED source transfers ownership
+        // to the using var (an `owned`/`out owned` parameter — kept below — a
+        // drain-loop element or a moved owned local, which are LocalSymbols and
+        // unaffected by this parameter check). The canonical borrow forms
+        // (`using var c := obj.f`, `:= methodReturningBorrow()`) are
+        // MemberAccess/Call exprs, not bare identifiers, and already return null.
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                ctx_.exprSymbol(*ld->initializer))) {
+            if (ps->modifier != "owned" && ps->modifier != "out owned")
+                return nullptr;
+        }
         if (auto* rt = ctx_.exprType(*ld->initializer)) {
             if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration)
                 return rt->declaration;
