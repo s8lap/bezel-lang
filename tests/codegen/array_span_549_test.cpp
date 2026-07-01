@@ -1075,3 +1075,15 @@ BEZEL_TEST(codegen_span549, span_ctor_start_oob_throws_1275) {
         "  catch IndexOutOfRangeException => return 77; end; "
         "end Main; end C;"), 77);
 }
+
+// §4.14 (#1286): the init lambda of `new OwnedBuffer<T>(n, (i) => …)` is
+// call-scoped — it fills the buffer and does not escape. Codegen now releases
+// its closure cell after the fill loop; previously the closure leaked (LSan
+// reported 32 bytes for a non-capturing `(i) => …`). Value: buf[3] = 4.
+BEZEL_TEST(codegen_span549, ownedbuffer_init_closure_not_leaked_1286) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(4, (i) => i + 1); "
+        "  return buf[3]; "  // 4 — and the init closure is freed (ASan-clean)
+        "end Main; end C;", 4);
+}

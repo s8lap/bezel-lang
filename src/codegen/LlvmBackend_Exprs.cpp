@@ -8213,6 +8213,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                 iSlot);
                             builder_.CreateBr(hdr);
                             builder_.SetInsertPoint(doneBB);
+                            // §4.14 (#1286): the init lambda is call-scoped — it
+                            // fills the buffer and does not escape. Release the
+                            // producer's +1 so its closure cell (and env) are
+                            // freed; without this the closure leaked (LSan: 32
+                            // bytes for a non-capturing `(i) => …`). initClosure
+                            // is the { fn, env, envdtor, rc } cell pointer (the
+                            // loop loads fn/env from its slots). bz_closure_release
+                            // is null-safe and, with today's null envdtor, frees
+                            // only the cell + env — no captured-slot
+                            // double-release — and the closure is released nowhere
+                            // else, so this is an exactly-once drop.
+                            auto* relFn = declareC(
+                                "bz_closure_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(relFn, {initClosure});
                         }
                     }
                     return buf;
