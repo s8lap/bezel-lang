@@ -230,3 +230,42 @@ BEZEL_TEST(codegen_577_var_destructure, method_call_on_naked_binding_no_crash_12
         "  end; "
         "end Main; end C;"), 43);
 }
+
+// #1281 (§19.3): a NESTED destructure that binds a CLASS/reference inner field
+// and reads a member through it (`Outer(Inner(x)) => x.Id`). The nested binding's
+// sema declType was left null (the nested walk only registered the name), so
+// `x.Id` could not resolve — in a case EXPRESSION the arm body's `lowerExpr`
+// returned null and `case.end` was left unterminated (IR verification failure);
+// in a case STATEMENT it miscompiled (arm mis-selection → wrong value). The nested
+// binding now takes its inner record field's type. Expression position:
+BEZEL_TEST(codegen_577_var_destructure, nested_class_binding_member_access_expr_1281) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Widget public Id: int; "
+        "  public constructor(id: int) Id := id; end constructor; end Widget; "
+        "record Inner(W: Widget); record Outer(I: Inner); "
+        "class C public static method Main(): int "
+        "  using var w := new Widget(9); "
+        "  var inner := new Inner(w); var o := new Outer(inner); "
+        "  return case o Outer(Inner(x)) => x.Id, _ => -1, end; "  // 9
+        "end Main; end C;"), 9);
+}
+
+// #1281 statement position (was a miscompile to -1): the same nested class binding
+// in a case STATEMENT arm reads the right value.
+BEZEL_TEST(codegen_577_var_destructure, nested_class_binding_member_access_stmt_1281) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Widget public Id: int; "
+        "  public constructor(id: int) Id := id; end constructor; end Widget; "
+        "record Inner(W: Widget); record Outer(I: Inner); "
+        "class C public static method Main(): int "
+        "  using var w := new Widget(9); "
+        "  var inner := new Inner(w); var o := new Outer(inner); "
+        "  case o "
+        "    Outer(Inner(x)) => do return x.Id; end, "  // 9
+        "    _ => do return -1; end, "
+        "  end; "
+        "  return -2; "
+        "end Main; end C;"), 9);
+}

@@ -3888,10 +3888,38 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // only handles naked/`var` binds; a nested DestructuringPattern
                 // sub-pattern was skipped, so `v` never entered armScope and the
                 // body's identifier resolution failed. Walk a worklist of nested
-                // patterns and register their binds (best-effort declType —
-                // resolution only needs the name; codegen binds the value, keyed
-                // on the same inner sub-pattern pointer).
+                // patterns and register their binds.
+                // #1281 (§19.3): the nested binding's declType MUST be its inner
+                // record field's type — the top-level binds set it, but the nested
+                // walk left it null ("best-effort"). With a null declType a nested
+                // binding of a class/record field could not resolve a member access
+                // in the arm body (`Outer(Inner(x)) => x.Id` — sema can't type `x`,
+                // so `x.Id` returns no symbol → fieldAddr null → the case-expr's
+                // `case.end` is left unterminated → IR verification failure). Set
+                // it from the inner record's positional field at each index.
                 {
+                    auto fieldsOfRecord =
+                        [&](const ast::QualifiedName* tn) -> std::vector<FieldSymbol*> {
+                        std::vector<FieldSymbol*> out;
+                        if (!tn || tn->parts.empty()) return out;
+                        std::string_view nm = tn->parts.back();
+                        for (const auto& sym : ctx_.symbols()) {
+                            auto* ts = dynamic_cast<TypeSymbol*>(sym.get());
+                            if (!ts || ts->name != nm ||
+                                ts->kind != ast::TypeDeclKind::Record)
+                                continue;
+                            for (Symbol* m : ts->members) {
+                                auto* fs = dynamic_cast<FieldSymbol*>(m);
+                                if (!fs) continue;
+                                bool isStatic = false;
+                                for (auto& md : fs->modifiers)
+                                    if (md == "static") { isStatic = true; break; }
+                                if (!isStatic) out.push_back(fs);
+                            }
+                            break;
+                        }
+                        return out;
+                    };
                     std::vector<const ast::DestructuringPattern*> nestedWork;
                     for (const auto& sp : dp->subPatterns)
                         if (sp.nakedBinding.empty())
@@ -3902,11 +3930,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     while (!nestedWork.empty()) {
                         const ast::DestructuringPattern* nd = nestedWork.back();
                         nestedWork.pop_back();
-                        for (const auto& s : nd->subPatterns) {
+                        std::vector<FieldSymbol*> ndFields =
+                            fieldsOfRecord(nd->typeName.get());
+                        for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
+                            const auto& s = nd->subPatterns[i];
+                            TypeRef* fieldTy = nullptr;
+                            if (i < ndFields.size() && ndFields[i]->posParam &&
+                                ndFields[i]->posParam->type)
+                                fieldTy = ctx_.resolvedType(
+                                    *ndFields[i]->posParam->type);
                             if (!s.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = s.nakedBinding;
                                 lsym->decl = s.nakedAnchor.get();  // #1271 real Node anchor
+                                lsym->declType = fieldTy;  // #1281
                                 armScope.names[s.nakedBinding] = lsym;
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
@@ -3915,7 +3952,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 lsym->name = vbp->name;
                                 lsym->decl = vbp;
                                 lsym->declType = vbp->type
-                                    ? ctx_.resolvedType(*vbp->type) : nullptr;
+                                    ? ctx_.resolvedType(*vbp->type) : fieldTy;  // #1281
                                 armScope.names[vbp->name] = lsym;
                             } else if (auto* deeper = dynamic_cast<
                                            const ast::DestructuringPattern*>(
