@@ -315,3 +315,74 @@ BEZEL_TEST(generic_constraint_dispatch_484,
         "  return Utils.GenLambdaPlus1(n); "
         "end Main; end C;"), 42);
 }
+
+// ── §28.2 / §14.2 (#1293): Dispose() on an IDisposable-constrained type param ─
+// Every class implicitly implements IDisposable (§28.2); tryConstraints cannot
+// resolve Dispose (the builtin IDisposable has no declared member surface), so
+// `t.Dispose()` on a `where T: IDisposable` (or `class`) param was wrongly
+// rejected as "unconstrained". Now it compiles; a value/unconstrained T still
+// rejects.
+
+// #1293: `where T: IDisposable` — t.Dispose() compiles and runs.
+BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_idisposable_constrained_ok_1293) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Res end Res; "
+        "static class F "
+        "  public static method Take<T>(owned t: T): int where T: IDisposable "
+        "    t.Dispose(); return 7; "
+        "  end Take; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  var r := new Res(); "
+        "  return F.Take<Res>(r); "  // 7
+        "end Main; end C;"), 7);
+}
+
+// #1293: `where T: class` — every class is IDisposable (§28.2), so Dispose is ok.
+BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_class_constrained_ok_1293) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Res end Res; "
+        "static class F "
+        "  public static method Take<T>(owned t: T): int where T: class, new() "
+        "    t.Dispose(); return 9; "
+        "  end Take; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  var r := new Res(); "
+        "  return F.Take<Res>(r); "  // 9
+        "end Main; end C;"), 9);
+}
+
+// #1293 (negative): an UNCONSTRAINED type param has no Dispose — still rejected.
+BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_unconstrained_rejected_1293) {
+    bezel::test::JitResult r = runJit(
+        "module M; "
+        "static class F "
+        "  public static method Take<T>(t: T): int "
+        "    t.Dispose(); return 0; "
+        "  end Take; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  return F.Take<int>(5); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #1293 (negative): a VALUE-constrained type param has no Dispose — rejected.
+BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_value_constrained_rejected_1293) {
+    bezel::test::JitResult r = runJit(
+        "module M; "
+        "static class F "
+        "  public static method Take<T>(t: T): int where T: value "
+        "    t.Dispose(); return 0; "
+        "  end Take; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  return F.Take<int>(5); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}

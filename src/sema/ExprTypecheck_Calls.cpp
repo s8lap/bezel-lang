@@ -1664,6 +1664,64 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         mbr == "ToString"    || mbr == "GetHashCode" ||
                         mbr == "Equals"      || mbr == "CompareTo"   ||
                         mbr == "GetType";
+                    // §28.2 / §14.2 (#1293): `t.Dispose()` is admissible on a
+                    // type parameter constrained to a REFERENCE type — every
+                    // class implicitly implements IDisposable (§28.2), so a
+                    // `class`, interface, or class-type constraint makes the
+                    // call legal. tryConstraints cannot resolve it (the builtin
+                    // IDisposable carries no declared member surface), so without
+                    // this the call fell through to the "unconstrained" diagnostic
+                    // even for `where T: IDisposable`. A value-typed / unconstrained
+                    // T has no Dispose and stays (correctly) rejected; codegen
+                    // already dispatches Dispose through the object's disposer.
+                    if (mbr == "Dispose") {
+                        auto scanRefConstraint =
+                            [&](const std::vector<ast::GenericConstraint>& gcs)
+                            -> bool {
+                            for (const auto& gc : gcs) {
+                                if (gc.typeParam != paramName) continue;
+                                for (const auto& item : gc.items) {
+                                    if (item.kind == "class") return true;
+                                    if (item.kind != "type" || !item.typeArg)
+                                        continue;
+                                    const TypeRef* ctr =
+                                        ctx_.resolvedType(*item.typeArg);
+                                    if (!ctr ||
+                                        ctr->kind != TypeRef::Kind::Named)
+                                        continue;
+                                    if (ctr->declaration &&
+                                        (ctr->declaration->kind ==
+                                             ast::TypeDeclKind::Interface ||
+                                         ctr->declaration->kind ==
+                                             ast::TypeDeclKind::Class))
+                                        return true;
+                                    // Builtin IDisposable / IAsyncDisposable
+                                    // (no user declaration) — reference types.
+                                    if (!ctr->declaration && ctr->astNode &&
+                                        ctr->astNode->name &&
+                                        !ctr->astNode->name->parts.empty()) {
+                                        auto nm =
+                                            ctr->astNode->name->parts.back();
+                                        if (nm == "IDisposable" ||
+                                            nm == "IAsyncDisposable")
+                                            return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        };
+                        bool refConstrained = false;
+                        if (currentMethodDecl_)
+                            refConstrained = scanRefConstraint(
+                                currentMethodDecl_->genericConstraints);
+                        if (!refConstrained && currentType_ &&
+                            currentType_->decl)
+                            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                    currentType_->decl))
+                                refConstrained =
+                                    scanRefConstraint(td->genericConstraints);
+                        if (refConstrained) isObjectMember = true;
+                    }
                     if (!isObjectMember) {
                         bool isDeclaredParam = false;
                         if (currentMethodDecl_) {
