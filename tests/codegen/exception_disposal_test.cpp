@@ -1502,4 +1502,68 @@ BEZEL_TEST(exception_disposal_895, owned_iteration_var_normal_discharge_once) {
         "  end Main; end C;"), 2);
 }
 
+// --------------------------------------------------------------------------
+// [1291] §22.7 step 2 — a throwing OWN field initializer of a NO-EXPLICIT-CTOR
+// class disposes the earlier owned fields whose initializers already completed
+// (in reverse declaration order), plus the base subobject, then reclaims the
+// block. The explicit-ctor path already did this (inlineCtorBody's cleanup); the
+// no-ctor field-init path did not, and leaked the earlier owned field.
+// --------------------------------------------------------------------------
+
+// #1291: `_a` (new Res()) completes, then `_b`'s initializer throws — `_a` must
+// be disposed on the unwind. created - disposed == 0 (both 1); LSan-clean.
+BEZEL_TEST(codegen_excdisp_1291, no_ctor_field_init_throw_disposes_earlier_field) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class Res "
+        "  public static created: int := 0; "
+        "  public static disposed: int := 0; "
+        "  public constructor() Res.created := Res.created + 1; end constructor; "
+        "  destructor Res.disposed := Res.disposed + 1; end destructor; "
+        "end Res; "
+        "class Helpers "
+        "  public static method Boom(): owned Res "
+        "    throw new InvalidOperationException(\"boom\"); "
+        "  end Boom; "
+        "end Helpers; "
+        "class P4 "
+        "  private owned _a: Res := new Res(); "
+        "  private owned _b: Res := Helpers.Boom(); "
+        "end P4; "
+        "class C public static method Main(): int "
+        "  try using var p := new P4(); "
+        "  catch InvalidOperationException => Console.WriteLine(\"caught\") end; "
+        "  return Res.created - Res.disposed; "  // 1 - 1 = 0
+        "end Main; end C;", 0);
+}
+
+// #1291: with a base class, a derived field-init throw disposes the derived owned
+// field AND the base subobject's owned field (§22.7: base Dispose follows the
+// derived field disposal). created - disposed == 0 (both 2); LSan-clean.
+BEZEL_TEST(codegen_excdisp_1291, no_ctor_field_init_throw_disposes_base_and_derived) {
+    expectExitAndLeakFree(
+        "module M; "
+        "class Res "
+        "  public static created: int := 0; "
+        "  public static disposed: int := 0; "
+        "  public constructor() Res.created := Res.created + 1; end constructor; "
+        "  destructor Res.disposed := Res.disposed + 1; end destructor; "
+        "end Res; "
+        "class Helpers "
+        "  public static method Boom(): owned Res "
+        "    throw new InvalidOperationException(\"boom\"); "
+        "  end Boom; "
+        "end Helpers; "
+        "class Base private owned _base: Res := new Res(); end Base; "
+        "class Derived: Base "
+        "  private owned _a: Res := new Res(); "
+        "  private owned _b: Res := Helpers.Boom(); "
+        "end Derived; "
+        "class C public static method Main(): int "
+        "  try using var p := new Derived(); "
+        "  catch InvalidOperationException => Console.WriteLine(\"caught\") end; "
+        "  return Res.created - Res.disposed; "  // 2 - 2 = 0
+        "end Main; end C;", 0);
+}
+
 }  // namespace

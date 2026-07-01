@@ -9353,7 +9353,37 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         llvm::Value* savedThisNoCtor = currentThis_;
         currentThis_ = obj;
         emitImplicitBase(t, obj);
-        emitOwnFieldInit(t, obj, st);
+        // §22.7 step 2 (#1291): a throwing OWN field initializer must dispose the
+        // earlier owned fields (whose initializers completed, in reverse
+        // declaration order) and the base subobject, then reclaim the instance
+        // block — mirroring inlineCtorBody's cleanup for the explicit-ctor case.
+        // Without this the no-explicit-ctor path leaked the earlier owned fields:
+        // emitNewPendingCheck below reclaims only the instance BLOCK, not its
+        // owned field objects. The cleanup routes a throwing field init through
+        // owned-field + base disposal (emitOwnedFieldDisposals is null-safe, so
+        // the not-yet-initialized field of the throwing initializer is a no-op)
+        // and then reclaims the block. Set only around the field-init sequence,
+        // so a base-ctor throw (emitImplicitBase, above) is still handled by
+        // emitNewPendingCheck — the base's own cleanup already disposed the base.
+        {
+            llvm::BasicBlock* savedUnwind = unwindTarget_;
+            std::size_t savedDepth = unwindScopeDepth_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            llvm::BasicBlock* enclosingUnwind = unwindBB();
+            auto* cleanupBB = llvm::BasicBlock::Create(
+                llvm_, "noctor.field.cleanup", currentFn_);
+            builder_.SetInsertPoint(cleanupBB);
+            emitOwnedFieldDisposals(t);
+            emitBaseDisposeChain(t);
+            builder_.CreateCall(freeFn(), {obj});
+            builder_.CreateBr(enclosingUnwind);
+            builder_.SetInsertPoint(savedInsert);
+            unwindTarget_ = cleanupBB;
+            unwindScopeDepth_ = disposeStack_.size();
+            emitOwnFieldInit(t, obj, st);
+            unwindTarget_ = savedUnwind;
+            unwindScopeDepth_ = savedDepth;
+        }
         currentThis_ = savedThisNoCtor;
         // §22.9 / §28.3 (FINDING [4]): the implicit base ctor may throw; the
         // base ctor's own cleanup disposed the base subobject without freeing
