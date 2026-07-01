@@ -177,6 +177,17 @@ private:
     // out, so auto-disposing would risk a double-free). Monotone (grows only), so
     // it is fixpoint-safe across the dataflow's block re-evaluations.
     std::unordered_set<sema::Symbol*> everDischarged_;
+    // §28.3 (#1257): every plain (non-`using`) `var` local that a LocalDecl
+    // transfer classified as Owned at its declaration. Recorded so the end-of-
+    // method auto-drop can flag a nested-scope owned local that is NOT present in
+    // the function-exit `endState` — one declared in an inner block that exits
+    // normally before the function reaches a throw-only exit (its scope ended, so
+    // it is not live at the function exit, and when the sole exit is a throw the
+    // exit state may be empty entirely). Such a local is never flagged by the
+    // endState loop, and codegen's fallback unwind-only disposal cannot fire (the
+    // inner scope was popped before the outer throw unwinds) → leak. Monotone
+    // (grows only) like `everDischarged_`, so it is fixpoint-safe.
+    std::unordered_set<sema::Symbol*> everOwnedPlainLocals_;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed

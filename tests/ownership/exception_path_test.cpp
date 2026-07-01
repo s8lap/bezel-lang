@@ -65,3 +65,44 @@ BEZEL_TEST(own_exc, throw_after_dispose_is_clean) {
         "var x := new T(); x.Dispose(); throw new Error();"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §28.3 (#1257): an owned local in a NESTED do-block that exits normally, then a
+// later `throw`, must be flagged for scope-end auto-drop. It never reaches the
+// function-exit state (its inner scope ended; the sole exit is the throw), so the
+// function-exit auto-drop loop misses it and codegen's fallback unwind-only
+// disposal cannot fire (the inner scope was popped before the throw unwinds) — a
+// leak. The never-discharged plain owner must still be flagged (via
+// everOwnedPlainLocals_) so its disposal fires at the inner-block scope end. We
+// assert the auto-drop warning names `r` and no error is reported. (The runtime
+// exactly-once disposal is verified AOT + ASan; the codegen_support runJit harness
+// omits checkOwnership, so this ownership-pass flag is asserted at the sema level.)
+BEZEL_TEST(own_exc, nested_block_owned_local_before_throw_auto_dropped_1257) {
+    auto r = parseAndCheckOwnership(
+        "module M; class E end E; class R end R; "
+        "class C public static method Main(): int "
+        "  try "
+        "    do var r := new R(); end; "
+        "    throw new E(); "
+        "  catch E => return 0; end; "
+        "  return -1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "r"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 (#1257) guard: a nested owned local that IS moved out (discharged on a
+// path, everDischarged > 0) is NOT auto-dropped — the move transfers ownership and
+// auto-disposing would double-free. No auto-drop warning for `r` here.
+BEZEL_TEST(own_exc, nested_block_moved_local_not_auto_dropped_1257) {
+    auto r = parseAndCheckOwnership(
+        "module M; class R end R; "
+        "class C "
+        "  public static method Take(owned x: R): int return 0; end Take; "
+        "  public static method Main(): int "
+        "    do var r := new R(); var _ := Take(move r); end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(bezel::test::hasAutoDropWarning(r, "r"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

@@ -236,6 +236,42 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 "`.Dispose()`, `move`, or `return`)");
         }
     }
+    // §28.3 (#1257): a plain-var owned local declared in a NESTED scope that exits
+    // normally before the function reaches a throw-only exit never appears in
+    // `endState` (its inner scope ended, so it is not live at the function exit;
+    // and when the sole exit is a throw the exit state may be empty). The loop
+    // above therefore never flags it, and codegen's fallback unwind-only disposal
+    // cannot fire (the inner scope was popped before the outer throw unwinds) → the
+    // value leaks. Flag every plain owner that was NEVER discharged on any path
+    // (everDischarged == 0, !reassigned) and not already flagged above: it is a
+    // never-moved genuine owner, so treating it like a `using var` is exactly-once-
+    // safe — registerUsingDisposal places the disposal at the local's OWN lexical
+    // scope, firing at the inner-block scope end on the normal path (before the
+    // throw) and via that block's unwind landing pad otherwise. Gated to
+    // synchronous, non-iterator, non-destructor bodies exactly like the function-
+    // exit auto-drop above (async suspend-locals / iterator-frame locals dispose
+    // via their own machinery; routing them here would double-dispose).
+    if (!isAsync_ && !sawYield_ && !isDestructor_) {
+        for (sema::Symbol* sym : everOwnedPlainLocals_) {
+            if (everDischarged_.count(sym) != 0) continue;
+            if (reassignedLocals.count(sym) != 0) continue;
+            auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (!ls) continue;
+            auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+            // Skip a local already flagged by the endState loop (it reaches the
+            // function exit as Owned) — flagging is idempotent but its warning
+            // would duplicate.
+            if (!ld || ld->autoDropAtScopeEnd) continue;
+            const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
+            ctx_.diagnostics().report(
+                Severity::Warning, ld->span.begin,
+                std::string("owned value in `") + std::string(sym->name) +
+                "` is implicitly disposed at the end of its scope "
+                "(§28.3 auto-drop); declare it `using var` to make the scope-bound "
+                "disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` "
+                "to discharge it");
+        }
+    }
     // Slice O8 / §28.8.1: a `move this.field` leaves the field in
     // moved-from state. The field must be reassigned (restored) before the
     // surrounding method exits — otherwise the field's invariant is broken on
@@ -1586,6 +1622,12 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // state-machine frame). Only ever set in an async body. // per §30.5
     if (suspendLocalDecls_.count(&ld)) lo.suspendLocal = true;
     states_[lsym] = lo;
+    // §28.3 (#1257): record a plain (non-`using`) owned local so the end-of-method
+    // auto-drop can flag it even when its nested scope ends before the function
+    // exit (so it never reaches `endState`). `using var`s are already Owned +
+    // implicitly discharged and need no flag.
+    if (!ld.isUsing && lo.state == OwnershipState::Owned)
+        everOwnedPlainLocals_.insert(lsym);
     // Async-readiness 3c (§30.5 line ~6110): a `using var`/`var` initializer
     // `:= await <bound owned task local>` consumes that operand task local
     // (the Pattern B await is owned-consuming with respect to its operand).
