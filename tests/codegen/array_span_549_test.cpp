@@ -970,3 +970,38 @@ BEZEL_TEST(array_span_549, ownedarray_real_surface_still_accepted_920) {
         "  return a.Count + a.Get(0)._v + a.Get(1)._v; "  // 2 + 9 + 7 = 18
         "end Main; end C;", 18);
 }
+
+// #1277 (§4.14): `Span<T>.Start` (field 1 of the {ptr,i32 start,i32 length}
+// struct) had no member-access handler, so `sp.Start` fell through to the generic
+// path and read 0 — and, in an expression, poisoned a sibling `sp.Length` read to
+// 0 (`sp.Start + sp.Length` returned 0 instead of Start+Length). It now reads
+// field 1 directly.
+BEZEL_TEST(codegen_span549, span_start_field_read_1277) {
+    // AsSpan(2, 4) → Start=2, Length=4; Start+Length = 6.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(8, (i) => i + 1); "
+        "  var sp := buf.AsSpan(2, 4); "
+        "  return sp.Start + sp.Length; "  // 2 + 4 = 6
+        "end Main; end C;"), 6);
+}
+
+// #1277: `Start` alone reads the true start (2), not 0.
+BEZEL_TEST(codegen_span549, span_start_alone_1277) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(8, (i) => i + 1); "
+        "  var sp := buf.AsSpan(3, 2); "
+        "  return sp.Start; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// #1277: ReadOnlySpan.Start works the same (shared {ptr,i32,i32} layout).
+BEZEL_TEST(codegen_span549, readonly_span_start_field_read_1277) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var buf := new OwnedBuffer<int>(8, (i) => i + 1); "
+        "  var sp := buf.AsReadOnlySpan(2, 3); "
+        "  return sp.Start + sp.Length; "  // 2 + 3 = 5
+        "end Main; end C;"), 5);
+}

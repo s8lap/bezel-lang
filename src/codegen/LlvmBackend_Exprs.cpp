@@ -2363,7 +2363,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // Length extracts field 2; IsEmpty compares field 2 to 0.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target &&
-            (ma->member == "Length" || ma->member == "IsEmpty")) {
+            (ma->member == "Length" || ma->member == "IsEmpty" ||
+             ma->member == "Start")) {
             auto* tt = ctx_.exprType(*ma->target);
             // §3.3 (#883): ReadOnlyStringSpan shares the {ptr,i32,i32} layout, so
             // Length/IsEmpty are the same field-2 read as the array-backed spans.
@@ -2374,6 +2375,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             if (isSpanLikeTypeName(tt) || isStrSpan) {
                 llvm::Value* sv = lowerExpr(*ma->target);
                 if (!sv) return nullptr;
+                // §4.14 (#1277): `Start` is field 1 of the { ptr source, i32
+                // start, i32 length } span struct. It had no handler, so `sp.Start`
+                // fell through to the generic member-access path and read 0 (also
+                // poisoning a sibling `sp.Length` in the same expression). Read
+                // field 1 directly.
+                if (ma->member == "Start")
+                    return builder_.CreateExtractValue(sv, {1u}, "sp.start");
                 llvm::Value* slen = builder_.CreateExtractValue(
                     sv, {2u}, "sp.len");
                 if (ma->member == "Length")
