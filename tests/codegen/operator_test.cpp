@@ -166,6 +166,39 @@ BEZEL_TEST(codegen_cg48, generic_class_operator_1059) {
         "end Main; end C;"), 7);
 }
 
+// #1260 / §25 / §14.1: a user-defined operator on a GENERIC record, whose result
+// is bound WITHOUT an explicit type annotation (`var r := a + b`), must be typed
+// as the concrete instantiation `Box<int>`, not the unsubstituted `Box<T>`. The
+// operator resolves and the value is correct, but the result type left `T`
+// unsubstituted, so a later access `r.value` typed as the opaque param `T` — and
+// a second operator on it (`r.value + 1`) wrongly reported "operator + not
+// defined for `?`". (The existing 1059 tests above use an explicit annotation,
+// which masks this — the inference path is what regressed.) Here `r.value` must
+// resolve to `int` so `r.value + 1` type-checks and evaluates.
+BEZEL_TEST(codegen_cg48, generic_record_operator_inferred_result_field_1260) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(value: T) "
+        "  public static method operator +(a: Box<T>, b: Box<T>): Box<T> => "
+        "    new Box<T>(a.value); end Box; "
+        "class C public static method Main(): int "
+        "  var a := new Box<int>(10); var b := new Box<int>(20); "
+        "  var r := a + b; return r.value + 1; "
+        "end Main; end C;"), 11);
+}
+
+// #1260 sibling: the operator returns the bare param `T`; the inferred result
+// `r` must be `int` (not opaque `T`) so `r + 1` type-checks.
+BEZEL_TEST(codegen_cg48, generic_record_operator_inferred_bare_param_result_1260) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box<T>(value: T) "
+        "  public static method operator +(a: Box<T>, b: Box<T>): T => a.value; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var a := new Box<int>(7); var b := new Box<int>(8); "
+        "  var r := a + b; return r + 1; "
+        "end Main; end C;"), 8);
+}
+
 // #1219 / §25.2 / §14 / §9.5: `++` on a GENERIC record with a `new`-body operator.
 // Before the fix: call site loaded record.Box$spec0 but called unspecialized
 // bz$Box$op$++ (expects record.Box) → LLVM IR_FAIL.  After the fix: the per-

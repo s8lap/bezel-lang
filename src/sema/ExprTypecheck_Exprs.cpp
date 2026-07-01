@@ -1881,8 +1881,34 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             ctx_.setExprSymbol(&be, opm);
             if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl))
                 if (od->returnType)
-                    if (auto* rt = ctx_.resolvedType(*od->returnType))
+                    if (auto* rt = ctx_.resolvedType(*od->returnType)) {
+                        // §25 / §14.1 (#1260): the operator is declared inside a
+                        // GENERIC record/class (`operator +(a,b: Box<T>): Box<T>`).
+                        // Its return type embeds the declaring type's params (`T`),
+                        // which `resolvedType` leaves unsubstituted. Substitute them
+                        // from the concrete operand instantiation (`Box<int>`) so
+                        // the result is `Box<int>` — otherwise `r := a + b` was typed
+                        // `Box<T>` and a downstream `r.value` resolved to the opaque
+                        // param `T` (a later `r.value + 1` then wrongly reported
+                        // "operator + not defined for `?`"). Reuses the #597 member-
+                        // return substitution (substituteMemberType → classSubst).
+                        if (opm->parent &&
+                            !opm->parent->genericParams.empty()) {
+                            auto isParentInst = [&](const ast::Expr* e) -> bool {
+                                TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+                                return t && t->kind == TypeRef::Kind::Named &&
+                                       t->declaration == opm->parent &&
+                                       !t->genericArgs.empty();
+                            };
+                            const ast::Expr* recv =
+                                isParentInst(be.left.get())  ? be.left.get()
+                                : isParentInst(be.right.get()) ? be.right.get()
+                                                               : nullptr;
+                            if (recv)
+                                rt = substituteMemberType(rt, recv, opm->parent);
+                        }
                         ctx_.setExprType(&be, rt);
+                    }
             return;
         }
         // §7.11 (#1132): user-defined operator lifting over nullable operands is
