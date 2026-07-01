@@ -522,3 +522,76 @@ BEZEL_TEST(codegen_extension,
         "  end Main; "
         "end C;"), 42);
 }
+
+// ===========================================================================
+// §26.2 / §26.5 (#1308) — extension declared on `Object`, the implicit base of
+// every class and interface (spec §2 "every type derives from Object"; §12
+// "if no base class is specified, the implicit base is Object"). §26.5 rule 2
+// searches "x's type, base types, or implemented interfaces" — Object is a
+// base of every reference type, so `f.Tag()` on a class receiver must resolve
+// to the Object extension. Before the fix the receiver's baseTypeRefs chain
+// did not materialise the implicit Object base, so extension lookup omitted it
+// and the call was BAD_REJECT'd ("no member Tag on type Foo").
+// ===========================================================================
+
+// Object extension resolved through a plain user-class receiver.
+BEZEL_TEST(codegen_extension, method_on_object_via_class_receiver_spec_26_5_1308) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 7; end; "
+        "class Foo "
+        "  public v: int; "
+        "  public constructor() v := 5; end constructor; "
+        "end Foo; "
+        "class C public static method Main(): int "
+        "  using var f := new Foo(); "
+        "  return f.Tag() + f.v; "  // 7 + 5 = 12
+        "end Main; end C;"), 12);
+}
+
+// Object extension resolved through an interface-typed receiver.
+BEZEL_TEST(codegen_extension, method_on_object_via_interface_receiver_spec_26_5_1308) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 7; end; "
+        "interface IShape method Area(): int; end; "
+        "class Sq : IShape "
+        "  public method Area(): int => 4; "
+        "  destructor end destructor; "
+        "end Sq; "
+        "class C public static method Main(): int "
+        "  using var s: IShape := new Sq(); "
+        "  return s.Tag(); "  // 7
+        "end Main; end C;"), 7);
+}
+
+// Object extension resolved through a receiver that has an explicit base class
+// (the implicit Object base is still reached).
+BEZEL_TEST(codegen_extension, method_on_object_via_derived_receiver_spec_26_5_1308) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 9; end; "
+        "class Base "
+        "  public b: int; "
+        "  public constructor() b := 1; end constructor; "
+        "  destructor end destructor; "
+        "end Base; "
+        "class Der : Base public constructor() base(); end constructor; end Der; "
+        "class C public static method Main(): int "
+        "  using var d := new Der(); "
+        "  return d.Tag(); "  // 9
+        "end Main; end C;"), 9);
+}
+
+// A real member of the receiver still takes precedence over the Object
+// extension (§26.5 — extensions are a fallback, never shadowing a real member).
+BEZEL_TEST(codegen_extension, real_member_wins_over_object_extension_spec_26_5_1308) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 7; end; "
+        "class Foo public method Tag(): int => 100; end; "
+        "class C public static method Main(): int "
+        "  using var f := new Foo(); "
+        "  return f.Tag(); "  // 100 — the real member, not the extension
+        "end Main; end C;"), 100);
+}

@@ -1904,6 +1904,23 @@ static const TypeRef* extensionFindMatchingAncestor(
     std::vector<std::unique_ptr<TypeRef>>& owned) {
     if (!target || !recv) return nullptr;
     if (extensionTargetMatchesReceiver(target, recv, freeVars)) return recv;
+    // §26.2/§26.5 (#1308): `Object` (a Primitive TypeRef) is the implicit base
+    // of every class and interface — spec §2 "every type derives from Object",
+    // §12 "if no base class is specified, the implicit base is Object". A
+    // receiver's `baseTypeRefs` chain does NOT materialise this implicit Object
+    // base, so the walk below never reaches Object for a class/interface
+    // receiver whose declared bases are empty (or don't transitively list
+    // Object). Treat Object as a matching (least-specific, §26.5.1 rule 1)
+    // ancestor of any reference-typed receiver so `extension Object` methods
+    // resolve. Value-typed receivers (record/enum/primitive) would need boxing
+    // to Object before the call and are out of scope here — they fall through
+    // to the existing diagnostic.
+    if (target->kind == TypeRef::Kind::Primitive &&
+        target->primitive == PrimitiveType::Object &&
+        recv->kind == TypeRef::Kind::Named && recv->declaration &&
+        (recv->declaration->kind == ast::TypeDeclKind::Class ||
+         recv->declaration->kind == ast::TypeDeclKind::Interface))
+        return target;
     // Walk user-declared receiver's base type chain.
     if (recv->kind == TypeRef::Kind::Named && recv->declaration) {
         std::vector<const TypeRef*> frontier;
