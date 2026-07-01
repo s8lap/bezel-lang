@@ -248,6 +248,54 @@ const char* kEarlyReturnDispose =
     "end Main; end C;";
 // Expected: 10
 
+// §28.10 (#1285): run the FULL front-end pipeline INCLUDING checkOwnership,
+// then AOT-compile, link with ASan, and run — returning the program's real exit
+// code (99 on a sanitizer abort / SEGV from a double-free, -1 when the
+// toolchain is absent). runJit omits checkOwnership, so the ownership-pass flag
+// that suppresses a borrow-local using-var disposal (usingVarSourceIsBorrow) is
+// set only on this AOT path; a runJit run would double-free. An exit code equal
+// to the expected value simultaneously proves disposed-exactly-once AND
+// ASan-clean (no double-free).
+int runAotExit(const std::string& source) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_1285_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+    {
+        bezel::DiagnosticEngine diags;
+        bezel::Lexer lexer(source, diags);
+        bezel::Parser parser(lexer, diags);
+        auto unit = parser.parseCompilationUnit();
+        if (!unit) return -1;
+        bezel::sema::SemaContext ctx(diags);
+        bezel::sema::collectSymbols(*unit, ctx);
+        bezel::sema::resolveTypes(*unit, ctx);
+        bezel::sema::typecheckExpressions(*unit, ctx);
+        bezel::sema::checkDefiniteAssignment(*unit, ctx);
+        bezel::ownership::checkOwnership(*unit, ctx);
+        if (diags.hasErrors()) return -1;
+        llvm::LLVMContext llvmCtx;
+        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+        if (!module) return -1;
+        std::string err;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    }
+    auto cleanup = [&] { std::remove(objPath.c_str()); std::remove(exe.c_str()); };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
+                         " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (!WIFEXITED(status)) return 99;  // crashed (e.g. SEGV from a double-free)
+    return WEXITSTATUS(status);
+}
+
 }  // namespace
 
 // ---- (a) exact repro: destructor of `using var a := new T()` runs at scope end ----
@@ -290,4 +338,49 @@ BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
 BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
            type_param_new_early_return_disposes_28_3) {
     expectNoDoubleFree(kEarlyReturnDispose, 10);
+}
+
+// ---- (e) §28.10 (#1285): borrow-LOCAL using-var must not double-free --------
+
+// §28.10 (#1285): `using var c := b` where `b` is a local that ALIASES a borrow
+// parameter holds no ownership obligation — the value's real owner (the
+// caller's `using var w`) disposes it. Before the fix codegen registered a
+// second scope-end disposal → a double-free (SIGSEGV). Now the ownership pass
+// flags the borrow-local source and codegen skips the disposal, so the object
+// is disposed exactly once (Widget.D == 1). The borrow-PARAMETER case was #1274;
+// this is the borrow-LOCAL sibling. Verified on the AOT path because runJit
+// omits checkOwnership (the suppression flag would otherwise not be set).
+BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
+           using_var_of_borrow_local_no_double_free_1285) {
+    int rc = runAotExit(
+        "module M; "
+        "class Widget public static D: int := 0; "
+        "  destructor Widget.D := Widget.D + 1; end destructor; end Widget; "
+        "public static class Prog "
+        "  public static method Take(x: Widget) "
+        "    var b := x; using var c := b; end Take; "
+        "  public static method Main(): int "
+        "    do using var w := new Widget(); Prog.Take(w); end; "
+        "    return Widget.D; end Main; "
+        "end Prog;");
+    if (rc == -1) return;         // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(rc, 1);       // disposed exactly once, ASan-clean
+}
+
+// §28.10 (#1285) control: an OWNED-local transfer to a using var STILL disposes
+// exactly once — the fix only suppresses a positively-Borrowed source, so an
+// owned local (Owned in the flow) keeps its scope-end disposal (Widget.D == 1).
+BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
+           using_var_of_owned_local_still_disposes_1285) {
+    int rc = runAotExit(
+        "module M; "
+        "class Widget public static D: int := 0; "
+        "  destructor Widget.D := Widget.D + 1; end destructor; end Widget; "
+        "public static class Prog "
+        "  public static method Main(): int "
+        "    do var o := new Widget(); using var c := o; end; "
+        "    return Widget.D; end Main; "
+        "end Prog;");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 1);
 }

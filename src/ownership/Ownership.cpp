@@ -1632,6 +1632,22 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                         break;
                     }
                 }
+                // §28.10 (#1285): if the bare-id source resolves to a local (or
+                // parameter) that the flow currently holds as a BORROW — a
+                // borrow local aliasing a borrow, or a borrow parameter — the
+                // using var only pins it and must NOT dispose it at scope end
+                // (its real owner does). Record that on the decl so codegen
+                // skips the disposal. Only a positive Borrowed classification
+                // sets the flag, so an owned transfer (Owned above), a
+                // drain-loop element, or an owned parameter (which register
+                // real disposals) is untouched.
+                if (sema::Symbol* srcSym = ctx_.exprSymbol(*aid)) {
+                    auto it = states_.find(srcSym);
+                    if (it != states_.end() &&
+                        it->second.state == OwnershipState::Borrowed)
+                        const_cast<ast::LocalDecl&>(ld)
+                            .usingVarSourceIsBorrow = true;
+                }
             }
         }
     } else if (ld.initializer) {

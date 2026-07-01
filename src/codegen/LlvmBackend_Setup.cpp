@@ -12433,6 +12433,12 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
             if (ps->modifier != "owned" && ps->modifier != "out owned")
                 return nullptr;
         }
+        // §28.10 (#1285): the borrow-LOCAL sibling of the parameter check above.
+        // A `using var c := b` where `b` is a local that aliases a borrow holds
+        // no ownership obligation — the ownership pass flags it; skip disposal
+        // so the borrowed value is not freed here and again by its real owner.
+        if (ld->usingVarSourceIsBorrow)
+            return nullptr;
         if (auto* rt = ctx_.exprType(*ld->initializer)) {
             if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration)
                 return rt->declaration;

@@ -134,6 +134,14 @@ struct LocalDecl : Stmt {
     // instead of the unwind-only path. A conditionally-discharged local is NOT
     // flagged (auto-disposing its moved/disposed path would double-free).
     bool autoDropAtScopeEnd = false;
+    // §28.10 (#1285): set by the ownership pass on a `using var` whose bare
+    // identifier initializer resolves to a BORROW (a borrow local aliasing a
+    // borrow, or a borrow parameter) rather than an owned transfer. Codegen
+    // (classOfLocal / registerUsingDisposal) skips the scope-end disposal for
+    // such a using var — disposing a borrowed value here would double-free the
+    // value its real owner also disposes (the borrow-LOCAL sibling of the
+    // #1274 borrow-parameter exclusion, which codegen can detect on its own).
+    bool usingVarSourceIsBorrow = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`
