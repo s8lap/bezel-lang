@@ -292,26 +292,25 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_field_roundtrip_spec_9_1) {
         "end Main; end C;"), 1);
 }
 
-// §8.3 / §9.1: the guard is generic over NULLABLE REFERENCE fields, not just
-// string. A nullable class field (`Inner?`) set to null must likewise compare
-// equal (both-null), hash to the sentinel, and render `null` — never call
-// ToString on a null `this` nor deref. (Equality/hash were already non-crashing
-// for class refs; ToString previously rendered the type name and risked a
-// null-`this` ToString call — the guard makes all three consistent.)
-BEZEL_TEST(codegen_record_str_eq, nullable_class_field_null_value_semantics_spec_8_3) {
+// §9.3 (v0.158, #1383): a positional record whose positional field is a
+// class type (`Inner?` — a reference type, not admissible per §9.2) is no
+// longer equality-bearing. Using `=` / `GetHashCode` / `ToString` on it is a
+// compile error at the use site (the same use-site-error discipline as a
+// non-auto-equality-bearing body record). The codegen null-guard for nullable
+// reference fields (`string?`, which IS admissible) is covered by
+// nullable_string_field_roundtrip_spec_9_1 above.
+BEZEL_TEST(codegen_record_str_eq, nullable_class_field_eq_is_compile_error_spec_9_3) {
+    // Compile error expected: Inner is a class (reference type) — not admissible
+    // as a positional-record field per §9.3/§9.2.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class Inner public V: int := 0; "
-        "  public override method ToString(): string return \"inner!\"; end ToString; "
-        "end Inner; "
+        "class Inner public V: int := 0; end Inner; "
         "record Holder(inner: Inner?); "
         "class C public static method Main(): int "
         "  var a := new Holder(null); "
         "  var b := new Holder(null); "
-        "  return (1 if a = b "
-        "             and a.GetHashCode() = b.GetHashCode() "
-        "             and a.ToString() = \"Holder(inner: null)\" else 0); "
-        "end Main; end C;"), 1);
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), -999);  // -999 = did not run (compile error)
 }
 
 // ---------------------------------------------------------------------------

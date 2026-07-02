@@ -915,7 +915,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     hashRole = "key";
                 if (!hashRole.empty() && !ref.genericArgs.empty())
                     hashContainerSites_.push_back(
-                        {first, hashRole, ref.genericArgs[0], &t});
+                        {first, hashRole, ref.genericArgs[0], &t,
+                         currentOuterType_});  // §1384: for per-instantiation check
                 // §16.5 / issue #922: Range<T> is a compiler-intrinsic record.
                 // An explicit annotation `Range<int>` must resolve to the SAME
                 // TypeRef shape as the inferred form `var r := 1..5` — both

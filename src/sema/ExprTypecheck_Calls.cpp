@@ -8864,23 +8864,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // path).  recordHasUserDeclaredEquality returns true only for
             // operator=/operator<> overloads (not bare Equals/GetHashCode — see
             // #1249 / §9.2 v0.156).  ToString is not covered: ineligible records
-            // keep the type-name default ToString per §8.5/§9.2.  Positional
-            // records, enums, and eligible body records are unaffected.
+            // keep the type-name default ToString per §8.5/§9.2.
             if ((m == "Equals" || m == "GetHashCode") &&
                 targetType->kind == ast::TypeDeclKind::Record) {
-                bool positional = false;
-                if (auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl))
-                    positional = td->hasPositionalFields;
-                if (!positional &&
-                    !isAutoEqualityBearingBodyRecord(targetType, ctx_) &&
-                    !recordHasUserDeclaredEquality(targetType)) {
+                // §9.3 (v0.158, #1383): positional/combined-form records with
+                // non-admissible fields are also not equality-bearing and get
+                // the same use-site error. Check TypeSymbol flag first (covers
+                // imported records per #501), then ast::TypeDecl.
+                bool positional = targetType->hasPositionalFields;
+                if (!positional)
+                    if (auto* td =
+                            dynamic_cast<const ast::TypeDecl*>(targetType->decl))
+                        positional = td->hasPositionalFields;
+                bool isEq = positional
+                                ? isPositionalRecordEqualityBearing(
+                                      targetType, ctx_)
+                                : isAutoEqualityBearingBodyRecord(
+                                      targetType, ctx_);
+                if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "`." + std::string(m) + "` is not available on record `" +
                         std::string(targetType->name) +
-                        "`: it is not auto-equality-bearing (§9.2). Declare `=`"
-                        " and `<>` overloads (with `Equals`/`GetHashCode`), or"
-                        " simplify the record to an auto-equality-bearing form.");
+                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                        " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
+                        " or simplify the record to an auto-equality-bearing"
+                        " form.");
                 }
             }
             if (m == "ToString")

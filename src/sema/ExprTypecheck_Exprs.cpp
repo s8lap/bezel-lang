@@ -2127,26 +2127,29 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             if (ts && ts->kind == ast::TypeDeclKind::Record &&
                 !isAutoEqualityBearingBodyRecord(ts, ctx_) &&
                 !recordHasUserDeclaredEquality(ts)) {
-                // §9.3: skip positional / combined-form records (they get §9.1
-                // positional value equality, not the body-record rule).
-                // For LOCAL records the flag lives on the ast::TypeDecl; for
-                // IMPORTED records (no ast node) it lives on TypeSymbol itself
-                // (set by SymbolCollection and carried in module metadata per
-                // issue #501 fix). Check TypeSymbol::hasPositionalFields first;
-                // if false and a TypeDecl is available, also check there.
+                // §9.3 (v0.158, #1383): positional/combined-form records are no
+                // longer unconditionally skipped. A positional record whose
+                // fields fall outside the admissible-component rule gets the same
+                // use-site error as a non-auto-equality-bearing body record (§9.3
+                // "use-site-error discipline"). For LOCAL records the flag lives
+                // on the ast::TypeDecl; for IMPORTED records (no ast node) it
+                // lives on TypeSymbol itself (issue #501 fix).
                 bool positional = ts->hasPositionalFields;
                 if (!positional) {
                     if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
                         positional = td->hasPositionalFields;
                 }
-                if (!positional) {
+                bool isEq = positional
+                                ? isPositionalRecordEqualityBearing(ts, ctx_)
+                                : false;
+                if (!isEq) {
                     ctx_.diagnostics().report(
                         Severity::Error, be.span.begin,
                         "`" + std::string(op) + "` is not available on record `" +
                         std::string(ts->name) +
-                        "`: it is not auto-equality-bearing (§9.2). Declare `=`"
-                        " and `<>` overloads (with `Equals`/`GetHashCode`), or"
-                        " simplify the record to an auto-equality-bearing form.");
+                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                        " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
+                        " or simplify the record to an auto-equality-bearing form.");
                     break;
                 }
             }

@@ -1263,8 +1263,16 @@ void Resolver::checkEqualityCoDeclaration() {
 // auto-equality-bearing property depends on the record's own members being
 // resolved, which may happen after the container annotation is visited (§3.6
 // rule 2: per-instantiation, at the instantiation site).
+//
+// #1384: a second pass handles sites where the key was a generic type parameter
+// (conservatively accepted in the generic body — no constraint surface exists to
+// require equality-bearing). When the enclosing generic is concretely
+// instantiated with a non-equality-bearing type, the per-instantiation check
+// fires at the hash-container annotation site (§3.6 rule 2).
 void Resolver::checkHashContainerKeys() {
     std::unordered_set<const ast::Type*> reported;
+
+    // Pass 1: direct (non-generic-param) key check (the original #1338 logic).
     for (const HashContainerSite& s : hashContainerSites_) {
         if (isEqualityBearing(s.keyRef, ctx_)) continue;
         if (s.site && !reported.insert(s.site).second) continue;  // dedup per site
@@ -1284,6 +1292,61 @@ void Resolver::checkHashContainerKeys() {
             "declares custom equality (`operator =`/`<>` with `Equals(T)` and "
             "`override GetHashCode`, \xC2\xA7""25.2). Give it an "
             "auto-equality-bearing form, or declare custom equality.");
+    }
+
+    // Pass 2 (#1384): per-instantiation check for sites whose key is a generic
+    // type parameter. isEqualityBearing returns true conservatively for unresolved
+    // generic params (no concrete type is known at the declaration site), so those
+    // sites pass pass 1. Here we walk concrete instantiations of the enclosing
+    // type to check whether the bound type is equality-bearing.
+    std::unordered_set<const ast::Type*> reported2;
+    for (const HashContainerSite& s : hashContainerSites_) {
+        // Only unresolved-param keys (declaration == null); concrete keys were
+        // handled in pass 1.
+        if (!s.keyRef || s.keyRef->declaration) continue;
+        if (s.keyRef->kind != TypeRef::Kind::Named) continue;
+        if (!s.enclosingType) continue;
+        // Recover the parameter name from the key's AST node.
+        if (!s.keyRef->astNode ||
+            s.keyRef->astNode->kind != ast::TypeKind::Named ||
+            !s.keyRef->astNode->name ||
+            s.keyRef->astNode->name->parts.size() != 1)
+            continue;
+        std::string_view paramName = s.keyRef->astNode->name->parts.front();
+        // Find the index of this parameter in the enclosing type's param list.
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == paramName) {
+                paramIdx = i; break;
+            }
+        }
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+        // Walk all recorded instantiations of the enclosing type.
+        for (const GenericInstantiation& inst : instantiations_) {
+            if (inst.type != s.enclosingType) continue;
+            if (paramIdx >= inst.argRefs.size()) continue;
+            TypeRef* concreteKey = inst.argRefs[paramIdx];
+            if (!concreteKey || concreteKey->kind == TypeRef::Kind::Error) continue;
+            if (isEqualityBearing(concreteKey, ctx_)) continue;
+            // Concrete key is not equality-bearing — report at the hash-container
+            // annotation site (§3.6 rule 2 per-instantiation discipline).
+            if (s.site && !reported2.insert(s.site).second) continue;
+            const TypeSymbol* rec = concreteKey->declaration;
+            std::string keyName =
+                rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+            ctx_.diagnostics().report(
+                Severity::Error,
+                s.site ? s.site->span.begin : SourceLocation{},
+                std::string("`") + std::string(s.container) +
+                "` requires an equality-bearing " + std::string(s.property) +
+                " type, but the type argument " + keyName +
+                " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): it is a "
+                "record that is neither auto-equality-bearing (\xC2\xA7""9.2) nor "
+                "declares custom equality (`operator =`/`<>` with `Equals(T)` and "
+                "`override GetHashCode`, \xC2\xA7""25.2). Give it an "
+                "auto-equality-bearing form, or declare custom equality.");
+        }
     }
 }
 

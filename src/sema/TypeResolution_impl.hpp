@@ -521,6 +521,10 @@ private:
         std::string_view property;    // "key" / "element" (for the diagnostic)
         TypeRef* keyRef = nullptr;    // the K / T type argument
         const ast::Type* site = nullptr;  // the annotation node (span)
+        // §1384: when keyRef is a generic parameter (declaration == null), the
+        // enclosing type is stored so checkHashContainerKeys can walk
+        // instantiations of that type to find the concrete bound for the key.
+        TypeSymbol* enclosingType = nullptr;
     };
     std::vector<HashContainerSite> hashContainerSites_;
 

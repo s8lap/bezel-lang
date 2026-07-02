@@ -360,3 +360,115 @@ BEZEL_TEST(equality_v0158, set_user_equality_record_element_accepted_spec_3_6) {
         "class C public method M(s: Set<V>) end M; end C;");
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
+
+// ─── §9.3 v0.158: positional/combined-record admissibility (#1383) ───────────
+
+// §9.3: a purely-positional record whose positional field is a class type (not
+// admissible per §9.2) gets the same use-site-error discipline as a body record
+// with a non-admissible component — `=` is a compile error (not silent
+// reference-shaped equality).
+BEZEL_TEST(equality_v0158, positional_class_field_eq_rejected_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "class K public v: int := 0; end K; "
+        "record BadPos(Ref: K); "
+        "class C public method M(a: BadPos, b: BadPos) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+}
+
+// §9.3: a purely-positional record with admissible fields (int, string) keeps
+// its auto-generated equality — `=` is accepted.
+BEZEL_TEST(equality_v0158, positional_admissible_fields_eq_accepted_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "record GoodPos(X: int, Y: string); "
+        "class C public method M(a: GoodPos, b: GoodPos) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.3: `.Equals` on a positional record with a class-typed field is also a
+// use-site error (the same as `=`).
+BEZEL_TEST(equality_v0158, positional_class_field_equals_call_rejected_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "class K public v: int := 0; end K; "
+        "record BadPos(Ref: K); "
+        "class C public method M(a: BadPos, b: BadPos) _ := a.Equals(b); end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+}
+
+// §9.3: a combined-form record (positional fields + body) with a class-typed
+// positional field is not auto-equality-bearing — `=` is a compile error.
+BEZEL_TEST(equality_v0158, combined_class_positional_field_rejected_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "class K public v: int := 0; end K; "
+        "record Combined(Ref: K) "
+        "  public method Len(): int => 0; "
+        "end Combined; "
+        "class C public method M(a: Combined, b: Combined) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+}
+
+// §9.3: a combined-form record with only admissible positional fields and a
+// trivial body is auto-equality-bearing — `=` is accepted.
+BEZEL_TEST(equality_v0158, combined_admissible_fields_eq_accepted_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "record Vec(X: double, Y: double) "
+        "  public method Len(): double => 0.0; "
+        "end Vec; "
+        "class C public method M(a: Vec, b: Vec) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.3: a positional record with a class-typed field is NOT equality-bearing,
+// so it is rejected as a Dictionary key.
+BEZEL_TEST(equality_v0158, positional_class_field_dict_key_rejected_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "class K public v: int := 0; end K; "
+        "record BadPos(Ref: K); "
+        "class C public method M(d: Dictionary<BadPos, int>) end M; end C;");
+    BEZEL_EXPECT_TRUE(hasEqualityBearingError(r));
+}
+
+// §9.3 / §3.6: a nested positional record in another record — if its positional
+// field is a class (not admissible), the outer record is also not admissible.
+BEZEL_TEST(equality_v0158, nested_positional_non_admissible_rejects_outer_spec_9_3) {
+    auto r = parseSema(
+        "module M; "
+        "class K public v: int := 0; end K; "
+        "record Inner(Ref: K); "   // not admissible (class field)
+        "record Outer "
+        "  public property I: Inner; "
+        "  public constructor(i: Inner) I := i; end constructor; "
+        "end Outer; "
+        "class C public method M(a: Outer, b: Outer) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+}
+
+// ─── §3.6 / §8.3 v0.158: generic type param key — per-instantiation (#1384) ──
+
+// §3.6 rule 2 / #1384: when a hash container is used inside a generic type
+// body with a type parameter as the key, the site is CONSERVATIVELY accepted
+// (no constraint surface for equality-bearing exists). The check fires
+// per-instantiation: a concrete instantiation with a non-equality-bearing key
+// is rejected at the instantiation site.
+BEZEL_TEST(equality_v0158, dict_generic_param_key_concrete_bad_instantiation_spec_3_6) {
+    auto r = parseSema(
+        "module M; "
+        // Inner non-equality-bearing body record
+        "record Bad "
+        "  public property Id: int; "
+        "  private _cache: int := 0; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "end Bad; "
+        // Generic class whose M method uses Dictionary<K2, int>
+        "class Outer<K2> "
+        "  public method M(d: Dictionary<K2, int>) end M; "
+        "end Outer; "
+        // Concrete instantiation Outer<Bad> — the key becomes Bad at this site
+        "class C public method Use(o: Outer<Bad>) end Use; end C;");
+    BEZEL_EXPECT_TRUE(hasEqualityBearingError(r));
+}

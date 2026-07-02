@@ -278,6 +278,16 @@ struct ExternDeclSymbol : Symbol {
 // auto-property storage.
 bool isAutoPropertySymbol(const Symbol* m);
 
+// §9.3 (v0.158, #1383): true when a positional or combined-form record
+// synthesizes equality — i.e. every positional field's type (and every body
+// auto-property's type for the combined form) is an admissible component type
+// (§9.2 recursive rule) and the body carries no disqualifying member. Imported
+// positional records (no ast::TypeDecl) are conservatively treated as true.
+// Called from isAdmissibleComponentType (nested record check), isEqualityBearing
+// (hash-container key check), and ExprTypecheck (use-site equality error).
+bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
+                                        const SemaContext& ctx);
+
 // §9.2 (v0.158) auto-equality eligibility for a *body record* (a record with
 // no positional fields). Returns true iff the record is "auto-equality-bearing":
 // every member is an auto-property whose type is an **admissible component

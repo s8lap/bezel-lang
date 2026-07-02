@@ -345,6 +345,14 @@ bool isAutoPropertySymbol(const Symbol* m) {
     return true;
 }
 
+// §9.3 (v0.158, #1383): forward declaration for mutual recursion with
+// isAdmissibleComponentType — a positional field's type calls
+// isAdmissibleComponentType recursively, which in turn calls this function
+// to check whether a nested positional record is itself equality-bearing.
+// Definition follows isAutoEqualityBearingBodyRecord below.
+bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
+                                        const SemaContext& ctx);
+
 // §9.2 v0.158: resolve a record storage component (an auto-property, a body
 // field, or a §9.1 positional field) to its declared TypeRef. Returns null when
 // the type is not resolvable (an imported member with no local ast::Type node
@@ -418,11 +426,17 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
             if (decl->kind == ast::TypeDeclKind::Enum) return true;
             if (decl->kind == ast::TypeDeclKind::Record) {
                 // Another record — admissible iff it is itself
-                // auto-equality-bearing (a positional/combined record always
-                // synthesizes equality; a body record must pass §9.2).
-                if (decl->hasPositionalFields) return true;
+                // equality-bearing. §9.3 (v0.158, #1383): a positional or
+                // combined-form record synthesizes equality only when every
+                // positional field (and body member for combined form) is
+                // admissible; the blind `return true` for all positional
+                // records was the pre-#1383 bug (over-accept). Imported
+                // positional records (no ast::TypeDecl) remain conservative.
+                if (decl->hasPositionalFields)
+                    return isPositionalRecordEqualityBearing(decl, ctx);
                 if (auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl))
-                    if (td->hasPositionalFields) return true;
+                    if (td->hasPositionalFields)
+                        return isPositionalRecordEqualityBearing(decl, ctx);
                 return isAutoEqualityBearingBodyRecord(decl, ctx);
             }
             // class / interface — reference types are not admissible.
@@ -537,6 +551,84 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
     return true;
 }
 
+// §9.3 (v0.158, #1383): true when a positional or combined-form record
+// synthesizes equality. Every positional field's type must be an admissible
+// component type (§9.2 recursive rule). For the combined form, body members must
+// not include disqualifiers (§9.3 applies §9.2's membership and disqualifier
+// rules to the full storage set: positional fields + body auto-properties).
+// Imported positional records (no ast::TypeDecl — only hasPositionalFields flag)
+// are conservatively treated as equality-bearing: individual field types are not
+// available across module boundaries (see the §3.6 rule-2 per-instantiation
+// discipline; this function is the LOCAL record side, not the cross-module side).
+bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
+                                        const SemaContext& ctx) {
+    if (!rec) return false;
+    // Imported positional record: no ast::TypeDecl to inspect → conservative.
+    if (!dynamic_cast<const ast::TypeDecl*>(rec->decl)) return true;
+    for (const Symbol* m : rec->members) {
+        if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
+            if (fs->posParam) {
+                // Positional field: type must be admissible (§9.3 → §9.2 rule).
+                if (!isAdmissibleComponentType(
+                        storageComponentType(m, ctx), ctx, 0))
+                    return false;
+            } else {
+                // Explicit body field declaration: disqualifying per §9.2.
+                return false;
+            }
+            continue;
+        }
+        // Body auto-property of combined form: type must be admissible.
+        if (isAutoPropertySymbol(m)) {
+            if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
+                return false;
+            continue;
+        }
+        // Computed (expression-bodied) property: no storage, does not disqualify.
+        if (dynamic_cast<const PropertySymbol*>(m)) continue;
+        if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
+            if (meth->isOperator) {
+                // User `=`/`<>` operator: opts the record out of auto-equality.
+                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                    return false;
+                continue;  // other operator overloads are benign
+            }
+            // Equals/GetHashCode override: disqualifying (§9.2 v0.158).
+            if (meth->name == "Equals" || meth->name == "GetHashCode")
+                return false;
+            continue;  // ordinary methods and ToString override are benign
+        }
+        if (auto* cs = dynamic_cast<const ConstructorSymbol*>(m)) {
+            // Same trivial-body check as body records (§9.3 → §9.2, #770).
+            if (auto* cd =
+                    dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                for (const auto& st : cd->body) {
+                    if (!st) continue;
+                    if (auto* as =
+                            dynamic_cast<const ast::AssignmentStmt*>(
+                                st.get())) {
+                        if (as->op == ":=" && as->target &&
+                            (dynamic_cast<const ast::IdentifierExpr*>(
+                                 as->target.get()) ||
+                             dynamic_cast<const ast::MemberAccessExpr*>(
+                                 as->target.get())))
+                            continue;
+                        return false;
+                    }
+                    if (dynamic_cast<const ast::ExpressionStmt*>(st.get()))
+                        continue;
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (dynamic_cast<const ConstMemberSymbol*>(m)) continue;
+        if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
+        return false;
+    }
+    return true;
+}
+
 // §9.2 (v0.156)/§8.4: returns true only when the record has declared an
 // explicit `operator =` or `operator <>` overload.  Per §9.2 v0.156 the
 // complete form is: "Authors who want explicit equality on a record outside the
@@ -576,12 +668,18 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
         return true;  // class (reference identity), interface, enum — all bear
                       // consistent Equals/GetHashCode.
     // A record: equality-bearing iff it synthesizes equality (positional /
-    // combined §9.1, or an auto-equality-bearing body record §9.2) or declares
-    // user equality (an `operator =`/`<>` overload — its §25.2 co-declared
-    // `Equals(T)`/`GetHashCode` companions are separately enforced).
-    if (ts->hasPositionalFields) return true;
+    // combined §9.1/§9.3, or an auto-equality-bearing body record §9.2) or
+    // declares user equality (an `operator =`/`<>` overload — its §25.2
+    // co-declared `Equals(T)`/`GetHashCode` companions are separately enforced).
+    // §9.3 (v0.158, #1383): positional/combined records must pass the
+    // admissibility check; the blind `return true` was the pre-#1383 bug.
+    if (ts->hasPositionalFields)
+        return isPositionalRecordEqualityBearing(ts, ctx) ||
+               recordHasUserDeclaredEquality(ts);
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-        if (td->hasPositionalFields) return true;
+        if (td->hasPositionalFields)
+            return isPositionalRecordEqualityBearing(ts, ctx) ||
+                   recordHasUserDeclaredEquality(ts);
     return isAutoEqualityBearingBodyRecord(ts, ctx) ||
            recordHasUserDeclaredEquality(ts);
 }
