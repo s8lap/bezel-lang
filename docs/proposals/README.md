@@ -15,3 +15,4 @@ Conventions:
 - **0002 — The `Http` server** (`0002-http-server.md`): minimal-API/Express-shaped routing over the fetch-symmetric Request→Response vocabulary of 0001; handlers on worker domains with compile-time sendability; draft for owner review.
 - **Stdlib gap review 2026-07** (`stdlib-gap-review-2026-07.md`): 31 ranked gaps across 9 domains + 8 declined-with-reasons + wave sequencing; the map the 0003+ proposals draw from.
 - **Declined register** (`DECLINED.md`): declined-with-reasons directions (D-0001 DI container; pointers to the gap review's eight).
+- **Networking design comparison** (`networking-design-comparison.md`): recorded pros/cons of 0001/0002 vs .NET, fetch, Node/Express, Go, Rust — the two structural bets (fetch symmetry; guarantees over batteries) with costs stated plainly.
