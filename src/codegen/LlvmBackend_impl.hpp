@@ -1410,9 +1410,11 @@ private:
 
     // CG50: a `ref` / `out` parameter is passed by reference (its LLVM type
     // is a pointer to the value type, and the caller passes an address).
+    // v0.160: `out owned var` replaces the former bare `out owned` call-site
+    // form (§22.4); both are by-reference. per §22.4
     static bool isByRefMod(std::string_view m) {
         return m == "ref" || m == "out" || m == "out var" ||
-               m == "out owned" || m == "out using var";
+               m == "out owned" || m == "out owned var" || m == "out using var";
     }
 
     // Is this member symbol a static method with a lowerable body?

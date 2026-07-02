@@ -7,12 +7,12 @@
 // Two families of defects are covered:
 //
 //   6a — operator dispatch on alias-typed values.
-//       `type Meters = double; var x: Meters := 5.0; var sum := x + y;`
+//       `type Meters := double; var x: Meters := 5.0; var sum := x + y;`
 //       must NOT produce an "operator '+' is not defined" error — the alias
 //       unfolds to `double` before operator lookup.
 //
 //   6b — lambda assignment to a function-type alias variable.
-//       `type Pred = (int) -> bool; var f: Pred := (x) => x mod 2 = 0;`
+//       `type Pred := (int) -> bool; var f: Pred := (x) => x mod 2 = 0;`
 //       must NOT produce an "initializer not implicitly convertible" error —
 //       the alias unfolds to its Function type before the assignability check.
 //
@@ -70,7 +70,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            alias_of_double_plus_no_error_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Meters = double; "
+        "type Meters := double; "
         "class C public static method M(a: Meters, b: Meters): Meters "
         "  return a + b; "
         "end M; end C;");
@@ -83,7 +83,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            alias_plus_result_typed_as_underlying_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Meters = double; "
+        "type Meters := double; "
         "class C public method M() "
         "  var a: Meters := 5.0; "
         "  var b: Meters := 3.0; "
@@ -103,7 +103,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            alias_of_int_arithmetic_no_error_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Count = int; "
+        "type Count := int; "
         "class C public static method M(a: Count, b: Count): int "
         "  var s := a + b; "
         "  var d := a - b; "
@@ -120,7 +120,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            alias_plus_underlying_mixed_no_error_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Meters = double; "
+        "type Meters := double; "
         "class C public static method M(a: Meters, b: double): double "
         "  return a + b; "
         "end M; end C;");
@@ -136,7 +136,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            function_type_alias_lambda_assign_no_error_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Pred = (int) -> bool; "
+        "type Pred := (int) -> bool; "
         "class C public method M() "
         "  var isEven: Pred := (x) => x mod 2 = 0; "
         "end M; end C;");
@@ -148,7 +148,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            function_type_alias_local_has_function_type_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Pred = (int) -> bool; "
+        "type Pred := (int) -> bool; "
         "class C public method M() "
         "  var isEven: Pred := (x) => x mod 2 = 0; "
         "end M; end C;");
@@ -165,7 +165,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            function_type_alias_two_params_no_error_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Combiner = (int, int) -> int; "
+        "type Combiner := (int, int) -> int; "
         "class C public method M() "
         "  var add: Combiner := (a, b) => a + b; "
         "end M; end C;");
@@ -180,7 +180,7 @@ BEZEL_TEST(sema_alias_transparency_578,
            alias_arg_to_underlying_param_no_error_spec_27_8) {
     auto r = parseSema(
         "module M; "
-        "type Meters = double; "
+        "type Meters := double; "
         "class C "
         "  public static method Use(x: double): double => x; "
         "  public static method M(m: Meters): double => Use(m); "
@@ -194,7 +194,7 @@ BEZEL_TEST(sema_alias_transparency_578,
     auto r = parseSema(
         "module M; "
         "class Point public X: int := 0; end Point; "
-        "type Pt = Point; "
+        "type Pt := Point; "
         "class C public static method M(p: Pt): int => p.X; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -206,7 +206,7 @@ BEZEL_TEST(sema_alias_transparency_578,
     auto r = parseSema(
         "module M; "
         "class Kg public V: double := 0.0; end Kg; "
-        "type Weight = Kg; "
+        "type Weight := Kg; "
         "class C public static method M(a: Weight, b: Weight): double "
         "  var s := a + b; "
         "  return 0.0; "

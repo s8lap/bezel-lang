@@ -576,8 +576,9 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
 }
 
 std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
-    // A.2: `TypeAliasDecl ::= "type" Identifier GenericParams? "=" Type
-    //                          GenericConstraints* ";"`. Slice 27 completes
+    // A.2: `TypeAliasDecl ::= "type" Identifier GenericParams? ":=" Type
+    //                          GenericConstraints* ";"`. (v0.160: ":=" replaces
+    // the old "=" — all bindings in Bezel use ":="; §27.8.) Slice 27 completes
     // the optional GenericParams and trailing GenericConstraints.
     auto alias = std::make_unique<ast::TypeAlias>();
     advance(); // past `type`
@@ -592,9 +593,16 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
 
     alias->genericParams = parseGenericParams();
 
-    if (!consumePunctuator("=")) {
+    // per §27.8 / v0.160: type aliases bind with ":=" (not bare "=").
+    // Detect plain "=" and emit a fix-it diagnostic for migration.
+    if (isPunctuator("=")) {
         diagnostics_.report(Severity::Error, current_.location,
-                            "expected '=' in type alias");
+                            "type aliases bind with ':=' since v0.160 "
+                            "(replace '=' with ':='; §27.8)");
+        advance(); // consume "=" for error recovery
+    } else if (!consumePunctuator(":=")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ':=' in type alias (§27.8)");
     }
 
     alias->aliasedType = parseType();
@@ -1586,17 +1594,49 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
 
     m->genericConstraints = parseGenericConstraints();
 
-    // A.4 MethodBody: `=> Expression ";"` | `Statement* "end" Identifier? ";"`
-    // | `";"`. (GenericConstraints* between signature and body land later.)
+    // A.4 MethodBody: `=> (Expression | AssignmentStmt) ";"` | Block | ";"
+    // (v0.160: AssignmentStmt alternative in the `=>` body; valid only for
+    // unit methods, i.e. no declared return type — enforced semantically, §22.2.)
     if (consumePunctuator("=>")) {
-        m->bodyKind = ast::MethodBodyKind::Expression;
-        m->exprBody = parseExpression();
-        captureEnd();  // #783: the `;` terminating the expression body
-        if (!consumePunctuator(";")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected ';' after expression-body method");
-            methodEnd = {};  // span unreliable on error
+        // Parse the leading expression first (LHS of potential assignment).
+        auto lhs = parseExpression();
+        const bool isAssignOp =
+            current_.kind == TokenKind::Punctuator &&
+            (current_.text == ":="  || current_.text == "+="  ||
+             current_.text == "-="  || current_.text == "*="  ||
+             current_.text == "/="  || current_.text == "&="  ||
+             current_.text == "|="  || current_.text == "^="  ||
+             current_.text == "<<=" || current_.text == ">>=" ||
+             current_.text == "??=");
+        if (isAssignOp) {
+            // §22.2 / v0.160: `=> LHS := RHS;` on a unit method (no return type).
+            // Stored as a Block body (one AssignmentStmt), mirroring the accessor
+            // `set => _x := value;` pattern. Semantic check (return type must be
+            // absent) is enforced in sema, not here. per §22.2
+            m->bodyKind = ast::MethodBodyKind::Block;
+            auto a = std::make_unique<ast::AssignmentStmt>();
+            a->target = std::move(lhs);
+            a->op = current_.text;
+            advance(); // past assignment operator
+            a->value = parseExpression();
+            captureEnd();
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after arrow-assignment method body (§22.2)");
+                methodEnd = {};
+            }
+            m->stmts.push_back(std::unique_ptr<ast::Stmt>(a.release()));
+        } else {
+            m->bodyKind = ast::MethodBodyKind::Expression;
+            m->exprBody = std::move(lhs);
+            captureEnd();  // #783: the `;` terminating the expression body
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after expression-body method");
+                methodEnd = {};  // span unreliable on error
+            }
         }
     } else if (isPunctuator(";")) {
         captureEnd();  // #783: the `;` terminating an abstract method
@@ -1783,8 +1823,9 @@ std::vector<ast::Param> Parser::parseParamList() {
 std::vector<ast::CallArgument> Parser::parseArgList() {
     // A.4 ArgList ::= Argument ("," Argument)*
     // Argument    ::= ArgModifiers? (Identifier ":=")? ArgExpression
-    // ArgModifiers ∈ { ref | out var? | out using var | out owned | owned }
-    // ArgExpression ::= Expression | "_"
+    // ArgModifiers ∈ { ref | out var? | out using var | out owned var | owned }
+    // per §A.4 / v0.160: the former bare `out owned` form now requires "var"
+    // (an inline owned-local declaration). ArgExpression ::= Expression | "_"
     std::vector<ast::CallArgument> args;
     if (isPunctuator(")")) return args;
     auto parseOne = [&]() -> ast::CallArgument {
@@ -1793,7 +1834,16 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
             a.modifier = "ref";
         } else if (consumeKeyword("out")) {
             if (consumeKeyword("owned")) {
-                a.modifier = "out owned";
+                // per §A.4 / v0.160: `out owned` MUST be followed by `var`
+                // (declares an inline owned local); bare `out owned x` is
+                // no longer derivable from the grammar.
+                if (!consumeKeyword("var")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected 'var' after 'out owned' (§22.4, v0.160: "
+                        "use 'out owned var x' to declare an inline owned local)");
+                }
+                a.modifier = "out owned var";
             } else if (consumeKeyword("using")) {
                 if (!consumeKeyword("var")) {
                     diagnostics_.report(
@@ -1811,9 +1861,15 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
         }
         // Named-arg prefix `Identifier :=`. peekAt(1) distinguishes from
         // a bare-Identifier expression argument.
-        if (current_.kind == TokenKind::Identifier &&
-            peekAt(1).kind == TokenKind::Punctuator &&
-            peekAt(1).text == ":=") {
+        // per §22.5 / v0.160: `ref`/`out`/`owned` arguments are positional-only;
+        // the named form is for plain-value arguments only.
+        if (!a.modifier.empty()) {
+            // Modified arg: named form is not permitted; parse no prefix here.
+            // We do NOT look for `Identifier :=` — the expression parsing below
+            // handles the identifier as the argument value.
+        } else if (current_.kind == TokenKind::Identifier &&
+                   peekAt(1).kind == TokenKind::Punctuator &&
+                   peekAt(1).text == ":=") {
             a.name = current_.text;
             advance(); // identifier
             advance(); // :=

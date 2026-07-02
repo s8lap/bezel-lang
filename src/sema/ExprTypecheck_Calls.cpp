@@ -487,7 +487,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // ENFORCES the mandatory keyword even for a single candidate (defects 3/4).
     auto isOutMod = [](std::string_view m) {
         return m == "out" || m == "out var" || m == "out using var" ||
-               m == "out owned";
+               m == "out owned var";  // per §22.4 / v0.160: bare "out owned" is gone
     };
     auto refOutMatch = [&](std::string_view argMod,
                            std::string_view paramMod) -> bool {
@@ -538,7 +538,9 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 if (paramRefOut && am.empty())
                     detail = "parameter `" + pname + "` is `" + pm +
                              "` — pass the argument with `" +
-                             (pm == "out owned" ? std::string("out")
+                             // per §22.4 / v0.160: `out owned` param → use
+                             // `out owned var x` (inline declaration) at call site
+                             (pm == "out owned" ? std::string("out owned var")
                                                 : pm) +
                              "` at the call site";
                 else if (!paramRefOut && !am.empty())
@@ -5402,7 +5404,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                           std::string_view paramMod) -> bool {
         auto isOut = [](std::string_view m) {
             return m == "out" || m == "out var" || m == "out using var" ||
-                   m == "out owned";
+                   m == "out owned var";  // per §22.4 / v0.160
         };
         bool argRef = argMod == "ref", argOut = isOut(argMod);
         bool paramRef = paramMod == "ref";
@@ -5426,7 +5428,8 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 prefOut && am.empty()
                     ? "parameter `" + pname + "` is `" + pm +
                           "` — pass the argument with `" +
-                          (pm == "out owned" ? std::string("out") : pm) +
+                          // per §22.4 / v0.160: `out owned` param → use `out owned var x`
+                          (pm == "out owned" ? std::string("out owned var") : pm) +
                           "` at the call site"
                 : (!prefOut && !am.empty()
                        ? "parameter `" + pname +

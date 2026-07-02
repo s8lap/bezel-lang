@@ -3,8 +3,11 @@
 //   ArgList       ::= Argument ("," Argument)*
 //   Argument      ::= ArgModifiers? (Identifier ":=")? ArgExpression
 //   ArgModifiers  ::= "ref" | "out" "var"? | "out" "using" "var"
-//                   | "out" "owned" | "owned"
+//                   | "out" "owned" "var" | "owned"
 //   ArgExpression ::= Expression | "_"
+//
+// v0.160 (§22.4/§22.5): the former bare `out owned x` form now requires "var"
+// (inline declaration); named form is positional-only for modified args.
 //
 // Slice 49 extends call/new/null-cond-call argument lists with modifiers,
 // named arguments, and the `_` discard form. Earlier slices treated all
@@ -63,10 +66,11 @@ BEZEL_TEST(parser_arg, out_using_var_modifier) {
         std::string("f(out using var r)"));
 }
 
-BEZEL_TEST(parser_arg, out_owned_modifier) {
+// v0.160: `out owned var` is the inline-declaration form (§22.4).
+BEZEL_TEST(parser_arg, out_owned_var_modifier) {
     BEZEL_EXPECT_EQ(
-        render("f(out owned r)"),
-        std::string("f(out owned r)"));
+        render("f(out owned var r)"),
+        std::string("f(out owned var r)"));
 }
 
 BEZEL_TEST(parser_arg, owned_modifier) {
@@ -81,10 +85,11 @@ BEZEL_TEST(parser_arg, named_arg) {
         std::string("f(name := \"x\", age := 30)"));
 }
 
-BEZEL_TEST(parser_arg, modifier_and_named) {
-    BEZEL_EXPECT_EQ(
-        render("f(ref x := source)"),
-        std::string("f(ref x := source)"));
+// v0.160 §22.5: `ref`/`out`/`owned` arguments are positional-only;
+// combining a modifier with the named `Identifier :=` form is a parse error.
+BEZEL_TEST(parser_arg, modifier_and_named_is_error) {
+    // `ref x := source` — modifier present, named form invalid.
+    BEZEL_EXPECT_EQ(render("f(ref x := source)"), std::string("<errors>"));
 }
 
 BEZEL_TEST(parser_arg, discard_underscore) {

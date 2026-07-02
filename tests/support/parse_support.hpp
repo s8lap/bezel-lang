@@ -286,7 +286,7 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
     if (auto* ta = dynamic_cast<const ast::TypeAlias*>(&decl)) {
         std::string out = "type ";
         out += std::string(ta->name);
-        out += " = ";
+        out += " := ";  // v0.160: type aliases bind with := (§27.8)
         out += ta->aliasedType ? typeToString(*ta->aliasedType)
                                : std::string("<null>");
         return out;

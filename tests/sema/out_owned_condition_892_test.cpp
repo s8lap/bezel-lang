@@ -56,15 +56,14 @@ bool hasDropError(const bezel::test::OwnershipResult& r,
 
 } // namespace
 
-// §28.3 / #892 (headline): `if s.TryPop(out owned item) then end;` — item
+// §28.3 / #892 (headline): `if s.TryPop(out owned var item) then end;` — item
 // received ownership in the condition but is dropped (no disposal after). Must
 // be REJECTED. Before the fix this was silently accepted — a leak.
 BEZEL_TEST(out_owned_condition_892, if_cond_drop_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
-        "var item: Cell? := null; "
-        "if s.TryPop(out owned item) then end; "));
+        "if s.TryPop(out owned var item) then end; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
 }
@@ -75,14 +74,13 @@ BEZEL_TEST(out_owned_condition_892, if_cond_dispose_after_accepted) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
-        "var item: Cell? := null; "
-        "if s.TryPop(out owned item) then end; "
+        "if s.TryPop(out owned var item) then end; "
         "item?.Dispose(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // §28.3 / #892 (WHILE DRAIN ACCEPT): the idiomatic drain loop
-// `while s.TryPop(out owned item) do item?.Dispose(); end`
+// `while s.TryPop(out owned var item) do item?.Dispose(); end`
 // disposes item in the body each iteration and carries no obligation past the
 // loop (false exit → TryPop returned false, item not written). Must ACCEPT.
 BEZEL_TEST(out_owned_condition_892, while_drain_dispose_body_accepted) {
@@ -90,8 +88,7 @@ BEZEL_TEST(out_owned_condition_892, while_drain_dispose_body_accepted) {
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "s.Push(move (new Cell())); "
-        "var item: Cell? := null; "
-        "while s.TryPop(out owned item) do "
+        "while s.TryPop(out owned var item) do "
         "  item?.Dispose(); "
         "end; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -103,8 +100,7 @@ BEZEL_TEST(out_owned_condition_892, while_drain_drop_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
-        "var item: Cell? := null; "
-        "while s.TryPop(out owned item) do "
+        "while s.TryPop(out owned var item) do "
         "  // item dropped without disposal "
         "end; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -132,14 +128,13 @@ BEZEL_TEST(out_owned_condition_892, if_borrow_form_accepted) {
 }
 
 // §28.3 / §28.11 / #860 (REGRESSION — statement form): the statement-level
-// `s.TryPop(out owned item)` (issue #860) still correctly marks item Owned and
-// rejects a dropped item. Guards against regressing the existing fix.
+// `s.TryPop(out owned var item)` (issue #860) still correctly marks item Owned
+// and rejects a dropped item. Guards against regressing the existing fix.
 BEZEL_TEST(out_owned_condition_892, stmt_form_860_regression_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
-        "var item: Cell? := null; "
-        "s.TryPop(out owned item); "));
+        "s.TryPop(out owned var item); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
 }
@@ -150,8 +145,7 @@ BEZEL_TEST(out_owned_condition_892, stmt_form_860_regression_dispose_accepted) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
-        "var item: Cell? := null; "
-        "s.TryPop(out owned item); "
+        "s.TryPop(out owned var item); "
         "item?.Dispose(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

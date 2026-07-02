@@ -17,18 +17,18 @@ static bool succeedsParse(const std::string& source) {
 
 BEZEL_TEST(parser_alias_op, generic_type_alias) {
     BEZEL_EXPECT_TRUE(
-        succeedsParse("module M; type Box<T> = List<T>;"));
+        succeedsParse("module M; type Box<T> := List<T>;"));
 }
 
 BEZEL_TEST(parser_alias_op, generic_type_alias_with_constraint) {
     BEZEL_EXPECT_TRUE(succeedsParse(
-        "module M; type DisposableList<T> = List<T> "
+        "module M; type DisposableList<T> := List<T> "
         "where T: IDisposable;"));
 }
 
 BEZEL_TEST(parser_alias_op, two_generic_params) {
     BEZEL_EXPECT_TRUE(
-        succeedsParse("module M; type Pair<K, V> = Dictionary<K, V>;"));
+        succeedsParse("module M; type Pair<K, V> := Dictionary<K, V>;"));
 }
 
 // --- OperatorDecl ----------------------------------------------------------

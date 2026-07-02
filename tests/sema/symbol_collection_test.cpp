@@ -63,7 +63,7 @@ BEZEL_TEST(sema_symbols, four_top_level_decl_kinds) {
 }
 
 BEZEL_TEST(sema_symbols, type_alias_is_registered) {
-    auto r = parseAndCollect("module M; type Map<K, V> = IDictionary<K, V>;");
+    auto r = parseAndCollect("module M; type Map<K, V> := IDictionary<K, V>;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.ctx->module()->children.size(), std::size_t(1));
     if (r.ctx->module()->children.size() == 1) {
@@ -319,7 +319,7 @@ module Sink;
 
 import System.Collections.Generic;
 
-type Map<K, V> = IDictionary<K, V>;
+type Map<K, V> := IDictionary<K, V>;
 
 public enum Color
   Red, Green, Blue;

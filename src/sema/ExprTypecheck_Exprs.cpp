@@ -2923,6 +2923,102 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     currentScope_->names[id->name] = lsym;
                 }
             }
+            // §22.4 / v0.160 (#1305/#1344): `out owned var x` is the inline
+            // declaration form for an `out owned T` parameter.  Register the
+            // symbol exactly as for `out var`, so that subsequent uses of `x`
+            // in the same scope resolve correctly.  Ownership tracking (marking
+            // the local Owned after the call) is handled in
+            // markOutOwnedArgs (Ownership_Checks.cpp). per §22.4
+            if (a.modifier == "out owned var" && a.value && currentScope_) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                   a.value.get())) {
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = id->name;
+                    lsym->decl = id;
+                    // Infer type from the callee's `out owned T` parameter.
+                    if (calleeMd2 && pos2 < calleeMd2->params.size() &&
+                        calleeMd2->params[pos2].type) {
+                        lsym->declType = ctx_.resolvedType(
+                            *calleeMd2->params[pos2].type);
+                        // `out owned T?` parameter: strip nullable so the
+                        // local holds the non-nullable owned value.
+                        if (lsym->declType && lsym->declType->nullable) {
+                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
+                            nn->nullable = false;
+                            lsym->declType = nn;
+                        }
+                    }
+                    // §28.11 / v0.160 (#1305): for BUILTIN owning-collection Try*
+                    // methods (TryPop/TryDequeue/TryPopFirst/TryPopLast/TryTake/
+                    // TryPopValue/TryReceive) there is no MethodDecl (calleeMd2 is
+                    // null), so the callee-param path above leaves declType null.
+                    // This means ctx_.exprType on the local returns null later,
+                    // and `item?.Dispose()` / `item.Dispose()` in
+                    // lowerNullCondCall fail the recvIsClassOrIface check and emit
+                    // nothing (the element leaks). Mirror the `out using var`
+                    // inference: derive the element type from the receiver's
+                    // generic args. per §28.11, §22.4
+                    if (!lsym->declType) {
+                        if (auto* maCallee =
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    ce->callee.get())) {
+                            if (maCallee->target) {
+                                if (const TypeRef* rt =
+                                        ctx_.exprType(*maCallee->target)) {
+                                    if (rt->kind == TypeRef::Kind::Named &&
+                                        !rt->declaration && rt->astNode &&
+                                        rt->astNode->name &&
+                                        !rt->astNode->name->parts.empty()) {
+                                        const std::string_view cn =
+                                            rt->astNode->name->parts[0];
+                                        const std::string_view mn =
+                                            maCallee->member;
+                                        // Owning-collection Try* methods —
+                                        // element type from genericArgs[0] (T),
+                                        // or genericArgs[1] (V) for
+                                        // OwnedDictionary.TryPopValue.
+                                        const TypeRef* elemT = nullptr;
+                                        if ((cn == "OwnedStack" &&
+                                             mn == "TryPop" && pos2 == 0) ||
+                                            (cn == "OwnedQueue" &&
+                                             mn == "TryDequeue" && pos2 == 0) ||
+                                            (cn == "OwnedLinkedList" &&
+                                             (mn == "TryPopFirst" ||
+                                              mn == "TryPopLast") &&
+                                             pos2 == 0) ||
+                                            (cn == "OwnedSet" &&
+                                             mn == "TryTake" && pos2 == 1) ||
+                                            (cn == "Channel" &&
+                                             mn == "TryReceive" && pos2 == 0)) {
+                                            if (!rt->genericArgs.empty() &&
+                                                rt->genericArgs[0])
+                                                elemT = rt->genericArgs[0];
+                                        } else if (cn == "OwnedDictionary" &&
+                                                   mn == "TryPopValue" &&
+                                                   pos2 == 1 &&
+                                                   rt->genericArgs.size() >= 2 &&
+                                                   rt->genericArgs[1]) {
+                                            elemT = rt->genericArgs[1];
+                                        }
+                                        if (elemT) {
+                                            if (elemT->nullable) {
+                                                TypeRef* nn =
+                                                    ctx_.makeTypeRef(*elemT);
+                                                nn->nullable = false;
+                                                lsym->declType = nn;
+                                            } else {
+                                                lsym->declType =
+                                                    const_cast<TypeRef*>(elemT);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    currentScope_->names[id->name] = lsym;
+                }
+            }
             // §28.13 / §28.11 / stdlib §2.16 (#603 #890): `out using var x`
             // declares a using-var–scoped handle whose type is derived from
             // the receiver's generic element argument.
@@ -3219,7 +3315,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (a.value &&
                 (a.modifier == "ref" || a.modifier == "out" ||
                  a.modifier == "out var" || a.modifier == "out using var" ||
-                 a.modifier == "out owned")) {
+                 a.modifier == "out owned var")) {  // per §22.4 / v0.160
                 if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
                         a.value.get())) {
                     if (aid->name != "this" && aid->name != "base") {
@@ -3326,6 +3422,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             *ctorDecl->params[posn].type);
                         // out params are nullable refs — strip nullable (the
                         // variable holds the non-nullable value), as for methods.
+                        if (lsym->declType && lsym->declType->nullable) {
+                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
+                            nn->nullable = false;
+                            lsym->declType = nn;
+                        }
+                    }
+                    currentScope_->names[id->name] = lsym;
+                }
+            }
+            // §22.4 / v0.160 (#1305): `out owned var x` at a constructor call
+            // site declares x inline (parallel to `out var` above). per §22.4
+            if (a.modifier == "out owned var" && a.value && currentScope_) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                   a.value.get())) {
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = id->name;
+                    lsym->decl = id;
+                    if (ctorDecl && posn < ctorDecl->params.size() &&
+                        ctorDecl->params[posn].type) {
+                        lsym->declType = ctx_.resolvedType(
+                            *ctorDecl->params[posn].type);
                         if (lsym->declType && lsym->declType->nullable) {
                             TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
                             nn->nullable = false;

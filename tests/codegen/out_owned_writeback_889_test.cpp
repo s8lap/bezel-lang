@@ -41,16 +41,15 @@ const char* kCellHdr =
     "  destructor Cell._n := Cell._n - 1; end destructor; end Cell; ";
 }  // namespace
 
-// Form A — `out owned <pre-declared local>` + `item?.Dispose()` (the #889 repro):
-// the single element is disposed exactly once; Cell._n returns to 0 (was 1 — the
-// dispose was a no-op and the element leaked).
+// Form A — `out owned var item` inline declaration + `item?.Dispose()` (the
+// #889 repro): the single element is disposed exactly once; Cell._n returns to
+// 0 (was 1 — the dispose was a no-op and the element leaked).
 BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_null_cond_dispose) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); "
         "    s.Push(move (new Cell())); "
-        "    var item: Cell? := null; "
-        "    var ok := s.TryPop(out owned item); "
+        "    var ok := s.TryPop(out owned var item); "
         "    item?.Dispose(); "
         "  end; return Cell._n; end Main; end C;"), 0);
 }
@@ -63,8 +62,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_narrowed_dispose) {
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); "
         "    s.Push(move (new Cell())); "
-        "    var item: Cell? := null; "
-        "    var ok := s.TryPop(out owned item); "
+        "    var ok := s.TryPop(out owned var item); "
         "    if item <> null then item.Dispose(); end; "
         "  end; return Cell._n; end Main; end C;"), 0);
 }
@@ -81,8 +79,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_two_elements_each_disposed_once) {
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); "
         "    s.Push(move (new Cell(1))); s.Push(move (new Cell(2))); "
-        "    var item: Cell? := null; "
-        "    var ok := s.TryPop(out owned item); "      // pops id=2 (top)
+        "    var ok := s.TryPop(out owned var item); "  // pops id=2 (top)
         "    item?.Dispose(); "                          // disposes 2 -> log=2
         "  end; return Cell._log; end Main; end C;"), 21);
 }
@@ -105,8 +102,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_empty_null_cond_noop) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); "
-        "    var item: Cell? := null; "
-        "    var ok := s.TryPop(out owned item); "
+        "    var ok := s.TryPop(out owned var item); "
         "    item?.Dispose(); "
         "    if ok then return 99; end; "
         "  end; return Cell._n; end Main; end C;"), 0);
@@ -121,15 +117,14 @@ BEZEL_TEST(out_owned_writeback_889, trypop_empty_null_cond_noop) {
 // therefore not duplicated here (a JIT-harness run without the ownership pass
 // would not exercise the same lowering).
 
-// OwnedQueue.TryDequeue(out owned item): the front element is written back and
-// disposed exactly once.
+// OwnedQueue.TryDequeue(out owned var item): the front element is written back
+// and disposed exactly once.
 BEZEL_TEST(out_owned_writeback_889, trydequeue_out_owned_disposed_once) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do using var q := new OwnedQueue<Cell>(); "
         "    q.Enqueue(move (new Cell())); "
-        "    var item: Cell? := null; "
-        "    var ok := q.TryDequeue(out owned item); "
+        "    var ok := q.TryDequeue(out owned var item); "
         "    item?.Dispose(); "
         "  end; return Cell._n; end Main; end C;"), 0);
 }

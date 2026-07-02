@@ -461,7 +461,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // parameter / builtin dispatch so `consumed=true` suppresses the
             // unwanted read. User `out owned` is reliable; `builtinOutOwnedArg`
             // covers builtin TryPop / TryDequeue / etc. // per §28.3, §28.11
-            if (a.modifier == "out owned" ||
+            if (a.modifier == "out owned var" ||  // per §22.4 / v0.160
                 builtinOutOwnedArg(call->callee.get(), pos)) {
                 consumed = true;  // write target: skip read-check; markOutOwnedArgs handles it
             } else if (a.modifier == "owned") {
@@ -2655,25 +2655,42 @@ void MethodOwnership::markOutOwnedArgs(
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
         // The argument is an out-owned transfer when the formal is genuinely
-        // `out owned`. We do NOT trust the call-site `out owned` modifier on
-        // its own: a user may write `out owned item` on a plain `out`
-        // (borrow-form) builtin and sema does not always reject it, so keying
-        // off the modifier alone would over-fire on a value-typed `out`
-        // (e.g. `Stack<int>.TryPop(out owned item)`, no disposal obligation).
+        // `out owned`. We do NOT trust the call-site modifier alone: a user
+        // may write a modifier on a plain `out` (borrow-form) builtin and sema
+        // does not always reject it, so keying off the modifier alone would
+        // over-fire on a value-typed `out`
+        // (e.g. `Stack<int>.TryPop(out var item)`, no disposal obligation).
         const bool userOutOwned =
             params && pos < params->size() &&
             (*params)[pos].modifier == "out owned";
         const bool builtinOutOwned = builtinOutOwnedArg(callee, pos);
         if (userOutOwned || builtinOutOwned) {
-            // Only a bare LOCAL identifier receives the obligation here. The
-            // call-site declaring forms `out using var x` (implicitly
-            // discharged) and `out owned var x` declare a fresh local the
-            // dataflow tracks elsewhere; a bare pre-declared local `x` is the
-            // form this models. markOwnedByName acts only on a tracked local
-            // (states_), so a discard `_` or a non-local target is a no-op.
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                markOwnedByName(id->name, id->span.begin, id);
+                // §22.4 / v0.160 (#1305): `out owned var x` declares a FRESH
+                // local inline.  The LocalSymbol was registered in
+                // currentScope_ by ExprTypecheck_Exprs.cpp, but the ownership
+                // dataflow has not yet seen any LocalDecl for it, so it is not
+                // in `states_`.  Add it here with Owned state and record it in
+                // `everOwnedPlainLocals_` so the end-of-method discharge check
+                // catches it even if its enclosing block exits before the method
+                // return. per §22.4, §28.3
+                if (a.modifier == "out owned var") {
+                    if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                        if (states_.find(sym) == states_.end()) {
+                            LocalOwnership lo;
+                            lo.state = OwnershipState::Owned;
+                            lo.obligationOrigin = id;
+                            states_[sym] = lo;
+                            everOwnedPlainLocals_.insert(sym);
+                        }
+                    }
+                } else {
+                    // Pre-declared local (plain `out x`) or `out using var x`
+                    // (implicitly discharged — markOwnedByName's
+                    // implicitDischarge guard skips it safely): mark Owned.
+                    markOwnedByName(id->name, id->span.begin, id);
+                }
             }
         }
         ++pos;

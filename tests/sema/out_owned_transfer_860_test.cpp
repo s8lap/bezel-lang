@@ -64,15 +64,14 @@ bool hasDropError(const bezel::test::OwnershipResult& r,
 
 }  // namespace
 
-// §28.3 / §28.11 / #860 (headline): an `out owned item` local moved out of an
-// OwnedStack via TryPop and then dropped without disposal must be REJECTED.
-// Before the fix this was silently accepted (a leak).
+// §28.3 / §28.11 / #860 (headline): an `out owned var item` inline local moved
+// out of an OwnedStack via TryPop and then dropped without disposal must be
+// REJECTED. Before the fix this was silently accepted (a leak).
 BEZEL_TEST(out_owned_transfer_860, trypop_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
-        "var item: Cell? := null; "
-        "var ok := s.TryPop(out owned item); "));
+        "var ok := s.TryPop(out owned var item); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
 }
@@ -84,8 +83,7 @@ BEZEL_TEST(out_owned_transfer_860, trypop_null_safe_dispose_accepted) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
-        "var item: Cell? := null; "
-        "var ok := s.TryPop(out owned item); "
+        "var ok := s.TryPop(out owned var item); "
         "item?.Dispose(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -98,8 +96,7 @@ BEZEL_TEST(out_owned_transfer_860, trypop_moved_out_accepted) {
         "using var s := new OwnedStack<Cell>(); "
         "using var s2 := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
-        "var item: Cell? := null; "
-        "var ok := s.TryPop(out owned item); "
+        "var ok := s.TryPop(out owned var item); "
         "s2.Push(move item); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -118,8 +115,7 @@ BEZEL_TEST(out_owned_transfer_860, trypop_returned_accepted) {
         "  public static method Take(): owned Cell? "
         "    using var s := new OwnedStack<Cell>(); "
         "    s.Push(move (new Cell(1))); "
-        "    var item: Cell? := null; "
-        "    var ok := s.TryPop(out owned item); "
+        "    var ok := s.TryPop(out owned var item); "
         "    return move item; "
         "  end Take; "
         "  public static method Main(): int "
@@ -135,8 +131,7 @@ BEZEL_TEST(out_owned_transfer_860, trydequeue_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var q := new OwnedQueue<Cell>(); "
         "q.Enqueue(move (new Cell(1))); "
-        "var item: Cell? := null; "
-        "var ok := q.TryDequeue(out owned item); "));
+        "var ok := q.TryDequeue(out owned var item); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
 }
@@ -148,8 +143,7 @@ BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var d := new OwnedDictionary<string, Cell>(); "
         "d.Add(\"a\", move (new Cell(1))); "
-        "var v: Cell? := null; "
-        "var ok := d.TryPopValue(\"a\", out owned v); "));
+        "var ok := d.TryPopValue(\"a\", out owned var v); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasDropError(r, "v"));
 }
@@ -160,8 +154,7 @@ BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dispose_accepted) {
     auto r = parseAndCheckOwnership(withMain(
         "using var d := new OwnedDictionary<string, Cell>(); "
         "d.Add(\"a\", move (new Cell(1))); "
-        "var v: Cell? := null; "
-        "var ok := d.TryPopValue(\"a\", out owned v); "
+        "var ok := d.TryPopValue(\"a\", out owned var v); "
         "v?.Dispose(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -190,8 +183,7 @@ BEZEL_TEST(out_owned_transfer_860, user_out_owned_param_dropped_rejected) {
         "  public static method Main(): int "
         "    do "
         "      using var b := new Box(); "
-        "      var got: Cell? := null; "
-        "      var ok := b.TakeIt(out owned got); "
+        "      var ok := b.TakeIt(out owned var got); "
         "    end; "
         "    return 0; "
         "  end Main; "
@@ -222,8 +214,7 @@ BEZEL_TEST(out_owned_transfer_860, user_out_owned_param_dispose_accepted) {
         "  public static method Main(): int "
         "    do "
         "      using var b := new Box(); "
-        "      var got: Cell? := null; "
-        "      var ok := b.TakeIt(out owned got); "
+        "      var ok := b.TakeIt(out owned var got); "
         "      got?.Dispose(); "
         "    end; "
         "    return 0; "
@@ -257,17 +248,15 @@ BEZEL_TEST(out_owned_transfer_860, borrow_trypeek_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 / #860 (VALUE-TYPED GUARDRAIL): writing `out owned item` on a
-// value-typed borrow-form `Stack<int>.TryPop(out item: int)` — `item` is an
-// `int` with no disposal obligation — must NOT be over-rejected. This is why
-// the fix keys off the receiver method's genuine out-owned-ness (the element
-// is a class only on owning collections), not the call-site modifier alone.
+// §28.3 / §28.11 / #860 (VALUE-TYPED GUARDRAIL): inline `out var item` on a
+// value-typed `Stack<int>.TryPop(out item: int)` — `item` is an `int` with no
+// disposal obligation — must NOT be over-rejected. The ownership checker must
+// not assign an Owned discharge obligation to value-type out-var locals.
 BEZEL_TEST(out_owned_transfer_860, value_typed_out_owned_not_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new Stack<int>(); "
         "s.Push(7); "
-        "var item: int := 0; "
-        "var ok := s.TryPop(out owned item); "));
+        "var ok := s.TryPop(out var item); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

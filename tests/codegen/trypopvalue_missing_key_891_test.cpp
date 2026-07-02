@@ -43,14 +43,14 @@ const char* kCellHdr =
 }  // namespace
 
 // (a) Missing key on an EMPTY dict: was rc=139 SIGSEGV before the fix.
-//     v starts null, TryPopValue returns false and leaves v null,
-//     v?.Dispose() is a safe null no-op, program returns 0.  §28.11, #891.
+//     TryPopValue returns false and leaves v null (v declared inline via
+//     `out owned var`), v?.Dispose() is a safe null no-op, program returns 0.
+//     §28.11, #891.
 BEZEL_TEST(trypopvalue_missing_key_891, empty_dict_missing_key_no_crash) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do using var d := new OwnedDictionary<string, Cell>(); "
-        "    var v: Cell? := null; "
-        "    var ok := d.TryPopValue(\"x\", out owned v); "
+        "    var ok := d.TryPopValue(\"x\", out owned var v); "
         "    v?.Dispose(); "
         "    if ok then return 99; end; "
         "  end; return Cell._n; end Main; end C;"), 0);
@@ -65,8 +65,7 @@ BEZEL_TEST(trypopvalue_missing_key_891, nonempty_dict_missing_key_others_dispose
         "  do using var d := new OwnedDictionary<string, Cell>(); "
         "    d.Add(\"a\", move (new Cell())); "
         "    d.Add(\"b\", move (new Cell())); "
-        "    var v: Cell? := null; "
-        "    var ok := d.TryPopValue(\"x\", out owned v); "
+        "    var ok := d.TryPopValue(\"x\", out owned var v); "
         "    v?.Dispose(); "
         "    if ok then return 99; end; "
         "  end; return Cell._n; end Main; end C;"), 0);
@@ -80,8 +79,7 @@ BEZEL_TEST(trypopvalue_missing_key_891, present_key_disposed_exactly_once) {
         "class C public static method Main(): int "
         "  do using var d := new OwnedDictionary<string, Cell>(); "
         "    d.Add(\"k\", move (new Cell())); "
-        "    var v: Cell? := null; "
-        "    var ok := d.TryPopValue(\"k\", out owned v); "
+        "    var ok := d.TryPopValue(\"k\", out owned var v); "
         "    v?.Dispose(); "
         "  end; return Cell._n; end Main; end C;"), 0);
 }

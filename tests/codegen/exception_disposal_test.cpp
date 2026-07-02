@@ -1404,36 +1404,36 @@ BEZEL_TEST(exception_disposal_900, out_owned_recipient_unwind_disposed) {
         std::string("module M; ") + kCellCtorDtor +
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
-        "    try do var item: Cell? := null; var ok := s.TryPop(out owned item); "
+        "    try do var ok := s.TryPop(out owned var item); "
         "           throw new Exception(\"x\"); item?.Dispose(); end; "
         "    catch Exception => return Cell._n; end; "  // 0
         "    return -1; end; "
         "end Main; end C;", 0);
 }
 
-// Double-free control: an `out owned` recipient explicitly disposed BEFORE the
-// throw must not be re-disposed on unwind (the nulled slot + null-guard) — and
-// LSan asserts no double-free.
+// Double-free control: an `out owned var` recipient explicitly disposed BEFORE
+// the throw must not be re-disposed on unwind (the nulled slot + null-guard) —
+// and LSan asserts no double-free.
 BEZEL_TEST(exception_disposal_900, out_owned_dispose_then_throw_no_double_free) {
     expectExitAndLeakFree(
         std::string("module M; ") + kCellCtorDtor + "class E end E; "
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
-        "    try do var item: Cell? := null; var ok := s.TryPop(out owned item); "
+        "    try do var ok := s.TryPop(out owned var item); "
         "           item?.Dispose(); throw new E(); end; "
         "    catch E => return Cell._n; end; "  // 0 — disposed once
         "    return -1; end; "
         "end Main; end C;", 0);
 }
 
-// Control: an `out owned` recipient disposed on a NORMAL exit (no throw) — single
-// dispose, no double-free.
+// Control: an `out owned var` recipient disposed on a NORMAL exit (no throw) —
+// single dispose, no double-free.
 BEZEL_TEST(exception_disposal_900, out_owned_normal_exit_disposed_once) {
     expectExitAndLeakFree(
         std::string("module M; ") + kCellCtorDtor +
         "class C public static method Main(): int "
         "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
-        "    do var item: Cell? := null; var ok := s.TryPop(out owned item); "
+        "    do var ok := s.TryPop(out owned var item); "
         "       item?.Dispose(); end; "
         "    return Cell._n; end; "  // 0
         "end Main; end C;", 0);

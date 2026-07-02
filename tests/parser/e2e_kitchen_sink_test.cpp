@@ -24,7 +24,7 @@ module Kitchen.Sink;
 import System.Collections.Generic;
 import System.Threading;
 
-type Map<K, V> = IDictionary<K, V>;
+type Map<K, V> := IDictionary<K, V>;
 
 public enum Color: int
   Red := 1 serialized "red",
@@ -103,7 +103,7 @@ where T: class
   end Sub;
 
   public method ParallelArgs(name: string, ref count: int, owned r: Resource)
-    Update(name := name, ref count := count, owned r := r);
+    Update(name := name, ref count, owned r);
   end ParallelArgs;
 
   public method Dispose()

@@ -527,22 +527,71 @@ bool sameFlow(const FlowState& a, const FlowState& b) {
 // exception-path discharge to exactly the locals whose scope the unwind
 // destroys (a try body's own locals), leaving enclosing-scope locals
 // untouched — they remain live in the catch and after the try.
+//
+// §22.4 / v0.160 (#1344, #1305): an `out owned var x` argument inline-
+// declares a fresh local whose ownership symbol carries `decl = id` (the
+// IdentifierExpr argument node) rather than a LocalDecl. Collect those
+// IdentifierExpr nodes too — they must appear in `unwoundDecls` so that
+// dischargeOnExceptionEdge correctly recognises them as try-body-scoped
+// locals and discharges them on the exception edge (otherwise they survive
+// as Owned to the function exit and trigger a spurious §28.3 error).
 void collectLocalDecls(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        std::unordered_set<const ast::Node*>& out);
+
+// Scan `e` for any CallExpr / NullCondCallExpr that has an `out owned var`
+// argument and insert the argument's IdentifierExpr node into `out`.
+void collectOutOwnedVarArgs(const ast::Expr* e,
+                            std::unordered_set<const ast::Node*>& out) {
+    if (!e) return;
+    auto scan = [&](const std::vector<ast::CallArgument>& args) {
+        for (const auto& a : args) {
+            if (a.modifier == "out owned var") {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                    out.insert(id);
+            }
+        }
+    };
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e))
+        scan(ce->args);
+    else if (auto* ncc = dynamic_cast<const ast::NullCondCallExpr*>(e))
+        scan(ncc->args);
+}
 
 void collectLocalDeclsStmt(const ast::Stmt& s,
                            std::unordered_set<const ast::Node*>& out) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         out.insert(ld);
+        // §22.4 / v0.160: also collect `out owned var` inline locals from
+        // the initializer, e.g. `var ok := s.TryPop(out owned var item);`.
+        collectOutOwnedVarArgs(ld->initializer.get(), out);
+        return;
+    }
+    // Bare call statement: `s.TryPop(out owned var item);`
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        collectOutOwnedVarArgs(es->expr.get(), out);
+        return;
+    }
+    // Assignment RHS: `ok := s.TryPop(out owned var item);`
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        collectOutOwnedVarArgs(as->value.get(), out);
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // §22.4: the `if` / `elif` condition may itself be the call that
+        // declares the inline local, e.g. `if s.TryPop(out owned var item)`.
+        collectOutOwnedVarArgs(ifs->ifBranch.condition.get(), out);
         collectLocalDecls(ifs->ifBranch.body, out);
-        for (const auto& el : ifs->elifBranches) collectLocalDecls(el.body, out);
+        for (const auto& el : ifs->elifBranches) {
+            collectOutOwnedVarArgs(el.condition.get(), out);
+            collectLocalDecls(el.body, out);
+        }
         collectLocalDecls(ifs->elseBody, out);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        // §22.4: while-condition may declare the inline local.
+        collectOutOwnedVarArgs(ws->condition.get(), out);
         collectLocalDecls(ws->body, out);
         return;
     }

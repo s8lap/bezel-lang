@@ -7807,7 +7807,7 @@ namespace {
 // left consuming (the callee may move out through it).
 inline bool isOutArg(std::string_view m) {
     return m == "out" || m == "out var" || m == "out using var" ||
-           m == "out owned";
+           m == "out owned" || m == "out owned var";
 }
 
 // §28.3 (#994): the callee's parameter list backing a CallExpr/NullCondCallExpr,

@@ -8362,6 +8362,46 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             pos++;
             continue;
         }
+        // §22.4 / v0.160 (#1305/#1344): `out owned var x` is the INLINE form —
+        // x is declared fresh here (no pre-existing LocalDecl). Create a ptr
+        // alloca, null-initialize it, record it in outOwnedRecipients_ so that
+        // a later explicit `x?.Dispose()` reclaims the slot, and register a
+        // null-guarded unwindOnly disposal for the exception path (§28.3 #900).
+        // per §22.4, §28.11, §28.3
+        if (a.modifier == "out owned var" && a.value) {
+            if (auto* idoo = dynamic_cast<const ast::IdentifierExpr*>(
+                    a.value.get())) {
+                sema::Symbol* symoo = ctx_.exprSymbol(*idoo);
+                auto* locoo = dynamic_cast<sema::LocalSymbol*>(symoo);
+                bool alreadyMapped = (locoo && locoo->decl &&
+                                      locals_.count(locoo->decl)) ||
+                                     locals_.count(idoo);
+                if (!alreadyMapped) {
+                    llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), outSlot);
+                    locals_[idoo] = outSlot;
+                    if (locoo && locoo->decl) locals_[locoo->decl] = outSlot;
+                    // Record as out-owned recipient so explicit dispose reclaims.
+                    const void* declKey =
+                        locoo && locoo->decl
+                            ? static_cast<const void*>(locoo->decl)
+                            : static_cast<const void*>(idoo);
+                    outOwnedRecipients_.insert(declKey);
+                    // Exception-path unwind disposal (#900): null-guarded.
+                    if (!disposeStack_.empty() &&
+                        currentFn_ == unwindIneligibleFn_ &&
+                        !emittingDisposerBody_ &&
+                        !unwindIneligible_.count(declKey)) {
+                        Disposal d{outSlot, nullptr};
+                        d.unwindOnly = true;
+                        disposeStack_.back().push_back(d);
+                    }
+                }
+            }
+            pos++;
+            continue;
+        }
         if (a.modifier != "out var" || !a.value) { pos++; continue; }
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
         if (!id) { pos++; continue; }
@@ -9294,6 +9334,14 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
         if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
             auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
             if (!ld) {
+                // §22.4 / v0.160 (#1305): `out owned var x` declares x inline;
+                // sema sets lsym->decl = the IdentifierExpr (not a LocalDecl).
+                // If the IdentifierExpr is in outOwnedRecipients_ we pre-created
+                // the slot in ensureOutVarSlots and must reclaim it here.
+                if (auto* ie = dynamic_cast<const ast::IdentifierExpr*>(loc->decl)) {
+                    if (outOwnedRecipients_.count(static_cast<const void*>(ie)))
+                        return lvalueAddr(receiver, slotTy);
+                }
                 // #963 / §28.11 / §29.2: a for-loop variable of an
                 // `OwnedEnumerable<T>` loop (`for var x in Gen()`) is a
                 // LocalSymbol whose decl is the ForStmt (sema sets `lsym->decl =
