@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.160 — July 2026**
+**Version 0.161 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -4956,7 +4956,7 @@ The ownership state of an expression is determined by the expression form:
 | Collection literal (`[1, 2, 3]`) targeting a reference type (`Array<T>`, `OwnedArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc.) | Owned |
 | Collection literal (`[1, 2, 3]`) targeting an inline-array type (`[N]T`, including `[N owned]T?`) | Not applicable — produces a value. For move-only `[N owned]…` targets, the value is move-only ([§15.3](#sec-move-only-value-types)). |
 | Method call returning `owned T` | Owned |
-| Method call returning `T` (no `owned`) | Borrowed (source: as documented by the callee; see *Factory methods* below) |
+| Method call returning `T` (no `owned`) | Borrowed — instance method: source is the receiver; static method: no source, treated as owned with a warning (see *Factory methods* below) |
 | Field access `obj.f` where `f` is `owned` | Borrowed (source: `obj`) |
 | `move obj.f` where `f` is `owned` | Owned. Field is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression)). |
 | Field access `obj.f` where `f` is not `owned` | Borrowed (source: `obj`) |
@@ -4977,11 +4977,11 @@ The ownership state of an expression is determined by the expression form:
 <a id="sec-factory-methods-and-sourceless-returns"></a>
 #### Factory methods and sourceless returns
 
-When a method returns a class type `T` (no `owned`) and the call has no identifiable borrow source — because the method is `static`, or because the return is documented as a freshly-allocated value rather than a reference into existing state — the return is treated as **owned** by the caller. The caller must discharge the ownership obligation (store in an `owned` field, bind with `using var`, pass to an `owned` parameter, or explicitly dispose).
+When a method returns a class type `T` (no `owned`) and the call has no **structural** borrow source — the method is `static` — the return is treated as **owned** by the caller, with a warning nudging the API author toward the explicit `owned` return type. The caller must discharge the ownership obligation (store in an `owned` field, bind with `using var`, pass to an `owned` parameter, or explicitly dispose). *(Non-normative note for API authors: `owned` on the return type is the only compiler-visible transfer signal; documentation phrases like "returns a fresh instance" carry no weight in this classification — write the qualifier.)*
 
 This rule applies to static factory methods (`Stopwatch.StartNew()`, `File.ReadAllLines(...)`, `string.Split(...)` returning `Array<string>`, LINQ materialization methods like `ToArray()` returning `Array<T>`) and to any instance method whose documentation states that the return is freshly allocated. The `owned` return-type annotation remains the preferred way to communicate ownership transfer across method boundaries ([§28.8](#sec-ownership-transfer)); the sourceless-return rule exists as a safety net for methods that produce fresh values but omit the annotation.
 
-When the method has an identifiable borrow source — an instance method returning state from its receiver, or a method whose documentation names the source — the return is borrowed from that source, and the caller has no disposal obligation.
+When the method has a structural borrow source — an **instance** method, whose source is the receiver — the return is borrowed from that source, and the caller has no disposal obligation.
 
 The compiler determines the borrow source as follows: for an instance method, the default source is the receiver; for a static method, there is no default source. When the compiler cannot identify a source for a non-`owned` class-typed return from a static method, it treats the return as owned and emits a warning recommending that the callee add `owned` to its return type. Implementations are encouraged to add `owned` annotations to static factory methods proactively.
 
@@ -5014,7 +5014,7 @@ A borrowed value's lifetime is the lifetime of its *source*. The compiler enforc
 - A borrowed local may not be returned from a method whose return type is `owned`.
 - A borrowed local may not be returned from a method at all unless the return type is the same kind of borrow with a clearly-defined source (in this version, that means: receiver-borrows from extension methods, value-typed returns, and runtime-managed returns).
 - A method's return type that names an **owning-collection or owning-wrapper type** (`OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedLinkedList<T>`, `OwnedTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) follows the *same* owned-vs-borrow rule as any other reference return (the *Producers* table above): declared `owned`, the caller takes ownership; declared **without** `owned`, the result is a **borrow** with a documented source (the `Owned*` type name denotes *element* ownership, orthogonal to the container ownership the `owned` qualifier governs — [§5.11](Bezel_Design_Rationale.md#sec-owning-collections)). The borrow-return restrictions then apply unchanged: a bare owning-collection *field* read may be returned (its source is the receiver, [§28.6](#sec-leak-prevention)); a borrowed *local* or *parameter* with no source that outlives the call may **not** be returned; a `move`d field or a freshly-produced owning value must be returned through an `owned` return type. A borrow returned this way carries the capability restriction of [§28.6](#sec-borrowed-owning-collections) — the caller may not `Dispose` it (the owner does); it may otherwise be read and mutated like any borrowed collection.
-- A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference; the lifetime relationship is the programmer's obligation, checked at each assignment site (a borrowed local fails the check, a constructor-parameter borrow whose source outlives the object passes).
+- A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference. **The assignment-site check is structural and decidable** — parameter-sourced and receiver-sourced borrows are admissible; scope-bound locals and temporaries are rejected. **The residual is trust:** whether the caller-side source actually outlives the object is the programmer's obligation, not a compile-time guarantee; a violation is caught as `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior in unchecked mode.
 - A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted.
 - The same capture-and-escape rule applies to **method references** ([§27.6](#sec-method-references)) that bind an instance receiver: `obj.Method` produces a function value whose captured environment includes `obj`. If `obj` is a borrow, the resulting function value is subject to the closure-escape rules above as if `obj` had been captured by an explicit lambda. The function value's runtime-managed status ([§28.9](#sec-runtime-managed-types)) governs the *function value's own* lifetime; it does not relax the lifetime constraints on borrows captured by the function value.
 
@@ -5072,7 +5072,7 @@ The compiler must produce error messages that name the variable, its current own
 - *"Owned value in `x` was already moved out at line N."* (When a moved-from local is read.)
 - *"Cannot move out of `using var` `x`; `using var` is scope-bound."* (When a `using var` is moved.)
 
-These rules are sufficient to ensure that every owned class instance is disposed exactly once at runtime, that every borrow refers to a live object, and that no owned reference is silently leaked.
+These rules ensure that every owned class instance is disposed **exactly once** at runtime and that no owned reference is silently leaked (with drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields), the claim has no carve-outs). Borrow **liveness** is guaranteed statically for locals, returns, and captures; for *field-held* borrows it holds up to the caller-side lifetime obligation of the bullet above, backstopped by checked disposal mode ([§28.2](#sec-the-idisposable-contract)).
 
 <a id="sec-the-destructor"></a>
 ### 28.4 The `destructor`
@@ -5210,44 +5210,23 @@ The chained calls all operate on the same object. The returned borrow may not be
 When a chain originates from a `new` expression — `new StringBuilder().Append("a").Append("b")` — the owned value produced by `new` is the root of the chain. The compiler treats the overall chain expression as owned (its root is a `new`). The borrow-returning intermediate calls do not lose the root's ownership; the chain as a whole must reach an owned location or `using var`, just as any other `new` expression must.
 
 <a id="sec-reassigning-owned-fields"></a>
-### 28.7 Reassigning owned fields
+### 28.7 Reassigning owned fields and locals — drop-on-overwrite
 
-Assignment to an owned field is a plain assignment. The compiler does not insert automatic cleanup of the previous value. The programmer disposes the previous value first:
+**Assignment to an owned field or owned local disposes the displaced value (v0.161).** The right-hand side is evaluated first; then, if the previous value is live (non-null and not moved-from — the per-slot tracking [§28.11](#sec-collection-element-ownership)'s indexer-set rule already defines), it is disposed; then the new value is stored. The disposal is null-guarded and dynamic-dispatched, exactly the machinery scope-end disposal already uses. This completes the v0.150–v0.152 affine trajectory: with overwrite covered, the §28.3 claim — *every owned value is disposed exactly once on every path* — holds with no carve-outs. (Through v0.160, overwrite was a plain store with a should-level leak warning — the one place an owned value could be disposed zero times. The original v0.89 justification, "field assignment is a primitive operation with no method body," predates the affine model.)
 
 ```bezel
 public method Resize(newSize: int)
-  _buffer.Dispose();
-  _buffer := new Array<byte>(newSize);
+  _buffer := new Array<byte>(newSize);   // previous _buffer disposed here, implicitly
 end Resize;
 ```
 
-For nullable owned fields, guard the disposal:
+An explicit `field.Dispose();` before the assignment remains legal and behavior-preserving — `Dispose` is idempotent ([§28.2](#sec-the-idisposable-contract)), so the implicit disposal of an already-disposed value is a no-op. Code written under the old discipline compiles and behaves identically.
 
-```bezel
-if _cache <> null then
-  _cache.Dispose();
-end;
-_cache := newCache;
-```
+**Ordering and exceptions.** Because the RHS is evaluated *before* the displaced value is disposed, a throwing RHS leaves the field/local untouched and still-owned (disposed later by the normal unwinding rules) — the historically exception-unsafe window of the manual `Dispose-then-assign` pattern (disposed field holding a dangling reference while the constructor throws) no longer exists on the implicit path. Disposers themselves are still expected not to throw ([§28.4](#sec-the-destructor)); a throwing disposer during overwrite propagates after the store is abandoned, leaving the new value an unbound owned temporary disposed by [§28.3](#sec-unbound-owned-temporaries)'s end-of-statement rule.
 
-Forgetting to dispose the previous value leaks memory but cannot dangle (the leak-prevention rules ensure no other reference exists).
+**Moved-from and null.** Overwriting a moved-from field/local ([§28.8.1](#sec-the-move-expression)) or a null-valued nullable stores without disposal — this is precisely how the field-restoration rule's `move`-then-reassign idiom stays single-disposal. `using var` locals are not reassignable at all ([§28.10](#sec-using-var)); this section covers `owned` fields and plain-`var` owned locals.
 
-<a id="sec-disposers-are-expected-not-to-throw"></a>
-#### Disposers are expected not to throw
-
-The pattern `field.Dispose(); field := new T(...);` is exception-unsafe if `Dispose` throws: the field is left in disposed state but still holds a reference whose use is undefined behavior ([§28.2](#sec-the-idisposable-contract)). For non-nullable owned fields, recovery from a throwing disposer is essentially impossible — the field cannot be left null and the new value has not been constructed.
-
-Disposers are therefore expected not to throw under any condition the program is expected to handle. Standard library disposers do not throw under normal operation; user-written destructors should follow the same convention. A disposer that throws should be considered a programming error. Methods that need to perform fallible cleanup should expose a separate `Close` or `Flush` method, leave `Dispose` to handle the unrecoverable cleanup, and let the destructor swallow exceptions from late cleanup with a logged warning.
-
-<a id="sec-compiler-warning-on-undisposed-overwrite"></a>
-#### Compiler warning on undisposed overwrite
-
-Implementations should emit a warning when a write to an `owned` field is not preceded by a `Dispose()` call (or, for nullable owned fields, by a null check guarding a `Dispose()`) on the same field within the same method, unless the field is provably null or in moved-from state at the write site. A field is provably in moved-from state when an earlier `move obj.f` ([§28.8.1](#sec-the-move-expression)) without an intervening reassignment dominates the write site on every path. The warning highlights the leak that the rule above acknowledges as possible. False positives are addressable by an explicit `field.Dispose();` immediately before the write, even when the programmer knows the previous value to be null — the explicit dispose call is idempotent ([§28.2](#sec-the-idisposable-contract)).
-
-<a id="sec-reassigning-owned-locals"></a>
-#### Reassigning owned locals
-
-The same rules apply to owned locals declared with plain `var`. Assignment to an owned local is a plain assignment; the compiler does not insert automatic cleanup of the previous value. The programmer either disposes the previous value first (`x.Dispose(); x := newValue;`), moves the previous value out (`y := x; x := newValue;`, leaving `x` moved-from before the reassignment), or relies on the local being in moved-from state already (which is automatic after a prior `move`, `using var` transfer, or owned-argument call). The same compiler-warning rule of [§28.7](#sec-compiler-warning-on-undisposed-overwrite) applies: an undisposed-overwrite warning is emitted unless a visible `Dispose()` precedes the reassignment, or the local is provably in moved-from or null state at the assignment site. `using var` locals are not reassignable at all ([§28.10](#sec-using-var)), so this rule covers only plain `var` owned locals.
+**Move-only inline arrays:** whole-value reassignment of `[N owned]T` values keeps the [§15.3](#sec-move-only-value-types) manual discipline for this revision — the slot-wise disposal interacts with the open #747 design and is deferred with its own tracking issue.
 
 <a id="sec-ownership-transfer"></a>
 ### 28.8 Ownership transfer
@@ -5256,8 +5235,8 @@ The same rules apply to owned locals declared with plain `var`. Assignment to an
 
 ```bezel
 public method TakeOwnership(owned resource: Stream)
-  _resource := resource;     // moves into owned field; previous _resource
-                             // must have been disposed first per §28.7
+  _resource := resource;     // moves into owned field; the previous
+                             // _resource is disposed by the assignment (§28.7)
 end TakeOwnership;
 
 public static method NewBuffer(size: int): owned Array<byte>
@@ -5753,7 +5732,7 @@ The `move coll[i]` form is admitted on:
 
 The field-restoration rule applies: the slot must be reassigned before the surrounding method exits. For nullable element types (`OwnedArray<T>` internally storing `T?`, `OwnedDictionary<K, V>`, `[N owned]T?`, `OwnedBuffer<T>` for class-typed T which stores `T?`), assigning `null` to a moved-from slot satisfies the rule. For non-nullable element types (`[N owned]T`), restoration requires assigning a fresh owned T value — a constructor call, another moved value, or a borrow promoted to ownership. Code that needs "leave the slot empty after take" must use the nullable form. (For value-typed `OwnedBuffer<T>` the rule is moot — `move buf[i]` is not admitted, so no restoration obligation arises.)
 
-**Indexer setter on a moved-from slot.** When the slot is in moved-from state, assigning to it through the indexer setter does *not* trigger the owned-setter's "dispose previous value" semantics — the previous value was already taken out by `move`, so there is no previous value to dispose. The slot transitions directly from moved-from to holding the new value. This matches the analogous rule for owned-local reassignment ([§28.7](#sec-reassigning-owned-locals)) where a moved-from local accepts reassignment without triggering an undisposed-overwrite warning. The compiler's per-slot moved-from tracking is what makes this distinguishable from a non-moved-from slot, where the setter does dispose the previous value.
+**Indexer setter on a moved-from slot.** When the slot is in moved-from state, assigning to it through the indexer setter does *not* trigger the owned-setter's "dispose previous value" semantics — the previous value was already taken out by `move`, so there is no previous value to dispose. The slot transitions directly from moved-from to holding the new value. This matches owned-field/local reassignment ([§28.7](#sec-reassigning-owned-fields)): a moved-from location accepts the new value with nothing to dispose. The compiler's per-slot moved-from tracking is what makes this distinguishable from a non-moved-from slot, where the setter does dispose the previous value.
 
 The compiler tracks moved-from state per slot when the index is a compile-time constant or a local read. For variable indices that the compiler cannot prove are constant within the method, the analysis is conservative: after `move coll[i]` with a non-constant `i`, the *entire collection* is treated as having one or more slots in moved-from state. The admissible restoration operations depend on the collection kind:
 
@@ -5892,7 +5871,7 @@ interface IEnumerator<out T>: IDisposable
 end IEnumerator;
 ```
 
-Calling `GetEnumerator()` produces a fresh enumerator positioned just before the first element. `MoveNext()` advances the cursor and returns `true` if a new element became available, `false` if the sequence is exhausted. `Current` returns the element at the current position; reading `Current` before the first successful `MoveNext` or after `MoveNext` returns `false` is undefined behavior — concrete enumerators typically throw `InvalidOperationException`.
+Calling `GetEnumerator()` produces a fresh enumerator positioned just before the first element. `MoveNext()` advances the cursor and returns `true` if a new element became available, `false` if the sequence is exhausted. `Current` returns the element at the current position. Reading `Current` before the first successful `MoveNext` or after `MoveNext` returns `false` raises **`InvalidOperationException`** (v0.161 — normative for standard-library enumerators and compiler-generated iterators; contractual for user implementations, the same shape as [§29.12](#sec-concurrent-modification)'s mutation rule; previously undefined behavior).
 
 `IEnumerator<T>` extends `IDisposable`. An enumerator with no resources to release simply has an empty `Dispose` body; the compiler generates one if the implementor writes none.
 
@@ -5906,7 +5885,7 @@ Calling `GetEnumerator()` produces a fresh enumerator positioned just before the
 
 - **`IEnumerator<T>.Current`** is **non-destructive**: it returns a borrow of the most-recently-yielded value, which the enumerator continues to own (if it has ownership of the source) or re-borrow (if the source is borrow-based). Multiple reads between `MoveNext` calls produce additional borrows of the same value. The async variant `IAsyncEnumerator<T>.Current` has the same non-destructive semantics relative to `MoveNextAsync`.
 
-- **`OwnedEnumerator<T>.Current`** is **destructive**: the first read after a successful `MoveNext` transfers ownership of the most-recently-yielded value to the caller, leaving the enumerator's internal slot empty. A second read without an intervening `MoveNext` is undefined behavior — concrete enumerators typically throw `InvalidOperationException`. Reading `Current` and *not* discharging the resulting owned value is a compile error at the call site (per the standard owned-value discharge rules). The async variant `OwnedAsyncEnumerator<T>.Current` has the same destructive semantics relative to `MoveNextAsync`.
+- **`OwnedEnumerator<T>.TakeCurrent()`** (v0.161 — was the destructive property `Current: owned T`) is an ordinary **owned-returning method**: after a successful `MoveNext`, `TakeCurrent()` transfers ownership of the most-recently-yielded value to the caller, leaving the enumerator's internal slot empty; the result follows the standard [§28.1](#sec-where-the-owned-modifier-can-appear)/[§28.3](#sec-local-variables-ownership-and-borrows) owned-return rules (discharge or auto-drop-with-warning — no special carve-out needed). A second take without an intervening advance, or a take before the first advance / after exhaustion, raises **`InvalidOperationException`** (previously undefined behavior). The redesign removes the language's only *destructive property getter* — a getter that moved out of a field violated [§28.6](#sec-leak-prevention) as written, and [§23](#sec-properties-and-indexers) itself prescribes "an explicit method that returns the owned value" for transfer-out semantics. The async variant is `OwnedAsyncEnumerator<T>.TakeCurrent()` relative to `MoveNextAsync`.
 
 `OwnedEnumerator<T>` is reached via:
 - `OwnedEnumerable<T>.GetOwnedEnumerator()` — typically called by the for-loop desugaring when the source is `OwnedEnumerable<T>`.
@@ -5948,7 +5927,7 @@ do
   using var __source := source;
   using var __enumerator := __source.GetOwnedEnumerator();
   while __enumerator.MoveNext() do
-    var x := __enumerator.Current;           // x is owned; discharge required
+    var x := __enumerator.TakeCurrent();     // x is owned; §28.3 rules apply
                                               //   on every body-exit edge
     // body
   end;
@@ -6546,7 +6525,7 @@ public async method ProcessAllAsync(paths: IEnumerable<string>): Task
 end ProcessAllAsync;
 ```
 
-The `await for` desugaring picks `GetOwnedAsyncEnumerator()` (and the destructive `Current`) when the source has static type `OwnedAsyncEnumerable<T>`. Each iteration variable is owned; the §28.3 discharge rules apply on every exit edge of the loop body — the same rule as for synchronous `for` over `OwnedEnumerable<T>` ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). When the source implements both `IAsyncEnumerable<T>` and `OwnedAsyncEnumerable<T>`, the static type of the source expression selects the desugaring; default iteration uses `IAsyncEnumerable<T>` (borrowing), and the owning path requires the source to be typed `OwnedAsyncEnumerable<T>` explicitly.
+The `await for` desugaring picks `GetOwnedAsyncEnumerator()` (and `TakeCurrent()`, v0.161) when the source has static type `OwnedAsyncEnumerable<T>`. Each iteration variable is owned; the §28.3 discharge rules apply on every exit edge of the loop body — the same rule as for synchronous `for` over `OwnedEnumerable<T>` ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). When the source implements both `IAsyncEnumerable<T>` and `OwnedAsyncEnumerable<T>`, the static type of the source expression selects the desugaring; default iteration uses `IAsyncEnumerable<T>` (borrowing), and the owning path requires the source to be typed `OwnedAsyncEnumerable<T>` explicitly.
 
 The `with token` clause works the same way for owning async iterators — `await for var fs in OpenFilesAsync(paths) with token do ...` passes the token to `GetOwnedAsyncEnumerator(token)`.
 
@@ -8324,6 +8303,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `Dispose()` is generated for every non-static class.
 - The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls execute disposal exactly once ([§28.2](#sec-the-idisposable-contract)).
 - Owned fields are restricted to class- or interface-typed fields ([§28.5](#sec-owned-fields); not `string`, not function types, not value types).
+- Assignment to an owned field or plain-`var` owned local disposes the displaced live value before storing (drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields); null/moved-from displaced values dispose nothing; RHS evaluated first).
 - Owned values may not escape: *transferring* an owned field out (a `move`, or a fresh owning value) requires an `owned` return type; a bare owned-field read may be returned through a non-`owned` return as a borrow of the receiver ([§28.6](#sec-leak-prevention)); assigning an owned value to a non-owned field of another object is rejected.
 - A `new` expression's result, and any owned local, is disposed exactly once on every path: it either reaches an owned location / explicit `Dispose()` / `move` / return, or is **auto-dropped at scope end** ([§28.3](#sec-owned-local-discharge-requirement)). An implicit auto-drop of a plain-`var` owned local raises a **must-use warning** (not an error); the warning is suppressed by `using var`, explicit disposal, discard, move, or return. Discard `_ := …` of an owned class or move-only value is permitted (disposes at end of statement). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
 - A static method returning a class type without `owned` and without an identifiable borrow source produces an owned value; the same discharge rules as `new` apply ([§28.3](#sec-local-variables-ownership-and-borrows)).

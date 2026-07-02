@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.160 — July 2026**
+**Companion to the Bezel Language Specification, v0.161 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1334,7 +1334,7 @@ C#'s `protected internal` (union: visible to derived classes *or* same-module co
 
 Many languages provide a way to declare a local variable that cannot be reassigned after initialization: `let` (Swift, Rust, JavaScript), `val` (Kotlin, Scala), `final` (Java). Bezel deliberately does not provide this in the current version.
 
-`var` is always reassignable. `const` requires a compile-time constant. `using var` is non-reassignable but carries disposal semantics. There is no `let`, `val`, or `readonly var` for runtime-computed but non-reassignable locals.
+`var` is always reassignable. `const` requires a compile-time constant. `using var` is non-reassignable and carries disposal semantics — with the honest footnote (2026-07, review finding #1360) that per spec §28.10 a `using var` whose RHS is value-typed, runtime-managed, or a borrow has a no-op disposal, making it an *admitted* (if unidiomatic) readonly-local spelling. That admission is tolerated for generic and desugaring uniformity, not endorsed as the readonly-local idiom; a runtime-`const` (see the deferred list, §18) remains the candidate if demand materializes. There is no `let`, `val`, or `readonly var` for runtime-computed but non-reassignable locals.
 
 The omission is a cost-benefit judgment. The bug class prevented by readonly locals — accidental reassignment of a local that should have been stable — is real but small relative to the complexity budget. Most locals in well-written code are single-assignment regardless of enforcement, and the ownership system ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) already tracks local-variable state far more aggressively than mutability alone. Adding a fourth local-declaration form (`let`, `readonly var`, or similar) would increase the decision burden on every local declaration without a proportionate safety payoff.
 
@@ -7341,6 +7341,19 @@ v0.160 is the **members revision**: the call/parameter-modifier composition matr
 
 #### Migration
 Tightenings: named ref/out/owned arguments (were undefined-but-parseable) now rejected; non-public operators rejected; protected/private extension members rejected; block-bodied extension properties rejected; defaults on ref/out rejected. Type alias `=` → `:=` is source-breaking but trivially mechanical. Compiler alignment for all of v0.160 rides the wave-3 lanes (the `out owned var` parse is #1305's fix; the owned-`out _` disposal semantics subsumes the #1315 scratch-slot family for owned outs).
+
+<a id="sec-v0-160-to-v0-161-changelog"></a>
+### v0.161 changelog (v0.160 → v0.161)
+
+v0.161 is the **ownership-honesty revision**: the one remaining zero-disposal path closes, the soundness claims are rescoped to exactly what is checked, and the owning-enumeration protocol loses its anomalous destructive getter. (Issues: #1328, #1331, #1349, #1360.)
+
+- **Drop-on-overwrite** (§28.7 rewritten, #1328): assignment to an owned field or plain-`var` owned local now disposes the displaced live value (RHS-first; null/moved-from displaced values dispose nothing; explicit prior `Dispose()` stays legal via idempotence, so all correct v0.160 code is behavior-preserved). The "compiler warning on undisposed overwrite" subsection is deleted; the disposers-don't-throw discussion is rewritten for the new ordering (the manual pattern's exception-unsafe window no longer exists on the implicit path). New Appendix C.3 invariant. §28.8's commentary updated. The §28.3 exactly-once claim becomes true without carve-outs. Move-only inline-array whole-value reassignment retains §15.3's manual discipline (deferred with its own issue — #747 interaction). *Compiler: locals half already shipped (#913/#1054); the fields half is a wave-4 ownership lane; spec-ahead-of-implementation until it lands.*
+- **Borrow honesty** (§28.3, #1331): the producers-table borrow row and the factory-methods text are restated structurally (instance ⇒ receiver-sourced borrow; static ⇒ owned-with-warning; documentation phrases carry no classification weight — `owned` is the only transfer signal); the borrow-into-field bullet separates the decidable assignment-site check from the trusted caller-side lifetime obligation, naming the checked-mode `DisposedAccessException` backstop and the unchecked-mode UB honestly; the closing soundness sentence is rescoped to what is actually guaranteed.
+- **`TakeCurrent()`** (§29.1/§29.2/§30.7 + stdlib §4.13, #1349): the owning enumerators' destructive `Current: owned T` property is replaced by an ordinary owned-returning method — the language's only destructive property getter is removed (it violated §28.6 as written; §23 itself prescribes a method for transfer-out). Protocol misuse (read/take before first advance, after exhaustion, double-take) is a **defined `InvalidOperationException`** (was undefined behavior), normative for stdlib/compiler-generated enumerators, contractual for user ones. *Compiler: builtin-member rename + desugaring + IOE guards ride wave-4.*
+- **`using var` as readonly-local** (rationale §17.8, #1360): the no-op-disposal admission documented honestly (tolerated for uniformity, not the endorsed idiom; runtime-`const` stays on the deferred list). No diagnostic added — §28.10 sanctions scope-pinning.
+
+#### Migration
+Drop-on-overwrite is behavior-preserving for all correct code and un-leaks previously-leaking code. `TakeCurrent()` is a mechanical rename for owning-enumerator users (the for-desugarings are compiler-internal). No other changes.
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)

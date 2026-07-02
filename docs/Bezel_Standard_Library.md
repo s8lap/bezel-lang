@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.160 — July 2026**
+**Companion to the Bezel Language Specification, v0.161 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1820,12 +1820,12 @@ public interface OwnedEnumerable<T>: IDisposable where T: class
 end OwnedEnumerable;
 
 public interface OwnedEnumerator<T>: IDisposable where T: class
-  readonly property Current: owned T;   // destructive: transfers ownership
+  method TakeCurrent(): owned T;        // transfers ownership (v0.161; was destructive property Current)
   method MoveNext(): bool;
 end OwnedEnumerator;
 ```
 
-The owning iteration interfaces. `OwnedEnumerator<T>.Current` is **destructive**: the first read after a successful `MoveNext` transfers ownership of the most-recently-yielded value to the caller; a second read without an intervening `MoveNext` is undefined behavior (concrete enumerators typically throw `InvalidOperationException`). The for-loop desugaring at language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) reads `Current` exactly once per iteration, matching the destructive semantics naturally.
+The owning iteration interfaces. `OwnedEnumerator<T>.TakeCurrent()` (v0.161 — replaces the destructive `Current` property) transfers ownership of the most-recently-yielded value to the caller after a successful `MoveNext`; a second take without an intervening advance, or a take before the first advance/after exhaustion, raises `InvalidOperationException` (spec §29.1). The for-loop desugaring at language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) calls `TakeCurrent()` exactly once per iteration.
 
 A `for var x in src do ... end` where `src` is an `OwnedEnumerable<T>` produces owned iteration variables. The loop body must discharge each `x` on every normal-exit edge (fall-through, `break`, `continue`, `return`); the standard owned-local discharge rules ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) apply. On exception edges the iteration variable is auto-disposed by the implicit `try`/`finally` rule of [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) "Exception-path discharge."
 
@@ -1839,12 +1839,12 @@ public interface OwnedAsyncEnumerable<T>: IAsyncDisposable where T: class
 end OwnedAsyncEnumerable;
 
 public interface OwnedAsyncEnumerator<T>: IAsyncDisposable where T: class
-  readonly property Current: owned T;   // destructive
+  method TakeCurrent(): owned T;        // transfers ownership (v0.161)
   method MoveNextAsync(): Task<bool>;
 end OwnedAsyncEnumerator;
 ```
 
-`OwnedAsyncEnumerable<T>` is the return type for async iterator methods that yield owned values (asynchronously-produced owned resources, async drain operations on owning collections). The destructive-Current rule applies to `OwnedAsyncEnumerator<T>` the same way; `await for var x in src do ... end` produces owned iteration variables; the spec §28.3 discharge rules (auto-drop with must-use warning) apply in the body.
+`OwnedAsyncEnumerable<T>` is the return type for async iterator methods that yield owned values (asynchronously-produced owned resources, async drain operations on owning collections). The `TakeCurrent()` rule applies to `OwnedAsyncEnumerator<T>` the same way (relative to `MoveNextAsync`); `await for var x in src do ... end` produces owned iteration variables; the spec §28.3 discharge rules (auto-drop with must-use warning) apply in the body.
 
 A type may implement both `IEnumerable<T>` and `OwnedEnumerable<T>`. `OwnedArray<T>` does so: default iteration via `IEnumerable<T>` yields borrows of T (the standard read-only-iteration semantics); drain iteration via `OwnedEnumerable<T>` yields owned T values that the consumer must discharge. The for-loop desugaring picks based on the static type of the source expression: `for var x in arr do` desugars via `IEnumerable<T>` (borrowing); `for var x in arr.Drain() do` desugars via `OwnedEnumerable<T>` (owning).
 
