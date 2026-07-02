@@ -3669,18 +3669,58 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // scope exit (on the normal AND unwind paths via disposeStack_).
             const sema::TypeRef* pt =
                 params[idx].type ? ctx_.resolvedType(*params[idx].type) : nullptr;
-            llvm::Value* coll =
-                pt ? materializeCollectionLiteralForArg(cl, pt) : nullptr;
-            if (!coll) return false;  // unrecognised target — decline cleanly
-            // Spill the collection pointer to a slot (the disposal entry frees
-            // through the alloca, mirroring a `using var` local's slot).
-            llvm::AllocaInst* slot = entryAlloca(coll->getType());
-            builder_.CreateStore(coll, slot);
-            v = coll;
-            bool ownedParam = (params[idx].modifier == "owned");
-            if (!ownedParam && !disposeStack_.empty())
-                disposeStack_.back().push_back(
-                    buildCollectionTempDisposal(slot, pt));
+            // fix #1382 / §15.4: an INLINE-ARRAY parameter `[N]T` receiving a
+            // collection literal `[e1, …, eN]`. materializeCollectionLiteralForArg
+            // only handles heap collections; for a value-type inline array it
+            // returns nullptr and the old code bailed out, leaving the body
+            // record's local variable slot uninitialised (garbage read-back).
+            // Mirror the positional-record constructor path: materialise
+            // element-by-element into a stack alloca and load the aggregate.
+            // Inline arrays are value types — no disposal registration needed.
+            if (pt && pt->kind == sema::TypeRef::Kind::InlineArray && !cl->isDict) {
+                llvm::Type* arrLlvmTy = lowerTypeRef(pt);
+                if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(arrLlvmTy)) {
+                    llvm::AllocaInst* aslot = entryAlloca(aty);
+                    builder_.CreateStore(
+                        llvm::ConstantAggregateZero::get(aty), aslot);
+                    llvm::Type* elTy = aty->getElementType();
+                    for (std::size_t k = 0;
+                         k < cl->elements.size() &&
+                         k < aty->getNumElements(); ++k) {
+                        if (!cl->elements[k]) continue;
+                        llvm::Value* ev = lowerExpr(*cl->elements[k]);
+                        if (!ev) continue;
+                        if (ev->getType() != elTy &&
+                            ev->getType()->isIntegerTy() &&
+                            elTy->isIntegerTy()) {
+                            unsigned eb = ev->getType()->getIntegerBitWidth();
+                            unsigned db = elTy->getIntegerBitWidth();
+                            ev = db > eb ? builder_.CreateSExt(ev, elTy)
+                                         : builder_.CreateTrunc(ev, elTy);
+                        }
+                        builder_.CreateStore(
+                            coerceToNullableSlot(elTy, ev),
+                            builder_.CreateGEP(
+                                aty, aslot,
+                                {builder_.getInt32(0),
+                                 builder_.getInt32(static_cast<unsigned>(k))}));
+                    }
+                    v = builder_.CreateLoad(aty, aslot);
+                }
+            } else {
+                llvm::Value* coll =
+                    pt ? materializeCollectionLiteralForArg(cl, pt) : nullptr;
+                if (!coll) return false;  // unrecognised target — decline cleanly
+                // Spill the collection pointer to a slot (the disposal entry frees
+                // through the alloca, mirroring a `using var` local's slot).
+                llvm::AllocaInst* slot = entryAlloca(coll->getType());
+                builder_.CreateStore(coll, slot);
+                v = coll;
+                bool ownedParam = (params[idx].modifier == "owned");
+                if (!ownedParam && !disposeStack_.empty())
+                    disposeStack_.back().push_back(
+                        buildCollectionTempDisposal(slot, pt));
+            }
         } else {
             // When the argument is a lambda and the formal parameter has a
             // function type, inform lowerLambda of the expected param types

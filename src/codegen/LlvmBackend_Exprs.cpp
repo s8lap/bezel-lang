@@ -7783,6 +7783,47 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         if (!m) continue;
         auto idxIt = fieldIndex_.find(m);
         if (idxIt == fieldIndex_.end()) continue;
+        // fix #1382 / §15.4 / §9.5: a `with`-replacement value that is a
+        // collection literal `[e1, …]` targeting an INLINE-ARRAY field.
+        // lowerExpr returns null for CollectionLiteralExpr, so the plain
+        // `lowerExpr` + `if (!v) continue` below silently drops the write,
+        // leaving the field holding the source record's original value.
+        // Mirror the positional-record constructor path: store elements
+        // directly into the field slot via GEP (no aggregate load needed).
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                a.value.get())) {
+            if (!cl->isDict) {
+                llvm::Value* fslot =
+                    builder_.CreateStructGEP(st, base, idxIt->second);
+                llvm::Type* fty = st->getElementType(idxIt->second);
+                if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(fty)) {
+                    llvm::Type* elTy = aty->getElementType();
+                    for (std::size_t k = 0;
+                         k < cl->elements.size() &&
+                         k < aty->getNumElements(); ++k) {
+                        if (!cl->elements[k]) continue;
+                        llvm::Value* ev = lowerExpr(*cl->elements[k]);
+                        if (!ev) continue;
+                        if (ev->getType() != elTy &&
+                            ev->getType()->isIntegerTy() &&
+                            elTy->isIntegerTy()) {
+                            unsigned eb = ev->getType()->getIntegerBitWidth();
+                            unsigned db = elTy->getIntegerBitWidth();
+                            ev = db > eb ? builder_.CreateSExt(ev, elTy)
+                                         : builder_.CreateTrunc(ev, elTy);
+                        }
+                        builder_.CreateStore(
+                            coerceToNullableSlot(elTy, ev),
+                            builder_.CreateGEP(
+                                aty, fslot,
+                                {builder_.getInt32(0),
+                                 builder_.getInt32(
+                                     static_cast<unsigned>(k))}));
+                    }
+                    continue;  // field handled — skip the lowerExpr path below
+                }
+            }
+        }
         llvm::Value* v = lowerExpr(*a.value);
         if (!v) continue;
         llvm::Value* slot = builder_.CreateStructGEP(st, base, idxIt->second);
