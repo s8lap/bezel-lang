@@ -10041,6 +10041,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> instance methods and
     // Array<T>.AsSpan()/AsReadOnlySpan() construction.
     if (auto* v = tryLowerArraySpanCall(call)) return v;
+    // §15.1.2 / #1342: inline-array `[N]T` built-in intrinsics ToArray / Contains.
+    if (auto* v = tryLowerInlineArrayCall(call)) return v;
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
@@ -18060,6 +18062,178 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
     // bz_tcs_free) is enforced by the Disposal.tcs emitDisposals arm.
     if (mname == "Dispose") {
         return nullptr;
+    }
+
+    return nullptr;
+}
+
+
+// §15.1.2 / §17.5 / #1342: lower an inline-array `[N]T` built-in intrinsic:
+//   ToArray()    — copies all N slots into a fresh bz_array_t* (owned Array<T>).
+//                  String elements are +1 retained (bz_array_retain_strings).
+//   Contains(v)  — linear scan over the N slots; returns i1.  Element equality
+//                  uses emitRemoveElementEquality (§9.2: value-eq for values,
+//                  content-eq for strings, identity/Equals for classes, structural
+//                  for records).
+//
+// The receiver is an InlineArray-typed expression that lowers to an LLVM
+// `[N x elemTy]` value (usually an lvalue, but we spill to a temp alloca when
+// it is a computed expression).  The same pattern is used by lowerArrayFor.
+llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view m = ma->member;
+    if (m != "ToArray" && m != "Contains") return nullptr;
+
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::InlineArray) return nullptr;
+
+    sema::TypeRef* elemRef = recvTy->arrayElement;
+    int64_t N = recvTy->arraySizeValue;
+
+    llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : i64();
+    if (!elemTy) elemTy = i64();
+
+    // Compute element byte size (mirrors collectionElemSize logic).
+    auto elemSzOf = [&](llvm::Type* et) -> int64_t {
+        if (!et) return 8;
+        if (et->isIntegerTy(32) || et->isFloatTy()) return 4;
+        if (et->isIntegerTy(1) || et->isIntegerTy(8)) return 1;
+        if (et->isIntegerTy(16)) return 2;
+        if (et->isStructTy())
+            return (int64_t)module_->getDataLayout().getTypeAllocSize(et);
+        return 8;  // ptr, i64, double
+    };
+    int64_t esz = elemSzOf(elemTy);
+
+    // Get the receiver array address: try lvalue first, spill if needed.
+    // Same pattern as lowerArrayFor (§15.1.2 iteration, LlvmBackend_Stmts.cpp).
+    llvm::Type* arrSlotTy = nullptr;
+    llvm::Value* arrAddr = lvalueAddr(*ma->target, arrSlotTy);
+    if (!arrAddr || !arrSlotTy) {
+        llvm::Value* v = lowerExpr(*ma->target);
+        if (!v) return nullptr;
+        auto* at = llvm::dyn_cast<llvm::ArrayType>(v->getType());
+        if (!at) return nullptr;
+        llvm::AllocaInst* tmp = entryAlloca(at);
+        builder_.CreateStore(v, tmp);
+        arrAddr = tmp;
+        arrSlotTy = at;
+    }
+    auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy);
+    if (!arrTy) return nullptr;
+
+    // -----------------------------------------------------------------------
+    // ToArray(): allocate a bz_array_t, copy N elements, retain strings.
+    // -----------------------------------------------------------------------
+    if (m == "ToArray" && call.args.empty()) {
+        auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+        llvm::Value* result = builder_.CreateCall(
+            allocFn,
+            {builder_.getInt64(esz), builder_.getInt64(N > 0 ? N : 0)},
+            "ia.toarr");
+
+        if (N > 0) {
+            auto* addFn = declareC("bz_array_add",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            // Emit a counted loop: for i in 0..N-1: arr.add(&src[i], esz).
+            auto* idxSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "iat.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "iat.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "iat.end",  currentFn_);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot);
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx,
+                    builder_.getInt32(static_cast<uint32_t>(N))),
+                bodyBB, endBB);
+
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* cur = builder_.CreateLoad(i32(), idxSlot);
+            llvm::Value* ep = builder_.CreateGEP(
+                arrTy, arrAddr, {builder_.getInt64(0), cur});
+            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+            builder_.CreateStore(
+                builder_.CreateAdd(cur, builder_.getInt32(1)), idxSlot);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(endBB);
+
+            // §15.1.2 / #1342: string elements — after filling, retain each
+            // element +1 so the Array<string> co-owns a refcount per slot.
+            // Mirrors the LINQ ToArray string path (tryLowerLazyLinqCall).
+            if (elemRef &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String &&
+                !elemRef->nullable) {
+                auto* rf = declareC("bz_array_retain_strings",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(rf, {result});
+            }
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Contains(v): linear scan, element-type equality per §9.2.
+    // -----------------------------------------------------------------------
+    if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* target = lowerExpr(*call.args[0].value);
+        if (!target) return nullptr;
+
+        // Empty array always returns false.
+        if (N == 0) return builder_.getFalse();
+
+        bool elemIsClass = elemRef &&
+            elemRef->kind == sema::TypeRef::Kind::Named &&
+            elemRef->declaration &&
+            (elemRef->declaration->kind == ast::TypeDeclKind::Class ||
+             elemRef->declaration->kind == ast::TypeDeclKind::Interface);
+
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "iac.cond",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iac.body",  currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "iac.found", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iac.next",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "iac.end",   currentFn_);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot);
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx,
+                builder_.getInt32(static_cast<uint32_t>(N))),
+            bodyBB, endBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* cur = builder_.CreateLoad(i32(), idxSlot);
+        llvm::Value* ep = builder_.CreateGEP(
+            arrTy, arrAddr, {builder_.getInt64(0), cur});
+        llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+        llvm::Value* eq = emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* inc = builder_.CreateAdd(cur, builder_.getInt32(1));
+        builder_.CreateStore(inc, idxSlot);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "iac.result");
+        phi->addIncoming(builder_.getTrue(),  foundBB);
+        phi->addIncoming(builder_.getFalse(), condBB);
+        return phi;
     }
 
     return nullptr;

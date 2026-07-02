@@ -4943,6 +4943,87 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return phi;
             }
         }
+        // §17.5 / §15.1.2 / #1342: `x in inlineArr` where `inlineArr` is a
+        // `[N]T`-typed expression.  Lowers to the same linear scan as
+        // tryLowerInlineArrayCall's Contains branch — element equality uses
+        // emitRemoveElementEquality per §9.2 (value, string content, class
+        // identity/Equals, record structural).
+        if (bin.right) {
+            auto* rTy = ctx_.exprType(*bin.right);
+            if (rTy && rTy->kind == sema::TypeRef::Kind::InlineArray) {
+                sema::TypeRef* elemRef = rTy->arrayElement;
+                int64_t N = rTy->arraySizeValue;
+                llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : i64();
+                if (!elemTy) elemTy = i64();
+
+                // Get receiver address (lvalue or spill to alloca).
+                llvm::Type* arrSlotTy = nullptr;
+                llvm::Value* arrAddr = lvalueAddr(*bin.right, arrSlotTy);
+                if (!arrAddr || !arrSlotTy) {
+                    llvm::Value* v = lowerExpr(*bin.right);
+                    if (!v) return nullptr;
+                    auto* at = llvm::dyn_cast<llvm::ArrayType>(v->getType());
+                    if (!at) return nullptr;
+                    llvm::AllocaInst* tmp = entryAlloca(at);
+                    builder_.CreateStore(v, tmp);
+                    arrAddr = tmp;
+                    arrSlotTy = at;
+                }
+                auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy);
+                if (!arrTy) return nullptr;
+
+                llvm::Value* target = lowerExpr(*bin.left);
+                if (!target) return nullptr;
+
+                if (N == 0) return builder_.getFalse();
+
+                bool elemIsClass = elemRef &&
+                    elemRef->kind == sema::TypeRef::Kind::Named &&
+                    elemRef->declaration &&
+                    (elemRef->declaration->kind == ast::TypeDeclKind::Class ||
+                     elemRef->declaration->kind == ast::TypeDeclKind::Interface);
+
+                auto* idxSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(0), idxSlot);
+                auto* condBB  = llvm::BasicBlock::Create(llvm_, "iin.cond",  currentFn_);
+                auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iin.body",  currentFn_);
+                auto* foundBB = llvm::BasicBlock::Create(llvm_, "iin.found", currentFn_);
+                auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iin.next",  currentFn_);
+                auto* endBB   = llvm::BasicBlock::Create(llvm_, "iin.end",   currentFn_);
+                builder_.CreateBr(condBB);
+
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx,
+                        builder_.getInt32(static_cast<uint32_t>(N))),
+                    bodyBB, endBB);
+
+                builder_.SetInsertPoint(bodyBB);
+                llvm::Value* cur = builder_.CreateLoad(i32(), idxSlot);
+                llvm::Value* ep = builder_.CreateGEP(
+                    arrTy, arrAddr, {builder_.getInt64(0), cur});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* eq =
+                    emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+                if (!eq) return nullptr;
+                builder_.CreateCondBr(eq, foundBB, nextBB);
+
+                builder_.SetInsertPoint(foundBB);
+                builder_.CreateBr(endBB);
+
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(
+                    builder_.CreateAdd(cur, builder_.getInt32(1)), idxSlot);
+                builder_.CreateBr(condBB);
+
+                builder_.SetInsertPoint(endBB);
+                auto* phi = builder_.CreatePHI(i1(), 2, "iin.result");
+                phi->addIncoming(builder_.getTrue(),  foundBB);
+                phi->addIncoming(builder_.getFalse(), condBB);
+                return phi;
+            }
+        }
         // #628 (part 1): unhandled `in` form — emit a hard error so the
         // caller sees a failed compile rather than silent garbage IR.
         ctx_.diagnostics().report(

@@ -951,7 +951,9 @@ set(BEZEL_TEST_SOURCES
     codegen/dateonly_timeonly_1357_stdlib_2_5_test.cpp  # §2.5 DateOnly / TimeOnly full surface
     codegen/random_nextint64_1359_stdlib_2_7_test.cpp   # §2.7 Random NextInt64 / NextBoolean / NextBytes
     # --- fix #1328: §28.7 drop-on-overwrite for owned class/interface FIELDS ---
-    codegen/field_drop_on_overwrite_1328_test.cpp)
+    codegen/field_drop_on_overwrite_1328_test.cpp
+    # --- fix #1342: §15.1.2 / §17.5 inline-array ToArray() + Contains() intrinsics ---
+    codegen/inline_array_intrinsics_1342_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

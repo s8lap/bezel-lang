@@ -1,16 +1,18 @@
 // Regression tests for #1100 (§15.1.2): an inline array `[N]T` exposes ONLY
-// `.Length` and the indexer `arr[i]` (with iteration via `for var x in arr`).
-// It is a value type that does NOT implement `IEnumerable<T>` and CANNOT be
-// extended (§26.2), so LINQ / IEnumerable operators — `.Count()`, `.Sum()`,
-// `.Where()`, `.All()`, `.ToArray()`, … — have no member to resolve on it.
+// `.Length`, `.ToArray()`, `.Contains(v)`, the indexer `arr[i]`, and iteration
+// via `for var x in arr`.  It is a value type that does NOT implement
+// `IEnumerable<T>` and CANNOT be extended (§26.2), so general LINQ / IEnumerable
+// operators — `.Count()`, `.Sum()`, `.Where()`, `.All()`, … — have no member to
+// resolve on it.  (Note: `.ToArray()` and `.Contains()` ARE now supported as
+// §15.1.2 intrinsics per fix #1342 — they are NOT LINQ operators.)
+//
 // These previously slipped past every gate: resolveMemberAccess derives no
 // `targetType` for an InlineArray receiver, so the `knownCompleteUserType`
 // "no member" diagnostic never fired, the call typed to nothing, and codegen
 // defaulted the result (Count → 0, Sum → garbage, a bool result in a branch →
 // IR crash). Sema now rejects any member access on an InlineArray receiver
-// other than `.Length` and the universal Object members (§8.1), directing the
-// caller to materialize a heap `Array<T>`. Found by adversarial discovery
-// sweep #8.
+// other than `.Length`, the intrinsics (`.ToArray()`/`.Contains()`), and the
+// universal Object members (§8.1). Found by adversarial discovery sweep #8.
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
@@ -58,18 +60,8 @@ BEZEL_TEST(inline_array_linq_reject_1100, sum_rejected) {
     BEZEL_EXPECT_TRUE(has1512Error(r));
 }
 
-// #1100: `.ToArray()` rejected (was: silently produced an empty array).
-BEZEL_TEST(inline_array_linq_reject_1100, to_array_rejected) {
-    auto r = runJit(
-        "module M; import System.Collections.Generic; "
-        "class C public static method Main(): int "
-        "  var arr: [3]int := [1,2,3]; "
-        "  using var r: Array<int> := arr.ToArray(); "
-        "  return r.Length; "
-        "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(has1512Error(r));
-}
+// NOTE: `.ToArray()` and `.Contains()` are now §15.1.2 intrinsics (#1342) and
+// are NOT rejected — they are tested in inline_array_intrinsics_1342_test.cpp.
 
 // #1100: a predicate LINQ operator (`.All`) is rejected — its bool result fed a
 // branch and previously crashed IR verification.

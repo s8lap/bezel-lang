@@ -6865,24 +6865,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
-    // §15.1.2 (#1100): an inline array `[N]T` exposes ONLY `.Length` and the
-    // indexer `arr[i]` (with iteration via `for var x in arr`). It is a value
-    // type that does NOT implement `IEnumerable<T>` and CANNOT be extended
-    // (§26.2), so LINQ / IEnumerable operators (`.Count()`, `.Sum()`,
-    // `.Where()`, `.ToArray()`, …) — and any other arbitrary member — have no
-    // member to resolve on it. An InlineArray receiver yields no `targetType`
-    // below, so the `knownCompleteUserType` "no member" diagnostic never fired;
-    // the call then typed to nothing and codegen defaulted the result (Count→0,
-    // Sum→garbage, a bool result in a branch → an IR-verification crash). Reject
-    // any member on an InlineArray receiver other than `.Length` and the
-    // universal Object members (§8.1, synthesized on every type), directing the
-    // caller to materialize a heap `Array<T>`.
+    // §15.1.2 (#1100, #1342): an inline array `[N]T` exposes `.Length`,
+    // `.ToArray()`, `.Contains(v)`, the indexer `arr[i]`, and iteration via
+    // `for var x in arr`.  It is a value type that does NOT implement
+    // `IEnumerable<T>` and CANNOT be extended (§26.2), so general LINQ /
+    // IEnumerable operators (`.Count()`, `.Sum()`, `.Where()`, …) — and any
+    // other arbitrary member — have no member to resolve on it.  An InlineArray
+    // receiver yields no `targetType` below, so the `knownCompleteUserType`
+    // "no member" diagnostic never fired; the call then typed to nothing and
+    // codegen defaulted the result (Count→0, Sum→garbage, a bool result in a
+    // branch → an IR-verification crash).  Reject any member not in the
+    // explicit allow-list; for the two new intrinsics (#1342) also set the
+    // return type so that `typeCall`'s calleeSym==nullptr fallback (line ~5127)
+    // propagates it to the CallExpr.
     if (ma.target) {
         if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
             if (recvTy->kind == TypeRef::Kind::InlineArray) {
                 const auto& mm = ma.member;
                 bool allowed =
                     mm == "Length" ||
+                    mm == "ToArray" || mm == "Contains" ||
                     mm == "ToString" || mm == "Equals" ||
                     mm == "GetHashCode" || mm == "GetType";
                 if (!allowed) {
@@ -6890,13 +6892,38 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         Severity::Error, ma.span.begin,
                         std::string("no member `") + std::string(mm) +
                         "` on inline array type `[N]T`: inline arrays expose "
-                        "only `.Length` and the indexer `[i]`, and do not "
-                        "implement `IEnumerable<T>` (\xC2\xA7""15.1.2) nor admit "
-                        "extension methods (\xC2\xA7""26.2) — LINQ/IEnumerable "
-                        "operators are unavailable; materialize a heap "
-                        "`Array<T>` (iterate the slots into a fresh array) to "
-                        "use them");
+                        "only `.Length`, `.ToArray()`, `.Contains(v)`, and "
+                        "the indexer `[i]`; they do not implement "
+                        "`IEnumerable<T>` (\xC2\xA7""15.1.2) nor admit extension "
+                        "methods (\xC2\xA7""26.2) — LINQ/IEnumerable operators are "
+                        "unavailable");
                     return;
+                }
+                // §15.1.2 / #1342: set the return type on the MemberAccessExpr
+                // for the two built-in intrinsics so that typeCall's
+                // calleeSym==nullptr path propagates the type to the CallExpr.
+                if (mm == "ToArray") {
+                    // Return type: owned Array<T> where T = recvTy->arrayElement.
+                    // Mirrors the makeConcreteCollectionResult pattern used by
+                    // LINQ ToArray() in typeCall (line ~2025).
+                    static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("Array");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
+                    auto* tr = ctx_.makeTypeRef();
+                    tr->kind = TypeRef::Kind::Named;
+                    tr->declaration = nullptr;
+                    tr->astNode = kArrayAstNode;
+                    if (recvTy->arrayElement)
+                        tr->genericArgs.push_back(recvTy->arrayElement);
+                    ctx_.setExprType(&ma, tr);
+                } else if (mm == "Contains") {
+                    // Return type: bool (per §15.1.2).
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 }
             }
         }

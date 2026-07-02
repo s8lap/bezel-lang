@@ -6338,6 +6338,15 @@ private:
     //  CopyFrom, CopyTo, Reverse, SequenceEqual).
     llvm::Value* tryLowerArraySpanCall(const ast::CallExpr& call);
 
+    // §15.1.2 / #1342: lower an inline-array `[N]T` intrinsic call:
+    //   ToArray()    → fresh owned Array<T> (bz_array_t*) containing copies of
+    //                  all N element slots; string elements are +1 retained.
+    //   Contains(v)  → i1 from a linear scan using emitRemoveElementEquality
+    //                  (§9.2: value-eq for values, content-eq for strings,
+    //                  identity/Equals for classes, structural for records).
+    // Returns nullptr when `call` is not an InlineArray receiver call.
+    llvm::Value* tryLowerInlineArrayCall(const ast::CallExpr& call);
+
     // stdlib §4.10 (#351): lower a dict-backed Set's set-algebra op
     // (UnionWith/ExceptWith/IsSubsetOf/IsSupersetOf) when `otherExpr` is a
     // same-element dict-backed Set, by enumerating the other table's elements
