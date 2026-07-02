@@ -136,3 +136,75 @@ BEZEL_TEST(codegen_async_event_1176, dispose_unsubscribes_spec_24_4) {
         "return box.V; "        // expect 3
     )), 3);
 }
+
+// =========================================================================
+// §24.5 / §30.13 / #1377: continuation-chaining tests
+//
+// These tests require handlers that GENUINELY SUSPEND (await Task.Delay).
+// Under the prior bz_task_await_sync implementation the domain drain thread
+// would block waiting for a step that can only be scheduled ON that same
+// thread → deadlock.  Under the continuation-chain fix, each handler step
+// is scheduled non-blockingly via bz_task_then, so the domain drain loop
+// can process both the original await-suspension and the chained resumes.
+// =========================================================================
+
+// §24.5 / §30.13 / #1377: a GENUINELY SUSPENDING handler (awaits Task.Delay)
+// must not deadlock.  Pre-fix: deadlocks.  Post-fix: completes with box.V = 5.
+BEZEL_TEST(codegen_async_event_1176, suspending_handler_no_deadlock_spec_24_5_30_13) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var src := new Src(); "
+        "var box := new Box(); "
+        "var sub := src.E.Subscribe(async (ev) => do "
+        "  await Task.Delay(1); "
+        "  box.Add(ev.N); "
+        "end); "
+        "await src.Fire(5); "
+        "sub.Dispose(); "
+        "return box.V; "    // expect 5
+    )), 5);
+}
+
+// §24.5 / #1377: two suspending handlers run in subscription order.
+// handler 1 adds N; handler 2 adds N*10.  Sequential chaining means both
+// complete before the outer task resolves: 3 + 30 = 33.
+BEZEL_TEST(codegen_async_event_1176, two_suspending_handlers_order_spec_24_5) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var src := new Src(); "
+        "var box := new Box(); "
+        "var sub1 := src.E.Subscribe(async (ev) => do "
+        "  await Task.Delay(1); "
+        "  box.Add(ev.N); "
+        "end); "
+        "var sub2 := src.E.Subscribe(async (ev) => do "
+        "  await Task.Delay(1); "
+        "  box.Add(ev.N * 10); "
+        "end); "
+        "await src.Fire(3); "
+        "sub1.Dispose(); sub2.Dispose(); "
+        "return box.V; "    // expect 3 + 30 = 33
+    )), 33);
+}
+
+// §24.5 / #1377: first-error-wins — a suspending-then-throwing first handler
+// faults RaiseAsync; the second handler must NOT execute.
+// box.V stays 0 (sub2 never ran); caught = 1 → return 1.
+BEZEL_TEST(codegen_async_event_1176, first_error_wins_suspending_spec_24_5) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var src := new Src(); "
+        "var box := new Box(); "
+        "var sub1 := src.E.Subscribe(async (ev) => do "
+        "  await Task.Delay(1); "
+        "  throw new InvalidOperationException(); "
+        "end); "
+        "var sub2 := src.E.Subscribe(async (ev) => do "
+        "  box.Add(100); "
+        "end); "
+        "var caught := 0; "
+        "try "
+        "  await src.Fire(1); "
+        "catch Exception => caught := 1; "
+        "end; "
+        "sub1.Dispose(); sub2.Dispose(); "
+        "return box.V * 10 + caught; "  // expect 0*10 + 1 = 1
+    )), 1);
+}

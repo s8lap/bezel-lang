@@ -6799,6 +6799,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                                    &wasGuardedParam);  // the shared cell pointer
         paramSlots_[sym] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
+        // §30 / #1377: same smAllocaToField_ update as for local captures above
+        // — a captured param of an async method that is a suspend-local needs its
+        // cell holder tracked for correct spill/restore across await points.
+        if (newSlot != slot) {
+            auto smit = smAllocaToField_.find(slot);
+            if (smit != smAllocaToField_.end()) {
+                unsigned fieldIdx = smit->second;
+                smAllocaToField_.erase(smit);
+                smAllocaToField_[newSlot] = fieldIdx;
+            }
+        }
         ce.sym = sym;
         ce.decl = nullptr;
         // #429: record freshly-boxed param cells that are eligible for free
@@ -6906,6 +6917,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                                    &wasGuardedLocal);
         locals_[decl] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
+        // §30 / #1377: when the enclosing function is an ASYNC STATE MACHINE and
+        // this captured local is a suspend-local (tracked in smAllocaToField_ for
+        // spill/restore across await yield points), update smAllocaToField_ to
+        // track the CELL HOLDER (newSlot) instead of the original slot.  The cell
+        // holder holds the cell_ptr (a heap pointer); after boxing, the yield
+        // spill must save cell_ptr and the post-await restore must reload it into
+        // newSlot so that body code (which reads box through newSlot) sees the
+        // correct cell.  Without this update, newSlot is uninitialized on the
+        // post-await resume path (the original slot's frame field restores Box*
+        // into the stale slot, but newSlot is never filled → null/garbage cell).
+        if (newSlot != slot) {
+            auto smit = smAllocaToField_.find(slot);
+            if (smit != smAllocaToField_.end()) {
+                unsigned fieldIdx = smit->second;
+                smAllocaToField_.erase(smit);
+                smAllocaToField_[newSlot] = fieldIdx;
+            }
+        }
         ce.sym = nullptr;
         ce.decl = decl;
         // #429: record freshly-boxed, non-for-var local cells that are

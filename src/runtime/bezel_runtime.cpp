@@ -6070,6 +6070,117 @@ extern "C" void bz_event_source_free(void* srcp) {
     free(s);
 }
 
+// per §24.5 / §30.13 / #1377: async-event RaiseAsync via continuation chaining.
+//
+// Problem with the prior implementation (bz_task_await_sync loop inside the
+// raiser's continuation): bz_task_await_sync blocks the OS thread, which is
+// the domain's drain worker.  When a handler genuinely suspends (e.g. awaits
+// Task.Delay) the domain can never process the handler's resume step →
+// deadlock.  §30.13: "a continuation blocks its whole domain."
+//
+// Fix: replace the blocking loop with a continuation chain via bz_task_then so
+// the domain drain thread is never blocked:
+//   1. Allocate an outer Task (the RaiseAsync return value).
+//   2. Invoke handler[0] via the SHIM (a per-call-site codegen function that
+//      knows the exact LLVM payload type).
+//   3. Register bz_raise_chain_step via bz_task_then on handler[0]'s task.
+//      - already-done  → step is enqueued to the domain (no blocking).
+//      - pending       → step fires when the handler's timer/await completes.
+//   4. bz_raise_chain_step:
+//      - if faulted → fault the outer task (first-error-wins §24.5); done.
+//      - else       → free completed task, invoke handler[i+1]; repeat.
+//      - if all done → complete the outer task.
+//
+// Payload: codegen generates a per-call-site SHIM function
+//   (ptr closure, ptr payload_buf) → ptr (Task*)
+// that loads the payload from payload_buf with the correct LLVM type and
+// invokes the handler's fn(env, payload?).  The runtime memcpys the caller's
+// alloca into a heap buffer (ctx->payload_buf) so subsequent chain steps can
+// read the payload after the originating continuation has returned.
+//
+// §24.6: the subscriber list is unsynchronized — single-domain run-to-
+// completion serializes all continuation steps within a domain.  count is
+// snapshotted at raise time; bz_event_handler_at is re-read live at each step
+// so handlers deactivated mid-raise are skipped (matching sync Raise, #908).
+
+typedef void* (*bz_handler_shim_t)(void* closure, void* payload_buf);
+
+struct BzRaiseChainCtx {
+    bz_task_t*          outer;        // outer Task returned by RaiseAsync
+    bz_event_source_t*  src;          // event source (no retain; outlives the frame)
+    int64_t             count;        // active-handler count snapshotted at raise time
+    int64_t             index;        // NEXT handler index to invoke (0-based, active)
+    void*               payload_buf;  // heap copy of payload (null = no payload)
+    bz_handler_shim_t   shim;         // codegen shim: (closure, payload_buf) → Task*
+};
+
+static void bz_raise_chain_step(void* completed_task, void* state);
+
+// Invoke the next active handler in the chain, or complete outer on exhaustion.
+static void bz_raise_invoke_next(BzRaiseChainCtx* ctx) {
+    while (ctx->index < ctx->count) {
+        void* closure = bz_event_handler_at(ctx->src, ctx->index);
+        ctx->index++;
+        if (!closure) continue;  // deactivated mid-raise (#908)
+        void* h_task = ctx->shim(closure, ctx->payload_buf);
+        bz_task_then(h_task, bz_raise_chain_step, ctx);
+        return;
+    }
+    // All handlers done — complete outer with success.
+    bz_task_complete(ctx->outer, nullptr, 0);
+    free(ctx->payload_buf);
+    delete ctx;
+}
+
+static void bz_raise_chain_step(void* completed_task, void* state) {
+    auto* ctx = (BzRaiseChainCtx*)state;
+    if (bz_task_is_error(completed_task)) {
+        // §24.5 first-error-wins: fault outer, skip remaining handlers.
+        void* errObj = bz_task_error_obj(completed_task);
+        bz_task_free(completed_task);
+        bz_task_complete_error_obj(ctx->outer, errObj);
+        free(ctx->payload_buf);
+        delete ctx;
+        return;
+    }
+    bz_task_free(completed_task);
+    bz_raise_invoke_next(ctx);
+}
+
+// per §24.5 / §30.13 / #1377: non-blocking RaiseAsync entry point.
+// srcp         — bz_event_source_t* (the AsyncEventSource backing field).
+// payload_buf  — pointer to caller's stack buffer holding a copy of the payload;
+//                null when payload_size == 0 (unit / no-payload event).
+// payload_size — sizeof(payload_type) in bytes; 0 if no payload.
+// shim_fn      — codegen-generated per-call-site function:
+//                  void* shim(void* closure, void* payload_buf) → Task*
+//                invokes the handler's fn(env, payload?) with the correct types.
+// Returns the outer Task* that the caller's `await E.RaiseAsync(...)` awaits.
+extern "C" void* bz_event_raise_async_chain(
+        void* srcp, void* payload_buf, int64_t payload_size, void* shim_fn) {
+    void* outer_raw = bz_task_alloc();
+    auto* s = (bz_event_source_t*)srcp;
+    int64_t n = s ? bz_event_count(s) : 0;
+    if (n == 0) {
+        // Zero subscribers: no-op; return an already-done task.
+        bz_task_complete(outer_raw, nullptr, 0);
+        return outer_raw;
+    }
+    // Heap-copy the payload so subsequent chain steps can read it after the
+    // originating continuation (whose stack buffer holds the payload) returns.
+    void* heap_payload = nullptr;
+    if (payload_size > 0 && payload_buf) {
+        heap_payload = malloc((size_t)payload_size);
+        memcpy(heap_payload, payload_buf, (size_t)payload_size);
+    }
+    auto* ctx = new BzRaiseChainCtx{
+        (bz_task_t*)outer_raw, s, n, 0,
+        heap_payload, (bz_handler_shim_t)shim_fn
+    };
+    bz_raise_invoke_next(ctx);
+    return outer_raw;
+}
+
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len) {
     void* arr = bz_array_alloc(8, 8);
