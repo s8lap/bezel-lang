@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.157 — July 2026**
+**Companion to the Bezel Language Specification, v0.158 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7264,6 +7264,39 @@ Language spec: §29.11 (single-consumption lazy queries); §8.6 (the `IReadOnlyS
 Source-breaking only for code that was already wrong or relied on an unspecified value. A `.Set(...)` call on a collection now reports an unknown-member error (use the indexer `coll[k] := v` or the type's insertion method). A no-argument `DateTime.ToString()` that previously produced an empty/garbage string (and crashed when its result was used) now returns the ISO 8601 rendering. Nothing sound stops compiling.
 
 ---
+
+<a id="sec-v0-157-to-v0-158-changelog"></a>
+### v0.158 changelog (v0.157 → v0.158)
+
+v0.158 is the **grammar-normativity and equality revision**: parse rules that lived in grammar comments become normative text, Appendix A becomes able to derive the language the prose describes, record equality is consolidated into one recursive rule, and two equality-consistency rules become compiler-enforced. One conversion ruling (bool↔integer asymmetry) settles a fork exposed by implementation. (Issues: #1320, #1321, #1322-ruling, #1325, #1326, #1338, #1341, #1368; #1381 filed as the split-out enum-operators fork.)
+
+#### Normative promotions (were grammar comments; now rules)
+
+- **Case scrutinee level** (#1320): §19.1 states the rule — the scrutinee parses at the *multiplicative* level; additive/shift/bitwise/range/relational scrutinees must be parenthesized, which is what lets a first pattern begin with `-10..-6`. The A.7 comment (previously *mis-stating* the level as "above range") corrected to match the implemented and now-normative rule.
+- **Generics-vs-less-than** (#1368): the balanced-`<…>`-plus-follow-token rule is now normative prose in §22.12 (purely syntactic, no name-resolution feedback; `f(a<b, c>(d))` is a generic call; parenthesize for the relational reading).
+
+#### Grammar repairs (Appendix A derives the prose language)
+
+- **Pattern alternatives factored to the arm level** (#1321): new `ArmPattern ::= Pattern ("," Pattern)*`; `Pattern`'s constant-alternatives production reduced to a single `Constant`. Inside a positional destructure list the comma is now unambiguously the slot separator (the #1300 ambiguity closed at the grammar level); §19.3 states the per-slot rule and the guard workaround.
+- **Range patterns** (#1341): dedicated `RangePattern`/`PatternBound` productions (no bare-expression leg, no `step`, `-`-prefixed bounds); `Constant` admits `-`-prefixed numeric literals; §19.3: alternative-list members must resolve to constants (a type is an error; grouped type tests = separate arms).
+- **Derivability** (#1325): `PrimitiveType` production added to `TypeNoNullable` and `PrimaryAtom` (with the `T?(x)` type-reading-wins note); `UnaryExpr` made right-recursive (`not not x`, `- -x`); `NullCoalesce` admits `?? throw …`; the retired pre-v0.97 `where T is owned` constraint form and `ModifierConstraint` deleted, the orphaned accessor `GenericConstraints?` removed, the SetterParamSpec comment recited to §22.3/§23.3. The enum-operator fork is **not** bundled: filed as #1381.
+
+#### Record equality, consolidated (#1326)
+
+§9.2 restated as **one recursive rule over storage components**; admissible component types now include `T?` (null-safe `=` per §8.4/§7.11) and non-owning inline arrays (element-wise per §8.3); the undefined "sealed reference type with content equality" clause **deleted**. §8.3's stale "Body-only record | compile error" row corrected. §9.3 gains the combined-form eligibility rule (positional fields count as storage components; disqualifiers suppress with the use-site error) and extends the use-site-error discipline to purely-positional records with non-admissible fields (closing a reference-equality footgun). §9.8 delegates to §9.2 instead of paraphrasing. **#1249-A narrowed:** an `override ToString` now suppresses only auto-`ToString`; equality survives (through v0.157 it revoked the whole package — the v0.156 reasoning never argued formatting should kill equality). §8.5 aligned.
+
+#### Equality consistency, enforced (#1338)
+
+- **Co-declaration rule** (§25.2): a record/enum overloading homogeneous `=`/`<>` must also declare `Equals(T)` and `override GetHashCode` — compiler-enforced, mirroring §8.3's Equals→GetHashCode rule. (IntPtr/UIntPtr intrinsics exempt.)
+- **Equality-bearing** joins the §3.6 derived-property table; `Dictionary`/`OwnedDictionary` keys and `Set`/`OwnedSet` elements require it **at the instantiation site** (stdlib §4.8/§4.10), replacing the unenforceable "must provide consistent Equals and GetHashCode" prose.
+
+#### Conversion ruling (§5.2, from #1322's merge adjudication)
+
+Explicit `bool`→integer is **admitted** (total: `false`→`0`, `true`→`1`; the `int(r = null)` exit-code and branchless-counting idioms). `bool(n)` remains an error in both forms — partial and truthiness-shaped — as does `bool`→`float`/`double`/`decimal`/`char`. The asymmetry is deliberate and recorded in §5.2.
+
+#### Migration
+
+Mostly source-compatible. Tightenings: the §25.2 co-declaration rule (a record overloading `=` without `Equals`/`GetHashCode` now errors — the fix is stating them); hash-container instantiation over non-equality-bearing record keys/elements now errors at the instantiation. Loosenings: `int(b)` compiles; records with `override ToString` regain auto-equality; negative constant patterns and `T?`/inline-array record components become expressible/eligible. Compiler alignment for the new checks and eligibility extensions follows in-run; the parser already implements the #1320/#1321 rules.
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)

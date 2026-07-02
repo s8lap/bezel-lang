@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.157 — July 2026**
+**Companion to the Bezel Language Specification, v0.158 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1406,7 +1406,7 @@ The `move` operator does not extend to linked-list nodes in this version — rem
 <a id="sec-dictionaryk-v"></a>
 ### 4.8 `Dictionary<K, V>`
 
-Borrowing hash-based map. `K` must provide consistent `Equals` and `GetHashCode`.
+Borrowing hash-based map. `K` must be **equality-bearing** (spec §3.6/§8.3) — enforced at the instantiation site per §3.6 rule 2: a `Dictionary<K, V>` (or `OwnedDictionary<K, V>`) whose `K` is a record that is neither auto-equality-bearing nor declares user equality is rejected with a diagnostic naming the property. (Added in v0.158, replacing the previous unenforceable prose requirement.)
 
 ```bezel
 public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
@@ -1664,7 +1664,7 @@ The structural insight: **every bucket mutation is expressed as taking the chain
 <a id="sec-sett-and-ownedsett"></a>
 ### 4.10 `Set<T>` and `OwnedSet<T>`
 
-Borrowing and owning hash-based sets. `T` must provide consistent `Equals` and `GetHashCode`.
+Borrowing and owning hash-based sets. `T` must be **equality-bearing** (spec §3.6/§8.3), enforced at the instantiation site per §3.6 rule 2 — same rule as `Dictionary<K, V>` keys (§4.8). (Added in v0.158.)
 
 ```bezel
 public class Set<T>: ICollection<T>

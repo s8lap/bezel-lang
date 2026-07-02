@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.157 — July 2026**
+**Version 0.158 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -280,6 +280,7 @@ The derived type properties of this revision:
 | **borrow-bearing** | [§9.7](#sec-records-and-disposal) | records (and inline arrays, [§15.1](#sec-inline-arrays)) carrying at least one borrow of a non-runtime-managed reference type |
 | **auto-equality-bearing** | [§9.2](#sec-body-records) | records for which `=`, `GetHashCode`, and `ToString` are synthesized |
 | **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records and enums for which `Serialize`/`Deserialize` are synthesized |
+| **equality-bearing** | [§8.3](#sec-equals-and-gethashcode), [§9.2](#sec-body-records) | types usable where consistent `Equals`/`GetHashCode` are required (hash-container keys/elements): every type except a record that is neither auto-equality-bearing nor declares user equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule) |
 | **element category** | [§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) | every type, as collection-element: value, runtime-managed reference, class/interface, or move-only value — the classification on which collection and buffer slot semantics dispatch |
 | **sendable** | [§30.14](#sec-sendable-types) | types whose values may cross an execution-domain boundary (spawn arguments and results, channel elements) |
 
@@ -447,6 +448,8 @@ var f: double := double(m);       // decimal to double
 ```
 
 Integer narrowing raises `OverflowException` if the value does not fit. Floating-point to integer truncates toward zero; `NaN`, `±Infinity`, and out-of-range values raise `OverflowException`. Integer to floating-point never overflows; precision may be lost.
+
+**`bool` to integer (added in v0.158).** An explicit conversion from `bool` to any integer type is admitted: `int(b)` yields `0` for `false` and `1` for `true` (total, never fails). The idiom turns a comparison into a number — `return int(r = null);`, branchless counting `sum := sum + int(x > 0);`. The directions are deliberately **asymmetric**: `bool(n)` remains an error in both the implicit and explicit forms ([§5.1](#sec-implicit-conversions)) — a numeric-to-`bool` reading is partial and truthiness-shaped (which value is `true`? what of `2`?), exactly the ambiguity the no-truthiness rule ([§4.1](#sec-bool), rationale §17.1) exists to exclude; write the comparison (`n <> 0`) instead. A `bool` source likewise does not convert to `float`/`double`/`decimal` (no blessed numeric reading) or `char` (a code point, not a number).
 
 A conversion between a signed and an unsigned integer type of the *same width* (`int` ↔ `uint`, `long` ↔ `ulong`, `short` ↔ `ushort`, `byte` ↔ `sbyte`) is likewise a checked narrowing: it raises `OverflowException` when the value is not representable in the destination type — a negative value cast to an unsigned type, or an unsigned value greater than the destination type's signed maximum. Such a cast is a *value* conversion, not a reinterpretation of bits: it preserves the numeric value or fails. To view the bit pattern of a same-width integer under the other signedness *without* a range check — reading a `uint` as the `int` with the identical representation — use [`BitConverter.Reinterpret<T>`](Bezel_Standard_Library.md#sec-bitconverter), the standard library's bit-reinterpretation surface ([stdlib §2.12](Bezel_Standard_Library.md#sec-bitconverter)).
 
@@ -743,7 +746,7 @@ end Object;
 |---|---|---|
 | Class | Reference equality | Identity-based |
 | Positional record | Field-by-field value equality | Hash of all positional fields |
-| Body-only record | Compile error if `=`/`<>` used; no default | Same |
+| Body-only record | Auto-equality-bearing ([§9.2](#sec-body-records)): property-by-property value equality; otherwise no default — `=`/`<>`/`.Equals`/`.GetHashCode` use is a compile error | Same |
 | Enum | Underlying integer comparison | Hash of integer value |
 | Primitive | Value comparison | Value-based |
 | Inline array `[N]T`, `[N]T?` | Element-by-element value equality ([§15.1.2](#sec-inline-array-members)) | Hash combining element hashes in slot order |
@@ -769,7 +772,7 @@ For classes, `=` always invokes `Equals`. Operator overloading of `=` and `<>` i
 
 - For classes: the type's qualified name.
 - For positional records: a representation of fields, e.g. `"Point(X: 10, Y: 20)"`.
-- For body records that satisfy the auto-equality conditions ([§9.2](#sec-body-records) — only auto-properties, no manually-declared `Equals` or `GetHashCode`): a representation of auto-properties, formatted as `"TypeName(Prop1: value1, Prop2: value2)"`. The auto-`ToString` is part of the same auto-equality package: a body record gets auto-`Equals`, auto-`GetHashCode`, and auto-`ToString` together, or it gets none and the type-name default applies. This matches the analogous design in C# records and lets `Console.WriteLine(person)` produce useful output for auto-equality records without ceremony.
+- For body records that satisfy the auto-equality conditions ([§9.2](#sec-body-records) — only auto-properties, no manually-declared `Equals` or `GetHashCode`): a representation of auto-properties, formatted as `"TypeName(Prop1: value1, Prop2: value2)"`. Auto-`ToString` accompanies the auto-equality members, with one asymmetry (v0.158): an `override ToString` replaces only the formatting — the record keeps auto-`Equals`/`GetHashCode`/`=` — while an `Equals`/`GetHashCode` override disqualifies the whole package ([§9.2](#sec-body-records)). This matches the analogous design in C# records and lets `Console.WriteLine(person)` produce useful output for auto-equality records without ceremony.
 - For body records that do not satisfy auto-equality conditions, and for enums: the type's qualified name.
 
 <a id="sec-boxing"></a>
@@ -867,10 +870,19 @@ end Rectangle;
 
 A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToString` over its **auto-properties** (and only its auto-properties) when every member of the record is one of:
 
-- An auto-property with a primitive type, an enum, `string`, another record with auto-equality, or a sealed reference type with content equality.
+- An auto-property whose type is an **admissible component type** (below).
 - A method or expression-bodied property whose value is a pure function of the record's auto-properties — these do not contribute storage, do not participate in equality, and do not disqualify the record from auto-equality.
 - An overload of a non-equality operator.
 - A constructor.
+
+**Admissible component types** (one recursive rule, applied per storage component):
+
+- a primitive type, an enum, or `string`;
+- another record that is itself auto-equality-bearing (recursively, this same rule);
+- `T?` where `T` is admissible — the comparison is the null-safe `=` of [§8.4](#sec-=-and)/[§7.11](#sec-lifted-operators);
+- a non-owning inline array `[N]T` or `[N]T?` whose element type is admissible — the comparison is element-by-element per [§8.3](#sec-equals-and-gethashcode)'s inline-array rows.
+
+*(Removed in v0.158: the former "sealed reference type with content equality" clause — an undefined, non-structural predicate that violated [§3.6](#sec-derived-type-properties)'s "computed, never declared" discipline; its only instance, `string`, is listed explicitly.)*
 
 Such a record is said to be **auto-equality-bearing** — a derived type property ([§3.6](#sec-derived-type-properties)). The generated `=` compares each auto-property by its declared type's `=`; the generated `GetHashCode` combines per-property hashes; the generated `ToString` produces `"TypeName(Prop1: value1, Prop2: value2)"` over the auto-properties in declaration order (matching the positional-record form in [§8.5](#sec-tostring)). Computed (expression-bodied) properties are not part of the equality comparison or the ToString output even when they are visible on the public surface — equality and the auto-formatted representation are always over storage, never over derived values.
 
@@ -879,7 +891,7 @@ A body record is **not** auto-equality-bearing — and `=` on it without an expl
 - An explicit field declaration (storage that is not an auto-property).
 - A computed property whose getter has observable side effects, or whose value depends on state outside the record's auto-properties (an external clock, a global, a mutable field of a captured object).
 - A non-trivial constructor body that performs work other than property initialization.
-- An `override` of `Equals`, `GetHashCode`, or `ToString`. Declaring any of these means the author has taken over equality or formatting, and auto-synthesis would silently diverge from the override; the record is therefore not auto-equality-bearing, and `=`/`<>` (and the direct `.Equals`/`.GetHashCode` calls above) are a compile error unless the author also declares the `operator =`/`<>` overloads.
+- An `override` of `Equals` or `GetHashCode`. Declaring either means the author has taken over equality, and the synthesized structural `=` would silently ignore the override; the record is therefore not auto-equality-bearing, and `=`/`<>` (and the direct `.Equals`/`.GetHashCode` calls above) are a compile error unless the author also declares the `operator =`/`<>` overloads. *(Narrowed in v0.158: an `override` of `ToString` alone suppresses only the auto-`ToString` — the author took over formatting, not equality; auto-`Equals`/auto-`GetHashCode`/`=` remain. Through v0.157 a `ToString` override disqualified the whole package; the v0.156 #1249-A reasoning — "the synthesized structural `=` would silently ignore the author's override" — never applied to formatting.)*
 
 Authors who want explicit equality on a record outside the auto-equality-bearing set declare `=` and `<>` overloads in the body, along with `Equals(Object?)`, `Equals(T)`, and `GetHashCode` overrides as needed.
 
@@ -911,6 +923,8 @@ The auto-generated members are present and the body adds further members. Confli
 
 - The body may not declare a constructor with the same parameter list as the auto-generated primary constructor.
 - The body may not declare a property with the same name as a positional field's auto-generated property.
+
+**Eligibility of the combined form.** The [§9.2](#sec-body-records) membership and disqualifier rules apply to the combined form with the positional fields counted as storage components alongside the body's auto-properties: every storage component must be of an admissible component type, and a disqualifying body member (an `Equals`/`GetHashCode` override, or a member outside the §9.2 list) suppresses the auto-generated equality members — the declaration itself stays legal, and any *use* of `=`/`<>`/`.Equals`/`.GetHashCode` on the type gets §9.2's existing use-site error. The same use-site-error discipline applies to a **purely positional** record whose fields fall outside the admissible-component rule: it declares fine, but comparing it is a compile error rather than silent reference-shaped equality.
 
 <a id="sec-mutability"></a>
 ### 9.4 Mutability
@@ -999,7 +1013,7 @@ A type is **serialization-eligible** — a derived type property ([§3.6](#sec-d
 
 - **Enums** are always serialization-eligible. The synthesized form writes the member *name* as a string (via `WriteString`) and reads it back by matching against the declared members; a value that is not a declared constant (a "raw" enum value, [§10](#sec-enums)) raises `SerializationException` on write and on read. Writing the name rather than the underlying integer makes the encoded form stable against reordering or renumbering of members and self-describing in text formats; programs that need the integer form serialize `int(e)` (or the underlying-typed cast) explicitly through a hand-written `Serialize`.
 - **Positional records** ([§9.1](#sec-positional-records)) are serialization-eligible when every positional field's type is serialization-eligible. The synthesized form is an object whose field names are the positional-field names in declaration order.
-- **Body records** ([§9.2](#sec-body-records)) are serialization-eligible under exactly the auto-equality membership conditions of [§9.2](#sec-body-records) — only auto-properties (no explicit-field storage, no side-effecting computed members) — *and* additionally every auto-property's type is serialization-eligible. The serialized components are the auto-properties in declaration order; computed (expression-bodied) properties are not serialized, exactly as they do not participate in equality or `ToString`.
+- **Body records** ([§9.2](#sec-body-records)) are serialization-eligible under exactly the auto-equality membership conditions of [§9.2](#sec-body-records) — the §9.2 member list and admissible-component rule are the single normative statement, applied here unchanged — *and* additionally every auto-property's type is serialization-eligible. The serialized components are the auto-properties in declaration order; computed (expression-bodied) properties are not serialized, exactly as they do not participate in equality or `ToString`.
 - A component type is **serialization-eligible** when it is: a primitive (`bool`, the integer types, `float`, `double`, `decimal`, `char`); `string`; an enum; another serialization-eligible record; a serialization-eligible **synthesized class** (a class that declares `ISerializable`/`IDeserializable` and whose serialized components are each serialization-eligible, below); a `Shared<T>` or `Weak<T>` whose `T` is a serialization-eligible class; a nullable `T?` whose `T` is serialization-eligible (encoded as the value or `WriteNull`/`TryReadNull`); or a standard sequence collection (`Array<T>`, `OwnedArray<T>`, `LinkedList<T>`, etc., and inline arrays `[N]T`) whose element type is serialization-eligible (encoded with `BeginArray`/`EndArray`). A standard dictionary (`Dictionary<K, V>`, `OwnedDictionary<K, V>`) is serialization-eligible when both `K` and `V` are serialization-eligible (encoded as an array of key/value pairs to admit non-string keys uniformly).
 
 A type that declares `: ISerializable` or `: IDeserializable` but is **not** serialization-eligible is a **compile error at the conformance declaration**, naming the first offending member and the reason (mirroring the auto-equality non-membership error of [§9.2](#sec-body-records), but reported at the declaration rather than the use site, because the conformance declaration is the explicit opt-in and the obstruction should be reported where the promise is made). The error names the remedy: remove the conformance, make the offending component serializable, or hand-write `Serialize`/`Deserialize` (which suppresses synthesis — see below).
@@ -2986,6 +3000,19 @@ Surrogate escapes (U+D800–U+DFFF) are compile errors.
 
 **`case` (scrutinee form)** — `case expression` followed by arms. The scrutinee is evaluated once and matched against each pattern in order. `case` **always** takes a scrutinee; a `case` written with no scrutinee expression is a syntax error — use `when` for condition dispatch.
 
+**Scrutinee grammar level (normative).** Because nothing delimits the scrutinee from the first arm's pattern, the scrutinee parses at the *multiplicative* precedence level: multiplicative and postfix expressions (`x`, `a.b[i]`, `n * 2`, `F(x)`) are admitted directly; an additive, shift, bitwise, range, or relational scrutinee **must be parenthesized** (`case (x - 1)`, `case (flags & mask)`). This is what allows a first pattern to begin with tokens an expression could otherwise absorb — a negative range bound in particular:
+
+```bezel
+case delta
+  -10..-6 => "strongly down",   // `-10` starts the pattern; an additive-level
+  ..<0    => "down",            //   scrutinee would have absorbed `- 10`
+  0       => "flat",
+  _       => "up"
+end;
+```
+
+A diagnostic for an unparenthesized additive scrutinee names this rule and suggests the parens.
+
 ```bezel
 var grade := case score
   90..100 => "A",
@@ -3052,9 +3079,13 @@ Arms are comma-separated. A trailing comma after the last arm is optional.
 <a id="sec-patterns"></a>
 ### 19.3 Patterns
 
-**Constants:** `1`, `42`, `"hello"`, `Priority.High`.
+**Constants:** `1`, `42`, `-7`, `"hello"`, `Priority.High`. A leading `-` on a numeric literal is part of the constant pattern (grammar A.8).
 
-**Comma-separated alternatives:** `2, 3, 4, 5` matches any of these. The arm separator and the pattern-alternative separator are both `,`; the parser disambiguates by the `=>` token, which always follows the complete pattern. In `1, 2 => "low", 3 => "high"`, the first arm matches 1 or 2; the second arm matches 3.
+**Comma-separated alternatives:** `2, 3, 4, 5` matches any of these. Alternatives exist at the **arm level only** (grammar: `ArmPattern`): the arm separator and the alternative separator are both `,`, disambiguated by the `=>` token, which always follows the complete pattern. In `1, 2 => "low", 3 => "high"`, the first arm matches 1 or 2; the second arm matches 3.
+
+In a comma-alternative list, every member must resolve to a **constant** (a literal, an enum constant, or a named `const`); a member that resolves to a *type* is a compile error — grouped type tests are written as separate arms.
+
+Inside a positional destructuring pattern, the comma is exclusively the **position separator** — alternatives are *not* available per slot. `TwoColor(Color.Red, Color.Blue)` is a two-slot pattern (first position `Color.Red`, second `Color.Blue`), never a one-slot pattern matching either color. To match several constants in one position, use separate arms or a `when` guard (`TwoColor(var c, Color.Blue) when c = Color.Red or c = Color.Green => …`).
 
 **Inclusive and exclusive ranges:** `90..100`, `0..<60`. Open-ended forms allowed: `..<0` (less than 0), `31..` (at least 31).
 
@@ -3845,7 +3876,11 @@ Static methods, properties, fields, events, and constructors are declared with `
 
 `const` declarations (with or without `static`) require a compile-time-constant expression and a primitive value type or `string`. `static readonly` accepts any value but is read at runtime.
 
-A static member of a *generic* class is accessed by supplying the type arguments on the type name in receiver position — `Registry<int>.Register()`, `Cache<string>.Default`. Each distinct instantiation has its own static state ([§22.13](#sec-static-initialization-order)). This is one form of the broader "generic arguments in an expression" family the grammar admits ([Appendix A.7](#sec-expressions)): generic type arguments on a name in receiver position (the static-member form here), and explicit method type arguments at a call site, `obj.Method<int>(args)`. Both supply generic arguments where an expression is expected; the parser resolves the `<…>` against the generics-vs-less-than ambiguity as described in the grammar.
+A static member of a *generic* class is accessed by supplying the type arguments on the type name in receiver position — `Registry<int>.Register()`, `Cache<string>.Default`. Each distinct instantiation has its own static state ([§22.13](#sec-static-initialization-order)). This is one form of the broader "generic arguments in an expression" family the grammar admits ([Appendix A.7](#sec-expressions)): generic type arguments on a name in receiver position (the static-member form here), and explicit method type arguments at a call site, `obj.Method<int>(args)`. Both supply generic arguments where an expression is expected, which raises the classic generics-vs-less-than ambiguity. The resolution is **normative and purely syntactic** (no name-resolution feedback):
+
+> After an identifier in expression position, a `<` opens generic arguments **iff** scanning forward finds a balanced `<…>` group (respecting nesting) whose closing `>` is immediately followed by a token that can continue a primary expression — `.`, `?.`, `(`, or `[`. Otherwise the `<` is the relational operator.
+
+Consequences worth stating: `f(a<b, c>(d))` parses as a generic call `f(a<b, c>(d))` — never as two relational arguments; to express the relational reading, parenthesize (`f((a<b), (c>(d)))`), consistent with the mandatory-parenthesization discipline of [§17.1.1](#sec-precedence). The scan is bounded by the enclosing statement and commits no semantic judgment — a name that resolves to a non-generic entity after a syntactically-successful generic reading is an ordinary error at that name. Implementations and tooling may rely on this rule verbatim; it is the same rule stated in the Appendix A.7 `PrimaryAtom` commentary.
 
 <a id="sec-static-initialization-order"></a>
 ### 22.13 Static initialization order
@@ -4277,7 +4312,9 @@ The following operators are also not overloadable, for various reasons:
 - Comparison operators must be overloaded as a complete group: `<`, `>`, `<=`, `>=` together; `=` and `<>` together.
 - `++` and `--` are postfix-only and statement-only. There is no separate prefix overload; the single overload is used in the one permitted position.
 
-When a record overloads `=` and `<>`, the overloaded operators are invoked for `a = b` and `a <> b` directly — they do not delegate to `Equals`. The auto-generated or user-supplied `Equals(Object?)` and `Equals(T)` methods continue to exist and may have different (though usually identical) semantics; they are reachable via `.Equals(...)` call syntax. Authors who overload `=` should ensure consistency with the type's `Equals` and `GetHashCode` implementations to avoid surprising behavior in collections and pattern matching, which use `Equals` rather than `=`.
+When a record overloads `=` and `<>`, the overloaded operators are invoked for `a = b` and `a <> b` directly — they do not delegate to `Equals`. The auto-generated or user-supplied `Equals(Object?)` and `Equals(T)` methods continue to exist; they are reachable via `.Equals(...)` call syntax and are what collections and pattern matching use.
+
+**Co-declaration rule (added in v0.158, compiler-enforced).** A record or enum that overloads `=`/`<>` with **both operands of the declaring type** must also declare `Equals(T)` and `override GetHashCode` — the same discipline, and the same diagnostic style, as [§8.3](#sec-equals-and-gethashcode)'s Equals→GetHashCode pairing. The three surfaces (`=`, `Equals`, hashing) can otherwise silently diverge exactly where it hurts: `a = b` true while a `Set<T>` treats them as distinct. The rule does not force delegation (operator overloads admit heterogeneous operand types, so "the operator is the body of Equals" is ill-defined in general); it forces the author to *state* all three, so a divergence is a visible choice rather than an accident. Heterogeneous-operand overloads (`T = U`) carry no such obligation. (The compiler-intrinsic `IntPtr`/`UIntPtr` operator declarations in stdlib §10 predate and are exempt from the rule.)
 
 <a id="sec-examples"></a>
 ### 25.3 Examples
@@ -7622,7 +7659,7 @@ PropertyBody    ::= "=>" Expression ";"
                   | Accessor* "end" Identifier? ";"
 AutoAccessorVis ::= Visibility ("get" | "set")   /* e.g. `private set` */
 Accessor        ::= Visibility? "get" AccessorBody
-                  | Visibility? "set" SetterParamSpec? GenericConstraints? AccessorBody
+                  | Visibility? "set" SetterParamSpec? AccessorBody
 SetterParamSpec ::= "(" ParamMod? Identifier? ")"
                               /* Explicit setter parameter spec, used when
                                  the parameter modifier needs to be declared
@@ -7635,8 +7672,8 @@ SetterParamSpec ::= "(" ParamMod? Identifier? ")"
                                  remains `value`. When the SetterParamSpec
                                  is omitted entirely (`set` alone), the
                                  implicit `value` parameter has no modifier
-                                 (borrow-taking per §14.4 Rule 2 after
-                                 substitution). */
+                                 and takes a borrow of the property's declared
+                                 type (§22.3, §23.3). */
 ParamMod        ::= "owned" | "ref" | "out" | "out" "owned"
 AccessorBody    ::= "=>" (Expression | AssignmentStmt | "do" Statement* "end") ";"
                   | ";"                                  /* abstract / interface body */
@@ -7718,21 +7755,15 @@ GenericParams   ::= "<" GenericParam ("," GenericParam)* ">"
 GenericParam    ::= Variance? Identifier
 Variance        ::= "in" | "out"
 GenericConstraints ::= "where" Identifier ":" Constraint ("," Constraint)*
-                  | "where" Identifier "is" ModifierConstraint
-                              /* The `is`-form constraint conditions on the
-                                 modifier of T's argument rather than on a
-                                 type bound. Used in stdlib declarations
-                                 to condition methods on `owned T` vs
-                                 unmodified T. See §14.4. */
+                              /* The pre-v0.97 `where T is owned` modifier-
+                                 constraint form is retired along with `<owned T>`
+                                 generic arguments (§14.4); constraints bound
+                                 types only. */
 Constraint      ::= "class" | "value" | "notnull" | "new" "(" ")" | Type
                               /* "new" "(" ")" is the parameterless-constructor
                                  constraint, three tokens with whitespace
                                  permitted (lexer-level) — `new()` and
                                  `new ()` are equivalent. */
-ModifierConstraint ::= "owned" | "not" "owned"
-                              /* `is owned` matches when T's argument carries
-                                 the `owned` modifier; `is not owned` matches
-                                 when it does not. */
 ```
 
 <a id="sec-types"></a>
@@ -7741,6 +7772,7 @@ ModifierConstraint ::= "owned" | "not" "owned"
 ```
 Type            ::= TypeNoNullable "?"?
 TypeNoNullable  ::= QualifiedName GenericArgs?
+                  | PrimitiveType
                   | InlineArrayType
                   | FunctionType
                   | "(" ")"                    /* unit type */
@@ -7782,6 +7814,13 @@ FuncParamMods   ::= "ref"
                                  produces an owned value. */
 IntegerType     ::= "byte" | "sbyte" | "short" | "ushort"
                   | "int" | "uint" | "long" | "ulong"
+PrimitiveType   ::= IntegerType | "float" | "double" | "decimal"
+                  | "bool" | "char" | "string"
+                              /* The primitive KEYWORD spellings are tokens, not
+                                 identifiers (§1.4, §3.4), so `var x: int` and
+                                 `int.Parse(s)` need this production; the
+                                 PascalCase aliases (`Int32`, `String`, …) arrive
+                                 through QualifiedName as ordinary identifiers. */
 ```
 
 <a id="sec-appendix-a-statements"></a>
@@ -7875,7 +7914,10 @@ ThrowExpr       ::= "throw" Expression?
                                  operand is required. Enforced semantically. */
 LogicalOr       ::= LogicalAnd ("or" LogicalAnd)*
 LogicalAnd      ::= NullCoalesce ("and" NullCoalesce)*
-NullCoalesce    ::= Equality ("??" NullCoalesce)?
+NullCoalesce    ::= Equality ("??" (ThrowExpr | NullCoalesce))?
+                              /* The right operand may be a throw expression —
+                                 `x ?? throw new ArgumentNullException(…)`
+                                 (§17.12); ThrowExpr is bottom-typed there. */
 Equality        ::= Relational (("=" | "<>") Relational)*
 Relational      ::= BitwiseOr (RelTail)*
 RelTail         ::= RelOp BitwiseOr
@@ -7918,9 +7960,13 @@ RangeExpr       ::= Shift                                    /* no range */
 Shift           ::= Additive (("<<" | ">>") Additive)*
 Additive        ::= Multiplicative (("+" | "-") Multiplicative)*
 Multiplicative  ::= UnaryExpr (("*" | "/" | "mod") UnaryExpr)*
-UnaryExpr       ::= ("+" | "-" | "not" | "~")? PrimaryExpr
-                  | "await" UnaryExpr      /* unary-precedence; right-recursive
-                                              so `await await x` is permitted */
+UnaryExpr       ::= ("+" | "-" | "not" | "~") UnaryExpr
+                  | "await" UnaryExpr
+                  | PrimaryExpr
+                              /* Right-recursive: `not not x`, `- -x` (with the
+                                 space; `--` lexes as the decrement token), and
+                                 `-(await x)` without parens all derive, matching
+                                 §17.1 level 2's right-to-left associativity. */
 PrimaryExpr     ::= PrimaryAtom PrimarySuffix*
 PrimarySuffix   ::= "." Identifier GenericArgs?
                   | "?." Identifier GenericArgs?
@@ -7950,6 +7996,14 @@ PrimarySuffix   ::= "." Identifier GenericArgs?
                                  PrimaryAtom level. */
 
 PrimaryAtom     ::= Literal
+                  | PrimitiveType
+                              /* A primitive keyword in expression position:
+                                 static access `int.Parse(s)` / `int.MaxValue`
+                                 (§3.4) and the cast-call `int(d)` (§5.2). When a
+                                 name in this position is followed by `?(`, the
+                                 type reading wins: `T?(x)` where T resolves to a
+                                 type is the §5.3 nullable cast, not a §7.6
+                                 null-conditional call. */
                   | Identifier GenericArgs?
                               /* The optional GenericArgs lets a generic type
                                  name appear in receiver/expression position so
@@ -8009,12 +8063,25 @@ LambdaBody      ::= Expression
 CaseExpr        ::= "case" Expression CaseArm ("," CaseArm)* ","? "end"
                               /* The scrutinee Expression is mandatory (#744).
                                  The scrutinee-less condition-dispatch form is
-                                 the separate WhenExpr below. A parser parses the
-                                 scrutinee above the range precedence level so a
-                                 following relational, range, or open-ended range
-                                 token begins the first arm's Pattern rather than
-                                 being absorbed into the scrutinee (§19.3). */
-CaseArm         ::= Pattern ("when" Expression)? "=>" ArmBody
+                                 the separate WhenExpr below. The scrutinee is
+                                 parsed at the MULTIPLICATIVE level (multiplicative
+                                 and postfix expressions only) — normative rule in
+                                 §19.1 — so a following `-` (negative range bound),
+                                 relational, range, or open-ended-range token
+                                 begins the first arm's Pattern rather than being
+                                 absorbed into the scrutinee. An additive, shift,
+                                 bitwise, range, or relational scrutinee must be
+                                 parenthesized. */
+CaseArm         ::= ArmPattern ("when" Expression)? "=>" ArmBody
+ArmPattern      ::= Pattern ("," Pattern)*
+                              /* Comma-separated pattern ALTERNATIVES exist at
+                                 the arm level only (`1, 2 => "low"`); they are
+                                 factored out of Pattern so that inside a
+                                 positional destructure list the comma is
+                                 unambiguously the SLOT separator (#1300/#1321).
+                                 The arm separator and the alternative separator
+                                 are disambiguated by `=>`, which always follows
+                                 the complete ArmPattern (§19.3). */
 WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end"
                               /* Scrutinee-less condition dispatch (§19.1). Arms
                                  are tried in textual order; the first whose
@@ -8036,21 +8103,11 @@ ArmBody         ::= Expression
 Pattern         ::= "_"                       /* discard */
                   | "null"                     /* null literal pattern */
                   | "var" Identifier (":" Type)?      /* binding */
-                  | Constant ("," Constant)*          /* literal alternatives */
-                  | RangeExpr                         /* closed, half-open, or
-                                                         open-ended range —
-                                                         see RangeExpr productions
-                                                         in §A.7's expression
-                                                         chain. The grammar's
-                                                         RangeExpr admits an
-                                                         optional `step`; in
-                                                         pattern position the
-                                                         `step` modifier is
-                                                         rejected semantically
-                                                         (§16.4: patterns test
-                                                         membership, and stride
-                                                         has no membership
-                                                         meaning). */
+                  | Constant                          /* single constant; comma
+                                                         alternatives live in
+                                                         ArmPattern above */
+                  | RangePattern                      /* closed, half-open, or
+                                                         open-ended range */
                   | RelOpPattern Expression           /* relational; restricted
                                                          operator set, see below */
                   | Type                              /* type test */
@@ -8072,6 +8129,17 @@ PositionalPattern     ::= Pattern
                                                      valid only inside
                                                      positional destructuring */
 
+RangePattern    ::= PatternBound (".." | "..<") PatternBound
+                  | PatternBound ".."
+                  | (".." | "..<") PatternBound
+                  | ".."
+PatternBound    ::= "-"? Shift
+                              /* Dedicated pattern-position range form (mirrors
+                                 the v0.94 RelOpPattern fix): no bare-expression
+                                 leg (a lone Shift is not a range pattern) and no
+                                 `step` (patterns test membership; stride has no
+                                 membership meaning, §16.4). Bounds admit a
+                                 leading `-` for negative literals. */
 RelOpPattern    ::= "<" | ">" | "<=" | ">="
                               /* Pattern-form relational operators are restricted
                                  to the four ordering operators. `is`, `is not`,
@@ -8108,7 +8176,8 @@ Literal         ::= IntLiteral | FloatLiteral | CharLiteral
                   | StringLiteral | InterpString
                   | "true" | "false" | "null"
 ConstExpr       ::= Expression           /* must be evaluable at compile time */
-Constant        ::= IntLiteral | FloatLiteral | CharLiteral
+Constant        ::= "-"? (IntLiteral | FloatLiteral)
+                  | CharLiteral
                   | StringLiteral | "true" | "false" | "null"
                   | QualifiedName        /* enum constant or const reference */
 ```
