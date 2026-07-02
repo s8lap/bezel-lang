@@ -949,7 +949,8 @@ set(BEZEL_TEST_SOURCES
     codegen/guid_compar_frombytes_1357_stdlib_2_6_test.cpp  # §2.6 Guid CompareTo / FromByteArray
     codegen/dateonly_timeonly_1357_stdlib_2_5_test.cpp  # §2.5 DateOnly / TimeOnly full surface
     codegen/random_nextint64_1359_stdlib_2_7_test.cpp   # §2.7 Random NextInt64 / NextBoolean / NextBytes
-)
+    # --- fix #1328: §28.7 drop-on-overwrite for owned class/interface FIELDS ---
+    codegen/field_drop_on_overwrite_1328_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

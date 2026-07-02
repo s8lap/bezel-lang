@@ -5386,6 +5386,26 @@ private:
                                         llvm::Value* fieldAddr,
                                         llvm::Value* newVal);
 
+    // §28.7 / #1328: is `target` an `owned` CLASS/INTERFACE instance field
+    // lvalue? Excludes locals, ref params, static fields, record fields, and any
+    // field whose type is already handled by a sibling helper (string, closure,
+    // box, collection — those dispatch through isOwnedReferenceField returning
+    // false for collection kinds, and through other helpers for the refcounted
+    // categories). Only plain class- or interface-typed `owned` fields on CLASS
+    // instances remain; these are disposed at scope end by emitOwnedFieldDisposals
+    // and need drop-on-overwrite on reassignment.
+    bool isOwnedClassFieldLvalue(const ast::Expr& target);
+    // §28.7 / #1328: dispose the prior value of an owned class/interface CLASS
+    // field before storing the new owner.  Order (per spec §28.7): load-old →
+    // null-guard (moved-from / never-assigned slot holds null) → identity-guard
+    // (self-assign `this.f := this.f` must NOT dispose the incoming value) →
+    // dispose-old → store-new.  Constructor first-time assignments are safe
+    // because the object is calloc-zeroed (null → guard skips). Returns true
+    // when handled; false if not an owned class/interface field (caller stores).
+    bool lowerOwnedClassFieldStore(const ast::Expr& target,
+                                   llvm::Value* fieldAddr,
+                                   llvm::Value* newVal);
+
     // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: the per-module set of
     // class field symbols (FieldSymbol / auto-property PropertySymbol) for which
     // EVERY store (across all methods + constructors + field initializers of the

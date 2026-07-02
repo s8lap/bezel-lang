@@ -6531,7 +6531,17 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     // programmer may borrow from them after the move (e.g. `new T(move n, n)`),
     // and plain-var locals are not registered for scope-end disposal.
     if (op == "move") {
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un.operand.get())) {
+        // §28.8.1 / #1328 merge gate: `move _f!` / `move this._f!` — a
+        // null-assert wrapper does not change WHICH slot is moved from; unwrap
+        // it so the slot-nulling form matching below sees the underlying
+        // field/local form. Without this the field slot kept the moved-out
+        // pointer, and the subsequent `_f := null` (now a §28.7 drop-on-
+        // overwrite site) disposed the value the new owner also disposes — a
+        // double-free (undisposed_leak kMoveField, caught by the serial suite).
+        const ast::Expr* moveSrc = un.operand.get();
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(moveSrc))
+            moveSrc = pb->operand.get();
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(moveSrc)) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
                 // Null the source slot when: (a) it is a `using var` local whose
@@ -6547,7 +6557,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     return false;
                 }();
                 if (loc->isUsing || isIterVarAutoDrop) {
-                    if (llvm::AllocaInst* slotAI = localSlot(*un.operand)) {
+                    if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);
                         if (ety && ety->isPointerTy()) {
@@ -6584,7 +6594,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // non-null and the auto-dispose pass disposes it exactly once.
                 if (isOwnedReferenceField(fs) && !emittingDisposerBody_) {
                     llvm::Type* fty = nullptr;
-                    if (llvm::Value* addr = implicitFieldAddr(*un.operand, fty)) {
+                    if (llvm::Value* addr = implicitFieldAddr(*id, fty)) {
                         if (fty && fty->isPointerTy())
                             builder_.CreateStore(
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
@@ -6592,7 +6602,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 }
             }
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                       un.operand.get())) {
+                       moveSrc)) {
             // §28.8.1, #897 #898 (Part B): the QUALIFIED `move this._field`
             // form. Part A (ownership pass) now rejects a SECOND move of an
             // already-moved-from field, so a sound program never double-owns;

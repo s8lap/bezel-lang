@@ -473,6 +473,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerOwnedCollectionFieldStore(*as->target, addr,
                                                              rhs);
+                // §28.7 (#1328): drop-on-overwrite for owned class/interface
+                // FIELDS — the field analog of disposeDisplacedOwnedClassLocal.
+                // Loads the old object pointer, applies null+identity guards (so a
+                // moved-from slot or a self-assign never disposes), then dispatches
+                // the old object's Dispose and reclaims its block. The new value is
+                // stored after disposal. Must come AFTER the collection helper (which
+                // handles OwnedArray<T> etc. via bz_array_free, not emitDisposeAndReclaim)
+                // and BEFORE the local helper (which only fires for plain locals).
+                if (!handled)
+                    handled = lowerOwnedClassFieldStore(*as->target, addr, rhs);
                 if (!handled) {
                     // §28.7 (#1054): reassigning an owned class local must dispose
                     // the displaced old value before overwriting (the class analog

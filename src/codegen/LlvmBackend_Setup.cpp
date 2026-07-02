@@ -9555,6 +9555,85 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
 }
 
 
+// §28.7 / #1328: is `target` an `owned` plain class/interface CLASS instance
+// field lvalue that needs drop-on-overwrite? Classification mirrors
+// isOwnedCollectionFieldLvalue: exclude locals, ref params, static fields, and
+// any field that a sibling helper already handles (string, closure, box, and
+// collection fields are excluded because isOwnedReferenceField returns false for
+// collection-typed fields and the other categories never reach this helper).
+// Only class- or interface-typed `owned` fields on CLASS instances remain.
+bool Emitter::isOwnedClassFieldLvalue(const ast::Expr& target) {
+    if (localSlot(target)) return false;       // a plain local / parameter
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;  // a ref/out alias
+    }
+    if (staticFieldGlobal(target)) return false;  // program-lifetime storage
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    // Must be a CLASS instance field (not a record field — records have no
+    // §28.4-step-2 auto-dispose, §9.7). Mirrors isOwnedCollectionFieldLvalue.
+    if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return false;
+    // isOwnedReferenceField covers exactly class- and interface-typed `owned`
+    // fields (with generic-type-param substitution) while excluding collection
+    // types (which are handled by lowerOwnedCollectionFieldStore) and
+    // Shared<T>/Weak<T> (handled by their own refcount release paths).
+    return isOwnedReferenceField(fs);
+}
+
+
+// §28.7 / #1328: dispose the prior value of an owned class/interface CLASS
+// field before storing the new owner. Parallel to lowerOwnedCollectionFieldStore
+// for collections.
+//
+// Order (per spec §28.7 / the disposeDisplacedOwnedClassLocal local analog):
+//   load-old → null-guard (moved-from or never-assigned → null) →
+//   identity-guard (self-assign `this.f := this.f` must NOT dispose) →
+//   dispose-old → store-new.
+//
+// Constructor first-time assignments are safe: the object is calloc-zeroed
+// (field holds null → null-guard skips disposal). The §28.4-step-2 auto-dispose
+// (emitOwnedFieldDisposals) runs after our store and disposes the new value at
+// scope end — no double-free. Inside a destructor body, a reassignment disposes
+// the old value here; the auto-dispose after the body disposes the new value —
+// correct. emittingDisposerBody_ does NOT need to gate this: the auto-dispose's
+// null-guard (and the §28.6 isDisposed flag) protect against double-dispose.
+bool Emitter::lowerOwnedClassFieldStore(const ast::Expr& target,
+                                        llvm::Value* fieldAddr,
+                                        llvm::Value* newVal) {
+    if (!isOwnedClassFieldLvalue(target)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    // Load the old object pointer.
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "ocls.old");
+
+    // Null-guard (a moved-from slot holds null) AND identity-guard (a self-
+    // assignment `this.f := this.f` would otherwise dispose the value that is
+    // being stored → UAF). Mirrors disposeDisplacedOwnedClassLocal exactly.
+    llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* live = builder_.CreateICmpNE(oldVal, nullp, "ocls.live");
+    llvm::Value* doDispose = builder_.CreateAnd(
+        live, builder_.CreateICmpNE(oldVal, newVal, "ocls.diff"));
+
+    auto* dispBB = llvm::BasicBlock::Create(llvm_, "ocls.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "ocls.cont", currentFn_);
+    builder_.CreateCondBr(doDispose, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
+    emitDisposeAndReclaim(oldVal);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+
+    // Store new value after disposing old (spec §28.7: RHS first, then dispose
+    // displaced, then store). The field holds null between dispose and store; the
+    // §28.4-step-2 emitOwnedFieldDisposals null-guard handles a re-entrant
+    // dispose that catches the field in that window (null → skips it).
+    builder_.CreateStore(newVal, fieldAddr);
+    return true;
+}
+
+
 namespace {
 // #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
 // SPECIFIC closure (function-typed) `var` local ever escapes its scope. A
