@@ -686,6 +686,21 @@ void  bz_task_complete_error_obj(void* task, void* error_obj);
 bool  bz_task_is_done(void* task);
 bool  bz_task_is_error(void* task);
 
+// §30.5 (v0.162 / #1352): OwnedTask single-consumer spent tracking.
+// bz_task_mark_spent: record that an OwnedTask has been consumed by its first
+// await (success or fault). A second await on a spent task raises IOE.
+void  bz_task_mark_spent(void* task);
+// bz_task_is_spent: returns true after the first await consumed the OwnedTask.
+bool  bz_task_is_spent(void* task);
+
+// §30.5 / #1332 (v0.162): Pattern A chained slot.
+// Transfer ownership of `source` (a Pattern A Task<T:class> result producer) into
+// `outer`. The outer task keeps the source alive (and its result buffer valid) until
+// bz_task_free(outer) is called, which frees the chain transitively. Used when an
+// async method does `return await <Pattern A source>` — the result is a borrow
+// through the source, so the source must outlive the outer task.
+void  bz_task_set_chained(void* outer, void* source);
+
 // Block the calling thread until the task completes. Returns a pointer to the
 // result buffer (owned by the task; valid until bz_task_free). Returns null on error.
 void* bz_task_await_sync(void* task);

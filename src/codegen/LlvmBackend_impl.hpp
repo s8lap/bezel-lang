@@ -4479,7 +4479,8 @@ private:
     // null the task's result buffer (§28.3/#1250: consumed-tracking for owned results).
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
-                                  bool takeResultAfter = false);
+                                  bool takeResultAfter = false,
+                                  bool markSpentAfter = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // via `disposeAsyncFn` (the direct LLVM function pointer resolved at
@@ -4629,6 +4630,12 @@ private:
     // double?, enum?) and wrap a plain returned value into the {hasValue=1,
     // value} struct before storing — per §30.1 / §7.2 (#493).
     const sema::TypeRef* asyncResultSemaType_ = nullptr;
+    // §30.5 / #1332 (v0.162): set to true in lowerStmt(ReturnStmt) when the
+    // pattern `return await <call>` with a pointer-typed (Pattern A class)
+    // result is detected inside an async method — signals lowerAwait to NOT
+    // free the source task immediately (it will be chained to the outer task).
+    // Reset to false after lowerExpr returns in lowerStmt.
+    bool asyncChainedReturn_ = false;
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);

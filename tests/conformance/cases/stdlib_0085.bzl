@@ -30,6 +30,6 @@ public class Task
     owned tasks: OwnedArray<OwnedTask<T>>
   ): OwnedTask<OwnedArray<T>> where T: class;
 
-  public static method WhenAny(tasks: Array<Task>): Task<Task>;
+  public static method WhenAny(tasks: Array<Task>): Task<int>;   // index of first-done task (v0.162)
   public static method FireAndForget(owned task: Task);
 end Task;

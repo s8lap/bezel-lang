@@ -1766,26 +1766,43 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // §30.5: reclaim the awaited task at the await site when its operand is an
     // anonymous producer result (`await Producer()`) — a single-use task with no
     // other owner. A task bound to a local is left to its binder's disposal.
+    // §30.5 / #1332 (v0.162): if this await is a Pattern A chained return
+    // (asyncChainedReturn_ set by lowerStmt for `return await <call>` with a
+    // pointer result type), do NOT free the source task — lowerStmt will chain
+    // it to the outer task after the await completes.
     bool freeTaskAfter =
-        dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr;
+        dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr &&
+        !asyncChainedReturn_;
     // §28.3 / #1250: for a BOUND OwnedTask<T:class> await, null the result buffer
     // after loading so bz_tcs_dispose_owned_result (called at TCS disposal) sees no
     // result and skips the dispose — preventing a double-free of the caller-owned obj.
     // Only fires for OwnedTask (not plain Task) with a ClassOwned element type.
     bool takeResultAfter = false;
-    if (!freeTaskAfter) {
+    // §30.5 (v0.162 / #1352): OwnedTask single-consumer tracking. After the first
+    // await (success or fault), mark the task as spent so a second await raises
+    // InvalidOperationException. Only fires for BOUND OwnedTask (!freeTaskAfter):
+    // an anonymous inline `await Producer()` (freeTaskAfter=true) is freed
+    // immediately after the first await, so no second await is possible and
+    // calling mark_spent after free would be UAF. Plain Task<T> is re-awaitable
+    // and must NOT be marked spent.
+    bool markSpentAfter = false;
+    {
         const sema::TypeRef* taskTy = ctx_.exprType(*un.operand);
-        if (taskTy && taskTy->kind == sema::TypeRef::Kind::Named &&
+        bool isOwnedTask = (taskTy && taskTy->kind == sema::TypeRef::Kind::Named &&
             !taskTy->declaration && taskTy->astNode && taskTy->astNode->name &&
             !taskTy->astNode->name->parts.empty() &&
-            taskTy->astNode->name->parts[0] == "OwnedTask" &&
-            !taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {
-            takeResultAfter =
-                (elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true).cat ==
-                 ElementPolicy::Category::ClassOwned);
+            taskTy->astNode->name->parts[0] == "OwnedTask");
+        if (isOwnedTask && !freeTaskAfter) {
+            markSpentAfter = true;
+            if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {
+                takeResultAfter =
+                    (elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true).cat ==
+                     ElementPolicy::Category::ClassOwned);
+            }
         }
     }
-    return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter);
+    return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
+                            markSpentAfter);
 }
 
 
@@ -1799,7 +1816,8 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
 // that registers the resume continuation + returns; the resume / fast-path
 // convergence reads the result and re-raises a faulted task (§30.9).
 llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
-                                       bool freeTaskAfter, bool takeResultAfter) {
+                                       bool freeTaskAfter, bool takeResultAfter,
+                                       bool markSpentAfter) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -1865,6 +1883,19 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                          smStateStruct_, smSelf_,
                                          asyncPendingTaskField_));
 
+    // §30.5 (v0.162 / #1352): OwnedTask single-consumer guard — if a SECOND await
+    // is attempted on a spent OwnedTask (one already consumed on any path, including
+    // a faulted/cancelled first await), raise InvalidOperationException instead of
+    // reading freed or stale memory. markSpentAfter is true only for OwnedTask.
+    if (markSpentAfter) {
+        auto* isSpentFn = declareC("bz_task_is_spent", i1(), {ptrTy()});
+        llvm::Value* spent =
+            builder_.CreateCall(isSpentFn, {awaitedTask}, "await.spent");
+        // emitGuardThrow splits the block: true branch throws IOE + unwinds;
+        // the insert point is left at the continuation (false branch).
+        emitGuardThrow(spent, "InvalidOperationException");
+    }
+
     // §30.9: awaiting a faulted task RE-RAISES the original exception "with the
     // original stack trace preserved" (spec §30.9). The state machine routes this
     // re-raise through the SAME unwind machinery a synchronous `throw` uses:
@@ -1917,6 +1948,14 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeTaskFn, {awaitedTask});
         }
+        // §30.5 (v0.162 / #1352): mark OwnedTask spent BEFORE the unwind so any
+        // catch arm that re-awaits the same variable gets IOE, not the re-raised
+        // original exception. Applies on fault path regardless of freeTaskAfter.
+        if (markSpentAfter) {
+            auto* markSpentFn = declareC("bz_task_mark_spent",
+                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(markSpentFn, {awaitedTask});
+        }
         // §28.3 / CG21: dispose the using-vars unwound between here and the
         // handler (a caught-exception entry is skipped — it stays in flight), the
         // same as emitThrowValue's synchronous-throw path, then branch to the
@@ -1951,6 +1990,13 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(takeResultFn, {awaitedTask});
         }
+    }
+    // §30.5 (v0.162 / #1352): mark OwnedTask spent after successful result
+    // consumption so a second await gets IOE (spend-on-all-edges, not just fault).
+    if (markSpentAfter) {
+        auto* markSpentFn = declareC("bz_task_mark_spent",
+                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(markSpentFn, {awaitedTask});
     }
     // §30.5 (minimal): reclaim the awaited task when its operand is an anonymous
     // producer result (`await Producer()`) — a single-use task with no other

@@ -3941,13 +3941,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, resultTy);
                         }
                         // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>):
-                        // Task<Task>. Completes with the first-done task pointer as
-                        // the result. Typed as Task<Task> so the await result is the
-                        // winning task pointer (ptr-sized).
+                        // Task<int> (v0.162 / #1332). Completes with the INDEX of the
+                        // first-done task (i32), not the task pointer. (Task<Task> was
+                        // unconstructible under §30.5.) The codegen passes the array to
+                        // bz_task_when_any which stores an i32 winner index.
                         if (m == "WhenAny") {
                             auto* tt = makeTaskTypeRef();
-                            // genericArgs[0] = Task (the inner Task type)
-                            tt->genericArgs.push_back(makeTaskTypeRef());
+                            // genericArgs[0] = int (winner index)
+                            tt->genericArgs.push_back(
+                                ctx_.primitiveTypeRef(PrimitiveType::Int));
                             ctx_.setExprType(&ce, tt);
                         }
                         // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
@@ -4006,6 +4008,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // does not need the return value. No TypeRef set → unit.
                         // (FireAndForget return type is untyped/unit in sema.)
                     }
+                    // §30.3 (v0.162 / #1362): t.Wait() on a Task / Task<T> receiver
+                    // inside an async method or lambda is a compile error — a blocking
+                    // wait inside a domain continuation deadlocks (§30.3). Use `await t`.
+                    // Also fires for OwnedTask.Wait() in async context (same deadlock).
+                    if (m == "Wait" && ce.args.empty() && inAsyncContext_) {
+                        ctx_.diagnostics().report(Severity::Error, ce.span.begin,
+                            "use `await t` — blocking waits are not available in "
+                            "async code (§30.3)");
+                    }
+                }
+                // §30.3 (v0.162 / #1362): OwnedTask.Wait() — same async-context reject.
+                if (colName == "OwnedTask" && m == "Wait" && ce.args.empty() &&
+                        inAsyncContext_) {
+                    ctx_.diagnostics().report(Severity::Error, ce.span.begin,
+                        "use `await t` — blocking waits are not available in "
+                        "async code (§30.3)");
                 }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
@@ -7854,6 +7872,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (mbr == "Result") {
                     if ((tn == "Task" || tn == "OwnedTask") && tt &&
                         !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                        // §30.3 (v0.162 / #1362): .Result inside an async method or
+                        // lambda is a compile error — blocking waits deadlock inside
+                        // domain continuations. Use `await t` instead. Report the error
+                        // but still type the expression so downstream checks don't
+                        // cascade unrelated diagnostics.
+                        if (inAsyncContext_) {
+                            ctx_.diagnostics().report(Severity::Error, ma.span.begin,
+                                "use `await t` — blocking waits are not available in "
+                                "async code (§30.3)");
+                        }
                         ctx_.setExprType(&ma, tt->genericArgs[0]);
                         return;
                     }

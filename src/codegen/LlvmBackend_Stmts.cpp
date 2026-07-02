@@ -997,6 +997,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // literal also falls through lowerExpr → null.  The `!cl->isDict` guard
         // below is widened to also handle dict literals via the same
         // materializeHeapDictLiteral helper that #534 introduced for local-decls.
+        // §30.5 / #1332 (v0.162): detect `return await <call>` with a pointer-typed
+        // result inside an async method — Pattern A chained return. If detected, set
+        // asyncChainedReturn_ so lowerAwait does NOT free the source task immediately;
+        // lowerStmt will chain the source task to the outer task after the await.
+        // Guard: no finally in flight (the finally path's emitAsyncComplete call would
+        // need separate chaining, deferred; in that case fall back to normal free).
+        // Guard: asyncResultTy_ is a pointer type (class/string, not int/bool/struct).
+        if (rs->value && smKind_ == SuspendKind::Await && smStateStruct_ &&
+            asyncResultTy_ && asyncResultTy_->isPointerTy() && finallyStack_.empty()) {
+            if (const auto* awaitUE =
+                    dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
+                if (awaitUE->op == "await" &&
+                    dynamic_cast<const ast::CallExpr*>(awaitUE->operand.get()) !=
+                        nullptr) {
+                    asyncChainedReturn_ = true;
+                }
+            }
+        }
         llvm::Value* v = nullptr;
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
@@ -1054,6 +1072,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
             if (!v) v = lowerExpr(*rs->value);
         }
+        // §30.5 / #1332 (v0.162): read and reset the chained-return flag now that
+        // lowerExpr has completed (lowerAwait already used the flag to suppress the
+        // source-task free; we must reset before any possible re-entry).
+        bool chainedReturn = asyncChainedReturn_;
+        asyncChainedReturn_ = false;
         if (diverged_) return true;  // CG40: the value expression threw
         // §30.1: inside an async method's Resume function, `return expression;`
         // completes the OUTER task with the value (and `return;` / fall-off
@@ -1101,6 +1124,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 builder_.CreateStore(builder_.getInt32(5), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
                 return true;
+            }
+            // §30.5 / #1332 (v0.162): Pattern A chained return — chain the source
+            // task (set by emitAwaitSuspend into asyncPendingTaskField_ and NOT freed
+            // because asyncChainedReturn_ suppressed bz_task_free) to the outer task
+            // BEFORE bz_task_complete. This ordering is required: bz_task_complete
+            // notifies continuations which may immediately free the outer task on a
+            // racing thread; calling bz_task_set_chained AFTER complete would be a
+            // UAF on the outer task pointer.
+            if (chainedReturn) {
+                // Load source task from the pending-task frame slot (still alive:
+                // freeTaskAfter=false kept it from being reclaimed in emitAwaitSuspend).
+                llvm::Value* pendField = builder_.CreateStructGEP(
+                    smStateStruct_, smSelf_, asyncPendingTaskField_);
+                llvm::Value* sourceTask =
+                    builder_.CreateLoad(ptrTy(), pendField, "chain.src");
+                // Load outer task pointer (set at async-method entry).
+                llvm::Value* otField = builder_.CreateStructGEP(
+                    smStateStruct_, smSelf_, asyncOuterTaskField_);
+                llvm::Value* outerTask =
+                    builder_.CreateLoad(ptrTy(), otField, "chain.outer");
+                // Transfer source-task lifetime ownership to the outer task's chained
+                // slot: bz_task_free(outer) will recursively free source when done.
+                auto* setChainedFn = declareC(
+                    "bz_task_set_chained", llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(setChainedFn, {outerTask, sourceTask});
             }
             emitAsyncComplete(v);
             builder_.CreateRetVoid();

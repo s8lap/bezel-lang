@@ -2622,6 +2622,28 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 llvm::Value* task = lowerExpr(*ma->target);
                 if (task && task->getType()->isPointerTy()) {
                     llvm::Type* resTy = lowerTypeRef(tt->genericArgs[0]);
+                    // §30.3 (v0.162 / #1362): catchable at-call-site guard —
+                    // reading Result on an INCOMPLETE task inside a domain
+                    // continuation raises InvalidOperationException (mirrors
+                    // the Wait() guard; runtime abort remains the backstop).
+                    {
+                        auto* isDoneFn = declareC("bz_task_is_done",
+                                                  builder_.getInt1Ty(), {ptrTy()});
+                        auto* curDomFn = declareC("bz_current_domain_ptr",
+                                                  ptrTy(), {});
+                        llvm::Value* done = builder_.CreateCall(
+                            isDoneFn, {task}, "result.done");
+                        llvm::Value* dom =
+                            builder_.CreateCall(curDomFn, {}, "result.dom");
+                        llvm::Value* inDomain = builder_.CreateICmpNE(
+                            dom, llvm::Constant::getNullValue(ptrTy()),
+                            "result.indomain");
+                        llvm::Value* wouldDeadlock = builder_.CreateAnd(
+                            builder_.CreateNot(done), inDomain,
+                            "result.deadlock");
+                        emitGuardThrow(wouldDeadlock,
+                                       "InvalidOperationException");
+                    }
                     // Block until complete; bz_task_await_sync returns a pointer
                     // to the result buffer (already-done → returns immediately).
                     auto* awaitFn =

@@ -320,11 +320,14 @@ BEZEL_TEST(task_combinators_6_7, when_all_with_delays_cross_thread) {
 }
 
 // ============================================================
-// stdlib §6.7 line 2884: Task.WhenAny(tasks: Array<Task>): Task<Task>
+// stdlib §6.7 line 2884: Task.WhenAny(tasks: Array<Task>): Task<int>  (v0.162/#1332)
 // ============================================================
+// WhenAny now produces Task<int> (winner INDEX), not Task<Task> (winner task ptr).
+// Task<Task> was unconstructible under §30.5; an int index is unambiguous and safe.
 
-// §6.7: Task.WhenAny on two already-completed tasks. The first one completed
-// wins; WhenAny itself is also immediately complete. Main exits 8.
+// §6.7 / #1332: Task.WhenAny on two already-completed tasks. The first one completed
+// wins; WhenAny itself is also immediately complete. `await wa` yields an int (the
+// winner's index in the tasks array, 0-based). Main exits 8.
 // NOTE: individual tasks in the Array<Task> are borrowed (no disposal from array).
 // Correctness-only test (not LSan-clean by design).
 BEZEL_TEST(task_combinators_6_7, when_any_already_complete) {
@@ -341,7 +344,25 @@ BEZEL_TEST(task_combinators_6_7, when_any_already_complete) {
         8);
 }
 
-// §6.7: Task.WhenAny with Task.Delay — genuinely cross-thread (first delay to
+// §6.7 / #1332: WhenAny index — verify `await wa` produces the winner index (0 or 1).
+// With two already-completed tasks, the first one (index 0) wins. Main exits with 0.
+// NOTE: individual tasks in the Array<Task> are borrowed (no disposal from array).
+// Correctness-only test.
+BEZEL_TEST(task_combinators_6_7, when_any_yields_winner_index) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(Task.FromResult(10)); "
+        "    tasks.Add(Task.FromResult(20)); "
+        "    using var wa := Task.WhenAny(tasks); "
+        "    var idx := await wa; "
+        "    return idx; "          // 0 — first task completed first (already-done)
+        "  end Main; end C;"),
+        0);
+}
+
+// §6.7 / #1332: Task.WhenAny with Task.Delay — genuinely cross-thread (first delay to
 // fire wins). Run 3x for nondeterminism stability. Correctness-only test.
 BEZEL_TEST(task_combinators_6_7, when_any_with_delay_cross_thread) {
     const std::string src =
@@ -356,6 +377,23 @@ BEZEL_TEST(task_combinators_6_7, when_any_with_delay_cross_thread) {
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
         BEZEL_EXPECT_EQ(compileAndRun(src), 6);
+}
+
+// §6.7 / #1332: WhenAny Delay-race index — shorter delay wins index 0 (5ms vs 500ms).
+// The first-done task is index 0; winner index is 0. Run 3x for stability.
+BEZEL_TEST(task_combinators_6_7, when_any_delay_race_winner_index) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(Task.Delay(5)); "
+        "    tasks.Add(Task.Delay(500)); "
+        "    using var wa := Task.WhenAny(tasks); "
+        "    var idx := await wa; "
+        "    return idx; "  // 0 — the 5ms delay always wins over 500ms
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 0);
 }
 
 // ============================================================

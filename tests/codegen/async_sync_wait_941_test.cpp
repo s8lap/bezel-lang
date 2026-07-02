@@ -70,6 +70,24 @@ void expectValue941(const std::string& source, int expected) {
         BEZEL_EXPECT_EQ(compileAndRun(source), expected);
 }
 
+// §30.3 (v0.162 / #1362): compile returns true when it fails (error emitted).
+bool compileFails941(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_941_neg_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    {
+        std::ofstream out(src);
+        out << source;
+    }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return !r.success;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -300,4 +318,201 @@ BEZEL_TEST(async_sync_wait_941, result_on_faulted_bound_task_isFaulted_variant_1
         "    return r; "
         "  end Main; end C;",
         42);
+}
+
+// ---------------------------------------------------------------------------
+// §30.3 (v0.162 / #1362): Wait() and .Result are rejected inside async methods
+// and async lambdas. Three shapes: Wait() in async method, Result in async method,
+// Wait() in async lambda body. Non-async context (plain method Main) still accepts.
+// ---------------------------------------------------------------------------
+
+// §30.3 v0.162: `t.Wait()` lexically inside an `async` method → compile error.
+BEZEL_TEST(async_sync_wait_941, wait_inside_async_method_rejected_30_3_v0162) {
+    // §30.3 (v0.162): Wait() in async context — compile error "use `await t`".
+    BEZEL_EXPECT_EQ(compileFails941(
+        "module M; class C "
+        "  public static async method Helper(): Task "
+        "    using var t := Task.Delay(1); "
+        "    t.Wait(); "          // ERROR: blocking wait inside async context
+        "  end Helper; "
+        "  public static async method Main(): Task<int> "
+        "    return 0; "
+        "  end Main; end C;"),
+        true);
+}
+
+// §30.3 v0.162: `t.Result` lexically inside an `async` method → compile error.
+BEZEL_TEST(async_sync_wait_941, result_inside_async_method_rejected_30_3_v0162) {
+    BEZEL_EXPECT_EQ(compileFails941(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Task.FromResult(42); "
+        "    var r: int := t.Result; "   // ERROR: blocking wait inside async context
+        "    return r; "
+        "  end Main; end C;"),
+        true);
+}
+
+// §30.3 v0.162: `t.Wait()` inside an `async` lambda → compile error.
+BEZEL_TEST(async_sync_wait_941, wait_inside_async_lambda_rejected_30_3_v0162) {
+    BEZEL_EXPECT_EQ(compileFails941(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var f := async () => do "
+        "      using var t := Task.Delay(1); "
+        "      t.Wait(); "        // ERROR: blocking wait inside async lambda
+        "    end; "
+        "    return 0; "
+        "  end Main; end C;"),
+        true);
+}
+
+// §30.3 v0.162: Wait() in non-async Main is STILL ACCEPTED (the escape hatch).
+BEZEL_TEST(async_sync_wait_941, wait_in_sync_main_still_accepted_30_3_v0162) {
+    // Plain (non-async) Main: Wait() is the intended escape hatch — must compile OK.
+    expectValue941(
+        "module M; class C "
+        "  public static async method RunAsync(): Task<int> "
+        "    await Task.Delay(1); "
+        "    return 5; "
+        "  end RunAsync; "
+        "  public static method Main(): int "
+        "    using var t := C.RunAsync(); "
+        "    t.Wait(); "          // LEGAL: non-async context
+        "    return t.Result; "   // LEGAL: t is complete, non-blocking
+        "  end Main; end C;",
+        5);
+}
+
+// ---------------------------------------------------------------------------
+// §30.5 (v0.162 / #1352): OwnedTask spend-on-all-edges.
+// An OwnedTask must be marked spent after the FIRST await on any path —
+// fault as well as success. A second `await t` must raise
+// InvalidOperationException (not replay the original error).
+//
+// Test shape: async producer throws; consumer catches the fault from the
+// first await, then attempts a second await in another try/catch. The
+// second await must raise IOE (r=2), not fault again (r=1) or crash.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_fault_raises_ioe_1352) {
+    // §30.5 v0.162: first await faults (r=1), second await must raise IOE (r=2).
+    expectValue941(
+        "module M; class C "
+        "  public static async method FaultProducer(): OwnedTask<int> "
+        "    throw new Exception(\"boom\"); "
+        "  end FaultProducer; "
+        "  public static async method RunTest(): Task<int> "
+        "    using var t := C.FaultProducer(); "
+        "    var r: int := 0; "
+        "    try "
+        "      var _: int := await t; "      // first await — faults
+        "    catch Exception => r := 1; "    // caught: r=1
+        "    end; "
+        "    try "
+        "      var _: int := await t; "      // second await — IOE (spent)
+        "    catch InvalidOperationException => r := 2; "
+        "    end; "
+        "    return r; "
+        "  end RunTest; "
+        "  public static method Main(): int "
+        "    using var t := C.RunTest(); "
+        "    t.Wait(); "
+        "    return t.Result; "
+        "  end Main; end C;",
+        2);
+}
+
+// §30.5 v0.162: OwnedTask spend-on-success: after a SUCCESSFUL first await,
+// a second await must also raise IOE (not silently return a stale value or crash).
+BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_success_raises_ioe_1352) {
+    // §30.5 v0.162: first await succeeds (r=99), second await raises IOE (r=2).
+    expectValue941(
+        "module M; class C "
+        "  public static async method Produce99(): OwnedTask<int> "
+        "    return 99; "
+        "  end Produce99; "
+        "  public static async method RunTest(): Task<int> "
+        "    using var t := C.Produce99(); "
+        "    var r: int := 0; "
+        "    try "
+        "      r := await t; "               // first await — succeeds: r=99
+        "    catch Exception => r := 0; "
+        "    end; "
+        "    try "
+        "      var _: int := await t; "      // second await — IOE (spent)
+        "    catch InvalidOperationException => r := 2; "
+        "    end; "
+        "    return r; "
+        "  end RunTest; "
+        "  public static method Main(): int "
+        "    using var t := C.RunTest(); "
+        "    t.Wait(); "
+        "    return t.Result; "
+        "  end Main; end C;",
+        2);
+}
+
+// ---------------------------------------------------------------------------
+// §30.5 / #1332 (v0.162): Pattern A chained slot — `return await <call>`
+// where the outer async method returns Task<T:class>. The source task is NOT
+// freed immediately at the await site; instead it is chained to the outer task
+// via bz_task_set_chained so its lifetime is tied to the outer task's lifetime.
+// Correctness: the class value passes through the chain and the result is
+// accessible via .Result. (Pattern A class-result disposal is a deferred
+// increment; this test verifies the basic chain mechanics.)
+//
+// Fast-path variant: MakeBox is synchronous (no delay) → takes the already-done
+// fast path through emitAwaitSuspend (no real thread suspension).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_fast_path_1332) {
+    expectValue941(
+        "module M; "
+        "class Box "
+        "  public X: int; "
+        "  public constructor(x: int) "
+        "    this.X := x; "
+        "  end constructor; "
+        "end Box; "
+        "class C "
+        "  public static async method MakeBox(x: int): Task<Box> "
+        "    return new Box(x); "
+        "  end MakeBox; "
+        "  public static async method ChainBox(x: int): Task<Box> "
+        "    return await C.MakeBox(x); "      // Pattern A chained return
+        "  end ChainBox; "
+        "  public static method Main(): int "
+        "    var b: Box := C.ChainBox(77).Result; "
+        "    return b.X; "
+        "  end Main; "
+        "end C;",
+        77);
+}
+
+// Slow-path variant: MakeBox suspends via Task.Delay(0) before returning, so
+// the real suspension path (bz_task_then + Resume) is exercised.
+// bz_task_set_chained must be called in the Resume function (state 1) after
+// the source task completes, before bz_task_complete on the outer task.
+BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_slow_path_1332) {
+    expectValue941(
+        "module M; "
+        "class Box "
+        "  public X: int; "
+        "  public constructor(x: int) "
+        "    this.X := x; "
+        "  end constructor; "
+        "end Box; "
+        "class C "
+        "  public static async method MakeBoxDelayed(x: int): Task<Box> "
+        "    await Task.Delay(0); "
+        "    return new Box(x); "
+        "  end MakeBoxDelayed; "
+        "  public static async method ChainBoxDelayed(x: int): Task<Box> "
+        "    return await C.MakeBoxDelayed(x); "   // Pattern A chained return (slow)
+        "  end ChainBoxDelayed; "
+        "  public static method Main(): int "
+        "    var b: Box := C.ChainBoxDelayed(55).Result; "
+        "    return b.X; "
+        "  end Main; "
+        "end C;",
+        55);
 }

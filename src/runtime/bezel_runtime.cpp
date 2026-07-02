@@ -3566,6 +3566,14 @@ struct bz_task_t {
     std::condition_variable cv;
     bool done = false;
     bool is_error = false;
+    // §30.5 (v0.162 / #1352): OwnedTask single-consumer affine tracking. Set to
+    // true after the FIRST await consumes the task (regardless of whether the await
+    // succeeded or faulted). A second await on a spent OwnedTask is diagnosed at
+    // compile time for the straight-line case (ownership pass); for the general
+    // cross-method / cross-catch case the codegen reads is_spent at the await site
+    // and raises InvalidOperationException if it is already set. Plain Task<T> (not
+    // OwnedTask<T>) never sets this flag — it can be awaited multiple times.
+    bool is_spent = false;
     char* error_msg = nullptr;
     // §30.9: the ORIGINAL exception object that faulted this task (a Bezel heap
     // object with a leading vtable word). Preserved across the task boundary so
@@ -3578,6 +3586,12 @@ struct bz_task_t {
     void* error_obj = nullptr;
     void* result = nullptr;
     int64_t result_size = 0;
+    // §30.5 / #1332 (v0.162): Pattern A chained slot. When an async method does
+    // `return await <Pattern A source>`, the source task transfers into this field
+    // so that the outer task keeps the source alive (and its result buffer valid)
+    // for as long as the outer task exists. bz_task_free disposes the chain
+    // transitively. Null for tasks that own their result directly (most tasks).
+    void* chained_source = nullptr;
     // §30.13 (#618): owning execution domain (set at allocation; always
     // g_main_domain for current single-domain programs).
     bz_domain_t* domain = nullptr;
@@ -4118,6 +4132,40 @@ bool bz_task_is_error(void* tp) {
     return task->is_error;
 }
 
+// §30.5 (v0.162 / #1352): OwnedTask single-consumer tracking.
+// bz_task_mark_spent: record that an OwnedTask has been consumed by its first
+// await (whether the await succeeded or faulted). A second await on a spent task
+// should raise InvalidOperationException (checked by the codegen via
+// bz_task_is_spent at the await site).
+void bz_task_mark_spent(void* tp) {
+    auto* task = (bz_task_t*)tp;
+    std::lock_guard<std::mutex> lk(task->mtx);
+    task->is_spent = true;
+}
+
+// bz_task_is_spent: returns true after the first await consumed the OwnedTask.
+bool bz_task_is_spent(void* tp) {
+    auto* task = (bz_task_t*)tp;
+    std::lock_guard<std::mutex> lk(task->mtx);
+    return task->is_spent;
+}
+
+// §30.5 / #1332 (v0.162): transfer ownership of `source` into `outer`'s chained
+// slot. Called when `return await <Pattern A source>` completes the outer async
+// method — the source task must outlive the outer task so the borrowed result
+// (stored in the outer task's result buffer as a pointer into the source task's
+// result buffer) is valid for as long as the outer task is alive. The outer task
+// takes exclusive ownership of the source; do not free source separately.
+void bz_task_set_chained(void* outer_p, void* source_p) {
+    if (!outer_p || !source_p) return;
+    auto* outer = (bz_task_t*)outer_p;
+    std::lock_guard<std::mutex> lk(outer->mtx);
+    // If a previous chained source exists (shouldn't in normal use, but guard
+    // defensively), free it to avoid a leak.
+    if (outer->chained_source) bz_task_free(outer->chained_source);
+    outer->chained_source = source_p;
+}
+
 // §30.13 / bz_task_await_sync: the main OS thread (emitted by the async-Main
 // wrapper in LlvmBackend_Async.cpp) blocks here until the top-level Task
 // completes.  This function is NOT a domain continuation: the main thread is
@@ -4133,9 +4181,34 @@ bool bz_task_is_error(void* tp) {
 //     while running continuations.
 //   - Lock ordering is always task->mtx then dom->mtx (in the completers /
 //     task_dispatch / domain_enqueue), never reversed.
+//
+// §30.3 (v0.162 / #1362): the fast-path MUST remain first — WhenAll/WhenAny
+// internals and lowerAwait result-reads call this on COMPLETED tasks from
+// inside continuations (g_current_domain != null), and those must not abort.
+// Only the slow-path (task not yet done while inside a domain continuation)
+// would deadlock; that case aborts with a diagnostic message.
 void* bz_task_await_sync(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::unique_lock<std::mutex> lk(task->mtx);
+    // Fast path: already done — return immediately (no blocking, no domain risk).
+    // This path is taken by WhenAll/WhenAny internals and by the result-reads
+    // inside continuations (g_current_domain != null, task already complete).
+    if (task->done) {
+        return task->is_error ? nullptr : task->result;
+    }
+    // §30.3 (v0.162 / #1362): blocking on an INCOMPLETE task inside a domain
+    // continuation is a deterministic deadlock — the domain is frozen, so the
+    // task's continuation can never be enqueued and run.  The sema check already
+    // rejects Wait()/Result inside `async` methods; this guard covers the
+    // non-async-helper case (a sync helper called from a continuation).
+    if (g_current_domain != nullptr) {
+        lk.unlock();
+        fputs("fatal: blocking wait inside a domain continuation; "
+              "the domain can never advance — await the task, or query IsCompleted "
+              "(§30.3 v0.162)\n", stderr);
+        fflush(stderr);
+        abort();
+    }
     task->cv.wait(lk, [task]{ return task->done; });
     return task->is_error ? nullptr : task->result;
 }
@@ -4173,9 +4246,13 @@ void bz_task_free(void* tp) {
     auto* task = (bz_task_t*)tp;
     free(task->result);
     free(task->error_msg);
+    // §30.5 / #1332 (v0.162): dispose the chained Pattern A source task (if any)
+    // transitively — the source owns the result that the outer task borrowed.
+    void* chainedSrc = task->chained_source;
     bz_domain_t* dom = task->domain;
     delete task;
     if (dom) domain_release(dom);  // per fix #632: release task's domain ref
+    if (chainedSrc) bz_task_free(chainedSrc);
 }
 
 // stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a fresh task and
@@ -4512,15 +4589,23 @@ void* bz_task_when_all_owned(void* task_arr) {
     return aggregate;
 }
 
-// stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<Task>.
-// Returns a new task that completes with a ptr-sized result (the pointer to the
-// FIRST task that finishes). Uses a shared context with a once-flag and a
-// refcount. Every continuation decrements the refcount on exit; the first to
-// fire completes the aggregate via CAS on the once-flag.
+// stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<int> (v0.162 / #1332).
+// Returns a new task that completes with the INDEX (i32) of the first task to
+// finish. (Previously returned Task<Task> — the task pointer — but that form was
+// unconstructible under §30.5.) Uses a shared context with a once-flag and a
+// refcount. Every continuation decrements the refcount on exit; the first to fire
+// completes the aggregate via CAS on the once-flag. Per-slot state carries the
+// index so the lambda can complete the aggregate with the right i32 value.
 struct BzWhenAnyCtx {
     bz_task_t* aggregate;
     std::atomic<bool> fired;         // once-flag: only the first winner fires
     std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
+};
+
+// Per-slot state carrying the shared context and this slot's input index.
+struct BzWhenAnySlot {
+    BzWhenAnyCtx* ctx;
+    int32_t idx;   // i32: WhenAny produces Task<int>, int is 32-bit in Bezel
 };
 
 void* bz_task_when_any(void* task_arr) {
@@ -4532,6 +4617,11 @@ void* bz_task_when_any(void* task_arr) {
     { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
       aggregate->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (n == 0) {
+        // Empty array: complete immediately with index -1 (no winner).
+        int32_t noWinner = -1;
+        aggregate->result = malloc(sizeof(int32_t));
+        memcpy(aggregate->result, &noWinner, sizeof(int32_t));
+        aggregate->result_size = (int64_t)sizeof(int32_t);
         aggregate->done = true;
         return aggregate;
     }
@@ -4539,17 +4629,22 @@ void* bz_task_when_any(void* task_arr) {
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
+        auto* slot = new BzWhenAnySlot{ctx, (int32_t)i};
         bz_task_then(t,
-            [](void* completedTask, void* state) {
-                auto* c = (BzWhenAnyCtx*)state;
+            [](void* /*completedTask*/, void* state) {
+                auto* slot = (BzWhenAnySlot*)state;
+                auto* c = slot->ctx;
+                int32_t winnerIdx = slot->idx;
+                delete slot;
                 bool expected = false;
+                // #1332: complete with the i32 winner index, not the task pointer.
                 if (c->fired.compare_exchange_strong(expected, true,
                         std::memory_order_acq_rel))
-                    bz_task_complete(c->aggregate, &completedTask, sizeof(void*));
+                    bz_task_complete(c->aggregate, &winnerIdx, sizeof(int32_t));
                 if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
                     delete c;
             },
-            ctx);
+            slot);
     }
     return aggregate;
 }

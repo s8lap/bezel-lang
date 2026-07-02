@@ -6381,9 +6381,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
             }
         }
-        // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>): Task<Task>.
-        // Returns a new task that completes (with a ptr-sized result — the first-
-        // done task pointer) as soon as any one input task is done.
+        // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>): Task<int>
+        // (v0.162 / #1332). Returns a new task that completes with the i32 INDEX
+        // of the first-done input task (not the task pointer — Task<Task> was
+        // unconstructible under §30.5). sema types the result as Task<int>, so the
+        // await-result is loaded as i32. The runtime bz_task_when_any completes
+        // the aggregate with sizeof(int32_t) bytes holding the winner index.
         if (m == "WhenAny" && !call.args.empty() && call.args[0].value) {
             llvm::Value* arr = lowerExpr(*call.args[0].value);
             if (!arr) return nullptr;
@@ -10548,6 +10551,10 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // result buffer pointer is discarded — Wait() returns unit. A faulted
         // task is NOT re-raised here (spec §30.3 attributes re-raise to reading
         // `Result`, not `Wait()`); the fault surfaces when the result is read.
+        //
+        // §30.3 (v0.162 / #1362): Wait() inside async code is a sema error (the
+        // sema check fires before codegen). For non-async helpers called from a
+        // continuation, the runtime bz_task_await_sync domain guard catches it.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "Wait" && ma->target && call.args.empty()) {
@@ -10555,6 +10562,25 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 if (isTaskTypeName(recvTy)) {
                     llvm::Value* task = lowerExpr(*ma->target);
                     if (task && task->getType()->isPointerTy()) {
+                        // §30.3 (v0.162 / #1362): catchable guard AT the call
+                        // site — blocking on an INCOMPLETE task inside a domain
+                        // continuation raises InvalidOperationException (the
+                        // runtime abort in bz_task_await_sync stays as a last-
+                        // resort backstop for paths that bypass this lowering).
+                        auto* isDoneFn = declareC("bz_task_is_done",
+                                                  builder_.getInt1Ty(), {ptrTy()});
+                        auto* curDomFn = declareC("bz_current_domain_ptr",
+                                                  ptrTy(), {});
+                        llvm::Value* done =
+                            builder_.CreateCall(isDoneFn, {task}, "wait.done");
+                        llvm::Value* dom =
+                            builder_.CreateCall(curDomFn, {}, "wait.dom");
+                        llvm::Value* inDomain = builder_.CreateICmpNE(
+                            dom, llvm::Constant::getNullValue(ptrTy()),
+                            "wait.indomain");
+                        llvm::Value* wouldDeadlock = builder_.CreateAnd(
+                            builder_.CreateNot(done), inDomain, "wait.deadlock");
+                        emitGuardThrow(wouldDeadlock, "InvalidOperationException");
                         auto* awaitFn = declareC("bz_task_await_sync", ptrTy(),
                                                  {ptrTy()});
                         builder_.CreateCall(awaitFn, {task}, "task.wait");
