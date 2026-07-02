@@ -450,19 +450,13 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     advance(); // past ":"
                 }
                 arm.types.push_back(parseType());
-                // Within the pattern, "," joins additional exception types.
-                // Stop if the next token starts an arm (is `var`/`when`/`=>`).
-                // Peek ahead: `,` followed by `var` → arm separator, not type.
-                while (isPunctuator(",") && !isKeyword("when")) {
-                    // Peek past the comma.
-                    const auto& afterComma = peekAt(1);
-                    // If comma is followed by `var`, another binding pattern starts.
-                    if (afterComma.kind == TokenKind::Keyword &&
-                        afterComma.text == "var") break;
-                    // If comma is followed by end/finally, it's a trailing comma.
-                    if (afterComma.kind == TokenKind::Keyword &&
-                        (afterComma.text == "end" || afterComma.text == "finally")) break;
-                    advance(); // consume ","
+                // §31.2.1 / §A.6 (v0.167, #1371): multi-type alternatives are
+                // now `|`-separated — the same alternatives spelling as case
+                // patterns. The comma is exclusively the arm separator, so no
+                // lookahead past the comma is needed to tell an added type from
+                // the next arm. `IOException | TimeoutException` and
+                // `var e: IOException | TimeoutException` both collect here.
+                while (consumePunctuator("|")) {
                     arm.types.push_back(parseType());
                 }
                 if (consumeKeyword("when")) {

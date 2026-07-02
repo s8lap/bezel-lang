@@ -61,6 +61,7 @@ set(BEZEL_TEST_SOURCES
     parser/serialized_class_clause_test.cpp
     parser/catch_patterns_test.cpp
     parser/constant_alternatives_test.cpp
+    parser/pattern_alternatives_1371_test.cpp
     parser/collection_literals_test.cpp
     parser/type_extensions_test.cpp
     parser/enum_members_test.cpp
@@ -125,6 +126,7 @@ set(BEZEL_TEST_SOURCES
     sema/private_visibility_test.cpp
     sema/sealed_class_test.cpp
     sema/case_exhaustiveness_test.cpp
+    sema/pattern_alternatives_1371_test.cpp
     sema/case_common_type_nullable_747_test.cpp
     sema/case_pattern_literal_range_1153_test.cpp
     sema/range_reversed_pattern_warn_1340_test.cpp
@@ -348,6 +350,7 @@ set(BEZEL_TEST_SOURCES
     codegen/ffi_test.cpp
     codegen/rawbytes_disposal_test.cpp
     codegen/case_expr_test.cpp
+    codegen/pattern_alternatives_1371_test.cpp
     codegen/record_pattern_constants_615_test.cpp
     codegen/var_destructure_577_test.cpp
     codegen/case_expr_nullable_result_573_test.cpp

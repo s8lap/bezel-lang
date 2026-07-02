@@ -2241,7 +2241,85 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
                 Severity::Error, p->span.begin,
                 "the `_` discard pattern must be the last arm of a `case` — "
                 "arms after an unguarded `_` are unreachable (§19.6)");
+        // §19.3 (v0.167, #1371): a `|` alternative list is constants-only —
+        // reject a type member (a binding member is caught at parse).
+        checkAltMembersConstant(p);
     }
+}
+
+// §19.3 (v0.167, #1371): recurse through a pattern and, for every `|`
+// alternatives ConstantPattern (two or more members), reject a member that
+// names a TYPE. Per-slot alternatives are reached through DestructuringPattern
+// slots. A single-member ConstantPattern is an ordinary single constant (or a
+// scrutinee-less bool condition) and is not an alternatives list.
+void ExprTC::checkAltMembersConstant(const ast::Pattern* p) {
+    if (!p) return;
+    if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+        if (cp->constants.size() < 2) return;
+        for (const auto& c : cp->constants)
+            if (c && altMemberNamesType(c.get()))
+                ctx_.diagnostics().report(
+                    Severity::Error, c->span.begin,
+                    "a type may not appear in a `|` pattern alternative list "
+                    "\xe2\x80\x94 every member must be a constant (a literal, an "
+                    "enum constant, or a named `const`); grouped type tests are "
+                    "written as separate arms (\xc2\xa7""19.3)");
+        return;
+    }
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p))
+        for (const auto& sp : dp->subPatterns)
+            if (sp.pattern) checkAltMembersConstant(sp.pattern.get());
+}
+
+// §19.3 / §A.7: does one alternative-member expression denote a TYPE (a class,
+// interface, record, enum, or nested type) rather than a constant? A literal or
+// other non-name expression is never a type. For a bare name, a value/const
+// binding shadows a same-named type (so a resolved non-type symbol wins). For a
+// qualified name, `Color.Red` is an enum constant (its final segment is not a
+// nested type) while `Outer.Inner` is a nested type.
+bool ExprTC::altMemberNamesType(const ast::Expr* c) {
+    // Peel a MemberAccess chain into dotted parts; the innermost must be a
+    // plain IdentifierExpr for this to be a qualified name.
+    std::vector<std::string_view> parts;
+    const ast::Expr* cur = c;
+    while (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(cur)) {
+        parts.push_back(ma->member);
+        cur = ma->target.get();
+    }
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(cur);
+    if (!id) return false;
+    parts.push_back(id->name);
+    for (std::size_t lo = 0, hi = parts.size(); lo + 1 < hi; ++lo, --hi)
+        std::swap(parts[lo], parts[hi - 1]);
+
+    // Resolve the head. A resolved non-type symbol (local/param/const/enum
+    // constant) shadows a same-named type and means "not a type".
+    TypeSymbol* ts = nullptr;
+    if (Symbol* head = lookupName(parts[0])) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(head)) ts = t;
+        else if (auto* nt = dynamic_cast<NestedTypeSymbol*>(head)) ts = nt->type;
+        else return false;  // resolves to a value/const → not a type
+    } else {
+        // Not in scope: fall back to a top-level TypeSymbol of that name.
+        for (const auto& sym : ctx_.symbols())
+            if (auto* t = dynamic_cast<TypeSymbol*>(sym.get()))
+                if (t->name == parts[0]) { ts = t; break; }
+    }
+    if (!ts) return false;
+    if (parts.size() == 1) return true;  // bare type name (`Circle`)
+    // Qualified: only a name whose FINAL segment is itself a nested type is a
+    // type; a trailing enum constant / static const (`Color.Red`) is not.
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        NestedTypeSymbol* found = nullptr;
+        for (Symbol* m : ts->members)
+            if (m->name == parts[i]) {
+                found = dynamic_cast<NestedTypeSymbol*>(m);
+                break;
+            }
+        if (!found) return false;  // final segment is a member, not a type
+        ts = found->type;
+    }
+    return ts != nullptr;
 }
 
 // §5.1 / §19 (#1153): a `case` constant or range-bound integer literal that

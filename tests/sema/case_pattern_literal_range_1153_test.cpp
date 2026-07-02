@@ -118,7 +118,7 @@ BEZEL_TEST(sema_case_pattern_range, multi_alternative_one_out_of_range_rejected)
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x of 1, 2, 256 => 1, _ => 0 end; "
+        "    return case x of 1 | 2 | 256 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));

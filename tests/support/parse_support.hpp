@@ -815,7 +815,10 @@ inline std::string stmtSummary(const ast::Stmt& s) {
                 out += ": ";
             }
             for (std::size_t i = 0; i < arm.types.size(); ++i) {
-                if (i > 0) out += ", ";
+                // §A.6 CatchPattern (v0.167, #1371): multi-type alternatives are
+                // `|`-separated, matching the case-pattern alternatives spelling
+                // and the source form the parser consumes.
+                if (i > 0) out += " | ";
                 out += arm.types[i] ? typeToString(*arm.types[i])
                                     : std::string("<null>");
             }

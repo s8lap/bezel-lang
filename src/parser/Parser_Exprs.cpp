@@ -882,7 +882,84 @@ ast::Param Parser::parseLambdaParam() {
 
 // ===== Slice 38: patterns and case expressions (§A.7) =====================
 
+// §19.3 / §A.7 AltPattern (v0.167, #1371): `AltPattern ::= Pattern ("|"
+// Pattern)*`. The `|` alternative separator replaces the pre-v0.167 comma —
+// the comma now means exactly one thing in pattern context (the arm/slot
+// separator), so no `=>` lookahead is needed to disambiguate an alternatives
+// list from an arm boundary, and alternatives become available *per positional
+// slot* as well as at arm level. `|` never collides with bitwise-or: the only
+// expression positions embedded in patterns (relational operand, range bounds)
+// parse at Shift level or tighter, below `|` (§19.3). Every member must resolve
+// to a CONSTANT (§19.3: a literal, an enum constant, or a named `const`); the
+// members are collected into a single ConstantPattern so the existing
+// OR-of-tests lowering (codegen `patternMatches` over ConstantPattern) applies
+// unchanged at both arm level and inside a destructuring slot. A structurally
+// non-constant member (a binding, range, relational, primitive type, or `_`)
+// is rejected here; a QualifiedName that resolves to a *type* is rejected in
+// sema (the type-vs-constant distinction is a name-resolution question, §A.7).
 std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
+    SourceLocation start = current_.location;
+    auto first = stampSpan(parsePrimaryPattern(inPositional), start,
+                           current_.location);
+    if (!isPunctuator("|")) return first;
+    auto cp = std::make_unique<ast::ConstantPattern>();
+    cp->span.begin = start;
+    appendAlternativeMember(*cp, std::move(first));
+    while (consumePunctuator("|")) {
+        SourceLocation memStart = current_.location;
+        appendAlternativeMember(
+            *cp, stampSpan(parsePrimaryPattern(inPositional), memStart,
+                           current_.location));
+    }
+    cp->span.end = current_.location;
+    return std::unique_ptr<ast::Pattern>(cp.release());
+}
+
+// §19.3 / §A.7 (v0.167, #1371): fold one already-parsed primary pattern into an
+// alternatives ConstantPattern as a constant member. Constant-shaped members
+// (a ConstantPattern, a NamedPattern's QualifiedName, or `null`) contribute
+// their constant expression(s); any other shape is a structurally non-constant
+// member and is rejected with the §19.3 membership diagnostic.
+void Parser::appendAlternativeMember(ast::ConstantPattern& cp,
+                                     std::unique_ptr<ast::Pattern> p) {
+    if (!p) return;
+    if (auto* inner = dynamic_cast<ast::ConstantPattern*>(p.get())) {
+        for (auto& c : inner->constants)
+            if (c) {
+                if (c->span.begin.line == 0) c->span = p->span;
+                cp.constants.push_back(std::move(c));
+            }
+        return;
+    }
+    if (auto* np = dynamic_cast<ast::NamedPattern*>(p.get())) {
+        auto e = qualifiedNameToExpr(std::move(np->name));
+        if (e) e->span = p->span;
+        cp.constants.push_back(std::move(e));
+        return;
+    }
+    if (dynamic_cast<ast::NullPattern*>(p.get())) {
+        auto nl = std::make_unique<ast::NullLiteralExpr>();
+        nl->span = p->span;
+        cp.constants.push_back(std::unique_ptr<ast::Expr>(nl.release()));
+        return;
+    }
+    // §19.3: a binding, a type, or any other non-constant is not admissible in
+    // an alternative list. (`var`/naked bindings and primitive types are caught
+    // here; a user-type QualifiedName reaches sema as a ConstantPattern member.)
+    diagnostics_.report(
+        Severity::Error, p->span.begin,
+        "a pattern alternative member must be a constant \xe2\x80\x94 a "
+        "literal, an enum constant, or a named `const` (\xc2\xa7""19.3); a "
+        "binding or a type may not appear in a `|` alternative list");
+}
+
+std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
+    [[maybe_unused]] bool inPositional) {
+    // §A.7 (v0.167, #1371): one primary (non-alternative) pattern. `|`-joined
+    // alternatives are handled by the parsePattern wrapper; the comma is
+    // exclusively the arm/slot separator, so `inPositional` no longer changes
+    // this routine's behavior (it is retained for call-site symmetry with the
+    // naked-binding recognition in parsePositionalPattern).
     // `_` discard. `_` is an Identifier per the lexer.
     if (current_.kind == TokenKind::Identifier && current_.text == "_") {
         advance();
@@ -906,13 +983,19 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
         if (consumePunctuator(":")) bp->type = parseType();
         return std::unique_ptr<ast::Pattern>(bp.release());
     }
-    // Relational pattern: `<`, `>`, `<=`, `>=` followed by Expression.
+    // Relational pattern: `<`, `>`, `<=`, `>=` followed by a Shift-level
+    // operand. §19.3 (v0.167, #1371): the operand parses at the Shift level or
+    // tighter (parseBinaryExpression(12)) — below `|` — so a trailing `|` is the
+    // alternative separator, not bitwise-or absorbed into the operand. A
+    // bitwise operand must be parenthesized (§17.1.1).
     if (isPunctuator("<") || isPunctuator(">") ||
         isPunctuator("<=") || isPunctuator(">=")) {
         auto rop = std::make_unique<ast::RelOpPattern>();
         rop->op = current_.text;
         advance();
-        rop->expr = parseExpression();
+        SourceLocation opStart = current_.location;
+        rop->expr = stampSpan(parseBinaryExpression(12), opStart,
+                              current_.location);
         return std::unique_ptr<ast::Pattern>(rop.release());
     }
     // §16.2 / §19.3 (#726, #744): both open-ended range-pattern forms are
@@ -977,34 +1060,26 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
             }
             return std::unique_ptr<ast::Pattern>(dp.release());
         }
-        // §A.7 (#1300): a `,`-separated Constant-alternatives list is valid only
-        // at the case-arm level, NOT inside a DestructuringPattern positional
-        // slot — there the `,` is the positional separator. Guard on
-        // !inPositional, mirroring the catch-all path below. Without this a
-        // QualifiedName constant (`Color.Red`) in a non-final positional slot
-        // greedily absorbed the positional comma (`Pair(Color.Red, Color.Blue)`
-        // collapsed to one alternatives slot → spurious binding-count reject);
-        // int-literal constants already went through the guarded catch-all path.
-        if (!inPositional && isPunctuator(",") && isConstantStart(peekAt(1))) {
-            // Convert qn → IdentifierExpr/MemberAccess chain and continue
-            // as ConstantPattern alternatives.
-            auto cp = std::make_unique<ast::ConstantPattern>();
-            cp->constants.push_back(qualifiedNameToExpr(std::move(qn)));
-            while (consumePunctuator(",")) {
-                cp->constants.push_back(parseConstantExpr());
-                if (!(isPunctuator(",") && isConstantStart(peekAt(1)))) break;
-            }
-            return std::unique_ptr<ast::Pattern>(cp.release());
-        }
+        // §A.7 (v0.167, #1371): a QualifiedName that is not a destructuring
+        // head is a NamedPattern (sema disambiguates Constant-vs-Type by name
+        // resolution). Any `|`-joined alternatives are collected by the
+        // parsePattern wrapper, not here — the comma is now exclusively the
+        // arm/slot separator, so no `,`-alternatives branch remains.
         auto np = std::make_unique<ast::NamedPattern>();
         np->name = std::move(qn);
         return std::unique_ptr<ast::Pattern>(np.release());
     }
-    // Catch-all: parse an Expression and classify. A RangeExpr at the root
-    // is a RangePattern (slice 52 — replaces the earlier BinaryExpr-based
-    // representation); otherwise wrap as a ConstantPattern with one or
-    // more `,`-separated constants (slice 44).
-    auto e = parseExpression();
+    // Catch-all: parse a Constant / RangePattern. §19.3 (v0.167, #1371): the
+    // pattern-embedded expression parses at the RANGE level (precedence 11) —
+    // its Shift-level bounds/value (12+) are tighter than `|` (bitwise-or, 8),
+    // so a `|` at pattern level is left for the alternative separator, never
+    // absorbed as bitwise-or. A bitwise-or *value* pattern must be
+    // parenthesized (`(A | B)`), per the §17.1.1 mandatory-parenthesization
+    // discipline. A RangeExpr at the root is a RangePattern (slice 52);
+    // otherwise the expression is a single ConstantPattern member (the
+    // parsePattern wrapper collects any `|`-joined alternatives).
+    SourceLocation exprStart = current_.location;
+    auto e = stampSpan(parseBinaryExpression(11), exprStart, current_.location);
     if (dynamic_cast<ast::RangeExpr*>(e.get())) {
         auto rp = std::make_unique<ast::RangePattern>();
         rp->rangeExpr = std::move(e);
@@ -1012,16 +1087,9 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
     }
     auto cp = std::make_unique<ast::ConstantPattern>();
     cp->constants.push_back(std::move(e));
-    // §A.7: ConstantPattern alternatives (`,` list) are only valid at the
-    // case-arm level, NOT inside DestructuringPattern sub-patterns — the `,`
-    // there is the sub-pattern separator. Suppress the alternatives loop when
-    // parsing a positional sub-pattern (inPositional=true).
-    if (!inPositional) {
-        while (isPunctuator(",") && isConstantStart(peekAt(1))) {
-            advance(); // past `,`
-            cp->constants.push_back(parseConstantExpr());
-        }
-    }
+    // §A.7 (v0.167, #1371): a single Constant pattern. `|`-joined alternatives
+    // are collected by the parsePattern wrapper; the comma is exclusively the
+    // arm/slot separator, so no `,`-alternatives loop remains here.
     return std::unique_ptr<ast::Pattern>(cp.release());
 }
 
@@ -1172,51 +1240,8 @@ std::unique_ptr<ast::Expr> Parser::parseWhenExpr() {
     return std::unique_ptr<ast::Expr>(ce.release());
 }
 
-// Slice 44: helpers for ConstantPattern alternatives.
-
-bool Parser::isConstantStart(const Token& t) const {
-    if (t.kind == TokenKind::IntLiteral ||
-        t.kind == TokenKind::FloatLiteral ||
-        t.kind == TokenKind::CharLiteral ||
-        t.kind == TokenKind::StringLiteral ||
-        t.kind == TokenKind::VerbatimStringLiteral) return true;
-    if (t.kind == TokenKind::Keyword &&
-        (t.text == "true" || t.text == "false" || t.text == "null")) {
-        return true;
-    }
-    // A.8 (v0.158): Constant admits a leading '-' before a numeric literal
-    // (`"-"? (IntLiteral | FloatLiteral)`), so '-' can begin a Constant.
-    // Callers that have two-token lookahead may refine further; here a bare
-    // '-' is conservatively accepted since in pattern-alternative position
-    // it can only start a negative numeric constant.
-    if (t.kind == TokenKind::Punctuator && t.text == "-") return true;
-    // Identifier — could begin a QualifiedName Constant — but `_` is the
-    // DiscardPattern, not a Constant.
-    return t.kind == TokenKind::Identifier && t.text != "_";
-}
-
-std::unique_ptr<ast::Expr> Parser::parseConstantExpr() {
-    // A.8 Constant. Admits a leading '-' before IntLiteral/FloatLiteral
-    // (§A.8, v0.158: `"-"? (IntLiteral | FloatLiteral)`).
-    // Other literals and QualifiedNames go through parsePrimaryExpression;
-    // QualifiedName is rebuilt as the equivalent IdentifierExpr/MemberAccess
-    // chain. Note: `null` is a keyword the lexer emits as TokenKind::Keyword,
-    // and parsePrimaryExpression handles it as NullLiteral.
-    if (isPunctuator("-")) {
-        // Negative numeric constant: consume '-', then the literal.
-        const Token opTok = current_;
-        advance(); // consume '-'
-        auto u = std::make_unique<ast::UnaryExpr>();
-        u->op = opTok.text;
-        u->operand = parsePrimaryExpression(); // expects IntLiteral/FloatLiteral
-        return std::unique_ptr<ast::Expr>(u.release());
-    }
-    if (current_.kind == TokenKind::Identifier) {
-        auto qn = parseQualifiedName();
-        return qualifiedNameToExpr(std::move(qn));
-    }
-    return parsePrimaryExpression();
-}
+// §A.7 (v0.167, #1371): helper for folding a NamedPattern into a
+// ConstantPattern alternative member.
 
 std::unique_ptr<ast::Expr> Parser::qualifiedNameToExpr(
     std::unique_ptr<ast::QualifiedName> qn) {

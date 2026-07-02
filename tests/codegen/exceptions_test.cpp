@@ -78,7 +78,7 @@ BEZEL_TEST(codegen_cg20, multi_type_arm) {
         "module M; "
         "class A1 end A1; class A2 end A2; "
         "class C public static method Main(): int "
-        "  try throw new A2(); catch A1, A2 => return 9; end; "
+        "  try throw new A2(); catch A1 | A2 => return 9; end; "
         "  return 0; "
         "end Main; end C;"), 9);
 }

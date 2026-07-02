@@ -316,7 +316,7 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_arm_alternatives_still_
         "class C public static method Main(): int "
         "  var c := Color.Green; "
         "  return case c of "
-        "    Color.Red, Color.Green => 5, "
+        "    Color.Red | Color.Green => 5, "
         "    _ => 0 "
         "  end; "
         "end Main; end C;"), 5);

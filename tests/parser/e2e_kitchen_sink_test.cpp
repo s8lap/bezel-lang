@@ -83,7 +83,7 @@ where T: class
   public method Classify(x: int): string
     return case x of
       0 => "zero",
-      1, 2, 3 => "low",
+      1 | 2 | 3 => "low",
       0..10 => "medium",
       var n when n > 0 => "positive",
       _ => "other"
@@ -109,7 +109,7 @@ where T: class
   public method Dispose()
     try
       _ := _store.Save(default(T));
-    catch IOException, NetworkException when ShouldRetry() =>
+    catch IOException | NetworkException when ShouldRetry() =>
       retry();
     catch var e: Exception => do
       log(e);

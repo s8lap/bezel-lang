@@ -38,7 +38,7 @@ BEZEL_TEST(codegen_cg28, constant_alternatives) {
     // One arm listing several constants matches any of them.
     BEZEL_EXPECT_EQ(run(
         "var x := 3; "
-        "var r := case x of 1, 2, 3 => 99, 4 => 0 end; return r;"), 99);
+        "var r := case x of 1 | 2 | 3 => 99, 4 => 0 end; return r;"), 99);
 }
 
 BEZEL_TEST(codegen_cg28, discard_is_catch_all) {

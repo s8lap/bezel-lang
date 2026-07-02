@@ -123,7 +123,7 @@ BEZEL_TEST(sema_case_exhaust, enum_comma_alternatives_ok_spec_10_6) {
         "class C "
         "  public method M(c: Color): int "
         "    var n := case c of "
-        "      Red, Green => 1, "
+        "      Red | Green => 1, "
         "      Blue => 2 "
         "    end; "
         "    return n; "

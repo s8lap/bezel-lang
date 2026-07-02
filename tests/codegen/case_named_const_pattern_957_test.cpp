@@ -114,7 +114,7 @@ BEZEL_TEST(case_named_const_pattern_957, const_alternative_with_literal) {
         "  public const K: int := 42; "
         "  public static method Main(): int "
         "    var x := 99; "
-        "    return case x of  C.K, 99 => 0, _ => 1 end; "  // 0
+        "    return case x of  C.K | 99 => 0, _ => 1 end; "  // 0
         "  end Main; "
         "end C;"), 0);
 }

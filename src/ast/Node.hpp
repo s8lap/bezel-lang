@@ -281,10 +281,12 @@ struct YieldStmt : Stmt {
     std::unique_ptr<Expr> value;     // populated for `yield return Expr;`
 };
 
-// A.6 CatchArm (slice 22 + slice 43):
-//   CatchPattern ::= Type ("," Type)*                          /* no binding */
-//                  | "var" Identifier ":" Type ("," Type)*      /* binding */
+// A.6 CatchArm (slice 22 + slice 43; v0.167 #1371 respelled the separator):
+//   CatchPattern ::= Type ("|" Type)*                          /* no binding */
+//                  | "var" Identifier ":" Type ("|" Type)*      /* binding */
 //   CatchArm     ::= CatchPattern ("when" Expression)? "=>" ArmBody
+// Multi-type alternatives are `|`-separated (the same alternatives spelling as
+// case patterns, §A.7 AltPattern); the comma is exclusively the arm separator.
 //
 // ArmBody is stored as a Stmt. The three forms from §31.2.2 / §A.6 are all
 // supported: (1) Expression (no `;` — wrapped in ExpressionStmt by the

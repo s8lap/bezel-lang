@@ -215,7 +215,7 @@ BEZEL_TEST(parser_case_scrutineeless,
         "module M; class C public method M(p: int) "
         "case p of "
         "  Low => Console.WriteLine(\"low\"), "
-        "  Medium, High => Console.WriteLine(\"medium or high\") "
+        "  Medium | High => Console.WriteLine(\"medium or high\") "
         "end; "
         " end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

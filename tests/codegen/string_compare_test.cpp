@@ -115,7 +115,7 @@ BEZEL_TEST(codegen_cg27b, case_string_alternative_pattern) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"yes\"; "
-        "  var r := case s of \"yes\", \"ok\", \"true\" => 1, _ => 0 end; "
+        "  var r := case s of \"yes\" | \"ok\" | \"true\" => 1, _ => 0 end; "
         "  return r; "
         "end Main; end C;"), 1);
 }

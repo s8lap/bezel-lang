@@ -45,7 +45,7 @@ BEZEL_TEST(codegen_cg43, expr_case_alternatives) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var e := E.Green; "
-        "  return case e of E.Red, E.Green => 4, E.Blue => 9, end; "
+        "  return case e of E.Red | E.Green => 4, E.Blue => 9, end; "
         "end Main; end C;"), 4);
 }
 

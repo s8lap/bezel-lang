@@ -67,7 +67,7 @@ BEZEL_TEST(codegen_593, two_builtin_types_message_resolves_spec_31_2_1) {
         "  try "
         "    throw new OverflowException(\"overflow\"); "
         "  catch "
-        "    var e: OverflowException, ArgumentException => "
+        "    var e: OverflowException | ArgumentException => "
         "      return e.Message.Length; "
         "  end; "
         "  return 0; "
@@ -83,7 +83,7 @@ BEZEL_TEST(codegen_593, two_builtin_types_second_thrown_spec_31_2_1) {
         "  try "
         "    throw new ArgumentException(\"arg\"); "
         "  catch "
-        "    var e: OverflowException, ArgumentException => "
+        "    var e: OverflowException | ArgumentException => "
         "      return e.Message.Length; "
         "  end; "
         "  return 0; "
@@ -112,7 +112,7 @@ BEZEL_TEST(codegen_593, two_user_types_no_member_error_spec_31_2_1) {
             "  try "
             "    throw new ErrA(\"x\", 42); "
             "  catch "
-            "    var e: ErrA, ErrB => return e.Message.Length; "
+            "    var e: ErrA | ErrB => return e.Message.Length; "
             "  end; "
             "  return 0; "
             "end Main; end C;",
@@ -136,7 +136,7 @@ BEZEL_TEST(codegen_593, two_user_types_arm_executes_spec_31_2_1) {
         "  try "
         "    throw new ErrA(\"a\", 42); "
         "  catch "
-        "    var e: ErrA, ErrB => return 77; "
+        "    var e: ErrA | ErrB => return 77; "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -158,7 +158,7 @@ BEZEL_TEST(codegen_593, two_user_types_second_type_thrown_spec_31_2_1) {
         "  try "
         "    throw new ErrB(\"b\"); "
         "  catch "
-        "    var e: ErrA, ErrB => return 88; "
+        "    var e: ErrA | ErrB => return 88; "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -187,7 +187,7 @@ BEZEL_TEST(codegen_593, three_user_types_no_member_error_spec_31_2_1) {
             "  try "
             "    throw new ErrB(\"ab\"); "
             "  catch "
-            "    var e: ErrA, ErrB, ErrC => return e.Message.Length; "
+            "    var e: ErrA | ErrB | ErrC => return e.Message.Length; "
             "  end; "
             "  return 0; "
             "end Main; end C;",
@@ -213,7 +213,7 @@ BEZEL_TEST(codegen_593, three_user_types_arm_executes_spec_31_2_1) {
         "  try "
         "    throw new ErrC(\"c\"); "
         "  catch "
-        "    var e: ErrA, ErrB, ErrC => return 55; "
+        "    var e: ErrA | ErrB | ErrC => return 55; "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -254,7 +254,7 @@ BEZEL_TEST(codegen_593, ncb_is_user_class_member_resolves_spec_31_2_1) {
         "  try "
         "    throw new AppErrA(\"test\", 42); "
         "  catch "
-        "    var e: AppErrA, AppErrB => return e.Code(); "
+        "    var e: AppErrA | AppErrB => return e.Code(); "
         "  end; "
         "  return 0; "
         "end Main; end C;"),

@@ -52,20 +52,20 @@ BEZEL_TEST(parser_catch_pattern, no_binding_single_type) {
 BEZEL_TEST(parser_catch_pattern, no_binding_multi_type) {
     BEZEL_EXPECT_EQ(
         renderBody(
-            "try risky(); catch IOException, NetException => log(); end;"),
+            "try risky(); catch IOException | NetException => log(); end;"),
         std::string(
             "try { risky(); } "
-            "catch IOException, NetException => log(); end;"));
+            "catch IOException | NetException => log(); end;"));
 }
 
 BEZEL_TEST(parser_catch_pattern, binding_multi_type) {
     BEZEL_EXPECT_EQ(
         renderBody(
-            "try risky(); catch var e: IOException, NetException "
+            "try risky(); catch var e: IOException | NetException "
             "=> log(e); end;"),
         std::string(
             "try { risky(); } "
-            "catch var e: IOException, NetException => log(e); end;"));
+            "catch var e: IOException | NetException => log(e); end;"));
 }
 
 BEZEL_TEST(parser_catch_pattern, binding_single_type_with_guard) {

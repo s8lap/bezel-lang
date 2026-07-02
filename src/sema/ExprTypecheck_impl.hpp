@@ -440,6 +440,15 @@ private:
     // replace a downstream codegen IR failure / silently-unreachable arms.
     void validateCaseArms(const std::vector<ast::CaseArm>& arms);
 
+    // §19.3 (v0.167, #1371): every member of a `|` pattern-alternative list must
+    // resolve to a CONSTANT — a type member is a compile error "in any
+    // position", at arm level or inside a positional destructuring slot.
+    // `checkAltMembersConstant` walks a pattern (recursing through
+    // DestructuringPattern slots) and reports a member that names a type;
+    // `altMemberNamesType` resolves whether one member expression denotes a type.
+    void checkAltMembersConstant(const ast::Pattern* p);
+    bool altMemberNamesType(const ast::Expr* c);
+
     // §31.1 (issue #739): the operand of `throw` must be an exception — a CLASS
     // instance. A primitive/string/record/enum/function thrown value miscompiles
     // (codegen treats it as an exception-object pointer → SIGSEGV); reject it

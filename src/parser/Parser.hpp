@@ -111,9 +111,18 @@ private:
     // Slice 37: parse one Accessor within a PropertyBody block form.
     ast::PropertyAccessor parsePropertyAccessor();
     // Slice 38: patterns and case expressions (§A.7).
-    // inPositional=true suppresses the ConstantPattern `,` alternatives loop
-    // to avoid consuming the sub-pattern separator in DestructuringPatterns.
+    // parsePattern parses an AltPattern (§A.7, v0.167 #1371): a primary
+    // pattern optionally followed by `|`-joined constant alternatives.
+    // parsePrimaryPattern parses one non-alternative pattern. inPositional is
+    // threaded through so a naked-binding Identifier can be recognized in a
+    // destructuring slot.
     std::unique_ptr<ast::Pattern> parsePattern(bool inPositional = false);
+    std::unique_ptr<ast::Pattern> parsePrimaryPattern(bool inPositional = false);
+    // §19.3 / §A.7 (v0.167, #1371): fold one already-parsed primary pattern
+    // into an alternatives ConstantPattern as a constant member, rejecting a
+    // structurally non-constant member with the §19.3 membership diagnostic.
+    void appendAlternativeMember(ast::ConstantPattern& cp,
+                                 std::unique_ptr<ast::Pattern> p);
     // parseCaseArm: when `scrutineeLess` is true the arm "pattern" is a
     // full boolean expression (§19.1 scrutinee-less form); the Pattern
     // grammar is bypassed and parseExpression() is used directly, wrapping
@@ -138,14 +147,9 @@ private:
     // delegates to parsePattern, but also admits naked-binding Identifier
     // per A.7.
     ast::PositionalPattern parsePositionalPattern();
-    // Slice 44: ConstantPattern alternatives (`1, 2, 3` and
-    // `Color.Red, Color.Blue`). `isConstantStart` returns true for a token
-    // that could begin an A.8 Constant (literal or non-`_` Identifier).
-    // `parseConstantExpr` parses one Constant; `qualifiedNameToExpr`
-    // rebuilds a QualifiedName as the corresponding Identifier/MemberAccess
-    // expression chain.
-    bool isConstantStart(const Token& t) const;
-    std::unique_ptr<ast::Expr> parseConstantExpr();
+    // `qualifiedNameToExpr` rebuilds a QualifiedName as the corresponding
+    // Identifier/MemberAccess expression chain (used to fold a NamedPattern
+    // into a ConstantPattern alternative member).
     std::unique_ptr<ast::Expr> qualifiedNameToExpr(
         std::unique_ptr<ast::QualifiedName> qn);
     // Slice 39: statement-position `case` (A.6). Sibling of parseCaseExpr;
