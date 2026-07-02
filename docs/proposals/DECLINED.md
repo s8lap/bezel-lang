@@ -22,6 +22,20 @@ The lifetime taxonomy maps without a framework: *singleton* → composition-root
 
 ---
 
+## D-0002 — Anonymous types (C#-style ad-hoc object shapes)
+
+**Declined 2026-07-03 (owner conversation on data projections).** Three structural grounds:
+
+1. **They require structural typing inside a nominal system** — two same-shaped anonymous types must unify, which imports a second typing discipline for one convenience.
+2. **They cannot cross method boundaries** — C#'s own recorded limitation, mitigated there only via `object`/`dynamic`, neither of which Bezel will have. A shape that cannot be returned, stored, or passed is a local-only convenience…
+3. **…whose killer habitat is reflection.** Anonymous types earn their keep in ORM expression trees that read property names off the shape at runtime — machinery Bezel deliberately lacks (rationale §18). C# itself largely migrated to *named* ValueTuples once available.
+
+**The accepted remedy** is method-local `record` declarations (tracked separately): the shape lives next to its single use, keeping the recorded records-over-tuples stance ("a name and a documented shape is a feature") while removing the distance cost. Cross-type mapping stays explicit (constructors/factory methods; `with` for same-type variants) — automatic mapping is reflection-shaped and would be reconsidered only as compile-time generation, per D-0001's wiring posture. Truly dynamic data goes through the JSON DOM (gap review item 21): runtime-shaped values behind typed faults, quarantined at the parse boundary, never a `dynamic` type.
+
+**What would reopen this:** tuples being reopened first (the recorded deferral names evidence-from-real-code as the bar) — named tuples would then be re-weighed against anonymous types, and would still win.
+
+---
+
 ## Gap-review declines (2026-07)
 
 Eight further declined-with-reasons entries — metrics API (pending #1363), BigInteger (rides crypto), blocking process waits (§30 discipline), `CurrentDirectory` setter (fights domain isolation), `String.Format` (second format convention), compile-time platform branching (language change), overwrite-on-full ring buffer (inverts ownership legibility), implicit Unicode normalization in equality (§9.6 ordinal contract) — are recorded in [the gap review](stdlib-gap-review-2026-07.md) §"Declined".
