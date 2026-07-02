@@ -8391,13 +8391,24 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                             ? static_cast<const void*>(locoo->decl)
                             : static_cast<const void*>(idoo);
                     outOwnedRecipients_.insert(declKey);
-                    // Exception-path unwind disposal (#900): null-guarded.
+                    // Normal-exit or exception-path disposal.
+                    // §28.3 / #1387 (Item 2b): if the ownership pass set
+                    // autoDropAtScopeEnd on the symbol (the inline local is never
+                    // discharged on any path), register a dynamicDispose entry that
+                    // fires on BOTH the normal and unwind paths — exactly-once-safe
+                    // because the slot is null-guarded and nulled on disposal.
+                    // Otherwise register the prior unwindOnly entry (exception edge
+                    // only; an explicit Dispose() / _ := item / move will handle
+                    // the normal path). // per §28.3, §22.4, §28.11
                     if (!disposeStack_.empty() &&
                         currentFn_ == unwindIneligibleFn_ &&
                         !emittingDisposerBody_ &&
                         !unwindIneligible_.count(declKey)) {
                         Disposal d{outSlot, nullptr};
-                        d.unwindOnly = true;
+                        if (locoo && locoo->autoDropAtScopeEnd)
+                            d.dynamicDispose = true;
+                        else
+                            d.unwindOnly = true;
                         disposeStack_.back().push_back(d);
                     }
                 }

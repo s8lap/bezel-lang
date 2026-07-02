@@ -195,6 +195,17 @@ private:
     // the break edge is not a loopEdge so item=Owned is not propagated to the
     // after block via unionKeys=true. Monotone (grows only), fixpoint-safe.
     std::unordered_set<sema::Symbol*> seededIterVarSyms_;
+    // §28.3 / #1387: every `out owned var` INLINE local whose declaring call
+    // appears in a WHILE-LOOP CONDITION (block.isLoopHeader == true). While-
+    // condition items are potentially overwritten on each iteration (the slot is
+    // shared across iterations via ensureOutVarSlots' alreadyMapped check), so
+    // an intermediate value that was not disposed before the next iteration leaks.
+    // Auto-drop can only dispose the FINAL slot value → incomplete. These symbols
+    // are excluded from the §28.3 affine auto-drop (undischarged keeps the hard
+    // error). If-condition and statement-level `out owned var` locals are NOT in
+    // this set — they are written at most once, making auto-drop exactly-once-safe.
+    // Monotone (grows only), fixpoint-safe.  // per §28.3, §22.4
+    std::unordered_set<sema::Symbol*> loopCondOutOwnedSyms_;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed

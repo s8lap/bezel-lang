@@ -198,6 +198,14 @@ struct LocalSymbol : Symbol {
     bool isUsing = false;
     bool isAwaitUsing = false;
     bool isConst = false;
+    // §28.3 / #1387: set by the ownership pass on an `out owned var` INLINE local
+    // (ls->decl is IdentifierExpr, not LocalDecl) that is never discharged on ANY
+    // path — a never-moved genuine owner. Codegen (ensureOutVarSlots) registers a
+    // dynamicDispose for the slot (the same null-guarded scope-end disposal a
+    // `using var` gets), firing at the enclosing scope's end. Mirrors the
+    // LocalDecl::autoDropAtScopeEnd flag but lives on the LocalSymbol because the
+    // inline local has no LocalDecl node to annotate.
+    bool autoDropAtScopeEnd = false;
     // Slice 3g: resolved type for the local. Set either from an
     // explicit `: Type` ascription (via TypeResolution) or inferred
     // from the initializer's exprType. Null when neither is available

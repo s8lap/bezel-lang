@@ -22,6 +22,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::parseAndCheckOwnership;
+using bezel::test::hasAutoDropWarning;
 
 namespace {
 
@@ -56,16 +57,18 @@ bool hasDropError(const bezel::test::OwnershipResult& r,
 
 } // namespace
 
-// §28.3 / #892 (headline): `if s.TryPop(out owned var item) then end;` — item
-// received ownership in the condition but is dropped (no disposal after). Must
-// be REJECTED. Before the fix this was silently accepted — a leak.
+// §28.3 / #892 / #1387: `if s.TryPop(out owned var item) then end;` — item
+// received ownership in the condition and is never discharged. Under #1387 the
+// affine auto-drop rule (§28.3 v0.150) now applies to `out owned var` inline
+// locals that are never discharged: emit a MUST-USE WARNING (not an error) and
+// register scope-end disposal. Before #1387 this was a hard error.
 BEZEL_TEST(out_owned_condition_892, if_cond_drop_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "if s.TryPop(out owned var item) then end; "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "item"));
 }
 
 // §28.3 / #892: `item?.Dispose()` AFTER the if discharges item on both the
@@ -127,16 +130,18 @@ BEZEL_TEST(out_owned_condition_892, if_borrow_form_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 / #860 (REGRESSION — statement form): the statement-level
-// `s.TryPop(out owned var item)` (issue #860) still correctly marks item Owned
-// and rejects a dropped item. Guards against regressing the existing fix.
+// §28.3 / §28.11 / #860 / #1387 (REGRESSION — statement form): the statement-
+// level `s.TryPop(out owned var item)` with an undischarged item now follows
+// the same affine auto-drop rule as the if-condition form (#1387): it emits a
+// must-use WARNING and registers scope-end disposal, not a hard error. The
+// item is still correctly marked Owned (the #860 mark-owned fix is intact).
 BEZEL_TEST(out_owned_condition_892, stmt_form_860_regression_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "s.TryPop(out owned var item); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "item"));
 }
 
 // §28.3 / §28.11 / #860 (REGRESSION — statement form dispose): disposing after

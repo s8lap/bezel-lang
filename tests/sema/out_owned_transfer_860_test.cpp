@@ -26,6 +26,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::parseAndCheckOwnership;
+using bezel::test::hasAutoDropWarning;
 
 namespace {
 
@@ -49,31 +50,22 @@ std::string withMain(const std::string& body) {
         "end C;";
 }
 
-// True iff some diagnostic names `<name>` as an owned value dropped without
-// disposal (the §28.3 owned-local discharge error the out-owned local triggers
-// when undischarged).
-bool hasDropError(const bezel::test::OwnershipResult& r,
-                  const std::string& name) {
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("owned value in `" + name + "`") !=
-                std::string::npos &&
-            d.message.find("without disposal") != std::string::npos)
-            return true;
-    return false;
-}
 
 }  // namespace
 
-// §28.3 / §28.11 / #860 (headline): an `out owned var item` inline local moved
-// out of an OwnedStack via TryPop and then dropped without disposal must be
-// REJECTED. Before the fix this was silently accepted (a leak).
+// §28.3 / §28.11 / #860 / #1387: an `out owned var item` inline local moved out
+// of an OwnedStack via TryPop and then dropped without disposal. Under #1387 the
+// §28.3 v0.150 affine auto-drop rule applies to ALL `out owned var` inline fresh
+// locals (statement-level and if-condition alike): emit a must-use WARNING and
+// register scope-end disposal rather than a hard error.  Before #1387 this was a
+// hard error; before #860 it was silently accepted (a leak).
 BEZEL_TEST(out_owned_transfer_860, trypop_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new OwnedStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
         "var ok := s.TryPop(out owned var item); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "item"));
 }
 
 // §28.3 / §28.11 / #860: the canonical null-safe consumer `item?.Dispose()`
@@ -125,27 +117,32 @@ BEZEL_TEST(out_owned_transfer_860, trypop_returned_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 / #860: OwnedQueue.TryDequeue — out-owned at arg 0 — dropped
-// must be REJECTED (a second built-in family beyond TryPop).
+// §28.3 / §28.11 / #860 / #1387: OwnedQueue.TryDequeue — out-owned at arg 0 —
+// dropped without disposal. As with TryPop (#1387 affine auto-drop), this is now
+// a must-use WARNING with scope-end disposal, not a hard error.  Confirms the
+// `item` is still marked Owned (the #860 mark-owned fix intact) so the must-use
+// path fires, not silent acceptance (the pre-#860 bug).
 BEZEL_TEST(out_owned_transfer_860, trydequeue_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var q := new OwnedQueue<Cell>(); "
         "q.Enqueue(move (new Cell(1))); "
         "var ok := q.TryDequeue(out owned var item); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasDropError(r, "item"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "item"));
 }
 
-// §28.3 / §28.11 / #860: OwnedDictionary.TryPopValue(key, out owned value) —
-// out-owned at arg POSITION 1 (not 0) — dropped must be REJECTED. Guards the
-// per-method argument-index table.
+// §28.3 / §28.11 / #860 / #1387: OwnedDictionary.TryPopValue(key, out owned
+// value) — out-owned at arg POSITION 1 (not 0) — dropped without disposal.
+// Under #1387 affine auto-drop: must-use WARNING, not a hard error. Guards the
+// per-method argument-index table AND confirms `v` is still marked Owned (the
+// #860 mark-owned fix, not the pre-#860 silent-acceptance bug).
 BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
         "using var d := new OwnedDictionary<string, Cell>(); "
         "d.Add(\"a\", move (new Cell(1))); "
         "var ok := d.TryPopValue(\"a\", out owned var v); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasDropError(r, "v"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "v"));
 }
 
 // §28.3 / §28.11 / #860: TryPopValue at arg 1 with a null-safe dispose — the
@@ -159,10 +156,12 @@ BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dispose_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 / #860 (user method): a USER method's `out owned r` parameter
-// is the owned-OUT direction. The receiving local dropped must be REJECTED.
-// Before the fix the `out owned` formal was mis-classified as an owned-IN sink
-// (mis-marking the receiving local moved-from); now it correctly receives.
+// §28.3 / §28.11 / #860 / #1387 (user method): a USER method's `out owned r`
+// parameter is the owned-OUT direction. The receiving local dropped without
+// disposal. Under #1387 affine auto-drop: must-use WARNING, not a hard error.
+// Before the #860 fix, the `out owned` formal was mis-classified as an owned-IN
+// sink — now it correctly receives and marks `got` Owned. Before #1387 that
+// generated a hard error; now it generates the auto-drop warning.
 BEZEL_TEST(out_owned_transfer_860, user_out_owned_param_dropped_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; "
@@ -188,8 +187,8 @@ BEZEL_TEST(out_owned_transfer_860, user_out_owned_param_dropped_rejected) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasDropError(r, "got"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "got"));
 }
 
 // §28.3 / §28.11 / #860 (user method): the same user `out owned` form with a

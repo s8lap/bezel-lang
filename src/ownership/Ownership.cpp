@@ -237,6 +237,29 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             "`return` / `.Dispose()` / `_ := …` to discharge it");
                         continue;
                     }
+                    // §28.3 / #1387: `out owned var x` inline local — ls->decl is
+                    // the IdentifierExpr (not a LocalDecl). Apply affine auto-drop
+                    // so an undischarged inline local gets a warning and scope-end
+                    // disposal rather than a hard error.
+                    // EXCLUDED: while-loop condition items (loopCondOutOwnedSyms_)
+                    // share their slot across iterations — auto-drop only covers the
+                    // FINAL iteration's value, so earlier values would leak; those
+                    // keep the hard §28.3 discharge error.  // per §28.3, #1387
+                    if (dynamic_cast<const ast::IdentifierExpr*>(ls->decl) &&
+                        loopCondOutOwnedSyms_.count(sym) == 0) {
+                        ls->autoDropAtScopeEnd = true;
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned value in `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed at the end of its scope "
+                            "(§28.3 auto-drop); use `item?.Dispose()`, "
+                            "`_ := item`, `move`, or `return` to discharge it "
+                            "explicitly (§28.3/§28.11)");
+                        continue;
+                    }
                 } else if (auto* ps =
                                dynamic_cast<sema::ParameterSymbol*>(sym)) {
                     // §28.3 v0.152 (#1008 Part B, extended to parameters): an
@@ -324,18 +347,40 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
             if (!ls) continue;
             auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-            // Skip a local already flagged by the endState loop (it reaches the
-            // function exit as Owned) — flagging is idempotent but its warning
-            // would duplicate.
-            if (!ld || ld->autoDropAtScopeEnd) continue;
-            const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
-            ctx_.diagnostics().report(
-                Severity::Warning, ld->span.begin,
-                std::string("owned value in `") + std::string(sym->name) +
-                "` is implicitly disposed at the end of its scope "
-                "(§28.3 auto-drop); declare it `using var` to make the scope-bound "
-                "disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` "
-                "to discharge it");
+            if (ld) {
+                // Skip a local already flagged by the endState loop (it reaches the
+                // function exit as Owned) — flagging is idempotent but its warning
+                // would duplicate.
+                if (ld->autoDropAtScopeEnd) continue;
+                const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
+                ctx_.diagnostics().report(
+                    Severity::Warning, ld->span.begin,
+                    std::string("owned value in `") + std::string(sym->name) +
+                    "` is implicitly disposed at the end of its scope "
+                    "(§28.3 auto-drop); declare it `using var` to make the scope-bound "
+                    "disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` "
+                    "to discharge it");
+                continue;
+            }
+            // §28.3 / #1387: `out owned var x` inline local in a NESTED scope —
+            // ls->decl is IdentifierExpr (not LocalDecl). Skip if already flagged by
+            // the endState loop above (warning would duplicate). Excluded when the
+            // declaring call is in a while-loop condition (loopCondOutOwnedSyms_);
+            // those keep the hard §28.3 discharge error (slot is reused each
+            // iteration, auto-drop only covers the FINAL value).  // per §28.3, #1387
+            if (dynamic_cast<const ast::IdentifierExpr*>(ls->decl) &&
+                loopCondOutOwnedSyms_.count(sym) == 0) {
+                if (ls->autoDropAtScopeEnd) continue;
+                ls->autoDropAtScopeEnd = true;
+                ctx_.diagnostics().report(
+                    Severity::Warning,
+                    ls->decl ? ls->decl->span.begin : SourceLocation{},
+                    std::string("owned value in `") + std::string(sym->name) +
+                    "` is implicitly disposed at the end of its scope "
+                    "(§28.3 auto-drop); use `item?.Dispose()`, "
+                    "`_ := item`, `move`, or `return` to discharge it "
+                    "explicitly (§28.3/§28.11)");
+            }
         }
     }
     // Slice O8 / §28.8.1: a `move this.field` leaves the field in
@@ -538,6 +583,29 @@ bool sameFlow(const FlowState& a, const FlowState& b) {
 void collectLocalDecls(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        std::unordered_set<const ast::Node*>& out);
 
+// §28.3 / #1387: scan `e` for `out owned var` call arguments and insert each
+// argument's resolved LocalSymbol into `out`. Used to populate
+// loopCondOutOwnedSyms_ for while-loop condition calls. Requires a SemaContext
+// to resolve the IdentifierExpr argument to its symbol.
+void collectOutOwnedVarSyms(const ast::Expr& e,
+                             sema::SemaContext& ctx,
+                             std::unordered_set<sema::Symbol*>& out) {
+    auto scan = [&](const std::vector<ast::CallArgument>& args) {
+        for (const auto& a : args) {
+            if (a.modifier == "out owned var" && a.value) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get()))
+                    if (sema::Symbol* s = ctx.exprSymbol(*id))
+                        out.insert(s);
+            }
+        }
+    };
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+        scan(ce->args);
+    else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+        scan(nc->args);
+}
+
 // Scan `e` for any CallExpr / NullCondCallExpr that has an `out owned var`
 // argument and insert the argument's IdentifierExpr node into `out`.
 void collectOutOwnedVarArgs(const ast::Expr* e,
@@ -637,7 +705,19 @@ void scanReassignArgs(const std::vector<ast::CallArgument>& args,
                       sema::SemaContext& ctx,
                       std::unordered_set<const sema::Symbol*>& out) {
     for (const auto& a : args) {
-        if (a.value &&
+        // §28.3 / #1387: `out owned var`, `out using var`, `out var` inline
+        // declarations are FRESH locals written AT MOST ONCE per call-site
+        // evaluation — not reassignments of an existing local. Excluding them
+        // from reassignedLocals enables the §28.3 affine auto-drop for these
+        // locals when they are never discharged. (While-loop conditions
+        // overwrite the slot on each iteration; those are blocked separately
+        // via loopCondOutOwnedSyms_ in the dataflow, not here.)
+        // Pre-existing `out` / `out owned` params that refer to a local
+        // already declared BEFORE the call ARE reassignments → keep them.
+        bool isInlineFresh = (a.modifier == "out owned var" ||
+                              a.modifier == "out using var" ||
+                              a.modifier == "out var");
+        if (!isInlineFresh && a.value &&
             a.modifier.find("out") != std::string_view::npos) {
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
@@ -1233,6 +1313,12 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
             // skip-edge entry faithfully represents the state when TryPop
             // returned false (did NOT write item). // per §28.3, #892
             loopSkipExitState_[&block] = FlowState{states_, fieldMovedFrom_};
+            // §28.3 / #1387: while-condition `out owned var` items share the
+            // same slot across ALL iterations (ensureOutVarSlots alreadyMapped).
+            // Auto-drop only disposes the FINAL slot value → earlier iterations'
+            // values would leak. Track these symbols so the auto-drop check in
+            // run() can exclude them (they keep the hard §28.3 discharge error).
+            collectOutOwnedVarSyms(*block.condition, ctx_, loopCondOutOwnedSyms_);
         }
         handleDischarge(*block.condition);
     }
@@ -1333,6 +1419,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
             handleDischarge(*ds->value);
+            // §17.13 / §28.3 / #1387: `_ := top` where `top` is an `out owned var`
+            // inline local (ls->decl is IdentifierExpr) that is currently Owned.
+            // Recognize this as an explicit §17.13 discharge: mark `top` as moved-
+            // from (so the affine auto-drop path does not fire and emit a warning)
+            // and flag the DiscardStmt so codegen emits null-guarded dispose+reclaim
+            // of the local's slot at this statement and nulls the slot.
+            // Restricted to IdentifierExpr-decl locals (the `out owned var` inline
+            // form) — regular LocalDecl locals go through the auto-drop path which
+            // is already correct. // per §17.13, §28.3, §28.11
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                    ds->value.get())) {
+                auto* dstate = lookupState(id->name);
+                if (dstate && dstate->state == OwnershipState::Owned) {
+                    // Find the symbol to confirm it is an `out owned var` inline
+                    // local (LocalSymbol with IdentifierExpr decl).
+                    sema::LocalSymbol* dls = nullptr;
+                    for (auto& [sym, st] : states_) {
+                        if (sym->name == id->name) {
+                            dls = dynamic_cast<sema::LocalSymbol*>(sym);
+                            break;
+                        }
+                    }
+                    if (dls && dynamic_cast<const ast::IdentifierExpr*>(
+                                   dls->decl)) {
+                        markMovedByName(id->name, id->span.begin);
+                        const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
+                            true;
+                    }
+                }
+            }
             // §17.13 / §28.3 v0.150 (#1009): a discard `_ := <owned producer>` of
             // a USER class/interface is an *unbound owned temporary* (§28.3) — it
             // is disposed at end-of-statement. Mark it so codegen emits that

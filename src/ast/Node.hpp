@@ -263,6 +263,14 @@ struct DiscardStmt : Stmt {
     // marks the source as transferred so its scope-end disposal is skipped
     // (no double-free).
     bool disposeInlineOwnedArray = false;
+    // §17.13 / §28.3 / #1387: set by the ownership pass when `value` is a plain
+    // IdentifierExpr referencing an `out owned var` inline local that is currently
+    // Owned — a legal §17.13 discard-discharge. The discard consumes the value:
+    // codegen emits null-guarded dispose+reclaim of the local's slot at this
+    // statement and nulls the slot (so the exception-path unwindOnly disposal is a
+    // no-op). Distinct from disposeOwnedValue (fresh-producer path) which stores to
+    // a separate alloca and does not null the original slot.
+    bool discardOutOwnedVar = false;
 };
 
 // A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.

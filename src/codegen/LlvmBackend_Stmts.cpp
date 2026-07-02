@@ -1294,7 +1294,33 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
-            if (ds->disposeOwnedValue) {
+            if (ds->discardOutOwnedVar) {
+                // §17.13 / §28.3 / #1387 (Item 2a): `_ := top` where `top` is an
+                // `out owned var` inline local recognized as a §17.13 discharge by
+                // the ownership pass. Emit null-guarded dispose+reclaim of the
+                // local's slot and null it so the exception-path unwindOnly disposal
+                // (registered by ensureOutVarSlots) is a no-op after this point.
+                // Uses explicitDisposeOwnedReceiverSlot to find the slot address
+                // (the same path as `top?.Dispose()` / `top.Dispose()`).
+                llvm::Type* slotTy = nullptr;
+                llvm::Value* slotAddr =
+                    explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);
+                if (slotAddr && !diverged_) {
+                    llvm::Value* obj = builder_.CreateLoad(ptrTy(), slotAddr);
+                    auto* nullVal = llvm::ConstantPointerNull::get(ptrTy());
+                    auto* isNull  = builder_.CreateICmpEQ(obj, nullVal);
+                    auto* dispBB  = llvm::BasicBlock::Create(
+                        llvm_, "disc.disp", currentFn_);
+                    auto* contBB  = llvm::BasicBlock::Create(
+                        llvm_, "disc.cont", currentFn_);
+                    builder_.CreateCondBr(isNull, contBB, dispBB);
+                    builder_.SetInsertPoint(dispBB);
+                    emitDisposeAndReclaim(obj);
+                    builder_.CreateStore(nullVal, slotAddr);
+                    builder_.CreateBr(contBB);
+                    builder_.SetInsertPoint(contBB);
+                }
+            } else if (ds->disposeOwnedValue) {
                 // §17.13 / §28.3 v0.150 (#1009): the ownership pass classified
                 // this discard's value as an owned PRODUCER of a user class/
                 // interface — an unbound owned temporary. Dispose it at the end
@@ -2268,6 +2294,23 @@ bool Emitter::lowerIf(const ast::IfStmt& ifs) {
         return mergeBB;
     };
 
+    // #1387 Item 1 / §28.11 / §22.4: push a dedicated condition scope so
+    // out-inline locals declared in an if/elif CONDITION (e.g.
+    // `if s.TryPop(out using var top)`) are disposed at the END of the
+    // if-statement, not at the end of the enclosing block.
+    //
+    // ensureOutVarSlots (called inside lowerExpr for the condition call)
+    // registers each out-inline local's disposal into disposeStack_.back().
+    // Without this scope they land in the OUTER block's scope and are never
+    // disposed until the outer block exits — causing a leak (return 122
+    // instead of 121 in the test). With this scope:
+    //   • normal-exit (merge): emitDisposals fires at the if's end → correct.
+    //   • terminating paths (return/throw): emitAllDisposals includes this
+    //     scope → correct (no disposal missed, no double-free).
+    // The dynamicDispose entries are null-guarded, so paths where TryPop
+    // returned false (slot null) are always safe.  // per §28.3, §22.4, §28.11
+    disposeStack_.emplace_back();  // condition scope
+
     // The if-branch and each elif form a (condition, body) test chain.
     std::vector<const ast::IfStmt::Branch*> chain;
     chain.push_back(&ifs.ifBranch);
@@ -2303,8 +2346,17 @@ bool Emitter::lowerIf(const ast::IfStmt& ifs) {
 
     if (mergeBB) {
         builder_.SetInsertPoint(mergeBB);
+        // Dispose any out-inline locals from the condition scope at the
+        // if-statement's end (normal-exit path). Paths that terminated
+        // (return/throw) already emitted these via emitAllDisposals; the
+        // null-guard in dynamicDispose makes the slot-null paths safe.
+        emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
         return false;
     }
+    // All paths terminated; each branch's emitAllDisposals already included
+    // the condition scope. Just pop it to restore the stack.
+    disposeStack_.pop_back();
     return allPathsTerminate;
 }
 
