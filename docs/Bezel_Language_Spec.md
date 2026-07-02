@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.163 — July 2026**
+**Version 0.164 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -130,6 +130,12 @@ import System.Collections.Generic;
 
 `import` makes the public names of the named module visible in the current file. Imports are file-scoped: an import in one file has no effect on other files in the same module.
 
+**Aliases (v0.164).** An import may bind a file-scoped alias: `import BankingApp.Transactions as Tx;` — thereafter `Tx.Ledger` names that module's public `Ledger`. The alias is an additional *qualifier*, not a rename: the module's publics are still visible by bare name (subject to the collision rule below), and the full dotted module name also remains usable as a qualifier (`BankingApp.Transactions.Ledger`). An alias may not collide with another alias, an imported module's name segment in qualifier position, or a type declared in the file's module.
+
+**Collisions (v0.164).** When two imported modules export the same public name, the **bare** name is ambiguous: using it unqualified is a compile error citing both origins; the fix is qualification (full module name or alias). Imports never shadow one another, and import order is immaterial. A declaration in the *current module* shadows any same-named import for bare-name purposes (the import stays reachable by qualifier) — the same shadowing already specified for auto-imported names ([§2.3](#sec-always-available-names)).
+
+**Qualified access (v0.164).** `SomeModule.Name.Type` and `Alias.Type` are admissible wherever a type or static-member root is expected; resolution order for dotted names is defined in [§2.7](#sec-name-resolution-order).
+
 <a id="sec-always-available-names"></a>
 ### 2.3 Always-available names
 
@@ -158,9 +164,9 @@ The module is the unit of compilation. The compiler takes all source files belon
 <a id="sec-dependency-resolution"></a>
 ### 2.5 Dependency resolution
 
-Dependencies are declared through `import` statements. The compiler resolves each dependency by reading the imported module's compiled artifact, which embeds public-interface metadata (type signatures, method signatures, generic constraints).
+Dependencies are declared through `import` statements. In the acyclic case the compiler resolves each dependency by reading the imported module's compiled artifact, which embeds public-interface metadata (type signatures, method signatures, generic constraints).
 
-Circular type-level dependencies between modules are permitted. Circular static-initialization dependencies are not; the compiler detects and rejects them.
+**Circular imports compile as one unit (v0.164 — previously this section permitted circularity while also requiring artifact-based resolution, which are jointly impossible: neither of two mutually-importing modules could be compiled first).** Modules whose imports form a cycle constitute a **strongly-connected component**, and an SCC is the unit of compilation: the build supplies the sources of all SCC members to one compiler invocation, which resolves their types against each other directly (no artifacts consumed within the SCC) and still emits one artifact per member module. A build that presents only part of an SCC is an error naming the missing members. Between SCCs, resolution is artifact-based as above; the module dependency graph condensed by SCCs is processed in topological order. Circular *static-initialization* dependencies remain rejected regardless of compilation grouping ([§22.13](#sec-static-initialization-order)).
 
 <a id="sec-build-phases"></a>
 ### 2.6 Build phases
@@ -171,6 +177,16 @@ Circular type-level dependencies between modules are permitted. Circular static-
 4. Generate native code; emit the artifact with embedded interface metadata.
 
 Build-tool integration and project-file format are implementation-defined.
+
+<a id="sec-name-resolution-order"></a>
+### 2.7 Name resolution for dotted names (v0.164)
+
+A dotted name `A.B` (and longer chains) can in principle read as a module-qualified type, a nested type ([§11.6](#sec-nested-types)), an enum constant or named `const` ([A.8](#sec-appendix-a-statements)), or a static-member access ([§22.12](#sec-static-members)). Resolution is **leftmost-first and type-wins**, with no backtracking:
+
+1. **Resolve the leftmost segment `A` as a bare name**: local scope, then the current module's declarations, then unambiguous imported bare names (per [§2.2](#sec-imports)'s collision rule), then import **aliases**. If `A` resolves to a *type*, the rest of the chain resolves against that type (nested type, enum constant, static member — each segment in turn). If it resolves to a *value* (a local, field, or property), the chain is member access.
+2. **Otherwise, match the longest dotted prefix of the chain against an imported module's full name** (or the current module's). The remainder then resolves against that module's public declarations, continuing as in rule 1. A prefix matching *no* import is an error at `A` (naming the unresolved segment, and — when a non-imported module of that name is known to the build — suggesting the missing `import`).
+
+Consequences worth stating: a type named `A` in scope **shadows** a module-name prefix `A.…` for chain purposes (the compiler warns when both readings exist — qualify via an alias to reach the module); two module prefixes cannot be ambiguous (module names are exact); and because resolution never backtracks, the meaning of a chain is determined by its shortest resolvable head — adding an unrelated import can make a previously-erroring chain resolve, but can never silently *change* a chain that already resolved (rule 1 outranks rule 2, and rule-1 resolutions are collision-checked).
 
 ---
 
@@ -7548,7 +7564,9 @@ InterpPart      ::= "{" Expression ("," "-"? IntLiteral)? (":" FormatSpec)? "}"
 ```
 SourceFile      ::= ModuleDecl Import* TopDecl*
 ModuleDecl      ::= "module" QualifiedName ";"
-Import          ::= "import" QualifiedName ";"
+Import          ::= "import" QualifiedName ("as" Identifier)? ";"
+                              /* alias (v0.164): a file-scoped qualifier for the
+                                 imported module (§2.2). */
 QualifiedName   ::= Identifier ("." Identifier)*
 
 TopDecl         ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl

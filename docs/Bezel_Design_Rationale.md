@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.163 — July 2026**
+**Companion to the Bezel Language Specification, v0.164 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7385,6 +7385,19 @@ v0.163 is the **domains-and-system revision**: the statics side door closes, ter
 
 #### Migration
 Tightenings: mutable non-synchronized statics become errors (the sanctioned shapes: synchronized types, readonly immutables, or domain-confined design); capturing/bound FFI callbacks become errors (pass state through the C user-data pointer). `WhenAny`-era note: none. Compiler alignment rides waves 4–5 (statics checks, static-event sync, snapshot raise, FFI admission flip, exit-code path).
+
+<a id="sec-v0-163-to-v0-164-changelog"></a>
+### v0.164 changelog (v0.163 → v0.164)
+
+v0.164 is the **module-system revision** — §2 grows from ~70 lines to a real chapter, closing the review's one chapter-sized hole (#1365).
+
+- **Circular imports compile as one unit** (§2.5): import cycles form strongly-connected components; an SCC is the compilation unit (sources compiled together, one artifact per member still emitted; partial-SCC builds are errors naming the missing members); between SCCs resolution stays artifact-based in condensed topological order. This replaces the jointly-impossible pair "resolution reads compiled artifacts" + "circular type-level imports are permitted".
+- **Import aliases** (§2.2 + A.1): `import M.N as X;` — a file-scoped qualifier; bare names and the full module name stay usable.
+- **Collision rule** (§2.2): same public name from two imports ⇒ the bare name is ambiguous (error citing both; qualify or alias); imports never shadow one another; current-module declarations shadow imports for bare-name purposes.
+- **Dotted-name resolution** (new §2.7): leftmost-first, type-wins, no backtracking; longest-module-prefix fallback; shadowing warning when a type and module prefix compete; adding an import can un-error a chain but never silently re-mean one.
+
+#### Migration
+Additive except the collision rule, which turns silent first-import-wins behavior (where an implementation had any) into an explicit ambiguity error. Compiler alignment (alias parse, ambiguity diagnostic, §2.7 order, SCC build mode) is a wave-5 lane with probe-first discipline — the implementation's current behavior for each corner is measured before changing it.
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)
