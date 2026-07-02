@@ -209,6 +209,21 @@ private:
     // are implicitly static), and nested types are permitted.
     void checkStaticClassMembers();
     void checkStaticIndexers();  // §23.5: static indexers are not supported
+
+    // §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains enforcement.
+    //   Rule 2: a mutable (non-readonly, non-const) static field or static
+    //     auto-property whose resolved type is a user-declared class or
+    //     interface is a compile error unless the type is in the compiler-known
+    //     internally-synchronized set (Mutex, Semaphore, Atomic<T>,
+    //     AtomicInteger<T>, Channel<T>, ChannelSender<T>).
+    //   Rule 4: a static readonly field/auto-property of user-declared class or
+    //     interface type emits a declaration-site warning unless the type is in
+    //     the synchronized set.
+    //   Primitive value types, string, enums, and records are not checked here
+    //   (Rule 3 makes them unrestricted; the Rule 2 extension to primitive
+    //   value types is tracked as #1363-followup).
+    void checkStaticFieldDomains();
+    void checkTypeStaticFieldDomains(TypeSymbol* t);
     void checkOperatorGroups();  // §25.2: comparison/equality operator groups
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
     void checkEqualsHashCodePairing();

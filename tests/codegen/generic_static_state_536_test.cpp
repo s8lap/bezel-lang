@@ -317,6 +317,10 @@ BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_two_insta
 // Concrete non-generic static owned field on a non-generic class must still work
 // after the #1116 change (no regression on the non-generic path).
 // Per §22.8 (static fields) / §28.5 (owned fields).
+// Updated for §22.12 rule 2 (v0.163, #1363): a mutable static class field is a
+// compile error; the field uses `static owned readonly` with a static initializer
+// instead — exercising the same ownership/disposal path (§28.5) under rule 4
+// (warning-only, not an error, for static readonly class fields).
 BEZEL_TEST(codegen_generic_static_536, concrete_static_owned_field_unaffected_22_8_28_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -326,12 +330,11 @@ BEZEL_TEST(codegen_generic_static_536, concrete_static_owned_field_unaffected_22
         "  public method Val(): int => _v; "
         "end Cell; "
         "class Store "
-        "  public static owned item: Cell?; "
+        "  public static owned readonly item: Cell := new Cell(42); "
         "end Store; "
         "class C "
         "  public static method Main(): int "
-        "    Store.item := new Cell(42); "
-        "    return Store.item!.Val(); "
+        "    return Store.item.Val(); "
         "  end Main; "
         "end C;"), 42);
 }

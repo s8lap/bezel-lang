@@ -227,10 +227,14 @@ const char* kOwnedCallClass =
 // destructor must NOT run here (it is process-bound static state). Count stays
 // 0. This guards against over-disposal (which would double-free the shared
 // instance). No LSan leg — the shared static R intentionally outlives main.
+// §22.12 rule 2 (v0.163, #1363): mutable static class-typed fields are
+// compile errors; _shared uses `static readonly` instead (never reassigned
+// after init). Rule 4 emits a warning for the singleton pattern, which is
+// expected and does not prevent compilation.
 const char* kBorrowCallNotDisposed =
     "module M; class R "
     "  public static _n: int := 0; "
-    "  public static _shared: R := new R(); "
+    "  public static readonly _shared: R := new R(); "
     "  destructor _n := _n + 1; end destructor; "
     "  public static method Get(): R => _shared; "
     "  public static method Main(): int "

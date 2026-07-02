@@ -3635,4 +3635,140 @@ void Resolver::checkSerializationEligibility() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains checks.
+// ---------------------------------------------------------------------------
+
+// True when `rt` is a compiler-known internally-synchronized type per §22.12:
+//   Mutex, Semaphore, Atomic<T>, AtomicInteger<T>, Channel<T>, ChannelSender<T>
+// These are the only class-typed mutable static fields the spec admits (rule 2)
+// and the types for which the rule 4 warning is suppressed.
+static bool isInSynchronizedSet(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name ||
+        rt->astNode->name->parts.empty())
+        return false;
+    std::string_view n = rt->astNode->name->parts[0];
+    return n == "Mutex" || n == "Semaphore" ||
+           n == "Atomic" || n == "AtomicInteger" ||
+           n == "Channel" || n == "ChannelSender";
+}
+
+// True when `rt` is a user-declared class or interface type (possibly nullable).
+// These are the reference types targeted by §22.12 rules 2 and 4.
+// Excludes primitives, enums, records, and value-builtin types (all covered by
+// Rule 3's "unrestricted" grant).
+static bool isUserClassOrInterface(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    auto k = rt->declaration->kind;
+    return k == ast::TypeDeclKind::Class ||
+           k == ast::TypeDeclKind::Interface;
+}
+
+void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        // Check FieldSymbol (body fields, not positional record fields).
+        if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+            if (!hasMod(fs, "static")) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) continue;
+
+            const TypeRef* rt = ctx_.resolvedType(*fd->type);
+            if (!rt) continue;
+
+            bool isReadonly = hasMod(fs, "readonly");
+
+            if (!isReadonly) {
+                // §22.12 rule 2 (v0.163, #1363): a mutable static field of a
+                // user-declared class or interface type is a compile error unless
+                // the type is in the compiler-known internally-synchronized set.
+                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("mutable static field `") +
+                        std::string(fs->name) + "` has type `" +
+                        std::string(rt->declaration->name) +
+                        "` which is not in the compiler-known internally-"
+                        "synchronized set; a mutable static field of class or "
+                        "interface type must be Mutex, Semaphore, Atomic<T>, "
+                        "AtomicInteger<T>, Channel<T>, or ChannelSender<T> "
+                        "(§22.12 rule 2, #1363)");
+                }
+            } else {
+                // §22.12 rule 4 (v0.163, #1363): a static readonly field of
+                // user-declared class or interface type is admitted with a
+                // declaration-site warning unless the type is in the synchronized
+                // set — the referenced instance is process-global and reachable
+                // from every domain.
+                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
+                    ctx_.diagnostics().report(
+                        Severity::Warning, m->declLoc,
+                        std::string("static readonly field `") +
+                        std::string(fs->name) + "` has class type `" +
+                        std::string(rt->declaration->name) +
+                        "` which is reachable from every domain; confine its "
+                        "use to one domain or ensure its own internal "
+                        "synchronization (§22.12 rule 4, #1363)");
+                }
+            }
+            continue;
+        }
+
+        // Check static auto-properties (PropertySymbol with Auto body).
+        if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+            if (ps->isIndexer || !hasMod(ps, "static")) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd || pd->isIndexer ||
+                pd->bodyKind != ast::PropertyBodyKind::Auto ||
+                !pd->type)
+                continue;
+
+            const TypeRef* rt = ctx_.resolvedType(*pd->type);
+            if (!rt) continue;
+
+            bool isReadonly = hasMod(ps, "readonly");
+
+            if (!isReadonly) {
+                // §22.12 rule 2: mutable static auto-property of user
+                // class/interface type.
+                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("mutable static property `") +
+                        std::string(ps->name) + "` has type `" +
+                        std::string(rt->declaration->name) +
+                        "` which is not in the compiler-known internally-"
+                        "synchronized set; a mutable static auto-property of "
+                        "class or interface type must be Mutex, Semaphore, "
+                        "Atomic<T>, AtomicInteger<T>, Channel<T>, or "
+                        "ChannelSender<T> (§22.12 rule 2, #1363)");
+                }
+            } else {
+                // §22.12 rule 4: static readonly auto-property of user
+                // class/interface type.
+                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
+                    ctx_.diagnostics().report(
+                        Severity::Warning, m->declLoc,
+                        std::string("static readonly property `") +
+                        std::string(ps->name) + "` has class type `" +
+                        std::string(rt->declaration->name) +
+                        "` which is reachable from every domain; confine its "
+                        "use to one domain or ensure its own internal "
+                        "synchronization (§22.12 rule 4, #1363)");
+                }
+            }
+        }
+    }
+}
+
+void Resolver::checkStaticFieldDomains() {
+    for (const auto& sym : ctx_.symbols()) {
+        auto* t = dynamic_cast<TypeSymbol*>(sym.get());
+        if (!t) continue;
+        checkTypeStaticFieldDomains(t);
+    }
+}
+
 }  // namespace bezel::sema

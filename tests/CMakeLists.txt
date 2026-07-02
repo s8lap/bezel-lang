@@ -175,6 +175,7 @@ set(BEZEL_TEST_SOURCES
     sema/nested_type_upcast_test.cpp
     sema/method_body_presence_test.cpp
     sema/static_virtual_test.cpp
+    sema/static_field_domains_1363_test.cpp
     sema/async_abstract_test.cpp
     sema/await_typing_test.cpp
     sema/async_lambda_diagnostic_test.cpp

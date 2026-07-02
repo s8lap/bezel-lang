@@ -56,9 +56,12 @@ BEZEL_TEST(static_init_main_owner_917, own_class_static_owned_fields_constructed
         "  public constructor() Cell.n := Cell.n + 1; end constructor; "
         "  destructor Cell.n := Cell.n - 1; end destructor; "
         "end Cell; "
+        // §22.12 rule 2 (v0.163, #1363): mutable static class fields are
+        // errors; `readonly` is required. Static initializers still run at
+        // first-use so Cell.n == 2 when Main executes (§22.13).
         "class C "
-        "  public static owned c1: Cell := new Cell(); "
-        "  public static owned c2: Cell := new Cell(); "
+        "  public static owned readonly c1: Cell := new Cell(); "
+        "  public static owned readonly c2: Cell := new Cell(); "
         "  public static method Main(): int "
         "    return Cell.n; "
         "  end Main; "
