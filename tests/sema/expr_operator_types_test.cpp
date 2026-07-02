@@ -273,7 +273,7 @@ BEZEL_TEST(sema_ops, is_test_is_bool) {
 BEZEL_TEST(sema_ops, case_expression_takes_arm_type) {
     auto r = parseSema(
         "module M; class C public method M(k: int, a: N, b: N) "
-        "  _ := case k 1 => a, _ => b, end; "
+        "  _ := case k of 1 => a, _ => b, end; "
         "end M; end C; class N end N;");
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);

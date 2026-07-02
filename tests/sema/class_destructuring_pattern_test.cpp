@@ -62,7 +62,7 @@ BEZEL_TEST(sema_class_destruct, class_positional_pattern_in_case_expr_spec_19_3)
         "class C public static method Main(): int "
         "  using var c := new Circle(5); "
         "  var shape: Shape := c; "
-        "  return case shape "
+        "  return case shape of "
         "    Circle(_) => 1, "
         "    _ => 0 "
         "  end; "
@@ -85,7 +85,7 @@ BEZEL_TEST(sema_class_destruct, class_multi_subpat_in_case_expr_spec_19_3) {
         "class C public static method Main(): int "
         "  using var d := new Dog(\"Rex\", 3); "
         "  var obj: Dog := d; "
-        "  return case obj "
+        "  return case obj of "
         "    Dog(_, _) => 1, "
         "    _ => 0 "
         "  end; "
@@ -106,7 +106,7 @@ BEZEL_TEST(sema_class_destruct, class_positional_pattern_in_case_stmt_spec_19_3)
         "class C public static method Main(): int "
         "  using var a := new Animal(\"meow\"); "
         "  var x: int := 0; "
-        "  case a "
+        "  case a of "
         "    Animal(_) => x := 1 "
         "  end; "
         "  return x; "
@@ -140,7 +140,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_over_binding_expr_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p Pt(x, y, z) => 1, _ => 0 end; "
+        "  return case p of Pt(x, y, z) => 1, _ => 0 end; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasArityDiag(r));
@@ -154,7 +154,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_over_binding_stmt_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); var r := 0; "
-        "  case p Pt(x, y, z) => r := 1 end; "
+        "  case p of Pt(x, y, z) => r := 1 end; "
         "  return r; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -168,7 +168,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_under_binding_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p Pt(x) => 1, _ => 0 end; "
+        "  return case p of Pt(x) => 1, _ => 0 end; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasArityDiag(r));
@@ -181,7 +181,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_correct_arity_ok_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p Pt(x, y) => x + y, _ => 0 end; "
+        "  return case p of Pt(x, y) => x + y, _ => 0 end; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(!hasArityDiag(r));
 }
@@ -202,7 +202,7 @@ BEZEL_TEST(sema_class_destruct, class_type_test_pattern_ok_spec_19_3) {
         "class C public static method Main(): int "
         "  using var c := new Circle(5); "
         "  var shape: Shape := c; "
-        "  return case shape "
+        "  return case shape of "
         "    Circle => 1, "
         "    _ => 0 "
         "  end; "
@@ -224,7 +224,7 @@ BEZEL_TEST(sema_class_destruct, class_typed_binding_pattern_ok_spec_19_3) {
         "class C public static method Main(): int "
         "  using var c := new Circle(5); "
         "  var shape: Shape := c; "
-        "  return case shape "
+        "  return case shape of "
         "    var c: Circle => c._r, "
         "    _ => 0 "
         "  end; "
@@ -243,7 +243,7 @@ BEZEL_TEST(sema_class_destruct, record_destructuring_still_ok_spec_19_3) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(3, 4); "
-        "  return case p "
+        "  return case p of "
         "    Point(x, y) => x + y, "
         "    _ => 0 "
         "  end; "
@@ -259,7 +259,7 @@ BEZEL_TEST(sema_class_destruct, record_destructuring_with_discard_ok_spec_19_3) 
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(10, 20); "
-        "  return case p "
+        "  return case p of "
         "    Point(_, y) => y, "
         "    _ => 0 "
         "  end; "

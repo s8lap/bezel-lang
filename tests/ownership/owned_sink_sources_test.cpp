@@ -357,7 +357,7 @@ BEZEL_TEST(owned_sink_sources, destructure_binding_into_owned_arg_rejected_1280)
         "class Prog "
         "  public static method Sink(owned w: Widget) end Sink; "
         "  public static method Use(b: Box) "
-        "    case b Box(a) => Prog.Sink(a) end; "
+        "    case b of Box(a) => Prog.Sink(a) end; "
         "  end Use; "
         "end Prog;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -371,7 +371,7 @@ BEZEL_TEST(owned_sink_sources, borrow_param_into_owned_arg_in_case_arm_rejected_
         "class Prog "
         "  public static method Sink(owned w: Widget) end Sink; "
         "  public static method Use(p: Widget, n: int) "
-        "    case n 0 => Prog.Sink(p), _ => do end, end; "
+        "    case n of 0 => Prog.Sink(p), _ => do end, end; "
         "  end Use; "
         "end Prog;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -384,7 +384,7 @@ BEZEL_TEST(owned_sink_sources, destructure_binding_read_in_arm_accepted_1280) {
         "module M; record Inner(v: int); record Outer(i: Inner); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(9)); "
-        "  return case o Outer(Inner(x)) => x, _ => 0, end; "
+        "  return case o of Outer(Inner(x)) => x, _ => 0, end; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -397,7 +397,7 @@ BEZEL_TEST(owned_sink_sources, owned_move_into_owned_arg_in_case_arm_accepted_12
         "class Prog "
         "  public static method Sink(owned w: Widget) end Sink; "
         "  public static method Use(n: int) "
-        "    case n 0 => do var w := new Widget(); Prog.Sink(move w); end, "
+        "    case n of 0 => do var w := new Widget(); Prog.Sink(move w); end, "
         "           _ => do end, end; "
         "  end Use; "
         "end Prog;");
@@ -414,7 +414,7 @@ BEZEL_TEST(owned_sink_sources, destructure_binding_into_owned_arg_case_expr_reje
         "class Prog "
         "  public static method Sink(owned w: Widget): int return 0; end Sink; "
         "  public static method Use(b: Box): int "
-        "    return case b Box(a) => Prog.Sink(a), _ => -1, end; "
+        "    return case b of Box(a) => Prog.Sink(a), _ => -1, end; "
         "  end Use; "
         "end Prog;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -428,7 +428,7 @@ BEZEL_TEST(owned_sink_sources, owned_new_into_owned_arg_case_expr_accepted_1284)
         "class Prog "
         "  public static method Sink(owned w: Widget): int return 0; end Sink; "
         "  public static method Use(n: int): int "
-        "    return case n 0 => Prog.Sink(new Widget()), _ => -1, end; "
+        "    return case n of 0 => Prog.Sink(new Widget()), _ => -1, end; "
         "  end Use; "
         "end Prog;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

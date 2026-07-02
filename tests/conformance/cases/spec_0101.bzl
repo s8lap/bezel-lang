@@ -1,4 +1,4 @@
-var description := case score
+var description := case score of
   > 90 => "excellent",
   > 70 => "good",
   > 50 => "passing",

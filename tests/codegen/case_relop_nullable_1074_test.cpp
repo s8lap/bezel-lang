@@ -23,7 +23,7 @@ int run(const std::string& prog) {
 std::string caseProg(const std::string& init, const std::string& arm) {
     return std::string("module M; class C public static method Main(): int "
                        "  var n: int? := ") + init + "; "
-           "  var r := case n " + arm + ", _ => 2 end; "
+           "  var r := case n of " + arm + ", _ => 2 end; "
            "  return r; end Main; end C;";
 }
 }  // namespace
@@ -60,7 +60,7 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n: int? := 10; "
-        "  var r := case n > 100 => 1, 10 => 5, _ => 2 end; "
+        "  var r := case n of > 100 => 1, 10 => 5, _ => 2 end; "
         "  return r; end Main; end C;"), 5);  // 10 not >100; matches constant 10
 }
 

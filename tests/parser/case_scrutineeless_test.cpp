@@ -189,7 +189,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Block-body method so extractExpr (stmts[0]) works correctly.
     auto r = parseAll(
         "module M; class C public method M(x: int): int "
-        "_ := case x 1 => 10, _ => 0 end"
+        "_ := case x of 1 => 10, _ => 0 end"
         "; end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* e = extractExpr(r);
@@ -213,7 +213,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Note: `p` would be unresolved in sema; parser test only checks parse shape.
     auto r = parseAll(
         "module M; class C public method M(p: int) "
-        "case p "
+        "case p of "
         "  Low => Console.WriteLine(\"low\"), "
         "  Medium, High => Console.WriteLine(\"medium or high\") "
         "end; "
@@ -240,7 +240,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     //   case month  1 => Console.WriteLine("Jan"),  _ => Console.WriteLine("Other")  end;
     auto r = parseAll(
         "module M; class C public method M(month: int) "
-        "case month "
+        "case month of "
         "  1 => Console.WriteLine(\"Jan\"), "
         "  _ => Console.WriteLine(\"Other\") "
         "end; "
@@ -253,7 +253,7 @@ BEZEL_TEST(parser_case_scrutineeless,
            stmt_case_expr_arm_body_with_semicolon_spec_19_2) {
     auto r = parseAll(
         "module M; class C public method M(x: int) "
-        "case x "
+        "case x of "
         "  1 => Console.WriteLine(\"one\");, "
         "  _ => Console.WriteLine(\"other\"); "
         "end; "
@@ -268,7 +268,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // The fix only suppresses TypePattern when followed by `(`.
     auto r = parseAll(
         "module M; class C public method M() _ := "
-        "case x int => 1, string => 2, _ => 0 end"
+        "case x of int => 1, string => 2, _ => 0 end"
         "; end M; end C;");
     // Note: `x` is unresolved in parser-only test; we just check parse success.
     // The test verifies the TypePattern branch still fires for bare `int`.

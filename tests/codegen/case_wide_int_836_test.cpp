@@ -31,13 +31,13 @@ std::string mainOf(const std::string& body) {
 // §19.3: a `long` constant pattern matches (was a compiler abort, rc=134).
 BEZEL_TEST(case_wide_int_836, long_constant_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: long := 5L; return case x 5L => 1, _ => 2 end;")), 1);
+        "var x: long := 5L; return case x of 5L => 1, _ => 2 end;")), 1);
 }
 
 // The non-matching arm falls through to `_`.
 BEZEL_TEST(case_wide_int_836, long_constant_no_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: long := 9L; return case x 5L => 1, _ => 2 end;")), 2);
+        "var x: long := 9L; return case x of 5L => 1, _ => 2 end;")), 2);
 }
 
 // A `long` constant exceeding i32 must NOT be truncated to i32 before the
@@ -45,38 +45,38 @@ BEZEL_TEST(case_wide_int_836, long_constant_no_match) {
 BEZEL_TEST(case_wide_int_836, long_wide_constant_not_truncated) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var x: long := 5000000000L; "
-        "return case x 5000000000L => 1, _ => 2 end;")), 1);
+        "return case x of 5000000000L => 1, _ => 2 end;")), 1);
 }
 
 // A `long` range whose bounds exceed i32.
 BEZEL_TEST(case_wide_int_836, long_wide_range) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var x: long := 5000000000L; "
-        "return case x 4000000000L..6000000000L => 1, _ => 2 end;")), 1);
+        "return case x of 4000000000L..6000000000L => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a `short` constant pattern (i16 scrutinee, i32-default constant).
 BEZEL_TEST(case_wide_int_836, short_constant_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: short := 5; return case x 5 => 1, _ => 2 end;")), 1);
+        "var x: short := 5; return case x of 5 => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: an `sbyte` constant pattern (i8 scrutinee).
 BEZEL_TEST(case_wide_int_836, sbyte_constant_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: sbyte := 5; return case x 5 => 1, _ => 2 end;")), 1);
+        "var x: sbyte := 5; return case x of 5 => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a `byte` constant pattern (unsigned i8 scrutinee).
 BEZEL_TEST(case_wide_int_836, byte_constant_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: byte := 200; return case x 200 => 1, _ => 2 end;")), 1);
+        "var x: byte := 200; return case x of 200 => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a `ulong` constant pattern (unsigned i64 scrutinee).
 BEZEL_TEST(case_wide_int_836, ulong_constant_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: ulong := 5UL; return case x 5UL => 1, _ => 2 end;")), 1);
+        "var x: ulong := 5UL; return case x of 5UL => 1, _ => 2 end;")), 1);
 }
 
 // A `ulong` value above 2^63 in a range pattern: the comparison must be
@@ -85,49 +85,49 @@ BEZEL_TEST(case_wide_int_836, ulong_constant_match) {
 BEZEL_TEST(case_wide_int_836, ulong_high_bit_range_unsigned) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var x: ulong := 10000000000000000000UL; "
-        "return case x 9000000000000000000UL..11000000000000000000UL => 1, "
+        "return case x of 9000000000000000000UL..11000000000000000000UL => 1, "
         "_ => 2 end;")), 1);
 }
 
 // §19.3: a `ushort` constant pattern.
 BEZEL_TEST(case_wide_int_836, ushort_constant_match) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: ushort := 7; return case x 7 => 1, _ => 2 end;")), 1);
+        "var x: ushort := 7; return case x of 7 => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a relational pattern on a `long` with a wide bound.
 BEZEL_TEST(case_wide_int_836, long_relop_wide_bound) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var x: long := 5000000000L; "
-        "return case x > 4000000000L => 1, _ => 2 end;")), 1);
+        "return case x of > 4000000000L => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a relational pattern on an unsigned `byte` scrutinee.
 BEZEL_TEST(case_wide_int_836, byte_relop_unsigned) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: byte := 200; return case x >= 100 => 1, _ => 2 end;")), 1);
+        "var x: byte := 200; return case x of >= 100 => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a `long` range pattern (closed) matches a value inside it.
 BEZEL_TEST(case_wide_int_836, long_range_inside) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: long := 5L; return case x 1L..10L => 1, _ => 2 end;")), 1);
+        "var x: long := 5L; return case x of 1L..10L => 1, _ => 2 end;")), 1);
 }
 
 // §19.3: a `long` range pattern excludes a value outside it.
 BEZEL_TEST(case_wide_int_836, long_range_outside) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: long := 50L; return case x 1L..10L => 1, _ => 2 end;")), 2);
+        "var x: long := 50L; return case x of 1L..10L => 1, _ => 2 end;")), 2);
 }
 
 // Regression: an ordinary `int` constant pattern still works.
 BEZEL_TEST(case_wide_int_836, int_constant_regression) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: int := 5; return case x 5 => 1, _ => 2 end;")), 1);
+        "var x: int := 5; return case x of 5 => 1, _ => 2 end;")), 1);
 }
 
 // Regression: a `string` scrutinee still routes through content equality.
 BEZEL_TEST(case_wide_int_836, string_constant_regression) {
     BEZEL_EXPECT_EQ(run(mainOf(
-        "var x: string := \"hi\"; return case x \"hi\" => 1, _ => 2 end;")), 1);
+        "var x: string := \"hi\"; return case x of \"hi\" => 1, _ => 2 end;")), 1);
 }

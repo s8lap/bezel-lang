@@ -28,7 +28,7 @@ BEZEL_TEST(case_record_typed_binding_801, record_same_type_matches) {
         "module M; record Pt(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(40, 2); "
-        "  return case p var q: Pt => q.x + q.y, _ => 0 end; "  // 42
+        "  return case p of var q: Pt => q.x + q.y, _ => 0 end; "  // 42
         "end Main; end C;"), 42);
 }
 
@@ -39,7 +39,7 @@ BEZEL_TEST(case_record_typed_binding_801, record_different_type_falls_through) {
         "module M; record Pt(x: int, y: int); record Qt(a: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(40, 2); "
-        "  return case p var q: Qt => q.a, _ => 99 end; "  // 99
+        "  return case p of var q: Qt => q.a, _ => 99 end; "  // 99
         "end Main; end C;"), 99);
 }
 
@@ -50,7 +50,7 @@ BEZEL_TEST(case_record_typed_binding_801, enum_typed_binding_matches) {
         "module M; enum E A, B, C; end E; "
         "class C public static method Main(): int "
         "  var e := E.B; "
-        "  return case e var q: E => 42, _ => 0 end; "  // 42
+        "  return case e of var q: E => 42, _ => 0 end; "  // 42
         "end Main; end C;"), 42);
 }
 
@@ -63,6 +63,6 @@ BEZEL_TEST(case_record_typed_binding_801, boxed_record_binding_runtime_isa) {
         "class C public static method Main(): int "
         "  var p := new Pt(40, 2); "
         "  var o: Object? := p; "
-        "  return case o var q: Pt => q.x + q.y, _ => 0 end; "  // 42
+        "  return case o of var q: Pt => q.x + q.y, _ => 0 end; "  // 42
         "end Main; end C;"), 42);
 }

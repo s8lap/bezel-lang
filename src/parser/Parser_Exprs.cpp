@@ -1102,21 +1102,38 @@ ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
 // `when` (parseWhenExpr / parseWhenStmt), so `case` is unconditionally
 // scrutinee'd and the parser no longer consults source line numbers anywhere.
 
+// §19.1 / A.7 CaseExpr (v0.166, #1370): the `of` delimiter separates the case
+// scrutinee from the first arm. `of` is a CONTEXTUAL keyword — Appendix B does
+// not reserve it, so the lexer emits it as an ordinary Identifier and it is
+// recognized only here, in the scrutinee-terminating position. Programs may
+// still use `of` as an identifier anywhere else. A missing `of` is a syntax
+// error at the first arm token; the diagnostic names the delimiter.
+bool Parser::expectOfDelimiter() {
+    if (current_.kind == TokenKind::Identifier && current_.text == "of") {
+        advance();
+        return true;
+    }
+    diagnostics_.report(Severity::Error, current_.location,
+                        "expected `of` after the case scrutinee");
+    return false;
+}
+
 std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     advance(); // past `case`
     auto ce = std::make_unique<ast::CaseExpr>();
 
-    // #744 / §19: `case` ALWAYS takes a scrutinee; the scrutinee-less
-    // condition-dispatch form is now spelled `when` (parseWhenExpr), so the
-    // newline-significant `isScruntineeLessCase` heuristic is gone. The
-    // scrutinee is parsed ABOVE the additive level (precedence ≥ 14, i.e.
-    // multiplicative and postfix only) so that negative range patterns
-    // (`-10..-6`), relational patterns (`>= 90`, `< 0`), and leading-open
-    // range patterns (`..<0`, `..5`) are recognised as arm patterns and NOT
-    // consumed into the scrutinee (fix #1233). A scrutinee that is itself an
-    // additive, bitwise, range, or relational expression must be parenthesised.
+    // §19.1 / A.7 CaseExpr (v0.166, #1370): `case Expression "of" ...`. `case`
+    // ALWAYS takes a scrutinee; the scrutinee-less condition-dispatch form is
+    // spelled `when` (parseWhenExpr). The `of` delimiter terminates the
+    // scrutinee, so the scrutinee is a FULL Expression — no precedence
+    // restriction and no parenthesization rule. The old multiplicative-level
+    // restriction (`parseBinaryExpression(14)`) that existed only to serve the
+    // missing boundary (#1233/#1320) is removed; a first pattern may begin with
+    // `-`, `..`, `..<`, or a relational token with no possibility of the
+    // scrutinee absorbing it, because `of` marks the boundary explicitly.
     SourceLocation start = current_.location;
-    ce->scrutinee = stampSpan(parseBinaryExpression(14), start, current_.location);
+    ce->scrutinee = stampSpan(parseExpression(), start, current_.location);
+    expectOfDelimiter();
 
     ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     while (consumePunctuator(",")) {

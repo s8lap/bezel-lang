@@ -123,6 +123,13 @@ private:
     // #744 / §19: `case` always takes a scrutinee (the scrutinee-less form is
     // now `when`); no source-line heuristic is consulted.
     std::unique_ptr<ast::Expr> parseCaseExpr();
+    // §19.1 / A.7 CaseExpr (v0.166, #1370): consume the `of` delimiter that
+    // terminates the case scrutinee, reporting the missing-`of` diagnostic
+    // otherwise. `of` is a CONTEXTUAL keyword — it is not in Appendix B's
+    // reserved-word list, so it is lexed as an ordinary identifier and
+    // recognized only in this position; identifiers named `of` elsewhere are
+    // unaffected. Returns true when the delimiter was present.
+    bool expectOfDelimiter();
     // #744 / §19: `when` is the dedicated scrutinee-less condition-dispatch
     // construct (arms are boolean conditions; the first true wins). It reuses
     // the null-scrutinee CaseExpr representation.

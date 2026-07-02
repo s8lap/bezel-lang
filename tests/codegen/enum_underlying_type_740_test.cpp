@@ -44,7 +44,7 @@ BEZEL_TEST(enum_underlying_740, long_case_dispatch_full_width) {
         "enum Big: long A := 1L, B := 9000000000L, C := 3L; end Big; "
         "class C public static method Main(): int "
         "  var x: Big := Big.B; "
-        "  return case x Big.A => 1, Big.B => 2, Big.C => 3 end; "
+        "  return case x of Big.A => 1, Big.B => 2, Big.C => 3 end; "
         "end Main; end C;"), 2);
 }
 
@@ -211,7 +211,7 @@ BEZEL_TEST(enum_underlying_740, default_int_enum_unchanged) {
         "class C public static method Main(): int "
         "  var d: Dir := Dir.East; "
         "  if int(d) <> 2 then return 1; end; "
-        "  return case d Dir.North => 10, Dir.East => 0, _ => 9 end; "
+        "  return case d of Dir.North => 10, Dir.East => 0, _ => 9 end; "
         "end Main; end C;"), 0);
 }
 

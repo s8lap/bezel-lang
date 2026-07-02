@@ -81,7 +81,7 @@ where T: class
   end LoadAll;
 
   public method Classify(x: int): string
-    return case x
+    return case x of
       0 => "zero",
       1, 2, 3 => "low",
       0..10 => "medium",

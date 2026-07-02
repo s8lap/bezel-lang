@@ -45,7 +45,7 @@ std::string renderCaseStmt(const std::string& body) {
 
 BEZEL_TEST(parser_case_stmt, single_stmt_arm) {
     BEZEL_EXPECT_EQ(
-        renderCaseStmt("case x 1 => return 1;, _ => return 0; end;"),
+        renderCaseStmt("case x of 1 => return 1;, _ => return 0; end;"),
         std::string(
             "case x of { 1 => { return 1; } "
             "| _ => { return 0; } } end;"));
@@ -54,7 +54,7 @@ BEZEL_TEST(parser_case_stmt, single_stmt_arm) {
 BEZEL_TEST(parser_case_stmt, do_end_arm_body) {
     BEZEL_EXPECT_EQ(
         renderCaseStmt(
-            "case x 1 => do _ := \"one\"; end, _ => do _ := \"other\"; end end;"),
+            "case x of 1 => do _ := \"one\"; end, _ => do _ := \"other\"; end end;"),
         std::string(
             "case x of { 1 => { _ := \"one\"; } "
             "| _ => { _ := \"other\"; } } end;"));
@@ -63,7 +63,7 @@ BEZEL_TEST(parser_case_stmt, do_end_arm_body) {
 BEZEL_TEST(parser_case_stmt, mixed_stmt_and_do_arms) {
     BEZEL_EXPECT_EQ(
         renderCaseStmt(
-            "case x 1 => return 1;, "
+            "case x of 1 => return 1;, "
             "2 => do _ := x; return 2; end, "
             "_ => return 0; end;"),
         std::string(
@@ -75,7 +75,7 @@ BEZEL_TEST(parser_case_stmt, mixed_stmt_and_do_arms) {
 BEZEL_TEST(parser_case_stmt, with_when_guard) {
     BEZEL_EXPECT_EQ(
         renderCaseStmt(
-            "case x var n: int when n > 0 => return n;, _ => return 0; end;"),
+            "case x of var n: int when n > 0 => return n;, _ => return 0; end;"),
         std::string(
             "case x of { var n: int when (n > 0) => { return n; } "
             "| _ => { return 0; } } end;"));
@@ -83,7 +83,7 @@ BEZEL_TEST(parser_case_stmt, with_when_guard) {
 
 BEZEL_TEST(parser_case_stmt, trailing_comma_allowed) {
     BEZEL_EXPECT_EQ(
-        renderCaseStmt("case x 1 => return 1;, _ => return 0;, end;"),
+        renderCaseStmt("case x of 1 => return 1;, _ => return 0;, end;"),
         std::string(
             "case x of { 1 => { return 1; } "
             "| _ => { return 0; } } end;"));
@@ -92,7 +92,7 @@ BEZEL_TEST(parser_case_stmt, trailing_comma_allowed) {
 BEZEL_TEST(parser_case_stmt, destructuring_arm_with_block_body) {
     BEZEL_EXPECT_EQ(
         renderCaseStmt(
-            "case x Pair(var a, var b) => do _ := a + b; end, "
+            "case x of Pair(var a, var b) => do _ := a + b; end, "
             "_ => return; end;"),
         std::string(
             "case x of { Pair(var a, var b) => { _ := (a + b); } "
@@ -105,7 +105,7 @@ BEZEL_TEST(parser_case_stmt, case_expression_still_works_in_expr_position) {
     // arms allow Expression bodies.
     auto r = parseAll(
         "module M; class C "
-        "public method M() _ := case x 1 => \"one\", _ => \"other\" end; "
+        "public method M() _ := case x of 1 => \"one\", _ => \"other\" end; "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

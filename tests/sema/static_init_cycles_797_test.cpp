@@ -216,7 +216,7 @@ BEZEL_TEST(static_init_cycles_797, self_recursive_static_method_accepted) {
         "module M; "
         "class A "
         "  public static _a: int := Rec(3); "
-        "  public static method Rec(n: int): int => case n 0 => 0, _ => Rec(n - 1) end; "
+        "  public static method Rec(n: int): int => case n of 0 => 0, _ => Rec(n - 1) end; "
         "end A; "
         "class C public static method Main(): int => A._a; end C;"), 0);
 }

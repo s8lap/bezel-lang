@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_482_spec_10_spec_17, equality_comparison) {
 BEZEL_TEST(codegen_482_spec_10_spec_17, case_expr_on_nested_enum) {
     BEZEL_EXPECT_EQ(run482(
         "var s := Container.Status.Inactive; "
-        "return case s "
+        "return case s of "
         "  Container.Status.Active   => 0, "
         "  Container.Status.Inactive => 9, "
         "  _ => -1, "

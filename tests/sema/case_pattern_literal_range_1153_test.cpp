@@ -67,7 +67,7 @@ BEZEL_TEST(sema_case_pattern_range, byte_const_over_range_rejected_spec_5_1) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x 256 => 1, _ => 0 end; "
+        "    return case x of 256 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -79,7 +79,7 @@ BEZEL_TEST(sema_case_pattern_range, byte_const_at_max_ok_spec_5_1) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x 255 => 1, _ => 0 end; "
+        "    return case x of 255 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
@@ -92,7 +92,7 @@ BEZEL_TEST(sema_case_pattern_range, byte_const_in_range_ok_spec_19) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x 5 => 1, _ => 0 end; "
+        "    return case x of 5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
@@ -105,7 +105,7 @@ BEZEL_TEST(sema_case_pattern_range, sbyte_const_over_max_rejected_spec_5_1) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: sbyte): int "
-        "    return case x 200 => 1, _ => 0 end; "
+        "    return case x of 200 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -118,7 +118,7 @@ BEZEL_TEST(sema_case_pattern_range, multi_alternative_one_out_of_range_rejected)
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x 1, 2, 256 => 1, _ => 0 end; "
+        "    return case x of 1, 2, 256 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -133,7 +133,7 @@ BEZEL_TEST(sema_case_pattern_range, int_range_bound_over_range_rejected_spec_5_1
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 0..5000000000 => 1, _ => 0 end; "
+        "    return case x of 0..5000000000 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -146,7 +146,7 @@ BEZEL_TEST(sema_case_pattern_range, int_range_in_range_ok_spec_19_1) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 0..100 => 1, _ => 0 end; "
+        "    return case x of 0..100 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
@@ -164,7 +164,7 @@ BEZEL_TEST(sema_case_pattern_range, byte_relop_operand_over_range_rejected_spec_
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x > 300 => 1, _ => 0 end; "
+        "    return case x of > 300 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -177,7 +177,7 @@ BEZEL_TEST(sema_case_pattern_range, byte_relop_operand_in_range_ok_spec_19) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte): int "
-        "    return case x > 5 => 1, _ => 0 end; "
+        "    return case x of > 5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
@@ -190,7 +190,7 @@ BEZEL_TEST(sema_case_pattern_range, int_relop_le_operand_over_range_rejected_spe
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x <= 5000000000 => 1, _ => 0 end; "
+        "    return case x of <= 5000000000 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -205,7 +205,7 @@ BEZEL_TEST(sema_case_pattern_range, statement_case_out_of_range_rejected_spec_5_
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: byte) "
-        "    case x 256 => do return; end, _ => do return; end end; "
+        "    case x of 256 => do return; end, _ => do return; end end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternRangeError(r));
@@ -222,7 +222,7 @@ BEZEL_TEST(sema_case_pattern_range, enum_scrutinee_unaffected_spec_19) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public static method M(c: Color): int "
-        "    return case c Red => 1, Green => 2, Blue => 3 end; "
+        "    return case c of Red => 1, Green => 2, Blue => 3 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternRangeError(r));
@@ -261,7 +261,7 @@ BEZEL_TEST(sema_case_pattern_range, case_relop_type_mismatch_rejected_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x > \"hi\" => 1, _ => 0 end; "
+        "    return case x of > \"hi\" => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
@@ -275,7 +275,7 @@ BEZEL_TEST(sema_case_pattern_range, case_relop_float_over_int_rejected_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x > 1.5 => 1, _ => 0 end; "
+        "    return case x of > 1.5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
@@ -288,7 +288,7 @@ BEZEL_TEST(sema_case_pattern_range, case_range_type_mismatch_rejected_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 1.5..3.5 => 1, _ => 0 end; "
+        "    return case x of 1.5..3.5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
@@ -301,7 +301,7 @@ BEZEL_TEST(sema_case_pattern_range, case_relop_string_scrutinee_rejected_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: string): int "
-        "    return case x > 5 => 1, _ => 0 end; "
+        "    return case x of > 5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
@@ -314,7 +314,7 @@ BEZEL_TEST(sema_case_pattern_range, case_relop_compatible_ok_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x > 3 => 1, _ => 0 end; "
+        "    return case x of > 3 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
@@ -327,7 +327,7 @@ BEZEL_TEST(sema_case_pattern_range, case_range_compatible_ok_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 1..10 => 1, _ => 0 end; "
+        "    return case x of 1..10 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
@@ -341,7 +341,7 @@ BEZEL_TEST(sema_case_pattern_range, case_relop_decimal_scrutinee_ok_1202) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: decimal): int "
-        "    return case x > 5 => 1, _ => 0 end; "
+        "    return case x of > 5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
@@ -365,7 +365,7 @@ BEZEL_TEST(sema_case_pattern_range, case_new_record_pattern_rejected_1205) {
         "record Pt(x: int, y: int); "
         "class C "
         "  public static method M(p: Pt): int "
-        "    return case p new Pt(1, 2) => 10, _ => 0 end; "
+        "    return case p of new Pt(1, 2) => 10, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCaseNonConstantPatternError(r));
@@ -378,7 +378,7 @@ BEZEL_TEST(sema_case_pattern_range, case_literal_pattern_still_ok_1205) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(n: int): int "
-        "    return case n 1 => 10, 2 => 20, _ => 0 end; "
+        "    return case n of 1 => 10, 2 => 20, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
@@ -392,7 +392,7 @@ BEZEL_TEST(sema_case_pattern_range, case_enum_pattern_still_ok_1205) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public static method M(c: Color): int "
-        "    return case c Red => 1, Green => 2, Blue => 3 end; "
+        "    return case c of Red => 1, Green => 2, Blue => 3 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
@@ -404,7 +404,7 @@ BEZEL_TEST(sema_case_pattern_range, case_null_pattern_still_ok_1205) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(n: int?): int "
-        "    return case n null => 0, _ => 1 end; "
+        "    return case n of null => 0, _ => 1 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCaseNonConstantPatternError(r));
@@ -436,7 +436,7 @@ BEZEL_TEST(sema_case_pattern_range,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x var s: string => 1, _ => 2 end; "
+        "    return case x of var s: string => 1, _ => 2 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasBindingTypeIncompatError(r));
@@ -453,7 +453,7 @@ BEZEL_TEST(sema_case_pattern_range,
         "class Dog end Dog; "
         "class C "
         "  public static method M(x: int): int "
-        "    return case x var d: Dog => 1, _ => 2 end; "
+        "    return case x of var d: Dog => 1, _ => 2 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasBindingTypeIncompatError(r));
@@ -467,7 +467,7 @@ BEZEL_TEST(sema_case_pattern_range,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int) "
-        "    case x var s: string => do return; end end; "
+        "    case x of var s: string => do return; end end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasBindingTypeIncompatError(r));
@@ -481,7 +481,7 @@ BEZEL_TEST(sema_case_pattern_range,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x var n: int => n, _ => 0 end; "
+        "    return case x of var n: int => n, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
@@ -495,7 +495,7 @@ BEZEL_TEST(sema_case_pattern_range,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: string): int "
-        "    return case x var s: string => 1, _ => 0 end; "
+        "    return case x of var s: string => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
@@ -512,7 +512,7 @@ BEZEL_TEST(sema_case_pattern_range,
         "class Dog: Animal end Dog; "
         "class C "
         "  public static method M(a: Animal): int "
-        "    return case a var d: Dog => 1, _ => 0 end; "
+        "    return case a of var d: Dog => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
@@ -528,7 +528,7 @@ BEZEL_TEST(sema_case_pattern_range,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int?): int "
-        "    return case x null => 0, var n: int => n end; "
+        "    return case x of null => 0, var n: int => n end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasBindingTypeIncompatError(r));
@@ -552,7 +552,7 @@ BEZEL_TEST(sema_case_pattern_range, case_const_float_over_int_rejected_1213) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 1.5 => 1, _ => 0 end; "
+        "    return case x of 1.5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
@@ -565,7 +565,7 @@ BEZEL_TEST(sema_case_pattern_range, case_const_decimal_over_int_rejected_1213) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 1.0m => 1, _ => 0 end; "
+        "    return case x of 1.0m => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasCasePatternOperandError(r));
@@ -578,7 +578,7 @@ BEZEL_TEST(sema_case_pattern_range, case_const_int_over_int_ok_1213) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 5 => 1, _ => 0 end; "
+        "    return case x of 5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
@@ -591,7 +591,7 @@ BEZEL_TEST(sema_case_pattern_range, case_const_float_over_double_ok_1213) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: double): int "
-        "    return case x 2.5 => 1, _ => 0 end; "
+        "    return case x of 2.5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
@@ -606,7 +606,7 @@ BEZEL_TEST(sema_case_pattern_range, case_const_float_over_decimal_ok_1213) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: decimal): int "
-        "    return case x 1.5 => 1, _ => 0 end; "
+        "    return case x of 1.5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));

@@ -154,15 +154,17 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
 std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
     advance(); // past `case`
     auto cs = std::make_unique<ast::CaseStmt>();
-    // #744 / §19: `case` ALWAYS takes a scrutinee (scrutinee-less dispatch is
-    // now `when`, parseWhenStmt). Scrutinee parsed above the additive level
-    // (precedence ≥ 14, multiplicative and postfix only) so that negative
-    // range patterns (`-10..-6`) and relational/range/leading-open-range
-    // patterns are recognised as arms rather than swallowed (fix #1233;
-    // mirrors parseCaseExpr). An additive/shift/bitwise/relational scrutinee
-    // must be parenthesised.
+    // §19.1 / A.7 CaseExpr (v0.166, #1370): `case Expression "of" ...`. `case`
+    // ALWAYS takes a scrutinee (scrutinee-less dispatch is `when`,
+    // parseWhenStmt). The `of` delimiter terminates the scrutinee, so the
+    // scrutinee is a FULL Expression — no precedence restriction and no
+    // parenthesization rule (mirrors parseCaseExpr). The old multiplicative-
+    // level restriction (#1233/#1320) that served the missing boundary is
+    // removed; a first pattern may begin with `-`, `..`, `..<`, or a
+    // relational token without the scrutinee absorbing it.
     SourceLocation start = current_.location;
-    cs->scrutinee = stampSpan(parseBinaryExpression(14), start, current_.location);
+    cs->scrutinee = stampSpan(parseExpression(), start, current_.location);
+    expectOfDelimiter();
     cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/false));
     while (consumePunctuator(",")) {
         if (isKeyword("end")) break;

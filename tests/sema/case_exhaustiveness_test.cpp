@@ -65,7 +65,7 @@ BEZEL_TEST(sema_case_exhaust, enum_missing_constant_warns_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      Green => 2 "  // Blue uncovered, no `_`
         "    end; "
@@ -83,7 +83,7 @@ BEZEL_TEST(sema_case_exhaust, enum_all_constants_ok_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue => 3 "
@@ -103,7 +103,7 @@ BEZEL_TEST(sema_case_exhaust, enum_missing_with_discard_ok_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      _ => 0 "
         "    end; "
@@ -122,7 +122,7 @@ BEZEL_TEST(sema_case_exhaust, enum_comma_alternatives_ok_spec_10_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red, Green => 1, "
         "      Blue => 2 "
         "    end; "
@@ -141,7 +141,7 @@ BEZEL_TEST(sema_case_exhaust, enum_untyped_var_is_catchall_spec_19_3) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      var other => 0 "
         "    end; "
@@ -160,7 +160,7 @@ BEZEL_TEST(sema_case_exhaust, enum_guarded_arm_does_not_cover_spec_19_4) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color, b: bool): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue when b => 3 "  // guarded — coverage of Blue not assured
@@ -183,7 +183,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_enum_no_null_arm_warns_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color?): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue => 3 "  // every constant covered, but no `null` arm
@@ -202,7 +202,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_enum_with_null_arm_ok_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color?): int "
-        "    var n := case c "
+        "    var n := case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue => 3, "
@@ -222,7 +222,7 @@ BEZEL_TEST(sema_case_exhaust, bool_both_covered_ok_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool): int "
-        "    var n := case b "
+        "    var n := case b of "
         "      true => 1, "
         "      false => 0 "
         "    end; "
@@ -238,7 +238,7 @@ BEZEL_TEST(sema_case_exhaust, bool_one_missing_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool): int "
-        "    var n := case b "
+        "    var n := case b of "
         "      true => 1 "  // false uncovered, no `_`
         "    end; "
         "    return n; "
@@ -258,7 +258,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_null_true_false_ok_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool?): int "
-        "    var n := case b "
+        "    var n := case b of "
         "      null => 2, "
         "      true => 1, "
         "      false => 0 "
@@ -277,7 +277,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_no_null_arm_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool?): int "
-        "    var n := case b "
+        "    var n := case b of "
         "      true => 1, "
         "      false => 0 "
         "    end; "
@@ -295,7 +295,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_missing_false_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool?): int "
-        "    var n := case b "
+        "    var n := case b of "
         "      null => 2, "
         "      true => 1 "
         "    end; "
@@ -329,7 +329,7 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_all_leaves_ok_spec_19_6) {
         "end Triangle; "
         "class Calc "
         "  public method M(shape: Shape): int "
-        "    var a := case shape "
+        "    var a := case shape of "
         "      var c: Circle => c.Area(), "
         "      var s: Square => s.Area(), "
         "      var t: Triangle => t.Area() "
@@ -359,7 +359,7 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_missing_leaf_warns_spec_19_6) {
         "end Triangle; "
         "class Calc "
         "  public method M(shape: Shape): int "
-        "    var a := case shape "
+        "    var a := case shape of "
         "      var c: Circle => c.Area(), "
         "      var s: Square => s.Area() "  // Triangle uncovered, no `_`
         "    end; "
@@ -380,7 +380,7 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_bare_type_patterns_ok_spec_19_3) 
         "sealed class Square : Shape end Square; "
         "class Calc "
         "  public method M(shape: Shape): int "
-        "    var a := case shape "
+        "    var a := case shape of "
         "      Circle => 1, "
         "      Square => 2 "
         "    end; "
@@ -404,7 +404,7 @@ BEZEL_TEST(sema_case_exhaust, open_hierarchy_warns_spec_19_6) {
         "class Cat : Animal end Cat; "
         "class Calc "
         "  public method M(a: Animal): int "
-        "    var n := case a "
+        "    var n := case a of "
         "      Dog => 1, "
         "      Cat => 2 "  // open base: more subclasses could exist
         "    end; "
@@ -424,7 +424,7 @@ BEZEL_TEST(sema_case_exhaust, open_hierarchy_with_discard_ok_spec_19_6) {
         "class Cat : Animal end Cat; "
         "class Calc "
         "  public method M(a: Animal): int "
-        "    var n := case a "
+        "    var n := case a of "
         "      Dog => 1, "
         "      Cat => 2, "
         "      _ => 0 "
@@ -445,7 +445,7 @@ BEZEL_TEST(sema_case_exhaust, int_scrutinee_no_discard_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(score: int): int "
-        "    var n := case score "
+        "    var n := case score of "
         "      90..100 => 1, "
         "      80..89 => 2 "  // no `_`: rest of the int range uncovered
         "    end; "
@@ -462,7 +462,7 @@ BEZEL_TEST(sema_case_exhaust, int_scrutinee_with_discard_ok_spec_19_1) {
         "module M; "
         "class C "
         "  public method M(score: int): string "
-        "    var grade := case score "
+        "    var grade := case score of "
         "      90..100 => \"A\", "
         "      80..89 => \"B\", "
         "      70..<80 => \"C\", "
@@ -486,7 +486,7 @@ BEZEL_TEST(sema_case_exhaust, statement_case_no_warning_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color) "
-        "    case c "
+        "    case c of "
         "      Red => do return; end, "
         "      Green => do return; end "  // Blue uncovered — but statement position
         "    end; "
@@ -506,7 +506,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_typed_binding_plus_null_ok_spec_19_5) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int?): int "
-        "    return case x null => 0, var n: int => n end; "
+        "    return case x of null => 0, var n: int => n end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
@@ -518,7 +518,7 @@ BEZEL_TEST(sema_case_exhaust, nonnullable_typed_binding_is_exhaustive_spec_19_5)
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x var n: int => n end; "
+        "    return case x of var n: int => n end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
@@ -529,7 +529,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_typed_binding_no_null_arm_warns_spec_19_6
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int?): int "
-        "    return case x var n: int => n end; "
+        "    return case x of var n: int => n end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
@@ -544,7 +544,7 @@ BEZEL_TEST(sema_case_exhaust, narrower_typed_binding_still_warns_spec_19_5) {
         "class Dog: Animal end Dog; "
         "class Cat: Animal end Cat; "
         "class C public static method M(a: Animal): int "
-        "  return case a var d: Dog => 1 end; "
+        "  return case a of var d: Dog => 1 end; "
         "end M; end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
 }

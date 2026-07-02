@@ -60,7 +60,7 @@ BEZEL_TEST(codegen_pattern_guard_member, field_guard_true_expr_pos) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when c.r > 5 => 1000, _ => 0 end; "
+        "    return case sh of var c: Circle when c.r > 5 => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(10); return K(c); "
@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_pattern_guard_member, field_guard_false_falls_through) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when c.r > 5 => 1000, _ => 0 end; "
+        "    return case sh of var c: Circle when c.r > 5 => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(3); return K(c); "
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_pattern_guard_member, method_guard_true) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when c.Area() > 5 => 1000, _ => 0 end; "
+        "    return case sh of var c: Circle when c.Area() > 5 => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(9); return K(c); "
@@ -103,7 +103,7 @@ BEZEL_TEST(codegen_pattern_guard_member, method_guard_false_falls_through) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when c.Area() > 5 => 1000, _ => 0 end; "
+        "    return case sh of var c: Circle when c.Area() > 5 => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(2); return K(c); "
@@ -119,7 +119,7 @@ BEZEL_TEST(codegen_pattern_guard_member, field_guard_statement_pos) {
         "class C "
         "  public static method K(sh: Shape): int "
         "    var r := 0; "
-        "    case sh "
+        "    case sh of "
         "      var c: Circle when c.r > 5 => do r := 1000; end, "
         "      _ => do r := 0; end "
         "    end; "
@@ -137,7 +137,7 @@ BEZEL_TEST(codegen_pattern_guard_member, method_guard_statement_pos) {
         "class C "
         "  public static method K(sh: Shape): int "
         "    var r := 0; "
-        "    case sh "
+        "    case sh of "
         "      var c: Circle when c.Area() > 5 => do r := 1000; end, "
         "      _ => do r := 0; end "
         "    end; "
@@ -157,7 +157,7 @@ BEZEL_TEST(codegen_pattern_guard_member, complex_member_expr_guard) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when c.r * 2 > c.r => 1000, _ => 0 end; "
+        "    return case sh of var c: Circle when c.r * 2 > c.r => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(10); return K(c); "
@@ -175,7 +175,7 @@ BEZEL_TEST(codegen_pattern_guard_member, typed_binding_distinguishes_types) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh "
+        "    return case sh of "
         "      var c: Circle => 100, "
         "      var sq: Square => 200, "
         "      _ => 0 "
@@ -194,7 +194,7 @@ BEZEL_TEST(codegen_pattern_guard_member, non_matching_type_skips_member_guard) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when c.r > 5 => 1000, _ => 7 end; "
+        "    return case sh of var c: Circle when c.r > 5 => 1000, _ => 7 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var sq := new Square(99); return K(sq); "
@@ -209,7 +209,7 @@ BEZEL_TEST(codegen_pattern_guard_member, control_no_guard) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle => 100, _ => 0 end; "
+        "    return case sh of var c: Circle => 100, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(10); return K(c); "
@@ -222,7 +222,7 @@ BEZEL_TEST(codegen_pattern_guard_member, control_constant_guard) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when true => 77, _ => 0 end; "
+        "    return case sh of var c: Circle when true => 77, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(10); return K(c); "
@@ -237,7 +237,7 @@ BEZEL_TEST(codegen_pattern_guard_member, control_whole_var_to_function) {
         "class C "
         "  public static method Big(c: Circle): bool => c.r > 5; "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle when Big(c) => 77, _ => 0 end; "
+        "    return case sh of var c: Circle when Big(c) => 77, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(10); return K(c); "
@@ -250,7 +250,7 @@ BEZEL_TEST(codegen_pattern_guard_member, control_outer_var_guard) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape, threshold: int): int "
-        "    return case sh var c: Circle when threshold > 5 => 77, _ => 0 end; "
+        "    return case sh of var c: Circle when threshold > 5 => 77, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(10); return K(c, 9); "
@@ -263,7 +263,7 @@ BEZEL_TEST(codegen_pattern_guard_member, control_member_access_in_body) {
     BEZEL_EXPECT_EQ(run(
         "class C "
         "  public static method K(sh: Shape): int "
-        "    return case sh var c: Circle => c.r, _ => 0 end; "
+        "    return case sh of var c: Circle => c.r, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
         "    using var c := new Circle(8); return K(c); "

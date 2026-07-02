@@ -49,7 +49,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 100..0 => 1, _ => 0 end; "
+        "    return case x of 100..0 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasReversedPatternWarning(r));
@@ -64,7 +64,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 100..<0 => 1, _ => 0 end; "
+        "    return case x of 100..<0 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasReversedPatternWarning(r));
@@ -78,7 +78,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 5..<5 => 1, _ => 0 end; "
+        "    return case x of 5..<5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasReversedPatternWarning(r));
@@ -91,7 +91,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 0..100 => 1, _ => 0 end; "
+        "    return case x of 0..100 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasReversedPatternWarning(r));
@@ -105,7 +105,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 5..5 => 1, _ => 0 end; "
+        "    return case x of 5..5 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasReversedPatternWarning(r));
@@ -118,7 +118,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 0..<10 => 1, _ => 0 end; "
+        "    return case x of 0..<10 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasReversedPatternWarning(r));
@@ -132,7 +132,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 0..-10 => 1, _ => 0 end; "
+        "    return case x of 0..-10 => 1, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasReversedPatternWarning(r));
@@ -147,7 +147,7 @@ BEZEL_TEST(sema_range_reversed_pattern_warn_1340,
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x 50..10 => 99, _ => 0 end; "
+        "    return case x of 50..10 => 99, _ => 0 end; "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasReversedPatternWarning(r));

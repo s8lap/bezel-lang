@@ -43,7 +43,7 @@ BEZEL_TEST(case_pattern_type_compat_964, int_scrutinee_string_literal_rejected) 
     BEZEL_EXPECT_EQ(compileErrored(
         "module M; class C public static method Main(): int "
         "  var x := 5; "
-        "  return case x \"foo\" => 0, _ => 1 end; "
+        "  return case x of \"foo\" => 0, _ => 1 end; "
         "end Main; end C;"), true);
 }
 
@@ -54,7 +54,7 @@ BEZEL_TEST(case_pattern_type_compat_964, int_scrutinee_string_named_const_reject
         "  public const S: string := \"hi\"; "
         "  public static method Main(): int "
         "    var x := 5; "
-        "    return case x C.S => 0, _ => 1 end; "
+        "    return case x of C.S => 0, _ => 1 end; "
         "  end Main; end C;"), true);
 }
 
@@ -64,7 +64,7 @@ BEZEL_TEST(case_pattern_type_compat_964, bool_scrutinee_int_literal_rejected) {
     BEZEL_EXPECT_EQ(compileErrored(
         "module M; class C public static method Main(): int "
         "  var b := true; "
-        "  return case b 5 => 0, _ => 1 end; "
+        "  return case b of 5 => 0, _ => 1 end; "
         "end Main; end C;"), true);
 }
 
@@ -74,7 +74,7 @@ BEZEL_TEST(case_pattern_type_compat_964, int_literal_match_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 5; "
-        "  return case x 5 => 42, _ => 1 end; "  // 42
+        "  return case x of 5 => 42, _ => 1 end; "  // 42
         "end Main; end C;"), 42);
 }
 
@@ -83,7 +83,7 @@ BEZEL_TEST(case_pattern_type_compat_964, string_literal_match_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hi\"; "
-        "  return case s \"hi\" => 7, _ => 0 end; "  // 7
+        "  return case s of \"hi\" => 7, _ => 0 end; "  // 7
         "end Main; end C;"), 7);
 }
 
@@ -95,7 +95,7 @@ BEZEL_TEST(case_pattern_type_compat_964, matching_named_const_unaffected) {
         "  public const K: int := 5; "
         "  public static method Main(): int "
         "    var x := 5; "
-        "    return case x C.K => 99, _ => 0 end; "  // 99
+        "    return case x of C.K => 99, _ => 0 end; "  // 99
         "  end Main; end C;"), 99);
 }
 
@@ -105,7 +105,7 @@ BEZEL_TEST(case_pattern_type_compat_964, long_scrutinee_int_literal_unaffected) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := 5L; "
-        "  return case n 5 => 33, _ => 0 end; "  // 33
+        "  return case n of 5 => 33, _ => 0 end; "  // 33
         "end Main; end C;"), 33);
 }
 
@@ -116,6 +116,6 @@ BEZEL_TEST(case_pattern_type_compat_964, enum_pattern_unaffected) {
         "module M; enum Color Red, Green; end Color; "
         "class C public static method Main(): int "
         "  var col := Color.Green; "
-        "  return case col Red => 1, Green => 2 end; "  // 2
+        "  return case col of Red => 1, Green => 2 end; "  // 2
         "end Main; end C;"), 2);
 }

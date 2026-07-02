@@ -83,6 +83,6 @@ BEZEL_TEST(scrutineeless_case_727, case_with_scrutinee_still_works) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 2; "
-        "  return case x 1 => 10, 2 => 20, _ => 0 end; "
+        "  return case x of 1 => 10, 2 => 20, _ => 0 end; "
         "end Main; end C;"), 20);
 }

@@ -147,7 +147,7 @@ BEZEL_TEST(codegen_extension, case_this_over_enum_in_extension_method_r36) {
         "enum Color Red, Green, Blue; end Color; "
         "extension Color "
         "  public method ToInt(): int "
-        "    return case this "
+        "    return case this of "
         "      Color.Red => 10, "
         "      Color.Green => 20, "
         "      Color.Blue => 30, "

@@ -21,21 +21,21 @@ BEZEL_TEST(codegen_cg43, expr_case_selects_matching_arm) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var e := E.Green; "
-        "  return case e E.Red => 1, E.Green => 2, E.Blue => 3, end; "
+        "  return case e of E.Red => 1, E.Green => 2, E.Blue => 3, end; "
         "end Main; end C;"), 2);
 }
 
 BEZEL_TEST(codegen_cg43, expr_case_first_arm) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
-        "  var e := E.Red; return case e E.Red => 5, _ => 0, end; "
+        "  var e := E.Red; return case e of E.Red => 5, _ => 0, end; "
         "end Main; end C;"), 5);
 }
 
 BEZEL_TEST(codegen_cg43, expr_case_discard_fallback) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
-        "  var e := E.Blue; return case e E.Red => 1, _ => 8, end; "
+        "  var e := E.Blue; return case e of E.Red => 1, _ => 8, end; "
         "end Main; end C;"), 8);
 }
 
@@ -45,7 +45,7 @@ BEZEL_TEST(codegen_cg43, expr_case_alternatives) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var e := E.Green; "
-        "  return case e E.Red, E.Green => 4, E.Blue => 9, end; "
+        "  return case e of E.Red, E.Green => 4, E.Blue => 9, end; "
         "end Main; end C;"), 4);
 }
 
@@ -53,7 +53,7 @@ BEZEL_TEST(codegen_cg43, explicitly_typed_scrutinee) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var e: E := E.Blue; "
-        "  return case e E.Red => 1, E.Green => 2, E.Blue => 7, end; "
+        "  return case e of E.Red => 1, E.Green => 2, E.Blue => 7, end; "
         "end Main; end C;"), 7);
 }
 
@@ -61,7 +61,7 @@ BEZEL_TEST(codegen_cg43, statement_position_enum_case) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var e := E.Green; var r := 0; "
-        "  case e E.Red => do r := 1; end, E.Green => do r := 6; end, end; "
+        "  case e of E.Red => do r := 1; end, E.Green => do r := 6; end, end; "
         "  return r; "
         "end Main; end C;"), 6);
 }
@@ -70,6 +70,6 @@ BEZEL_TEST(codegen_cg43, guarded_enum_arm) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var e := E.Green; "
-        "  return case e E.Green when false => 1, E.Green => 3, _ => 0, end; "
+        "  return case e of E.Green when false => 1, E.Green => 3, _ => 0, end; "
         "end Main; end C;"), 3);
 }

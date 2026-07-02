@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_cg44, enum_of_int_roundtrips_through_case) {
     BEZEL_EXPECT_EQ(runJit(
         "module M; enum E Red, Green, Blue; end E; "
         "class C public static method Main(): int "
-        "  var e := E(2); return case e E.Blue => 9, _ => 0, end; "
+        "  var e := E(2); return case e of E.Blue => 9, _ => 0, end; "
         "end Main; end C;").exitCode, 9);
 }
 

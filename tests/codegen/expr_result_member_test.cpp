@@ -20,7 +20,7 @@ BEZEL_TEST(codegen_expr_member, member_on_case_result) {
     BEZEL_EXPECT_EQ(runProg(std::string(kN) +
         "class C public static method Main(): int "
         "  var a := new N(); a.V := 5; var b := new N(); b.V := 9; "
-        "  var k := 1; var r := case k 1 => a, _ => b, end; return r.V; "
+        "  var k := 1; var r := case k of 1 => a, _ => b, end; return r.V; "
         "end Main; end C;"), 5);
 }
 
@@ -36,6 +36,6 @@ BEZEL_TEST(codegen_expr_member, case_result_else_branch) {
     BEZEL_EXPECT_EQ(runProg(std::string(kN) +
         "class C public static method Main(): int "
         "  var a := new N(); a.V := 5; var b := new N(); b.V := 9; "
-        "  var k := 3; var r := case k 1 => a, _ => b, end; return r.V; "
+        "  var k := 3; var r := case k of 1 => a, _ => b, end; return r.V; "
         "end Main; end C;"), 9);
 }

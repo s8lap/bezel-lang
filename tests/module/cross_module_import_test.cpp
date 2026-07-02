@@ -1098,7 +1098,7 @@ BEZEL_TEST(cross_module_import, imported_enum_case_arm_selects_spec_19) {
         "public class Program "
         "  public static method Main(): int "
         "    var c := Color.Green; "
-        "    return case c "
+        "    return case c of "
         "      Color.Red => 11, "
         "      Color.Green => 22, "
         "      Color.Blue => 33, "

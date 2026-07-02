@@ -449,7 +449,7 @@ BEZEL_TEST(codegen_generic, enum_instance_method_case_this) {
         "module M; "
         "enum Color Red, Green, Blue; "
         "  public method Name(): string "
-        "    return case this "
+        "    return case this of "
         "      Color.Red => \"red\", "
         "      Color.Green => \"green\", "
         "      _ => \"blue\" "

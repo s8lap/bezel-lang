@@ -30,7 +30,7 @@ BEZEL_TEST(case_record_bare_type_pattern_1206, record_bare_type_matches) {
         "module M; record Pt(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(1, 2); "
-        "  return case p Pt => 7, _ => 0 end; "  // Pt matches → 7
+        "  return case p of Pt => 7, _ => 0 end; "  // Pt matches → 7
         "end Main; end C;"), 7);
 }
 
@@ -41,7 +41,7 @@ BEZEL_TEST(case_record_bare_type_pattern_1206, record_bare_type_nonmatch_falls_t
         "module M; record Pt(x: int, y: int); record Qt(a: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(1, 2); "
-        "  return case p Qt => 5, _ => 0 end; "  // Qt ≠ Pt → 0
+        "  return case p of Qt => 5, _ => 0 end; "  // Qt ≠ Pt → 0
         "end Main; end C;"), 0);
 }
 
@@ -52,7 +52,7 @@ BEZEL_TEST(case_record_bare_type_pattern_1206, enum_bare_type_matches) {
         "module M; enum E A, B, C; end E; "
         "class C public static method Main(): int "
         "  var e := E.B; "
-        "  return case e E => 42, _ => 0 end; "  // E matches → 42
+        "  return case e of E => 42, _ => 0 end; "  // E matches → 42
         "end Main; end C;"), 42);
 }
 
@@ -64,8 +64,8 @@ BEZEL_TEST(case_record_bare_type_pattern_1206, bare_and_typed_binding_coexist) {
         "module M; record Pt(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  var a := case p var q: Pt => q.x + q.y, _ => 0 end; "  // typed binding → 7
-        "  var b := case p Pt => 1, _ => 0 end; "                  // bare type   → 1
+        "  var a := case p of var q: Pt => q.x + q.y, _ => 0 end; "  // typed binding → 7
+        "  var b := case p of Pt => 1, _ => 0 end; "                  // bare type   → 1
         "  return a * 10 + b; "  // 71
         "end Main; end C;"), 71);
 }

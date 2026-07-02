@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_cg27b, case_string_match_first_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  var r := case s \"hello\" => 1, \"world\" => 2, _ => 0 end; "
+        "  var r := case s of \"hello\" => 1, \"world\" => 2, _ => 0 end; "
         "  return r; "
         "end Main; end C;"), 1);
 }
@@ -95,7 +95,7 @@ BEZEL_TEST(codegen_cg27b, case_string_match_second_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"world\"; "
-        "  var r := case s \"hello\" => 1, \"world\" => 2, _ => 0 end; "
+        "  var r := case s of \"hello\" => 1, \"world\" => 2, _ => 0 end; "
         "  return r; "
         "end Main; end C;"), 2);
 }
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_cg27b, case_string_discard_fallback) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"other\"; "
-        "  var r := case s \"hello\" => 1, \"world\" => 2, _ => 0 end; "
+        "  var r := case s of \"hello\" => 1, \"world\" => 2, _ => 0 end; "
         "  return r; "
         "end Main; end C;"), 0);
 }
@@ -115,7 +115,7 @@ BEZEL_TEST(codegen_cg27b, case_string_alternative_pattern) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"yes\"; "
-        "  var r := case s \"yes\", \"ok\", \"true\" => 1, _ => 0 end; "
+        "  var r := case s of \"yes\", \"ok\", \"true\" => 1, _ => 0 end; "
         "  return r; "
         "end Main; end C;"), 1);
 }

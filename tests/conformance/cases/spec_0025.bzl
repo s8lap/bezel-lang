@@ -3,7 +3,7 @@ enum Priority
 
   public method IsUrgent(): bool => this = High;
 
-  public property Name: string => case this
+  public property Name: string => case this of
     Low => "Low",
     Medium => "Medium",
     High => "High"
@@ -12,7 +12,7 @@ enum Priority
   public static readonly All: Array<Priority> := [Low, Medium, High];
 
   public static method Parse(text: string): Priority?
-    return case text
+    return case text of
       "Low" => Low,
       "Medium" => Medium,
       "High" => High,

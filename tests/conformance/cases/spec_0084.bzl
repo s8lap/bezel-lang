@@ -1,4 +1,4 @@
-public property [i: int]: double => case i
+public property [i: int]: double => case i of
   0 => X,
   1 => Y,
   2 => Z,

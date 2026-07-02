@@ -31,7 +31,7 @@ BEZEL_TEST(case_enum_prefix_body_772, case_expr_bare_enum_body) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C "
-        "  public static method Toggle(c: Color): Color => case c "
+        "  public static method Toggle(c: Color): Color => case c of "
         "    Red => Green, "
         "    Green => Blue, "
         "    Blue => Red "
@@ -49,7 +49,7 @@ BEZEL_TEST(case_enum_prefix_body_772, case_stmt_bare_enum_body) {
         "class C public static method Main(): int "
         "  var c := Color.Red; "
         "  var picked := Color.Blue; "
-        "  case c "
+        "  case c of "
         "    Red => do picked := Green; end, "
         "    Green => do picked := Blue; end, "
         "    Blue => do picked := Red; end "
@@ -65,7 +65,7 @@ BEZEL_TEST(case_enum_prefix_body_772, binding_arm_body_resolves_bare_enum) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c := Color.Blue; "
-        "  var r := case c "
+        "  var r := case c of "
         "    Red => Green, "
         "    var other => other "  // binds the value; body unaffected
         "  end; "
@@ -80,7 +80,7 @@ BEZEL_TEST(case_enum_prefix_body_772, unknown_name_in_arm_body_still_rejected) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c := Color.Red; "
-        "  return case c Red => Nonexistent, Green => 2, Blue => 3 end; "
+        "  return case c of Red => Nonexistent, Green => 2, Blue => 3 end; "
         "end Main; end C;"));
 }
 
