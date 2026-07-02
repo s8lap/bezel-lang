@@ -46,9 +46,11 @@ struct ModuleDecl : Node {
     std::unique_ptr<QualifiedName> name;
 };
 
-// A.2: `Import ::= "import" QualifiedName ";"`  (§2.2)
+// Grammar A.1: `Import ::= "import" QualifiedName ("as" Identifier)? ";"` (§2.2 v0.164)
+// The optional `as Identifier` clause binds an import alias (#1365).
 struct Import : Node {
     std::unique_ptr<QualifiedName> name;
+    std::string alias;  // §2.2 v0.164: non-empty when "as Identifier" is present
 };
 
 // §13 visibility keywords; `None` means the declaration carries no explicit

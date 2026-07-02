@@ -60,6 +60,16 @@ private:
     // require an explicit import (BinarySerializer / BinaryDeserializer).
     std::unordered_set<std::string> sourceImports_;
 
+    // §2.2 v0.164 / #1365: import aliases declared in this source file.
+    // Maps alias identifier → dotted module name.
+    // E.g. `import BankingApp.Transactions as Tx;` → {"Tx" → "BankingApp.Transactions"}
+    std::unordered_map<std::string, std::string> importAliases_;
+
+    // §2.2 v0.164 / #1365: bare names ambiguous because ≥2 imported modules
+    // export a public type with the same name (§2.2 collision rule). Using a
+    // bare ambiguous name is a compile error; qualification resolves it.
+    std::unordered_set<std::string> ambiguousImportNames_;
+
     // Slice S38 (§13.7 / Appendix C.2): a class's base class and
     // implemented interfaces must be at least as visible as the class.
     // Effective top-level visibility defaults to `internal`. Restricted

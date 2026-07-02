@@ -466,6 +466,35 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // so downstream (type-assignability, .Length, etc.) can use it.
             ctx_.setExprType(&e,
                 ctx_.primitiveTypeRef(PrimitiveType::String));
+        } else if (
+            // §2.2 v0.164 / §2.7 / #1365: an import alias (e.g. `ML` in
+            // `import MathLib as ML;`) or a module-name prefix segment
+            // (e.g. `MathLib` in `MathLib.Calc.Square(4)`) is NOT a type
+            // symbol in scope, but is a valid qualifier in a dotted member-
+            // access chain.  Suppress "unresolved identifier" so the
+            // enclosing MemberAccessExpr's resolveMemberAccess can handle
+            // the full qualifier correctly (§2.7 rule 1 for aliases, rule 2
+            // for module-qualified names).
+            !importAliases_.empty() &&
+            importAliases_.count(std::string(id->name))) {
+            // Import alias: silently pass — resolveMemberAccess will handle
+            // the enclosing `Alias.TypeName` pattern.
+        } else if (
+            !sourceImports_.empty() && [&]() {
+                const std::string name(id->name);
+                // Exact match: `MathLib` in `import MathLib;`.
+                if (sourceImports_.count(name)) return true;
+                // Prefix match: `BankingApp` when `BankingApp.Txn` is imported.
+                for (const std::string& mod : sourceImports_) {
+                    if (mod.size() > name.size() &&
+                        mod.substr(0, name.size()) == name &&
+                        mod[name.size()] == '.')
+                        return true;
+                }
+                return false;
+            }()) {
+            // Module-name prefix: silently pass — resolveMemberAccess will
+            // handle the enclosing `ModuleName.TypeName` pattern.
         } else if (currentScope_) {
             ctx_.diagnostics().report(
                 Severity::Error, id->span.begin,

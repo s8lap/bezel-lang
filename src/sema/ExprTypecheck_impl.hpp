@@ -54,6 +54,21 @@ private:
     // so paramSymbolsOf consults this when set.
     ExtensionSymbol* currentExtension_ = nullptr;
 
+    // §2.2 v0.164 / #1365: import aliases for the current source file.
+    // Mirrors TypeResolution's importAliases_; used in resolveMemberAccess to
+    // support `Alias.TypeName.Member` in expression position (§2.7).
+    std::unordered_map<std::string, std::string> importAliases_;
+    // §2.2 v0.164 / #1365: explicitly-imported module names (dotted) for the
+    // current source file. Used for module-prefix resolution (§2.7 rule 2).
+    std::unordered_set<std::string> sourceImports_;
+    // §2.2 v0.164 / #1365: bare names ambiguous due to import collision.
+    std::unordered_set<std::string> ambiguousImportNames_;
+    // §2.7 v0.164 / #1365: maps a MemberAccessExpr* → dotted module name when
+    // that expression resolves to a partial module-name prefix in expression
+    // position (e.g. `BankingApp.Transactions` in `BankingApp.Transactions.Calc`).
+    // Lets the next MemberAccess level detect the complete module name.
+    std::unordered_map<const ast::MemberAccessExpr*, std::string> partialModulePaths_;
+
     // §12.7 flow narrowing. When `if x is T` (or the else branch of
     // `if x is not T`) narrows a simple variable `x` to `T`, an entry maps the
     // variable's resolved symbol (a LocalSymbol or ParameterSymbol) to the

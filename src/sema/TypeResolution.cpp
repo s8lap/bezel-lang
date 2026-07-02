@@ -58,7 +58,11 @@ void Resolver::run(const ast::SourceFile& src) {
     // §2.15 / issue #631: build the set of imported namespace names so that
     // import-gated builtin types (BinarySerializer / BinaryDeserializer) can be
     // checked in resolveNamed. Every `import X;` contributes its dotted name.
+    // §2.2 v0.164 / #1365: also collect import aliases for qualified-name
+    // resolution in resolveNamed (§2.7).
     sourceImports_.clear();
+    importAliases_.clear();
+    ambiguousImportNames_.clear();
     for (const auto& imp : src.imports) {
         if (!imp || !imp->name) continue;
         std::string dotted;
@@ -66,7 +70,11 @@ void Resolver::run(const ast::SourceFile& src) {
             if (i != 0) dotted += '.';
             dotted += std::string(imp->name->parts[i]);
         }
-        sourceImports_.insert(std::move(dotted));
+        sourceImports_.insert(dotted);
+        // §2.2 v0.164: record the alias → module name mapping.
+        if (!imp->alias.empty()) {
+            importAliases_[imp->alias] = dotted;
+        }
     }
     Scope moduleScope;
     // Populate module-scope: every top-level type / alias by name.
@@ -84,9 +92,21 @@ void Resolver::run(const ast::SourceFile& src) {
     // reference to one resolves to the imported TypeSymbol. A local declaration
     // of the same name takes precedence (it was inserted above); imports never
     // shadow a local type (§2.2: imports make names *visible*, locals win).
+    // §2.2 v0.164 collision rule (#1365): when two imported modules export the
+    // same public name, that bare name is ambiguous — using it unqualified is a
+    // compile error. Track each name's origin module; on collision, remove it
+    // from scope and record it in ambiguousImportNames_ so resolveNamed can
+    // diagnose a clear "ambiguous" error rather than "unresolved identifier".
     // Only engaged when imports were actually loaded — the no-import path is
     // byte-for-byte unchanged.
     if (ctx_.hasImports()) {
+        // Snapshot local module declarations already in scope: these shadow
+        // imports and are never marked ambiguous (§2.2: local wins silently).
+        std::unordered_set<std::string_view> localNames;
+        for (const auto& [name, _] : moduleScope.names)
+            localNames.insert(name);
+        // Track which module first introduced each bare name via import.
+        std::unordered_map<std::string, std::string> importedNameOrigin;
         for (const auto& imp : src.imports) {
             if (!imp || !imp->name) continue;
             std::string dotted;
@@ -99,8 +119,20 @@ void Resolver::run(const ast::SourceFile& src) {
             if (!exported) continue;
             for (TypeSymbol* t : *exported) {
                 if (t->name.empty()) continue;
-                // Local declarations win (do not overwrite an existing entry).
-                moduleScope.names.emplace(t->name, t);
+                // §2.2: local declarations shadow imports — do not overwrite.
+                if (localNames.count(std::string_view(t->name))) continue;
+                auto [originIt, inserted] =
+                    importedNameOrigin.emplace(std::string(t->name), dotted);
+                if (inserted) {
+                    // First import to export this name — add it to scope.
+                    moduleScope.names.emplace(std::string_view(t->name), t);
+                } else if (originIt->second != dotted) {
+                    // §2.2 collision: a second (different) import exports this
+                    // name. Remove it from scope and record as ambiguous.
+                    ambiguousImportNames_.insert(std::string(t->name));
+                    moduleScope.names.erase(std::string_view(t->name));
+                }
+                // else: same module listed twice (no-op).
             }
         }
     }

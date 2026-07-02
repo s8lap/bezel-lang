@@ -889,6 +889,7 @@ set(BEZEL_TEST_SOURCES
     module/xmod_static_init_798_test.cpp  # #798: imported type's static init runs cross-module
     module/xmod_generic_method_783_test.cpp  # #783: imported generic-class method body monomorphized per instantiation
     module/xmod_const_string_1225_test.cpp  # #1225: imported const string not truncated (§2.5/§22.12)
+    module/module_chapter_1365_test.cpp     # #1365: §2 module chapter alignment (v0.164): import aliases, collision rule, §2.7 resolution
 
     runtime/event_subscription_test.cpp
     runtime/concurrent_dispose_706_test.cpp

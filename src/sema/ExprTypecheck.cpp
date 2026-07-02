@@ -60,6 +60,23 @@ static bool caseIntScrutineeRange(PrimitiveType t, long long& lo, long long& hi)
 
 void ExprTC::run(const ast::SourceFile& src) {
     moduleScope_ = std::make_unique<Scope>();
+    partialModulePaths_.clear();
+    // §2.2 v0.164 / #1365: collect import aliases + sourceImports for
+    // alias/module-prefix resolution in resolveMemberAccess (§2.7).
+    importAliases_.clear();
+    sourceImports_.clear();
+    ambiguousImportNames_.clear();
+    for (const auto& imp : src.imports) {
+        if (!imp || !imp->name) continue;
+        std::string dotted;
+        for (std::size_t i = 0; i < imp->name->parts.size(); ++i) {
+            if (i != 0) dotted += '.';
+            dotted += std::string(imp->name->parts[i]);
+        }
+        sourceImports_.insert(dotted);
+        if (!imp->alias.empty())
+            importAliases_[imp->alias] = dotted;
+    }
     if (ctx_.module()) {
         for (Symbol* child : ctx_.module()->children) {
             if (!child->name.empty()) {
@@ -81,7 +98,14 @@ void ExprTC::run(const ast::SourceFile& src) {
     // and the static-member-access path can find its method. Mirrors the
     // type-resolution pass's import gating (a local declaration wins). Engaged
     // only when dependencies were loaded — the single-module path is unchanged.
+    // §2.2 v0.164 collision rule (#1365): same as TypeResolution — track which
+    // module first introduced each bare name; on collision, remove from scope
+    // and record as ambiguous.
     if (ctx_.hasImports()) {
+        std::unordered_set<std::string_view> localNames;
+        for (const auto& [name, _sym] : moduleScope_->names)
+            localNames.insert(name);
+        std::unordered_map<std::string, std::string> importedNameOrigin;
         for (const auto& imp : src.imports) {
             if (!imp || !imp->name) continue;
             std::string dotted;
@@ -91,9 +115,18 @@ void ExprTC::run(const ast::SourceFile& src) {
             }
             if (const std::vector<TypeSymbol*>* exported =
                     ctx_.importedTypesOf(dotted)) {
-                for (TypeSymbol* t : *exported)
-                    if (!t->name.empty())
-                        moduleScope_->names.emplace(t->name, t);
+                for (TypeSymbol* t : *exported) {
+                    if (t->name.empty()) continue;
+                    if (localNames.count(std::string_view(t->name))) continue;
+                    auto [originIt, inserted] =
+                        importedNameOrigin.emplace(std::string(t->name), dotted);
+                    if (inserted) {
+                        moduleScope_->names.emplace(std::string_view(t->name), t);
+                    } else if (originIt->second != dotted) {
+                        ambiguousImportNames_.insert(std::string(t->name));
+                        moduleScope_->names.erase(std::string_view(t->name));
+                    }
+                }
             }
         }
     }

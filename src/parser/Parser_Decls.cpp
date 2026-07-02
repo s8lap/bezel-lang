@@ -121,6 +121,20 @@ std::unique_ptr<ast::Import> Parser::parseImport() {
     // Caller has verified `current_` is the `import` keyword.
     advance(); // past `import`
     decl->name = parseQualifiedName();
+    // Grammar A.1 (§2.2 v0.164 / #1365): optional `as Identifier` alias clause.
+    // `import BankingApp.Transactions as Tx;` binds `Tx` as a file-scoped
+    // qualifier for that module.
+    if (isKeyword("as")) {
+        advance(); // past `as`
+        if (current_.kind == TokenKind::Identifier) {
+            decl->alias = std::string(current_.text);
+            advance(); // past alias identifier
+        } else {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected identifier after 'as' in import alias "
+                                "(Grammar A.1 / §2.2)");
+        }
+    }
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after import declaration");

@@ -7002,6 +7002,129 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
+    // §2.2 v0.164 / §2.7 / #1365: import-alias and module-qualified resolution
+    // in expression position. Handles:
+    //   (a) `Alias.TypeName` — alias binds a module; ma.member is a public type.
+    //   (b) `ModuleName.TypeName` — single-segment module prefix exact match.
+    //   (c) Multi-segment: `Seg1.Seg2.TypeName` via partialModulePaths_ chain:
+    //       if ma.target is in partialModulePaths_ (a partial module path built
+    //       in a previous call), extend the path or find the type.
+    // All of (a–c) set exprType on `ma` to TypeRef(Named, TypeSymbol) and return
+    // early, so the subsequent regular-member-lookup path is bypassed.
+    // A further `MemberAccess("Square")` on the resulting TypeRef will find the
+    // static method through the normal targetType path.
+    if (ma.target) {
+        // Case (a) + (b): target is a bare identifier (alias or module name).
+        if (auto* iid =
+                dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            // (a) Import alias
+            auto aliasIt = importAliases_.find(std::string(iid->name));
+            if (aliasIt != importAliases_.end()) {
+                const std::string& modName = aliasIt->second;
+                if (const auto* exported = ctx_.importedTypesOf(modName)) {
+                    for (TypeSymbol* ts : *exported) {
+                        if (ts->name == ma.member) {
+                            // ma resolves to the imported type `ts`.
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->declaration = ts;
+                            ctx_.setExprType(&ma, tr);
+                            ctx_.setExprSymbol(&ma, ts);
+                            return;
+                        }
+                    }
+                }
+                // Alias known but member is not a public type — fall through.
+            }
+            // (b) Single-segment module name: `ModuleName.TypeName`
+            if (aliasIt == importAliases_.end()) {
+                const std::string name = std::string(iid->name);
+                if (sourceImports_.count(name)) {
+                    if (const auto* exported = ctx_.importedTypesOf(name)) {
+                        for (TypeSymbol* ts : *exported) {
+                            if (ts->name == ma.member) {
+                                auto* tr = ctx_.makeTypeRef();
+                                tr->kind = TypeRef::Kind::Named;
+                                tr->declaration = ts;
+                                ctx_.setExprType(&ma, tr);
+                                ctx_.setExprSymbol(&ma, ts);
+                                return;
+                            }
+                        }
+                    }
+                }
+                // Multi-segment prefix building: record a partial module path
+                // so the next MemberAccess level can extend or resolve it.
+                // E.g. `BankingApp` in `BankingApp.Transactions.Calc.Square()`:
+                // "BankingApp.Transactions" is an imported module.
+                if (!sourceImports_.empty() &&
+                    !lookupName(std::string_view(name))) {
+                    // Only build a partial path when the identifier isn't a type.
+                    std::string extended = name + "." + std::string(ma.member);
+                    bool exactMod = sourceImports_.count(extended) != 0;
+                    bool prefixMod = false;
+                    if (!exactMod) {
+                        for (const std::string& mod : sourceImports_) {
+                            if (mod.size() > extended.size() &&
+                                mod.substr(0, extended.size()) == extended &&
+                                mod[extended.size()] == '.') {
+                                prefixMod = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (exactMod || prefixMod) {
+                        partialModulePaths_[&ma] = extended;
+                        return;
+                    }
+                }
+            }
+        }
+        // Case (c): target is a MemberAccessExpr that was recorded as a
+        // partial module path. Extend the path or resolve to a TypeSymbol.
+        if (auto* inner =
+                dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
+            auto pathIt = partialModulePaths_.find(inner);
+            if (pathIt != partialModulePaths_.end()) {
+                const std::string& partialMod = pathIt->second;
+                std::string extended =
+                    partialMod + "." + std::string(ma.member);
+                // Does extending the path yield an exact import match?
+                if (sourceImports_.count(extended)) {
+                    partialModulePaths_[&ma] = extended;
+                    return;
+                }
+                // Is extended a prefix of some imported module?
+                bool isPrefix = false;
+                for (const std::string& mod : sourceImports_) {
+                    if (mod.size() > extended.size() &&
+                        mod.substr(0, extended.size()) == extended &&
+                        mod[extended.size()] == '.') {
+                        isPrefix = true;
+                        break;
+                    }
+                }
+                if (isPrefix) {
+                    partialModulePaths_[&ma] = extended;
+                    return;
+                }
+                // ma.member is a type in module `partialMod`.
+                if (const auto* exported = ctx_.importedTypesOf(partialMod)) {
+                    for (TypeSymbol* ts : *exported) {
+                        if (ts->name == ma.member) {
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->declaration = ts;
+                            ctx_.setExprType(&ma, tr);
+                            ctx_.setExprSymbol(&ma, ts);
+                            return;
+                        }
+                    }
+                }
+                // Module found but type not found — fall through to error path.
+            }
+        }
+    }
     TypeSymbol* targetType = nullptr;
     // `this.X` — currentType_ takes precedence over name lookup so
     // we don't have to teach `this` to be an expression with type

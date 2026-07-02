@@ -951,6 +951,150 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 return;
             }
         }
+        // §2.2 v0.164 / #1365: bare-name collision — two or more imported modules
+        // export a type with this name. Using it unqualified is a compile error;
+        // the fix is a module-qualified name or an import alias (§2.2).
+        if (!ambiguousImportNames_.empty() &&
+            ambiguousImportNames_.count(std::string(first))) {
+            ctx_.diagnostics().report(
+                Severity::Error, t.span.begin,
+                std::string("bare name `") + std::string(first) +
+                "` is ambiguous: multiple imported modules export a type "
+                "with this name; qualify it via a module-qualified name or "
+                "an import alias (\xC2\xA7""2.2)");
+            ref.kind = TypeRef::Kind::Error;
+            return;
+        }
+        // §2.2 v0.164 / §2.7 / #1365: import-alias resolution in type position.
+        // `Alias.TypeName[.Nested...]` where `Alias` is an import alias.
+        // Per §2.7 rule 1 this is checked before module-prefix matching.
+        if (!importAliases_.empty()) {
+            auto aliasIt = importAliases_.find(std::string(first));
+            if (aliasIt != importAliases_.end()) {
+                const std::string& modName = aliasIt->second;
+                if (t.name->parts.size() < 2) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("`") + std::string(first) +
+                        "` is an import alias; use `" + std::string(first) +
+                        ".TypeName` to name a type from that module (\xC2\xA7""2.2)");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+                std::string_view typeName = t.name->parts[1];
+                const auto* exported = ctx_.importedTypesOf(modName);
+                TypeSymbol* tsymAlias = nullptr;
+                if (exported) {
+                    for (TypeSymbol* ts : *exported) {
+                        if (ts->name == typeName) { tsymAlias = ts; break; }
+                    }
+                }
+                if (!tsymAlias) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("module `") + modName +
+                        "` has no public type `" + std::string(typeName) +
+                        "` (\xC2\xA7""2.2)");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+                // Walk remaining parts as nested types (§11.3).
+                for (std::size_t pi = 2; pi < t.name->parts.size(); ++pi) {
+                    std::string_view part = t.name->parts[pi];
+                    TypeSymbol* inner = nullptr;
+                    for (Symbol* m : tsymAlias->members) {
+                        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                            if (nt->name == part && nt->type) {
+                                inner = nt->type;
+                                break;
+                            }
+                        }
+                    }
+                    if (!inner) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("type `") + std::string(tsymAlias->name) +
+                            "` has no nested type `" + std::string(part) +
+                            "` (\xC2\xA7""11.3)");
+                        ref.kind = TypeRef::Kind::Error;
+                        return;
+                    }
+                    tsymAlias = inner;
+                }
+                ref.kind = TypeRef::Kind::Named;
+                ref.declaration = tsymAlias;
+                for (const auto& ga : t.genericArgs) {
+                    if (!ga) continue;
+                    ref.genericArgs.push_back(resolveType(*ga, scope));
+                }
+                return;
+            }
+        }
+        // §2.7 rule 2 / #1365: module-prefix resolution in type position.
+        // Try each prefix of the dotted name (longest-first) against imported
+        // module names. The remaining parts then resolve as type + nested types.
+        // Only fires when the context has loaded imports (ctx_.hasImports()).
+        if (ctx_.hasImports() && t.name->parts.size() >= 2) {
+            // Build prefixes longest-first: for N parts, try N-1, N-2, ..., 1.
+            for (int prefixLen = (int)t.name->parts.size() - 1;
+                 prefixLen >= 1; --prefixLen) {
+                std::string prefix;
+                for (int k = 0; k < prefixLen; ++k) {
+                    if (k > 0) prefix += '.';
+                    prefix += std::string(t.name->parts[k]);
+                }
+                // Only honour modules that are explicitly imported in this file.
+                if (!sourceImports_.count(prefix)) continue;
+                const auto* exported = ctx_.importedTypesOf(prefix);
+                if (!exported) continue;
+                // parts[prefixLen] is the type name.
+                std::string_view typeName = t.name->parts[prefixLen];
+                TypeSymbol* tsymMod = nullptr;
+                for (TypeSymbol* ts : *exported) {
+                    if (ts->name == typeName) { tsymMod = ts; break; }
+                }
+                if (!tsymMod) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("module `") + prefix +
+                        "` has no public type `" + std::string(typeName) +
+                        "` (\xC2\xA7""2.7)");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+                // Walk remaining parts as nested types.
+                for (std::size_t pi = (std::size_t)prefixLen + 1;
+                     pi < t.name->parts.size(); ++pi) {
+                    std::string_view part = t.name->parts[pi];
+                    TypeSymbol* inner = nullptr;
+                    for (Symbol* m : tsymMod->members) {
+                        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                            if (nt->name == part && nt->type) {
+                                inner = nt->type;
+                                break;
+                            }
+                        }
+                    }
+                    if (!inner) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("type `") + std::string(tsymMod->name) +
+                            "` has no nested type `" + std::string(part) +
+                            "` (\xC2\xA7""11.3)");
+                        ref.kind = TypeRef::Kind::Error;
+                        return;
+                    }
+                    tsymMod = inner;
+                }
+                ref.kind = TypeRef::Kind::Named;
+                ref.declaration = tsymMod;
+                for (const auto& ga : t.genericArgs) {
+                    if (!ga) continue;
+                    ref.genericArgs.push_back(resolveType(*ga, scope));
+                }
+                return;
+            }
+        }
         ctx_.diagnostics().report(
             Severity::Error, t.span.begin,
             std::string("unresolved type name `") +
