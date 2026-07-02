@@ -4887,6 +4887,16 @@ private:
     // returns false.
     const sema::TypeSymbol* unwindOwnedLocalClass(const ast::LocalDecl* ld);
 
+    // §4.5/§4.7/§4.9/§4.11/§2.14/§29.1: is `call` a BUILTIN method that
+    // TRANSFERS an owned class element to the caller (Pop/Dequeue on owning
+    // stacks/queues, PopLast/PopFirst/PopAt/PopValue, T.Deserialize,
+    // TakeCurrent on owning enumerators)? Builtins have no MethodSymbol, so
+    // owned-return recognition keys on the callee name plus an OWNING receiver
+    // type. Shared by usingVarOwnsClassObjectDynamically (using-var scope-end
+    // disposal) and unwindOwnedLocalClass (explicit-dispose reclaim, §28.3
+    // unwind disposal, §28.7 drop-on-overwrite).
+    bool isBuiltinOwnedTransferCall(const ast::CallExpr& call);
+
     // §28.3: the set of local-decl AST nodes and parameter symbols that are
     // INELIGIBLE for unwind disposal because they are moved, explicitly
     // disposed, reassigned, or otherwise consumed somewhere in the current

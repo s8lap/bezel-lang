@@ -7561,6 +7561,40 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
 }
 
 
+bool Emitter::isBuiltinOwnedTransferCall(const ast::CallExpr& call) {
+    // §4.5/§4.7/§4.9/§4.11/§2.14/§29.1: builtin methods that TRANSFER an owned
+    // class element to the caller. These have no MethodSymbol (sema sets no
+    // exprSymbol on the builtin callee), so recognition keys on the callee name
+    // plus — where a borrowing counterpart with the same name exists — an
+    // OWNING receiver type (a borrowing Stack.Pop returns a BORROW; disposing
+    // it would double-free).
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma) return false;
+    const auto& nm = ma->member;
+    if (nm == "PopLast" || nm == "PopFirst" || nm == "PopAt" ||
+        nm == "PopValue" || nm == "Deserialize")
+        return true;
+    std::string_view rcn;
+    if (ma->target) {
+        const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+        if (rt && rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty())
+            rcn = rt->astNode->name->parts[0];
+        else if (rt && !rt->importedName.empty())
+            rcn = rt->importedName;
+    }
+    if ((nm == "Pop" || nm == "Dequeue") &&
+        (rcn == "OwnedStack" || rcn == "OwnedQueue"))
+        return true;
+    // #1349 / §29.1 v0.161: TakeCurrent on the owning enumerators (vtable
+    // slot 3) transfers the yielded element.
+    if (nm == "TakeCurrent" &&
+        (rcn == "OwnedEnumerator" || rcn == "OwnedAsyncEnumerator"))
+        return true;
+    return false;
+}
+
+
 const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld) {
     // §28.3: a plain `var` owned local eligible for exception-unwind disposal.
     // Restrict to a definitely-owned, definitely-assigned class/interface object
@@ -7685,6 +7719,25 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                             rt->declaration->kind == ast::TypeDeclKind::Class)
                             return rt->declaration;
                     // Interface return: dynamic dispatch with a null cls.
+                    return reinterpret_cast<const sema::TypeSymbol*>(1);
+                }
+            }
+            // (b3) #1349 / #642 / §28.3 / §28.11: builtin owned-TRANSFER calls
+            // (Pop/Dequeue on owning stacks/queues, PopLast/PopFirst/PopAt/
+            // PopValue, T.Deserialize, TakeCurrent on owning enumerators) have
+            // no MethodSymbol, so (b) above missed them: a plain
+            // `var x := s.Pop()` was neither reclaimed by an explicit
+            // `x.Dispose()` (destructor dispatched, block leaked — found by the
+            // #1349 merge-gate ASan probe) nor disposed on an exception unwind,
+            // and §28.7 drop-on-overwrite skipped it. Mirrors the using-var
+            // allowlist (usingVarOwnsClassObjectDynamically b2).
+            if (!ms && isBuiltinOwnedTransferCall(*call)) {
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (isClassOrInterfaceRef(initTy)) {
+                    if (initTy->kind == sema::TypeRef::Kind::Named &&
+                        initTy->declaration &&
+                        initTy->declaration->kind == ast::TypeDeclKind::Class)
+                        return initTy->declaration;
                     return reinterpret_cast<const sema::TypeSymbol*>(1);
                 }
             }
@@ -11490,71 +11543,29 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                 // class (including those with no user destructor), so slot 2 is
                 // always non-null for a class that's in disposerFns_.
                 if (isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
-                    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        call->callee.get());
-                    if (ma) {
-                        auto nm = ma->member;
-                        // §2.14 / #550: T.Deserialize(d) is the synthesized
-                        // (or hand-written conforming) factory returning
-                        // `owned T` by contract — sema sets no exprSymbol on
-                        // the synthesized form, so (b1) misses it and the
-                        // deserialized tree leaked under `using var` (found by
-                        // the t2/t3 ASan round-trip probes, 2026-06-12).
-                        // §4.11 (#746 R41-F): OwnedStack.Pop() /
-                        // OwnedQueue.Dequeue() transfer the owned element to the
-                        // caller, exactly like PopLast/PopFirst. Gate on the
-                        // OWNING receiver — a borrowing Stack/Queue returns a
-                        // BORROW, and disposing that would double-free.
-                        bool ownedPopDequeue = false;
-                        if ((nm == "Pop" || nm == "Dequeue") && ma->target) {
-                            const sema::TypeRef* rt =
-                                ctx_.exprType(*ma->target);
-                            std::string_view rcn =
-                                (rt && rt->astNode && rt->astNode->name &&
-                                 !rt->astNode->name->parts.empty())
-                                    ? rt->astNode->name->parts[0]
-                                    : std::string_view{};
-                            ownedPopDequeue =
-                                rcn == "OwnedStack" || rcn == "OwnedQueue";
-                        }
-                        // #1349 / §29.1 v0.161: OwnedEnumerator<T>.TakeCurrent()
-                        // and OwnedAsyncEnumerator<T>.TakeCurrent() transfer the
-                        // owned element to the caller (vtable slot 3). Gate on the
-                        // OWNING receiver type so a hypothetical user-defined
-                        // TakeCurrent on another type is not mistakenly disposed.
-                        bool ownedTakeCurrent = false;
-                        if (nm == "TakeCurrent" && ma->target) {
-                            const sema::TypeRef* rt =
-                                ctx_.exprType(*ma->target);
-                            std::string_view rcn =
-                                (rt && rt->astNode && rt->astNode->name &&
-                                 !rt->astNode->name->parts.empty())
-                                    ? rt->astNode->name->parts[0]
-                                    : std::string_view{};
-                            ownedTakeCurrent =
-                                rcn == "OwnedEnumerator" ||
-                                rcn == "OwnedAsyncEnumerator";
-                        }
-                        if (nm == "PopLast" || nm == "PopFirst" ||
-                            nm == "PopAt"   || nm == "PopValue" ||
-                            nm == "Deserialize" || ownedPopDequeue ||
-                            ownedTakeCurrent) {
-                            // Only register if the element class has a disposer
-                            // (vtable slot 2 non-null).  Interface-typed results
-                            // always dispatch dynamically and always have a vtable,
-                            // so treat them as having a disposer too.
-                            const sema::TypeRef* eTy =
-                                ctx_.exprType(*ld->initializer);
-                            if (eTy && eTy->declaration) {
-                                bool hasDisposer =
-                                    disposerFns_.find(eTy->declaration) !=
-                                    disposerFns_.end();
-                                bool isIface =
-                                    eTy->declaration->kind ==
-                                    ast::TypeDeclKind::Interface;
-                                if (hasDisposer || isIface)
-                                    return true;
-                            }
+                    // §2.14 / §4.5 / §4.11 / §29.1 (#550/#642/#746/#1349): the
+                    // builtin owned-TRANSFER calls (Pop/Dequeue on owning
+                    // stacks/queues, PopLast/PopFirst/PopAt/PopValue,
+                    // T.Deserialize, TakeCurrent on owning enumerators) —
+                    // recognized by name + owning receiver in the shared
+                    // isBuiltinOwnedTransferCall (also used by
+                    // unwindOwnedLocalClass for the plain-var forms).
+                    if (isBuiltinOwnedTransferCall(*call)) {
+                        // Only register if the element class has a disposer
+                        // (vtable slot 2 non-null).  Interface-typed results
+                        // always dispatch dynamically and always have a vtable,
+                        // so treat them as having a disposer too.
+                        const sema::TypeRef* eTy =
+                            ctx_.exprType(*ld->initializer);
+                        if (eTy && eTy->declaration) {
+                            bool hasDisposer =
+                                disposerFns_.find(eTy->declaration) !=
+                                disposerFns_.end();
+                            bool isIface =
+                                eTy->declaration->kind ==
+                                ast::TypeDeclKind::Interface;
+                            if (hasDisposer || isIface)
+                                return true;
                         }
                     }
                 }

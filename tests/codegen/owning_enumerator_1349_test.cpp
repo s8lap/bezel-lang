@@ -384,3 +384,55 @@ BEZEL_TEST(owning_enumerator_1349, asan_manual_protocol_no_leak_spec_29_1) {
     if (rc == -1) return;  // toolchain unavailable — skip
     BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no leak, no double-free)
 }
+
+// ===========================================================================
+// §28.11 / §28.3 / §28.7 family: builtin owned-TRANSFER results held in a
+// plain `var` local (merge-gate ASan follow-up to #1349). unwindOwnedLocalClass
+// missed calls with no MethodSymbol (builtin Pop/Dequeue/PopLast/.../
+// TakeCurrent), so an explicit `x.Dispose()` dispatched the destructor but
+// never RECLAIMED the block, and §28.7 drop-on-overwrite skipped the local.
+// Now shares the using-var allowlist (isBuiltinOwnedTransferCall).
+// ===========================================================================
+
+// AOT + ASan: `var x := en.TakeCurrent(); ...; x.Dispose()` — the manual form
+// the §29.1 desugaring itself uses (spec_0226) — reclaims exactly once.
+BEZEL_TEST(owning_enumerator_1349, asan_plain_var_explicit_dispose_reclaims) {
+    int rc = runUnderASan(
+        "module M; " + kCountR +
+        "class C "
+        "  public static method Gen(): OwnedEnumerable<R> "
+        "    yield return new R(); "
+        "    yield return new R(); "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    using var source := Gen(); "
+        "    using var en := source.GetOwnedEnumerator(); "
+        "    while en.MoveNext() do "
+        "      var x := en.TakeCurrent(); "
+        "      x.Dispose(); "
+        "    end; "
+        "    return 0; "
+        "  end Main; end C;");
+    if (rc == -1) return;  // toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no leak, no double-free)
+}
+
+// AOT + ASan: the same gap for the owning-collection transfers — §4.11
+// OwnedStack.Pop() into a plain `var` with explicit Dispose, plus a §28.7
+// reassignment (`x := s.Pop()`) that must dispose the displaced element.
+BEZEL_TEST(owning_enumerator_1349, asan_pop_plain_var_dispose_and_overwrite) {
+    int rc = runUnderASan(
+        "module M; " + kCountR +
+        "class C "
+        "  public static method Main(): int "
+        "    using var s := new OwnedStack<R>(); "
+        "    s.Push(move (new R())); "
+        "    s.Push(move (new R())); "
+        "    var x := s.Pop(); "
+        "    x := s.Pop(); "      // §28.7: displaced element disposed
+        "    x.Dispose(); "       // §28.11: reclaim + null
+        "    return 0; "
+        "  end Main; end C;");
+    if (rc == -1) return;  // toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no leak, no double-free)
+}
