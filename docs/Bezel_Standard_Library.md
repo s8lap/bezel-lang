@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.161 — July 2026**
+**Companion to the Bezel Language Specification, v0.162 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2747,7 +2747,7 @@ This matches C#'s `CancellationToken.Register` behavior. The synchronous-fire po
 public class TimeoutException: Exception
   public constructor();
   public constructor(message: string);
-  public constructor(message: string, inner: Exception);
+  public constructor(message: string, inner: Exception);   // borrows inner; snapshot copied into CauseChain (spec §31.4, v0.162) — no reference retained
 end TimeoutException;
 ```
 
@@ -3021,7 +3021,7 @@ public class Task
     owned tasks: OwnedArray<OwnedTask<T>>
   ): OwnedTask<OwnedArray<T>> where T: class;
 
-  public static method WhenAny(tasks: Array<Task>): Task<Task>;
+  public static method WhenAny(tasks: Array<Task>): Task<int>;   // index of the first task to complete (v0.162)
   public static method FireAndForget(owned task: Task);
 end Task;
 ```
@@ -3664,7 +3664,7 @@ public record Range<T>: IEnumerable<T>
 end Range;
 ```
 
-`Contains` tests membership by endpoints and inclusivity; `Step` does not affect `Contains`. This is the operation invoked by the `in` operator (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)).
+`Contains(v)` is `true` iff the range is nonempty under iteration and `v` lies within the endpoint extent (exclusive upper bound excluded) — an empty range contains nothing, and `Contains` agrees with range patterns on the stepless forms (language spec [§16.3](Bezel_Language_Spec.md#sec-range-operations), v0.162). `Step` affects membership only through direction/emptiness. This is the operation invoked by the `in` operator (spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)).
 
 `GetEnumerator` produces an enumerator that yields values from `Start` to `End`, incrementing by `Step`. Calling `GetEnumerator` on an open-ended range (`IsOpenEnded` is `true`) raises `InvalidOperationException`. Because `Range<T>` implements `IEnumerable<T>`, ranges compose with LINQ and other IEnumerable-based APIs:
 

@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.161 — July 2026**
+**Version 0.162 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2333,13 +2333,13 @@ A range whose `Start` is U+E000 or higher iterates that upper segment without su
 
 Step strides that would land within the surrogate range terminate at the same boundary. `'\uD7F0'..'\uE010' step 4` yields U+D7F0, U+D7F4, U+D7F8, U+D7FC, then would compute U+D800 — a surrogate — and terminates. No `InvalidOperationException` is raised; the surrogate boundary is iteration termination, not an error.
 
-Surrogate code points themselves cannot be written as `char` literals — `'\uD800'` and similar escapes are compile errors per [§18.3](#sec-character-literals) and [§18.8](#sec-escape-sequences-non-verbatim), and `char(0xD800)` raises `OverflowException` at runtime per [§5.2](#sec-explicit-conversions). Range endpoints, however, are integer-valued at construction; a `Range<char>` constructed from the integer endpoints by other means (e.g. by deserialization from a saved value) is bounded by `char`'s validity contract regardless of how the endpoints were spelled. The `Contains` operation uses the normative extent formula of [§16.3](#sec-range-operations) (below) and does not exclude surrogates from membership testing — for a range `r` whose integer extent covers U+D800, the integer-level membership test for U+D800 returns `true`, but iteration of `r` will not yield that value. The asymmetry is deliberate: `Contains` answers a mathematical question about the range's extent, while iteration produces a sequence of valid `char` values.
+Surrogate code points themselves cannot be written as `char` literals — `'\uD800'` and similar escapes are compile errors per [§18.3](#sec-character-literals) and [§18.8](#sec-escape-sequences-non-verbatim), and `char(0xD800)` raises `OverflowException` at runtime per [§5.2](#sec-explicit-conversions). Range endpoints, however, are integer-valued at construction; a `Range<char>` constructed from the integer endpoints by other means (e.g. by deserialization from a saved value) is bounded by `char`'s validity contract regardless of how the endpoints were spelled. The `Contains` operation uses the normative membership formula of [§16.3](#sec-range-operations) (below) and does not exclude surrogates from the within-extent test of a nonempty range — for a range `r` whose integer extent covers U+D800, the integer-level membership test for U+D800 returns `true`, but iteration of `r` will not yield that value. The asymmetry is deliberate: `Contains` answers a mathematical question about the range's extent, while iteration produces a sequence of valid `char` values.
 
 `IsOpenEnded` is `true` when `Start` is `null` or `End` is `null`.
 
-`IsEmpty` is `true` when **iteration of the range yields no values** (the lower bound exceeds the upper bound in the direction of iteration, or both endpoints are present and equal with an exclusive upper bound). `IsEmpty` is about iteration, not extent: `(100..0).IsEmpty` is `true` while `(100..0).Contains(50)` is `true` — see `Contains` below.
+`IsEmpty` is `true` when **iteration of the range yields no values** (the lower bound exceeds the upper bound in the direction of iteration, or both endpoints are present and equal with an exclusive upper bound). `IsEmpty` and `Contains` agree (v0.162): an empty range contains nothing.
 
-`Contains` is the operation invoked by `in` ([§17.5](#sec-the-in-operator)). **Normative formula (v0.159):** `Contains(v)` is `true` iff `min(Start, End) <= v <= max(Start, End)`, with `v = End` additionally excluded when `IsEndInclusive` is `false`; a `null` endpoint (open-ended form) imposes no bound on its side; `Step` never affects `Contains`. The formula is direction-independent — it answers a question about the range's mathematical *extent*, so `50 in 100..0` is `true` even though iterating `100..0` yields nothing. (This is the same extent-vs-iteration posture as the surrogate asymmetry above.)
+`Contains` is the operation invoked by `in` ([§17.5](#sec-the-in-operator)). **Normative formula (v0.162, revising v0.159):** `Contains(v)` is `true` iff the range is **nonempty under iteration** (`IsEmpty` is `false`) **and** `min(Start, End) <= v <= max(Start, End)`, with `v = End` additionally excluded when `IsEndInclusive` is `false`; a `null` endpoint (open-ended form) imposes no bound on its side and never makes the range empty. `Step` affects membership only through emptiness/direction — `0..10 step 2` contains `3`. Consequently an iteration-empty range contains nothing: `50 in 100..0` is `false` (matching Rust and Python), while `(100..0 step -1).Contains(50)` is `true` (descending and nonempty). A caller who wants *unordered-interval* membership over possibly-inverted endpoints writes it explicitly: `Math.Min(a,b) <= v and v <= Math.Max(a,b)`. (v0.159 briefly codified the implementation's direction-independent extent formula; owner review flagged the `IsEmpty`-yet-`Contains` contradiction and the divergence from every precedent language, and the pattern-vs-`in` asymmetry it created — all three resolve under this rule.)
 
 `GetEnumerator` produces an enumerator that yields values from `Start` to `End` (inclusive or exclusive per `IsEndInclusive`), incrementing by `Step`. Calling `GetEnumerator` on an open-ended range raises `InvalidOperationException`. The compiler warns when an open-ended range literal appears directly in a `for` statement or other iteration context.
 
@@ -2408,7 +2408,7 @@ Open-ended ranges are designed for slicing ([§15.6](#sec-slicing)) and pattern 
 <a id="sec-empty-ranges-and-equal-bound-ranges"></a>
 ### 16.6 Empty ranges and equal-bound ranges
 
-A range whose lower bound exceeds its upper bound (in the direction of iteration) is empty. Iterating an empty range is a no-op. Construction is not an error. **Range patterns (v0.159):** a range pattern `lo..hi` / `lo..<hi` (necessarily stepless, [§16.4](#sec-step)) matches `v` iff `lo <= v <= hi` (resp. `< hi`) read **directionally as written** — a reversed pattern like `100..0` matches nothing. This deliberately differs from `in`/`Contains` on reversed ranges (which test extent, [§16.3](#sec-range-operations)): a pattern states bounds in order, an extent query does not — the same recorded asymmetry as `Contains`-vs-iteration.
+A range whose lower bound exceeds its upper bound (in the direction of iteration) is empty. Iterating an empty range is a no-op. Construction is not an error. **Range patterns:** a range pattern `lo..hi` / `lo..<hi` (necessarily stepless, [§16.4](#sec-step)) matches `v` iff `lo <= v <= hi` (resp. `< hi`) read directionally as written. With the v0.162 `Contains` rule this **agrees exactly with `in`** on the stepless forms — a reversed pattern like `100..0` matches nothing, and `50 in 100..0` is likewise `false`; there is no pattern-vs-`Contains` asymmetry. Because a *constant* reversed range pattern can never match, the compiler emits a **warning** at the pattern ("this pattern never matches — bounds are reversed"), the same constant-fold discipline as [§16.4](#sec-step)'s step diagnostics.
 
 A range whose bounds are equal is a special case where direction is undefined:
 
@@ -3915,7 +3915,28 @@ Cycles in static initialization across types are rejected by the compiler.
 
 Enum constants are compile-time values and may be referenced freely from static initializers without triggering initialization.
 
-`await` may not appear in static field initializers or static constructor bodies. Static initialization runs synchronously during type loading; suspending would leave the type in a partially-initialized state visible to other threads. Asynchronous initialization should be performed in an explicitly-called `async` method, with the result stored in a `static readonly` field via a synchronous wrapper. The standard pattern is to call `task.Wait()` to block until completion, then read `task.Result` for the value (the synchronous escape hatches noted in [§30.3](#sec-the-task-and-taskt-types)); the wrapper itself is a non-`async` method that performs the sequence.
+`await` may not appear in static field initializers or static constructor bodies. Static initialization runs synchronously during type loading; suspending would leave the type in a partially-initialized state observable by other code. **Asynchronous values do not belong in static initializers** (v0.162 — the previously-prescribed `task.Wait()` wrapper deadlocks when first-use occurs inside a domain continuation, which lazy initialization cannot rule out). Two sanctioned patterns:
+
+**(a) Eager startup initialization** — do the async work in an `async Main` (all four async forms are admitted, [§33.2](#sec-signatures)) and assign the static before first use:
+
+```bezel
+public static async method Main(): Task<int>
+  Config.Current := await LoadConfigAsync();   // plain sync assignment of an awaited value
+  return Run();
+end Main;
+```
+
+**(b) Lazy async accessor** — for on-demand initialization, cache the *task*, not the value, and `await` it at every use site (Pattern A multi-await is exactly this fan-out shape, [§30.5](#sec-result-lifetime-and-task-disposal)):
+
+```bezel
+private static _cfg: Task<Config>? := null;
+public static async method GetConfig(): Task<Config>
+  if _cfg = null then _cfg := LoadConfigAsync(); end;
+  return await _cfg!;
+end GetConfig;
+```
+
+A non-`async` synchronous wrapper that blocks on the task is admitted **only** in code running outside any domain ([§30.3](#sec-the-task-and-taskt-types)) — startup code on the main thread — and never from a lazily-triggered initializer. *(The static cache in (b) is subject to the statics-and-domains rules tracked at #1363; the pattern is sound within a domain today.)*
 
 <a id="sec-disposal-of-static-owned-fields"></a>
 #### Disposal of static `owned` fields
@@ -6219,13 +6240,20 @@ end Task;
 
 public class OwnedTask<T>: Task where T: class
   // Owning task: result transfers ownership to the awaiter (Pattern B).
-  // Single-consumer by type. Reading the Result property is rejected
-  // because Result would require borrow-source rules that this class
-  // does not provide; consume via `await` only.
+  // Single-consumer by type.
+  public readonly property Result: T;
+                    // v0.162 (#1379): reading Result on a COMPLETED OwnedTask
+                    // in an owned-consuming position transfers ownership
+                    // exactly like `await` (the result buffer is consumed;
+                    // a second read/await raises InvalidOperationException).
+                    // Subject to the same §30.3 blocking rules as Task<T>.Result:
+                    // legal on an incomplete task only outside domains.
 end OwnedTask;
 ```
 
-`Wait()` and `Result` are synchronous escape hatches for non-async code. They block the calling thread until the task completes; inside async methods, prefer `await`. Reading `Result` on a faulted task re-raises the exception; reading `Result` on a cancelled task raises `OperationCanceledException`.
+`Wait()` and `Result` are synchronous escape hatches for **code running outside any domain** — in practice, the synchronous portion of program startup: a non-`async` `Main`, and code it calls directly on the main thread. There, they block the calling thread until the task completes; the pool's workers drain the task's domain concurrently, so completion makes progress (this is the same mechanism by which the runtime itself drives an `async Main`, [§33.2](#sec-signatures)).
+
+**Inside a domain continuation — equivalently, anywhere `await` is available or the caller was reached from one — a blocking wait on an incomplete task is an error (v0.162).** A domain executes its continuations serially to completion ([§30.13](#sec-runtime-model)); a continuation blocked in `Wait()`/`Result` freezes its domain, and any awaited chain whose completion routes through that domain can never finish: a deterministic deadlock, not a hazard. The compiler rejects `Wait()` and `Result` lexically inside `async` methods and `async` lambdas (there, `await` is strictly superior and always available). Where static rejection cannot see the call (a non-`async` helper invoked from a continuation), the runtime raises `InvalidOperationException` at the call site instead of parking: *"blocking wait inside a domain continuation; the domain can never advance — await the task, or query IsCompleted."* Reading `Result` on a **completed** task is always legal and non-blocking: on a faulted task it re-raises the exception; on a cancelled task it raises `OperationCanceledException`.
 
 `OwnedTask<T>` does not expose a `Result` property — the result is single-consumer and ownership-transferring, so a "read result" operation would have no well-defined semantics (a second read would yield a moved-from value). Consumers must `await` an `OwnedTask<T>` in an owned-consuming position to obtain the result (see [§30.5](#sec-result-lifetime-and-task-disposal) Pattern B).
 
@@ -6236,7 +6264,7 @@ end OwnedTask;
 
 A `Task` or `Task<T>` may be awaited from multiple places, sequentially or concurrently. Every awaiter sees the same eventual state. The underlying computation runs once. Continuations resume in unspecified order, but never concurrently with one another within a domain ([§30.13](#sec-runtime-model)).
 
-`OwnedTask<T>` is single-consumer per the Pattern B rules in [§30.5](#sec-result-lifetime-and-task-disposal): once awaited for a successful (non-faulted, non-cancelled) result, the task is spent, and a second await raises `InvalidOperationException`. Sharing an `OwnedTask<T>` across multiple potential awaiters is not the intended pattern. For fan-out with a class-typed result, use `Task<T>` (Pattern A); for single-consumer ownership-transferring resource production, use `OwnedTask<T>` (Pattern B).
+`OwnedTask<T>` is single-consumer per the Pattern B rules in [§30.5](#sec-result-lifetime-and-task-disposal): **the first await spends the task regardless of outcome** (v0.162 — success, fault, or cancellation), and a second await raises `InvalidOperationException`. (The "awaiting a faulted task re-raises" rule of [§30.9](#sec-exceptions-in-async-methods) applies to `Task`/`Task<T>` and to the *first* await of an `OwnedTask<T>` only.) Sharing an `OwnedTask<T>` across multiple potential awaiters is not the intended pattern. For fan-out with a class-typed result, use `Task<T>` (Pattern A); for single-consumer ownership-transferring resource production, use `OwnedTask<T>` (Pattern B).
 
 <a id="sec-result-lifetime-and-task-disposal"></a>
 ### 30.5 Result lifetime and task disposal
@@ -6248,6 +6276,8 @@ The task owns any class-typed result it produces. The pattern by which a result 
 
 - `Task` and `Task<T>` for value type, `string`, or runtime-managed T: produced as today; no ownership obligation crosses the await boundary.
 - `Task<T>` for **class** T: the task may be awaited from multiple places. Every awaiter receives a borrow of the same underlying result. The result's lifetime is tied to the task — disposing the task disposes the result. This is **Pattern A**.
+
+  **Pattern A result slots are of two kinds (v0.162).** When the async body produced a *fresh owned value* (a `return` of an owned expression), the task **owns the result** and its destructor disposes it directly. When the body did `return await <Pattern A source>`, the result is a *borrow through the source task* — the task cannot own what it borrowed; instead, ownership of the **source task** transfers into the outer task's state (a **chained** slot), and the outer destructor disposes the chained source task, never the borrowed result directly. "Disposing the task disposes the result" thereby holds *transitively*, and every Pattern A borrow has a defined owner at every link of the chain.
 - `OwnedTask<T>` for **class** T: the task produces a single owned result. Awaiting transfers ownership to the awaiter. The task may be awaited at most once for a successful (non-faulted, non-cancelled) result. This is **Pattern B**.
 - `OwnedTask<T>` for value type, `string`, or runtime-managed T: a compile error. `owned` on a non-class result is meaningless.
 
@@ -6320,7 +6350,7 @@ A bare `var x := await someTask;` where `someTask` is not in one of the admitted
 
 The task is disposed implicitly without disposing its result; it cannot be awaited again, and a second await raises `InvalidOperationException`.
 
-The await operator on a `OwnedTask<T>` for class T is itself **owned-consuming with respect to its operand**: when the awaited expression is an owned task value (an owned local of `OwnedTask<T>`, an iteration variable from draining an `OwnedArray<OwnedTask<T>>`, an `owned` parameter, or any other owned-typed expression of `OwnedTask<T>`), the await consumes the task as part of the operation and satisfies the discharge requirement on the operand. The implicit task-disposal that the runtime performs is the same operation that satisfies the type system's discharge rule; one is the runtime view, the other is the static-analysis view of the same event.
+The await operator on a `OwnedTask<T>` for class T is itself **owned-consuming with respect to its operand**: when the awaited expression is an owned task value (an owned local of `OwnedTask<T>`, an iteration variable from draining an `OwnedArray<OwnedTask<T>>`, an `owned` parameter, or any other owned-typed expression of `OwnedTask<T>`), the await consumes the task as part of the operation and satisfies the discharge requirement on the operand — **on all outgoing edges of the await, including the fault/cancel (exception) edge** (v0.162): after a faulted first await, an owned operand is moved-from per [§28.3](#sec-local-variables-ownership-and-borrows), and a retry requires binding a fresh task. The implicit task-disposal that the runtime performs is the same operation that satisfies the type system's discharge rule; one is the runtime view, the other is the static-analysis view of the same event.
 
 In practice this means the natural patterns work without explicit task disposal:
 
@@ -6609,7 +6639,7 @@ The standard library provides:
 - `Task.WhenAll(tasks: Array<Task>): Task` — completes when all tasks complete.
 - `Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>` — homogeneous result type for non-class T.
 - `Task.WhenAllOwned<T>(owned tasks: OwnedArray<OwnedTask<T>>): OwnedTask<OwnedArray<T>> where T: class` — Pattern B aggregator. The caller transfers ownership of the array (and its tasks); the result is an owned array of owned elements. Each task is awaited in turn (sequentially in the implementation, but the underlying operations run concurrently because the tasks were started before being passed in). See std lib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers) for a worked example.
-- `Task.WhenAny(tasks: Array<Task>): Task<Task>` — completes when the first task completes.
+- `Task.WhenAny(tasks: Array<Task>): Task<int>` — completes when the first task completes, yielding the **index** of the winner in `tasks` (v0.162 — was `Task<Task>`, which was unconstructible under this section's own rules: no factory produces a Pattern A `Task<T>` of class T from an externally-supplied value, and its destructor semantics were unsound; the input array is already indexable, so the index identifies the winner with no ownership question).
 - `Task.FireAndForget(owned task: Task)` — registers a continuation that logs or handles any exception the task produces, then disposes the task. The calling code relinquishes ownership; the runtime supervises the task's lifecycle. **`Task.FireAndForget` is the only supported way to discard a `Task` value** — the discard form `_ := someAsyncCall();` is rejected at compile time because `Task` has a destructor, and abandoning a `Task` reference would skip its continuation cleanup. The two legal patterns for "I don't want to await this task" are `Task.FireAndForget(call())` (supervised: exceptions thrown by the task are logged) and `using var t := call();` (unsupervised: the task is disposed at scope end without blocking, and any exceptions it raises are silently swallowed; see [§30.5](#sec-result-lifetime-and-task-disposal) for the disposal-of-unconsumed-task semantics).
 
 These compose with the rest of the async machinery; awaiting them works like awaiting any other task.
@@ -6675,19 +6705,21 @@ If the source is disposed before the task completes, the task is automatically t
 
 If the source is disposed after `SetResult` was called, the task continues to expose the result; awaiters are unaffected. For `OwnedTaskCompletionSource<T>`, the produced result is now owned by the task, not the source — disposing the source has no effect on the result.
 
-Pattern — wrapping a callback API:
+Pattern — wrapping a **one-shot** callback API (the registration invokes the callback at most once; illustrative API):
 
 ```bezel
-public async method WaitForKeyPressAsync(): Task<char>
-  using var tcs := new TaskCompletionSource<char>();
+public async method ReadSectorAsync(dev: BlockDevice, lba: long): Task<int>
+  using var tcs := new TaskCompletionSource<int>();
 
-  Keyboard.OnKeyPress((key) => do
-    tcs.TrySetResult(key);
+  dev.BeginRead(lba, (status) => do        // BeginRead invokes the callback ONCE
+    tcs.TrySetResult(status);
   end);
 
   return await tcs.Task;
-end WaitForKeyPressAsync;
+end ReadSectorAsync;
 ```
+
+*(v0.162: an earlier revision illustrated this pattern with a keyboard **event** subscription — a repeating registration whose handler can fire again after the `using var` scope ends. Repeating sources are outside the §30.11 closure-capture exception; see its one-shot requirement.)*
 
 Pattern — wrapping a class-typed result with ownership transfer:
 
@@ -6718,7 +6750,14 @@ Process(r);
 
 The proof is structural: the `await tcs.Task` blocks the enclosing method's continuation until `tcs.TrySetResult` is called from the callback. The enclosing method's `tcs` local stays in scope until the method completes; the await ensures the method does not return until the callback has either completed (running `TrySetResult`) or failed in a way the task observed. By the time `tcs`'s scope ends, the callback has been invoked (or the task is in a terminal state without invocation, in which case the callback may still hold a borrow but `tcs`'s task is already settled and disposal of `tcs` will fault the task safely).
 
-This reasoning is **specific to the TCS callback-registration pattern** and not a general closure-escape exception. The compiler recognizes the pattern by the shape "register callback that captures TCS; await TCS.Task" and admits it as a structural exception. Other patterns that capture a borrow into a callback that may outlive the registering scope remain rejected by the standard closure-escape rules. Library authors who write callback-registering APIs analogous to `StartLoadInBackground` should document the callback's lifetime guarantee; consumers wrapping such APIs via TCS rely on the same structural guarantee. A future revision is expected to introduce an explicit non-escaping-callback annotation that captures this contract in the type system; until then, the TCS pattern is the documented escape hatch.
+This reasoning is **specific to the TCS callback-registration pattern** and not a general closure-escape exception. **The admitted shape is defined by compiler-checkable conditions (v0.162 — previously "recognized by shape" with the conditions unstated):**
+
+1. the captured local is a `using var` of one of the four TaskCompletionSource classes;
+2. the lambda is passed **directly** as an argument to exactly one call in the same block (the registration site) and does not otherwise escape — not stored, not returned, not captured again;
+3. an `await` of that local's `.Task` post-dominates the registration and dominates every normal exit of the local's scope;
+4. the lambda's only use of the capture is invoking TCS members.
+
+A capture meeting all four conditions is admitted; anything else falls to the standard closure-escape rules. **The registration API's callback must be one-shot** — never invoked after its first invocation or after the operation settles. A *repeating* registration (an event subscription, a polling hook) is **outside** this exception: its callback can fire again after the `using var` scope ends, a use-after-dispose the structural proof cannot discharge; wrap repeating sources with an owned subscription object and an explicit lifetime instead. A future revision is expected to introduce an explicit non-escaping-callback annotation capturing this contract in the type system (recorded in the rationale); until then, the four-condition shape is the documented escape hatch.
 
 <a id="sec-thread-synchronization"></a>
 ### 30.12 Thread synchronization
@@ -6872,7 +6911,7 @@ The first form constructs and raises an exception. The second form preserves the
 
 Inside a catch arm, the bound exception variable (`var ex: Exception` in the arm pattern) is a **borrow** of the in-flight exception; its source is the runtime, and its lifetime is the arm body's. The borrow may be passed to other methods (which further borrow for the duration of the call) but may not be assigned to an `owned` field, returned as `owned`, or captured by a closure that may outlive the arm.
 
-To preserve an exception past the arm body — for logging, deferred reporting, or aggregation — copy the relevant data out of it (typically `ex.Message`, `ex.StackTrace.ToString()`, and any domain-specific properties) into separate owned values. Exception instances themselves cannot escape the arm that caught them. The bare re-throw `throw;` (which preserves the original instance) is the one exception to this rule, since it transfers the in-flight exception back to the runtime rather than capturing it.
+To preserve an exception past the arm body — for logging, deferred reporting, or aggregation — copy the relevant data out of it (typically `ex.Message`, `ex.StackTrace` — a `string`, [§31.4](#sec-standard-exception-types) — the `CauseChain` snapshot, and any domain-specific properties) into separate owned values. Exception instances themselves cannot escape the arm that caught them. The bare re-throw `throw;` (which preserves the original instance) is the one exception to this rule, since it transfers the in-flight exception back to the runtime rather than capturing it.
 
 <a id="sec-try-catch-finally"></a>
 ### 31.2 `try`/`catch`/`finally`
@@ -6895,6 +6934,8 @@ If no arm matches, the exception continues propagating to the enclosing handler 
 
 `finally` runs whether the protected block completed normally, was exited by an exception (caught or uncaught), or was exited by `return`. `return` inside a `finally` block is a compile error.
 
+**A throw escaping a `finally` supersedes the in-flight exception (v0.162 — the rule §31.2.1 has always cited, now stated here):** when a `finally` entered during exception propagation itself completes by throwing (directly, or via a call that propagates), the new exception replaces the one being handled; the superseded exception is **disposed by the runtime exactly once**, as if its handling had completed. The superseding exception then propagates from the `try` statement as usual.
+
 If the `try` has only a `finally` (no `catch`), the catch block is omitted entirely:
 
 ```bezel
@@ -6915,7 +6956,7 @@ A catch arm's pattern is one of:
 - A binding pattern: `var name: Type`. Matches and binds the exception to `name` for use in the arm's guard and body. The binding is in scope only within the arm.
 - A multi-type alternative, with or without binding: `Type1, Type2, ...` or `var name: Type1, Type2, ...`. Matches if the thrown exception is an instance of any of the listed types. When binding, `name` has the static type of the **nearest common base** of the listed types (the most specific type that is a base of every listed type; `Exception` if no more specific common base exists).
 
-Each pattern may be followed by an optional `when Expression` guard. The guard is evaluated only if the pattern matches; if the guard returns `false`, the arm is skipped and the next arm is considered. Inside the guard, the bound variable (if any) is in scope. The guard runs while the matched exception is in flight, but it evaluates as ordinary code — allocations, calls, and any other operations behave exactly as they would outside dispatch; the in-flight exception does not interfere with them. If the guard itself **throws**, that new exception *supersedes* the in-flight one (which is abandoned) and propagates to the enclosing handler — it is not caught by a later arm of the same `try` and does not resume guard evaluation. This mirrors the rule for a `throw` in a `finally` ([§31.2](#sec-try-catch-finally)): an exception raised in a non-normal position replaces the one already propagating.
+Each pattern may be followed by an optional `when Expression` guard. The guard is evaluated only if the pattern matches; if the guard returns `false`, the arm is skipped and the next arm is considered. Inside the guard, the bound variable (if any) is in scope. The guard runs while the matched exception is in flight, but it evaluates as ordinary code — allocations, calls, and any other operations behave exactly as they would outside dispatch; the in-flight exception does not interfere with them. If the guard itself **throws**, that new exception *supersedes* the in-flight one — the superseded exception is **disposed by the runtime exactly once**, as if its handling had completed (v0.162; previously "abandoned" with the disposal unstated) — and propagates to the enclosing handler — it is not caught by a later arm of the same `try` and does not resume guard evaluation. This mirrors the rule for a `throw` in a `finally` ([§31.2](#sec-try-catch-finally)): an exception raised in a non-normal position replaces the one already propagating.
 
 Arms are evaluated in textual order. Within a pattern, type alternatives are tested in declaration order, but this is not observable when types are disjoint; for non-disjoint alternatives (a base type listed alongside a derived type), the first matching type-arm wins, and the binding's static type is determined statically by the rule above, not by which alternative matched at runtime.
 
@@ -6996,7 +7037,7 @@ To re-throw with a different exception or to wrap the current exception, use `th
 
 ```bezel
 catch
-  var ex: SqlException => throw new DataAccessException("query failed", ex),
+  var ex: SqlException => throw new DataAccessException("query failed", ex),   // ex borrowed for the ctor call; snapshot taken, instance not retained (§31.2.4)
   var ex: Exception => Log(ex)
 end;
 ```
@@ -7031,6 +7072,29 @@ public method Deposit(amount: decimal) ...
 <a id="sec-standard-exception-types"></a>
 ### 31.4 Standard exception types
 
+**The base `Exception` surface (declared here for the first time in v0.162; previously the root type's members were never stated):**
+
+```bezel
+public class Exception
+  public constructor();
+  public constructor(message: string);
+  public constructor(message: string, cause: Exception);   // snapshot chaining, below
+  public readonly property Message: string;
+  public readonly property StackTrace: string;             // formatted; "" when unavailable
+  public readonly property CauseChain: Array<ExceptionInfo>;   // empty when no cause
+end Exception;
+
+public record ExceptionInfo(TypeName: string, Message: string, StackTrace: string);
+
+public class ArgumentException: Exception
+  public constructor(message: string);
+  public constructor(message: string, paramName: string);
+  public readonly property ParamName: string?;   // null when not supplied
+end ArgumentException;
+```
+
+**Cause chaining is by snapshot (v0.162, resolving RFC #811 within the exception-ownership model):** the `(message, cause)` constructor **borrows** `cause` for the duration of the call and copies its type name, message, stack-trace text, and its own `CauseChain` into the new exception's `CauseChain` (outermost cause first, flattened). The cause *instance* is never retained — consistent with [§31.1](#sec-throwing-and-catching)'s caught-exception-is-a-borrow rule, no ownership machinery is needed, and the full diagnostic chain survives into logs and `ToString()`. A live-instance `InnerException` on user exceptions is deliberately **not** provided (it would require exception instances to own exceptions, reopening the arm-lifetime rules); `TypeInitializationException.InnerException` remains the one runtime-owned live reference (below). User subclasses chain by calling the base constructor: `public constructor(msg: string, cause: Exception) base(msg, cause) end constructor;`.
+
 The following exception types are language-built-in and available without import. The hierarchy is shown as a tree; types not indented under another type derive directly from `Exception`.
 
 ```
@@ -7058,7 +7122,7 @@ All exceptions in the list above are catchable except `StackOverflowException`. 
 
 `DisposedAccessException` is raised only by implementations operating in checked disposal mode ([§28.2](#sec-checked-disposal)); in unchecked mode the same access is undefined behavior. Programs must not rely on it for control flow — it exists to convert a heisenbug into a deterministic fault during development, and a build is free to omit it.
 
-`TypeInitializationException` is the one built-in whose surface extends `Exception`'s: it exposes `public readonly property InnerException: Exception?`, carrying the original exception that escaped the static initializer ([§22.13](#sec-static-initialization-order); stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference)).
+`TypeInitializationException` is the one built-in whose surface extends `Exception`'s: it exposes `public readonly property InnerException: Exception?`, carrying the original exception that escaped the static initializer ([§22.13](#sec-static-initialization-order); stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference)). **The cached `TypeInitializationException` and its `InnerException` are runtime-owned for the life of the process** (v0.162): they are exempt from [§31.1](#sec-throwing-and-catching)'s dispose-after-arm rule — the runtime does not dispose the cached instance when a catch arm completes, which is what makes re-raising the same instance on every subsequent touch of the failed type sound.
 
 The principle behind the built-in list: an exception is built-in iff its only producer is a built-in operation (an array or string indexer, an integer arithmetic operation, the `case` construct, an async cancellation). Exceptions whose producer requires explicit `import` live alongside their producer in the standard library and require the same import.
 
@@ -8361,8 +8425,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `await` does not appear in static field initializers or static constructor bodies.
 - `await using` appears only inside async contexts.
 - The `with` clause in `await for ... with token` must be of type `CancellationToken`.
-- Awaiting a `Task<T>` for class T (Pattern A) requires the awaited task expression to occupy one of the admitted owning locations defined in [§30.5](#sec-result-lifetime-and-task-disposal): a reference to a `using var`/`await using var`-bound local of `Task<T>`, an `owned` parameter, an `owned` field of `this`, an indexer access on an owning collection of `Task<T>`, or an iteration variable from a borrowing iteration over an array of tasks. A producer call whose result is directly consumed by a Pattern A return in the enclosing async method is also admitted. A bare `var x := await Producer();` whose `Producer()` returns `Task<T>` for class T and whose result isn't in one of the admitted positions is rejected — the borrowed result would have no source.
-- `await` on a `OwnedTask<T>` (Pattern B) must appear in an owned-consuming context — a `using var` (or `await using var`) right-hand side, an `owned` parameter argument, an `owned` return expression, or any other position the type system requires the resulting value to be discharged. Awaiting a `OwnedTask<T>` more than once for a successful result raises `InvalidOperationException` at runtime; the second `await` cannot be statically prevented because the type system does not track whether a particular task has already been awaited.
+- Awaiting a `Task<T>` for class T (Pattern A) requires the awaited task expression to occupy one of the admitted owning locations defined in [§30.5](#sec-result-lifetime-and-task-disposal), **including**: a reference to a `using var`/`await using var`-bound local of `Task<T>`, an `owned` parameter, an `owned` field of `this`, an indexer access on an owning collection of `Task<T>`, or an iteration variable from a borrowing iteration over an array of tasks. A producer call whose result is directly consumed by a Pattern A return in the enclosing async method is also admitted. A bare `var x := await Producer();` whose `Producer()` returns `Task<T>` for class T and whose result isn't in one of the admitted positions is rejected — the borrowed result would have no source.
+- `await` on a `OwnedTask<T>` (Pattern B) must appear in an owned-consuming context — a `using var` (or `await using var`) right-hand side, an `owned` parameter argument, an `owned` return expression, or any other position the type system requires the resulting value to be discharged. The first await spends an `OwnedTask<T>` regardless of outcome (v0.162). When the operand is **owned**, the await consumes it on all edges and a second await is rejected at compile time as a moved-from read ([§28.3](#sec-local-variables-ownership-and-borrows)); when the operand is **borrowed** (e.g. a `using var`-bound task), the second await cannot be statically prevented and raises `InvalidOperationException` at runtime.
 - `OwnedTask<T>` is a compile error when T is not a class type. The argument-type check is performed during type checking; the diagnostic identifies the non-class argument and points at [§14.4](#sec-owned-as-a-generic-argument).
 
 <a id="sec-patterns-and-case"></a>

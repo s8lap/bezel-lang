@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.161 — July 2026**
+**Companion to the Bezel Language Specification, v0.162 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1073,9 +1073,9 @@ var c1 := await task;                  // borrow
 var c2 := await task;                  // same borrow, same underlying object
 ```
 
-**Step 4: The result is a class type produced by a query or lookup. The caller doesn't own it — something else does (a repository, a cache, a parent object).**
+**Step 4: The result is a class type produced by a query or lookup against longer-lived state (a repository, a cache, a parent object).**
 
-This is still Pattern A. The task borrows from whatever produced the result; the caller borrows through the task.
+This is still Pattern A — but not by "the task borrowing from the repository" (a task cannot hold a borrow it did not produce; §30.5/§28.3's return rules forbid returning a bare borrow through a task — the original wording here predated the v0.67 owns-result ruling and was unimplementable as stated, 2026-07 review #1332). The shape that types is: the async body *chains* (`return await repo.LoadAsync(id);` — the source task's ownership transfers into the outer task, §30.5's chained slots) or the body constructs/receives a fresh owned value to be shared through the task (owned slot). Either way callers borrow *through the task*, whose destructor is the defined owner of whatever the slot holds.
 
 ```bezel
 public async method FindUserAsync(id: int): Task<User>
@@ -7354,6 +7354,22 @@ v0.161 is the **ownership-honesty revision**: the one remaining zero-disposal pa
 
 #### Migration
 Drop-on-overwrite is behavior-preserving for all correct code and un-leaks previously-leaking code. `TakeCurrent()` is a mechanical rename for owning-enumerator users (the for-desugarings are compiler-internal). No other changes.
+
+<a id="sec-v0-161-to-v0-162-changelog"></a>
+### v0.162 changelog (v0.161 → v0.162)
+
+v0.162 is the **async-and-exceptions revision**, executing the #1362 deadlock proposal and closing the async/exception findings of the 2026-07 review; it also carries the owner-prompted range-membership correction. (Issues: #1362, #1332, #1333, #1340-revision, #1350, #1352, #1379; RFC #811 resolved by ruling.)
+
+- **Blocking waits are contextual** (§30.3/§22.13, #1362): `Wait()`/`Result` on an incomplete task are legal only outside domains (startup code on the main thread — the same mechanism that drives async `Main`); inside a domain continuation they are a deterministic deadlock and become a compile error in `async` bodies plus a runtime `InvalidOperationException` elsewhere. §22.13's previously-prescribed (and deadlocking) `Wait()` static-init pattern is replaced by eager-init-in-async-`Main` and the lazy-task-accessor patterns. New C.6 posture throughout.
+- **Pattern A slots are owned or chained** (§30.5, #1332): a `return await <source>` transfers the *source task* into the outer task (destructor disposes the chain link, never the borrowed result) — "disposing the task disposes the result" holds transitively. **`Task.WhenAny` returns `Task<int>`** (the winner's index): the former `Task<Task>` was unconstructible under this section's own rules. Rationale §12.2 Step 4 rewritten (the "task borrows from the repository" story was unimplementable).
+- **OwnedTask spends on all edges** (§30.4/§30.5/C.6, #1352): the first await consumes the operand regardless of outcome (fault/cancel included; retry = bind a fresh task); C.6 now distinguishes owned operands (second await = compile-time moved-from read) from borrowed ones (runtime IOE).
+- **`OwnedTask<T>.Result` blessed** (§30.3, #1379): a completed-task read in an owned-consuming position transfers ownership exactly like `await` (the implementation's #1250 semantics, now normative); subject to the same blocking-context rules.
+- **TCS closure-capture exception defined** (§30.11, #1333): four compiler-checkable conditions replace "recognized by shape"; the registration callback must be one-shot; repeating registrations are outside the exception (the old keyboard-event example — itself a use-after-dispose under the structural proof — replaced by a one-shot block-device read).
+- **Exception model completed** (§31/§22.7/stdlib, #1350 + RFC #811): the base `Exception` surface is declared for the first time (ctors, `Message`, `StackTrace: string`, `CauseChain`); **cause chaining is by snapshot** — the `(message, cause)` constructor borrows the cause and copies `ExceptionInfo` records (type/message/stack) into the new exception's flattened `CauseChain`, never retaining the instance — resolving #811 inside the caught-exception-is-a-borrow model with zero new ownership rules (a live `InnerException` on user exceptions is deliberately declined; `TypeInitializationException`'s stays the one runtime-owned live reference, now stated to be process-lifetime-owned and exempt from dispose-after-arm). The throw-in-finally supersede rule is stated in §31.2 itself (superseded exception disposed exactly once — same for guard supersede); wrapping constructors take the caught exception as a borrow and snapshot it; `ArgumentException`'s surface declared; `StackTrace` is a `string` (guides fixed).
+- **Range membership corrected** (§16.3/§16.6 + stdlib §9.8, revising v0.159 after owner review of #1340): `Contains(v)` = *nonempty under iteration* ∧ within-extent — an empty range contains nothing (`50 in 100..0` is now `false`, matching Rust/Python); `IsEmpty` and `Contains` agree; range patterns and `in` agree exactly on stepless forms (the v0.159 asymmetry is deleted); constant reversed range patterns get a mandatory never-matches warning; stepped descending ranges keep their members.
+
+#### Migration
+Tightenings: in-domain `Wait()`/`Result` (was a deadlock at runtime — now diagnosed); `50 in 100..0`-style extent membership over iteration-empty ranges (write `Math.Min/Max` comparisons for unordered intervals). `WhenAny` consumers switch from the (unconstructible) winner task to its index. Everything else is definition of previously-undefined or unstated behavior. Compiler alignment rides wave-4: the Wait/Result sema-reject + runtime guard (unblocked by #1377's RaiseAsync re-lower), WhenAny index, spend-on-fault, Contains flip + warning, Exception surface/CauseChain, TakeCurrent (v0.161), fields drop-on-overwrite (v0.161).
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)

@@ -113,7 +113,7 @@ end Handle;
 
 private method RecordError(ex: Exception)
   _lastErrorText := ex.Message;            // string is fine to keep
-  Log($"{ex.Message}\n{ex.StackTrace.ToString()}");
+  Log($"{ex.Message}\n{ex.StackTrace}");
 end RecordError;
 ```
 
@@ -208,6 +208,6 @@ end;                               // c disposed at end of this block
 | Operation invalid in current state | `throw new InvalidOperationException(...)` |
 | Must run cleanup that is not a disposal | `try … finally` |
 | Must dispose an owned resource on failure | nothing — ownership handles it automatically |
-| Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace.ToString()` into owned values; never the exception itself |
+| Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values; never the exception itself |
 
 Two habits carry most of it: prefer a nullable or `Try` return over an exception whenever the failure is expected, and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
