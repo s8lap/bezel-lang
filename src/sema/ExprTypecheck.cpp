@@ -4239,11 +4239,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             colTypeName = tt->astNode->name->parts[0];
                         else if (!tt->importedName.empty())
                             colTypeName = tt->importedName;
-                        if (colTypeName == "Dictionary" &&
+                        if ((colTypeName == "Dictionary" ||
+                             colTypeName == "SortedDictionary") &&
                             tt->genericArgs.size() >= 2 &&
                             tt->genericArgs[1]) {
-                            // per stdlib §4.8 (v0.135) / §21: `for var e in d`
-                            // on a Dictionary<K,V> yields DictionaryEntry<K,V>.
+                            // per stdlib §4.8 (v0.135) / §4.12 (v0.165) / §21:
+                            // `for var e in d` on Dictionary<K,V> or
+                            // SortedDictionary<K,V> yields DictionaryEntry<K,V>.
                             // DictionaryEntry<K,V> is a builtin record with no
                             // user TypeSymbol; represent it as a synthetic Named
                             // TypeRef with importedName="DictionaryEntry" and

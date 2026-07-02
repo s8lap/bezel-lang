@@ -476,20 +476,25 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
 
 // §29.2 / #1310: iterating the IEnumerable<T>-typed return (`=> expr` body)
 // walks the shared array through the wrapper's vtable protocol.
+// Migrated from OwnedArray<int> → OwnedArray<Cell> per stdlib §4.2/#1327.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_iterated_1310) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class Holder "
-        "  private owned arr: OwnedArray<int>; "
+        "module M; "
+        "class Cell public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; end Cell; "
+        "class Holder "
+        "  private owned arr: OwnedArray<Cell>; "
         "  public constructor() "
-        "    arr := new OwnedArray<int>(); arr.Add(3); arr.Add(4); "
+        "    arr := new OwnedArray<Cell>(); "
+        "    arr.Add(new Cell(3)); arr.Add(new Cell(4)); "
         "  end constructor; "
-        "  public method Items(): IEnumerable<int> => arr; "
+        "  public method Items(): IEnumerable<Cell> => arr; "
         "end Holder; "
         "class C "
         "  public static method Main(): int "
         "    using var h := new Holder(); "
-        "    var s := 0; for var x in h.Items() do s := s + x; end; "
+        "    var s := 0; for var x in h.Items() do s := s + x.V; end; "
         "    return s; "
         "  end Main; end C;"), 7);
 }
@@ -497,22 +502,26 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
 // §29.2 / #1310: the explicit-ReturnStmt path (LlvmBackend_Stmts.cpp) wraps the
 // same way as the `=> expr` path; two independent coerced returns (one iterated,
 // one bind-only) from the same owned field are both safe.
+// Migrated from OwnedArray<int> → OwnedArray<Cell> per stdlib §4.2/#1327.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_return_stmt_1310) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class Holder "
-        "  private owned arr: OwnedArray<int>; "
+        "module M; "
+        "class Cell public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; end Cell; "
+        "class Holder "
+        "  private owned arr: OwnedArray<Cell>; "
         "  public constructor() "
-        "    arr := new OwnedArray<int>(); arr.Add(5); "
+        "    arr := new OwnedArray<Cell>(); arr.Add(new Cell(5)); "
         "  end constructor; "
-        "  public method Items(): IEnumerable<int> "
+        "  public method Items(): IEnumerable<Cell> "
         "    return arr; "
         "  end Items; "
         "end Holder; "
         "class C "
         "  public static method Main(): int "
         "    using var h := new Holder(); "
-        "    var s := 0; for var x in h.Items() do s := s + x; end; "
+        "    var s := 0; for var x in h.Items() do s := s + x.V; end; "
         "    var e := h.Items(); "
         "    return s; "
         "  end Main; end C;"), 5);

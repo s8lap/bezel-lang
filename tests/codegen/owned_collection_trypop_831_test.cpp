@@ -28,54 +28,85 @@ int run(const std::string& prog) {
 
 // OwnedArray.TryPopFirst on a non-empty array returns true and writes the first
 // element (was malformed IR: br on a non-i1 value).
+// Migrated from OwnedArray<int> to OwnedArray<Box> per stdlib §4.2/#1327:
+// owned collections require class element types.
+// Uses `out owned var item` pattern (§28.2/#889); the sema fix (§4.5/#831)
+// ensures `item` gets type Box from OwnedArray<Box>'s generic arg — previously
+// OwnedArray was missing from the builtin-Try*-out-element-type inference in
+// ExprTypecheck_Exprs.cpp, so item.Val returned 0.
 BEZEL_TEST(owned_collection_trypop_831, array_try_pop_first_true) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  do using var a := new OwnedArray<int>(); a.Add(10); a.Add(20); "
-        "    var item: int := 0; var ok := a.TryPopFirst(out item); "
-        "    if ok then return item; end; return 0; end; return 0; "
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var a := new OwnedArray<Box>(); "
+        "    a.Add(move (new Box(10))); a.Add(move (new Box(20))); "
+        "    var ok := a.TryPopFirst(out owned var item); "
+        "    var v := 0; if item <> null then v := item.Val; end; "
+        "    item?.Dispose(); "
+        "    if ok then return v; end; return 0; end; return 0; "
         "end Main; end C;"), 10);
 }
 
 // OwnedArray.TryPopLast writes the last element.
+// Uses `out owned var item` pattern (§28.2/#889); see array_try_pop_first_true.
 BEZEL_TEST(owned_collection_trypop_831, array_try_pop_last_true) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  do using var a := new OwnedArray<int>(); a.Add(10); a.Add(20); "
-        "    var item: int := 0; var ok := a.TryPopLast(out item); "
-        "    if ok then return item; end; return 0; end; return 0; "
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var a := new OwnedArray<Box>(); "
+        "    a.Add(move (new Box(10))); a.Add(move (new Box(20))); "
+        "    var ok := a.TryPopLast(out owned var item); "
+        "    var v := 0; if item <> null then v := item.Val; end; "
+        "    item?.Dispose(); "
+        "    if ok then return v; end; return 0; end; return 0; "
         "end Main; end C;"), 20);
 }
 
 // OwnedArray.TryPopFirst on an empty array returns false and leaves the out
-// param unchanged.
+// param unchanged (item stays null).
 BEZEL_TEST(owned_collection_trypop_831, array_try_pop_empty_false) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  do using var a := new OwnedArray<int>(); var item: int := 7; "
-        "    var ok := a.TryPopFirst(out item); "
-        "    if ok then return 1; end; return item; end; return 0; "
+        "module M; "
+        "class Box public Val: int := 0; end Box; "
+        "class C public static method Main(): int "
+        "  do using var a := new OwnedArray<Box>(); "
+        "    var item: Box? := null; var ok := a.TryPopFirst(out item); "
+        "    if ok then return 1; end; "
+        "    if item = null then return 7; end; return 0; end; return 0; "
         "end Main; end C;"), 7);
 }
 
 // OwnedLinkedList.TryPopFirst on a non-empty list returns true and writes the
-// first element.
+// first element. Uses `out owned var item` pattern (§28.2/#889).
 BEZEL_TEST(owned_collection_trypop_831, linkedlist_try_pop_first_true) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  do using var l := new OwnedLinkedList<int>(); l.AddLast(7); "
-        "    var item: int := 0; var ok := l.TryPopFirst(out item); "
-        "    if ok then return item; end; return 0; end; return 0; "
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var l := new OwnedLinkedList<Box>(); "
+        "    l.AddLast(move (new Box(7))); "
+        "    var ok := l.TryPopFirst(out owned var item); "
+        "    var v := 0; if item <> null then v := item.Val; end; "
+        "    item?.Dispose(); "
+        "    if ok then return v; end; return 0; end; return 0; "
         "end Main; end C;"), 7);
 }
 
 // OwnedLinkedList.TryPopLast on an empty list returns false (out unchanged).
 BEZEL_TEST(owned_collection_trypop_831, linkedlist_try_pop_empty_false) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  do using var l := new OwnedLinkedList<int>(); var item: int := 9; "
-        "    var ok := l.TryPopLast(out item); "
-        "    if ok then return 1; end; return item; end; return 0; "
+        "module M; "
+        "class Box public Val: int := 0; end Box; "
+        "class C public static method Main(): int "
+        "  do using var l := new OwnedLinkedList<Box>(); "
+        "    var item: Box? := null; var ok := l.TryPopLast(out item); "
+        "    if ok then return 1; end; "
+        "    if item = null then return 9; end; return 0; end; return 0; "
         "end Main; end C;"), 9);
 }
 
@@ -108,13 +139,21 @@ BEZEL_TEST(owned_collection_trypop_831, dict_try_pop_value_miss) {
         "end Main; end C;"), 3);
 }
 
-// A primitive-valued OwnedDictionary TryPopValue decodes the scalar value.
+// OwnedDictionary TryPopValue returns the value via out; verify the Val field.
+// Migrated from OwnedDictionary<string,int> → OwnedDictionary<string,Box> per
+// stdlib §4.2/#1327 (value types cannot be owned collection elements).
+// Uses `out owned var v` pattern (§28.2/#889) and accesses Val before disposal.
 BEZEL_TEST(owned_collection_trypop_831, dict_try_pop_value_int) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  do using var d := new OwnedDictionary<string, int>(); "
-        "    d.Add(\"a\", 42); var v: int := 0; "
-        "    var hit := d.TryPopValue(\"a\", out v); "
-        "    if hit then return v; end; return 0; end; return 0; "
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var d := new OwnedDictionary<string, Box>(); "
+        "    d.Add(\"a\", move (new Box(42))); "
+        "    var hit := d.TryPopValue(\"a\", out owned var v); "
+        "    var result := 0; if hit then if v <> null then result := v.Val; end; end; "
+        "    v?.Dispose(); "
+        "    return result; end; return 0; "
         "end Main; end C;"), 42);
 }

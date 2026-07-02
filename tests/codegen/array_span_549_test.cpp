@@ -229,13 +229,17 @@ BEZEL_TEST(array_span_549, ownedarray_todictionary_rejected_1022) {
 // §4.5 (#1022) regression: a LINQ query result over an owning collection has an
 // IEnumerable receiver, so its ToArray() materializer is the borrowing copy-form
 // and stays VALID (only a DIRECT owning-collection receiver is rejected).
+// Migrated from OwnedArray<int> to OwnedArray<Cell> per stdlib §4.2/#1327.
 BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
     expectValueAndAsanClean(
         "module M; "
         "import System.Collections.Generic; "
+        "class Cell public V: int := 0; "
+        "  public constructor(v: int) V := v; end constructor; end Cell; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); a.Add(7); a.Add(8); a.Add(9); "
-        "  using var e: Array<int> := a.Where((x) => x > 7).ToArray(); "
+        "  using var a := new OwnedArray<Cell>(); "
+        "  a.Add(new Cell(7)); a.Add(new Cell(8)); a.Add(new Cell(9)); "
+        "  using var e: Array<Cell> := a.Where((x) => x.V > 7).ToArray(); "
         "  return e.Length; "  // 2 (8 and 9)
         "end Main; end C;", 2);
 }

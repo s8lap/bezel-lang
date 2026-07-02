@@ -2601,7 +2601,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     bool isNonOwningContainer =
                         colName == "Array" || colName == "Stack" ||
                         colName == "Queue" || colName == "Set" ||
-                        colName == "LinkedList" || colName == "Dictionary";
+                        colName == "LinkedList" || colName == "Dictionary" ||
+                        // §4.17/§4.18 (#1354): sorted collections
+                        colName == "SortedDictionary" || colName == "SortedSet";
                     if (isNonOwningContainer) {
                         // §4.8/§4.9 v0.155 (#920/#1112): targeted hint for .Set.
                         if (m == "Set") {
@@ -2638,6 +2640,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "IsReadOnly" || mm == "Keys" ||
                                 mm == "Values" || mm == "First" || mm == "Last" ||
                                 mm == "FirstNode" || mm == "LastNode" ||
+                                // §4.17 SortedDictionary-specific (#1354).
+                                mm == "FirstKey" || mm == "LastKey" ||
                                 // Dict-specific.
                                 mm == "PopValue" || mm == "TryPopValue" ||
                                 mm == "Drain" || mm == "DrainAndProcess" ||
@@ -2724,9 +2728,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // per §4.10 stdlib: TryAdd(item: T): bool
                         // §4.11/§4.12 (#725): Stack.TryPop/TryPeek,
                         // Queue.TryDequeue/TryPeek (out item: T): bool.
+                        // §4.5/§4.7 (#831/#1354): OwnedArray/OwnedLinkedList
+                        // TryPopFirst/TryPopLast (out owned item: T): bool.
                         else if (m == "Contains" || m == "TryAdd" ||
                                  m == "TryPop" || m == "TryDequeue" ||
-                                 m == "TryPeek")
+                                 m == "TryPeek" ||
+                                 m == "TryPopFirst" || m == "TryPopLast")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "IndexOf")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
@@ -3116,7 +3123,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // type and the loop variable `kv` stayed untyped → codegen
                     // fault.  Note: the lambda param seeding is handled separately
                     // in linqLambdaElementType (also patched for this bug).
-                    if (colName == "Dictionary" &&
+                    // §4.17 (#1354): SortedDictionary<K,V> conforms to
+                    // IReadOnlyCollection<DictionaryEntry<K,V>>, so it uses
+                    // the same LINQ element type as Dictionary<K,V>.
+                    if ((colName == "Dictionary" || colName == "SortedDictionary") &&
                         recvTy && recvTy->genericArgs.size() >= 2 &&
                         recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
                         // Build DictionaryEntry<K,V> (same synthetic repr as
@@ -3549,6 +3559,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             oenTy->genericArgs.push_back(entryTy);
                             ctx_.setExprType(&ce, oenTy);
                         }
+                    }
+                    // stdlib §4.12 / §4.13 (v0.165, #1354): SortedDictionary<K,V>
+                    // and SortedSet<T> method/property typing.
+                    // SortedDictionary conforms to IReadOnlyCollection<DictionaryEntry
+                    // <K,V>> (for-in handled above alongside Dictionary).
+                    // SortedSet conforms to IReadOnlyCollection<T> (for-in falls
+                    // through to the generic T-element path).
+                    if (colName == "SortedDictionary") {
+                        if (m == "Count")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "ContainsKey" || m == "Remove" ||
+                                 m == "TryGetValue")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // FirstKey / LastKey — return the key type K.
+                        else if ((m == "FirstKey" || m == "LastKey") && recvTy &&
+                                 !recvTy->genericArgs.empty() &&
+                                 recvTy->genericArgs[0])
+                            ctx_.setExprType(&ce, recvTy->genericArgs[0]);
+                        // Indexer / Value return: V (second generic arg).
+                        else if (recvTy && recvTy->genericArgs.size() > 1 &&
+                                 recvTy->genericArgs[1])
+                            ctx_.setExprType(&ce, recvTy->genericArgs[1]);
+                    }
+                    if (colName == "SortedSet") {
+                        if (m == "Count")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "Contains" || m == "Remove" || m == "TryAdd")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // Add returns unit (no explicit type set → defaults to unit).
+                        // Min / Max — return the element type T.
+                        else if ((m == "Min" || m == "Max") && recvTy &&
+                                 !recvTy->genericArgs.empty() &&
+                                 recvTy->genericArgs[0])
+                            ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                     }
                     // #639 / stdlib §4.5/§4.7/§4.11 v0.135:
                     // OwnedArray<T>.Drain(), OwnedLinkedList<T>.Drain(),

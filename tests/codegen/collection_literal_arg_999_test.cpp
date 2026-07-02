@@ -220,15 +220,21 @@ const char* kBorrowDict =
     "  end Main; "
     "end C;";
 
-// §15.4 / §28.3: an `owned OwnedArray<int>` parameter. Ownership TRANSFERS from
+// §15.4 / §28.3: an `owned OwnedArray<N>` parameter. Ownership TRANSFERS from
 // the materialized temp into the callee (no caller disposal — no double-free).
 // The callee discharges it via `using var`. Count must be 3.
+// (Migrated from OwnedArray<int> → OwnedArray<N> per stdlib §4.2/#1327.)
 const char* kOwnedArrayTransfer =
-    "module M; class C "
-    "  public static method Take(owned a: OwnedArray<int>): int "
-    "    using var local: OwnedArray<int> := a; return local.Count; "
+    "module M; "
+    "class N public V: int := 0; "
+    "  public constructor(v: int) V := v; end constructor; end N; "
+    "class C "
+    "  public static method Take(owned a: OwnedArray<N>): int "
+    "    using var local: OwnedArray<N> := a; return local.Count; "
     "  end Take; "
-    "  public static method Main(): int return C.Take([1, 2, 3]); end Main; "
+    "  public static method Main(): int "
+    "    return C.Take([new N(1), new N(2), new N(3)]); "
+    "  end Main; "
     "end C;";
 
 // stdlib §10.3 / §15.4 (the #999 CRASH): RawBytes.From([…]) — a literal arg to a
@@ -272,14 +278,21 @@ const char* kBorrowStringLoopLeakFree =
 
 // §15.4 / §28.3: owned-arg literal transfer looped — the callee disposes the
 // transferred collection exactly once; the caller does NOT (no double-free).
+// (Migrated from OwnedArray<int> → OwnedArray<N> per stdlib §4.2/#1327.)
 const char* kOwnedLoopLeakFree =
-    "module M; class C "
-    "  public static method Take(owned a: OwnedArray<int>): int "
-    "    using var local: OwnedArray<int> := a; return local.Count; "
+    "module M; "
+    "class N public V: int := 0; "
+    "  public constructor(v: int) V := v; end constructor; end N; "
+    "class C "
+    "  public static method Take(owned a: OwnedArray<N>): int "
+    "    using var local: OwnedArray<N> := a; return local.Count; "
     "  end Take; "
     "  public static method Main(): int "
     "    var i: int := 0; var t: int := 0; "
-    "    while i < 1000 do t := t + C.Take([1, 2, 3]); i := i + 1; end; "
+    "    while i < 1000 do "
+    "      t := t + C.Take([new N(1), new N(2), new N(3)]); "
+    "      i := i + 1; "
+    "    end; "
     "    if t = 3000 then return 0; end; return 1; "
     "  end Main; "
     "end C;";

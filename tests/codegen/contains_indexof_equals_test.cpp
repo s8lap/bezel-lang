@@ -219,10 +219,14 @@ BEZEL_TEST(contains_indexof_equals_4_6, string_indexof_by_content) {
 // OwnedArray — record element (issue #424 sibling: OwnedArray variant)
 // -----------------------------------------------------------------------
 
-// §4.5/§25.2: OwnedArray<P> record Contains — present (exit 1). The query
-// Pt is a PURE BORROW; no element is removed; no double-dispose.
+// §4.5/§14.4/#1327 v0.165: OwnedArray<P> with a record element type is NOW
+// rejected at sema (stdlib §4.2: owned collections require class/interface
+// elements; records are value types with no disposal obligation). These tests
+// were converted from behavioral to rejection tests when #1327 landed.
+// The behavioral Contains/IndexOf for class elements with custom Equals is
+// covered by owned_array_contains_query_is_pure_borrow below.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runJit(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
@@ -230,19 +234,23 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
         "  if a.Contains(new P(3, 4)) then return 1; end; "
         "  return 0; "
-        "end Main; end Program;"), 1);
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// §4.5/§25.2: OwnedArray<P> record IndexOf — present (returns 1).
+// §4.5/§14.4/#1327 v0.165: OwnedArray<P> with record element rejected at sema.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_indexof_present) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runJit(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
         "  using var a := new OwnedArray<P>(); "
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
         "  return a.IndexOf(new P(3, 4)); "
-        "end Main; end Program;"), 1);
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // §4.5: OwnedArray<R> with class element: Contains query is a PURE BORROW —

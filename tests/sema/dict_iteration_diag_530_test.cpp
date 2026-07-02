@@ -46,16 +46,18 @@ bool noDiagContains(const bezel::test::SemaResult& r, std::string_view needle) {
 
 // Helper: wrap body in a module/class/method that has
 //   d: Dictionary<string,int>
-//   od: OwnedDictionary<string,int>
+//   od: OwnedDictionary<string,V>  (V is a class; stdlib §4.2/#1327 rejects int)
 //   arr: Array<int>
 //   s: Set<int>
 //   n: int
 std::string wrap(const std::string& body) {
     return std::string(
-        "module M; class C "
+        "module M; "
+        "class V end V; "           // minimal class for OwnedDictionary value
+        "class C "
         "public method M("
         "  d: Dictionary<string, int>, "
-        "  od: OwnedDictionary<string, int>, "
+        "  od: OwnedDictionary<string, V>, "
         "  arr: Array<int>, "
         "  s: Set<int>, "
         "  n: int"

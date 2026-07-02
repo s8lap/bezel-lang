@@ -49,15 +49,17 @@ bool anyDiagContains(const bezel::test::SemaResult& r, std::string_view needle) 
 
 // Wrap a method body in a module/class that has:
 //   d  : Dictionary<string, int>
-//   od : OwnedDictionary<string, int>
+//   od : OwnedDictionary<string, Val>  (Val is a class; §4.2/#1327 rejects int)
 //   arr: Array<int>
 //   n  : int
 std::string wrap(const std::string& body) {
     return std::string(
-        "module M; class C "
+        "module M; "
+        "class Val end Val; "       // minimal class for OwnedDictionary value
+        "class C "
         "public method M("
         "  d: Dictionary<string, int>, "
-        "  od: OwnedDictionary<string, int>, "
+        "  od: OwnedDictionary<string, Val>, "
         "  arr: Array<int>, "
         "  n: int"
         ") ") + body + " end M; end C;";
@@ -113,17 +115,19 @@ BEZEL_TEST(sema_getoradd_argcheck_542,
 
 // §4.9 / #542: passing an int literal as the factory argument to
 // OwnedDictionary.GetOrAdd must also be rejected.
+// od is OwnedDictionary<string, Val>; factory must be (string) -> owned Val.
 BEZEL_TEST(sema_getoradd_argcheck_542,
            owned_dict_getoradd_int_factory_arg_is_rejected_spec_4_9) {
-    auto r = parseSemaAll(wrap("var v: int := od.GetOrAdd(\"a\", 99);"));
+    auto r = parseSemaAll(wrap("_ := od.GetOrAdd(\"a\", 99);"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §4.9 / #542: a valid lambda factory on OwnedDictionary.GetOrAdd must be
 // accepted without errors.
+// od is OwnedDictionary<string, Val>; factory returns owned Val.
 BEZEL_TEST(sema_getoradd_argcheck_542,
            owned_dict_getoradd_valid_lambda_accepted_spec_4_9) {
-    auto r = parseSemaAll(wrap("var v: int := od.GetOrAdd(\"a\", (k) => 7);"));
+    auto r = parseSemaAll(wrap("var v: Val := od.GetOrAdd(\"a\", (k) => new Val());"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

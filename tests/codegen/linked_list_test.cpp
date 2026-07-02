@@ -494,10 +494,13 @@ BEZEL_TEST(codegen_linked_list, literal_iterates_in_order_738) {
         "  return s + ll.Count; "  // 60 + 3 = 63
         "end Main; end C;"), 63);
 }
+// Migrated from OwnedLinkedList<int> → LinkedList<int> per stdlib §4.2/#1327:
+// owned collections require class element types; for value-type iteration
+// use the non-owning LinkedList<T>.
 BEZEL_TEST(codegen_linked_list, owned_literal_738) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var ll: OwnedLinkedList<int> := [5, 7]; "
+        "  using var ll: LinkedList<int> := [5, 7]; "
         "  var s := 0; "
         "  for var x in ll do s := s + x; end; "
         "  return s + ll.Count; "  // 12 + 2 = 14

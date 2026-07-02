@@ -274,16 +274,18 @@ BEZEL_TEST(owned_coll_acc_643, owned_dict_popvalue_transfers_ownership_no_double
 }
 
 // ---------------------------------------------------------------------------
-// #654-tail A / stdlib §4.11: OwnedQueue<T>.Peek() returns the FIRST element.
+// #654-tail A / stdlib §4.11: Queue<T>.Peek() returns the FIRST element.
+// (Migrated from OwnedQueue<int> → Queue<int> per stdlib §4.2/#1327: owned
+// collections require class element types; int is a value type.)
 // ---------------------------------------------------------------------------
 
-// stdlib §4.11: Peek on OwnedQueue<int> [10, 20] returns 10 (front).
+// stdlib §4.11: Peek on Queue<int> [10, 20] returns 10 (front).
 // Encoded: (peeked == 10 ? 1 : 0).
 BEZEL_TEST(owned_coll_acc_654a, owned_queue_peek_returns_first_element_fifo) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    using var oq := new OwnedQueue<int>(); "
+        "    using var oq := new Queue<int>(); "
         "    oq.Enqueue(10); oq.Enqueue(20); "
         "    var front := oq.Peek(); "
         "    if front = 10 then return 1; end; "
@@ -297,7 +299,7 @@ BEZEL_TEST(owned_coll_acc_654a, owned_queue_peek_does_not_remove_count_unchanged
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    using var oq := new OwnedQueue<int>(); "
+        "    using var oq := new Queue<int>(); "
         "    oq.Enqueue(10); oq.Enqueue(20); "
         "    var before := oq.Count; "
         "    var _ := oq.Peek(); "
@@ -311,7 +313,7 @@ BEZEL_TEST(owned_coll_acc_654a, owned_queue_peek_twice_same_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    using var oq := new OwnedQueue<int>(); "
+        "    using var oq := new Queue<int>(); "
         "    oq.Enqueue(5); oq.Enqueue(99); "
         "    var p1 := oq.Peek(); "
         "    var p2 := oq.Peek(); "
@@ -320,13 +322,14 @@ BEZEL_TEST(owned_coll_acc_654a, owned_queue_peek_twice_same_value) {
         "  end Main; end C;"), 1);
 }
 
-// stdlib §4.11: OwnedStack<T>.Peek() still returns the LAST element (top).
+// stdlib §4.11: Stack<T>.Peek() returns the LAST element (top).
 // Regression guard — fixing Queue Peek must not break Stack Peek.
+// (Migrated from OwnedStack<int> → Stack<int> per stdlib §4.2/#1327.)
 BEZEL_TEST(owned_coll_acc_654a, owned_stack_peek_still_returns_last_element) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    using var os := new OwnedStack<int>(); "
+        "    using var os := new Stack<int>(); "
         "    os.Push(1); os.Push(2); os.Push(3); "
         "    var top := os.Peek(); "
         "    if top = 3 then return 1; end; "

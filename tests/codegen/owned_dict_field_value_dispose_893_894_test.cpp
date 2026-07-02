@@ -138,10 +138,11 @@ const char* k894DictFieldReassign =
     "  return Cell._n; "
     "end Main; end C;";
 
-// --- Value-typed V: no per-value disposal, no crash ---
+// --- Value-typed V: rejected at compile per stdlib §4.2/#1327 ---
 
-// OwnedDictionary<string, int> field: bz_dict_free called with null disposer
-// (int is a value type), no crash, backing freed cleanly.
+// stdlib §4.2/#1327: OwnedDictionary<string, int> is now rejected at the
+// instantiation site because int is a value type with no disposal obligation.
+// Kept as a REJECTED-AT-COMPILE test to document the new behaviour.
 const char* kValueVNoCrash =
     "module M; "
     "class Box "
@@ -292,12 +293,14 @@ BEZEL_TEST(codegen_owned_dict_field_894, field_reassign_disposes_old_values) {
     BEZEL_EXPECT_EQ(run(k894DictFieldReassign), 0);
 }
 
-// ---- Value-typed V: no per-value disposal, no crash -------------------------
+// ---- Value-typed V: now rejected at instantiation per stdlib §4.2/#1327 ----
 
-BEZEL_TEST(codegen_owned_dict_field_893, value_v_no_crash) {
-    // OwnedDictionary<string, int>: bz_dict_free with null value disposer.
-    // No crash, backing freed cleanly.
-    BEZEL_EXPECT_EQ(run(kValueVNoCrash), 0);
+BEZEL_TEST(codegen_owned_dict_field_893, value_v_rejected_at_sema_1327) {
+    // stdlib §4.2/#1327: OwnedDictionary<string, int> is rejected at sema
+    // (int is a primitive value type with no disposal obligation).
+    auto r = runJit(kValueVNoCrash);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // ---- Borrowing dict field (not owned): values NOT disposed on Box disposal ---

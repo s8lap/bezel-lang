@@ -6,6 +6,11 @@
 //
 // Spec references:
 //   §4.9 v0.135 — OwnedDictionary.Drain() owned-consuming iteration
+//
+// Migrated from OwnedDictionary<string, int> to OwnedDictionary<string, R>
+// per stdlib §4.2 / #1327 (v0.165): owned collections require class element
+// types; `int` (a primitive value type) is now rejected at the instantiation
+// site.  The drain-loop behavior under test is unchanged.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -13,19 +18,26 @@
 using bezel::test::JitResult;
 using bezel::test::runJit;
 
+// Minimal class R for use as the OwnedDictionary value type.
+static const char* kClassR =
+    "class R "
+    "  public constructor() end constructor; "
+    "end R; ";
+
 // ===========================================================================
 // §4.9 / #628 part 2: drain loop must now compile and run (not fail).
 // These were hard-error tests in part 1; they verify the opposite after part 2.
 // ===========================================================================
 
-// §4.9 / #628 part 2: drain over OwnedDictionary<string, int> — one entry
+// §4.9 / #628 part 2: drain over OwnedDictionary<string, R> — one entry
 // added, loop increments count once, returns 1.
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_is_hard_error) {
     JitResult r = runJit(
-        "module M; class C "
+        std::string("module M; ") + kClassR +
+        "class C "
         "  public static method Main(): int "
-        "    using var d := new OwnedDictionary<string, int>(); "
-        "    d[\"a\"] := 1; "
+        "    using var d := new OwnedDictionary<string, R>(); "
+        "    d.Add(\"a\", move (new R())); "
         "    var count := 0; "
         "    for var entry in d.Drain() do "
         "      using var e := entry; "
@@ -43,9 +55,10 @@ BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_is_hard_error) {
 // §4.9 / #628 part 2: empty drain loop body compiles and runs (count stays 0).
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_records_error) {
     JitResult r = runJit(
-        "module M; class C "
+        std::string("module M; ") + kClassR +
+        "class C "
         "  public static method Main(): int "
-        "    using var d := new OwnedDictionary<string, int>(); "
+        "    using var d := new OwnedDictionary<string, R>(); "
         "    for var entry in d.Drain() do "
         "    end; "
         "    return 0; "
@@ -62,10 +75,11 @@ BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_records_error) {
 // enter the loop body and return 1 (one entry was added).
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_does_not_silently_succeed) {
     JitResult r = runJit(
-        "module M; class C "
+        std::string("module M; ") + kClassR +
+        "class C "
         "  public static method Main(): int "
-        "    using var d := new OwnedDictionary<string, int>(); "
-        "    d[\"x\"] := 42; "
+        "    using var d := new OwnedDictionary<string, R>(); "
+        "    d.Add(\"x\", move (new R())); "
         "    for var entry in d.Drain() do "
         "      using var e := entry; "
         "      return 1; "

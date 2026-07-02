@@ -33,12 +33,13 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
     return r;
 }
 
-// True iff some emitted diagnostic is the §14.4 owning-collection element
-// rejection (so the "rejected" tests assert THIS check fired, not an unrelated
-// error, and the "admitted" tests assert it did not).
+// True iff some emitted diagnostic is the stdlib §4.2 / §14.4 owning-collection
+// element rejection (so the "rejected" tests assert THIS check fired, not an
+// unrelated error, and the "admitted" tests assert it did not).
+// The sentinel substring matches the updated error message from #1327 (v0.165).
 bool hasOwningElementError(const bezel::test::SemaResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find("owning collection types reject runtime-managed") !=
+        if (d.message.find("requires a class or interface element type") !=
             std::string::npos) {
             return true;
         }

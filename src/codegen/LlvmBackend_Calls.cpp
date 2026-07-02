@@ -421,7 +421,9 @@ bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
         return false;
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
-    return n == "Dictionary" || n == "OwnedDictionary";
+    // stdlib §4.17 (#1354): SortedDictionary also has a K-indexed get/set
+    // property and shares the bz_dict_t* runtime representation.
+    return n == "Dictionary" || n == "OwnedDictionary" || n == "SortedDictionary";
 }
 
 

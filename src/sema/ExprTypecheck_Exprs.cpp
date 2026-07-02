@@ -2982,6 +2982,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                              mn == "TryPop" && pos2 == 0) ||
                                             (cn == "OwnedQueue" &&
                                              mn == "TryDequeue" && pos2 == 0) ||
+                                            // §4.5 (#831/#1354): OwnedArray
+                                            // TryPopFirst/TryPopLast write the
+                                            // element type T to the out param.
+                                            (cn == "OwnedArray" &&
+                                             (mn == "TryPopFirst" ||
+                                              mn == "TryPopLast") &&
+                                             pos2 == 0) ||
                                             (cn == "OwnedLinkedList" &&
                                              (mn == "TryPopFirst" ||
                                               mn == "TryPopLast") &&
@@ -3024,13 +3031,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // the receiver's generic element argument.
             //
             // Handled cases (all are builtins with no MethodDecl):
-            //   Weak<T>.TryUpgrade          → Shared<T>         (arg 0)
-            //   OwnedStack<T>.TryPop        → T                 (arg 0)
-            //   OwnedQueue<T>.TryDequeue    → T                 (arg 0)
-            //   OwnedLinkedList<T>.TryPopFirst/TryPopLast → T   (arg 0)
-            //   OwnedSet<T>.TryTake         → T  (from T? param, arg 1)
-            //   OwnedDictionary<K,V>.TryPopValue → V            (arg 1)
-            //   Channel<T>.TryReceive       → T  (from T? param, arg 0)
+            //   Weak<T>.TryUpgrade                           → Shared<T> (arg 0)
+            //   OwnedStack<T>.TryPop                         → T         (arg 0)
+            //   OwnedQueue<T>.TryDequeue                     → T         (arg 0)
+            //   OwnedArray<T>.TryPopFirst/TryPopLast         → T         (arg 0)
+            //   OwnedLinkedList<T>.TryPopFirst/TryPopLast    → T         (arg 0)
+            //   OwnedSet<T>.TryTake                          → T (T?, arg 1)
+            //   OwnedDictionary<K,V>.TryPopValue             → V         (arg 1)
+            //   Channel<T>.TryReceive                        → T (T?, arg 0)
             //
             // For T?-typed out params the spec still delivers the non-nullable
             // T to the `out using var` (parallel to the `out var` strip above).
@@ -3090,6 +3098,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                           mn == "TryPop" && pos2 == 0) ||
                                          (cn == "OwnedQueue" &&
                                           mn == "TryDequeue" && pos2 == 0) ||
+                                         // §4.5 (#831/#1354): OwnedArray
+                                         // TryPopFirst/TryPopLast (out using var).
+                                         (cn == "OwnedArray" &&
+                                          (mn == "TryPopFirst" ||
+                                           mn == "TryPopLast") &&
+                                          pos2 == 0) ||
                                          (cn == "OwnedLinkedList" &&
                                           (mn == "TryPopFirst" ||
                                            mn == "TryPopLast") &&

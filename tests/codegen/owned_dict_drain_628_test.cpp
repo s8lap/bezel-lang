@@ -300,12 +300,16 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_int_key_remainder_disposed_by_dic
 // §4.9 / #628 part 2: the drain loop now compiles and runs correctly.
 // (The part-1 test codegen_unimplemented_628.owned_dict_drain_for_is_hard_error
 // verified it WAS a hard error; now it must compile and run.)
+// Migrated from OwnedDictionary<string,int> → OwnedDictionary<string,R> per
+// stdlib §4.2/#1327 (value types rejected as owned-collection elements).
 BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
     auto r = runJit(
-        "module M; class C "
+        "module M; "
+        "class R public constructor() end constructor; end R; "
+        "class C "
         "  public static method Main(): int "
-        "    using var d := new OwnedDictionary<string, int>(); "
-        "    d[\"x\"] := 42; "
+        "    using var d := new OwnedDictionary<string, R>(); "
+        "    d.Add(\"x\", move (new R())); "
         "    var count := 0; "
         "    for var entry in d.Drain() do "
         "      using var e := entry; "

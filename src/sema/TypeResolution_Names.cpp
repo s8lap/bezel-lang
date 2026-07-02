@@ -127,6 +127,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
     }
     // §3 stdlib two-parameter collection types (arity 2):
     if (n == "Dictionary" || n == "OwnedDictionary") return 2;
+    // §4 stdlib sorted collection types (stdlib §4.12/§4.13, v0.165 / #1354):
+    // SortedDictionary<K,V> (arity 2) and SortedSet<T> (arity 1).  Both conform
+    // to IReadOnlyCollection per the §4 update; registering them lets
+    // for-in / LINQ / member-call type-checking proceed without "unresolved type".
+    if (n == "SortedDictionary") return 2;
+    if (n == "SortedSet") return 1;
     // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T> (arity 1).
     // Domain is a static class (arity 0); ChannelClosedException is a nullary
     // exception type (§30.15); DomainFaultedException is a nullary exception.
@@ -801,21 +807,18 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     if (!ga) continue;
                     ref.genericArgs.push_back(resolveType(*ga, scope));
                 }
-                // §14.4 (#761): the standard-library owning collection types are
-                // compiler-enforced to reject the runtime-managed reference
-                // element types (`string`, function values). Those are runtime-
-                // managed (§28.9) and carry no disposal obligation, so owning
-                // them is degenerate; the `where T: class` constraint in their
-                // declarations is the imprecise admission (§14.2 admits `string`
-                // and function types under `class`) that §14.4 narrows. Per §3.6
-                // this is a per-instantiation check AT THE INSTANTIATION SITE, so
-                // it fires for every spelling — a typed local / field / parameter
-                // / return as well as `new` — not only `new`. Interfaces and
-                // class types (including nullable, whose underlying type is what
-                // matters) remain admitted; only `string` / function elements are
-                // rejected. The owned slot is the element `T` for the list / set
-                // / stack / queue families and the VALUE `V` for
-                // `OwnedDictionary<K, V>` (its keys are value-like, §28.11).
+                // stdlib §4.2 / §14.4 (#1327, v0.165): owning collection types
+                // require a class or interface element type; value types (all
+                // primitives, records, enums, value builtins, inline arrays,
+                // function values, the unit type) have no disposal obligation
+                // and cannot be owned.  Per §3.6 this is a per-instantiation
+                // check at every typing site — typed local, field, parameter,
+                // return type, and `new` — not only `new`.  Nullable class /
+                // interface wrappers are admitted (the `?` does not change the
+                // underlying type's class-ness).  The owned slot is `T` (slot 0)
+                // for the list/set/stack/queue families and `V` (slot 1, the
+                // value) for `OwnedDictionary<K, V>` (the key K is value-like
+                // by design, §28.11).
                 std::size_t ownedSlot = static_cast<std::size_t>(-1);
                 if (first == "OwnedArray" || first == "OwnedSet" ||
                     first == "OwnedStack" || first == "OwnedQueue" ||
@@ -826,24 +829,73 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (ownedSlot != static_cast<std::size_t>(-1) &&
                     ownedSlot < ref.genericArgs.size()) {
                     const TypeRef* el = ref.genericArgs[ownedSlot];
-                    const char* badKind = nullptr;
-                    if (el && el->kind == TypeRef::Kind::Primitive &&
-                        el->primitive == PrimitiveType::String)
-                        badKind = "`string`";
-                    else if (el && el->kind == TypeRef::Kind::Function)
-                        badKind = "a function value";
-                    if (badKind) {
+                    std::string badDesc;
+                    if (el) {
+                        switch (el->kind) {
+                        case TypeRef::Kind::Primitive:
+                            // All primitives are rejected: value types and
+                            // `string` (runtime-managed, no dispose).
+                            badDesc = el->primitive == PrimitiveType::String
+                                ? "`string` (a runtime-managed reference type)"
+                                : "a primitive value type";
+                            break;
+                        case TypeRef::Kind::Function:
+                            badDesc = "a function value";
+                            break;
+                        case TypeRef::Kind::Unit:
+                            badDesc = "the unit type `()`";
+                            break;
+                        case TypeRef::Kind::InlineArray:
+                            badDesc = "an inline array value type";
+                            break;
+                        case TypeRef::Kind::Named: {
+                            const TypeSymbol* ts = el->declaration;
+                            if (ts) {
+                                if (ts->isValueBuiltin)
+                                    badDesc = "a value-type builtin";
+                                else if (ts->kind ==
+                                         ast::TypeDeclKind::Record)
+                                    badDesc = "a record (value type)";
+                                else if (ts->kind ==
+                                         ast::TypeDeclKind::Enum)
+                                    badDesc = "an enum (value type)";
+                                // Class or Interface → admitted; badDesc empty.
+                            } else {
+                                // No TypeSymbol: builtin type or generic param.
+                                // Reject the handful of known value-like builtin
+                                // names; admit all class/interface builtins and
+                                // generic type parameters.
+                                if (el->astNode && el->astNode->name &&
+                                    el->astNode->name->parts.size() == 1) {
+                                    std::string_view nm =
+                                        el->astNode->name->parts[0];
+                                    if (nm == "Range" || nm == "Buffer" ||
+                                        nm == "IntPtr" || nm == "UIntPtr" ||
+                                        nm == "ReadOnlyStringSpan" ||
+                                        nm == "Boolean" || nm == "Span" ||
+                                        nm == "ReadOnlySpan" ||
+                                        nm == "ArraySpan" ||
+                                        nm == "ReadOnlyArraySpan")
+                                        badDesc = "a value-type builtin";
+                                }
+                            }
+                            break;
+                        }
+                        default:  // Kind::Error — suppress cascade diagnostics
+                            break;
+                        }
+                    }
+                    if (!badDesc.empty()) {
                         ctx_.diagnostics().report(
                             Severity::Error, t.span.begin,
                             std::string("`") + std::string(first) +
-                            "` may not be instantiated with " + badKind +
-                            " \xE2\x80\x94 owning collection types reject "
-                            "runtime-managed reference element types (`string`, "
-                            "function values); they have no disposal obligation, "
-                            "so owning them is degenerate (\xC2\xA7""14.4 / "
-                            "\xC2\xA7""28.9). Use the borrowing collection `" +
-                            std::string(first.substr(5)) + "<\xE2\x80\xA6>` "
-                            "instead.");
+                            "` requires a class or interface element type "
+                            "(stdlib \xC2\xA7""4.2 / \xC2\xA7""14.4, #1327) "
+                            "\xE2\x80\x94 " + badDesc + " has no disposal "
+                            "obligation and cannot be owned in an owning "
+                            "collection. Use `" +
+                            std::string(first.substr(5)) +
+                            "<\xE2\x80\xA6>` for value elements.");
                     }
                 }
                 // §3.6 / §8.3 (v0.158, #1338): record a hash-container key /
