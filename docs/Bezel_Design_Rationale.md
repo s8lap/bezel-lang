@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.159 — July 2026**
+**Companion to the Bezel Language Specification, v0.160 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -100,6 +100,20 @@ Assignment is `:=` and equality is `=` (the Pascal family), yet compound assignm
 Considered: `+:=` and friends (Pascal-pure — declined: unfamiliar to effectively every working programmer, visually noisy, and without precedent in any language programmers arrive from); omitting compound assignment entirely (the Ada position — declined: read-modify-write is pervasive in the systems code Bezel targets, and its absence produces `x := x + 1` ceremony with no safety gain, while the compound forms come with the §17.6 evaluate-the-target-once guarantee, which the expanded spelling does not give).
 
 The `=` glyph inside `+=` never collides with equality: compound forms exist only in statement position (`AssignmentStmt`), a position where an equality expression cannot begin, so neither humans nor the parser encounter an ambiguity. Familiarity won over purity; the cost is aesthetic only.
+
+<a id="sec-arrow-body-family"></a>
+### 3.5 The `=>` body family: one addition, three recorded divergences
+
+v0.160 gives unit-returning methods the assignment arrow (`method SetX(v: int) => _x := v;`) that accessors always had — the two contexts are the same declaration shape, and the asymmetry had no recorded reason (review finding #1345). The **remaining** divergences are deliberate, with reasons:
+
+- **Lambdas** do not take a bare-statement body: a statement's mandatory `;` collides with expression position (`Apply((x) => _total := x;, 5)` puts the arm form's `;,` seam inside an argument list; `var f := (x) => _total := x;;` doubles the terminator). Multi-statement lambdas use `=> do … end`.
+- **Operators** are expression-only: an operator must produce a value; a statement form could never typecheck.
+- **Methods and constructors** have no `=> do … end` form: both already have the lighter bare-block body (`… end Name;`), so the arrow-block would be a second spelling of the same thing (declined for methods as far back as v0.84).
+
+<a id="sec-destructor-takes-no-parens"></a>
+### 3.6 `destructor` takes no parameter list
+
+`constructor()` carries parens because parameters may follow — the parens are the parameter list, present even when empty for uniformity across constructors. A destructor can never take parameters (it is invoked by the compiler-generated `Dispose()`, §28.4), so a mandatory empty `()` would be pure ceremony attached to nothing. The asymmetry is intentional (confirmed 2026-07, review finding #1343): `destructor` is a keyword-introduced block like `try` or `extension`, not a callable signature. (The §1.6 closer taxonomy already treats `constructor`/`destructor`/`operator` as one keyword-labeled family.)
 
 <a id="sec-memory-management"></a>
 ## 4. Memory management
@@ -7312,6 +7326,21 @@ v0.159 is the **conversions-and-typing revision**: four families of rules the co
 
 #### Migration
 None expected: every rule codifies implemented behavior. (In-run probes verify: reversed-range pattern non-match, MinValue literal forms, `T?`-idempotence corners; divergences found become implementation fixes, not spec changes.)
+
+<a id="sec-v0-159-to-v0-160-changelog"></a>
+### v0.160 changelog (v0.159 → v0.160)
+
+v0.160 is the **members revision**: the call/parameter-modifier composition matrix gets defined, extensions and operators get their resolution cores, the arrow-body family gets its one missing form, and two small syntax seams close. (Issues: #1335, #1343-remainder, #1344, #1345, #1346, #1347.)
+
+- **out-var annotations** (#1335): §22.6's stray annotated forms struck — the inline `out var x` never takes a type annotation (§22.4 was always explicit); typed disambiguation = pre-declared local.
+- **Modifier composition** (#1344): A.4 Argument gains `out owned var` (the thrice-stated prose form is now derivable) and restricts named arguments to plain values (`M(out var x := n)` has no reading); `out _` defined against both out kinds (owned discard = unbound owned temporary, end-of-statement disposal; both-overloads-present ⇒ ambiguity error); defaults permitted only on unmodified/`owned` parameters, with the trailing-defaults rule stated; primary constructors take plain/`owned` parameters only.
+- **Arrow bodies** (#1345): a unit-returning method takes the assignment arrow the accessors always had (`method SetX(v: int) => _x := v;`); the remaining per-context divergences recorded with reasons in rationale §3.5 (lambda `;`-collision, operators value-only, methods already have the bare block).
+- **Extensions** (#1346): the implicit type-parameter binding rule stated (bare single-segment identifier in argument position of the extended type binds fresh, always, with a shadowing warning — the only implicit type-parameter binding in the language; "resolution-wins" declined as action-at-a-distance); extension members are `public`/`internal` only; extension properties expression-bodied only.
+- **Operators** (#1347): declaring-type-operand requirement; the two-operand-types union resolution rule with no auto-commutation and the both-types ambiguity error; `public` made normative (A.4 narrowed); C.10 bullets added.
+- **Syntax seams closed** (#1343 remainder): type aliases bind with `:=` (was `=`, the sole exception — "all bindings introduce with `:=`" is now exceptionless; 9 examples migrated); `destructor` parens-less form recorded as intentional (rationale §3.6).
+
+#### Migration
+Tightenings: named ref/out/owned arguments (were undefined-but-parseable) now rejected; non-public operators rejected; protected/private extension members rejected; block-bodied extension properties rejected; defaults on ref/out rejected. Type alias `=` → `:=` is source-breaking but trivially mechanical. Compiler alignment for all of v0.160 rides the wave-3 lanes (the `out owned var` parse is #1305's fix; the owned-`out _` disposal semantics subsumes the #1315 scratch-slot family for owned outs).
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)

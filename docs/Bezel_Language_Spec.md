@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.159 — July 2026**
+**Version 0.160 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3402,7 +3402,7 @@ A method has a return type after `:`, or no `:` clause for a procedure (return t
 <a id="sec-expression-bodied-methods"></a>
 ### 22.2 Expression-bodied methods
 
-When the body is a single expression, `=> expression` replaces the block:
+When the body is a single expression, `=> expression` replaces the block. A method with **no declared return type** may also use a single *assignment* as its arrow body (v0.160): `public method SetTotal(v: int) => _total := v;` — the same shape the accessor form `set => _x := value;` has always had; the asymmetry between the two identical declaration contexts was the one indefensible gap in the arrow-body family (the remaining per-context differences are recorded with reasons in the rationale). On a method with a declared return type the assignment form is an error (an assignment produces no value):
 
 ```bezel
 public method Area(): decimal => Width * Height;
@@ -3449,7 +3449,9 @@ Log("System started", timestamp := false);
 Log(level := "ERROR", message := "Failed");
 ```
 
-Named arguments may appear in any order after positional arguments.
+Named arguments may appear in any order after positional arguments. **The named form is for plain-value arguments only (v0.160):** a `ref`/`out`/`owned` argument is passed positionally — `M(out var result := n)` has no reading and does not parse (Appendix A.4 Argument).
+
+**Defaults and modifiers (v0.160).** A default value is permitted only on parameters with **no modifier or `owned`** (an `owned` default is the owned-allocation form this section already blesses, e.g. a factory-call default); `ref` and `out` parameters can never carry defaults — both require a caller-side location, which an omitted argument cannot supply. Every parameter after the first defaulted parameter must itself have a default.
 
 <a id="sec-evaluation-timing"></a>
 #### Evaluation timing
@@ -3505,10 +3507,14 @@ Methods and constructors may be overloaded by parameter list. Overload resolutio
 
 Therefore: **`out T` and `out owned T` are distinct overloads.** Two methods differing only in the `owned` qualifier on an `out` parameter are permitted, and overload resolution selects between them based on the call-site form:
 
-- `M(out var x)` and `M(out var x: T)` resolve to the `out T` overload.
-- `M(out using var x)`, `M(out using var x: T)`, and `M(out owned var x)` resolve to the `out owned T` overload.
+- `M(out var x)` resolves to the `out T` overload.
+- `M(out using var x)` and `M(out owned var x)` resolve to the `out owned T` overload.
+
+(An explicit type annotation on the inline `out` declaration is not permitted — the type is inferred from the callee's parameter, [§22.4](#sec-ref-and-out-parameters). Overloads that differ only in the out parameter's *type* are disambiguated by pre-declaring a typed local and passing plain `out x`.)
 
 If only one overload exists, the call-site syntax must match it: a caller cannot write `out using var` to call a method whose `out` parameter is plain (the result wouldn't have an owned source), and a caller cannot write plain `out var` to call a method whose `out` parameter is `out owned` (the resulting value's ownership would have nowhere to go).
+
+**`out _` (v0.160).** The discard form applies to both parameter kinds: against `out T` the received value is simply dropped ([§17.13](#sec-the-discard-_)); against `out owned T` the discarded value is an unbound owned temporary disposed at the end of the full statement ([§28.3](#sec-unbound-owned-temporaries)). When *both* overloads of an out/out-owned pair exist, `out _` is ambiguous — a compile error citing both candidates, resolved by writing `out var x` or `out using var x` (the compiler declines to guess, as throughout this section).
 
 This carve-out exists for `out` specifically. `ref` parameters do not admit `owned` (a `ref` location is borrowed by definition); `in` parameters do not exist as a separate modifier in Bezel. The carve-out applies only where the call-site syntax visibly distinguishes the two forms.
 
@@ -3785,7 +3791,7 @@ The compiler generates the necessary `try`/`finally` around each phase. The base
 <a id="sec-methods-and-constructors-primary-constructors"></a>
 ### 22.10 Primary constructors
 
-A class may declare its primary constructor's parameters in the class header:
+A class may declare its primary constructor's parameters in the class header. A primary-constructor parameter list admits **plain and `owned` parameters only**; `ref` and `out` are rejected semantically (v0.160 — the grammar admits them through the shared Param production, the same over-admit-and-reject-semantically pattern Appendix A.4 uses elsewhere): a constructor's parameters initialize object state, and a by-reference alias or a caller-out slot has no meaning in that role.
 
 ```bezel
 public class BankAccount(name: string, initialBalance: decimal)
@@ -4294,7 +4300,7 @@ An interface event declaration cannot specify a payload type that is itself unim
 <a id="sec-operator-overloading"></a>
 ## 25. Operator Overloading
 
-Records, enums, and classes may overload operators. Operators are declared as `public static` methods using the `operator` keyword.
+Records, enums, and classes may overload operators. Operators are declared as `public static` methods using the `operator` keyword — **`public` is required** (v0.160): an operator invoked through `a + b` syntax has no call-site spelling that could name a restricted member, so any other visibility is a compile error (Appendix A.4's OperatorDecl admits only `public static`).
 
 <a id="sec-overloadable-operators"></a>
 ### 25.1 Overloadable operators
@@ -4314,7 +4320,11 @@ The following operators are also not overloadable, for various reasons:
 - The `+=` and `-=` syntactic forms used with events ([§24.4](#sec-subscribing)) — these are a fixed, language-defined desugaring available only on `EventSource<T>` and `AsyncEventSource<T>`; they are not operator overloads and are not part of the user-overloadable surface.
 
 <a id="sec-operator-overloading-restrictions"></a>
-### 25.2 Restrictions
+### 25.2 Restrictions and resolution
+
+**Declaring-type operand (v0.160).** At least one parameter of an operator overload must be the declaring type; a binary overload may pair the declaring type with any other type in either position (as `DateTime.operator +(t: TimeSpan, d: DateTime)` does). An operator whose parameters never mention the declaring type would be unreachable by the resolution rule below.
+
+**Resolution (v0.160, codifying implemented behavior).** For `a <op> b` on non-primitive operands, the candidate set is the union of the `operator <op>` overloads declared on the **static types of both operands**; parameters match operands **in order** — there is no automatic commutation (`4 - v` is not matched against `operator -(v: V, n: int)`). If distinct applicable overloads are found on both operand types, the expression is a compile error citing the candidates (mirroring [§22.6](#sec-overload-resolution)'s the-compiler-declines-to-guess stance). A unary operator consults the operand's type.
 
 - `=` and `<>` may **not** be overloaded on classes or on inline arrays. For classes, `=` always invokes `Equals`. For inline arrays, the language-defined structural equality of [§8.3](#sec-equals-and-gethashcode) is the only `=` available; inline arrays cannot be extended ([§26.2](#sec-what-can-be-extended)), so the overload mechanism does not reach them. Records and enums may overload `=` and `<>`.
 - Comparison operators must be overloaded as a complete group: `<`, `>`, `<=`, `>=` together; `=` and `<>` together.
@@ -4438,15 +4448,18 @@ What cannot be extended:
 <a id="sec-extension-blocks-restrictions"></a>
 ### 26.3 Restrictions
 
-- Only methods and computed read-only properties.
+- Only methods and computed read-only properties. An extension property is **expression-bodied only** (`property Name: Type => expr;`, v0.160) — the block-accessor form is not admitted; multi-statement logic goes in a method.
 - No fields, auto-properties, constructors, destructors, or `owned` fields.
 - No operator overloads.
 - No indexers.
 - No `virtual`, `override`, `abstract`, or `sealed` — extensions are statically dispatched.
+- Extension members must be declared `public` or `internal` (v0.160); `protected` and `private` are compile errors — an extension block has no declaring class and no inheritance, so [§13.1](#sec-visibility-levels)'s definitions for those levels do not apply. The member's effective visibility is the more restrictive of the block's reach and the member's own declaration (mirroring [§13.2](#sec-nested-types)'s nested-type rule).
 - Extension members see only the extended type's public API. From the same module, `internal` members are also visible.
 
 <a id="sec-generic-extensions"></a>
 ### 26.4 Generic extensions
+
+**Type-parameter binding (v0.160, codifying implemented behavior).** In the extended type's argument positions, each **bare single-segment non-nullable identifier** introduces a fresh block-level type parameter — *always*, shadowing any same-named type in scope (the compiler warns on such shadowing). This is the only implicit type-parameter binding in the language, so the rule is stated exactly: multiple parameters are permitted (`extension Dictionary<K, V>`); a **concrete** instantiation is written with keyword/primitive types, qualified names, or generic instantiations (`extension IEnumerable<int>`, `extension IEnumerable<Array<byte>>`), none of which are bare single-segment identifiers. The alternative — resolving the identifier against scope and only binding when unresolved — is declined: it would let an unrelated type declaration elsewhere silently re-mean an extension block (action at a distance).
 
 ```bezel
 extension IEnumerable<T> where T: IComparable<T>
@@ -4732,16 +4745,16 @@ For named methods, the same store-once pattern is recommended because the compil
 <a id="sec-type-aliases"></a>
 ### 27.8 Type aliases
 
-A `type` declaration introduces an alias for any existing type:
+A `type` declaration introduces an alias for any existing type, binding with `:=` like every other binding in the language (v0.160 — previously `=`, the sole exception):
 
 ```bezel
-type UserId = int;
-type ConnectionPool = Dictionary<string, Array<Connection>>;
+type UserId := int;
+type ConnectionPool := Dictionary<string, Array<Connection>>;
 
 /// <summary>Handles an HTTP response.</summary>
 /// <param name="status">The HTTP status code.</param>
 /// <returns>True if handled successfully.</returns>
-type ResponseHandler = (status: int, body: string, elapsed: TimeSpan) -> bool;
+type ResponseHandler := (status: int, body: string, elapsed: TimeSpan) -> bool;
 ```
 
 A type alias is a pure synonym — it does not create a new type. `UserId` and `int` are interchangeable.
@@ -4761,10 +4774,10 @@ Type aliases may be declared at module level.
 A type alias may declare type parameters:
 
 ```bezel
-type Result<T> = (success: bool, value: T?, error: string?);
-type Lookup<K, V> = Dictionary<K, Array<V>>;
-type Predicate<T> = (T) -> bool;
-type Reducer<T, TAccum> = (TAccum, T) -> TAccum;
+type Result<T> := (success: bool, value: T?, error: string?);
+type Lookup<K, V> := Dictionary<K, Array<V>>;
+type Predicate<T> := (T) -> bool;
+type Reducer<T, TAccum> := (TAccum, T) -> TAccum;
 ```
 
 Each instantiation of the alias is interchangeable with the corresponding instantiation of the aliased type. `Lookup<string, int>` and `Dictionary<string, Array<int>>` are the same type.
@@ -4772,7 +4785,7 @@ Each instantiation of the alias is interchangeable with the corresponding instan
 Generic aliases may carry constraints, written exactly as on generic methods:
 
 ```bezel
-type Sorted<T> = IOrderedEnumerable<T> where T: IComparable<T>;
+type Sorted<T> := IOrderedEnumerable<T> where T: IComparable<T>;
 ```
 
 The constraint applies to the alias's parameter; uses of the alias must satisfy it.
@@ -4780,7 +4793,7 @@ The constraint applies to the alias's parameter; uses of the alias must satisfy 
 A generic alias may not reference itself (no recursive aliases) and must resolve to a concrete type after substitution. Aliases of aliases are permitted:
 
 ```bezel
-type IntPredicate = Predicate<int>;       // Predicate<int>, which is (int) -> bool
+type IntPredicate := Predicate<int>;       // Predicate<int>, which is (int) -> bool
 ```
 
 Type aliases — generic or not — see through to the aliased type for identity, equality, method dispatch, and overload resolution. They are a naming convenience, not a separate type kind.
@@ -7483,7 +7496,10 @@ QualifiedName   ::= Identifier ("." Identifier)*
 
 TopDecl         ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
                   | ExtensionDecl | TypeAliasDecl | ExternBlock
-TypeAliasDecl   ::= "type" Identifier GenericParams? "=" Type
+TypeAliasDecl   ::= "type" Identifier GenericParams? ":=" Type
+                              /* v0.160: was `=` — the alias now binds with the
+                                 same `:=` every other binding uses; "all
+                                 bindings introduce with `:=`" is exceptionless. */
                     GenericConstraints* ";"
 ```
 
@@ -7650,7 +7666,14 @@ MethodDecl      ::= Visibility "static"? "async"? VirtualKind?
                                  to class-typed returns; for non-class types
                                  it is rejected semantically. */
 VirtualKind     ::= "abstract" | "virtual" | "sealed"? "override"
-MethodBody      ::= "=>" Expression ";"
+MethodBody      ::= "=>" (Expression | AssignmentStmt) ";"
+                              /* The AssignmentStmt alternative (v0.160) is
+                                 valid only on methods with no declared return
+                                 type (unit result); it makes the accessor
+                                 shape `set => _x := value;` available to the
+                                 identically-shaped unit method:
+                                 `method SetX(v: int) => _x := v;` (§22.2).
+                                 Enforced semantically. */
                   | Statement* "end" Identifier? ";"
                   | ";"                /* body-less method: requires
                                           VirtualKind = "abstract"; enforced
@@ -7715,7 +7738,7 @@ CtorChain       ::= ("base" | "this") "(" ArgList? ")" ";"
 
 DestructorDecl  ::= "destructor" Statement* "end" "destructor"? ";"
 
-OperatorDecl    ::= Visibility "static" "method" "operator" OpToken
+OperatorDecl    ::= "public" "static" "method" "operator" OpToken
                     "(" ParamList ")" ":" "owned"? Type OperatorBody
                               /* `owned` on an operator's return type is
                                  permitted for class-typed operators that
@@ -7735,11 +7758,15 @@ ParamModifiers  ::= "ref"
                   | "out" "owned"?
                   | "owned"
 ArgList         ::= Argument ("," Argument)*
-Argument        ::= ArgModifiers? (Identifier ":=")? ArgExpression
+Argument        ::= ArgModifiers ArgExpression
+                  | (Identifier ":=")? ArgExpression
+                              /* ref/out/owned arguments are positional-only
+                                 (§22.5, v0.160): the named form is for plain
+                                 values. */
 ArgModifiers    ::= "ref"
                   | "out" "var"?
                   | "out" "using" "var"
-                  | "out" "owned"
+                  | "out" "owned" "var"
                   | "owned"
 ArgExpression   ::= Expression | "_"
                               /* The "_" alternative is admitted by the grammar
@@ -8390,6 +8417,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 ### C.10 Operators
 
 - `=` and `<>` are not overloaded on classes.
+- An operator overload is `public static` and at least one parameter is the declaring type ([§25.2](#sec-operator-overloading-restrictions), v0.160).
+- A record/enum overloading homogeneous `=`/`<>` also declares `Equals(T)` and `override GetHashCode` (the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule, v0.158).
 - Comparison operators are overloaded as a complete group (`<`, `>`, `<=`, `>=` together; `=` and `<>` together).
 - The bitwise complement operator is `~`; the boolean negation operator is `not`. They are not interchangeable. `~` is user-overloadable; `not` is not.
 - `mod` has no compound-assignment form; `mod=` is not valid syntax.
