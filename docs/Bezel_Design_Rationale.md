@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.162 — July 2026**
+**Companion to the Bezel Language Specification, v0.163 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7370,6 +7370,21 @@ v0.162 is the **async-and-exceptions revision**, executing the #1362 deadlock pr
 
 #### Migration
 Tightenings: in-domain `Wait()`/`Result` (was a deadlock at runtime — now diagnosed); `50 in 100..0`-style extent membership over iteration-empty ranges (write `Math.Min/Max` comparisons for unordered intervals). `WhenAny` consumers switch from the (unconstructible) winner task to its index. Everything else is definition of previously-undefined or unstated behavior. Compiler alignment rides wave-4: the Wait/Result sema-reject + runtime guard (unblocked by #1377's RaiseAsync re-lower), WhenAny index, spend-on-fault, Contains flip + warning, Exception surface/CauseChain, TakeCurrent (v0.161), fields drop-on-overwrite (v0.161).
+
+<a id="sec-v0-162-to-v0-163-changelog"></a>
+### v0.163 changelog (v0.162 → v0.163)
+
+v0.163 is the **domains-and-system revision**: the statics side door closes, termination gets defined, FFI callbacks are inverted to the forms that actually lower, the sendability coordination text is reconciled, and event-raise reentrancy is pinned. (Issues: #1363, #1364, #1366, #1367, #1369. The module-system chapter, #1365, is deliberately its own following revision.)
+
+- **Statics and domains** (§22.12 + §30.14, #1363): statics are process-global; lazy initialization is runtime-synchronized once-semantics; a *mutable* static of non-synchronized type is a compile error; readonly immutable content is unrestricted; class-typed readonly singletons carry a declaration warning naming the cross-domain obligation; static events' subscriber lists are runtime-synchronized. §30.14's headline invariant now cites the statics rules instead of silently excluding them.
+- **Sendability list reconciled** (§30.14, #1364): `Shared<T>`'s v0.140 conditional rule replaces the stale blanket exclusion; `Mutex`/`Semaphore`/atomics stated sendable (their purpose), `Lock` guards domain-bound.
+- **Termination defined** (§33.3, #1366): uncaught exception ⇒ exit 70 + typed/chained report to stderr, shutdown sequence still runs; live spawned domains at `Main`'s completion are **abandoned** (join explicitly if their work matters); `Environment.Exit` initiates the same shutdown from any domain and never returns.
+- **FFI callbacks inverted** (§32.8/§32.10, #1367): static methods and *non-capturing lambdas* are admitted (both are bare fn pointers); bound instance references and capturing lambdas are rejected (they need an environment the FFI does not define) — the previous rule admitted exactly the wrong set. Environmentless callbacks may be retained by native code past the call (process-lifetime code addresses; foreign-thread discipline per §30.12/§30.14 governs what they may touch). The `errno()` example corrected.
+- **Event raise takes a snapshot** (§24.5, #1369): in-flight raises are unaffected by subscribes/unsubscribes from handlers; self-unsubscribing one-shot listeners are thereby well-defined.
+- **Diagnostic identity is implementation-defined** (Appendix D, #1369): conformance classifies accept/warn/reject; no error-code registry until multiple implementations exist.
+
+#### Migration
+Tightenings: mutable non-synchronized statics become errors (the sanctioned shapes: synchronized types, readonly immutables, or domain-confined design); capturing/bound FFI callbacks become errors (pass state through the C user-data pointer). `WhenAny`-era note: none. Compiler alignment rides waves 4–5 (statics checks, static-event sync, snapshot raise, FFI admission flip, exit-code path).
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)

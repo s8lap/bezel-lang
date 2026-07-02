@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.162 — July 2026**
+**Version 0.163 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3886,6 +3886,14 @@ The semantics of object initialization (mutation through setters) does not apply
 <a id="sec-static-members"></a>
 ### 22.12 Static members
 
+**Statics and domains (v0.163, closing the #1363 gap).** Static state is **process-global** — one instance across all domains — which makes unrestricted static mutability a side door through [§30.14](#sec-sendable-types)'s no-shared-mutable-state discipline. The rules:
+
+1. **Lazy static initialization is runtime-synchronized**: a type's static initializer runs exactly once process-wide; a domain touching a type mid-initialization by another domain blocks until initialization completes (or observes the failed state, [§22.7](#sec-constructors)). Exit disposal order ([§22.13](#sec-static-initialization-order)) is therefore well-defined: the runtime records the single global initialization order.
+2. A **mutable** (non-`readonly`, non-`const`) static field or auto-property is admitted **only** when its type is compiler-known internally-synchronized (`Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `Channel<T>`, `ChannelSender<T>` — stdlib §6); any other type is a **compile error** naming this rule. Unsynchronized cross-domain mutation is exactly the race §30.14 exists to exclude.
+3. `static readonly` and `const` of **immutable content** — value types of sendable-value category, `string`, enums — are unrestricted (shared-immutable).
+4. A `static readonly` (including `owned`) field of **class type** is admitted with a **declaration-site warning** unless the class is in the synchronized set: the referenced instance is reachable from every domain, and confining its use to one domain — or ensuring its own internal synchronization — is the programmer's obligation (the checked-disposal backstop of [§28.2](#sec-the-idisposable-contract) applies; this is the singleton-with-resources pattern the warning text names). The warning is suppressed by the synchronized set.
+5. **Static events are runtime-synchronized** (v0.163): the compiler-generated subscriber list of a `static event` uses synchronized operations, since subscribe/raise may arrive from any domain. (Instance events remain unsynchronized — their access is domain-serial per [§24.6](#sec-handler-lifetime).)
+
 Static methods, properties, fields, events, and constructors are declared with `static`. A class-level `const` is implicitly static; writing `static const` is redundant but permitted for clarity — both forms declare the same constant.
 
 `const` declarations (with or without `static`) require a compile-time-constant expression and a primitive value type or `string`. `static readonly` accepts any value but is read at runtime.
@@ -3941,7 +3949,7 @@ A non-`async` synchronous wrapper that blocks on the task is admitted **only** i
 <a id="sec-disposal-of-static-owned-fields"></a>
 #### Disposal of static `owned` fields
 
-A static field may be marked `owned`. Static `owned` fields are disposed at program exit, after `Main` returns (whether normally or by uncaught exception), in **reverse order of static initialization** across all types — the type whose static initializer ran last is the first to have its static `owned` fields disposed. Within a single type, multiple static `owned` fields are disposed in reverse declaration order, mirroring the instance-field disposal rule ([§28.4](#sec-the-destructor)).
+A static field may be marked `owned`. Static `owned` fields are disposed at program exit, after `Main` completes (normally, or by an uncaught exception — [§33.3](#sec-exit-code) defines the exit code for each), in **reverse order of static initialization** across all types — the type whose static initializer ran last is the first to have its static `owned` fields disposed. Within a single type, multiple static `owned` fields are disposed in reverse declaration order, mirroring the instance-field disposal rule ([§28.4](#sec-the-destructor)).
 
 A static field of owning-inline-array type (`[N owned]T?` or `[N owned]T`, [§15.1.1](#sec-owning-inline-arrays)) participates in the same program-exit disposal pass even though it does not carry the `owned` field modifier — the type-level `owned` slot marker conveys the obligation. At program exit, each non-null slot's `Dispose()` is called in the same reverse-of-initialization order as for `static owned` fields, and slot order within the array is unobservable (slots are disposed independently). A static field of owning-inline-array type whose initializer threw is not disposed (the array's slots were never observable); a static field whose initializer completed successfully before a later failing initializer is disposed normally.
 
@@ -4231,7 +4239,7 @@ await DataReceived.RaiseAsync(new DataReceivedEvent(this, payload, t)); // async
 ApplicationExiting.Raise();                                              // no-payload
 ```
 
-`Raise` and `RaiseAsync` invoke handlers in subscription order. With zero subscribers, both methods are no-ops — there is no null check at the call site, no `?.`, no `Invoke` indirection.
+`Raise` and `RaiseAsync` invoke handlers in subscription order, over a **snapshot of the subscriber list taken when the raise begins** (v0.163): a handler that subscribes or unsubscribes during the raise affects the *next* raise, never the in-flight pass — the same posture as [§24.6](#sec-handler-lifetime)'s cross-continuation rule and [§29.12](#sec-concurrent-modification)'s loud-mutation discipline, chosen here as snapshot-rather-than-fault because self-unsubscribing handlers (one-shot listeners) are a legitimate idiom. With zero subscribers, both methods are no-ops — there is no null check at the call site, no `?.`, no `Invoke` indirection.
 
 The synchronous form `Raise` returns `()` and runs each handler to completion before invoking the next. The asynchronous form `RaiseAsync` returns a `Task` that completes when every handler's task completes; each handler's task is awaited before the next is invoked.
 
@@ -6814,7 +6822,7 @@ The runtime does not provide synchronization contexts in this version.
 <a id="sec-multiple-domains"></a>
 ### 30.14 Multiple domains and sendable types
 
-Domains run in parallel: while each domain's continuations are serial ([§30.13](#sec-runtime-model)), continuations of *different* domains may run simultaneously on different threads. The data-race freedom of the single-domain guarantees is preserved across domains by one discipline: **no mutable state is ever reachable from two domains.** Every value that crosses a domain boundary is either *moved* (ownership transfers; the origin domain provably loses access, by the same `move`/owned-transfer machinery as [§28.8](#sec-ownership-transfer)) or *immutable* (`string`, copies of values). The compiler enforces the discipline through the *sendable* property below; the channel types ([§30.15](#sec-channels)) are the only objects two domains may reach simultaneously, and they are compiler-known and internally synchronized.
+Domains run in parallel: while each domain's continuations are serial ([§30.13](#sec-runtime-model)), continuations of *different* domains may run simultaneously on different threads. The data-race freedom of the single-domain guarantees is preserved across domains by one discipline: **no mutable state is ever reachable from two domains.** Every value that crosses a domain boundary is either *moved* (ownership transfers; the origin domain provably loses access, by the same `move`/owned-transfer machinery as [§28.8](#sec-ownership-transfer)) or *immutable* (`string`, copies of values). The compiler enforces the discipline through the *sendable* property below; the channel types ([§30.15](#sec-channels)) and the other compiler-known internally-synchronized types are the only objects two domains may reach simultaneously. **Static state** — process-global and hence reachable from every domain — is constrained to uphold this same invariant by [§22.12](#sec-static-members)'s statics-and-domains rules (v0.163).
 
 <a id="sec-sendable-types"></a>
 #### Sendable types
@@ -6829,7 +6837,7 @@ A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-pr
   3. The class has no function-typed fields, no `Object`-typed or interface-typed fields (boxed contents and runtime types behind interfaces cannot be statically verified), and no non-`owned` class-typed fields (a back-reference aliases an object owned in the origin domain).
   Mutually-recursive `owned` references among sendable classes are admitted; the property is evaluated coinductively (assume the types under test sendable, then check the rules). A sendable class instance crosses as an **owned transfer** — the entire ownership tree under it moves with it, and rule 2 guarantees that tree contains everything the instance can reach.
 - **Interface types** are never sendable (rule 3's reasoning, applied at the root).
-- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwnedBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwnedTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, `Shared<T>` and `Weak<T>` ([§28.13](#sec-shared-ownership) — the shared count is not synchronized), and the [§30.12](#sec-thread-synchronization) types are domain-local and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
+- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwnedBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwnedTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, and `Weak<T>` are domain-local and not sendable; **`Shared<T>` is sendable iff `T` is sendable and internally synchronized** (the v0.140 rule of [§28.13](#sec-shared-ownership) — `Shared<Mutex>` is the cross-domain sharing idiom; for every other `T` it remains domain-local — this list previously predated that amendment, v0.163/#1364); of the [§30.12](#sec-thread-synchronization) types, `Mutex`, `Semaphore`, and the atomics are **sendable** (internally synchronized — stdlib §6.2–§6.4; that is their purpose) while `Lock` guards are domain-bound and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
 
 Sendability of a generic instantiation is checked at the instantiation or call site under the rules of [§3.6](#sec-derived-type-properties); diagnostics name the property ("not sendable"), the offending type, and the failing rule.
 
@@ -7330,7 +7338,7 @@ end IntSorter;
 
 Constraints:
 
-- The callback must be a **method reference** — a named instance method, a static method, or a property reference. Lambdas, including non-capturing lambdas, are not accepted: the compiler does not promise to recognize a non-capturing lambda as equivalent to a function pointer, so a single rule (no lambdas) avoids relying on a heuristic. To pass a lambda-shaped operation, extract it into a named static method.
+- The callback must be a **static method reference or a non-capturing lambda** (v0.163 — the admission rule is *inverted* from earlier revisions): both lower to a bare C function pointer with no environment. A **bound instance-method reference** (`obj.Method`) and a **capturing lambda** are rejected — each carries an environment (the receiver / the captures) that a bare function pointer cannot represent; the earlier rule admitted exactly the forms that need a thunk-plus-context mechanism the FFI does not define, and rejected the one form that trivially *is* a function pointer. C APIs that provide a user-data pointer parameter are wrapped by passing state through that pointer explicitly (`IntPtr`), never through closure capture.
 - Callbacks are themselves trusted but unverified.
 - Exceptions thrown by a Bezel callback do not propagate to native callers. The FFI boundary catches and silently swallows them, or aborts the program, depending on platform. Callbacks should report errors via return codes.
 
@@ -7344,7 +7352,7 @@ public static class FileOps
   public static method OpenChecked(path: CString): int
     var fd := open(path, O_RDONLY);
     if fd < 0 then
-      throw new IOException($"open failed: errno={errno()}");
+      throw new IOException($"open failed: errno={GetErrno()}");   // GetErrno: a user-declared extern wrapper — C errno is a thread-local macro, not a callable function
     end;
     return fd;
   end OpenChecked;
@@ -7361,7 +7369,7 @@ The Bezel compiler guarantees:
 - Arguments passed to an `extern` method are of the declared types.
 - The return value, if any, is treated as the declared type.
 - The calling convention used matches the `convention` clause (or default).
-- Function pointers passed across the boundary are valid for at least the duration of the call.
+- Function pointers passed across the boundary are valid for at least the duration of the call. **Registrations that outlive the call (v0.163):** a static-method/non-capturing-lambda callback has no environment and its code address is process-lifetime — such a pointer *may* be retained by native code (signal handlers, event loops, plugin hooks) and remains valid until process exit; there is nothing to pin and nothing to unregister on the Bezel side. What Bezel-side state such a callback may touch is governed by the domain rules ([§30.14](#sec-sendable-types)): a callback invoked from a foreign thread is outside every domain and must confine itself to [§30.12](#sec-thread-synchronization)-synchronized state and `OwnedTaskCompletionSource` completion — the same discipline as any foreign thread.
 
 The programmer is responsible for:
 
@@ -7407,9 +7415,15 @@ A signature outside this set does not qualify as an entry point; a method named 
 `Main` must be `public` and `static`. An instance method named `Main` does not qualify.
 
 <a id="sec-exit-code"></a>
-### 33.3 Exit code
+### 33.3 Exit code and termination
 
 When `Main` returns `int` or `Task<int>`, the returned value becomes the process exit code. Otherwise, normal completion produces an exit code of 0.
+
+**Uncaught exception (v0.163):** an exception escaping `Main` (or the awaited `Main` task faulting) produces exit code **70** (the conventional software-error code, matching `EX_SOFTWARE`), after the runtime prints the exception's type, message, stack trace, and `CauseChain` ([§31.4](#sec-standard-exception-types)) to standard error. The [§22.13](#sec-static-initialization-order) shutdown sequence (static `owned` disposal) still runs.
+
+**Live domains at exit (v0.163):** when `Main` completes, spawned domains that have not completed are **abandoned**: the runtime signals no cancellation, runs no further continuations of theirs, and proceeds to the shutdown sequence — their owned state is reclaimed by the process exit, not by disposal, and their pending effects are lost. A program that needs a spawned domain's work must join it (await its completion task) before returning; the abandonment rule makes `Main`'s return the single authoritative end of computation rather than introducing an implicit barrier. In-flight continuations of the **main** domain queued behind `Main`'s completion are likewise not run.
+
+**`Environment.Exit(code)` (v0.163):** callable from any domain; it initiates the same shutdown sequence (no further continuations anywhere, static `owned` disposal on the dedicated shutdown thread, then process exit with `code`). It never returns. Like abandonment above, it is a statement that remaining work is deliberately discarded.
 
 <a id="sec-command-line-arguments"></a>
 ### 33.4 Command-line arguments
@@ -8486,6 +8500,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 
 <a id="appendix-d-conformance-levels"></a>
 ## Appendix D: Conformance Levels
+
+**Diagnostic identity (v0.163).** This specification mandates *when* a diagnostic is produced (accept / warn / reject) and, in places, what it should name; it deliberately defines **no error-code registry or message taxonomy**. Diagnostic identity — codes, exact wording, formatting — is implementation-defined, and conformance claims about diagnostics classify outcomes only (a mandated rejection is satisfied by any error at the mandated site; a mandated warning by any warning). A future revision may introduce a code registry if multiple implementations materialize; until then, requiring exact messages would freeze prose this document revises freely.
 
 This specification defines two conformance levels. The partition exists so that an implementation can be *complete and sound for a well-defined inner language* before the outer features are attempted, and so that the test-suite and teaching material can follow the same boundary.
 
