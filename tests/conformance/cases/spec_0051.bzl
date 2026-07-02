@@ -4,7 +4,7 @@ public class OwnedCache<T> where T: class
   public constructor() _items := new(); end;
 
   public method Add(owned item: T)
-    _items.Add(item);
+    _items.Add(owned item);
   end Add;
 
   public method Drain(): IOwningEnumerable<T>

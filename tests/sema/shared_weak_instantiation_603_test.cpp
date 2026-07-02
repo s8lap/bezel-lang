@@ -48,7 +48,7 @@ BEZEL_TEST(sema_shared_weak_instantiation_603,
         "class C "
         "  public static method M() "
         "    var obj := new Inner(); "
-        "    using var h := new Shared<Inner>(obj); "
+        "    using var h := new Shared<Inner>(owned obj); "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

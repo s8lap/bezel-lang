@@ -110,66 +110,62 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (!a.value) { ++pos; continue; }
-            if (a.modifier == "owned") {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    // §28.8 (#395): the consumed value must be owned, not a borrow.
-                    if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
-                    ++pos; continue;
-                }
-                if (exprIsOwnedFieldRead(*a.value)) {
-                    // §28.3 / §28.8.1 (#398): `owned obj.f` of a bare owned-
-                    // field read is a borrow (only `move obj.f` is owned).
-                    checkOwnedArgSource(*a.value, a.value->span.begin);
-                    ++pos; continue;
-                }
-                if (checkOwnedArgOtherBorrow(*a.value)) {
-                    // §28.3 / §28.11 (#407): `owned coll[i]` / `owned obj.f` is a
-                    // borrow (bare `this` was handled by the identifier branch).
-                    ++pos; continue;
-                }
-            }
-            // §28.8 implicit transfer: bare id to `owned` formal param.
-            if (a.modifier.empty() && cd && pos < cd->params.size() &&
+            // §28.8 / §28.13: is this argument position an owned sink? A ctor
+            // `owned` (or `out owned`) formal, or the implicit owned parameter
+            // of `new Shared<T>(value)` at position 0. The `owned`/`move`/borrow
+            // classification below is identical to the method-call path
+            // (recordMovesInArgs); the call-site `owned` marker (§22.3, v0.169)
+            // is layered on top of the SAME classification.
+            const bool ctorOwnedSink =
+                cd && pos < cd->params.size() &&
                 (cd->params[pos].modifier == "owned" ||
-                 cd->params[pos].modifier == "out owned")) {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    // §28.8 (#395): reject a borrow flowing into the owned formal.
-                    if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
-                    ++pos; continue;
-                }
-                if (exprIsOwnedFieldRead(*a.value)) {
-                    // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
-                    // into an owned ctor param is a borrow, not a transfer.
-                    checkOwnedArgSource(*a.value, a.value->span.begin);
-                    ++pos; continue;
-                }
-                if (checkOwnedArgOtherBorrow(*a.value)) {
-                    // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` flowing
-                    // into an owned ctor param is a borrow, not a transfer — the
-                    // double-dispose hazard (findings 18, 20). (Bare `this` was
-                    // handled by the identifier branch above.)
-                    ++pos; continue;
-                }
+                 cd->params[pos].modifier == "out owned");
+            const bool ownedSink =
+                ctorOwnedSink || (isSharedNew && pos == 0);
+            // §22.3 (v0.169, #1348): the `owned` marker is only valid on an
+            // argument to an `owned` parameter. On any other ctor position it
+            // is spurious.
+            if (a.modifier == "owned" && !ownedSink) {
+                reportSpuriousOwnedMarker(a.value->span.begin,
+                                          /*onFreshProducer=*/false);
+                recordMovesIn(*a.value);
+                ++pos; continue;
             }
-            // §28.13 / stdlib §2.16 (#603): `new Shared<T>(value)` has an
-            // implicit owned parameter at position 0. Apply the same owned-
-            // argument checks as a user ctor with `owned value: T` would.
-            // per §28.8 / §28.13.
-            if (a.modifier.empty() && isSharedNew && pos == 0) {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
+            if (ownedSink) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                    // §28.8 (#395): a borrow flowing into the owned formal is
+                    // rejected regardless of the marker.
+                    if (checkOwnedArgSource(*a.value, id->span.begin)) {
+                        ++pos; continue;
+                    }
+                    // A valid owned source. §22.3 (v0.169): if it is a NAMED
+                    // OWNED BINDING the call leaves it moved-from, so the marker
+                    // is REQUIRED; a fresh producer (not a bare Owned binding)
+                    // is unmarked and handled by the fall-through below.
+                    if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
+                        reportMissingOwnedMarker(id->name, id->span.begin);
+                    markMovedByName(id->name, id->span.begin);
                     ++pos; continue;
                 }
                 if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): a bare owned-field read is a borrow
+                    // (only `move obj.f` is owned).
                     checkOwnedArgSource(*a.value, a.value->span.begin);
                     ++pos; continue;
                 }
                 if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` borrow.
                     ++pos; continue;
                 }
+                // Fresh producer (`new`, a call returning `owned T`, an operator
+                // result, `move obj.f`). §22.3 (v0.169): the marker is REJECTED
+                // here — no live binding is invalidated.
+                if (a.modifier == "owned")
+                    reportSpuriousOwnedMarker(a.value->span.begin,
+                                              /*onFreshProducer=*/true);
+                recordMovesIn(*a.value);
+                ++pos; continue;
             }
             recordMovesIn(*a.value);
             ++pos;
@@ -194,83 +190,80 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
-        // Slice O14: `owned x` argument modifier consumes x.
-        if (a.modifier == "owned") {
+        // §28.8: is this argument position an owned sink? A user-declared
+        // `owned` formal, or a built-in owning-collection method whose owned
+        // arg sits at this position (#395: built-in methods have no AST decl).
+        // §28.3 / §28.11 (#860): an `out owned` formal is the owned-OUT
+        // direction (the argument RECEIVES ownership, marked Owned post-call by
+        // markOutOwnedArgs) — NOT an owned-IN sink; only a plain `owned` formal
+        // consumes the argument here.
+        const std::vector<ast::Param>* params = nullptr;
+        if (calleeMethod)  params = &calleeMethod->params;
+        if (calleeCtor)    params = &calleeCtor->params;
+        const bool userOwned =
+            params && pos < params->size() &&
+            (*params)[pos].modifier == "owned";
+        const bool ownedSink = userOwned || builtinOwnedSinkArg(callee, pos);
+
+        // §22.3 (v0.169, #1348): the `owned` call-site marker is valid ONLY on
+        // an argument to an `owned` parameter. On any other position it is
+        // spurious (its transfer semantics do not apply — the argument is not
+        // consumed — so treat it as a plain argument after reporting).
+        if (a.modifier == "owned" && !ownedSink) {
+            reportSpuriousOwnedMarker(a.value->span.begin,
+                                      /*onFreshProducer=*/false);
+            recordMovesIn(*a.value);
+            ++pos; continue;
+        }
+        // §28.8 owned-sink argument. The `owned`/`move`/borrow/fresh-producer
+        // classification is exactly the pre-v0.169 one; the call-site `owned`
+        // marker (§22.3, v0.169) is layered on top of the SAME classification.
+        if (ownedSink) {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     a.value.get())) {
-                // §28.8 (#395): the consumed value must be owned, not a borrow.
-                if (!checkOwnedArgSource(*a.value, id->span.begin))
-                    markMovedByName(id->name, id->span.begin);
+                // §28.8 (#395): a borrow flowing into the owned formal is
+                // rejected regardless of the marker.
+                if (checkOwnedArgSource(*a.value, id->span.begin)) {
+                    ++pos; continue;
+                }
+                // A valid owned source. §22.3 (v0.169): a NAMED OWNED BINDING is
+                // left moved-from by the call, so the marker is REQUIRED. (A
+                // fresh producer never reaches here as a bare identifier.)
+                if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
+                    reportMissingOwnedMarker(id->name, id->span.begin);
+                markMovedByName(id->name, id->span.begin);
                 ++pos; continue;
             }
             if (exprIsOwnedFieldRead(*a.value)) {
-                // §28.3 / §28.8.1 (#398): `owned obj.f` of a bare owned-field
-                // read is a borrow (only `move obj.f` is owned).
+                // §28.3 / §28.8.1 (#398): a bare owned-field read is a borrow
+                // (only `move obj.f` is owned).
                 checkOwnedArgSource(*a.value, a.value->span.begin);
                 ++pos; continue;
             }
             if (checkOwnedArgOtherBorrow(*a.value)) {
-                // §28.3 / §28.11 (#407): `owned coll[i]` / `owned obj.f` is a
-                // borrow under an explicit `owned` arg (bare `this` was handled
-                // by the identifier branch above).
+                // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` borrow.
                 ++pos; continue;
             }
-        }
-        // §28.8 implicit ownership transfer: a bare identifier passed
-        // to an `owned` formal parameter transfers ownership without
-        // an explicit `owned` or `move` at the call site. The owned-sink
-        // formal is either a user-declared `owned` param or a built-in
-        // owning-collection method whose owned arg sits at this position
-        // (#395: built-in collection methods have no AST declaration).
-        {
-            const std::vector<ast::Param>* params = nullptr;
-            if (calleeMethod)  params = &calleeMethod->params;
-            if (calleeCtor)    params = &calleeCtor->params;
-            // §28.3 / §28.11 (#860): an `out owned` formal is the owned-OUT
-            // direction — the argument local RECEIVES ownership, it is NOT a
-            // moved-from owned-IN sink. (It is marked Owned post-call by
-            // markOutOwnedArgs.) Only a plain `owned` formal consumes the
-            // argument here; including `out owned` would wrongly mark the
-            // receiving local moved-from.
-            const bool userOwned =
-                params && pos < params->size() &&
-                (*params)[pos].modifier == "owned";
-            const bool ownedSink =
-                userOwned || builtinOwnedSinkArg(callee, pos);
-            if (ownedSink) {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        a.value.get())) {
-                    // §28.8 (#395): reject a borrow flowing into the owned
-                    // formal; otherwise record the implicit move.
-                    if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
-                    ++pos; continue;
-                }
-                if (exprIsOwnedFieldRead(*a.value)) {
-                    // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
-                    // implicitly into an owned sink is a borrow, not a transfer.
-                    checkOwnedArgSource(*a.value, a.value->span.begin);
-                    ++pos; continue;
-                }
-                if (checkOwnedArgOtherBorrow(*a.value)) {
-                    // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` flowing
-                    // implicitly into the owned sink is a borrow (bare `this` was
-                    // handled by the identifier branch above).
-                    ++pos; continue;
-                }
-                // `move id` to an owned formal: `move b` of a borrow is not an
-                // owned value (§28.8/#395). When the source is owned, fall
-                // through to recordMovesIn, which records the legitimate move.
-                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
-                        a.value.get())) {
-                    if (un->op == "move" &&
-                        dynamic_cast<const ast::IdentifierExpr*>(
-                            un->operand.get()) &&
-                        checkOwnedArgSource(*a.value, un->span.begin)) {
-                        ++pos; continue;  // reported; skip the bogus move
-                    }
+            // `move id` to an owned formal: `move b` of a borrow is not an
+            // owned value (§28.8/#395). A legitimate `move` of an owned value
+            // falls through to recordMovesIn, which records the move.
+            if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                    a.value.get())) {
+                if (un->op == "move" &&
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        un->operand.get()) &&
+                    checkOwnedArgSource(*a.value, un->span.begin)) {
+                    ++pos; continue;  // reported; skip the bogus move
                 }
             }
+            // Fresh producer (`new`, a call returning `owned T`, an operator
+            // result, `move obj.f`). §22.3 (v0.169): the marker is REJECTED —
+            // no live binding is invalidated.
+            if (a.modifier == "owned")
+                reportSpuriousOwnedMarker(a.value->span.begin,
+                                          /*onFreshProducer=*/true);
+            recordMovesIn(*a.value);
+            ++pos; continue;
         }
         recordMovesIn(*a.value);
         ++pos;
@@ -451,6 +444,39 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         for (const auto& a : call->args) {
             if (!a.value) { ++pos; continue; }
             bool consumed = false;
+            // §22.3 (v0.169, #1348): call-site `owned` marker validation. This
+            // is SURFACE-ONLY — it does not change which arguments are consumed
+            // (the transfer is modelled by the unchanged logic below); it only
+            // requires/rejects the spelling, reusing the existing named-owned-
+            // binding / borrow classification. An owned-sink position is a user
+            // `owned` formal (isImplicitOwned) or a builtin owned-sink method.
+            const bool ownedSink =
+                isImplicitOwned(call->args, pos, call->callee.get()) ||
+                builtinOwnedSinkArg(call->callee.get(), pos);
+            if (a.modifier == "owned" && !ownedSink) {
+                // Spurious marker on a non-owned parameter position: reject, and
+                // do NOT consume (this position does not take ownership).
+                reportSpuriousOwnedMarker(a.value->span.begin,
+                                          /*onFreshProducer=*/false);
+                checkRead(*a.value, /*selfTarget=*/false);
+                ++pos; continue;
+            }
+            if (ownedSink) {
+                const bool namedBinding = isNamedOwnedBinding(*a.value);
+                if (a.modifier == "owned") {
+                    // Marker present. It is valid on a named owned binding;
+                    // rejected on a fresh producer. A borrow carries its own
+                    // §28.8 diagnostic (checkOwnedArgSource, in the logic below).
+                    if (!namedBinding && !ownedArgSourceIsBorrow(*a.value))
+                        reportSpuriousOwnedMarker(a.value->span.begin,
+                                                  /*onFreshProducer=*/true);
+                } else if (a.modifier.empty() && namedBinding) {
+                    // Missing marker on a named owned binding left moved-from.
+                    const auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+                    reportMissingOwnedMarker(id->name, id->span.begin);
+                }
+            }
             // §28.3 / §28.11 (#860 / #892): an `out owned` arg is a WRITE
             // target — the call deposits an owned value into the local; it does
             // NOT read the local. Skip read-checking it (a stale Disposed state
@@ -516,9 +542,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // a user-declared `owned` param (isImplicitOwned) or a built-in
             // owning-collection owned-sink method (#395, builtinOwnedSinkArg,
             // which has no AST declaration for isImplicitOwned to read).
-            const bool ownedSink =
-                isImplicitOwned(call->args, pos, call->callee.get()) ||
-                builtinOwnedSinkArg(call->callee.get(), pos);
+            // (`ownedSink` was computed above for the §22.3 marker validation.)
             // (A `move id` argument — `coll.Add(move b)` — was already handled
             // by the `move` arm above, which checks the source for every call;
             // it reaches here already consumed. The bare-id form is handled
@@ -685,6 +709,32 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         for (const auto& a : ne->args) {
             if (!a.value) { ++pos; continue; }
             bool consumed = false;
+            // §22.3 (v0.169, #1348): call-site `owned` marker validation for a
+            // constructor call, mirroring the CallExpr path above — surface-only,
+            // the consumption logic below is unchanged. An owned sink here is a
+            // ctor `owned` (or `out owned`) formal.
+            const bool ctorOwnedSink =
+                cd && pos < cd->params.size() &&
+                (cd->params[pos].modifier == "owned" ||
+                 cd->params[pos].modifier == "out owned");
+            if (a.modifier == "owned" && !ctorOwnedSink) {
+                reportSpuriousOwnedMarker(a.value->span.begin,
+                                          /*onFreshProducer=*/false);
+                checkRead(*a.value, /*selfTarget=*/false);
+                ++pos; continue;
+            }
+            if (ctorOwnedSink) {
+                const bool namedBinding = isNamedOwnedBinding(*a.value);
+                if (a.modifier == "owned") {
+                    if (!namedBinding && !ownedArgSourceIsBorrow(*a.value))
+                        reportSpuriousOwnedMarker(a.value->span.begin,
+                                                  /*onFreshProducer=*/true);
+                } else if (a.modifier.empty() && namedBinding) {
+                    const auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+                    reportMissingOwnedMarker(id->name, id->span.begin);
+                }
+            }
             if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
                     // §28.8 (#395): an `owned`-modified arg must be owned.
@@ -2475,6 +2525,47 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     // check skips a parameter the body moves out on some path.
     for (auto& [s, stt] : states_)
         if (s->name == name) { everDischarged_.insert(s); break; }
+}
+
+// §22.3 (v0.169, #1348): see the header. A named owned binding is exactly the
+// argument form whose transfer into an `owned` sink leaves a LIVE binding
+// moved-from — the case the call-site `owned` marker announces. We piggy-back
+// on the existing moved-from state machine: a tracked local/parameter in the
+// Owned state IS such a binding. Anything that is not a tracked Owned binding
+// (a fresh `new`/call/operator producer, a `move obj.f`, a borrow, `this`, or a
+// binding already moved/disposed) is not, so the marker is neither required nor
+// (for the not-owned states) meaningfully transferable here.
+bool MethodOwnership::isNamedOwnedBinding(const ast::Expr& e) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return false;
+    if (id->name == "this" || id->name == "base") return false;
+    const LocalOwnership* st = lookupState(id->name);
+    return st && st->state == OwnershipState::Owned;
+}
+
+void MethodOwnership::reportMissingOwnedMarker(std::string_view name,
+                                               SourceLocation loc) {
+    report(Severity::Error, loc,
+           std::string("this call consumes `") + std::string(name) +
+               "`; write `M(owned " + std::string(name) +
+               ")` — passing the named owned binding `" + std::string(name) +
+               "` to an `owned` parameter transfers ownership and leaves it "
+               "moved-from, which the call site must announce (§22.3, v0.169)");
+}
+
+void MethodOwnership::reportSpuriousOwnedMarker(SourceLocation loc,
+                                                bool onFreshProducer) {
+    if (onFreshProducer)
+        report(Severity::Error, loc,
+               "the `owned` call-site marker is not written on a fresh producer "
+               "(a `new` expression, a call returning `owned T`, an operator "
+               "result, or `move obj.f`) — no live binding is invalidated, so "
+               "there is nothing to announce; remove `owned` (§22.3, v0.169)");
+    else
+        report(Severity::Error, loc,
+               "the `owned` call-site marker is only valid on an argument to an "
+               "`owned` parameter; this parameter position does not take "
+               "ownership — remove `owned` (§22.3, v0.169)");
 }
 
 // §28.8.1, #897 #898: the field analogue of markMovedByName. Mirrors the

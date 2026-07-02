@@ -275,10 +275,10 @@ const char* kConsumingArgTransfersThenThrow =
     "end Sink; "
     "class C "
     "  public static method Take(owned c: Cell) "
-    "    using var s := new Sink(c); "
+    "    using var s := new Sink(owned c); "  // §22.3 v0.169: named owned binding
     "  end Take; "
     "  public static method Test(owned a: Cell) "
-    "    C.Take(a); "
+    "    C.Take(owned a); "  // §22.3 v0.169: named owned binding transfers
     "    throw new AppErr(); "
     "  end Test; "
     "  public static method Main(): int "

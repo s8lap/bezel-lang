@@ -50,9 +50,9 @@ BEZEL_TEST(using_var_reassign_830, shared_reassign_rejected) {
         "  destructor Inner.n := Inner.n + 1; end destructor; end Inner; "
         "class C public static method Fill() "
         "  var i1 := new Inner(); "
-        "  using var h1 := new Shared<Inner>(i1); "
+        "  using var h1 := new Shared<Inner>(owned i1); "
         "  var i2 := new Inner(); "
-        "  using var h2 := new Shared<Inner>(i2); "
+        "  using var h2 := new Shared<Inner>(owned i2); "
         "  h1 := h2.Clone(); "
         "end Fill; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());

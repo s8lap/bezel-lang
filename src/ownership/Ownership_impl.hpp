@@ -708,6 +708,28 @@ private:
 
     void markMovedByName(std::string_view name, SourceLocation loc);
 
+    // §22.3 (v0.169, #1348): true when `e` is a NAMED OWNED BINDING — a bare
+    // identifier (other than `this`/`base`) resolving to a tracked owned local
+    // or `owned` parameter currently in the Owned state, so passing it into an
+    // `owned` sink leaves the binding moved-from. This is the SOLE argument
+    // form on which the call-site `owned` marker (`M(owned x)`) is REQUIRED;
+    // every other owned-value form (a `new` expression, a call returning
+    // `owned T`, an operator result, a `move obj.f`) is a *fresh producer* that
+    // invalidates no live binding and stays unmarked. Reuses the existing
+    // moved-from state tracking rather than re-classifying the expression.
+    bool isNamedOwnedBinding(const ast::Expr& e);
+
+    // §22.3 (v0.169, #1348): report the "missing marker" error — a named owned
+    // binding `name` is being transferred into an `owned` sink without the
+    // required call-site `owned` marker. Emits the spec-stated fix-it.
+    void reportMissingOwnedMarker(std::string_view name, SourceLocation loc);
+
+    // §22.3 (v0.169, #1348): report a "spurious marker" error — an `owned`
+    // call-site marker written where it is rejected. `onFreshProducer` selects
+    // the fresh-producer wording (`new`/owned-returning call/operator/`move
+    // obj.f`); otherwise the non-`owned`-parameter-position wording.
+    void reportSpuriousOwnedMarker(SourceLocation loc, bool onFreshProducer);
+
     // §28.8.1 (#897 #898): record a `move this.field` / `move _field` (qualified
     // OR bare owned-field move). This is the field analogue of markMovedByName
     // for locals: BEFORE marking the field moved-from, it CHECKS the current

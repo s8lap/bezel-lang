@@ -70,14 +70,16 @@ BEZEL_TEST(owned_sink, add_move_owned_local_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3: a bare owned local in owned-consuming position is the implicit
-// move. `s.Add(x)` with `x` owned transfers ownership (x → moved-from).
-BEZEL_TEST(owned_sink, add_bare_owned_local_accepted) {
+// §22.3 (v0.169, #1348): a NAMED OWNED BINDING (owned local) in an owned-
+// consuming position requires the call-site `owned` marker — `s.Add(owned x)`
+// transfers ownership (x → moved-from) and the marker announces it. (The bare
+// `s.Add(x)` form is now rejected; see marker_transfer_test.cpp.)
+BEZEL_TEST(owned_sink, add_marked_owned_local_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
         "  public method M(s: Sink) "
         "    var x := new T(); "
-        "    s.Add(x); "
+        "    s.Add(owned x); "
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -311,7 +313,7 @@ BEZEL_TEST(owned_sink, task_whenallowned_consumes_owned_array_1121) {
         "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
         "    var tasks := new OwningArray<OwningTask<Res>>(); "
         "    tasks.Add(Make(3)); "
-        "    using var wt := Task.WhenAllOwned<Res>(tasks); "
+        "    using var wt := Task.WhenAllOwned<Res>(owned tasks); "  // §22.3 v0.169
         "    return await wt; "
         "  end LoadAll; "
         "  public static method Main(): int => 0; "

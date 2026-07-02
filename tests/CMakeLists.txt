@@ -922,6 +922,7 @@ set(BEZEL_TEST_SOURCES
     ownership/catch_escape_test.cpp
     ownership/out_owned_discharge_test.cpp
     ownership/owned_sink_test.cpp
+    ownership/owned_marker_transfer_test.cpp
     ownership/owned_field_sink_test.cpp
     ownership/owned_sink_sources_test.cpp
     ownership/inline_owned_array_slot_sink_780_test.cpp
