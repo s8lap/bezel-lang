@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.164 — July 2026**
+**Companion to the Bezel Language Specification, v0.165 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -43,6 +43,9 @@ This document is normative for the names, signatures, and observable behavior li
 ---
 
 <a id="sec-system-auto-imported"></a>
+
+**Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`, `AsAsciiByteSpan`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces' missing `I-` prefix is resolved by the pending family rename (#1372's train).
+
 ## 2. `System` (auto-imported)
 
 <a id="sec-console"></a>
@@ -58,6 +61,9 @@ public static class Console
   public static method WriteLine();
   public static method WriteLine(value: string);
   public static method WriteLine(value: Object);
+  // v0.165 (#1355): per-type Write/WriteLine overloads for bool and the numeric
+  // primitives (same shape as StringBuilder.Append §3.1) — behavior =
+  // Write(value.ToString()); no Object boxing on the path. TextWriter (§7.4) mirrors them.
 
   // Input
   public static method ReadLine(): string?;     // null at EOF
@@ -149,11 +155,20 @@ public static class Convert
   public static method ToBoolean(value: string): bool;
 
   public static method TryToInt32(value: string, out result: int): bool;
-  // ... corresponding Try forms
+  public static method TryToInt32(value: string, out result: int): bool;      // v0.165: elision expanded
+  public static method TryToInt64(value: string, out result: long): bool;
+  public static method TryToDouble(value: string, out result: double): bool;
+  public static method TryToDecimal(value: string, out result: decimal): bool;
+  public static method TryToBoolean(value: string, out result: bool): bool;
 
   public static method ToString(value: int): string;
   public static method ToString(value: int, radix: int): string;   // 2, 8, 10, 16
-  // ... corresponding ToString forms for other primitives
+  public static method ToString(value: long): string;                          // v0.165: elision expanded
+  public static method ToString(value: double): string;
+  public static method ToString(value: decimal): string;
+  public static method ToString(value: bool): string;
+  public static method ToString(value: int, toBase: int): string;              // bases 2, 8, 10, 16
+  public static method ToString(value: long, toBase: int): string;
 end Convert;
 ```
 
@@ -189,7 +204,18 @@ end Environment;
 Value types for representing points in time and durations. All are records.
 
 ```bezel
-public record DateTime
+public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
+  // v0.165 (#1357): ordering + construction. CompareTo = tick order (Kind not
+  // normalized, matching .NET); the <,>,<=,>= operator group agrees with CompareTo.
+  public constructor(year: int, month: int, day: int);
+  public constructor(year: int, month: int, day: int, hour: int, minute: int, second: int,
+                     millisecond: int := 0, kind: DateTimeKind := DateTimeKind.Unspecified);
+                              // ArgumentOutOfRangeException on invalid components
+  public method CompareTo(other: DateTime): int;
+  public readonly property Ticks: long;
+  public static method FromTicks(ticks: long, kind: DateTimeKind := DateTimeKind.Unspecified): DateTime;
+  public method ToUnixTimeSeconds(): long;
+  public static method FromUnixTimeSeconds(seconds: long): DateTime;
   public readonly property Year: int;
   public readonly property Month: int;        // 1..12
   public readonly property Day: int;          // 1..31
@@ -244,7 +270,11 @@ public enum DateTimeKind: byte
   Unspecified, Utc, Local;
 end DateTimeKind;
 
-public record TimeSpan
+public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
+  // v0.165 (#1357): CompareTo = tick order; operator group agrees.
+  public method CompareTo(other: TimeSpan): int;
+  public readonly property Ticks: long;
+  public static method FromTicks(ticks: long): TimeSpan;
   public readonly property Days: int;
   public readonly property Hours: int;             // -23..23
   public readonly property Minutes: int;           // -59..59
@@ -268,7 +298,35 @@ public record TimeSpan
 end TimeSpan;
 ```
 
-`DateOnly` and `TimeOnly` are similar value records carrying only the date or time components, respectively.
+`DateOnly` and `TimeOnly` (v0.165, #1357 — explicit surfaces replacing the previous one-liner):
+
+```bezel
+public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>
+  public constructor(year: int, month: int, day: int);   // ArgumentOutOfRangeException on invalid
+  public readonly property Year: int;
+  public readonly property Month: int;
+  public readonly property Day: int;
+  public method CompareTo(other: DateOnly): int;          // chronological; operator group agrees
+  public method ToDateTime(time: TimeOnly): DateTime;     // Kind = Unspecified
+  public static method Parse(s: string): DateOnly;        // FormatException on invalid
+  public static method TryParse(s: string, out result: DateOnly): bool;
+  public method ToString(): string;                       // "yyyy-MM-dd"
+end DateOnly;
+
+public record TimeOnly: IComparable<TimeOnly>, IEquatable<TimeOnly>
+  public constructor(hour: int, minute: int, second: int := 0, millisecond: int := 0);
+  public readonly property Hour: int;
+  public readonly property Minute: int;
+  public readonly property Second: int;
+  public readonly property Millisecond: int;
+  public method CompareTo(other: TimeOnly): int;
+  public static method Parse(s: string): TimeOnly;
+  public static method TryParse(s: string, out result: TimeOnly): bool;
+  public method ToString(): string;                       // "HH:mm:ss"
+end TimeOnly;
+```
+
+`DateTime.Date: DateOnly` and `DateTime.TimeOfDay: TimeOnly` accessors decompose a `DateTime`.
 
 The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` (e.g. `2024-03-15T00:00:00`); it is the value also used when a `DateTime` is interpolated into a string with no format specifier. `ToString(format)` selects an explicit format.
 
@@ -278,7 +336,12 @@ The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 860
 A 128-bit globally unique identifier.
 
 ```bezel
-public record Guid
+public record Guid: IComparable<Guid>, IEquatable<Guid>
+  // v0.165 (#1357): CompareTo = lexicographic over the 16 canonical big-endian
+  // bytes (stated explicitly — .NET's field-group order is a known trap);
+  // operator group agrees.
+  public method CompareTo(other: Guid): int;
+  public static method FromByteArray(bytes: Array<byte>): Guid;   // borrows; requires Length = 16, ArgumentException otherwise
   public static readonly property Empty: Guid;
 
   public static method NewGuid(): Guid;
@@ -306,7 +369,7 @@ public class Random
   public method Next(): int;                    // 0..int.MaxValue
   public method Next(maxValue: int): int;       // 0..<maxValue
   public method Next(minValue: int, maxValue: int): int;
-  public method NextLong(): long;
+  public method NextInt64(): long;
   public method NextDouble(): double;           // [0.0, 1.0)
   public method NextBytes(buffer: Array<byte>);
   public method NextBoolean(): bool;
@@ -681,7 +744,9 @@ public class JsonSerializer: ISerializer, IDisposable
 end JsonSerializer;
 
 public class JsonDeserializer: IDeserializer, IDisposable
-  public constructor(input: ReadOnlySpan<byte>);      // UTF-8 JSON
+  public constructor(input: ReadOnlySpan<byte>);
+  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+                                                          //   borrowed identically for the deserializer's lifetime      // UTF-8 JSON
   public constructor(input: string);                  // convenience
   public constructor(input: ReadOnlySpan<byte>, options: JsonOptions);
   // IDeserializer surface (§2.14) implemented for JSON text.
@@ -704,7 +769,9 @@ public class BinarySerializer: ISerializer, IDisposable
 end BinarySerializer;
 
 public class BinaryDeserializer: IDeserializer, IDisposable
-  public constructor(input: ReadOnlySpan<byte>);                     // strict
+  public constructor(input: ReadOnlySpan<byte>);
+  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+                                                          //   borrowed identically for the deserializer's lifetime                     // strict
   public constructor(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool);
   // IDeserializer surface (§2.14) implemented for the compact binary format.
 end BinaryDeserializer;
@@ -815,6 +882,10 @@ public class StringBuilder
   public method Append(value: string): StringBuilder;
   public method Append(value: char): StringBuilder;
   public method Append(value: Object): StringBuilder;
+  // v0.165 (#1355): per-type overloads for bool and the numeric primitives —
+  // observable behavior = Append(value.ToString()); no Object boxing on the path.
+  public method Append(value: bool): StringBuilder;
+  public method Append(value: int): StringBuilder;      // + byte/sbyte/short/ushort/uint/long/ulong/float/double/decimal, same shape
   public method AppendLine(): StringBuilder;
   public method AppendLine(value: string): StringBuilder;
   public method AppendFormat(format: string, args: Array<Object>): StringBuilder;
@@ -838,6 +909,10 @@ public abstract class Encoding
   public abstract method GetBytes(s: string): owned Array<byte>;
   public abstract method GetString(bytes: Array<byte>): string;
   public abstract method GetString(bytes: Array<byte>, index: int, count: int): string;
+                              // window over Count; IndexOutOfRangeException out of range (v0.165)
+  public abstract method GetByteCount(s: string): int;                       // v0.165 (#1355)
+  public abstract method GetBytes(s: string, destination: Span<byte>): int;  // v0.165: returns bytes written;
+                                                                             //   IndexOutOfRangeException if too short
   public abstract readonly property Name: string;
 
   public static readonly property UTF8: Encoding;
@@ -1069,7 +1144,7 @@ The two owning-collection interfaces. They extend the borrowing read-only interf
 
 The mutating methods take `owned` parameters where appropriate: `Add` and `Insert` take ownership of the new element; the indexer setter takes ownership and disposes the previous slot value. Read-side methods (`Contains`, the indexer getter, iteration through the read-only-collection ancestor) produce borrows.
 
-The `where T: class` constraint expresses that owning collections are primarily meaningful for class-typed elements, which carry a disposal obligation. The constraint admits more than the implementation enforces, and the language spec ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)) narrows it precisely: the owning collection types **reject only the runtime-managed reference element types** — `string` and function values — which are reclaimed automatically and have no disposal obligation, so owning them would be actively wrong. Value-typed elements are **admitted**: `OwnedArray<int>` and `OwnedArray<MyRecord>` compile (the element carries no disposal obligation, so the collection's `Dispose` just frees its backing — degenerate but harmless), while `OwnedArray<string>` and an owning collection of a function type are compile errors at the instantiation site. Code that wants a borrowing collection uses the unprefixed name (`Array<…>`) instead.
+The `where T: class` constraint expresses that owning collections are meaningful only for elements carrying a disposal obligation, and the language spec ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)) states the enforced rule: element types are **class and interface types** (nullable-underlying admitted). **Value-typed elements are rejected at the instantiation site** (v0.165, resolving a three-way documentation contradiction in the class-only direction the v0.102 decision records — this paragraph briefly claimed otherwise): a value element has no disposal obligation, so `OwnedArray<int>` says nothing `Array<int>` doesn't; use `Array<T>` or `OwnedBuffer<T>` for value elements. Runtime-managed reference types (`string`, function values) are likewise rejected. Code that wants a borrowing collection uses the unprefixed name (`Array<…>`).
 
 <a id="sec-borrowing-and-owning-collections-relate-via-iiterator-interfaces"></a>
 <a id="sec-how-the-borrowing-and-owning-hierarchies-relate"></a>
@@ -1101,7 +1176,8 @@ Borrowing resizable array. Stores references that the caller continues to own (o
 ```bezel
 public class Array<T>: IList<T>
   public constructor();
-  public constructor(capacity: int);
+  public constructor(capacity: int);                     // empty (Count = 0), storage reserved
+  public constructor(size: int, fill: T);                // Count = size, every slot = fill (v0.165, #1375)
 
   public readonly property Count: int;
   public readonly property Capacity: int;
@@ -1416,8 +1492,8 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
   public readonly property Count: int;
-  public readonly property Keys: ICollection<K>;
-  public readonly property Values: ICollection<V>;
+  public readonly property Keys: IReadOnlyCollection<K>;      // v0.165 (#1354): read-only views, matching §4.9
+  public readonly property Values: IReadOnlyCollection<V>;
 
   public property [key: K]: V;
 
@@ -1728,7 +1804,7 @@ A `Set<T>` may be constructed with a sequence literal (language spec [§15.4](Be
 LIFO and FIFO collections.
 
 ```bezel
-public class Stack<T>: ICollection<T>
+public class Stack<T>: IReadOnlyCollection<T>   // v0.165 (#1354): the v0.94 owned-twin fix applied here too; Contains stays via the explicit member
   public constructor();
   public method Push(item: T);
   public method Pop(): T;             // raises if empty
@@ -1748,11 +1824,12 @@ public class OwnedStack<T>: IOwnedCollection<T> where T: class
   public method Drain(): OwnedEnumerable<T>;
 end OwnedStack;
 
-public class Queue<T>: ICollection<T>
+public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public constructor();
   public method Enqueue(item: T);
   public method Dequeue(): T;
   public method Peek(): T;
+  public method Contains(item: T): bool;        // explicit (v0.165)
   public method TryDequeue(out item: T): bool;
   public method TryPeek(out item: T): bool;
 end Queue;
@@ -2331,6 +2408,8 @@ Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start,
 
 `ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwnedBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwnedBuffer<T>` owns its slots for class T, while `Array<T>` borrows them.
 
+**Byte-buffer accessors (v0.165, #1358):** the §4.14 endianness-aware extension family is mirrored onto this family — all `Read*{Little,Big}Endian`/`TryRead*` forms on `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>`, and the `Write*`/`TryWrite*` forms on `ArraySpan<byte>`, with identical semantics (no offset parameters; slice first). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy.
+
 <a id="sec-arrayspant"></a>
 #### `ArraySpan<T>`
 
@@ -2504,7 +2583,7 @@ Authors of performance-sensitive APIs typically provide the concrete-type signat
 A comparison-ordered associative collection: iteration visits entries in ascending key order. The borrowing/non-owning counterpart of `Dictionary<K, V>` ([§4.8](#sec-dictionaryk-v)) with an ordering guarantee.
 
 ```bezel
-public class SortedDictionary<K, V>: IDisposable where K: IComparable<K>
+public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>>, IDisposable where K: IComparable<K>   // conformance added v0.165 (#1354): makes for-in/LINQ legal per spec §29
   public constructor();
 
   public readonly property Count: int;
@@ -2512,7 +2591,7 @@ public class SortedDictionary<K, V>: IDisposable where K: IComparable<K>
   public property [key: K]: V;                  // get: KeyNotFoundException if absent
                                                 // set: insert or replace
   public method ContainsKey(key: K): bool;
-  public method TryGetValue(key: K, out value: V?): bool;
+  public method TryGetValue(key: K, out value: V): bool;   // v0.165 (#1354): out V, matching §4.8 (the v0.77 recorded shape)
   public method Remove(key: K): bool;           // false if absent
   public method Clear();
 
@@ -2531,12 +2610,13 @@ Value semantics match `Dictionary<K, V>`: values are copied in and out for value
 A comparison-ordered set: membership by `CompareTo`-equality, iteration in ascending order.
 
 ```bezel
-public class SortedSet<T>: IDisposable where T: IComparable<T>
+public class SortedSet<T>: IReadOnlyCollection<T>, IDisposable where T: IComparable<T>   // conformance added v0.165 (#1354)
   public constructor();
 
   public readonly property Count: int;
 
-  public method Add(item: T): bool;             // false if an equal item is present
+  public method Add(item: T);                   // v0.165 (#1354): unit-returning, matching §4.10's convention
+  public method TryAdd(item: T): bool;          // false if an equal item is present
   public method Contains(item: T): bool;
   public method Remove(item: T): bool;          // false if absent
   public method Clear();
@@ -2554,6 +2634,8 @@ The same single-order rule, complexity guarantees (point ops O(log n), in-order 
 ## 5. `System.Collections.Linq`
 
 LINQ-style extension methods on `IEnumerable<T>`. All are lazy unless documented otherwise. A lazy query produced by these operators is **single-consumption** — it may be enumerated at most once (a re-enumeration is a compile error, or `InvalidOperationException` where only dynamically reachable); call `ToArray()` to materialize an owned, re-enumerable `Array<T>`. See language spec [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration).
+
+A bound lazy query is single-consumption with the normative consumption-point list of spec §29.11 (enumeration/terminal, composing a further operator, passing as `IEnumerable<T>`); inside a callee a plain `IEnumerable<T>` parameter is statically untracked and guarded at runtime.
 
 ```bezel
 public extension IEnumerable<T>
@@ -3227,6 +3309,10 @@ public abstract class Stream
 
   public abstract method Read(buffer: Array<byte>, offset: int, count: int): int;
   public abstract method Write(buffer: Array<byte>, offset: int, count: int);
+  public method Read(buffer: Span<byte>): int;             // v0.165: span carries its own range
+  public method Write(buffer: ReadOnlySpan<byte>);          //   (§4.14 convention: slice first)
+  public async method ReadAsync(buffer: Span<byte>, token: CancellationToken := CancellationToken.None): Task<int>;
+  public async method WriteAsync(buffer: ReadOnlySpan<byte>, token: CancellationToken := CancellationToken.None): Task;
   public abstract method Flush();
 
   public abstract method Seek(offset: long, origin: SeekOrigin): long;
@@ -3242,6 +3328,9 @@ public abstract class Stream
   public method ReadAll(): owned Array<byte>;            // reads from current position to end
   public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Array<byte>>;
 end Stream;
+
+
+**Windowed-form contract (v0.165, #1375):** in `Read`/`Write(buffer, offset, count)` the window `[offset, offset+count)` ranges over the buffer's **`Count`** (like every other bounds rule in this library); out-of-range raises `IndexOutOfRangeException`. `Read` writes into *existing* elements and never grows the array — the canonical read loop allocates its buffer with the sized constructor (`new Array<byte>(64 * 1024, 0)`, §4.4) and passes `count := buffer.Count`. The span overloads carry their range in the value and are the preferred forms.
 
 public enum SeekOrigin: byte
   Begin, Current, End;
@@ -3279,6 +3368,7 @@ public static class File
   public static method WriteAllText(path: string, contents: string);
   public static method ReadAllBytes(path: string): owned Array<byte>;
   public static method WriteAllBytes(path: string, contents: Array<byte>);
+  public static method WriteAllBytes(path: string, contents: ReadOnlySpan<byte>);   // v0.165 (#1358): serializer-output path, zero-copy
   public static method ReadAllLines(path: string): owned Array<string>;
   public static method WriteAllLines(path: string, lines: IEnumerable<string>);
 
@@ -3315,7 +3405,29 @@ public abstract class TextWriter
 end TextWriter;
 ```
 
-`Directory` and `Path` are static utility classes following established conventions; full signatures are omitted here.
+`Directory` and `Path` (v0.165, #1356 — the previous elision is replaced by the surface the compiler already implements):
+
+```bezel
+public static class Directory
+  public static method Exists(path: string): bool;
+  public static method CreateDirectory(path: string);
+  public static method Delete(path: string);                       // IOException if non-empty
+  public static method Delete(path: string, recursive: bool);
+  public static method GetFiles(path: string): owned Array<string>;
+  public static method GetDirectories(path: string): owned Array<string>;
+end Directory;
+
+public static class Path
+  public static method Combine(a: string, b: string): string;
+  public static method GetFileName(path: string): string;
+  public static method GetExtension(path: string): string;         // "" when none
+  public static method GetFileNameWithoutExtension(path: string): string;
+  public static method GetDirectoryName(path: string): string;
+  public static method GetFullPath(path: string): string;
+end Path;
+```
+
+Failures raise the §7.5 IO exception types (`IOException`, `FileNotFoundException`).
 
 <a id="sec-io-exception-types"></a>
 ### 7.5 IO exception types

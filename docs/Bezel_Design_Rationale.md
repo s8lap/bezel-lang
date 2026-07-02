@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.164 — July 2026**
+**Companion to the Bezel Language Specification, v0.165 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1277,6 +1277,11 @@ PEP 393 hides the choice in the runtime. The user model is "string is a sequence
 `char` remains 32 bits — the right type for a code point. `s.IsAscii` gives FFI and IO a runtime predicate to skip encoding work for the dominant case. The char-level non-allocating substring view landed in v0.104 as `ReadOnlyStringSpan` (stdlib [§3.3](Bezel_Standard_Library.md#sec-readonlystringspan)) — a record carrying a borrow of the string. The byte-level view from ASCII strings landed in v0.106 as `ReadOnlyAsciiByteSpan` (stdlib [§3.4](Bezel_Standard_Library.md#sec-readonlyasciibytespan)) — a parallel record using the same borrow-of-string mechanism, with construction validated by an ASCII check. ASCII strings are now first-class for both char-level parsing and byte-level FFI/IO without per-call allocation. See rationale [§5.15](#sec-owned-buffers-and-spans) for the full design story.
 
 <a id="sec-ffi"></a>
+<a id="sec-convert-is-a-familiarity-alias"></a>
+### 15.x `Convert` is a familiarity alias (ruled 2026-07, #1356)
+
+`Convert`'s string↔primitive members exactly duplicate the §9 primitive `Parse`/`TryParse`/`ToString` members. Ruled: **kept, explicitly as a C#-familiarity alias** — the duplication is documented rather than deleted (deleting would break arriving muscle memory for zero space savings), and `Convert` gains no cross-primitive conversion role: value conversion is the §5.2 checked cast, bit reinterpretation is `BitConverter.Reinterpret` (the recorded split), and `Convert` stays a thin naming veneer over Parse/ToString.
+
 ## 16. FFI
 
 <a id="sec-hand-written-declarations-not-bindgen"></a>
@@ -7398,6 +7403,24 @@ v0.164 is the **module-system revision** — §2 grows from ~70 lines to a real 
 
 #### Migration
 Additive except the collision rule, which turns silent first-import-wins behavior (where an implementation had any) into an explicit ambiguity error. Compiler alignment (alias parse, ambiguity diagnostic, §2.7 order, SCC build mode) is a wave-5 lane with probe-first discipline — the implementation's current behavior for each corner is measured before changing it.
+
+<a id="sec-v0-164-to-v0-165-changelog"></a>
+### v0.165 changelog (v0.164 → v0.165)
+
+v0.165 is the **standard-library rules revision** — the review's stdlib findings land as one batch. (Issues: #1327, #1342, #1353, #1354, #1355, #1356, #1357, #1358, #1359, #1375.)
+
+- **Owning-collection elements are class/interface only** (#1327): the three-way contradiction resolved in the v0.102-recorded direction; stdlib §4.2 rewritten, spec §14.4's "proper class types" phrase corrected; value-typed elements rejected at instantiation.
+- **Stream read contract** (#1375): `Array<T>` gains the sized constructor `(size, fill)`; the windowed Read/Write forms range over `Count` (never grow); span-taking Read/Write/Async overloads added (#1355) as the preferred forms — the canonical read loop is finally writable.
+- **Byte-worlds bridges** (#1358): deserializers accept `ReadOnlyArraySpan<byte>`; the endianness accessors are mirrored onto the Array-span family; `File.WriteAllBytes` takes `ReadOnlySpan<byte>` — file→parse and serialize→file are zero-copy.
+- **Inline arrays join the ecosystem** (#1342): intrinsic `ToArray(): owned Array<T>` and `Contains` (making `x in arr` work through §17.5) — §15.1.2/§17.5 rewritten.
+- **Lazy-query consumption points** (#1353): the normative three-point list (enumerate/terminal, compose, pass-as-IEnumerable) with the untracked-callee honesty note; no Query<T> head type (declined — it would break the §5 surface and re-erase at the upcast).
+- **Collection-family consistency** (#1354): SortedDictionary/SortedSet gain their IReadOnlyCollection conformance (making documented iteration legal); SortedDictionary.TryGetValue takes `out V`; SortedSet gets Add/TryAdd per the §4.10 convention; Dictionary Keys/Values become read-only views; borrowing Stack/Queue retype to IReadOnlyCollection with explicit Contains. The hash-vs-sorted comparer split and the literal duplicate policies are kept and recorded (rationale).
+- **Directory/Path/Convert normativity** (#1356): full surfaces enumerated; the Convert elisions expanded; Convert ruled a kept familiarity alias (rationale §15.x) with no cross-primitive role.
+- **Temporal ordering and construction** (#1357): DateTime/TimeSpan/DateOnly/TimeOnly/Guid gain IComparable/IEquatable with stated CompareTo semantics (ticks; Guid = canonical-byte lexicographic — the .NET trap called out), component constructors, Ticks/FromTicks, Unix conversions, Guid.FromByteArray, and full DateOnly/TimeOnly declarations.
+- **Naming conventions recorded** (#1359): acronym/width rules stated (IEEERemainder and IeeeEquals both correct under one rule); Random.NextLong → **NextInt64**; the enumeration-interface I-prefix resolves in #1372's rename train.
+
+#### Migration
+Tightenings: value-element owning collections (`OwnedArray<int>`) become instantiation errors — use `Array<T>`/`OwnedBuffer<T>`; SortedSet.Add's bool form becomes TryAdd. Everything else is additive or a documented alias. Compiler alignment is the wave-5 stdlib lane (instantiation check + ~8 test migrations, intrinsics, retypes, new members).
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)
