@@ -124,6 +124,17 @@ compiles: `~/.config/ccache/ccache.conf` must contain
 `sloppiness = pch_defines,time_macros` (without it every PCH build is a cache
 miss — slower, never incorrect).
 
+**Concurrency discipline (32 GiB box, parallel dev agents).** Run every full
+build and every full suite through `scripts/dev_heavy.sh {build|suite} <cmd>`:
+it serializes heavy ops across agents via a global lock (one -j16 build at a
+time beats two thrashing ones), cages memory (12G/8G), and runs at background
+CPU/IO weight so the interactive session stays responsive. Small probe
+compiles/runs use `dev_heavy.sh probe <cmd>` (cage only, no lock). Scratch
+artifacts (probe binaries, big logs, scratch build trees) go in
+`/var/tmp/bezel-scratch` — never `/tmp`, which is tmpfs (RAM): a scratch build
+tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
+80G (a full 40G cache thrashes under multi-worktree churn).
+
 ## When in doubt
 
 The project's overall discipline is: ship the part that fits cleanly now, decline-with-reasons the part that fights the foundations, keep adjacent open questions explicitly scoped. If you're not sure whether a given piece of work fits cleanly: stop, open an issue, describe what you're trying to do and what's giving you pause. The project has reached its current state by catching defects early and recording decisions with reasoning. That discipline continues to apply.
