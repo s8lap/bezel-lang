@@ -121,6 +121,12 @@ Adopted v0.166 (#1370). Through v0.165 nothing separated the scrutinee from the 
 
 `of` supplies the boundary explicitly: `case score of 90..100 => …`. The scrutinee becomes a full `Expression` with no restriction; the leading-pattern-token ambiguity vanishes by construction rather than by precedence surgery; and the spelling is the language's declared §3 Pascal heritage verbatim (`case x of` is Pascal's form). One extra keyword-token per case was weighed against the removed restriction, the removed parens rule, and the removed parser delicacy, and judged the better trade at every scale of program. `when` (the scrutinee-less sibling) takes no delimiter — there is nothing to delimit. Alternatives declined: a colon (`case x:`) reads as a type annotation; a mandatory newline resurrects layout-sensitivity, which #744 deliberately removed from this construct family.
 
+### 3.8 Pattern alternatives are spelled `|`
+
+Adopted v0.167 (#1371). Through v0.166 the comma did triple duty in pattern context — arm separator, alternative separator (`1, 2 => "low"`), and positional-slot separator — disambiguated only by scanning ahead for `=>`. Three consequences followed: alternatives had to be banned inside positional destructure slots (the #1300 fix), `catch` grew its own comma-based multi-type list that read differently from case alternatives (#1341), and every tool that parses patterns needed the lookahead.
+
+`|` gives alternatives their own spelling: `1 | 2 => "low"`, `FormatException | OverflowException => …`, and — newly expressible — the per-slot form `TwoColor(Color.Red | Color.Blue, var x)`. The comma now means exactly one thing in pattern context; the `=>` lookahead is gone; case and catch share one alternatives syntax; and the spelling matches the Rust/Scala/Python-`match` precedent readers already know. The bitwise-or collision is dissolved structurally rather than by rule: the only expression positions inside patterns (relational operands, range bounds) parse below `|`'s precedence level, and the scrutinee is `of`-delimited (§3.7), so a pattern-level `|` is always the separator. Alternative members remain constants-only in case patterns (a type member stays a compile error; grouped type tests are separate arms) — the v0.144-era reasoning that constant-vs-type alternatives have different exhaustiveness and binding semantics is unchanged by the respelling.
+
 <a id="sec-memory-management"></a>
 ## 4. Memory management
 
@@ -894,7 +900,7 @@ try
   DoWork();
 catch
   var ex: TimeoutException => RetryWithBackoff(ex),
-  var ex: IOException, NetworkException => Retry(ex),
+  var ex: IOException | NetworkException => Retry(ex),
   InvalidOperationException => RecordInvalidState(),
   var ex: Exception => throw                 // re-raise unrecognized
 end;
@@ -931,7 +937,7 @@ The old syntax forced each exception type into its own `catch` clause. To handle
 
 ```bezel
 catch
-  var ex: IOException, TimeoutException => Retry()
+  var ex: IOException | TimeoutException => Retry()
 end;
 ```
 
@@ -7471,6 +7477,20 @@ v0.166 is the **case-of revision** — the first of the review's breaking-syntax
 #### Migration
 
 Breaking but purely mechanical: insert `of` after every `case` scrutinee. Previously-mandatory parens around additive/bitwise/range scrutinies may be dropped (they remain legal). The conformance corpus and the project's own test/example sources are migrated with this revision's compiler train.
+
+<a id="sec-v0-166-to-v0-167-changelog"></a>
+### v0.167 changelog (v0.166 → v0.167)
+
+v0.167 is the **pattern-alternatives revision** — the second breaking-syntax adoption from the review (#1371).
+
+- **Alternatives are `|`-separated** (§19.3, A.7 `AltPattern`, A.6 `CatchPattern`, §31.2): `1 | 2 => "low"`; `catch FormatException | OverflowException => …`. The comma is exclusively the arm/slot separator; the `=>` disambiguation lookahead is removed from the grammar.
+- **Per-slot alternatives** (§19.3, A.7 `PositionalPattern`): `TwoColor(Color.Red | Color.Blue, var x)` — previously inexpressible (#1300 had banned slot alternatives to keep the comma unambiguous).
+- **Members stay constants-only in case patterns**; catch alternatives stay types-only; the binding rule for `catch var e: T1 | T2` (nearest common base) is unchanged. New rationale [§3.8](#) records the trade.
+- **No bitwise-or collision** (normative note, §19.3): pattern-embedded expressions parse below `|`; the scrutinee is `of`-delimited (v0.166).
+
+#### Migration
+
+Breaking but purely mechanical: `,` → `|` inside pattern-alternative lists (case constant alternatives and catch multi-type lists — both syntactically identifiable). Slot separators and arm separators are untouched. The conformance corpus and the project's test/example sources are migrated with this revision's compiler train.
 
 ## 20. Closing
 

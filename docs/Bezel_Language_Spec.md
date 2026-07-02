@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.166 — July 2026**
+**Version 0.167 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3107,11 +3107,13 @@ Arms are comma-separated. A trailing comma after the last arm is optional.
 
 **Constants:** `1`, `42`, `-7`, `"hello"`, `Priority.High`. A leading `-` on a numeric literal is part of the constant pattern (grammar A.8).
 
-**Comma-separated alternatives:** `2, 3, 4, 5` matches any of these. Alternatives exist at the **arm level only** (grammar: `ArmPattern`): the arm separator and the alternative separator are both `,`, disambiguated by the `=>` token, which always follows the complete pattern. In `1, 2 => "low", 3 => "high"`, the first arm matches 1 or 2; the second arm matches 3.
+**Alternatives (v0.167, #1371):** `2 | 3 | 4 | 5` matches any of these. The alternative separator is `|` (grammar: `AltPattern`); the comma means exactly one thing in pattern context — the separator of arms and of positional slots — so no `=>` lookahead is needed to tell them apart. In `1 | 2 => "low", 3 => "high"`, the first arm matches 1 or 2; the second arm matches 3.
 
-In a comma-alternative list, every member must resolve to a **constant** (a literal, an enum constant, or a named `const`); a member that resolves to a *type* is a compile error — grouped type tests are written as separate arms.
+In an alternative list, every member must resolve to a **constant** (a literal, an enum constant, or a named `const`); a member that resolves to a *type* is a compile error in a `case` pattern — grouped type tests are written as separate arms. (`catch` arms, whose members are exclusively types, use the same `|` spelling for their multi-type alternatives — [§31.2](#sec-catch-arms).)
 
-Inside a positional destructuring pattern, the comma is exclusively the **position separator** — alternatives are *not* available per slot. `TwoColor(Color.Red, Color.Blue)` is a two-slot pattern (first position `Color.Red`, second `Color.Blue`), never a one-slot pattern matching either color. To match several constants in one position, use separate arms or a `when` guard (`TwoColor(var c, Color.Blue) when c = Color.Red or c = Color.Green => …`).
+Because the alternative separator no longer collides with the slot separator, alternatives are available **per slot** inside a positional destructuring pattern: `TwoColor(Color.Red | Color.Blue, var x)` is a two-slot pattern whose first position matches either color. Alternative members are constants per the rule above, so a binding (`var c`) cannot appear inside an alternative list.
+
+**No collision with bitwise-or (normative note).** `|` is the bitwise-or operator in expressions, but the expression positions embedded in patterns — a relational pattern's operand and a range pattern's bounds — parse at the Shift level or tighter, *below* `|`, so a `|` at pattern level is always the alternative separator. A scrutinee-level `|` belongs to the scrutinee expression (delimited by `of`, [§19.1](#sec-forms)); the [§17.1.1](#sec-precedence) mandatory-parenthesization discipline covers any residual mixed reading.
 
 **Inclusive and exclusive ranges:** `90..100`, `0..<60`. Open-ended forms allowed: `..<0` (less than 0), `31..` (at least 31).
 
@@ -6988,7 +6990,7 @@ A catch arm's pattern is one of:
 
 - A bare type: `IOException`. Matches any thrown exception that is an instance of the type, without binding.
 - A binding pattern: `var name: Type`. Matches and binds the exception to `name` for use in the arm's guard and body. The binding is in scope only within the arm.
-- A multi-type alternative, with or without binding: `Type1, Type2, ...` or `var name: Type1, Type2, ...`. Matches if the thrown exception is an instance of any of the listed types. When binding, `name` has the static type of the **nearest common base** of the listed types (the most specific type that is a base of every listed type; `Exception` if no more specific common base exists).
+- A multi-type alternative, with or without binding: `Type1 | Type2 | ...` or `var name: Type1 | Type2 | ...` (the `|` alternatives spelling, v0.167 #1371 — the same separator as case-pattern alternatives). Matches if the thrown exception is an instance of any of the listed types. When binding, `name` has the static type of the **nearest common base** of the listed types (the most specific type that is a base of every listed type; `Exception` if no more specific common base exists).
 
 Each pattern may be followed by an optional `when Expression` guard. The guard is evaluated only if the pattern matches; if the guard returns `false`, the arm is skipped and the next arm is considered. Inside the guard, the bound variable (if any) is in scope. The guard runs while the matched exception is in flight, but it evaluates as ordinary code — allocations, calls, and any other operations behave exactly as they would outside dispatch; the in-flight exception does not interfere with them. If the guard itself **throws**, that new exception *supersedes* the in-flight one — the superseded exception is **disposed by the runtime exactly once**, as if its handling had completed (v0.162; previously "abandoned" with the disposal unstated) — and propagates to the enclosing handler — it is not caught by a later arm of the same `try` and does not resume guard evaluation. This mirrors the rule for a `throw` in a `finally` ([§31.2](#sec-try-catch-finally)): an exception raised in a non-normal position replaces the one already propagating.
 
@@ -7011,7 +7013,7 @@ try
 catch
   var ex: ArgumentException when ex.ParamName = "amount" => Console.WriteLine("Invalid amount"),
   InvalidOperationException => Console.WriteLine("Invalid state"),
-  var ex: IOException, TimeoutException => Retry(ex),
+  var ex: IOException | TimeoutException => Retry(ex),
   var ex: Exception => do
     Log(ex);
     throw;
@@ -8009,8 +8011,11 @@ TryStmt         ::= "try" Statement* CatchBlock FinallyClause? "end" ";"
                   | "try" Statement* FinallyClause "end" ";"
 CatchBlock      ::= "catch" CatchArm ("," CatchArm)* ","?
 CatchArm        ::= CatchPattern ("when" Expression)? "=>" ArmBody
-CatchPattern    ::= Type ("," Type)*                          /* no binding */
-                  | "var" Identifier ":" Type ("," Type)*      /* binding */
+CatchPattern    ::= Type ("|" Type)*                          /* no binding */
+                  | "var" Identifier ":" Type ("|" Type)*      /* binding */
+                              /* Multi-type alternatives are `|`-separated
+                                 (v0.167, #1371) — the same alternatives
+                                 spelling as case patterns (AltPattern). */
 FinallyClause   ::= "finally" Statement*
 
 YieldStmt       ::= "yield" "return" Expression ";"
@@ -8192,16 +8197,16 @@ CaseExpr        ::= "case" Expression "of" CaseArm ("," CaseArm)* ","? "end"
                                  ambiguity. (Through v0.165 there was no
                                  delimiter and the scrutinee was restricted to
                                  the multiplicative level.) */
-CaseArm         ::= ArmPattern ("when" Expression)? "=>" ArmBody
-ArmPattern      ::= Pattern ("," Pattern)*
-                              /* Comma-separated pattern ALTERNATIVES exist at
-                                 the arm level only (`1, 2 => "low"`); they are
-                                 factored out of Pattern so that inside a
-                                 positional destructure list the comma is
-                                 unambiguously the SLOT separator (#1300/#1321).
-                                 The arm separator and the alternative separator
-                                 are disambiguated by `=>`, which always follows
-                                 the complete ArmPattern (§19.3). */
+CaseArm         ::= AltPattern ("when" Expression)? "=>" ArmBody
+AltPattern      ::= Pattern ("|" Pattern)*
+                              /* Pattern ALTERNATIVES are `|`-separated (v0.167,
+                                 #1371): the comma is exclusively the arm/slot
+                                 separator, so no `=>` lookahead is needed and
+                                 alternatives are available per positional slot
+                                 (see PositionalPattern). `|`-joined members must
+                                 be constants (§19.3). `|` never collides with
+                                 bitwise-or: pattern-embedded expressions parse
+                                 at Shift level or tighter (§19.3). */
 WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end"
                               /* Scrutinee-less condition dispatch (§19.1). Arms
                                  are tried in textual order; the first whose
@@ -8223,9 +8228,9 @@ ArmBody         ::= Expression
 Pattern         ::= "_"                       /* discard */
                   | "null"                     /* null literal pattern */
                   | "var" Identifier (":" Type)?      /* binding */
-                  | Constant                          /* single constant; comma
+                  | Constant                          /* single constant; `|`
                                                          alternatives live in
-                                                         ArmPattern above */
+                                                         AltPattern above */
                   | RangePattern                      /* closed, half-open, or
                                                          open-ended range */
                   | RelOpPattern Expression           /* relational; restricted
@@ -8244,7 +8249,9 @@ Pattern         ::= "_"                       /* discard */
                                  constant pattern; `System.IO.Stream` is a
                                  type-test pattern. */
 PositionalPatternList ::= PositionalPattern ("," PositionalPattern)*
-PositionalPattern     ::= Pattern
+PositionalPattern     ::= AltPattern              /* per-slot alternatives
+                                                     (v0.167, #1371):
+                                                     TwoColor(Red | Blue, var x) */
                         | Identifier              /* naked binding,
                                                      valid only inside
                                                      positional destructuring */
