@@ -1633,7 +1633,15 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
 
     // --- Apply the compound operator. ---
     llvm::Value* rhs = lowerExpr(*as.value);
-    if (!rhs) return false;
+    if (!rhs) {
+        // #1386: ICE — lowerExpr returned null for the RHS of a compound
+        // indexer assignment; the expression kind is not yet handled.
+        ctx_.diagnostics().report(
+            Severity::Error, as.value->span.begin,
+            "internal: lowerExpr returned null for compound indexer "
+            "assignment RHS (block-getter path) — #1386");
+        return false;
+    }
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
     llvm::Value* newVal = emitCompoundOp(
@@ -1729,7 +1737,15 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         llvm::Value* cur = lowerCollectionIndexerGet(*ix);
         if (!cur) return false;
         llvm::Value* rhs = lowerExpr(*as.value);
-        if (!rhs) return false;
+        if (!rhs) {
+            // #1386: ICE — lowerExpr returned null for the RHS of a
+            // compound dict-indexer assignment; expression kind unhandled.
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "internal: lowerExpr returned null for compound dict-indexer "
+                "assignment RHS — #1386");
+            return false;
+        }
         std::string op(as.op);
         if (!op.empty() && op.back() == '=') op.pop_back();
         // fix #626 / §25.1: if the VALUE element type has a user-defined
@@ -1812,7 +1828,15 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
 
     // --- Evaluate RHS and apply the compound operator. ---
     llvm::Value* rhs = lowerExpr(*as.value);
-    if (!rhs) return false;
+    if (!rhs) {
+        // #1386: ICE — lowerExpr returned null for the RHS of a compound
+        // array-indexer assignment; the expression kind is not yet handled.
+        ctx_.diagnostics().report(
+            Severity::Error, as.value->span.begin,
+            "internal: lowerExpr returned null for compound array-indexer "
+            "assignment RHS — #1386");
+        return false;
+    }
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
 
@@ -3689,7 +3713,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                          k < aty->getNumElements(); ++k) {
                         if (!cl->elements[k]) continue;
                         llvm::Value* ev = lowerExpr(*cl->elements[k]);
-                        if (!ev) continue;
+                        if (!ev) {
+                            // #1386: ICE — lowerExpr returned null for a
+                            // non-null inline-array element in buildOrderedArgs;
+                            // the expression kind is not yet handled by codegen.
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[k]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "inline-array element in call argument — #1386");
+                            continue;
+                        }
                         if (ev->getType() != elTy &&
                             ev->getType()->isIntegerTy() &&
                             elTy->isIntegerTy()) {
@@ -3735,7 +3769,15 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             v = lowerExpr(*a.value);
             expectedFunctionType_ = savedExpected;
         }
-        if (!v) return false;
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for a call argument value;
+            // the expression kind is not yet handled by codegen.
+            ctx_.diagnostics().report(
+                Severity::Error, a.value->span.begin,
+                "internal: lowerExpr returned null for call argument in "
+                "buildOrderedArgs — #1386");
+            return false;
+        }
         // CG-nullable: if the formal parameter is a nullable value type (a
         // primitive, or a nullable enum — issue #364) but the argument value is
         // a plain value, wrap it.

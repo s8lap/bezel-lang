@@ -165,7 +165,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // Expression part: lower the expression, then convert to
                 // string. If a format spec is present (§18.5), apply it.
                 ev = lowerExpr(*part.expr);
-                if (!ev) continue;
+                if (!ev) {
+                    // #1386: ICE — lowerExpr returned null for a non-null
+                    // interpolated-string expression part; the expression kind
+                    // is not yet handled by codegen.
+                    ctx_.diagnostics().report(
+                        Severity::Error, part.expr->span.begin,
+                        "internal: lowerExpr returned null for "
+                        "interpolated-string expression part — #1386");
+                    continue;
+                }
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
                     auto* frt = ctx_.exprType(*part.expr);
@@ -8067,7 +8076,16 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                         break;
                     }
                 llvm::Value* v = lowerExpr(*a.value);
-                if (!v || !setter) continue;
+                if (!v) {
+                    // #1386: ICE — lowerExpr returned null for the value in
+                    // a with-expression custom-setter assignment.
+                    ctx_.diagnostics().report(
+                        Severity::Error, a.value->span.begin,
+                        "internal: lowerExpr returned null for with-expression "
+                        "custom-setter value — #1386");
+                    continue;
+                }
+                if (!setter) continue;
                 llvm::AllocaInst* vslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, vslot);
                 locals_[pd] = vslot;  // `value` param anchored on the PropertyDecl
@@ -8117,7 +8135,17 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                          k < aty->getNumElements(); ++k) {
                         if (!cl->elements[k]) continue;
                         llvm::Value* ev = lowerExpr(*cl->elements[k]);
-                        if (!ev) continue;
+                        if (!ev) {
+                            // #1386: ICE — lowerExpr returned null for a
+                            // with-expression inline-array field element.
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[k]->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "with-expression inline-array field element"
+                                " — #1386");
+                            continue;
+                        }
                         if (ev->getType() != elTy &&
                             ev->getType()->isIntegerTy() &&
                             elTy->isIntegerTy()) {
@@ -8139,7 +8167,15 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
             }
         }
         llvm::Value* v = lowerExpr(*a.value);
-        if (!v) continue;
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for a with-expression field
+            // replacement value; the expression kind is not yet handled.
+            ctx_.diagnostics().report(
+                Severity::Error, a.value->span.begin,
+                "internal: lowerExpr returned null for with-expression "
+                "field/property replacement value — #1386");
+            continue;
+        }
         llvm::Value* slot = builder_.CreateStructGEP(st, base, idxIt->second);
         // #429 / §4.6 / §28.9 / §22.11: a CLASS object-initializer store into a
         // string field/auto-property takes an independent +1 (released on the
@@ -10686,7 +10722,18 @@ llvm::Value* Emitter::buildRecordValue(
                                      ++k) {
                                     if (!cl->elements[k]) continue;
                                     llvm::Value* ev = lowerExpr(*cl->elements[k]);
-                                    if (!ev) continue;
+                                    if (!ev) {
+                                        // #1386: ICE — lowerExpr returned null
+                                        // for a record construction inline-array
+                                        // field element.
+                                        ctx_.diagnostics().report(
+                                            Severity::Error,
+                                            cl->elements[k]->span.begin,
+                                            "internal: lowerExpr returned null "
+                                            "for record construction inline-array"
+                                            " field element — #1386");
+                                        continue;
+                                    }
                                     if (ev->getType() != elemTy &&
                                         ev->getType()->isIntegerTy() &&
                                         elemTy->isIntegerTy()) {
@@ -10798,7 +10845,15 @@ llvm::Value* Emitter::buildRecordValue(
         auto idxIt = fieldIndex_.find(m);
         if (idxIt == fieldIndex_.end()) continue;
         llvm::Value* v = lowerExpr(*init);
-        if (!v) continue;
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for a record field/property
+            // default initializer; the expression kind is not yet handled.
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                "internal: lowerExpr returned null for record field/property "
+                "default initializer — #1386");
+            continue;
+        }
         // CG-nullable: a NULLABLE VALUE field initialized with a plain value
         // (`property N: int? := 9;`, or `property C: Color? := Color.Green;` —
         // issue #364) must wrap the bare value into the {i8 hasValue; T value}

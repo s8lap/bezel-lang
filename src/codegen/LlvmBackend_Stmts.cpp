@@ -211,7 +211,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                     if (!cl->elements[i]) continue;
                                     llvm::Value* ev =
                                         lowerExpr(*cl->elements[i]);
-                                    if (!ev) continue;
+                                    if (!ev) {
+                                        // #1386: ICE — lowerExpr returned null
+                                        // for an inline-array assignment element;
+                                        // the expression kind is unhandled.
+                                        ctx_.diagnostics().report(
+                                            Severity::Error,
+                                            cl->elements[i]->span.begin,
+                                            "internal: lowerExpr returned null "
+                                            "for inline-array assignment element"
+                                            " — #1386");
+                                        continue;
+                                    }
                                     if (ev->getType() != et &&
                                         ev->getType()->isIntegerTy() &&
                                         et->isIntegerTy()) {
@@ -1052,7 +1063,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                      ++i) {
                                     if (!cl->elements[i]) continue;
                                     llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                                    if (!ev) continue;
+                                    if (!ev) {
+                                        // #1386: ICE — lowerExpr returned null
+                                        // for an inline-array return element.
+                                        ctx_.diagnostics().report(
+                                            Severity::Error,
+                                            cl->elements[i]->span.begin,
+                                            "internal: lowerExpr returned null "
+                                            "for inline-array return element"
+                                            " — #1386");
+                                        continue;
+                                    }
                                     if (ev->getType() != elemTy &&
                                         ev->getType()->isIntegerTy() &&
                                         elemTy->isIntegerTy()) {
@@ -2871,7 +2892,16 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 builder_.CreateGEP(at, tmp, {builder_.getInt32(0), builder_.getInt32(0)}));
             for (std::size_t i = 1; i < N; ++i) {
                 llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                if (!ev) continue;
+                if (!ev) {
+                    // #1386: ICE — lowerExpr returned null for a for-in
+                    // collection literal element.
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        cl->elements[i]->span.begin,
+                        "internal: lowerExpr returned null for for-in "
+                        "collection literal element — #1386");
+                    continue;
+                }
                 builder_.CreateStore(ev,
                     builder_.CreateGEP(at, tmp, {builder_.getInt32(0), builder_.getInt32(i)}));
             }
@@ -3073,7 +3103,15 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
         auto* tt = ctx_.exprType(*fs.iterable);
         if (!tt || tt->kind != sema::TypeRef::Kind::InlineArray) return false;
         llvm::Value* v = lowerExpr(*fs.iterable);
-        if (!v) return false;
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for a confirmed inline-array
+            // for-in iterable; the expression kind is not yet handled by codegen.
+            ctx_.diagnostics().report(
+                Severity::Error, fs.iterable->span.begin,
+                "internal: lowerExpr returned null for inline-array for-in "
+                "iterable — #1386");
+            return false;
+        }
         auto* at = llvm::dyn_cast<llvm::ArrayType>(v->getType());
         if (!at) return false;
         llvm::AllocaInst* tmp = entryAlloca(at);

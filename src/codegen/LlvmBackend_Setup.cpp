@@ -4669,7 +4669,16 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     for (std::size_t i = 0; i < cl->elements.size(); ++i) {
                         if (!cl->elements[i]) continue;
                         llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                        if (!ev) continue;
+                        if (!ev) {
+                            // #1386: ICE — lowerExpr returned null for a
+                            // static field inline-array initializer element.
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                cl->elements[i]->span.begin,
+                                "internal: lowerExpr returned null for static "
+                                "field inline-array initializer element — #1386");
+                            continue;
+                        }
                         if (ev->getType() != elemTy &&
                             ev->getType()->isIntegerTy() &&
                             elemTy->isIntegerTy()) {
@@ -4694,7 +4703,15 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                 }
             }
             if (!val) val = lowerExpr(*initExpr);
-            if (!val) continue;
+            if (!val) {
+                // #1386: ICE — lowerExpr returned null for a static field
+                // initializer; the expression kind is not yet handled by codegen.
+                ctx_.diagnostics().report(
+                    Severity::Error, initExpr->span.begin,
+                    "internal: lowerExpr returned null for static field "
+                    "initializer — #1386");
+                continue;
+            }
             builder_.CreateStore(val, gvIt->second);
             // §22.13 (#1212): a static OWNED class/interface field is disposed
             // at program exit in reverse init order (bz_dispose_static_owned,
@@ -5244,7 +5261,15 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 for (std::size_t i = 0; i < cl->elements.size(); ++i) {
                     if (!cl->elements[i]) continue;
                     llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                    if (!ev) continue;
+                    if (!ev) {
+                        // #1386: ICE — lowerExpr returned null for an instance
+                        // field inline-array initializer element.
+                        ctx_.diagnostics().report(
+                            Severity::Error, cl->elements[i]->span.begin,
+                            "internal: lowerExpr returned null for instance "
+                            "field inline-array initializer element — #1386");
+                        continue;
+                    }
                     if (ev->getType() != elemTy &&
                         ev->getType()->isIntegerTy() &&
                         elemTy->isIntegerTy()) {
@@ -5282,7 +5307,15 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             }
         }
         llvm::Value* v = lowerExpr(*init);
-        if (!v) continue;
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for an instance
+            // field/property initializer; the expression kind is unhandled.
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                "internal: lowerExpr returned null for instance "
+                "field/property initializer — #1386");
+            continue;
+        }
         // §5.1: an int initializer for a wider numeric field is implicitly
         // widened — convert before the store so the field holds the value, not
         // the int's raw bits (issue #408 / #410).
@@ -5653,7 +5686,15 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     for (const auto& a : call->args) {
         if (!a.value) return;
         llvm::Value* v = lowerExpr(*a.value);
-        if (!v) return;
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for a base-ctor argument;
+            // the expression kind is not yet handled by codegen.
+            ctx_.diagnostics().report(
+                Severity::Error, a.value->span.begin,
+                "internal: lowerExpr returned null for base-constructor "
+                "argument — #1386");
+            return;
+        }
         args.push_back(v);
     }
     // §12 / §14 (issue #617): when the DERIVED class is non-generic but its
@@ -5847,7 +5888,16 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
                         const auto& a = td->primaryBaseCtorArgs[i];
                         if (!a.value) { ok = false; break; }
                         llvm::Value* v = lowerExpr(*a.value);
-                        if (!v) { ok = false; break; }
+                        if (!v) {
+                            // #1386: ICE — lowerExpr returned null for a
+                            // positional-base-ctor argument.
+                            ctx_.diagnostics().report(
+                                Severity::Error, a.value->span.begin,
+                                "internal: lowerExpr returned null for "
+                                "positional base-constructor argument — #1386");
+                            ok = false;
+                            break;
+                        }
                         // Coerce a numeric arg to the base ctor's param type
                         // (a no-op for pointer/struct args, per §5.1).
                         v = coerceNumericToType(
@@ -6075,7 +6125,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             for (std::size_t i = 0; i < cl->elements.size(); ++i) {
                 if (!cl->elements[i]) continue;
                 llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                if (!ev) continue;
+                if (!ev) {
+                    // #1386: ICE — lowerExpr returned null for a local-decl
+                    // inline-array initializer element.
+                    ctx_.diagnostics().report(
+                        Severity::Error, cl->elements[i]->span.begin,
+                        "internal: lowerExpr returned null for local-decl "
+                        "inline-array initializer element — #1386");
+                    continue;
+                }
                 // Coerce element to the array's element type if needed.
                 if (ev->getType() != elemTy) {
                     if (ev->getType()->isIntegerTy() && elemTy->isIntegerTy()) {
@@ -11919,7 +11977,15 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
                     ev = materializeHeapCollectionLiteral(nested, er);
             }
             if (!ev) ev = lowerExpr(*elemPtr);
-            if (!ev) continue;
+            if (!ev) {
+                // #1386: ICE — lowerExpr returned null for a LinkedList
+                // literal element after nested-literal materialization also failed.
+                ctx_.diagnostics().report(
+                    Severity::Error, elemPtr->span.begin,
+                    "internal: lowerExpr returned null for LinkedList "
+                    "collection literal element — #1386");
+                continue;
+            }
             if (er && isNullableValueTy(er)) {
                 llvm::StructType* expected = nullableValueStructTy(er);
                 if (expected && ev->getType() != expected)
@@ -12007,7 +12073,15 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
                 ev = materializeHeapCollectionLiteral(nested, elemRef);
         }
         if (!ev) ev = lowerExpr(*elemPtr);
-        if (!ev) continue;
+        if (!ev) {
+            // #1386: ICE — lowerExpr returned null for a heap collection
+            // literal element after nested-literal materialization also failed.
+            ctx_.diagnostics().report(
+                Severity::Error, elemPtr->span.begin,
+                "internal: lowerExpr returned null for heap collection "
+                "literal element — #1386");
+            continue;
+        }
         // fix #455 parity: a nullable VALUE element (int?/bool?/enum?/record?)
         // may lower to its inner value; lift it to the tagged {hasValue, T}
         // struct the runtime stores (matching esz).
@@ -12338,7 +12412,15 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
     for (const auto& elemPtr : cl->elements) {
         if (!elemPtr) continue;
         llvm::Value* ev = lowerExpr(*elemPtr);
-        if (!ev) continue;
+        if (!ev) {
+            // #1386: ICE — lowerExpr returned null for a Set/OwnedSet
+            // literal element; the expression kind is not yet handled.
+            ctx_.diagnostics().report(
+                Severity::Error, elemPtr->span.begin,
+                "internal: lowerExpr returned null for Set/OwnedSet "
+                "literal element — #1386");
+            continue;
+        }
         // #429 / §28.9: retain the string element before inserting — the set
         // takes an INDEPENDENT +1.  A +1 producer is transferred (no retain);
         // a borrow / literal / identifier is retained.
@@ -12463,7 +12545,17 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         if (!cl->keys[i] || !cl->elements[i]) continue;
         llvm::Value* k = lowerExpr(*cl->keys[i]);
         llvm::Value* v = lowerExpr(*cl->elements[i]);
-        if (!k || !v) continue;
+        if (!k || !v) {
+            // #1386: ICE — lowerExpr returned null for a dict literal key or
+            // value; the expression kind is not yet handled by codegen.
+            ctx_.diagnostics().report(
+                Severity::Error,
+                (!k && cl->keys[i]) ? cl->keys[i]->span.begin
+                                    : cl->elements[i]->span.begin,
+                "internal: lowerExpr returned null for dictionary literal "
+                "key or value — #1386");
+            continue;
+        }
         llvm::Value* vPtr = encodeVal(v);
         if (keyTy) {
             auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),

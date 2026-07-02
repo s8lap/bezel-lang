@@ -17520,6 +17520,13 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                             builder_.CreateBitCast(argExprV, i64()), ptrTy(),
                             "spawn.arg.cast");
                     }
+                } else {
+                    // #1386: ICE — lowerExpr returned null for a single
+                    // Domain.Spawn argument; arg silently passed as null.
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.args[1].value->span.begin,
+                        "internal: lowerExpr returned null for single-arg "
+                        "Domain.Spawn argument — #1386");
                 }
             } else if (nExtra >= 2) {
                 // Multi-arg: malloc a void*[nExtra] array and store each arg.
@@ -17533,7 +17540,16 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                     const auto& a = call.args[i + 1];
                     if (!a.value) continue;
                     llvm::Value* val = lowerExpr(*a.value);
-                    if (!val) continue;
+                    if (!val) {
+                        // #1386: ICE — lowerExpr returned null for a
+                        // Domain.Spawn extra argument; the expression kind
+                        // is not yet handled by codegen.
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            "internal: lowerExpr returned null for "
+                            "Domain.Spawn argument — #1386");
+                        continue;
+                    }
                     // Cast to void* if needed.
                     llvm::Value* asPtr;
                     if (val->getType()->isPointerTy()) {
