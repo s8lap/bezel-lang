@@ -115,6 +115,12 @@ v0.160 gives unit-returning methods the assignment arrow (`method SetX(v: int) =
 
 `constructor()` carries parens because parameters may follow — the parens are the parameter list, present even when empty for uniformity across constructors. A destructor can never take parameters (it is invoked by the compiler-generated `Dispose()`, §28.4), so a mandatory empty `()` would be pure ceremony attached to nothing. The asymmetry is intentional (confirmed 2026-07, review finding #1343): `destructor` is a keyword-introduced block like `try` or `extension`, not a callable signature. (The §1.6 closer taxonomy already treats `constructor`/`destructor`/`operator` as one keyword-labeled family.)
 
+### 3.7 The `case` scrutinee is delimited by `of`
+
+Adopted v0.166 (#1370). Through v0.165 nothing separated the scrutinee from the first arm's pattern, and since patterns may begin with `-` (a negative range bound), `..`, `..<`, or a relational token, the scrutinee had to parse at a restricted precedence level — multiplicative and postfix only, with a mandatory-parenthesization rule for anything lower (`case (x - 1)`). The restriction served no semantic purpose; it existed to substitute for the missing boundary, surprised users whose scrutinee was a perfectly ordinary arithmetic expression, and required a normative paragraph (and issues #1320 and #1233) to keep the rule honest.
+
+`of` supplies the boundary explicitly: `case score of 90..100 => …`. The scrutinee becomes a full `Expression` with no restriction; the leading-pattern-token ambiguity vanishes by construction rather than by precedence surgery; and the spelling is the language's declared §3 Pascal heritage verbatim (`case x of` is Pascal's form). One extra keyword-token per case was weighed against the removed restriction, the removed parens rule, and the removed parser delicacy, and judged the better trade at every scale of program. `when` (the scrutinee-less sibling) takes no delimiter — there is nothing to delimit. Alternatives declined: a colon (`case x:`) reads as a type annotation; a mandatory newline resurrects layout-sensitivity, which #744 deliberately removed from this construct family.
+
 <a id="sec-memory-management"></a>
 ## 4. Memory management
 
@@ -7453,6 +7459,18 @@ A revision that changes a premise must touch every body section that stated that
 #### Migration
 
 None. No capability, grammar, or behavior change; the §13.6 wording aligns the spec to the already-implemented rule.
+
+<a id="sec-v0-165-to-v0-166-changelog"></a>
+### v0.166 changelog (v0.165 → v0.166)
+
+v0.166 is the **case-of revision** — the first of the review's breaking-syntax adoptions (#1370; RFC filed from the 2026-07 syntax pass).
+
+- **`case Expression of Arms end`** (§19.1, Appendix A.7): the keyword `of` delimits the scrutinee from the first arm. The scrutinee becomes a **full Expression**; the multiplicative-level restriction and its mandatory-parenthesization rule (normative since v0.158, the subject of #1320/#1233) are **removed** — they existed only to substitute for the missing boundary. New rationale [§3.7](#) records the trade and the declined alternatives. `when` is unaffected.
+- **Diagnostic**: a missing `of` is a syntax error at the first arm token, worded "expected `of` after the case scrutinee".
+
+#### Migration
+
+Breaking but purely mechanical: insert `of` after every `case` scrutinee. Previously-mandatory parens around additive/bitwise/range scrutinies may be dropped (they remain legal). The conformance corpus and the project's own test/example sources are migrated with this revision's compiler train.
 
 ## 20. Closing
 

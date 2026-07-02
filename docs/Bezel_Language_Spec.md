@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.165 — July 2026**
+**Version 0.166 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1204,7 +1204,7 @@ enum Priority
   public static readonly All: Array<Priority> := [Low, Medium, High];
 
   public static method Parse(text: string): Priority?
-    return case text
+    return case text of
       "Low" => Low,
       "Medium" => Medium,
       "High" => High,
@@ -1257,7 +1257,7 @@ When both an underlying type and interfaces are specified, the underlying type c
 Inside a `case` whose scrutinee is an enum, the enum prefix may be omitted:
 
 ```bezel
-case p
+case p of
   Low => Console.WriteLine("low"),
   Medium, High => Console.WriteLine("medium or high")
 end;
@@ -2783,7 +2783,7 @@ The identifier `_` is a *discard* — a sink that consumes a value without bindi
 **Pattern position.** Inside a `case` arm or destructuring pattern, `_` matches any value without binding.
 
 ```bezel
-case shape
+case shape of
   Circle(_) => "circle",
   Rectangle(_, _) => "rectangle",
   _ => "other"
@@ -3024,23 +3024,23 @@ Surrogate escapes (U+D800–U+DFFF) are compile errors.
 <a id="sec-forms"></a>
 ### 19.1 Forms
 
-**`case` (scrutinee form)** — `case expression` followed by arms. The scrutinee is evaluated once and matched against each pattern in order. `case` **always** takes a scrutinee; a `case` written with no scrutinee expression is a syntax error — use `when` for condition dispatch.
+**`case` (scrutinee form)** — `case expression of` followed by arms. The scrutinee is evaluated once and matched against each pattern in order. `case` **always** takes a scrutinee; a `case` written with no scrutinee expression is a syntax error — use `when` for condition dispatch.
 
-**Scrutinee grammar level (normative).** Because nothing delimits the scrutinee from the first arm's pattern, the scrutinee parses at the *multiplicative* precedence level: multiplicative and postfix expressions (`x`, `a.b[i]`, `n * 2`, `F(x)`) are admitted directly; an additive, shift, bitwise, range, or relational scrutinee **must be parenthesized** (`case (x - 1)`, `case (flags & mask)`). This is what allows a first pattern to begin with tokens an expression could otherwise absorb — a negative range bound in particular:
+**The `of` delimiter (v0.166, #1370).** The keyword `of` terminates the scrutinee and introduces the arms — the Pascal-heritage spelling (`case x of`). Because the boundary is explicit, the scrutinee is a **full Expression** with no precedence restriction and no parenthesization rule: `case x - 1 of`, `case flags & mask of`, and `case lo..hi of` are all direct. A first pattern may begin with any pattern token — a negative range bound in particular — with no possibility of the scrutinee absorbing it:
 
 ```bezel
-case delta
-  -10..-6 => "strongly down",   // `-10` starts the pattern; an additive-level
-  ..<0    => "down",            //   scrutinee would have absorbed `- 10`
+case delta of
+  -10..-6 => "strongly down",
+  ..<0    => "down",
   0       => "flat",
   _       => "up"
 end;
 ```
 
-A diagnostic for an unparenthesized additive scrutinee names this rule and suggests the parens.
+A missing `of` is a syntax error at the first arm token; the diagnostic names the delimiter ("expected `of` after the case scrutinee"). *(History: through v0.165 there was no delimiter, and the scrutinee parsed at the multiplicative precedence level with a mandatory-parens rule for anything lower — a restriction that existed only to serve the missing boundary; see the rationale's v0.166 entry.)*
 
 ```bezel
-var grade := case score
+var grade := case score of
   90..100 => "A",
   80..89 => "B",
   70..<80 => "C",
@@ -3083,7 +3083,7 @@ Each arm has the form `pattern => body`. An arm body has three possible shapes:
 Multi-statement logic in *expression-position* arms is extracted into a helper method or local lambda — both produce values, and the extraction makes the arm's intent visible at its declaration site:
 
 ```bezel
-var description := case score
+var description := case score of
   > 90 => "excellent",
   > 70 => "good",
   > 50 => "passing",
@@ -3139,7 +3139,7 @@ Inside a positional destructuring pattern, a naked identifier is interpreted as 
 A `when` clause adds a runtime guard:
 
 ```bezel
-case temperature
+case temperature of
   var t when t > 30 => Console.WriteLine($"Hot: {t}"),
   var t when t < 0 => Console.WriteLine($"Freezing: {t}"),
   var t => Console.WriteLine($"Mild: {t}")
@@ -3177,7 +3177,7 @@ public sealed class Circle: Shape ... end Circle;
 public sealed class Square: Shape ... end Square;
 public sealed class Triangle: Shape ... end Triangle;
 
-var area := case shape
+var area := case shape of
   var c: Circle => Math.Pi * c.Radius * c.Radius,
   var s: Square => s.Side * s.Side,
   var t: Triangle => 0.5 * t.Base * t.Height
@@ -3199,12 +3199,12 @@ The recommended discipline is treating any addition of a leaf type to a sealed h
 A `case` ends with `end`. The trailing `;` belongs to the enclosing statement, not the case:
 
 ```bezel
-var grade := case score
+var grade := case score of
   90..100 => "A",
   _ => "F"
 end;                   // ; ends the assignment
 
-case month
+case month of
   1 => Console.WriteLine("Jan"),
   _ => Console.WriteLine("Other")
 end;                   // ; ends the statement
@@ -8180,18 +8180,18 @@ LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
-CaseExpr        ::= "case" Expression CaseArm ("," CaseArm)* ","? "end"
-                              /* The scrutinee Expression is mandatory (#744).
-                                 The scrutinee-less condition-dispatch form is
-                                 the separate WhenExpr below. The scrutinee is
-                                 parsed at the MULTIPLICATIVE level (multiplicative
-                                 and postfix expressions only) — normative rule in
-                                 §19.1 — so a following `-` (negative range bound),
-                                 relational, range, or open-ended-range token
-                                 begins the first arm's Pattern rather than being
-                                 absorbed into the scrutinee. An additive, shift,
-                                 bitwise, range, or relational scrutinee must be
-                                 parenthesized. */
+CaseExpr        ::= "case" Expression "of" CaseArm ("," CaseArm)* ","? "end"
+                              /* The scrutinee Expression is mandatory (#744);
+                                 the scrutinee-less condition-dispatch form is
+                                 the separate WhenExpr below. `of` delimits the
+                                 scrutinee from the first arm (v0.166, #1370), so
+                                 the scrutinee is a FULL Expression — no
+                                 precedence restriction, no parenthesization
+                                 rule — and a first pattern may begin with `-`,
+                                 `..`, `..<`, or a relational token without
+                                 ambiguity. (Through v0.165 there was no
+                                 delimiter and the scrutinee was restricted to
+                                 the multiplicative level.) */
 CaseArm         ::= ArmPattern ("when" Expression)? "=>" ArmBody
 ArmPattern      ::= Pattern ("," Pattern)*
                               /* Comma-separated pattern ALTERNATIVES exist at
