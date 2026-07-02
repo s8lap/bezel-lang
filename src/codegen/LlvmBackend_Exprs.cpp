@@ -3524,11 +3524,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
     }
     // issue #494 / §29.2 / §29.3: explicit `e.Current` property access where
-    // `e` is typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
-    // TypeDecl, hence no PropertySymbol — lowerVirtualPropertyGet returns null).
-    // The iterator state struct's vtable layout is [0]=td, [1]=Dispose,
-    // [2]=MoveNext(→i1), [3]=Current(→T). Dispatch through slot 3 returning T.
+    // `e` is typed as the builtin IEnumerator<T> (no sema TypeDecl, hence no
+    // PropertySymbol — lowerVirtualPropertyGet returns null). The iterator state
+    // struct's vtable layout is [0]=td, [1]=Dispose, [2]=MoveNext(→i1),
+    // [3]=Current(→T). Dispatch through slot 3 returning T.
     // This complements the MoveNext fix in lowerCall (issue #494).
+    // #1349 / §29.1 v0.161: OwnedEnumerator<T>/OwnedAsyncEnumerator<T> no longer
+    // have Current — they use TakeCurrent() dispatched in lowerCall below.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->member == "Current" && ma->target) {
             const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
@@ -3538,11 +3540,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 !recvTy->declaration &&
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                // issue #759: async enumerators share the slot-3 Current layout.
+                // issue #759: async enumerators share the slot-3 layout.
+                // #1349: OwnedEnumerator/OwnedAsyncEnumerator excluded (TakeCurrent).
                 (recvTy->astNode->name->parts[0] == "IEnumerator" ||
-                 recvTy->astNode->name->parts[0] == "OwnedEnumerator" ||
-                 recvTy->astNode->name->parts[0] == "IAsyncEnumerator" ||
-                 recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerator");
+                 recvTy->astNode->name->parts[0] == "IAsyncEnumerator");
             if (isBuiltinEnumerator) {
                 llvm::Value* recv = lowerExpr(*ma->target);
                 if (recv && recv->getType()->isPointerTy()) {

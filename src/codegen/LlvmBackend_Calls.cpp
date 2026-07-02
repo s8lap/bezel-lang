@@ -10699,6 +10699,81 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // #1349 / §29.1 v0.161: explicit `e.TakeCurrent()` on builtin
+        // OwnedEnumerator<T> / OwnedAsyncEnumerator<T> (no sema TypeDecl).
+        // Dispatches vtable slot 3 (same slot as IEnumerator Current).
+        // emitPendingCheck() follows because TakeCurrent may raise
+        // InvalidOperationException (double-take / before-first / after-exhaust).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "TakeCurrent" && ma->target &&
+                    call.args.empty()) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                bool isOwningEnumerator =
+                    recvTy &&
+                    recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->declaration &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    (recvTy->astNode->name->parts[0] == "OwnedEnumerator" ||
+                     recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerator");
+                if (isOwningEnumerator) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (recv && recv->getType()->isPointerTy()) {
+                        llvm::Type* elemTy =
+                            (!recvTy->genericArgs.empty() &&
+                             recvTy->genericArgs[0])
+                            ? lowerTypeRef(recvTy->genericArgs[0])
+                            : i32();
+                        llvm::Value* vtable =
+                            builder_.CreateLoad(ptrTy(), recv);
+                        auto* tcTy =
+                            llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+                        llvm::Value* tcSlotPtr = builder_.CreateGEP(
+                            ptrTy(), vtable, {builder_.getInt32(3)});
+                        llvm::Value* tcFnPtr =
+                            builder_.CreateLoad(ptrTy(), tcSlotPtr);
+                        llvm::Value* r = builder_.CreateCall(
+                            tcTy, tcFnPtr, {recv}, "tc");
+                        emitPendingCheck();  // TakeCurrent may raise IOE
+                        return r;
+                    }
+                }
+            }
+        }
+        // #1349 / §29.1 v0.161: explicit `src.GetOwnedEnumerator()` on builtin
+        // OwnedEnumerable<T>. Dispatches vtable slot 4 (same as GetEnumerator in
+        // lowerIEnumerableBuiltinFor) to produce a fresh, independent
+        // OwnedEnumerator<T> clone. The result is typed OwnedEnumerator<T> (by
+        // sema), so using-var disposal wires up via isSyncIterEnum in Setup.cpp.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "GetOwnedEnumerator" && ma->target &&
+                    call.args.empty()) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                bool isOwnedEnumerable =
+                    recvTy &&
+                    recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->declaration &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    recvTy->astNode->name->parts[0] == "OwnedEnumerable";
+                if (isOwnedEnumerable) {
+                    llvm::Value* src = lowerExpr(*ma->target);
+                    if (src && src->getType()->isPointerTy()) {
+                        llvm::Value* vt = builder_.CreateLoad(ptrTy(), src);
+                        auto* geTy =
+                            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                        llvm::Value* geSlotPtr = builder_.CreateGEP(
+                            ptrTy(), vt, {builder_.getInt32(4)});
+                        llvm::Value* geFnPtr =
+                            builder_.CreateLoad(ptrTy(), geSlotPtr);
+                        return builder_.CreateCall(
+                            geTy, geFnPtr, {src}, "ge.owned");
+                    }
+                }
+            }
+        }
         // issue #759 / §29.3 / §30.7: explicit `e.MoveNextAsync()` where `e` is
         // the builtin IAsyncEnumerator<T> / OwnedAsyncEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol). Same async-iterator vtable layout

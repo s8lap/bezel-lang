@@ -1322,11 +1322,22 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // (IAsyncEnumerable<T> / IAsyncEnumerator<T>).
     llvm::Type* elemTy = i32();
     const sema::TypeRef* elemSemaTy = nullptr;  // #1102B
+    // #1349: detect OwnedAsyncEnumerable<T> so TakeCurrent gets the IOE guard.
+    bool isOwningIter = false;
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
         if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
             elemSemaTy = retRef->genericArgs[0];
             elemTy = lowerTypeRef(elemSemaTy);
+        }
+        if (retRef) {
+            std::string_view rn;
+            if (retRef->astNode && retRef->astNode->name &&
+                !retRef->astNode->name->parts.empty())
+                rn = retRef->astNode->name->parts[0];
+            else if (!retRef->importedName.empty())
+                rn = retRef->importedName;
+            isOwningIter = (rn == "OwnedAsyncEnumerable");
         }
     }
     // The per-advance MoveNextAsync result is Task<bool>; the await-result type
@@ -1422,13 +1433,53 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     }
 
     // --- Current: load current_val from the frame ---
+    // For OwnedAsyncEnumerable<T> this implements TakeCurrent() (vtable slot 3):
+    // check for null → IOE; on success null slot and return value. §29.1/#1349.
     {
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", currentFn);
-        llvm::IRBuilder<> cb(entry);
-        llvm::Value* self = &*currentFn->arg_begin();
-        llvm::Value* cvField =
-            cb.CreateStructGEP(stateStructTy, self, CURRENT_VAL_FIELD);
-        cb.CreateRet(cb.CreateLoad(elemTy, cvField));
+        if (isOwningIter && elemTy->isPointerTy()) {
+            // #1349 / §29.1 v0.161: TakeCurrent with IOE guard.
+            auto* ioeErrBB = llvm::BasicBlock::Create(llvm_, "tc.ioe", currentFn);
+            auto* tcOkBB   = llvm::BasicBlock::Create(llvm_, "tc.ok",  currentFn);
+            llvm::IRBuilder<> cb(entry);
+            llvm::Value* self    = &*currentFn->arg_begin();
+            llvm::Value* cvField = cb.CreateStructGEP(stateStructTy, self,
+                                                       CURRENT_VAL_FIELD);
+            llvm::Value* curVal  = cb.CreateLoad(elemTy, cvField, "tc.cur");
+            llvm::Value* isNull  = cb.CreateICmpEQ(
+                curVal, llvm::ConstantPointerNull::get(ptrTy()), "tc.isnull");
+            cb.CreateCondBr(isNull, ioeErrBB, tcOkBB);
+
+            cb.SetInsertPoint(ioeErrBB);
+            auto* callocTy  = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocFnV = module_->getOrInsertFunction("calloc", callocTy)
+                                  .getCallee();
+            llvm::Value* excObj = cb.CreateCall(
+                callocTy, callocFnV,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), 16)},
+                "tc.excobj");
+            auto vit = builtinVtable_.find("InvalidOperationException");
+            if (vit != builtinVtable_.end())
+                cb.CreateStore(vit->second, excObj);
+            auto* excAddrTy  = llvm::FunctionType::get(ptrTy(), {}, false);
+            auto* excAddrFnV = module_->getOrInsertFunction(
+                                   "bz_exc_addr", excAddrTy).getCallee();
+            llvm::Value* excSlot = cb.CreateCall(excAddrTy, excAddrFnV, {},
+                                                 "tc.exc");
+            cb.CreateStore(excObj, excSlot);
+            cb.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+
+            cb.SetInsertPoint(tcOkBB);
+            cb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), cvField);
+            cb.CreateRet(curVal);
+        } else {
+            llvm::IRBuilder<> cb(entry);
+            llvm::Value* self    = &*currentFn->arg_begin();
+            llvm::Value* cvField = cb.CreateStructGEP(stateStructTy, self,
+                                                       CURRENT_VAL_FIELD);
+            cb.CreateRet(cb.CreateLoad(elemTy, cvField));
+        }
     }
 
     // --- MoveNextAsync: alloc a fresh per-advance Task<bool>, drive Resume ---

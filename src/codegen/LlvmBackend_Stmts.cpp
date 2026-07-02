@@ -4477,13 +4477,17 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     emitPendingCheck();
     builder_.CreateCondBr(moved, bodyBB, endBB);
 
-    // body: call vtable slot 3 (Current)
+    // body: call vtable slot 3 (Current for IEnumerable / TakeCurrent for
+    // OwnedEnumerable — §29.1 v0.161 #1349). emitPendingCheck() after the
+    // call handles the IOE that TakeCurrent raises on protocol misuse (double-
+    // take etc.); for IEnumerable Current the check is a harmless no-op.
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* obj2 = builder_.CreateLoad(ptrTy(), enumSlot);
     llvm::Value* vtable2 = builder_.CreateLoad(ptrTy(), obj2);
     llvm::Value* curSlotPtr = builder_.CreateGEP(ptrTy(), vtable2, {builder_.getInt32(3)});
     llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
     llvm::Value* curVal = builder_.CreateCall(currentTy, curFnPtr, {obj2}, "ib.cur");
+    emitPendingCheck();  // TakeCurrent may raise IOE (#1349)
     builder_.CreateStore(curVal, varSlot);
 
     // §29.7 (#623): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
@@ -4842,7 +4846,8 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     if (!hasValue) return false;
     builder_.CreateCondBr(hasValue, bodyBB, endBB);
 
-    // body: x := Current(enum); run the user body.
+    // body: x := Current(enum) for IAsyncEnumerable / TakeCurrent(enum) for
+    // OwnedAsyncEnumerable (§29.1 v0.161 #1349; same vtable slot 3).
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* enumObj2 = builder_.CreateLoad(ptrTy(), enumSlot);
     llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), enumObj2);
@@ -4851,6 +4856,7 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
     llvm::Value* curVal =
         builder_.CreateCall(currentTy, curFnPtr, {enumObj2}, "afor.cur");
+    emitPendingCheck();  // TakeCurrent may raise IOE on OwnedAsync path (#1349)
     builder_.CreateStore(curVal, varSlot);
 
     // #792 / §29.7: loopScopeDepth = outerDepth (BEFORE the enumerator scope) so

@@ -3359,21 +3359,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                     // issue #494 / §29.2 / §29.3: builtin IEnumerator<T> /
                     // OwnedEnumerator<T> call-expression methods.
-                    //   MoveNext(): bool — advances the iterator (vtable slot 2)
-                    // (Current is a readonly property, typed in resolveMemberAccess.)
+                    //   MoveNext(): bool — advances the iterator (vtable slot 2).
+                    // #1349 / §29.1 v0.161: TakeCurrent(): owned T on
+                    // OwnedEnumerator<T> (replaces destructive Current property).
                     if (colName == "IEnumerator" || colName == "OwnedEnumerator") {
                         if (m == "MoveNext" && ce.args.empty())
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // TakeCurrent() on OwnedEnumerator<T> → T (vtable slot 3).
+                        if (colName == "OwnedEnumerator" &&
+                            m == "TakeCurrent" && ce.args.empty() &&
+                            recvTy && !recvTy->genericArgs.empty() &&
+                            recvTy->genericArgs[0])
+                            ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         // Dispose() → unit; no type needed.
+                    }
+                    // #1349 / §29.1 v0.161: GetOwnedEnumerator() on
+                    // OwnedEnumerable<T> → OwnedEnumerator<T> builtin sentinel
+                    // (no declaration), so TakeCurrent()/MoveNext() typing fires.
+                    if (colName == "OwnedEnumerable" &&
+                        m == "GetOwnedEnumerator" && ce.args.empty() &&
+                        recvTy && !recvTy->genericArgs.empty() &&
+                        recvTy->genericArgs[0]) {
+                        static const ast::Type* kOwnedEnumeratorNode =
+                            []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("OwnedEnumerator");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kOwnedEnumeratorNode;
+                        tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                        ctx_.setExprType(&ce, tr);
                     }
                     // issue #759 / §29.3 / §30.7 / stdlib §4.13: builtin
                     // IAsyncEnumerator<T> / OwnedAsyncEnumerator<T> manual
                     // protocol. MoveNextAsync(): Task<bool> — advances the async
                     // iterator (vtable slot 2). The `await` typer then peels
-                    // Task<bool> → bool. (Current is a readonly property typed in
-                    // resolveMemberAccess below.) makeTaskTypeRef is defined later
-                    // in this function (out of scope here), so build Task<bool>
-                    // inline — a Named "Task" ast::Type with genericArgs=[Bool].
+                    // Task<bool> → bool. makeTaskTypeRef is defined later in this
+                    // function (out of scope here), so build Task<bool> inline.
+                    // #1349 / §29.1 v0.161: TakeCurrent() on
+                    // OwnedAsyncEnumerator<T> → T (vtable slot 3).
                     if (colName == "IAsyncEnumerator" ||
                         colName == "OwnedAsyncEnumerator") {
                         if (m == "MoveNextAsync" && ce.args.empty()) {
@@ -3390,6 +3420,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.primitiveTypeRef(P::Bool));
                             ctx_.setExprType(&ce, taskBool);
                         }
+                        // TakeCurrent() on OwnedAsyncEnumerator<T> → T (#1349).
+                        if (colName == "OwnedAsyncEnumerator" &&
+                            m == "TakeCurrent" && ce.args.empty() &&
+                            recvTy && !recvTy->genericArgs.empty() &&
+                            recvTy->genericArgs[0])
+                            ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         // DisposeAsync()/Dispose() → Task/unit; no type needed.
                     }
                     // issue #757 / §30.7: a direct GetAsyncEnumerator(token) on a
@@ -7294,20 +7330,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
         // issue #494 / §29.2 / §29.3: `e.Current` property access where `e` is
-        // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
-        // TypeDecl). Current returns T (the first generic arg). Typing this lets
-        // `var x := e.Current` and `s := s + e.Current` infer the element type.
+        // typed as the builtin IEnumerator<T> (no sema TypeDecl). Current returns
+        // T (the first generic arg). Typing this lets `var x := e.Current` and
+        // `s := s + e.Current` infer the element type.
+        // #1349 / §29.1 v0.161: OwnedEnumerator<T> and OwnedAsyncEnumerator<T>
+        // no longer have Current — they use TakeCurrent() (a method call). Only
+        // the borrowing IEnumerator<T> / IAsyncEnumerator<T> retain the property.
         if (ma.target && ma.member == "Current") {
             if (auto* tt = ctx_.exprType(*ma.target)) {
                 bool isBuiltinEnumerator =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
-                    // issue #759: the async enumerators expose Current: T too.
+                    // issue #759: async enumerators also use Current: T.
+                    // #1349: OwnedEnumerator/OwnedAsyncEnumerator excluded.
                     (tt->astNode->name->parts[0] == "IEnumerator" ||
-                     tt->astNode->name->parts[0] == "OwnedEnumerator" ||
-                     tt->astNode->name->parts[0] == "IAsyncEnumerator" ||
-                     tt->astNode->name->parts[0] == "OwnedAsyncEnumerator");
+                     tt->astNode->name->parts[0] == "IAsyncEnumerator");
                 if (isBuiltinEnumerator && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                     ctx_.setExprType(&ma, tt->genericArgs[0]);

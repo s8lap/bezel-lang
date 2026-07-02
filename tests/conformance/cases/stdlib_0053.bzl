@@ -3,6 +3,6 @@ public interface OwnedEnumerable<T>: IDisposable where T: class
 end OwnedEnumerable;
 
 public interface OwnedEnumerator<T>: IDisposable where T: class
-  readonly property Current: owned T;   // destructive: transfers ownership
+  method TakeCurrent(): owned T;        // transfers ownership (v0.161; was destructive property Current)
   method MoveNext(): bool;
 end OwnedEnumerator;

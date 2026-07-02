@@ -11517,9 +11517,28 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                             ownedPopDequeue =
                                 rcn == "OwnedStack" || rcn == "OwnedQueue";
                         }
+                        // #1349 / §29.1 v0.161: OwnedEnumerator<T>.TakeCurrent()
+                        // and OwnedAsyncEnumerator<T>.TakeCurrent() transfer the
+                        // owned element to the caller (vtable slot 3). Gate on the
+                        // OWNING receiver type so a hypothetical user-defined
+                        // TakeCurrent on another type is not mistakenly disposed.
+                        bool ownedTakeCurrent = false;
+                        if (nm == "TakeCurrent" && ma->target) {
+                            const sema::TypeRef* rt =
+                                ctx_.exprType(*ma->target);
+                            std::string_view rcn =
+                                (rt && rt->astNode && rt->astNode->name &&
+                                 !rt->astNode->name->parts.empty())
+                                    ? rt->astNode->name->parts[0]
+                                    : std::string_view{};
+                            ownedTakeCurrent =
+                                rcn == "OwnedEnumerator" ||
+                                rcn == "OwnedAsyncEnumerator";
+                        }
                         if (nm == "PopLast" || nm == "PopFirst" ||
                             nm == "PopAt"   || nm == "PopValue" ||
-                            nm == "Deserialize" || ownedPopDequeue) {
+                            nm == "Deserialize" || ownedPopDequeue ||
+                            ownedTakeCurrent) {
                             // Only register if the element class has a disposer
                             // (vtable slot 2 non-null).  Interface-typed results
                             // always dispatch dynamically and always have a vtable,

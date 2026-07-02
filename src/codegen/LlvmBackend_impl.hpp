@@ -5607,17 +5607,23 @@ private:
     // §29.2: `for var x in obj` over a user-defined IEnumerable<T> type,
     // or over a runtime Array<T>/collection when the iterable's type has
     // a concrete GetEnumerator() / MoveNext() / Current interface.
-    // Desugar per spec:
+    // Desugar per spec (IEnumerable):
     //   using var __enum := obj.GetEnumerator();
     //   while __enum.MoveNext() do
-    //     var x := __enum.Current;
+    //     var x := __enum.Current;   // borrowing
+    //     body
+    //   end;
+    // Desugar per spec (OwnedEnumerable, §29.2/v0.161/#1349):
+    //   using var __enum := obj.GetOwnedEnumerator();
+    //   while __enum.MoveNext() do
+    //     var x := __enum.TakeCurrent();  // ownership transfer
     //     body
     //   end;
     //   __enum.Dispose();   ← via disposeStack_ at scope exit
     // §29.2 (B1): `for var x in items` where items is typed as IEnumerable<T> /
-    // IReadOnlyCollection<T> etc. with null declaration (builtin interface).
-    // Uses the vtable protocol (MoveNext at slot 2, Current at slot 3) which
-    // works for BOTH iterator state machines AND Array<T> (via its vtable).
+    // OwnedEnumerable<T> / IReadOnlyCollection<T> etc. with null declaration (builtin interface).
+    // Uses the vtable protocol (MoveNext at slot 2, Current/TakeCurrent at slot 3)
+    // which works for BOTH iterator state machines AND Array<T> (via its vtable).
     // If the actual runtime object is a bz_array_t, falls back to direct loop.
     bool lowerIEnumerableBuiltinFor(const ast::ForStmt& fs);
 

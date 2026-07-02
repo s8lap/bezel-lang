@@ -759,6 +759,7 @@ set(BEZEL_TEST_SOURCES
     codegen/codegen_unimplemented_hard_error_628_test.cpp
     codegen/owned_dict_drain_628_test.cpp
     codegen/owned_drain_639_test.cpp
+    codegen/owning_enumerator_1349_test.cpp  # fix #1349: TakeCurrent() replaces destructive Current on OwnedEnumerator<T>; IOE on misuse (§29.1 v0.161)
     codegen/generic_owned_drain_990_test.cpp           # fix #990: §4.5/§14.2 generic OwnedArray/Stack/Queue/LinkedList<T>.Drain() compiles (no ptr→i32 IR_FAIL) and disposes each drained element exactly once
     codegen/owned_collection_accessors_test.cpp
     codegen/user_exception_unqualified_msg_625_test.cpp

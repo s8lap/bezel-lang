@@ -457,13 +457,28 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // Determine element type T from the return type's generic arg.
     llvm::Type* elemTy = i32();  // default
     const sema::TypeRef* elemSemaTy = nullptr;  // #1102B
+    // Compute the return type name once — used by both elemIsOwnedClass and
+    // isOwningIter below.
+    std::string_view retName;
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
+        if (retRef && retRef->astNode && retRef->astNode->name &&
+            !retRef->astNode->name->parts.empty())
+            retName = retRef->astNode->name->parts[0];
+        else if (retRef && !retRef->importedName.empty())
+            retName = retRef->importedName;
         if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
             elemSemaTy = retRef->genericArgs[0];
             elemTy = lowerTypeRef(elemSemaTy);
         }
     }
+
+    // #1349 / §29.1 v0.161: true when the return type is OwnedEnumerable<T> —
+    // ownership transfers from the iterator to the consumer at each TakeCurrent()
+    // call. TakeCurrent (vtable slot 3) checks for null (before-first-advance /
+    // after-exhaustion / double-take) and raises InvalidOperationException.
+    // The iterator nulls current_val after transfer and on exhaustion.
+    bool isOwningIter = (retName == "OwnedEnumerable");
 
     // §29 (#1120): true when T is an owned class or interface AND the return type
     // is IEnumerable<T> (or a related non-owning interface) — meaning the
@@ -473,7 +488,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // value types and never need this.
     //
     // Excluded: OwnedEnumerable<T> iterators transfer ownership of each yielded
-    // value to the consumer loop variable on each MoveNext call — the consumer
+    // value to the consumer via TakeCurrent() on each MoveNext call — the consumer
     // (not the enumerator) is responsible for disposing it; the enumerator must
     // NOT also dispose current_val or the result is a double-free.
     bool elemIsOwnedClass = false;
@@ -482,16 +497,6 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         elemSemaTy->declaration != nullptr &&
         (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
          elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
-        // Check the return type name is NOT OwnedEnumerable.
-        std::string_view retName;
-        if (ci.returnType) {
-            auto* retRef = ctx_.resolvedType(*ci.returnType);
-            if (retRef && retRef->astNode && retRef->astNode->name &&
-                !retRef->astNode->name->parts.empty())
-                retName = retRef->astNode->name->parts[0];
-            else if (retRef && !retRef->importedName.empty())
-                retName = retRef->importedName;
-        }
         if (retName != "OwnedEnumerable")
             elemIsOwnedClass = true;
     }
@@ -674,12 +679,58 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     }
 
     // --- Current: load current_val from struct ---
+    // For OwnedEnumerable<T> iterators this implements TakeCurrent() (vtable slot 3):
+    // check current_val for null (before-first-advance / after-exhaustion /
+    // double-take) → raise InvalidOperationException; on success, null the slot
+    // and return the value. Per §29.1 v0.161 / #1349.
     {
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", currentFn);
-        llvm::IRBuilder<> cb(entry);
-        llvm::Value* self = &*currentFn->arg_begin();
-        llvm::Value* cvField = cb.CreateStructGEP(stateStructTy, self, CURRENT_VAL_FIELD);
-        cb.CreateRet(cb.CreateLoad(elemTy, cvField));
+        if (isOwningIter && elemTy->isPointerTy()) {
+            // #1349 / §29.1 v0.161: TakeCurrent with IOE guard.
+            auto* ioeErrBB = llvm::BasicBlock::Create(llvm_, "tc.ioe",  currentFn);
+            auto* tcOkBB   = llvm::BasicBlock::Create(llvm_, "tc.ok",   currentFn);
+            llvm::IRBuilder<> cb(entry);
+            llvm::Value* self     = &*currentFn->arg_begin();
+            llvm::Value* cvField  = cb.CreateStructGEP(stateStructTy, self,
+                                                        CURRENT_VAL_FIELD);
+            llvm::Value* curVal   = cb.CreateLoad(elemTy, cvField, "tc.cur");
+            llvm::Value* isNull   = cb.CreateICmpEQ(
+                curVal, llvm::ConstantPointerNull::get(ptrTy()), "tc.isnull");
+            cb.CreateCondBr(isNull, ioeErrBB, tcOkBB);
+
+            // IOE path: allocate exception object, store vtable, signal via
+            // bz_exc_addr(), return null so the caller can emitPendingCheck().
+            cb.SetInsertPoint(ioeErrBB);
+            auto* callocTy  = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocFnV = module_->getOrInsertFunction("calloc", callocTy)
+                                  .getCallee();
+            llvm::Value* excObj = cb.CreateCall(
+                callocTy, callocFnV,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), 16)},
+                "tc.excobj");
+            auto vit = builtinVtable_.find("InvalidOperationException");
+            if (vit != builtinVtable_.end())
+                cb.CreateStore(vit->second, excObj);
+            auto* excAddrTy  = llvm::FunctionType::get(ptrTy(), {}, false);
+            auto* excAddrFnV = module_->getOrInsertFunction(
+                                   "bz_exc_addr", excAddrTy).getCallee();
+            llvm::Value* excSlot = cb.CreateCall(excAddrTy, excAddrFnV, {}, "tc.exc");
+            cb.CreateStore(excObj, excSlot);
+            cb.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+
+            // OK path: null the slot (transfer ownership), return value.
+            cb.SetInsertPoint(tcOkBB);
+            cb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), cvField);
+            cb.CreateRet(curVal);
+        } else {
+            // Borrowing iterator (IEnumerable<T>): plain load.
+            llvm::IRBuilder<> cb(entry);
+            llvm::Value* self    = &*currentFn->arg_begin();
+            llvm::Value* cvField = cb.CreateStructGEP(stateStructTy, self,
+                                                       CURRENT_VAL_FIELD);
+            cb.CreateRet(cb.CreateLoad(elemTy, cvField));
+        }
     }
 
     // --- MoveNext: the state machine body ---
@@ -795,6 +846,18 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 builder_.CreateStore(builder_.getInt8(0), ownedFld);
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
+            }
+            // #1349 / §29.1 v0.161: for OwnedEnumerable<T> iterators, null
+            // current_val on exhaustion so TakeCurrent raises IOE afterwards.
+            // In the normal for-loop protocol TakeCurrent already nulled it, but
+            // defensive null on the exhaustion path covers manual-protocol usage
+            // where MoveNext returning false without a prior TakeCurrent is
+            // possible (e.g. zero-element owning iterator, or skip pattern).
+            if (isOwningIter && elemTy->isPointerTy()) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
             }
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRet(builder_.getFalse());
@@ -934,8 +997,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // Runs for BOTH source (disposeOwned=true) and clone (disposeOwned=false)
         // Dispose: the source's current_val is always null (GetEnumerator resets
         // it) so it's a guaranteed no-op for the source.
+        //
+        // #1349 / §29.1 v0.161: additionally, for OwnedEnumerable<T> iterators
+        // (isOwningIter), the enumerator always owns current_val (no owned-flag
+        // needed); if it is non-null when Dispose is called the consumer never
+        // called TakeCurrent (manual-protocol abandonment) and we must dispose.
         auto disposeYieldedVal = [&]() {
-            if (!elemIsOwnedClass) return;
+            if (!elemIsOwnedClass && !isOwningIter) return;
             llvm::Value* cvField = builder_.CreateStructGEP(
                 stateStructTy, self, CURRENT_VAL_FIELD);
             llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "ity.yv");
@@ -947,29 +1015,40 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 llvm_, "ity.yv.cont", targetFn);
             builder_.CreateCondBr(isNull, contBB, nonNullBB);
             builder_.SetInsertPoint(nonNullBB);
-            llvm::Value* ownedFld = builder_.CreateStructGEP(
-                stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
-            llvm::Value* ownedByte =
-                builder_.CreateLoad(i8(), ownedFld, "ity.yvowned");
-            llvm::Value* isOwned = builder_.CreateICmpNE(
-                ownedByte, builder_.getInt8(0), "ity.yvisowned");
-            auto* dispBB = llvm::BasicBlock::Create(
-                llvm_, "ity.yv.disp", targetFn);
-            auto* skipBB = llvm::BasicBlock::Create(
-                llvm_, "ity.yv.skip", targetFn);
-            auto* afterBB = llvm::BasicBlock::Create(
-                llvm_, "ity.yv.after", targetFn);
-            builder_.CreateCondBr(isOwned, dispBB, skipBB);
-            builder_.SetInsertPoint(dispBB);
-            emitDisposeAndReclaim(yv);
-            builder_.CreateBr(afterBB);
-            builder_.SetInsertPoint(skipBB);
-            builder_.CreateBr(afterBB);
-            builder_.SetInsertPoint(afterBB);
-            builder_.CreateStore(
-                llvm::ConstantPointerNull::get(ptrTy()), cvField);
-            builder_.CreateStore(builder_.getInt8(0), ownedFld);
-            builder_.CreateBr(contBB);
+            if (isOwningIter) {
+                // #1349: OwnedEnumerable<T> — enumerator always owns a
+                // non-null current_val (consumer didn't call TakeCurrent);
+                // dispose it unconditionally then null the slot.
+                emitDisposeAndReclaim(yv);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateBr(contBB);
+            } else {
+                // §29 (#1120): IEnumerable<owned T> — check owned flag.
+                llvm::Value* ownedFld = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
+                llvm::Value* ownedByte =
+                    builder_.CreateLoad(i8(), ownedFld, "ity.yvowned");
+                llvm::Value* isOwned = builder_.CreateICmpNE(
+                    ownedByte, builder_.getInt8(0), "ity.yvisowned");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.yv.disp", targetFn);
+                auto* skipBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.yv.skip", targetFn);
+                auto* afterBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.yv.after", targetFn);
+                builder_.CreateCondBr(isOwned, dispBB, skipBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(yv);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(skipBB);
+                builder_.CreateBr(afterBB);
+                builder_.SetInsertPoint(afterBB);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateStore(builder_.getInt8(0), ownedFld);
+                builder_.CreateBr(contBB);
+            }
             builder_.SetInsertPoint(contBB);
         };
 
