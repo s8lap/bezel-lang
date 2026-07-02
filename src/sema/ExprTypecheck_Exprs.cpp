@@ -1901,8 +1901,29 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         }
         return nullptr;
     };
-    if (auto* m = tryOperand(be.left.get())) return m;
-    return tryOperand(be.right.get());
+    MethodSymbol* fromLeft = tryOperand(be.left.get());
+    MethodSymbol* fromRight = tryOperand(be.right.get());
+    // §25.2 (#1347, v0.160): if distinct applicable overloads are found on
+    // BOTH operand types, the expression is a compile error. The compiler
+    // declines to guess which is intended (mirroring §22.6's overload-
+    // resolution stance). Operands of the same type find the same symbol —
+    // `fromLeft == fromRight` — which is unambiguous and not an error.
+    if (fromLeft && fromRight && fromLeft != fromRight) {
+        // Collect the declaring-type names for the error message.
+        std::string leftTypeName, rightTypeName;
+        if (fromLeft->parent)  leftTypeName  = std::string(fromLeft->parent->name);
+        if (fromRight->parent) rightTypeName = std::string(fromRight->parent->name);
+        ctx_.diagnostics().report(
+            Severity::Error, be.span.begin,
+            "ambiguous operator `" + std::string(be.op) + "`: distinct "
+            "applicable overloads found on both operand types "
+            "(candidates: `" + leftTypeName + "::operator " +
+            std::string(be.op) + "` and `" + rightTypeName +
+            "::operator " + std::string(be.op) + "`) — "
+            "remove a conflicting import or qualify the call (§25.2)");
+        return nullptr;
+    }
+    return fromLeft ? fromLeft : fromRight;
 }
 
 void ExprTC::typeBinary(const ast::BinaryExpr& be) {

@@ -1088,6 +1088,46 @@ void Resolver::checkOperatorGroups() {
                     "` may not be overloaded (§25.1)");
                 continue;
             }
+            // §25 (#1347, v0.160): operators must be declared `public`. An
+            // operator invoked through `a + b` syntax has no call-site spelling
+            // that could name a restricted member; any other visibility is a
+            // compile error (Appendix A.4's OperatorDecl requires `public`).
+            if (ms->visibility != ast::Visibility::Public) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "operator `" + std::string(tok) + "` must be `public` — "
+                    "operators are declared `public static` and invoked through "
+                    "infix syntax with no call-site spelling for a restricted "
+                    "member (§25)");
+            }
+            // §25.2 (#1347, v0.160): at least one parameter of an operator
+            // overload must be the declaring type. An operator whose parameters
+            // never mention the declaring type would be unreachable by the
+            // resolution rule (which consults the static types of both operands).
+            {
+                bool hasDeclaringTypeParam = false;
+                for (Symbol* ps : ms->params) {
+                    auto* param = dynamic_cast<ParameterSymbol*>(ps);
+                    if (!param) continue;
+                    TypeRef* pt = param->declType
+                                  ? ctx_.resolvedType(*param->declType)
+                                  : param->resolvedDeclType;
+                    if (pt && pt->kind == TypeRef::Kind::Named &&
+                        pt->declaration == t) {
+                        hasDeclaringTypeParam = true;
+                        break;
+                    }
+                }
+                if (!hasDeclaringTypeParam) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        "at least one parameter of operator `" +
+                        std::string(tok) + "` must be the declaring type `" +
+                        std::string(t->name) +
+                        "` — an operator with no declaring-type parameter is "
+                        "unreachable by the resolution rule (§25.2)");
+                }
+            }
             if (tok == "<" || tok == ">" || tok == "<=" || tok == ">=") {
                 if (!cmpFirst) cmpFirst = m;
                 if (tok == "<") lt = true;

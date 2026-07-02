@@ -163,3 +163,160 @@ BEZEL_TEST(sema_extension, plain_method_in_extension_still_accepted_936) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// §26.3 (#1346, v0.160) — extension member visibility must be public or
+// internal; `protected` and `private` are compile errors.
+// ---------------------------------------------------------------------------
+
+// §26.3 (#1346): `protected` extension method → error.
+BEZEL_TEST(sema_extension, protected_method_in_extension_rejected_1346) {
+    auto r = parseSemaAll(
+        "module M; class Foo public _x: int := 0; end Foo; "
+        "extension Foo protected method Bar(): int => this._x; end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("protected") != std::string::npos &&
+            d.message.find("26.3") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §26.3 (#1346): `private` extension method → error.
+BEZEL_TEST(sema_extension, private_method_in_extension_rejected_1346) {
+    auto r = parseSemaAll(
+        "module M; class Foo public _x: int := 0; end Foo; "
+        "extension Foo private method Bar(): int => this._x; end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("private") != std::string::npos &&
+            d.message.find("26.3") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §26.3 (#1346): `public` extension method → accepted (no error).
+BEZEL_TEST(sema_extension, public_method_in_extension_accepted_1346) {
+    auto r = parseSemaAll(
+        "module M; class Foo public _x: int := 0; end Foo; "
+        "extension Foo public method Bar(): int => this._x; end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §26.3 (#1346): `internal` (default) extension method → accepted (no error).
+BEZEL_TEST(sema_extension, internal_method_in_extension_accepted_1346) {
+    auto r = parseSemaAll(
+        "module M; class Foo public _x: int := 0; end Foo; "
+        "extension Foo internal method Bar(): int => this._x; end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// §26.3 (#1346, v0.160) — extension properties must be expression-bodied.
+// Auto-property and block-accessor forms are not admitted.
+// ---------------------------------------------------------------------------
+
+// §26.3 (#1346): auto-property in extension → error.
+BEZEL_TEST(sema_extension, auto_property_in_extension_rejected_1346) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension int public property X: int := 0; end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("26.3") != std::string::npos) found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §26.3 (#1346): expression-bodied property in extension → accepted (no error).
+BEZEL_TEST(sema_extension, expr_property_in_extension_accepted_1346) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension int public property Doubled: int => this * 2; end; "
+        "class C public static method Main(): int "
+        "  var x: int := 3; return x.Doubled; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §26.3 (#1346): regression — `extension Dictionary<K, V>` (two bare
+// type-params) continues to work; no shadowing warning, no visibility error.
+BEZEL_TEST(sema_extension, generic_extension_two_params_accepted_1346) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension Dictionary<K, V> "
+        "  public method IsEmpty(): bool => this.Count = 0; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §26.3 (#1346): regression — `extension IEnumerable<int>` (concrete arg)
+// continues to work.
+BEZEL_TEST(sema_extension, concrete_arg_extension_accepted_1346) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<int> "
+        "  public method Sum(): int "
+        "    var total: int := 0; "
+        "    for var x in this do total := total + x; end; "
+        "    return total; "
+        "  end Sum; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// §26.4 (#1346, v0.160) — shadowing warning when a bare type-param name in
+// an extension block shadows a same-named type already in scope.
+// ---------------------------------------------------------------------------
+
+// §26.4 (#1346): bare param shadows an in-scope user type → warning.
+BEZEL_TEST(sema_extension, type_param_shadows_in_scope_type_warns_1346) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record T(value: int); "   // T is now a type in scope
+        "extension IEnumerable<T> "  // T here should warn: shadows record T
+        "  public method First(): T "
+        "    for var item in this do return item; end; "
+        "    throw new InvalidOperationException(\"empty\"); "
+        "  end First; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    // Must produce a WARNING (Severity::Warning) but not a compile error.
+    bool hasWarning = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("shadows") != std::string::npos &&
+            d.message.find("26.4") != std::string::npos)
+            hasWarning = true;
+    BEZEL_EXPECT_TRUE(hasWarning);
+}
+
+// §26.4 (#1346): bare param with no same-named type in scope → no warning.
+BEZEL_TEST(sema_extension, type_param_no_shadow_no_warn_1346) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<T> "  // T is NOT in scope as a type
+        "  public method First(): T "
+        "    for var item in this do return item; end; "
+        "    throw new InvalidOperationException(\"empty\"); "
+        "  end First; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    // Must NOT produce a shadowing warning.
+    bool hasWarning = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("shadows") != std::string::npos)
+            hasWarning = true;
+    BEZEL_EXPECT_FALSE(hasWarning);
+}

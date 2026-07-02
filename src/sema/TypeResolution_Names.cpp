@@ -243,7 +243,29 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                     ga->name && ga->name->parts.size() == 1 &&
                     !ga->nullable) {
                     // Single-part bare name: treat as a type parameter.
-                    extScope.names[ga->name->parts[0]] = nullptr;
+                    std::string_view paramName = ga->name->parts[0];
+                    // §26.4 (#1346, v0.160): warn when the bare identifier that
+                    // becomes a block-level type parameter shadows a same-named
+                    // type already in scope. The binding is always the extension's
+                    // type parameter (action-at-a-distance would silently re-mean
+                    // the block if we fell back to the scope-found type), but a
+                    // shadowing author may not have intended the override.
+                    for (Scope* s = parent; s; s = s->parent) {
+                        auto it = s->names.find(paramName);
+                        if (it != s->names.end()) {
+                            if (it->second != nullptr) {
+                                ctx_.diagnostics().report(
+                                    Severity::Warning, ga->span.begin,
+                                    "type parameter `" + std::string(paramName) +
+                                    "` in this extension block shadows the type `" +
+                                    std::string(it->second->name) +
+                                    "` that is in scope (§26.4); the extension "
+                                    "type parameter always takes precedence");
+                            }
+                            break;
+                        }
+                    }
+                    extScope.names[paramName] = nullptr;
                 }
             }
         }

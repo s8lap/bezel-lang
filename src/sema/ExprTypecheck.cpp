@@ -2562,6 +2562,47 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     "`operator " + std::string(od->opToken) + "` (§26.3)");
                 continue;
             }
+            // §26.3 (#1346, v0.160): extension members must be `public` or
+            // `internal`; `protected` and `private` are compile errors — an
+            // extension block has no declaring class and no inheritance, so
+            // §13.1's definitions for those levels do not apply.
+            {
+                ast::Visibility vis = ast::Visibility::None;
+                SourceLocation loc{};
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                    vis = md->visibility; loc = md->span.begin;
+                } else if (auto* pd =
+                               dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                    vis = pd->visibility; loc = pd->span.begin;
+                }
+                if (vis == ast::Visibility::Protected ||
+                    vis == ast::Visibility::Private) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "extension members must be `public` or `internal`; "
+                        "`" + std::string(vis == ast::Visibility::Protected
+                                          ? "protected" : "private") +
+                        "` is not permitted — an extension block has no "
+                        "declaring class (§26.3)");
+                }
+            }
+            // §26.3 (#1346, v0.160): extension properties are expression-bodied
+            // only (`property Name: Type => expr;`); the block-accessor and
+            // auto-property forms are not admitted in extension blocks.
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                if (pd->bodyKind != ast::PropertyBodyKind::Expression) {
+                    std::string_view formName =
+                        (pd->bodyKind == ast::PropertyBodyKind::Block)
+                        ? "block-accessor" : "auto-property";
+                    ctx_.diagnostics().report(
+                        Severity::Error, pd->span.begin,
+                        "extension properties must be expression-bodied "
+                        "(`property Name: Type => expr;`); the " +
+                        std::string(formName) +
+                        " form is not admitted in extension blocks (§26.3)");
+                    continue;
+                }
+            }
             visitMember(*m);
         }
         currentType_ = save;

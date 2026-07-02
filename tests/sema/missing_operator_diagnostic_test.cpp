@@ -473,3 +473,177 @@ BEZEL_TEST(generic_operator_mismatched_instantiation_1270,
         "  var r := a + b; return r.value; end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// §25 (#1347, v0.160): operators must be declared `public`.
+// Non-public (internal, private, protected) operator declarations are errors.
+// ---------------------------------------------------------------------------
+
+// §25 (#1347): `internal` operator → error citing §25.
+BEZEL_TEST(operator_visibility_1347, internal_operator_rejected_spec_25) {
+    auto r = parseSema(
+        "module M; record Vec(X: int) "
+        "  internal static method operator +(a: Vec, b: Vec): Vec => "
+        "    new Vec(a.X + b.X); "
+        "end Vec; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "25"));
+}
+
+// §25 (#1347): `private` operator → error citing §25.
+BEZEL_TEST(operator_visibility_1347, private_operator_rejected_spec_25) {
+    auto r = parseSema(
+        "module M; record Vec(X: int) "
+        "  private static method operator +(a: Vec, b: Vec): Vec => "
+        "    new Vec(a.X + b.X); "
+        "end Vec; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "25"));
+}
+
+// §25 (#1347) CONTROL: `public` operator → no visibility error.
+BEZEL_TEST(operator_visibility_1347, public_operator_unaffected_spec_25) {
+    auto r = parseSema(
+        "module M; record Vec(X: int) "
+        "  public static method operator +(a: Vec, b: Vec): Vec => "
+        "    new Vec(a.X + b.X); "
+        "end Vec; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// §25.2 (#1347, v0.160): at least one parameter of an operator overload must
+// be the declaring type.
+// ---------------------------------------------------------------------------
+
+// §25.2 (#1347): operator with no declaring-type parameter → error.
+BEZEL_TEST(operator_declaring_type_1347, no_declaring_type_param_rejected_25_2) {
+    auto r = parseSema(
+        "module M; "
+        "record A(X: int); "
+        "record B(Y: int); "
+        "record Ops(Z: int) "
+        "  public static method operator +(a: A, b: B): int => a.X + b.Y; "
+        "end Ops; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "25.2"));
+}
+
+// §25.2 (#1347) CONTROL: first param is declaring type → OK.
+BEZEL_TEST(operator_declaring_type_1347, first_param_declaring_type_ok_25_2) {
+    auto r = parseSema(
+        "module M; record Vec(X: int) "
+        "  public static method operator +(a: Vec, b: Vec): Vec => "
+        "    new Vec(a.X + b.X); "
+        "end Vec; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §25.2 (#1347) CONTROL: second param is declaring type (cross-type, like
+// TimeSpan `operator +(duration, offset: TimeSpan)`) → OK.
+BEZEL_TEST(operator_declaring_type_1347, second_param_declaring_type_ok_25_2) {
+    auto r = parseSema(
+        "module M; record Offset(N: int); "
+        "record Duration(Ticks: int) "
+        "  public static method operator +(a: Offset, b: Duration): Duration => "
+        "    new Duration(a.N + b.Ticks); "
+        "end Duration; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// §25.2 (#1347, v0.160): ambiguity — distinct overloads on both operand types
+// → compile error citing candidates.
+// ---------------------------------------------------------------------------
+
+// §25.2 (#1347): `a + b` where A and B each declare an applicable operator
+// `+` → ambiguity error.
+BEZEL_TEST(operator_ambiguity_1347, both_operand_types_have_operator_error_25_2) {
+    auto r = parseSema(
+        "module M; "
+        "record A(X: int) "
+        "  public static method operator +(a: A, b: B): int => a.X + b.Y; "
+        "end A; "
+        "record B(Y: int) "
+        "  public static method operator +(a: A, b: B): int => a.X + b.Y; "
+        "end B; "
+        "class C public static method Main(): int "
+        "  var a := new A(1); var b := new B(2); "
+        "  var r := a + b; return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // The error should mention ambiguity.
+    BEZEL_EXPECT_TRUE(anyMessageMentions(r, "ambiguous"));
+}
+
+// §25.2 (#1347) CONTROL: same-type operands — both sides find the SAME
+// operator symbol → NOT ambiguous (fromLeft == fromRight).
+BEZEL_TEST(operator_ambiguity_1347, same_type_operands_not_ambiguous_25_2) {
+    auto r = parseSema(
+        "module M; record V(X: int) "
+        "  public static method operator +(a: V, b: V): V => "
+        "    new V(a.X + b.X); "
+        "end V; "
+        "class C public static method Main(): int "
+        "  var a := new V(1); var b := new V(2); "
+        "  var r := a + b; return r.X; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §25.2 (#1347) CONTROL: only left operand's type has matching operator →
+// unambiguous, no error.
+BEZEL_TEST(operator_ambiguity_1347, only_left_type_has_operator_ok_25_2) {
+    auto r = parseSema(
+        "module M; "
+        "record Scale(F: int); "
+        "record V(X: int) "
+        "  public static method operator *(a: V, b: Scale): V => "
+        "    new V(a.X * b.F); "
+        "end V; "
+        "class C public static method Main(): int "
+        "  var v := new V(3); var s := new Scale(2); "
+        "  var r := v * s; return r.X; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §25.2 (#1347) CONTROL: no auto-commutation — `4 - v` does not match
+// `operator -(v: V, n: int)`. The expression is rejected (no int operator -
+// on V).
+BEZEL_TEST(operator_ambiguity_1347, no_auto_commutation_literal_minus_v_spec_25_2) {
+    auto r = parseSema(
+        "module M; record V(X: int) "
+        "  public static method operator -(a: V, n: int): V => new V(a.X - n); "
+        "end V; "
+        "class C public static method Main(): int "
+        "  var v := new V(10); "
+        "  var r := 4 - v; return 0; "  // `4 - v` ≠ operator-(v: V, n: int)
+        "end M; end C;");
+    // `4 - v`: left=int, right=V. V's `operator -` expects (V, int) but we
+    // have (int, V) — parameters don't match in order. No commutation. Error.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §25.2 (#1347) CONTROL: cross-type operator (DateTime/TimeSpan style) — both
+// operand types' union is the candidate set, and one type's operator matches.
+BEZEL_TEST(operator_ambiguity_1347, cross_type_operator_works_spec_25_2) {
+    auto r = parseSema(
+        "module M; "
+        "record Span(N: int); "
+        "record Moment(T: int) "
+        "  public static method operator +(m: Moment, s: Span): Moment => "
+        "    new Moment(m.T + s.N); "
+        "end Moment; "
+        "class C public static method Main(): int "
+        "  var m := new Moment(10); var s := new Span(5); "
+        "  var r := m + s; return r.T; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
