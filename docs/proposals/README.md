@@ -12,7 +12,13 @@ Conventions:
 | # | Proposal | Status | Tracking |
 |---|----------|--------|----------|
 | 0001 | [Networking and the `Http` client](0001-networking-http.md) | draft | [#1376](https://github.com/s8lap/bezel-lang/issues/1376) |
-- **0002 — The `Http` server** (`0002-http-server.md`): minimal-API/Express-shaped routing over the fetch-symmetric Request→Response vocabulary of 0001; handlers on worker domains with compile-time sendability; draft for owner review.
-- **Stdlib gap review 2026-07** (`stdlib-gap-review-2026-07.md`): 31 ranked gaps across 9 domains + 8 declined-with-reasons + wave sequencing; the map the 0003+ proposals draw from.
-- **Declined register** (`DECLINED.md`): declined-with-reasons directions (D-0001 DI container; pointers to the gap review's eight).
-- **Networking design comparison** (`networking-design-comparison.md`): recorded pros/cons of 0001/0002 vs .NET, fetch, Node/Express, Go, Rust — the two structural bets (fetch symmetry; guarantees over batteries) with costs stated plainly.
+| 0002 | [The `Http` server](0002-http-server.md) — minimal-API routing over 0001's fetch-symmetric vocabulary; named-method handlers (§2.1); sendability-checked worker domains | draft | [#1402](https://github.com/s8lap/bezel-lang/issues/1402) |
+| 0003 | [`Locked<T>` / `RwLocked<T>`](0003-locked-t.md) — data-owning locks joining the §22.12 synchronized set; guard scope = critical section via the existing borrow rules | draft | [#1404](https://github.com/s8lap/bezel-lang/issues/1404) |
+
+Supporting records (not numbered proposals):
+
+| Record | Purpose |
+|--------|---------|
+| [Stdlib gap review 2026-07](stdlib-gap-review-2026-07.md) | 31 ranked gaps across 9 domains + 8 declined-with-reasons + wave sequencing — the map the 0004+ proposals draw from ([#1403](https://github.com/s8lap/bezel-lang/issues/1403)) |
+| [Networking design comparison](networking-design-comparison.md) | Recorded pros/cons of 0001/0002 vs .NET, fetch, Node/Express, Go, Rust — the two structural bets with costs stated plainly |
+| [DECLINED.md](DECLINED.md) | The declined-with-reasons register (D-0001: DI container; pointers to the gap review's eight) — revisiting requires new evidence, not re-asking |
