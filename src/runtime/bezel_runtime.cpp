@@ -3623,6 +3623,143 @@ struct BzScheduler {
 static BzScheduler* g_scheduler = nullptr;
 
 // ---------------------------------------------------------------------------
+// BzTimer — dedicated timer thread for Task.Delay (#1378)
+//
+// Replaces the previous approach of submitting sleep_for jobs to the worker
+// pool.  With only 4 pool workers, 4 concurrent delays would occupy all
+// workers and block domain work entirely.  A single timer thread owns a
+// min-heap of TimerEntry structs sorted by deadline; delays no longer consume
+// pool slots.
+//
+// Protocol:
+//   schedule(deadline, callback): insert into min-heap; notify the timer thread
+//     only when the new entry is the new earliest deadline (or the heap was
+//     empty), so the thread can shorten its wait.
+//   run(): wait for a non-empty heap, then wait_until the front deadline.
+//     If a new earlier entry arrives (notified), re-examine and re-wait.
+//     When the deadline passes, pop all due entries and call their callbacks
+//     with the heap mutex released (callbacks invoke bz_task_complete which
+//     acquires task->mtx — must not hold heap->mtx simultaneously to avoid
+//     lock-ordering cycles).
+//   shutdown_and_join(): set stop flag, notify, join.
+//
+// The timer thread runs with g_current_domain == null, matching the old pool-
+// worker behaviour (bz_task_complete does not require a domain context).
+//
+// Lifetime: g_timer is created lazily on the first bz_task_delay call and
+// destroyed in bz_scheduler_shutdown BEFORE domain memory is released.
+// ---------------------------------------------------------------------------
+
+struct TimerEntry {
+    std::chrono::steady_clock::time_point deadline;
+    std::function<void()> callback;
+    // min-heap ordering: earlier deadline = higher priority
+    bool operator>(const TimerEntry& o) const { return deadline > o.deadline; }
+};
+
+struct BzTimer {
+    std::priority_queue<TimerEntry,
+                        std::vector<TimerEntry>,
+                        std::greater<TimerEntry>> heap;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stop = false;
+    std::thread thread;
+
+    void run() {
+        std::unique_lock<std::mutex> lk(mtx);
+        for (;;) {
+            // Wait until there is at least one entry or stop is set.
+            cv.wait(lk, [this]{ return stop || !heap.empty(); });
+            if (stop) {
+                // Drain all pending entries before exiting.  This matches the
+                // old pool-worker behaviour where sleep_for jobs were run to
+                // completion during bz_scheduler_shutdown's queue drain: fire-
+                // and-forget tasks and using-var tasks register a continuation
+                // that calls bz_task_free; if the callback never fires the task
+                // struct leaks (detected by LSan, #1378 fix).  We fire
+                // callbacks immediately (without waiting for the deadline) for
+                // any pending entries.  g_scheduler is still live at this
+                // point (timer is shut down BEFORE the pool in bz_scheduler_
+                // shutdown), so domain_enqueue -> g_scheduler->submit is safe.
+                while (!heap.empty()) {
+                    TimerEntry e = heap.top();
+                    heap.pop();
+                    lk.unlock();
+                    e.callback();
+                    lk.lock();
+                }
+                return;
+            }
+
+            // Wait until the front deadline passes.  If a new earlier entry is
+            // inserted, schedule() calls cv.notify_one() and the predicate
+            // becomes true (heap.top().deadline < front), causing early return
+            // so we re-examine the new front.  Spurious wakes are harmless.
+            auto front = heap.top().deadline;
+            cv.wait_until(lk, front, [this, &front]{
+                return stop || heap.empty() || heap.top().deadline < front;
+            });
+            if (stop) continue;  // re-enter loop to drain via the stop path above
+
+            // Pop all entries whose deadline has passed and fire their callbacks.
+            // Release the mutex around each callback: the callback calls
+            // bz_task_complete (acquires task->mtx), and must not hold heap->mtx
+            // at that point to avoid lock-ordering inversion.
+            auto now = std::chrono::steady_clock::now();
+            while (!heap.empty() && heap.top().deadline <= now) {
+                TimerEntry e = heap.top();
+                heap.pop();
+                lk.unlock();
+                e.callback();   // g_current_domain == null, same as old pool workers
+                lk.lock();
+                now = std::chrono::steady_clock::now();
+            }
+        }
+    }
+
+    // Insert a timer entry.  Notifies the thread only when the new deadline is
+    // earlier than the current front (so the thread shortens its wait), or
+    // when the heap was empty (thread was blocked in cv.wait).
+    void schedule(std::chrono::steady_clock::time_point deadline,
+                  std::function<void()> callback) {
+        bool needs_notify;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            bool was_empty  = heap.empty();
+            bool is_earlier = !heap.empty() && deadline < heap.top().deadline;
+            heap.push(TimerEntry{deadline, std::move(callback)});
+            needs_notify = was_empty || is_earlier;
+        }
+        if (needs_notify) cv.notify_one();
+    }
+
+    // Signal stop and join the thread.  Called from bz_scheduler_shutdown
+    // BEFORE domain memory is released.
+    void shutdown_and_join() {
+        { std::lock_guard<std::mutex> lk(mtx); stop = true; }
+        cv.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+};
+
+static BzTimer* g_timer = nullptr;
+
+// Lazily start the timer thread on the first delay request.
+// Must be called AFTER bz_scheduler_init (which ensures g_main_domain is set).
+// Mutex-guarded (always — the delay path is not hot): the first Task.Delay
+// calls can arrive concurrently from continuations of two different domains on
+// two pool workers, so a naked check-then-create would race on g_timer.
+static std::mutex g_timer_init_mtx;
+static void bz_timer_ensure() {
+    std::lock_guard<std::mutex> lk(g_timer_init_mtx);
+    if (g_timer) return;
+    auto* t = new BzTimer();
+    t->thread = std::thread([t]{ t->run(); });
+    g_timer = t;
+}
+
+// ---------------------------------------------------------------------------
 // domain_drain — drains one domain's queue on a pool worker (§30.13 / #618)
 // ---------------------------------------------------------------------------
 //
@@ -3767,6 +3904,22 @@ void bz_scheduler_init(int num_threads) {
 
 void bz_scheduler_shutdown(void) {
     if (!g_scheduler) return;
+    // Shut down the timer thread BEFORE the pool workers and BEFORE g_scheduler
+    // is deleted.  The timer callback invokes bz_task_complete -> domain_enqueue
+    // -> g_scheduler->cv.notify_one().  If the timer thread is still inside
+    // notify_one() when bz_scheduler_shutdown deletes g_scheduler (and thus
+    // destructs g_scheduler->cv), there is a TSan-detectable use-after-free
+    // (#1378 fix).  Joining the timer thread here ensures it has finished all
+    // g_scheduler accesses before the BzScheduler is freed.
+    if (g_timer) {
+        g_timer->shutdown_and_join();
+        delete g_timer;
+        g_timer = nullptr;
+    }
+    // Now shut down the pool workers.  Any domain_drain jobs that the timer
+    // callbacks enqueued before the timer joined are still in the queue and
+    // will be drained by pool workers before they exit (run_worker returns only
+    // when shutdown && queue.empty()).
     { std::lock_guard<std::mutex> lk(g_scheduler->mtx); g_scheduler->shutdown = true; }
     g_scheduler->cv.notify_all();
     for (auto& t : g_scheduler->threads) t.join();
@@ -3804,24 +3957,29 @@ void bz_task_schedule(void* tp, void (*fn)(void* task, void* state), void* state
     domain_enqueue(dom, fn, task, state);
 }
 
-// stdlib §6.7 / §30.10: Task.Delay(ms). Allocate a fresh (incomplete) task and
-// post a worker that sleeps `ms` then completes it with no value. The task is
-// genuinely incomplete at return, so an `await Task.Delay(...)` hits the suspend
-// path (bz_task_then) and resumes via the domain queue when the sleep elapses
-// (§30.13 / #618).  The Delay timer runs on a raw pool worker (outside any
-// domain), which calls bz_task_complete -> task_notify -> domain_enqueue to
-// re-queue the awaiting continuation back into its domain.
+// stdlib §6.7 / §30.10: Task.Delay(ms).  Allocate a fresh (incomplete) task
+// and post a timer entry that fires after `ms` milliseconds then completes it
+// with no value.  The task is genuinely incomplete at return, so an
+// `await Task.Delay(...)` hits the suspend path (bz_task_then) and resumes
+// via the domain queue when the deadline elapses (§30.13 / #618).
+//
+// Fix #1378: the old implementation submitted a sleep_for job to the 4-worker
+// pool.  With 4 concurrent delays the pool was exhausted and domain work
+// stalled until timers fired.  The dedicated timer thread (BzTimer / g_timer)
+// owns a min-heap of deadlines and fires completions without occupying pool
+// workers, so arbitrarily many concurrent delays do not block domain work.
 void* bz_task_delay(int64_t milliseconds) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
-    if (!g_scheduler) bz_scheduler_init(4);   // ensure a pool exists
+    if (!g_scheduler) bz_scheduler_init(4);   // ensure g_main_domain is set
+    bz_timer_ensure();                         // lazily start the timer thread
     auto* task = new bz_task_t();
     // fix #713: route to the caller's domain.
     { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
       task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     int64_t ms = milliseconds < 0 ? 0 : milliseconds;
-    g_scheduler->submit([task, ms]() {
-        if (ms > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(ms);
+    g_timer->schedule(deadline, [task]() {
         bz_task_complete(task, nullptr, 0);
     });
     return task;
@@ -7848,14 +8006,17 @@ static void* bz_task_make_oce(void* oce_vtable) {
 // stdlib §6.7 (line 2868) / spec §30.8:
 // Task.Delay(milliseconds: int, token: CancellationToken): Task.
 //
-// Token-aware Delay. If the token is already cancelled at call time, returns an
-// immediately-faulted task (OperationCanceledException). Otherwise, starts the
-// timer worker but also polls the token at the WAKE point: if the sleep elaps
-// and the token is still not cancelled, complete normally; if the token was
-// cancelled during the sleep, complete with OCE. Mid-sleep polling (shorter
-// sleep intervals) is deferred — only the pre-delay and post-delay checks are
-// done here. oce_vtable is the vtable pointer for OperationCanceledException,
-// supplied by codegen so the runtime can construct the exception object.
+// Token-aware Delay.  If the token is already cancelled at call time, returns
+// an immediately-faulted task (OperationCanceledException).  Otherwise,
+// schedules a timer entry and polls the token when the deadline fires: if the
+// token is still live, complete normally; if cancelled, complete with OCE.
+// Mid-deadline early cancellation (pre-deadline token check) is deferred —
+// only the pre-call and post-deadline checks are performed, matching the prior
+// pool-worker implementation.
+//
+// Fix #1378: migrated from pool-worker sleep_for to g_timer (BzTimer).
+// oce_vtable is the vtable pointer for OperationCanceledException, supplied
+// by codegen so the runtime can construct the exception object.
 void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtable) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* s = (bz_cancel_state_t*)token;
@@ -7873,23 +8034,24 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
           task->done = true; }
         return task;
     }
-    // Not cancelled: schedule the delay worker.
+    // Not cancelled: schedule on the dedicated timer thread (fix #1378).
     if (!g_scheduler) bz_scheduler_init(4);
+    bz_timer_ensure();
     int64_t ms = milliseconds < 0 ? 0 : milliseconds;
-    // Retain the token for the pool worker so the bz_cancel_state_t stays alive
-    // even if the CTS is disposed before the sleep finishes (#647 / §6.1).
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(ms);
+    // Retain the token for the timer callback so the bz_cancel_state_t stays
+    // alive even if the CTS is disposed before the deadline fires (#647 / §6.1).
     bz_cancel_state_retain(s);
-    g_scheduler->submit([task, ms, s, oce_vtable]() {
-        if (ms > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        // Post-sleep check: if token was cancelled while sleeping, fault.
+    g_timer->schedule(deadline, [task, s, oce_vtable]() {
+        // Post-deadline check: if token was cancelled while waiting, fault.
         // #716: acquire load — synchronizes-with the release-store in bz_cts_cancel.
         if (s && s->cancelled.load(std::memory_order_acquire)) {
             void* excObj = bz_task_make_oce(oce_vtable);
-            bz_cancel_state_release(s);  // release the worker's token ref
+            bz_cancel_state_release(s);  // release the timer's token ref
             bz_task_complete_error_obj(task, excObj);
         } else {
-            bz_cancel_state_release(s);  // release the worker's token ref
+            bz_cancel_state_release(s);  // release the timer's token ref
             bz_task_complete(task, nullptr, 0);
         }
     });

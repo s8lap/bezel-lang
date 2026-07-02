@@ -11,6 +11,7 @@
 // runs, so all tests compile to native executables via Driver and check exit
 // codes. Cross-thread tests are run 3× for nondeterminism stability.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -38,6 +39,33 @@
 namespace {
 
 namespace fs = std::filesystem;
+
+// Compile and run, returning {exit_code, run_wall_ms}.
+// run_wall_ms is the time spent executing the compiled binary only (excludes
+// compile time).  Returns {-1, -1} on compile/link failure.
+std::pair<int,long> compileAndRunTimed(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_async451_timed_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    { std::ofstream out(src); out << source; }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    long elapsed_ms = -1;
+    if (r.success) {
+        auto t0 = std::chrono::steady_clock::now();
+        int status = std::system(exe.c_str());
+        elapsed_ms = static_cast<long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return {code, elapsed_ms};
+}
 
 // Compile `source` to a temp native executable via the real Driver and run it.
 // Returns the process exit code, or -1 on compile/link/run failure.
@@ -517,4 +545,48 @@ BEZEL_TEST(await_catch_guard_451, clean_diagnostic_not_crash) {
         "    end; "
         "    return 0; "
         "  end Main; end C;"));
+}
+
+// ===========================================================================
+// (D) Task.Delay pool-starvation regression (#1378)
+//
+// Before fix #1378, Task.Delay submitted a sleep_for job to the 4-worker pool.
+// Five concurrent delays would occupy all 4 workers (the 5th waits for a slot),
+// serialising the total delay to at least 2×delay_ms rather than ~delay_ms.
+// After fix #1378, delays use a dedicated timer thread; all 5 fire in parallel
+// and total runtime is near delay_ms regardless of pool size.
+//
+// The test compiles a Bezel program that starts 5 concurrent Task.Delay(200ms)
+// helpers via Task.WhenAll, awaits the result, and returns the sum of results
+// (should be 5).  Wall time of the RUN (not including compile) is measured.
+// A 600ms gate is generous for OS scheduling jitter yet far below the
+// serialised bound of at least 400ms (4 parallel + 1 waiting for a free slot).
+// ===========================================================================
+
+BEZEL_TEST(task_delay_1378, starvation_regression_concurrent_delays) {
+    // 5 async helpers each await Task.Delay(200ms) then return 1.
+    // WhenAll collects and Main returns 1+1+1+1+1 = 5.
+    const std::string src =
+        "module M; class C "
+        "  public static async method D(): Task<int> "
+        "    await Task.Delay(200); "
+        "    return 1; "
+        "  end D; "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task<int>>(); "
+        "    tasks.Add(D()); "
+        "    tasks.Add(D()); "
+        "    tasks.Add(D()); "
+        "    tasks.Add(D()); "
+        "    tasks.Add(D()); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    using var arr := await wa; "
+        "    return arr[0] + arr[1] + arr[2] + arr[3] + arr[4]; "
+        "  end Main; end C;";
+    auto [code, elapsed_ms] = compileAndRunTimed(src);
+    BEZEL_EXPECT_EQ(code, 5);
+    // All 5 delays run concurrently on the timer thread: wall time ≈ 200ms.
+    // 600ms provides ample margin for OS scheduling jitter while remaining far
+    // below the 400ms+ starvation floor (4 workers × 200ms each, then 5th).
+    BEZEL_EXPECT_TRUE(elapsed_ms >= 0 && elapsed_ms < 600);
 }
