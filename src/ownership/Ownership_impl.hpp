@@ -188,6 +188,13 @@ private:
     // inner scope was popped before the outer throw unwinds) → leak. Monotone
     // (grows only) like `everDischarged_`, so it is fixpoint-safe.
     std::unordered_set<sema::Symbol*> everOwnedPlainLocals_;
+    // §29.2 / §28.3 v0.157 (#1329): every owned iteration variable seeded by
+    // seedOwnedIterVar for the CURRENT method. Used by the post-endState
+    // break-body check: a seeded iter var absent from endState AND never
+    // discharged (everDischarged_.count == 0) leaked via a break-only body —
+    // the break edge is not a loopEdge so item=Owned is not propagated to the
+    // after block via unionKeys=true. Monotone (grows only), fixpoint-safe.
+    std::unordered_set<sema::Symbol*> seededIterVarSyms_;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed

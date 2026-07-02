@@ -70,26 +70,28 @@ std::string withOwnedAwaitFor(const std::string& body) {
         "end C;";
 }
 
-// True iff some diagnostic names `x` as an owned value dropped without
-// disposal (the §28.3 owned-local discharge error the iteration variable now
-// triggers when undischarged).
-bool hasIterVarDischargeError(const bezel::test::OwnershipResult& r) {
+// True iff some diagnostic names `x` as an owned iteration-variable that is
+// implicitly disposed per-iteration (the §29.2/§28.3 v0.157 auto-drop warning
+// that replaced the old hard discharge error — #1329).
+bool hasIterVarAutoDropWarning(const bezel::test::OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("owned value in `x`") != std::string::npos &&
-            d.message.find("without disposal") != std::string::npos)
+            d.message.find("implicitly disposed") != std::string::npos)
             return true;
     return false;
 }
 
 }  // namespace
 
-// §29.2 / #834 (headline): the owned iteration variable dropped without
-// discharge — the loop body does nothing with `x` — must be REJECTED. Before
-// the fix this was silently accepted (a leak).
-BEZEL_TEST(owned_iter_var_discharge_834, undischarged_sync_rejected) {
+// §29.2 / §28.3 v0.157 / #1329 / #834 (headline): the owned iteration variable
+// not discharged in the body — auto-dropped per-iteration with a must-use
+// WARNING (no hard error; that was the pre-v0.157 behaviour). Before #834 this
+// was silently accepted (no warning, a silent leak). Before #1329 it was a hard
+// error. Now it is a must-use warning: no errors, one auto-drop warning.
+BEZEL_TEST(owned_iter_var_discharge_834, undischarged_sync_warns) {
     auto r = parseAndCheckOwnership(withOwnedFor(""));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasIterVarDischargeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasIterVarAutoDropWarning(r));
 }
 
 // §29.2 / #834: discharge via an explicit `x.Dispose()` on every iteration —
@@ -123,31 +125,35 @@ BEZEL_TEST(owned_iter_var_discharge_834, conditional_all_paths_discharged_accept
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §29.2 / #834 (path-sensitive, interplay with #867): discharge on only the
-// `c` path — `x` is dropped on the `c == false` fall-through. Must be REJECTED.
-BEZEL_TEST(owned_iter_var_discharge_834, conditional_partial_discharge_rejected) {
+// §29.2 / §28.3 v0.157 / #1329 / #834 (path-sensitive): discharge on only
+// the `c` path — `x` is still-owned on the `c==false` fall-through. Must emit
+// the auto-drop WARNING (not an error). The null-guarded per-iteration disposal
+// fires on the fall-through path and is a no-op on the disposed path (slot is
+// null after x.Dispose()).
+BEZEL_TEST(owned_iter_var_discharge_834, conditional_partial_discharge_warns) {
     auto r = parseAndCheckOwnership(
         withOwnedFor("if c then x.Dispose(); end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasIterVarDischargeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasIterVarAutoDropWarning(r));
 }
 
-// §29.2 / #834: `break` without discharging `x` on the break path — break is a
-// normal-exit edge, so `x` is dropped there. Must be REJECTED.
-BEZEL_TEST(owned_iter_var_discharge_834, undischarged_break_rejected) {
+// §29.2 / §28.3 v0.157 / #1329 / #834: `break` without discharging `x` on
+// the break path — `x` is still-owned when breaking. Must emit the auto-drop
+// WARNING (emitLoopDisposals fires the iter-var scope on break). Not an error.
+BEZEL_TEST(owned_iter_var_discharge_834, undischarged_break_warns) {
     auto r = parseAndCheckOwnership(
         withOwnedFor("if c then break; end; x.Dispose();"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasIterVarDischargeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasIterVarAutoDropWarning(r));
 }
 
-// §29.2 / #834 (async form, was a runtime SIGSEGV): `await for` over an
-// OwnedAsyncEnumerable<Box> with the iteration variable dropped — must be
-// REJECTED, exactly like the sync form.
-BEZEL_TEST(owned_iter_var_discharge_834, undischarged_async_rejected) {
+// §29.2 / §28.3 v0.157 / #1329 / #834 (async form): `await for` over an
+// OwnedAsyncEnumerable<Box> with the iteration variable not discharged — must
+// emit the auto-drop WARNING (not an error, matching the sync form).
+BEZEL_TEST(owned_iter_var_discharge_834, undischarged_async_warns) {
     auto r = parseAndCheckOwnership(withOwnedAwaitFor(""));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasIterVarDischargeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasIterVarAutoDropWarning(r));
 }
 
 // §29.2 / #834 (async over-reject guard): the async iteration variable

@@ -6323,7 +6323,19 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un.operand.get())) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                if (loc->isUsing) {
+                // Null the source slot when: (a) it is a `using var` local whose
+                // scope-end disposal must be suppressed (existing rule), OR (b) it is
+                // an owned iteration variable flagged for per-iteration auto-drop
+                // (#1329 / §29.2/§28.3 v0.157): the auto-drop at body-end is
+                // null-guarded, so nulling here prevents a double-dispose when the
+                // object is moved to a new owner that disposes it.
+                const bool isIterVarAutoDrop = [&]() -> bool {
+                    if (auto* fs_node =
+                            dynamic_cast<const ast::ForStmt*>(loc->decl))
+                        return fs_node->ownedIterVarAutoDropAtBodyEnd;
+                    return false;
+                }();
+                if (loc->isUsing || isIterVarAutoDrop) {
                     if (llvm::AllocaInst* slotAI = localSlot(*un.operand)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);

@@ -154,6 +154,45 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     }
                 }
             }
+            // §29.2 / §28.3 v0.157 (#1329): affine auto-drop for owned ITERATION
+            // VARIABLES. A `for var x in OwnedEnumerable<T>` / `await for var x in
+            // OwnedAsyncEnumerable<T>` iteration variable whose ownership obligation
+            // reaches a body-exit edge (i.e. is still Owned in endState via the
+            // loop back-edge / skip-edge) is auto-dropped per-iteration at body-end
+            // with the must-use warning, matching the §28.3 auto-drop for regular
+            // owned locals.
+            //
+            // Safety: the iter var's slot is null-guarded (dynamicDispose codegen).
+            // `x.Dispose()` already nulls the slot (explicitDisposeOwnedReceiverSlot),
+            // and `move x` will be patched to null the slot when this flag is set.
+            // Null-guarded auto-drop is therefore exactly-once-safe regardless of
+            // whether the var was conditionally discharged (`everDischarged_` check is
+            // NOT required here). Applies to BOTH sync and async bodies (not gated on
+            // !isAsync_) since the iter var is NOT a suspend-local (annotateSuspendLocals
+            // only marks LocalDecl* nodes, not ForStmt-backed iter vars) and therefore
+            // is not disposed by the async completion-edge machinery.
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                if (auto* fs =
+                        dynamic_cast<const ast::ForStmt*>(ls->decl)) {
+                    // Confirm it is an owning enumerable loop (not a borrow for-loop).
+                    // iterableIsOwningEnumerable() is already used by seedOwnedIterVar.
+                    if (iterableIsOwningEnumerable(*fs)) {
+                        const_cast<ast::ForStmt*>(fs)->ownedIterVarAutoDropAtBodyEnd =
+                            true;
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned value in `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed at the end of each loop "
+                            "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                            "`move`, `using var`, or `return` to discharge it "
+                            "explicitly");
+                        continue;
+                    }
+                }
+            }
             // §28.3 v0.150 (#1008 Part B): affine auto-drop. A plain `var` owned
             // LOCAL that is never discharged on ANY path (everDischarged == 0)
             // is, on every path reaching this exit, a never-moved genuine owner:
@@ -235,6 +274,33 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 "(§28.3 — consider `using var`, explicit "
                 "`.Dispose()`, `move`, or `return`)");
         }
+    }
+    // §29.2 / §28.3 v0.157 (#1329) addendum — break-only loop bodies.
+    // A `for var x in OwnedEnumerable<T>` body that always exits via `break`
+    // never propagates item=Owned to the loop's `after` block: the break edge is
+    // not a loopEdge (it is not a back-edge or the header's zero-trip skip-edge),
+    // so `unionKeys=false` at the `after` block's entry merge prevents new symbols
+    // from the break edge from entering the state. `endState` therefore never sees
+    // item=Owned, and the `endState` loop above never fires. Detect this case by
+    // checking every seeded iter var: seeded-but-not-in-endState AND never
+    // discharged (everDischarged_.count == 0) means the value leaked at break.
+    // Restricted to `seededIterVarSyms_` (symbols seeded by THIS method's
+    // seedOwnedIterVar) so we never mis-flag iter vars from a different method.
+    for (sema::Symbol* sym : seededIterVarSyms_) {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) continue;
+        auto* fs = dynamic_cast<const ast::ForStmt*>(ls->decl);
+        if (!fs) continue;
+        if (fs->ownedIterVarAutoDropAtBodyEnd) continue; // already set above
+        if (everDischarged_.count(sym) != 0) continue;  // discharged on some path
+        const_cast<ast::ForStmt*>(fs)->ownedIterVarAutoDropAtBodyEnd = true;
+        ctx_.diagnostics().report(
+            Severity::Warning, fs->span.begin,
+            std::string("owned value in `") + std::string(ls->name) +
+            "` is implicitly disposed at the end of each loop "
+            "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+            "`move`, `using var`, or `return` to discharge it "
+            "explicitly");
     }
     // §28.3 (#1257): a plain-var owned local declared in a NESTED scope that exits
     // normally before the function reaches a throw-only exit never appears in
@@ -1142,6 +1208,9 @@ void MethodOwnership::seedOwnedIterVar(const ast::ForStmt& fs) {
     // `x` each iteration (§29.2). Anchor the diagnostic at the ForStmt span.
     lo.obligationOrigin = &fs;
     states_[iterSym] = lo;
+    // Track every iter var seeded for this method so the post-endState check
+    // can detect break-only bodies (§29.2/#1329 addendum — see run()).
+    seededIterVarSyms_.insert(iterSym);
 }
 
 // §29.2 (#834): true when the for-loop's iterable has static type

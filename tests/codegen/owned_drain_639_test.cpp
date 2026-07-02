@@ -50,6 +50,47 @@ int run(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
+// Like run() but includes checkDefiniteAssignment + checkOwnership in the
+// pipeline. Required for §29.2/#1329 auto-drop tests: the ownership pass sets
+// ownedIterVarAutoDropAtBodyEnd on ForStmt, which lowerForBody reads; without
+// checkOwnership the flag is never set and per-iteration auto-drop is skipped.
+int runFull(const std::string& src) {
+    bezel::test::ensureNativeTargetInitialized();
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(src, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return -999;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);
+    if (diags.hasErrors()) return -999;
+    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+    auto module = bezel::codegen::emitModule(*unit, ctx, *llvmCtx);
+    if (!module) return -999;
+    auto jitOrErr = llvm::orc::LLJITBuilder().create();
+    if (!jitOrErr) { llvm::consumeError(jitOrErr.takeError()); return -999; }
+    auto jit = std::move(*jitOrErr);
+    if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix())) {
+        jit->getMainJITDylib().addGenerator(std::move(*gen));
+    } else {
+        llvm::consumeError(gen.takeError());
+    }
+    llvm::orc::ThreadSafeModule tsm(std::move(module), std::move(llvmCtx));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+        llvm::consumeError(std::move(err)); return -999;
+    }
+    auto sym = jit->lookup("main");
+    if (!sym) { llvm::consumeError(sym.takeError()); return -999; }
+    int exitCode = sym->toPtr<int(*)()>()();
+    bz_flush_static_owned();
+    return exitCode;
+}
+
 // LSan/ASan helper — compile → object → link with ASan runtime → run.
 // Returns 0 (clean), 1 (sanitizer fired), -1 (toolchain missing).
 int runUnderASan(const std::string& source) {
@@ -665,6 +706,154 @@ BEZEL_TEST(owned_drain_639, asan_ownedlinkedlist_partial_drain_no_leak) {
         "  for var item in ll.Drain() do "
         "    using var u := item; "
         "    break; "
+        "  end; "
+        "end; "
+        "return 0;"
+    ));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+
+// ===========================================================================
+// §29.2 / §28.3 v0.157 / #1329: per-iteration auto-drop of owned iter vars
+// ===========================================================================
+//
+// The ownership pass now emits a WARNING (not error) for undischarged owned
+// iteration variables and sets ownedIterVarAutoDropAtBodyEnd = true on the
+// ForStmt. Codegen registers a null-guarded per-iteration disposal scope in
+// lowerForBody so the iter var is disposed at every body-exit edge (fall-
+// through, break, continue, return) that still holds a live pointer.
+// x.Dispose() nulls the slot; `move x` also nulls the slot so no double-free.
+
+// §29.2 / #1329: undischarged drain — auto-drop at body-end each iteration.
+// Three elements; loop body does nothing (auto-drop fires). R._n == 3.
+// Uses runFull (includes checkOwnership) so ownedIterVarAutoDropAtBodyEnd is set.
+BEZEL_TEST(owned_drain_639, autodrop_fallthrough_disposes_all_spec_29_2_1329) {
+    BEZEL_EXPECT_EQ(runFull(makeProgram(
+        "using var arr := new OwnedArray<R>(); "
+        "arr.Add(move (new R())); "
+        "arr.Add(move (new R())); "
+        "arr.Add(move (new R())); "
+        "for var item in arr.Drain() do "
+        "end; "     // body empty — auto-drop fires each iteration
+        "return R._n;"  // 3
+    )), 3);
+}
+
+// §29.2 / #1329: auto-drop on break — the current element must be disposed
+// when break exits the loop. Drain 3; break on first → 1 disposed by auto-
+// drop, 2 remain in array for collection Dispose. Total at scope-end: 3.
+// Uses runFull (includes checkOwnership) so ownedIterVarAutoDropAtBodyEnd is set.
+BEZEL_TEST(owned_drain_639, autodrop_break_disposes_current_element_spec_29_2_1329) {
+    BEZEL_EXPECT_EQ(runFull(makeProgram(
+        "var afterBreak := -1; "
+        "do "
+        "  using var arr := new OwnedArray<R>(); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  for var item in arr.Drain() do "
+        "    break; "   // item is auto-dropped by emitLoopDisposals
+        "  end; "
+        "  afterBreak := R._n; "   // 1 disposed (auto-drop on break)
+        "end; "
+        "return afterBreak * 10 + R._n;"  // 1*10 + 3 = 13
+    )), 13);
+}
+
+// §29.2 / #1329: explicit x.Dispose() — no double-dispose. The slot is nulled
+// by explicitDisposeOwnedReceiverSlot; the auto-drop null-guard skips it.
+// Three elements, each explicitly disposed: R._n == 3 exactly.
+BEZEL_TEST(owned_drain_639, autodrop_explicit_dispose_no_double_free_spec_29_2_1329) {
+    BEZEL_EXPECT_EQ(run(makeProgram(
+        "using var arr := new OwnedArray<R>(); "
+        "arr.Add(move (new R())); "
+        "arr.Add(move (new R())); "
+        "arr.Add(move (new R())); "
+        "for var item in arr.Drain() do "
+        "  item.Dispose(); "   // explicit; slot nulled → auto-drop is no-op
+        "end; "
+        "return R._n;"  // 3 (each disposed exactly once)
+    )), 3);
+}
+
+// §29.2 / #1329: `move item` — slot is nulled; auto-drop is no-op.
+// Moved into a using-var sink that disposes it. Three elements: R._n == 3.
+BEZEL_TEST(owned_drain_639, autodrop_move_out_no_double_free_spec_29_2_1329) {
+    BEZEL_EXPECT_EQ(run(makeProgram(
+        "using var arr := new OwnedArray<R>(); "
+        "arr.Add(move (new R())); "
+        "arr.Add(move (new R())); "
+        "arr.Add(move (new R())); "
+        "for var item in arr.Drain() do "
+        "  using var sink := move item; "  // move nulls slot; using-var disposes
+        "end; "
+        "return R._n;"  // 3 (each disposed exactly once via using-var)
+    )), 3);
+}
+
+// §29.2 / #1329 ASan: auto-drop fallthrough — no leak, no double-free.
+BEZEL_TEST(owned_drain_639, asan_autodrop_fallthrough_no_leak_spec_29_2_1329) {
+    int asan = runUnderASan(makeProgram(
+        "do "
+        "  using var arr := new OwnedArray<R>(); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  for var item in arr.Drain() do "
+        "  end; "
+        "end; "
+        "return 0;"
+    ));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// §29.2 / #1329 ASan: auto-drop on break — no leak, no double-free.
+BEZEL_TEST(owned_drain_639, asan_autodrop_break_no_leak_spec_29_2_1329) {
+    int asan = runUnderASan(makeProgram(
+        "do "
+        "  using var arr := new OwnedArray<R>(); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  for var item in arr.Drain() do "
+        "    break; "
+        "  end; "
+        "end; "
+        "return 0;"
+    ));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// §29.2 / #1329 ASan: explicit dispose + auto-drop null-guard — no double-free.
+BEZEL_TEST(owned_drain_639, asan_autodrop_explicit_dispose_no_double_free_spec_29_2_1329) {
+    int asan = runUnderASan(makeProgram(
+        "do "
+        "  using var arr := new OwnedArray<R>(); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "for var item in arr.Drain() do "
+        "  item.Dispose(); "
+        "  end; "
+        "end; "
+        "return 0;"
+    ));
+    if (asan == -1) return;
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// §29.2 / #1329 ASan: move-out + auto-drop null-guard — no double-free.
+BEZEL_TEST(owned_drain_639, asan_autodrop_move_out_no_double_free_spec_29_2_1329) {
+    int asan = runUnderASan(makeProgram(
+        "do "
+        "  using var arr := new OwnedArray<R>(); "
+        "  arr.Add(move (new R())); "
+        "  arr.Add(move (new R())); "
+        "  for var item in arr.Drain() do "
+        "    using var sink := move item; "
         "  end; "
         "end; "
         "return 0;"

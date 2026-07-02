@@ -2336,25 +2336,65 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
             }
         }
     }
-    if (!forVarFreshCell)
-        return lowerScopedBlock(fs.body);
-    // #793: wrap the body in an OUTER per-iteration disposal scope holding the
-    // for-var cell free. lowerScopedBlock opens the INNER body scope where the
-    // capturing closure's bz_closure_release (which runs the envdtor that reads
-    // captured values through the cell) is registered. By LIFO scope-exit order
-    // the inner scope fires FIRST (closure released), then this outer scope frees
-    // the cell — no UAF. The body block re-runs each iteration, so every
-    // iteration's fresh cell is freed; nested loops each get their own scope pair;
-    // break/continue/return/throw unwind both scopes (the loop's recorded depth is
-    // below this outer scope). free(null) is a no-op, so a never-allocated guard
-    // cell is safe.
-    disposeStack_.emplace_back();
-    Disposal d{forVarFreshCell, nullptr};
-    d.boxedCellFree = true;
-    disposeStack_.back().push_back(d);
-    bool terminated = lowerScopedBlock(fs.body);
-    if (!terminated) emitDisposals(disposeStack_.back());
-    disposeStack_.pop_back();
+
+    // §29.2 / §28.3 v0.157 (#1329): per-iteration null-guarded disposal for an
+    // owned iteration variable the ownership pass flagged as not always discharged.
+    // The disposal scope is the OUTERMOST (pushed first here, popped last): it
+    // wraps everything else including the capture-cell scope and the body's own
+    // lowerScopedBlock scope, so LIFO order fires body disposals first, then this
+    // one — correct for an object that was owned for the whole iteration. The scope
+    // is registered BELOW the loopStack_ depth recorded by the caller (lowerOwnedSeqDrainFor
+    // / lowerDictDrainFor / lowerAwaitFor push the loopStack_ entry BEFORE calling us,
+    // and emitLoopDisposals unwinds all scopes ABOVE the recorded depth), so break
+    // / continue / return via emitLoopDisposals fire this disposal too.
+    //
+    // dynamicDispose=true: null-guarded vtable Dispose + free. The slot may be
+    // null if the body discharged the variable on this iteration (x.Dispose()
+    // nulls the slot via explicitDisposeOwnedReceiverSlot; `move x` is patched to
+    // null the slot when ownedIterVarAutoDropAtBodyEnd is set). free(null) is safe.
+    //
+    // Applies to BOTH sync drain-for loops (smStateStruct_==null) and async
+    // await-for loops (smStateStruct_!=null). In the async case the iter var slot
+    // is an entryAlloca that round-trips smAllocaToField_ on every await suspend
+    // in the body, so at body-end the alloca always holds the current iteration's
+    // value. boxedStorage() returns the alloca directly (not the frame field), which
+    // is correct since dynamicDispose fires WITHIN the current Resume invocation
+    // (no suspend between bodyBB and body-end).
+    llvm::AllocaInst* iterVarSlot = nullptr;
+    if (fs.ownedIterVarAutoDropAtBodyEnd) {
+        auto sit = locals_.find(&fs);
+        if (sit != locals_.end())
+            iterVarSlot = sit->second;
+    }
+
+    if (iterVarSlot) {
+        // Push outermost scope: per-iteration iter-var disposal.
+        disposeStack_.emplace_back();
+        Disposal id{iterVarSlot, nullptr};
+        id.dynamicDispose = true;
+        disposeStack_.back().push_back(id);
+    }
+
+    bool terminated = false;
+    if (!forVarFreshCell) {
+        terminated = lowerScopedBlock(fs.body);
+    } else {
+        // #793: wrap the body in a scope holding the for-var cell free (inner
+        // scope, fires before the iter-var outer scope by LIFO order). lowerScopedBlock
+        // opens the body's own innermost scope.
+        disposeStack_.emplace_back();
+        Disposal d{forVarFreshCell, nullptr};
+        d.boxedCellFree = true;
+        disposeStack_.back().push_back(d);
+        terminated = lowerScopedBlock(fs.body);
+        if (!terminated) emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
+    }
+
+    if (iterVarSlot) {
+        if (!terminated) emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
+    }
     return terminated;
 }
 
