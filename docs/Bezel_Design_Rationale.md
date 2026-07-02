@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.158 — July 2026**
+**Companion to the Bezel Language Specification, v0.159 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -7297,6 +7297,21 @@ Explicit `bool`→integer is **admitted** (total: `false`→`0`, `true`→`1`; t
 #### Migration
 
 Mostly source-compatible. Tightenings: the §25.2 co-declaration rule (a record overloading `=` without `Equals`/`GetHashCode` now errors — the fix is stating them); hash-container instantiation over non-equality-bearing record keys/elements now errors at the instantiation. Loosenings: `int(b)` compiles; records with `override ToString` regain auto-equality; negative constant patterns and `T?`/inline-array record components become expressible/eligible. Compiler alignment for the new checks and eligibility extensions follows in-run; the parser already implements the #1320/#1321 rules.
+
+<a id="sec-v0-158-to-v0-159-changelog"></a>
+### v0.159 changelog (v0.158 → v0.159)
+
+v0.159 is the **conversions-and-typing revision**: four families of rules the compiler already implemented but the spec never stated are now normative. Nearly docs-only (probe-level verification in-run). (Issues: #1323, #1324, #1337, #1340; also settles #184's documented-vs-rejected fork.)
+
+- **Constant narrowing** (§5.1, #1323): a compile-time integer constant implicitly converts to any integer type containing its value; out-of-range constants error (never truncate). Cross-referenced from §15.4/§10.2/§18.1.
+- **MinValue literals** (§4.2): the 2³¹/2⁶³ magnitudes admitted solely as immediate operands of unary `-` — `int.MinValue`/`long.MinValue` become writable.
+- **Typed-context widening** (§4.2/§18.1, the #184 fork settled): an oversized unsuffixed decimal literal is admitted at an explicitly-declared integer target it fits; untyped contexts still error toward a suffix. Rationale: the width is taken only from a written target and range-checked — the suffix discipline's purpose survives; rejecting would break the corpus for no safety gain.
+- **Common-type (join) rule** (§20/§19.1/§21.9, #1324): A-into-B-or-B-into-A only (widening, T→T?, subtype→base); no sibling LUB (deliberately unlike §31.2.1 catch bindings); throw arms bottom-typed; condition-first evaluation and selected-arm-only evaluation stated; case/when expression type = left-fold of arm types; §21.9's discard rules applied per arm in statement position (resolving its tension with §19.1).
+- **`?` idempotent under substitution** (§7.10 + C.4 + stdlib §5 note, #1337): `T?` at T=`U?` is `U?`; no two-level optional; the `*OrNull`-at-nullable-T ambiguity documented with the recommended shapes; bare-T storage follows §7.9.
+- **Range `Contains` vs direction** (§16.3/§16.4/§16.6, #1340): normative extent formula (min/max endpoints, exclusivity, null-open sides, Step-independent) — `50 in 100..0` is true; `IsEmpty` reworded to iteration; **range patterns read bounds directionally as written** (reversed patterns match nothing) with the deliberate pattern-vs-Contains asymmetry recorded; the circular §17.5 reference in the surrogate paragraph fixed.
+
+#### Migration
+None expected: every rule codifies implemented behavior. (In-run probes verify: reversed-range pattern non-match, MinValue literal forms, `T?`-idempotence corners; divergences found become implementation fixes, not spec changes.)
 
 <a id="sec-v0-156-to-v0-157-changelog"></a>
 ### v0.157 changelog (v0.156 → v0.157)

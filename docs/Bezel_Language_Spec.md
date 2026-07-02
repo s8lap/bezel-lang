@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.158 — July 2026**
+**Version 0.159 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -319,7 +319,11 @@ Two values: `true` and `false`. No implicit conversion to or from any other type
 | `long` | 64, signed | −2⁶³ to 2⁶³ − 1 |
 | `ulong` | 64, unsigned | 0 to 2⁶⁴ − 1 |
 
-An integer literal without a suffix has type `int` if it fits in `int`'s range; otherwise the literal requires a suffix. Suffixes are case-insensitive: `L` (long), `U` (uint), `UL` or `LU` (ulong — both orderings accepted).
+An integer literal without a suffix has type `int` if it fits in `int`'s range; otherwise the literal requires a suffix or a typed context (below). Suffixes are case-insensitive: `L` (long), `U` (uint), `UL` or `LU` (ulong — both orderings accepted).
+
+**Boundary carve-out (v0.159).** The decimal literal of magnitude 2³¹ (unsuffixed) or 2⁶³ (`L`-suffixed) is admitted **only** as the immediate operand of unary `-`, denoting `int.MinValue` / `long.MinValue` respectively (`-2147483648`, `-9223372036854775808L`); anywhere else those magnitudes remain errors. Without this carve-out the most negative values would be unwritable as literals (the magnitude alone overflows before the `-` applies).
+
+**Typed-context widening (v0.159, codifying implemented behavior).** In a context whose target integer type is explicitly declared — a typed variable declaration (`var x: long := 3_000_000_000;`), a typed field initializer, or a parameter with a declared integer type — an unsuffixed decimal literal that exceeds `int`'s range but fits the declared target is admitted at the target type. The suffix discipline's purpose (no *accidental* width) is preserved: the wider type is taken only from an explicitly written target, and the value is range-checked against it. In an **untyped** context (`var x := 3_000_000_000;`) the literal remains a compile error directing to a suffix.
 
 <a id="sec-floating-point-types"></a>
 ### 4.3 Floating-point types
@@ -432,6 +436,8 @@ The following are **never implicit**:
 - Between `decimal` and binary floats (`float`, `double`).
 - Between an enum and its underlying integer.
 - Between integers and `bool`.
+
+**Constant narrowing (codified in v0.159).** An expression of integer type that is a **compile-time constant** (A.8 ConstExpr) implicitly converts to any integer type whose range contains its value: `var b: byte := 50;`, `Set(level: byte)` called as `Set(3)`, and enum constants of the underlying type ([§10.2](#sec-underlying-types)) are all well-typed by this rule. A constant whose value does not fit the target's range is a **compile error** at the conversion site — never a silent truncation. The rule applies to constants only; a run-time `int` value still requires the explicit `byte(x)` narrowing of [§5.2](#sec-explicit-conversions). Collection-literal element typing ([§15.4](#sec-collection-literals)) and default-argument typing use this same rule.
 
 A non-nullable reference type implicitly converts to its nullable form ([§7](#sec-nullability-2)).
 
@@ -690,6 +696,8 @@ Inside an unconstrained generic body, `T` is treated conservatively as possibly 
 Inside the generic body, T is non-nullable under any type-bound constraint.
 
 `T?` always means "the nullable form of T," regardless of constraint. Under `where T: notnull`, `T` is the non-nullable form and `T?` is the nullable companion.
+
+**`?` is idempotent under substitution (v0.159).** When an unconstrained `T` is instantiated with a nullable type `U?`, the substituted `T?` denotes `U?` itself — there is no two-level optional, consistent with the grammar (Appendix A: `Type ::= TypeNoNullable "?"?`, at most one `?`) and with [§8.6](#sec-boxing)'s single-wrapper boxing. Consequently an API whose result type is `T?` (e.g. the stdlib `FirstOrNull` family) cannot distinguish "no value" from "a present `null`" when instantiated at a nullable `T`; callers who need the distinction use the shape that carries it (`Count`/index checks, or the `Try` pattern). A field or local of **bare** type `T` under an unconstrained parameter follows [§7.9](#sec-definite-assignment)'s non-nullable-reference rules (must-initialize, no vacuous `null` default), since T may be instantiated non-nullable; *reads* remain conservatively possibly-null per this section.
 
 <a id="sec-lifted-operators"></a>
 ### 7.11 Lifted operators
@@ -2325,13 +2333,13 @@ A range whose `Start` is U+E000 or higher iterates that upper segment without su
 
 Step strides that would land within the surrogate range terminate at the same boundary. `'\uD7F0'..'\uE010' step 4` yields U+D7F0, U+D7F4, U+D7F8, U+D7FC, then would compute U+D800 — a surrogate — and terminates. No `InvalidOperationException` is raised; the surrogate boundary is iteration termination, not an error.
 
-Surrogate code points themselves cannot be written as `char` literals — `'\uD800'` and similar escapes are compile errors per [§18.3](#sec-character-literals) and [§18.8](#sec-escape-sequences-non-verbatim), and `char(0xD800)` raises `OverflowException` at runtime per [§5.2](#sec-explicit-conversions). Range endpoints, however, are integer-valued at construction; a `Range<char>` constructed from the integer endpoints by other means (e.g. by deserialization from a saved value) is bounded by `char`'s validity contract regardless of how the endpoints were spelled. The `Contains` operation uses the integer-membership rule of [§17.5](#sec-the-in-operator) and does not exclude surrogates from membership testing — for a range `r` whose integer extent covers U+D800, the integer-level membership test for U+D800 returns `true`, but iteration of `r` will not yield that value. The asymmetry is deliberate: `Contains` answers a mathematical question about the range's extent, while iteration produces a sequence of valid `char` values.
+Surrogate code points themselves cannot be written as `char` literals — `'\uD800'` and similar escapes are compile errors per [§18.3](#sec-character-literals) and [§18.8](#sec-escape-sequences-non-verbatim), and `char(0xD800)` raises `OverflowException` at runtime per [§5.2](#sec-explicit-conversions). Range endpoints, however, are integer-valued at construction; a `Range<char>` constructed from the integer endpoints by other means (e.g. by deserialization from a saved value) is bounded by `char`'s validity contract regardless of how the endpoints were spelled. The `Contains` operation uses the normative extent formula of [§16.3](#sec-range-operations) (below) and does not exclude surrogates from membership testing — for a range `r` whose integer extent covers U+D800, the integer-level membership test for U+D800 returns `true`, but iteration of `r` will not yield that value. The asymmetry is deliberate: `Contains` answers a mathematical question about the range's extent, while iteration produces a sequence of valid `char` values.
 
 `IsOpenEnded` is `true` when `Start` is `null` or `End` is `null`.
 
-`IsEmpty` is `true` when the range contains no values (the lower bound exceeds the upper bound in the direction of iteration, or both endpoints are present and equal with an exclusive upper bound).
+`IsEmpty` is `true` when **iteration of the range yields no values** (the lower bound exceeds the upper bound in the direction of iteration, or both endpoints are present and equal with an exclusive upper bound). `IsEmpty` is about iteration, not extent: `(100..0).IsEmpty` is `true` while `(100..0).Contains(50)` is `true` — see `Contains` below.
 
-`Contains` is the operation invoked by `in` ([§17.5](#sec-the-in-operator)). Membership is determined by endpoints and inclusivity; `Step` does not affect `Contains`.
+`Contains` is the operation invoked by `in` ([§17.5](#sec-the-in-operator)). **Normative formula (v0.159):** `Contains(v)` is `true` iff `min(Start, End) <= v <= max(Start, End)`, with `v = End` additionally excluded when `IsEndInclusive` is `false`; a `null` endpoint (open-ended form) imposes no bound on its side; `Step` never affects `Contains`. The formula is direction-independent — it answers a question about the range's mathematical *extent*, so `50 in 100..0` is `true` even though iterating `100..0` yields nothing. (This is the same extent-vs-iteration posture as the surrogate asymmetry above.)
 
 `GetEnumerator` produces an enumerator that yields values from `Start` to `End` (inclusive or exclusive per `IsEndInclusive`), incrementing by `Step`. Calling `GetEnumerator` on an open-ended range raises `InvalidOperationException`. The compiler warns when an open-ended range literal appears directly in a `for` statement or other iteration context.
 
@@ -2352,7 +2360,7 @@ Rules:
 - When the compiler can prove at compile time that a range's direction and step sign disagree (both endpoints and step are constants or constant after folding), it emits a warning: *"this range produces an empty iteration."* The warning is not produced for runtime-computed steps, where sign mismatches may be intentional.
 - A literal step of zero is a compile error; a computed step of zero is a runtime error (`ArgumentException`).
 - `step` may not be applied to open-ended ranges.
-- `step` is not legal in `case` patterns (patterns test membership; stride has no meaning).
+- `step` is not legal in `case` patterns (patterns test the written bounds; stride has no meaning).
 
 <a id="sec-iteration"></a>
 ### 16.5 Iteration
@@ -2400,7 +2408,7 @@ Open-ended ranges are designed for slicing ([§15.6](#sec-slicing)) and pattern 
 <a id="sec-empty-ranges-and-equal-bound-ranges"></a>
 ### 16.6 Empty ranges and equal-bound ranges
 
-A range whose lower bound exceeds its upper bound (in the direction of iteration) is empty. Iterating an empty range is a no-op. Matching against an empty range is a non-match. Construction is not an error.
+A range whose lower bound exceeds its upper bound (in the direction of iteration) is empty. Iterating an empty range is a no-op. Construction is not an error. **Range patterns (v0.159):** a range pattern `lo..hi` / `lo..<hi` (necessarily stepless, [§16.4](#sec-step)) matches `v` iff `lo <= v <= hi` (resp. `< hi`) read **directionally as written** — a reversed pattern like `100..0` matches nothing. This deliberately differs from `in`/`Contains` on reversed ranges (which test extent, [§16.3](#sec-range-operations)): a pattern states bounds in order, an extent query does not — the same recorded asymmetry as `Contains`-vs-iteration.
 
 A range whose bounds are equal is a special case where direction is undefined:
 
@@ -2881,7 +2889,7 @@ Floating-point and decimal literals:
 1.23e2m             // scientific notation, decimal
 ```
 
-Suffixes are case-insensitive: `L`/`l`, `U`/`u`, `F`/`f`, `M`/`m`. The compiler does not silently promote integer literals; `3_000_000_000` is a compile error without an `L` suffix.
+Suffixes are case-insensitive: `L`/`l`, `U`/`u`, `F`/`f`, `M`/`m`. The compiler does not silently promote integer literals: in an untyped context `3_000_000_000` is a compile error without an `L` suffix. (In a context with an explicitly declared integer target the literal is admitted at the declared type when it fits — the typed-context widening of [§4.2](#sec-integer-types), v0.159.)
 
 <a id="sec-boolean-and-null-literals"></a>
 ### 18.2 Boolean and null literals
@@ -2993,7 +3001,7 @@ Surrogate escapes (U+D800–U+DFFF) are compile errors.
 <a id="sec-the-case-construct"></a>
 ## 19. The `case` and `when` Constructs
 
-`case` is multi-way pattern matching against a scrutinee. Its sibling `when` is multi-way **condition** dispatch with no scrutinee — each arm is a boolean test, and the first true arm wins. Both are single constructs that produce a value; in statement position, the value is discarded. They share the same arm bodies ([§19.2](#sec-arms)) and the same `end` terminator, and either may appear in expression or statement position.
+`case` is multi-way pattern matching against a scrutinee. Its sibling `when` is multi-way **condition** dispatch with no scrutinee — each arm is a boolean test, and the first true arm wins. Both are single constructs that produce a value; in statement position, the value is discarded per the [§21.9](#sec-expression-statements) rules (applied per arm — see below). **Expression-position type (v0.159):** the construct's type is the left-fold of its arm-body types under the [§20](#sec-the-if-expression) common-type rule (`throw` arms are bottom-typed and impose no constraint). Only the selected arm's body is evaluated. They share the same arm bodies ([§19.2](#sec-arms)) and the same `end` terminator, and either may appear in expression or statement position.
 
 <a id="sec-forms"></a>
 ### 19.1 Forms
@@ -3202,7 +3210,7 @@ The `if` expression selects between two values:
 trueValue if condition else falseValue
 ```
 
-Both branches must have a common type.
+Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface ([§12](#sec-inheritance-and-dispatch)). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-catch-arms), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-throw-expressions)) and imposes no constraint. The condition is evaluated first; only the selected branch is then evaluated.
 
 ```bezel
 var max := a if a > b else b;
@@ -3365,7 +3373,7 @@ Form rules:
 <a id="sec-statement-form-of-expressions"></a>
 ### 21.9 Statement form of expressions
 
-A method call, an `await` expression, a `case` in statement position, or any other expression whose result is `()` may appear as a statement on its own line, terminated with `;`.
+A method call, an `await` expression, or any other expression whose result is `()` may appear as a statement on its own line, terminated with `;`. A `case`/`when` in statement position also stands alone as a statement; its value handling is **per arm** (v0.159): an *expression*-bodied arm whose value is non-`()` gets this section's discard warning — and the non-trivial-dispose / `Task` hard error — applied at that arm; statement-bodied and `do … end` arms have type `()` and are exempt.
 
 An expression statement whose result is a non-`()` type is permitted but the compiler emits a warning: the result is silently discarded, which may indicate a bug (a return value the programmer forgot to use). To suppress the warning, use the discard form `_ := expression;` ([§17.13](#sec-the-discard-_)) — but only when the result type allows it. For non-trivial-dispose class types and for `Task`, the warning is replaced by a hard error directing the caller to `using var _ := expression;`, an explicit `.Dispose()`, or `Task.FireAndForget` as appropriate.
 
@@ -8137,7 +8145,7 @@ PatternBound    ::= "-"? Shift
                               /* Dedicated pattern-position range form (mirrors
                                  the v0.94 RelOpPattern fix): no bare-expression
                                  leg (a lone Shift is not a range pattern) and no
-                                 `step` (patterns test membership; stride has no
+                                 `step` (patterns test written bounds; stride has no
                                  membership meaning, §16.4). Bounds admit a
                                  leading `-` for negative literals. */
 RelOpPattern    ::= "<" | ">" | "<=" | ">="
@@ -8318,6 +8326,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `where T: IFoo` substitutions are non-nullable types conforming to `IFoo` per the [§14.2](#sec-constraints) conformance rule: classes implementing it (directly or by inheritance), records implementing it directly, and interfaces extending it (directly or transitively).
 - Constraint combinations are checked for consistency (`class, value` is rejected).
 - Inside an unconstrained generic body, `T` is treated conservatively as possibly nullable.
+- `?` is idempotent under substitution: `T?` with T = `U?` denotes `U?` (no two-level optional; [§7.10](#sec-generics-and-nullability)).
 - Type-bound constraints (`where T: class`, `where T: SomeClass`, `where T: IFoo`) and `where T: notnull` make T non-nullable inside the body.
 - `owned` is not admitted on generic type arguments ([§14.4](#sec-owned-as-a-generic-argument)). The owning collection and task types are separate named classes (`OwnedArray<T>`, `OwnedTask<T>`, etc., declared in stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic) and [§6](Bezel_Standard_Library.md#sec-system-threading)); each carries `where T: class` (or `where V: class` for `OwnedDictionary<K, V>`) as part of its declaration.
 

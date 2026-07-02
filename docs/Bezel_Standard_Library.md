@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.158 — July 2026**
+**Companion to the Bezel Language Specification, v0.159 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2648,7 +2648,7 @@ public extension IOrderedEnumerable<T>
 end;
 ```
 
-`First`/`Last`/`Single`/`ElementAt` throw `InvalidOperationException` (or `IndexOutOfRangeException` for `ElementAt`) on missing-element; the `*OrNull` variants return `null` instead.
+`First`/`Last`/`Single`/`ElementAt` throw `InvalidOperationException` (or `IndexOutOfRangeException` for `ElementAt`) on missing-element; the `*OrNull` variants return `null` instead. (When the element type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so an `*OrNull` result cannot distinguish "empty" from "a present `null`"; use `Count` or the `Try` shape when the distinction matters.)
 
 The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` forms) restrict to the elements satisfying the predicate: `First(pred)` and `Last(pred)` yield the first and last matching element, and `Single(pred)` the sole matching element. Each is equivalent to the corresponding no-argument method applied after `Where(pred)` — `xs.First(pred)` is `xs.Where(pred).First()` — and inherits its missing-element behaviour: `First(pred)`/`Last(pred)`/`Single(pred)` throw `InvalidOperationException` when no element matches (and `Single(pred)` also when more than one matches), while `FirstOrNull(pred)`/`LastOrNull(pred)`/`SingleOrNull(pred)` return `null` when none matches (`SingleOrNull(pred)` still throws when more than one matches).
 
