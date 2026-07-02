@@ -249,6 +249,7 @@ set(BEZEL_TEST_SOURCES
     sema/compound_assign_operator_result_851_test.cpp # fix #851: §25.1 reject compound op whose overload result differs from LHS
     sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range
     sema/enum_int_conversion_924_test.cpp             # fix #924: §5.4/§10 reject implicit enum<->int conversion
+    sema/bool_int_conversion_1322_test.cpp            # fix #1322: §5.1/§5.2 reject bool(n)/int(b) — integer↔bool conversion forbidden
     sema/bare_drain_discard_832_test.cpp              # fix #832: §21.9 reject bare owning-collection drain discard
     sema/generic_default_new_constraint_864_test.cpp  # fix #864: §17.11 default(T) under where T:class rejected; §14.2 new() at method call site
     sema/with_expression_target_validation_875_test.cpp  # fix #875-#878: §9.5/§5.1 validate with-expression targets (type, existence, method, computed-property)

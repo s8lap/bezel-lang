@@ -9942,13 +9942,13 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         // unsigned source value with a negative dest value that share low bits.
         llvm::Value* trunc = builder_.CreateTrunc(src, dstTy);
         int64_t dstMax, dstMin;
-        // #1269 / §5.2: `bool` is i1 (db == 1) whose valid values are {0, 1};
-        // it must use the UNSIGNED range [0, 1], not the signed i1 range [-1, 0].
-        // isUnsignedPrim(Bool) is false (bool is not a numeric-arithmetic type),
-        // so without this the range was [-1, 0]: bool(1) wrongly raised
-        // OverflowException while bool(-1) passed and truncated to 1 (true).
-        // db == 1 iff the destination is bool, so this is scoped to bool only.
-        if (dstUns || db == 1) {
+        // #1322 / §5.1/§5.2: `bool(n)` is now a sema error, so `bool` can
+        // never be the destination here.  The `|| db == 1` clause added by
+        // #1269 (which worked around bool's unsigned i1 range) is removed as
+        // dead code.  Only unsigned numeric destinations (dstUns) now need the
+        // unsigned [0, 2^db) range; signed numeric destinations use the signed
+        // range.
+        if (dstUns) {
             dstMin = 0;
             dstMax = static_cast<int64_t>((1ULL << db) - 1ULL);
         } else {

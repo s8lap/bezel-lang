@@ -834,6 +834,66 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (!ctx_.exprSymbol(*ce.callee)) {
             PrimitiveType pt = primitiveFromName(id->name);
             if (pt != PrimitiveType::None) {
+                // §5.1 / §5.2 (#1322): bool↔numeric conversion is forbidden in
+                // BOTH directions.  §5.1 explicitly lists "Between integers and
+                // `bool`" as never-implicit; §5.2's explicit-conversion table
+                // does not include `bool` as a target from any numeric source
+                // nor as a numeric source for another type.  Reject
+                // `bool(numericExpr)` and `numericType(boolExpr)` here so
+                // codegen never sees the conversion.
+                // Idiomatic alternative: `n <> 0` to test for non-zero.
+                auto isNumericPrim = [](PrimitiveType p) {
+                    switch (p) {
+                        case PrimitiveType::Byte:    case PrimitiveType::SByte:
+                        case PrimitiveType::Short:   case PrimitiveType::UShort:
+                        case PrimitiveType::Int:     case PrimitiveType::UInt:
+                        case PrimitiveType::Long:    case PrimitiveType::ULong:
+                        case PrimitiveType::Float:   case PrimitiveType::Double:
+                        case PrimitiveType::Decimal: case PrimitiveType::Char:
+                            return true;
+                        default: return false;
+                    }
+                };
+                if (ce.args.size() == 1 && ce.args[0].value) {
+                    const TypeRef* argTy =
+                        ctx_.exprType(*ce.args[0].value);
+                    if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                        !argTy->nullable) {
+                        PrimitiveType srcPt = argTy->primitive;
+                        // bool(numericExpr): target is bool, source is numeric.
+                        if (pt == PrimitiveType::Bool &&
+                            isNumericPrim(srcPt)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "conversion between a numeric type and `bool` "
+                                "is not permitted (\xC2\xA7""5.1/\xC2\xA7""5.2); "
+                                "use `n <> 0` to test for non-zero");
+                            return;
+                        }
+                        // §5.2 (#1322 ruling, v0.158): the two directions are
+                        // deliberately ASYMMETRIC. Explicit integer(boolExpr) is a
+                        // total, information-preserving conversion (false→0, true→1)
+                        // and is admitted — `return int(r = null);` is the standard
+                        // way to turn a comparison into a number. bool(n) remains
+                        // forbidden (partial, truthiness-shaped). A bool source is
+                        // rejected only for NON-integer numeric targets (float/
+                        // double/decimal have no 0/1 reading worth blessing; char is
+                        // a code point, not a number).
+                        if (srcPt == PrimitiveType::Bool &&
+                            (pt == PrimitiveType::Float ||
+                             pt == PrimitiveType::Double ||
+                             pt == PrimitiveType::Decimal ||
+                             pt == PrimitiveType::Char)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "`bool` converts explicitly only to the integer "
+                                "types (false→0, true→1); conversion to "
+                                "float/double/decimal/char is not permitted "
+                                "(§5.2)");
+                            return;
+                        }
+                    }
+                }
                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(pt));
                 return;
             }

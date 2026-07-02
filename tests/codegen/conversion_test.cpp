@@ -107,24 +107,8 @@ BEZEL_TEST(codegen_cg44, int_of_enum_with_explicit_values) {
         "end Main; end C;").exitCode, 20);
 }
 
-// #1269 / §5.2: `bool(n)` is a strict integer narrowing — bool is i1 with valid
-// values {0, 1} (unsigned range [0,1]), NOT the signed i1 range [-1,0]. Before
-// the fix bool(1) wrongly raised OverflowException and bool(-1) passed (→ true).
-BEZEL_TEST(codegen_cg44, int_to_bool_one_is_true_1269) {
-    BEZEL_EXPECT_EQ(run("var n := 1; var b := bool(n); return (10 if b else 20);"), 10);
-}
-BEZEL_TEST(codegen_cg44, int_to_bool_zero_is_false_1269) {
-    BEZEL_EXPECT_EQ(run("var n := 0; var b := bool(n); return (10 if b else 20);"), 20);
-}
-BEZEL_TEST(codegen_cg44, int_to_bool_two_overflow_raises_1269) {
-    BEZEL_EXPECT_EQ(run(
-        "var n := 2; "
-        "try var b := bool(n); return (10 if b else 20); "
-        "catch OverflowException => return 99; end;"), 99);
-}
-BEZEL_TEST(codegen_cg44, int_to_bool_negone_overflow_raises_1269) {
-    BEZEL_EXPECT_EQ(run(
-        "var n := -1; "
-        "try var b := bool(n); return (10 if b else 20); "
-        "catch OverflowException => return 99; end;"), 99);
-}
+// NOTE (#1322 / §5.1/§5.2): the four `bool(n)` runtime tests added by #1269
+// have been migrated to sema/bool_int_conversion_1322_test.cpp as compile-time
+// reject tests.  The spec (§5.1: "Between integers and `bool`" is never
+// implicit; §5.2: does not list `bool` as an explicit-conversion target)
+// forbids the conversion entirely; it must be caught at sema, not at runtime.
