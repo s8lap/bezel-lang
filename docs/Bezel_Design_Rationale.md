@@ -7544,6 +7544,19 @@ v0.170 is the **uniform-closer revision** — the fifth and final syntax adoptio
 
 None — the change is additive; the entire existing corpus already conforms.
 
+<a id="sec-v0-170-to-v0-171-changelog"></a>
+### v0.171 changelog (v0.170 → v0.171)
+
+v0.171 is the **Try-convention revision** (#1336) — the review's P6 sweep.
+
+- **One Try shape for extraction** (stdlib §1 Conventions, §4.5/§4.7/§4.8/§4.9/§4.11, §4.17): every extraction Try's out parameter is **nullable** — `TryPop(out owned item: T?)`, `TryGetValue(key, out value: V?)`, `TryPeek(out item: T?)` — because §22.3 requires every out assigned on every exit path and the false path has only `null` to assign. This removes the third, unimplementable shape (`out owned item: T` on `where T: class` collections, reintroduced without a decision by the v0.96 rewrite against the rationale's own v0.89 rule). The nullable-return shape (`TryAcquire(): owned Lock?`, v0.77) remains the sanctioned alternative when null alone is the signal; §1 now names both shapes and when each applies.
+- **Borrowing forms included** (resolving v0.77's deferred question): `Dictionary.TryGetValue`, `Stack/Queue` `TryPop`/`TryDequeue`/`TryPeek` take `out ... T?`/`V?` uniformly — value-typed instantiations read a `T?` at the call site. Uniformity was chosen over per-category shapes: one rule, honest types, and the two-overload borrow/take pattern of §22.6 keeps working.
+- The `!` after a successful Try remains required — the §22.6-named flow-narrowing deferral is unchanged (copied here per the #1336 recommendation: a future revision adding flow-sensitive out-narrowing removes the `!`; the signature sweep deliberately does not wait for it).
+
+#### Migration
+
+Breaking for callers that declared the out recipient non-nullable: the recipient becomes `T?` (inline `out var x` forms simply infer the nullable type; explicit `var x: T := ...; Try(out x)` forms change the local's type or switch to inline-out). The compiler train migrates the corpus; call sites already using `out using var`/`out owned var` + `!` (the Guide 2 idiom) are unaffected.
+
 ## 20. Closing
 
 If the opening framed Bezel by what it borrows, the body has shown what it actually contributes: not the features — those have ancestors — but the discipline applied to combining them. The recurring move in this document is the same one every time a hard question arrived. Ship the part that fits the foundations cleanly. Decline the part that fights them, with the reason written down so the question stays settled rather than perennially reopened. Scope whatever genuinely remains open by naming its precise blocker, not by deferring it vaguely. Member-access reflection is declined, not pending. The cyclic-serialization soundness obligation was discharged in prose before any syntax was written. Tuples and post-condition loops are conveniences with recorded costs, not gaps. The deferred list is a list of decisions deliberately not yet made — each with its reasoning — never a list of unsolved problems.

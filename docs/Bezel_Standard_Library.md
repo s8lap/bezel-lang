@@ -35,6 +35,7 @@ Throughout this document:
 - Implementations may add internal helper methods and private members. Anything documented here is part of the public contract.
 - Methods returning freshly-allocated class instances annotate the return type with `owned` to communicate the caller's disposal obligation (see [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) and [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer) of the language spec). Methods returning `string` or other runtime-managed types ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) do not use `owned`, since those types are exempt from manual disposal.
 - Generic constraints are noted where relevant; absence of a constraint clause means "any T."
+- **The Try convention (v0.171, #1336).** Exactly two Try shapes are sanctioned. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and the out parameter is *nullable in every form* because §22.3 requires every out assigned on every exit path and the false path has no value to assign (it assigns `null`; for value-typed instantiations the call site therefore reads a `T?`). **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire`, the v0.77 ruling: simpler call sites). The pre-v0.171 non-nullable `out owned item: T` shape was unimplementable under §22.3 (the rationale's v0.89 entry states the rule; the v0.96 collection rewrite reintroduced the illegal shape without a decision) and is removed everywhere. The `!` after a successful Try remains required until the §22.6-named flow-narrowing revision.
 - Compiler-intrinsic types (primitive wrappers, `Range<T>`) may declare `const` members whose values are provided by the compiler rather than by a source-level initializer expression. In the declarations below, a `const` field shown without `:= value` (e.g. `public static const MaxValue: double;`) is such a compiler-provided constant. User-defined code may not omit `const` initializers (see language spec [§22.12](Bezel_Language_Spec.md#sec-static-members)).
 - **Elided interface-required members.** When a class declares it implements an interface, the members required by that interface are part of the class's public contract whether or not the declaration shows them explicitly. Some declarations show every interface-required member; others elide the redundant ones with a marker comment such as `// plus standard ICollection<T> operations` or `// ICollection<T> operations plus:`. Both forms are equivalent — the elided members are still part of the public contract, with signatures determined by the interface declaration plus the implementation's type substitution (per the [§11.2](Bezel_Language_Spec.md#sec-interface-declaration) exact-match rule). For interfaces whose substitution produces a member with the same name but a different parameter type than another method on the class — `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>` is the leading example, where ICollection's `Add(item: T)` substitutes to `Add(item: DictionaryEntry<K, V>)` while Dictionary also offers `Add(key: K, value: V)` — both forms are public members of the class and both are reachable.
 
@@ -44,7 +45,7 @@ This document is normative for the names, signatures, and observable behavior li
 
 <a id="sec-system-auto-imported"></a>
 
-**Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`, `AsAsciiByteSpan`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces' missing `I-` prefix is resolved by the pending family rename (#1372's train).
+**Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`, `AsAsciiByteSpan`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix since the v0.168 family rename (#1372).
 
 ## 2. `System` (auto-imported)
 
@@ -1262,8 +1263,8 @@ public class OwningArray<T>: IOwningList<T> where T: class
   public method PopAt(index: int): owned T;             // removes and returns owned
   public method PopFirst(): owned T;                     // = PopAt(0); raises if empty
   public method PopLast(): owned T;                      // = PopAt(Count - 1); raises if empty
-  public method TryPopFirst(out owned item: T): bool;
-  public method TryPopLast(out owned item: T): bool;
+  public method TryPopFirst(out owned item: T?): bool;   // v0.171 (#1336): the false path assigns null (§22.3)
+  public method TryPopLast(out owned item: T?): bool;
   public method Drain(): IOwningEnumerable<T>;             // iteration drains the source
 end OwningArray;
 
@@ -1469,8 +1470,8 @@ public class OwningLinkedList<T>: IOwningCollection<T> where T: class
   // Drain methods
   public method PopFirst(): owned T;                            // raises if empty
   public method PopLast(): owned T;
-  public method TryPopFirst(out owned item: T): bool;
-  public method TryPopLast(out owned item: T): bool;
+  public method TryPopFirst(out owned item: T?): bool;   // v0.171 (#1336)
+  public method TryPopLast(out owned item: T?): bool;
   public method Drain(): IOwningEnumerable<T>;
 end OwningLinkedList;
 ```
@@ -1502,7 +1503,7 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public method Contains(key: K): bool;            // alias for ContainsKey;
                                                    //   enables `key in dict`
   public method Remove(key: K): bool;
-  public method TryGetValue(key: K, out value: V): bool;
+  public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): false path assigns null; value-typed V reads as V? at the call site
   public method GetOrAdd(key: K, factory: (K) -> V): V;
 
   public method Clear();
@@ -1560,12 +1561,12 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   public method ContainsKey(key: K): bool;
   public method Contains(key: K): bool;
   public method Remove(key: K): bool;          // disposes the removed value
-  public method TryGetValue(key: K, out value: V): bool;       // out is borrow
+  public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
   public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
   // Drain
   public method PopValue(key: K): owned V;     // raises if not present
-  public method TryPopValue(key: K, out owned value: V): bool;
+  public method TryPopValue(key: K, out owned value: V?): bool;   // v0.171 (#1336)
   public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
                                                // iteration drains the dictionary;
                                                //   each yielded entry owns its Value
@@ -1809,8 +1810,8 @@ public class Stack<T>: IReadOnlyCollection<T>   // v0.165 (#1354): the v0.94 own
   public method Push(item: T);
   public method Pop(): T;             // raises if empty
   public method Peek(): T;
-  public method TryPop(out item: T): bool;
-  public method TryPeek(out item: T): bool;
+  public method TryPop(out item: T?): bool;    // v0.171 (#1336)
+  public method TryPeek(out item: T?): bool;
 end Stack;
 
 public class OwningStack<T>: IOwningCollection<T> where T: class
@@ -1818,8 +1819,8 @@ public class OwningStack<T>: IOwningCollection<T> where T: class
   public method Push(owned item: T);
   public method Pop(): owned T;                   // raises if empty; transfers out
   public method Peek(): T;                         // borrow of top element
-  public method TryPop(out owned item: T): bool;
-  public method TryPeek(out item: T): bool;       // out is borrow
+  public method TryPop(out owned item: T?): bool;   // v0.171 (#1336)
+  public method TryPeek(out item: T?): bool;       // out is borrow
   public method Clear();                           // disposes every element
   public method Drain(): IOwningEnumerable<T>;
 end OwningStack;
@@ -1830,8 +1831,8 @@ public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public method Dequeue(): T;
   public method Peek(): T;
   public method Contains(item: T): bool;        // explicit (v0.165)
-  public method TryDequeue(out item: T): bool;
-  public method TryPeek(out item: T): bool;
+  public method TryDequeue(out item: T?): bool;   // v0.171 (#1336)
+  public method TryPeek(out item: T?): bool;
 end Queue;
 
 public class OwningQueue<T>: IOwningCollection<T> where T: class
@@ -1839,8 +1840,8 @@ public class OwningQueue<T>: IOwningCollection<T> where T: class
   public method Enqueue(owned item: T);
   public method Dequeue(): owned T;
   public method Peek(): T;                         // borrow of front element
-  public method TryDequeue(out owned item: T): bool;
-  public method TryPeek(out item: T): bool;       // out is borrow
+  public method TryDequeue(out owned item: T?): bool;   // v0.171 (#1336)
+  public method TryPeek(out item: T?): bool;       // out is borrow
   public method Clear();                           // disposes every element
   public method Drain(): IOwningEnumerable<T>;
 end OwningQueue;
@@ -2591,7 +2592,7 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>>,
   public property [key: K]: V;                  // get: KeyNotFoundException if absent
                                                 // set: insert or replace
   public method ContainsKey(key: K): bool;
-  public method TryGetValue(key: K, out value: V): bool;   // v0.165 (#1354): out V, matching §4.8 (the v0.77 recorded shape)
+  public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): nullable out, matching §4.8's revised uniform Try shape
   public method Remove(key: K): bool;           // false if absent
   public method Clear();
 
