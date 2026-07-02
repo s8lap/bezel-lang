@@ -139,6 +139,10 @@ Adopted v0.169 (#1348 — an adversarially-verified review finding, not a reject
 
 The marker reuses grammar the language already reserved: Appendix A.7's `ArgModifiers` carried an orphaned bare-`owned` alternative with no prose semantics — v0.169 defines it rather than inventing syntax. `M(owned x)` is required exactly when a **named owned binding** is consumed (an owned local or `owned` parameter); **fresh producers** (`new`, owned-returning calls, `move obj._f`) stay unmarked because no live binding is invalidated — the marker announces invalidation, not the parameter's mode. `owned` was preferred over a `move` spelling: it fills the reserved slot, mirrors `out owned var x`, and avoids relaxing MoveExpr's deliberate field-only operand restriction (§5.10). The §22.6 overload ban deliberately stands — its own carve-out criterion is now satisfiable, but lifting it drags stdlib renames and resolution rules along; that is a recorded follow-on, adopted separately or not at all.
 
+### 3.11 One uniform end-closer rule
+
+Adopted v0.170 (#1374; one of #1343's recorded seams). The closer discipline was three rules: named declarations took an optional *name* label (`end Main;`), constructor/destructor/operator bodies an optional *keyword* label (`end constructor;`), and every statement-level block — plus extension and extern, the longest un-labelable bodies in the language — **forbade** any label, so the Ada-heritage `end for;`/`end if;` (the very heritage §3 cites) was an error. v0.170 collapses the three rules into one: `end` may repeat the construct's name (if it has one) or its introducing keyword (otherwise), checked when present. Bare `end;` stays legal everywhere, so the change is fully additive — zero migration — and long blocks gain the compiler-checked readability the declaration closers always had. The alternative of *requiring* labels on long blocks was declined: label ergonomics are a style choice, and the compiler-checked optional form gives tooling and reviewers the same benefit without ceremony.
+
 <a id="sec-memory-management"></a>
 ## 4. Memory management
 
@@ -7528,6 +7532,17 @@ v0.169 is the **call-site transfer-marker revision** — the fourth breaking-syn
 #### Migration
 
 Breaking, compiler-guided: every call passing a named owned binding to an `owned` parameter gains `owned` at the argument (the missing-marker diagnostic points at each site). Fresh-producer arguments are untouched. The conformance corpus and the project's test/example sources are migrated with this revision's compiler train.
+
+<a id="sec-v0-169-to-v0-170-changelog"></a>
+### v0.170 changelog (v0.169 → v0.170)
+
+v0.170 is the **uniform-closer revision** — the fifth and final syntax adoption from the review (#1374). Fully additive.
+
+- **One end-label rule** (§1.6, Appendix A): `end` may optionally repeat the construct's name or introducing keyword, checked when present. Newly legal-and-checked: `end if;`, `end while;`, `end for;`, `end do;`, `end try;`, `end case;`, `end when;`, `end extension;`, `end extern;`. Bare `end;` remains valid everywhere. New rationale [§3.11](#).
+
+#### Migration
+
+None — the change is additive; the entire existing corpus already conforms.
 
 ## 20. Closing
 

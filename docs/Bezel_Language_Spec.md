@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.169 — July 2026**
+**Version 0.170 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -95,13 +95,12 @@ Documentation comments use XML element syntax. See [§34](#sec-comments-and-docu
 <a id="sec-statements-and-termination"></a>
 ### 1.6 Statements and termination
 
-Every statement terminates with a semicolon. Block-bodied constructs terminate with `end`, optionally followed by a label, then a semicolon. Three categories of block construct admit different label forms:
+Every statement terminates with a semicolon. Block-bodied constructs terminate with `end`, optionally followed by a label, then a semicolon. **One uniform rule (v0.170, #1374): `end` may be followed by the construct's name if it has one, or by its introducing keyword otherwise; when a label is present, it must match.** Concretely:
 
-- **Named constructs** — class, interface, record, enum bodies; method bodies; property accessor blocks. The optional label is an *identifier*: `end ClassName;`, `end methodName;`. When supplied, the identifier must match the construct's declared name exactly; a mismatch is a compile error.
-- **Keyword-labelled constructs** — constructors, destructors, operator overload bodies. These have no user-chosen name, so the optional label is the construct keyword: `end constructor;`, `end destructor;`, `end operator +;`. When supplied, the keyword (and operator token, where applicable) must match the construct kind exactly.
-- **Plain-end constructs** — all statement-level blocks (`if`, `while`, `for`, `with`, `do … end`, `try`), extension blocks, extern blocks, and lambda or arm bodies introduced with `do`. These admit no label of any form; only `end;` is valid. In particular, even though these constructs are introduced by keywords (`if`, `while`, `try`, etc.), the construct-keyword form from the second category does not apply here: `end if;`, `end while;`, `end try;`, `end with;`, and similar are not accepted. The opening keyword and the indented body together identify the construct unambiguously; the closing `end;` needs no further qualification.
+- **Named constructs** — class, interface, record, enum bodies; method bodies; property accessor blocks. The optional label is the *identifier*: `end ClassName;`, `end methodName;`. A mismatch is a compile error.
+- **Keyword-labelled constructs** — everything else, labelled by the keyword that introduced the block: `end constructor;`, `end destructor;`, `end operator +;` (the operator token must also match), and — since v0.170 — the statement-level and container blocks: `end if;`, `end while;`, `end for;`, `end with;`, `end do;`, `end try;`, `end case;`, `end when;`, `end extension;`, `end extern;`. A label that does not match the construct's introducing keyword is a compile error.
 
-In all three categories the unlabelled form `end;` is always valid; the label is for readability across long bodies and carries no semantic weight beyond compile-time verification that it matches.
+The unlabelled form `end;` is always valid everywhere — the label is for readability across long bodies and carries no semantic weight beyond compile-time verification that it matches. *(History: through v0.169 the statement-level, extension, and extern blocks admitted no label at all — three different closer disciplines where one rule now suffices; see the rationale's v0.170 entry.)*
 
 ---
 
@@ -7696,10 +7695,10 @@ EnumConstant    ::= Identifier (":=" ConstExpr)? SerializedClause?
                                  them here is a compile error. */
 
 ExtensionDecl   ::= Visibility? "extension" Type GenericConstraints*
-                    ExtensionMember* "end" ";"
+                    ExtensionMember* "end" "extension"? ";"
 
 ExternBlock     ::= "extern" StringLiteral ("convention" StringLiteral)?
-                    ExternDecl+ "end" ";"
+                    ExternDecl+ "end" "extern"? ";"
 ExternDecl      ::= Visibility? "method" Identifier "(" ParamList? ")"
                     (":" "owned"? Type)? ";"
                               /* `owned` on the return is permitted for
@@ -7996,24 +7995,28 @@ ExpressionStmt  ::= Expression ";"
 IfStmt          ::= "if" Expression "then" Statement*
                     ("elif" Expression "then" Statement*)*
                     ("else" Statement*)?
-                    "end" ";"
+                    "end" "if"? ";"
+                              /* v0.170 (#1374): every statement-level closer
+                                 may optionally repeat its introducing keyword,
+                                 checked when present — one uniform end-label
+                                 rule (§1.6). */
 
-WhileStmt       ::= "while" Expression "do" Statement* "end" ";"
+WhileStmt       ::= "while" Expression "do" Statement* "end" "while"? ";"
 
 ForStmt         ::= "for" "var" Identifier (":" Type)? "in" Expression
-                    "do" Statement* "end" ";"
+                    "do" Statement* "end" "for"? ";"
                   | "await" "for" "var" Identifier (":" Type)? "in" Expression
-                    ("with" Expression)? "do" Statement* "end" ";"
+                    ("with" Expression)? "do" Statement* "end" "for"? ";"
 
-DoEndBlock      ::= "do" Statement* "end" ";"
+DoEndBlock      ::= "do" Statement* "end" "do"? ";"
 
 ReturnStmt      ::= "return" Expression? ";"
 ThrowStmt       ::= "throw" Expression? ";"
 BreakStmt       ::= "break" ";"
 ContinueStmt    ::= "continue" ";"
 
-TryStmt         ::= "try" Statement* CatchBlock FinallyClause? "end" ";"
-                  | "try" Statement* FinallyClause "end" ";"
+TryStmt         ::= "try" Statement* CatchBlock FinallyClause? "end" "try"? ";"
+                  | "try" Statement* FinallyClause "end" "try"? ";"
 CatchBlock      ::= "catch" CatchArm ("," CatchArm)* ","?
 CatchArm        ::= CatchPattern ("when" Expression)? "=>" ArmBody
 CatchPattern    ::= Type ("|" Type)*                          /* no binding */
@@ -8190,7 +8193,7 @@ LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
-CaseExpr        ::= "case" Expression "of" CaseArm ("," CaseArm)* ","? "end"
+CaseExpr        ::= "case" Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"?
                               /* The scrutinee Expression is mandatory (#744);
                                  the scrutinee-less condition-dispatch form is
                                  the separate WhenExpr below. `of` delimits the
@@ -8212,7 +8215,7 @@ AltPattern      ::= Pattern ("|" Pattern)*
                                  be constants (§19.3). `|` never collides with
                                  bitwise-or: pattern-embedded expressions parse
                                  at Shift level or tighter (§19.3). */
-WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end"
+WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"?
                               /* Scrutinee-less condition dispatch (§19.1). Arms
                                  are tried in textual order; the first whose
                                  condition is `true` is selected. Valid in both
