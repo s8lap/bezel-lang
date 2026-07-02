@@ -496,6 +496,7 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close extension block");
     }
+    consumeOptionalEndKeyword("extension"); // §1.6 / v0.170 (#1374)
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of extension block");
@@ -582,6 +583,7 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close extern block");
     }
+    consumeOptionalEndKeyword("extern"); // §1.6 / v0.170 (#1374)
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of extern block");

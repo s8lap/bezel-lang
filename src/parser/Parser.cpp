@@ -1,6 +1,7 @@
 #include "parser/Parser.hpp"
 
 #include <algorithm>
+#include <string>
 #include <string_view>
 
 namespace bezel {
@@ -248,6 +249,41 @@ bool Parser::consumePunctuator(std::string_view text) {
     if (!isPunctuator(text)) return false;
     advance();
     return true;
+}
+
+// §1.6 / v0.170 (#1374): uniform end-label for keyword-labelled constructs.
+// The keyword after `end` is optional; when present it must match the
+// construct's introducing keyword. If a different keyword from the known
+// end-label set appears, a mismatch diagnostic is emitted and it is consumed
+// so the `;` terminator can still be found.
+void Parser::consumeOptionalEndKeyword(std::string_view expected) {
+    if (current_.kind != TokenKind::Keyword) return; // bare `end;` — always valid
+    if (current_.text == expected) {
+        advance(); // label matches
+        return;
+    }
+    // Only report a mismatch when the token is plausibly an end-label attempt
+    // (i.e. it belongs to the known set of construct-introducing keywords that
+    // are valid end-labels). Other keywords are left for the caller so that
+    // `end` followed by the next statement's keyword does not produce a spurious
+    // diagnostic.
+    static constexpr std::string_view kEndLabelKws[] = {
+        "if", "while", "for", "do", "try",
+        "case", "when", "extension", "extern",
+    };
+    for (auto kw : kEndLabelKws) {
+        if (current_.text == kw) {
+            std::string msg = "end label '";
+            msg += current_.text;
+            msg += "' does not match the construct keyword '";
+            msg += expected;
+            msg += "'";
+            diagnostics_.report(Severity::Error, current_.location, std::move(msg));
+            advance(); // consume for error recovery
+            return;
+        }
+    }
+    // Not a recognised end-label keyword — leave it untouched.
 }
 
 } // namespace bezel

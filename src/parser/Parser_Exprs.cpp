@@ -1214,6 +1214,7 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close case expression");
     }
+    consumeOptionalEndKeyword("case"); // §1.6 / v0.170 (#1374)
     return std::unique_ptr<ast::Expr>(ce.release());
 }
 
@@ -1237,6 +1238,7 @@ std::unique_ptr<ast::Expr> Parser::parseWhenExpr() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close `when` expression");
     }
+    consumeOptionalEndKeyword("when"); // §1.6 / v0.170 (#1374)
     return std::unique_ptr<ast::Expr>(ce.release());
 }
 

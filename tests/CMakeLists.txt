@@ -79,6 +79,7 @@ set(BEZEL_TEST_SOURCES
     parser/nullable_function_type_584_test.cpp
     parser/lambda_conditional_body_589_test.cpp
     parser/catch_arm_expr_body_588_test.cpp
+    parser/uniform_closer_1374_test.cpp
     sema/symbol_collection_test.cpp
     sema/static_init_cycles_797_test.cpp
     sema/groupby_store_gate_755_test.cpp

@@ -53,6 +53,14 @@ private:
     // when no closing angle is present.
     bool consumeClosingAngle();
 
+    // §1.6 / v0.170 (#1374): uniform-closer keyword label. Call immediately
+    // after `consumeKeyword("end")` for a keyword-labelled construct. If the
+    // current token is `expected`, it is consumed (label matches); if it is
+    // any other keyword from the known end-label set, a mismatch diagnostic
+    // is reported and it is consumed for error recovery; otherwise the token
+    // is left untouched (bare `end;` form — always valid).
+    void consumeOptionalEndKeyword(std::string_view expected);
+
     // Grammar productions.
     std::unique_ptr<ast::ModuleDecl> parseModuleDecl();
     std::unique_ptr<ast::Import> parseImport();

@@ -174,6 +174,7 @@ std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close case statement");
     }
+    consumeOptionalEndKeyword("case"); // §1.6 / v0.170 (#1374)
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of case statement");
@@ -197,6 +198,7 @@ std::unique_ptr<ast::Stmt> Parser::parseWhenStmt() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected 'end' to close `when` statement");
     }
+    consumeOptionalEndKeyword("when"); // §1.6 / v0.170 (#1374)
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of `when` statement");
@@ -366,6 +368,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'if' statement");
         }
+        consumeOptionalEndKeyword("if"); // §1.6 / v0.170 (#1374)
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end' of 'if'");
@@ -395,6 +398,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'while' statement");
         }
+        consumeOptionalEndKeyword("while"); // §1.6 / v0.170 (#1374)
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end' of 'while'");
@@ -619,6 +623,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'try' statement");
         }
+        consumeOptionalEndKeyword("try"); // §1.6 / v0.170 (#1374)
         // §31.2 (#746 R41-G): "At least one of catch or finally must be
         // present." A bare `try ... end;` with neither was silently accepted.
         if (stmt->catches.empty() && !stmt->hasFinally) {
@@ -700,6 +705,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'for' statement");
         }
+        consumeOptionalEndKeyword("for"); // §1.6 / v0.170 (#1374)
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end' of 'for'");
@@ -724,6 +730,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'do' block");
         }
+        consumeOptionalEndKeyword("do"); // §1.6 / v0.170 (#1374)
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end' of 'do' block");
