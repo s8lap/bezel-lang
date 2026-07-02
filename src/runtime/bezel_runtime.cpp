@@ -1521,6 +1521,19 @@ void bz_random_next_bytes(void* rp, uint8_t* buf, int64_t len) {
     }
 }
 
+// per stdlib §2.7 / #1359: NextInt64 — full 64-bit unsigned xorshift128+ value
+// cast to int64_t (signed). Maps the full 64-bit range to [Long.MinValue..Long.MaxValue].
+int64_t bz_random_next_long(void* rp) {
+    auto* r = (bz_rng_t*)rp;
+    return (int64_t)xorshift128_next(r->state);
+}
+
+// per stdlib §2.7 / #1359: NextBoolean — test the low bit of a fresh PRNG word.
+int32_t bz_random_next_bool(void* rp) {
+    auto* r = (bz_rng_t*)rp;
+    return (int32_t)(xorshift128_next(r->state) & 1ULL);
+}
+
 // ---------------------------------------------------------------------------
 // decimal (§4.4 / stdlib §9.3) — 128-bit high-precision decimal type.
 //
@@ -2393,6 +2406,19 @@ int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b) {
     return a->lo == b->lo && a->hi == b->hi ? 1 : 0;
 }
 
+// per stdlib §2.6 / #1357: CompareTo — 16-byte lexicographic on canonical byte
+// order (bytes 0-7 in lo field, 8-15 in hi field; stored little-endian on x86).
+// Per §2.6: ordering is the same as memcmp on the 16 raw bytes.
+int32_t bz_guid_compare(const bz_guid_t* a, const bz_guid_t* b) {
+    int c = memcmp(a, b, 16);
+    return c < 0 ? -1 : c > 0 ? 1 : 0;
+}
+
+// per stdlib §2.6 / #1357: FromByteArray — copy exactly 16 bytes into *out.
+void bz_guid_from_bytes(const uint8_t* bytes, bz_guid_t* out) {
+    memcpy(out, bytes, 16);
+}
+
 // ---------------------------------------------------------------------------
 // DateTime — .NET compatible tick epoch (0001-01-01 00:00:00 UTC)
 // POSIX epoch is 1970-01-01 00:00:00 UTC = tick 621355968000000000
@@ -2532,6 +2558,18 @@ int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
     int32_t dim = (mo == 2 && leap) ? 29 : days_in_month[mo];
     if (d > dim) d = dim;
     return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+}
+
+// per stdlib §2.5 / #1357: ToUnixTimeSeconds — convert .NET ticks to POSIX
+// seconds (truncating sub-second precision).
+int64_t bz_datetime_to_unix_seconds(int64_t ticks) {
+    return (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+}
+
+// per stdlib §2.5 / #1357: FromUnixTimeSeconds — convert POSIX seconds to
+// .NET tick count (no sub-second precision).
+int64_t bz_datetime_from_unix_seconds(int64_t seconds) {
+    return POSIX_EPOCH_TICKS + seconds * TICKS_PER_SECOND;
 }
 
 // ---------------------------------------------------------------------------
@@ -2816,6 +2854,74 @@ double bz_timespan_total_seconds(int64_t ticks) {
 }
 double bz_timespan_total_milliseconds(int64_t ticks) {
     return (double)ticks / (double)TICKS_PER_MS;
+}
+
+// ---------------------------------------------------------------------------
+// per stdlib §2.5 / #1357: TimeOnly — value type stored as i32 ms from
+// midnight (0..86399999). Helpers for string conversion and parsing.
+// ---------------------------------------------------------------------------
+
+// Format ms_from_midnight as "HH:mm:ss" → fresh heap bz_string* (rc=1).
+void* bz_timeonly_to_string(int32_t ms_from_midnight) {
+    if (ms_from_midnight < 0) ms_from_midnight = 0;
+    int32_t total_sec = ms_from_midnight / 1000;
+    int32_t hh  = total_sec / 3600;
+    int32_t mm  = (total_sec % 3600) / 60;
+    int32_t ss  = total_sec % 60;
+    // "HH:mm:ss\0" — 9 chars.
+    char* out = (char*)malloc(9);
+    out[0] = '0' + hh / 10;
+    out[1] = '0' + hh % 10;
+    out[2] = ':';
+    out[3] = '0' + mm / 10;
+    out[4] = '0' + mm % 10;
+    out[5] = ':';
+    out[6] = '0' + ss / 10;
+    out[7] = '0' + ss % 10;
+    out[8] = '\0';
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data  = out;
+    sh->len   = 8;
+    sh->width = 1;
+    sh->rc    = 1;
+    return sh;
+}
+
+// Parse "HH:mm:ss" or "HH:mm:ss.fff" from a bz_string*.
+// Returns 1 on success (writes *out_ms in [0..86399999]), 0 on failure.
+int32_t bz_timeonly_try_parse(const void* str_p, int32_t* out_ms) {
+    if (out_ms) *out_ms = 0;
+    if (!str_p) return 0;
+    const bz_string_hdr* h = (const bz_string_hdr*)str_p;
+    if (!h->data || h->width != 1) return 0;
+    const char* s = h->data;
+    int64_t len = h->len;
+    if (len < 8) return 0;  // "HH:mm:ss" minimum
+    // Parse HH
+    if (s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9') return 0;
+    int32_t hh = (s[0]-'0')*10 + (s[1]-'0');
+    if (s[2] != ':') return 0;
+    // Parse mm
+    if (s[3] < '0' || s[3] > '9' || s[4] < '0' || s[4] > '9') return 0;
+    int32_t mm = (s[3]-'0')*10 + (s[4]-'0');
+    if (s[5] != ':') return 0;
+    // Parse ss
+    if (s[6] < '0' || s[6] > '9' || s[7] < '0' || s[7] > '9') return 0;
+    int32_t ss = (s[6]-'0')*10 + (s[7]-'0');
+    // Optional .fff
+    int32_t ms3 = 0;
+    if (len >= 12 && s[8] == '.') {
+        if (s[9] < '0' || s[9] > '9' || s[10] < '0' || s[10] > '9' ||
+            s[11] < '0' || s[11] > '9') return 0;
+        ms3 = (s[9]-'0')*100 + (s[10]-'0')*10 + (s[11]-'0');
+        if (len != 12) return 0;  // trailing chars not allowed
+    } else if (len != 8) {
+        return 0;  // trailing chars without .fff not allowed
+    }
+    // Validate ranges.
+    if (hh > 23 || mm > 59 || ss > 59) return 0;
+    if (out_ms) *out_ms = hh*3600000 + mm*60000 + ss*1000 + ms3;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

@@ -178,6 +178,9 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // §3 nullary stdlib classes:
     if (n == "StringBuilder" || n == "Random" ||
         n == "DateTime" || n == "TimeSpan" ||
+        // per §2.5 / #1357: DateOnly and TimeOnly — value types (stored as i32),
+        // auto-imported like DateTime/TimeSpan; no user TypeDecl.
+        n == "DateOnly" || n == "TimeOnly" ||
         n == "File" || n == "Directory" || n == "Path" ||
         n == "Encoding" || n == "Linq" ||
         // §2.15 / issue #550: BinarySerializer / BinaryDeserializer (opaque
@@ -925,6 +928,13 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (first == "Range") {
                     ref.declaration = ctx_.builtinClassSym("Range");
                 }
+                // per §2.5 / #1357: DateOnly and TimeOnly are value-type builtins
+                // (stored as i32). Like DateTime/TimeSpan/Guid they keep
+                // declaration=null here so that lowerNew()'s `if (!rt->declaration)`
+                // gate at LlvmBackend_Exprs.cpp fires for `new DateOnly(...)`/
+                // `new TimeOnly(...)`. The ownership tracker recognises them via
+                // Path B (name-string comparison) in Ownership.cpp.
+                //
                 // #1115 / §2.8–§2.9 / #975: the auto-imported builtin generic
                 // interfaces IComparable<T> / IEquatable<T> / IEqualityComparer<T>
                 // get a REAL synthesized Interface TypeSymbol (with their contract

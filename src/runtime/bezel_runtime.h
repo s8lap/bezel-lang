@@ -403,6 +403,10 @@ void    bz_random_free(void* r);
 int32_t bz_random_next_int(void* r, int32_t lo, int32_t hi_exclusive);
 double  bz_random_next_double(void* r);
 void    bz_random_next_bytes(void* r, uint8_t* buf, int64_t len);
+// per stdlib §2.7 / #1359: NextInt64 (renamed from NextLong) — full 64-bit.
+int64_t bz_random_next_long(void* r);
+// per stdlib §2.7 / #1359: NextBoolean — 1 bit from PRNG.
+int32_t bz_random_next_bool(void* r);
 
 // ---------------------------------------------------------------------------
 // decimal (§4.4 / stdlib §9.3) — 128-bit high-precision decimal type.
@@ -521,6 +525,11 @@ int32_t bz_guid_parse(const void* str, bz_guid_t* out);
 
 // Bytewise equality: returns 1 if *a == *b, 0 otherwise.
 int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b);
+// per stdlib §2.6 / #1357: CompareTo — 16-byte lexicographic (canonical byte order).
+// Returns negative/0/positive like memcmp.
+int32_t bz_guid_compare(const bz_guid_t* a, const bz_guid_t* b);
+// per stdlib §2.6 / #1357: FromByteArray — copy exactly 16 bytes into *out.
+void bz_guid_from_bytes(const uint8_t* bytes, bz_guid_t* out);
 
 // ---------------------------------------------------------------------------
 // DateTime / TimeSpan (100-ns ticks since 0001-01-01 00:00:00 UTC,
@@ -562,6 +571,10 @@ int32_t bz_datetime_day_of_year(int64_t ticks);
 int64_t bz_datetime_add_years(int64_t ticks, int32_t years);
 int64_t bz_datetime_add_months(int64_t ticks, int32_t months);
 
+// per stdlib §2.5 / #1357: Unix-time interop.
+int64_t bz_datetime_to_unix_seconds(int64_t ticks);
+int64_t bz_datetime_from_unix_seconds(int64_t seconds);
+
 // ---------------------------------------------------------------------------
 // Per §2.5: TimeSpan component properties (all computed from a signed i64
 // tick count). Total* return double; component Days/Hours/Minutes/Seconds/
@@ -581,6 +594,17 @@ double bz_timespan_total_hours(int64_t ticks);
 double bz_timespan_total_minutes(int64_t ticks);
 double bz_timespan_total_seconds(int64_t ticks);
 double bz_timespan_total_milliseconds(int64_t ticks);
+
+// ---------------------------------------------------------------------------
+// per stdlib §2.5 / #1357: TimeOnly — value type stored as i32 ms from
+// midnight (0..86399999). Helpers for string conversion and parsing.
+// ---------------------------------------------------------------------------
+
+// Format ms_from_midnight as "HH:mm:ss" → fresh heap bz_string* (rc=1).
+void* bz_timeonly_to_string(int32_t ms_from_midnight);
+// Parse "HH:mm:ss" or "HH:mm:ss.fff" from a bz_string*. Returns 1 on success
+// (writes *out_ms in [0..86399999]), 0 on failure.
+int32_t bz_timeonly_try_parse(const void* str, int32_t* out_ms);
 
 // ---------------------------------------------------------------------------
 // File I/O — wraps POSIX read/write. All path parameters are NUL-terminated

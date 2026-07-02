@@ -941,7 +941,15 @@ set(BEZEL_TEST_SOURCES
     ownership/channel_spawn_sink_692_693_test.cpp
     ownership/nested_new_owned_arg_835_test.cpp
     # --- fix #1029: null-coalescing owned-class disposal — both operand paths, no double-free (§28.3) ---
-    codegen/null_coalesce_owned_disposal_1029_test.cpp)
+    codegen/null_coalesce_owned_disposal_1029_test.cpp
+    # --- stdlib alignment #1356/#1357/#1359: Convert, DateTime/TimeSpan/Guid/DateOnly/TimeOnly, Random ---
+    codegen/convert_1356_stdlib_2_3_test.cpp         # §2.3 Convert ToDecimal + Try* overloads
+    codegen/datetime_compar_unix_1357_stdlib_2_5_test.cpp  # §2.5 DateTime CompareTo / unix-time interop
+    codegen/timespan_compar_fromticks_1357_stdlib_2_5_test.cpp  # §2.5 TimeSpan CompareTo / FromTicks / ToString
+    codegen/guid_compar_frombytes_1357_stdlib_2_6_test.cpp  # §2.6 Guid CompareTo / FromByteArray
+    codegen/dateonly_timeonly_1357_stdlib_2_5_test.cpp  # §2.5 DateOnly / TimeOnly full surface
+    codegen/random_nextint64_1359_stdlib_2_7_test.cpp   # §2.7 Random NextInt64 / NextBoolean / NextBytes
+)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

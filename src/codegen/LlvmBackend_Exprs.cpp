@@ -2308,6 +2308,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 }
                 // Ticks property — return the raw i64.
                 if (mbr == "Ticks") return ticks;
+                // per §2.5 / #1357: Date → DateOnly (i32 day number from epoch).
+                // TICKS_PER_DAY = 864000000000LL
+                if (mbr == "Date") {
+                    llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                    return builder_.CreateTrunc(
+                        builder_.CreateSDiv(ticks, tpd, "dt.date.dn"),
+                        i32(), "dt.date");
+                }
+                // per §2.5 / #1357: TimeOfDay → TimeOnly (i32 ms from midnight).
+                // ms = (ticks % TICKS_PER_DAY) / TICKS_PER_MS
+                if (mbr == "TimeOfDay") {
+                    llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                    llvm::Value* tpm = builder_.getInt64(10000LL);
+                    llvm::Value* rem = builder_.CreateSRem(ticks, tpd, "dt.tod.rem");
+                    return builder_.CreateTrunc(
+                        builder_.CreateSDiv(rem, tpm, "dt.tod.ms"),
+                        i32(), "dt.tod");
+                }
             }
             if (cn == "TimeSpan") {
                 llvm::Value* ticks = lowerExpr(*ma->target);
@@ -2361,6 +2379,58 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (mbr == "Milliseconds") return emitComponent(4);
                 // Ticks property — raw i64.
                 if (mbr == "Ticks") return ticks;
+            }
+            // per §2.5 / #1357: DateOnly property reads.
+            // DateOnly is stored as i32 day-number (ticks / TICKS_PER_DAY since epoch).
+            if (cn == "DateOnly") {
+                llvm::Value* dayNum = lowerExpr(*ma->target);
+                if (!dayNum) return nullptr;
+                if (!dayNum->getType()->isIntegerTy(32))
+                    dayNum = builder_.CreateTrunc(dayNum, i32(), "do.dn");
+                const auto& mbr = ma->member;
+                // Expand day number → ticks for decomposition via bz_datetime_* helpers.
+                llvm::Value* dn64 = builder_.CreateSExt(dayNum, i64(), "do.dn64");
+                llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                llvm::Value* dticks = builder_.CreateMul(dn64, tpd, "do.ticks");
+                if (mbr == "Year") {
+                    auto* fn = declareC("bz_datetime_year", i32(), {i64()});
+                    return builder_.CreateCall(fn, {dticks}, "do.year");
+                }
+                if (mbr == "Month") {
+                    auto* fn = declareC("bz_datetime_month", i32(), {i64()});
+                    return builder_.CreateCall(fn, {dticks}, "do.month");
+                }
+                if (mbr == "Day") {
+                    auto* fn = declareC("bz_datetime_day", i32(), {i64()});
+                    return builder_.CreateCall(fn, {dticks}, "do.day");
+                }
+            }
+            // per §2.5 / #1357: TimeOnly property reads.
+            // TimeOnly is stored as i32 ms from midnight (0..86399999).
+            if (cn == "TimeOnly") {
+                llvm::Value* ms = lowerExpr(*ma->target);
+                if (!ms) return nullptr;
+                if (!ms->getType()->isIntegerTy(32))
+                    ms = builder_.CreateTrunc(ms, i32(), "to.ms");
+                const auto& mbr = ma->member;
+                if (mbr == "Hour") {
+                    // hour = ms / 3600000
+                    return builder_.CreateSDiv(ms, builder_.getInt32(3600000), "to.hour");
+                }
+                if (mbr == "Minute") {
+                    // minute = (ms % 3600000) / 60000
+                    llvm::Value* r = builder_.CreateSRem(ms, builder_.getInt32(3600000), "to.mr");
+                    return builder_.CreateSDiv(r, builder_.getInt32(60000), "to.min");
+                }
+                if (mbr == "Second") {
+                    // second = (ms % 60000) / 1000
+                    llvm::Value* r = builder_.CreateSRem(ms, builder_.getInt32(60000), "to.sr");
+                    return builder_.CreateSDiv(r, builder_.getInt32(1000), "to.sec");
+                }
+                if (mbr == "Millisecond") {
+                    // millisecond = ms % 1000
+                    return builder_.CreateSRem(ms, builder_.getInt32(1000), "to.msec");
+                }
             }
         }
     }
@@ -8955,6 +9025,54 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     return v ? v : builder_.getInt64(0);
                 }
                 return builder_.getInt64(0);  // default: zero TimeSpan
+            }
+            // per §2.5 / #1357: new DateOnly(year, month, day) — stored as i32 day number.
+            // Compute: bz_datetime_parts_to_ticks(y,m,d,0,0,0,0) / TICKS_PER_DAY
+            if (colName == "DateOnly") {
+                auto getI32do = [&](size_t idx) -> llvm::Value* {
+                    if (idx >= ne.args.size() || !ne.args[idx].value)
+                        return builder_.getInt32(1);
+                    llvm::Value* v = lowerExpr(*ne.args[idx].value);
+                    if (!v) return builder_.getInt32(1);
+                    if (!v->getType()->isIntegerTy(32))
+                        v = builder_.CreateTrunc(v, i32());
+                    return v;
+                };
+                llvm::Value* yr  = getI32do(0);
+                llvm::Value* mo  = getI32do(1);
+                llvm::Value* day = getI32do(2);
+                auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
+                    {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
+                llvm::Value* ticks = builder_.CreateCall(fn,
+                    {yr, mo, day, builder_.getInt32(0), builder_.getInt32(0),
+                     builder_.getInt32(0), builder_.getInt32(0)}, "do.ctor.ticks");
+                llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                return builder_.CreateTrunc(
+                    builder_.CreateSDiv(ticks, tpd, "do.ctor.dn"),
+                    i32(), "do.ctor");
+            }
+            // per §2.5 / #1357: new TimeOnly(hour, minute, second[, ms]) — stored
+            // as i32 ms from midnight.
+            if (colName == "TimeOnly") {
+                auto getI32to = [&](size_t idx) -> llvm::Value* {
+                    if (idx >= ne.args.size() || !ne.args[idx].value)
+                        return builder_.getInt32(0);
+                    llvm::Value* v = lowerExpr(*ne.args[idx].value);
+                    if (!v) return builder_.getInt32(0);
+                    if (!v->getType()->isIntegerTy(32))
+                        v = builder_.CreateTrunc(v, i32());
+                    return v;
+                };
+                llvm::Value* hr  = getI32to(0);
+                llvm::Value* mn  = getI32to(1);
+                llvm::Value* sc  = getI32to(2);
+                llvm::Value* ms  = getI32to(3);
+                // ms_from_midnight = hr*3600000 + mn*60000 + sc*1000 + ms
+                llvm::Value* r = builder_.CreateMul(hr, builder_.getInt32(3600000));
+                r = builder_.CreateAdd(r, builder_.CreateMul(mn, builder_.getInt32(60000)));
+                r = builder_.CreateAdd(r, builder_.CreateMul(sc, builder_.getInt32(1000)));
+                r = builder_.CreateAdd(r, ms);
+                return r;
             }
 
             // §2.15 / issue #687: new JsonOptions(Indented, IndentWidth,

@@ -1628,7 +1628,8 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                         rt->astNode->name->parts.size() == 1) {
                         std::string_view n = rt->astNode->name->parts[0];
                         if (n == "DateTime" || n == "TimeSpan" ||
-                            n == "Guid"     || n == "CancellationToken")
+                            n == "Guid"     || n == "CancellationToken" ||
+                            n == "DateOnly" || n == "TimeOnly")  // per §2.5 / #1357
                             return OwnershipState::Borrowed;
                     }
                 }

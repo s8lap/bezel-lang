@@ -436,7 +436,7 @@ inline TypeSymbol* SemaContext::builtinClassSym(std::string_view name) {
     ts->decl = nullptr;
     if (name == "DateTime" || name == "TimeSpan" ||
         name == "Guid"     || name == "CancellationToken" ||
-        name == "Range") {
+        name == "Range"    || name == "DateOnly" || name == "TimeOnly") {
         ts->isValueBuiltin = true;
     }
     builtinClassCache_[key] = ts;

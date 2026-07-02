@@ -3643,6 +3643,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "NextDouble")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                        // per stdlib §2.7 / #1359: NextInt64 (renamed from NextLong) → long.
+                        else if (m == "NextInt64")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                        // per stdlib §2.7 / #1359: NextBoolean → bool.
+                        else if (m == "NextBoolean")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     }
                     // string static methods (§9.6)
                     if (colName == "string" || colName == "String") {
@@ -3729,6 +3735,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "DateTime") {
                         if (m == "Now" || m == "UtcNow" || m == "Today" ||
                             m == "MinValue" || m == "MaxValue" || m == "FromTicks" ||
+                            m == "FromUnixTimeSeconds" ||  // per §2.5 / #1357
                             m == "Parse")  // per §2.5 / #648: Parse(s) → DateTime
                             ctx_.setExprType(&ce, makeDTType());
                         // per §2.5 / #648: TryParse(s, out result) → bool.
@@ -3738,12 +3745,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // §2.5: TimeSpan static factories → TimeSpan type.
                     if (colName == "TimeSpan") {
                         if (m == "FromDays" || m == "FromHours" || m == "FromMinutes" ||
-                            m == "FromSeconds" || m == "FromMilliseconds" || m == "Zero")
+                            m == "FromSeconds" || m == "FromMilliseconds" || m == "Zero" ||
+                            m == "FromTicks")  // per §2.5 / #1357
                             ctx_.setExprType(&ce, makeTSType());
                     }
                     // stdlib §2.6: Guid static method return types.
                     if (colName == "Guid") {
-                        if (m == "NewGuid" || m == "Parse") {
+                        if (m == "NewGuid" || m == "Parse" || m == "FromByteArray") {
+                            // per §2.6 / #1357: FromByteArray(bytes) → Guid
                             auto* gTy = ctx_.makeTypeRef();
                             gTy->kind = TypeRef::Kind::Named;
                             gTy->declaration = builtinClassSym("Guid");
@@ -3752,6 +3761,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "TryParse") {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         }
+                    }
+                    // per §2.5 / #1357: DateOnly static methods.
+                    if (colName == "DateOnly") {
+                        auto* doTy = ctx_.makeTypeRef();
+                        doTy->kind = TypeRef::Kind::Named;
+                        doTy->declaration = builtinClassSym("DateOnly");
+                        if (m == "Parse")
+                            ctx_.setExprType(&ce, doTy);
+                        if (m == "TryParse")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                    }
+                    // per §2.5 / #1357: TimeOnly static methods.
+                    if (colName == "TimeOnly") {
+                        auto* toTy = ctx_.makeTypeRef();
+                        toTy->kind = TypeRef::Kind::Named;
+                        toTy->declaration = builtinClassSym("TimeOnly");
+                        if (m == "Parse")
+                            ctx_.setExprType(&ce, toTy);
+                        if (m == "TryParse")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     }
                     // §8.1 / issue #646: Stopwatch static factory.
                     // StartNew() → owned Stopwatch (same TypeRef shape as
@@ -4152,6 +4181,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // per §2.5 / #648: ToString(format: string) → string.
                         else if (m == "ToString" && !ce.args.empty())
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        // per §2.5 / #648: ToString() no-arg → string.
+                        else if (m == "ToString" && ce.args.empty())
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        // per §2.5 / #1357: CompareTo(other: DateTime): int.
+                        else if (m == "CompareTo")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // per §2.5 / #1357: ToUnixTimeSeconds(): long.
+                        else if (m == "ToUnixTimeSeconds")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
                     }
                     // TimeSpan arithmetic methods return TimeSpan (fallback if
                     // the operator desugaring lands here rather than BinaryExpr).
@@ -4161,6 +4199,41 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tsTy->declaration = builtinClassSym("TimeSpan");
                         if (m == "Add" || m == "Subtract" || m == "Negate")
                             ctx_.setExprType(&ce, tsTy);
+                        // per §2.5 / #1357: CompareTo(other: TimeSpan): int.
+                        else if (m == "CompareTo")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // per §2.5 / #1357: ToString(): string.
+                        else if (m == "ToString")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                    }
+                    // per §2.6 / #1357: Guid instance methods.
+                    if (rcn == "Guid") {
+                        if (m == "ToString")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        else if (m == "Equals")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        else if (m == "CompareTo")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    }
+                    // per §2.5 / #1357: DateOnly instance methods.
+                    if (rcn == "DateOnly") {
+                        if (m == "CompareTo")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "ToString")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        else if (m == "ToDateTime") {
+                            auto* dtTy2 = ctx_.makeTypeRef();
+                            dtTy2->kind = TypeRef::Kind::Named;
+                            dtTy2->declaration = builtinClassSym("DateTime");
+                            ctx_.setExprType(&ce, dtTy2);
+                        }
+                    }
+                    // per §2.5 / #1357: TimeOnly instance methods.
+                    if (rcn == "TimeOnly") {
+                        if (m == "CompareTo")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "ToString")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
                     // stdlib §10.1 / issue #1000: CString.ToBytes(): owned
                     // Array<byte>. Type the result as a concrete Array<byte>
@@ -7798,6 +7871,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
                     return;
                 }
+                // per §2.5 / #1357: Date → DateOnly (day part of DateTime).
+                if (mbr == "Date") {
+                    auto* doTy = ctx_.makeTypeRef();
+                    doTy->kind = TypeRef::Kind::Named;
+                    doTy->declaration = builtinClassSym("DateOnly");
+                    ctx_.setExprType(&ma, doTy);
+                    return;
+                }
+                // per §2.5 / #1357: TimeOfDay → TimeOnly (time part of DateTime).
+                if (mbr == "TimeOfDay") {
+                    auto* toTy = ctx_.makeTypeRef();
+                    toTy->kind = TypeRef::Kind::Named;
+                    toTy->declaration = builtinClassSym("TimeOnly");
+                    ctx_.setExprType(&ma, toTy);
+                    return;
+                }
                 // Add*/Subtract instance methods → return DateTime or TimeSpan
                 // (resolved in the call-expression handler below, not as a property).
             }
@@ -7904,6 +7993,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // Equals(other: Guid): bool — structural equality
                 if (ma.member == "Equals") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+                // per §2.6 / #1357: CompareTo(other: Guid): int.
+                if (ma.member == "CompareTo") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+            // per §2.5 / #1357: DateOnly instance property reads.
+            if (cn == "DateOnly") {
+                if (ma.member == "Year" || ma.member == "Month" || ma.member == "Day") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+                if (ma.member == "CompareTo" || ma.member == "ToDateTime" ||
+                    ma.member == "ToString") {
+                    // Method-like; typed in the CallExpr handler.
+                    return;
+                }
+            }
+            // per §2.5 / #1357: TimeOnly instance property reads.
+            if (cn == "TimeOnly") {
+                if (ma.member == "Hour" || ma.member == "Minute" ||
+                    ma.member == "Second" || ma.member == "Millisecond") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+                if (ma.member == "CompareTo" || ma.member == "ToString") {
+                    // Method-like; typed in the CallExpr handler.
                     return;
                 }
             }
@@ -8454,9 +8572,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (m=="ToInt32") setInt();
                 else if (m=="ToInt64") setLong();
                 else if (m=="ToDouble") setDbl();
+                // per stdlib §2.3 / #1356: ToDecimal(value: string): decimal.
+                else if (m=="ToDecimal") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Decimal));
+                }
                 else if (m=="ToBoolean") setBool();
                 // §2.3: Convert.TryToInt32(value, out result): bool.
                 else if (m=="TryToInt32") setBool();
+                // per stdlib §2.3 / #1356: Try* overloads → bool.
+                else if (m=="TryToInt64") setBool();
+                else if (m=="TryToDouble") setBool();
+                else if (m=="TryToDecimal") setBool();
+                else if (m=="TryToBoolean") setBool();
                 else if (m=="ToString") setStr();
                 else rejectBuiltinStatic();
             }
@@ -8493,12 +8620,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 else if (m == "NextDouble" || m == "NextFloat")
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
-                // Seed → unit (leave untyped)
+                // per stdlib §2.7 / #1359: NextInt64 (renamed from NextLong) → long.
+                else if (m == "NextInt64")
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                // per stdlib §2.7 / #1359: NextBoolean → bool.
+                else if (m == "NextBoolean")
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                // Seed / NextBytes → unit (leave untyped)
             }
             // stdlib §2.6: Guid static member types (reached via declaration lookup
             // path where the target is the Guid TypeSymbol with null decl).
             if (cls == "Guid") {
-                if (m == "NewGuid" || m == "Parse") {
+                if (m == "NewGuid" || m == "Parse" || m == "FromByteArray") {
                     auto* gTy = ctx_.makeTypeRef();
                     gTy->kind = TypeRef::Kind::Named;
                     gTy->declaration = builtinClassSym("Guid");
@@ -8514,6 +8647,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                 } else if (m == "Equals") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                } else if (m == "CompareTo") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 }
             }
             // stdlib §9.4 / issue #654: Boolean static member types.

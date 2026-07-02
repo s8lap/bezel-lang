@@ -448,11 +448,23 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 !rt->astNode->name->parts.empty()) {
                 auto n0 = rt->astNode->name->parts[0];
                 if (n0 == "DateTime" || n0 == "TimeSpan") return i64();
+                // per §2.5 / #1357: DateOnly and TimeOnly are i32 value types.
+                // DateOnly: day number since 0001-01-01; TimeOnly: ms since midnight.
+                if (n0 == "DateOnly" || n0 == "TimeOnly") return i32();
             }
             if (rt->declaration && !rt->declaration->decl &&
                 (rt->declaration->name == "DateTime" ||
                  rt->declaration->name == "TimeSpan")) {
                 return i64();
+            }
+            // per §2.5 / #1357: DateOnly / TimeOnly — builtinClassSym shape
+            // (TypeRef produced by DateOnly.Parse / TimeOnly.Parse / ToDateTime
+            // return types, and DateTime.Date / DateTime.TimeOfDay properties).
+            // Must be i32, not ptrTy() — they are scalar value types, not heap ptrs.
+            if (rt->declaration && !rt->declaration->decl &&
+                (rt->declaration->name == "DateOnly" ||
+                 rt->declaration->name == "TimeOnly")) {
+                return i32();
             }
             // fix #499 / §9.8: Range<T> is a compiler-intrinsic value-type
             // record. Lower it to { i64 start, i64 end, i64 step, i8 flags }

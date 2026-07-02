@@ -391,6 +391,10 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    id->name == "LinkedList" || id->name == "OwnedLinkedList" ||
                    id->name == "StringBuilder" || id->name == "Encoding" ||
                    id->name == "DateTime" || id->name == "TimeSpan" ||
+                   // stdlib §2.5 / #1357: DateOnly and TimeOnly are auto-imported
+                   // value-type builtins with static Parse/TryParse factory methods;
+                   // recognized here so DateOnly.Parse(…)/TimeOnly.Parse(…) resolve.
+                   id->name == "DateOnly" || id->name == "TimeOnly" ||
                    // stdlib §2.6: Guid is auto-imported (a builtin value type).
                    id->name == "Guid" ||
                    // stdlib §9.4 / issue #654: Boolean is auto-imported (a builtin

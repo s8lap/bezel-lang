@@ -5,7 +5,7 @@ public class Random
   public method Next(): int;                    // 0..int.MaxValue
   public method Next(maxValue: int): int;       // 0..<maxValue
   public method Next(minValue: int, maxValue: int): int;
-  public method NextLong(): long;
+  public method NextInt64(): long;              // renamed from NextLong per #1359
   public method NextDouble(): double;           // [0.0, 1.0)
   public method NextBytes(buffer: Array<byte>);
   public method NextBoolean(): bool;

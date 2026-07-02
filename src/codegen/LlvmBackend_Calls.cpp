@@ -4907,6 +4907,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 llvm::Value* r = builder_.CreateCall(fn, {slot, otherSlot}, "guid.eq.r");
                 return builder_.CreateICmpNE(r, builder_.getInt32(0), "guid.eq");
             }
+            // per stdlib §2.6 / #1357: CompareTo(other: Guid): int — 16-byte lexicographic.
+            if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+                if (!otherVal) return nullptr;
+                llvm::AllocaInst* otherSlot = entryAlloca(gst);
+                if (otherVal->getType()->isPointerTy())
+                    otherVal = builder_.CreateLoad(gst, otherVal, "guid.cmp.other.load");
+                builder_.CreateStore(otherVal, otherSlot);
+                auto* fn = declareC("bz_guid_compare", i32(), {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {slot, otherSlot}, "guid.cmp");
+            }
         }
     }
 
@@ -5366,6 +5377,31 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                "FormatException");
                 return dvCd;
             }
+            // per stdlib §2.3 / #1356: Convert.ToDecimal(s: string): decimal
+            // Delegates to bz_decimal_parse (same as Decimal.Parse).
+            if (m == "ToDecimal") {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                llvm::StructType* dst = decimalStructType();
+                llvm::AllocaInst* slot = entryAlloca(dst);
+                auto getOVE = [&]() -> llvm::Value* {
+                    auto vit = builtinVtable_.find("OverflowException");
+                    if (vit == builtinVtable_.end())
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    return vit->second;
+                };
+                auto getFE = [&]() -> llvm::Value* {
+                    auto vit = builtinVtable_.find("FormatException");
+                    if (vit == builtinVtable_.end())
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    return vit->second;
+                };
+                auto* fn = declareC("bz_decimal_parse", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {arg, slot, getOVE(), getFE()});
+                emitPendingCheck();
+                return builder_.CreateLoad(dst, slot, "cvtdec.val");
+            }
             // Convert.ToBoolean(s: string): bool — "true"/"1" → true
             if (m == "ToBoolean") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
@@ -5444,6 +5480,131 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* sel32 = builder_.CreateSelect(ok, trunc32, builder_.getInt32(0), "tryc.sel");
             builder_.CreateStore(sel32, outAddr);
             return ok;
+        }
+        // per stdlib §2.3 / #1356: Convert.TryToInt64(value: string, out result: long): bool.
+        if (m == "TryToInt64" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            llvm::Type* et64 = nullptr;
+            llvm::Value* outAddr64 = lvalueAddr(*call.args[1].value, et64);
+            if (!outAddr64) return nullptr;
+            auto* strtollT64 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+            auto* endSlotT64 = entryAlloca(ptrTy());
+            llvm::Value* val64_t = builder_.CreateCall(
+                strtollT64, {strData, endSlotT64, builder_.getInt32(10)}, "tryc64.val");
+            llvm::Value* endPtr64 = builder_.CreateLoad(ptrTy(), endSlotT64, "tryc64.ep");
+            auto* i8t64 = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* fc64 = builder_.CreateLoad(i8t64, strData, "tryc64.fc");
+            llvm::Value* fcWs64 = builder_.CreateICmpULE(
+                fc64, llvm::ConstantInt::get(i8t64, ' '), "tryc64.fws");
+            llvm::Value* adv64 = builder_.CreateICmpNE(endPtr64, strData, "tryc64.adv");
+            llvm::Value* endCh64 = builder_.CreateLoad(i8t64, endPtr64, "tryc64.end");
+            llvm::Value* atNul64 = builder_.CreateICmpEQ(
+                endCh64, llvm::ConstantInt::get(i8t64, 0), "tryc64.nul");
+            llvm::Value* ok64 = builder_.CreateAnd(
+                builder_.CreateNot(fcWs64),
+                builder_.CreateAnd(adv64, atNul64), "tryc64.ok");
+            llvm::Value* sel64 = builder_.CreateSelect(
+                ok64, val64_t, builder_.getInt64(0), "tryc64.sel");
+            builder_.CreateStore(sel64, outAddr64);
+            return ok64;
+        }
+        // per stdlib §2.3 / #1356: Convert.TryToDouble(value: string, out result: double): bool.
+        if (m == "TryToDouble" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            llvm::Type* etd = nullptr;
+            llvm::Value* outAddrd = lvalueAddr(*call.args[1].value, etd);
+            if (!outAddrd) return nullptr;
+            auto* strtodTr = declareC("strtod",
+                llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+            auto* endSlotTd = entryAlloca(ptrTy());
+            llvm::Value* dvTd = builder_.CreateCall(
+                strtodTr, {strData, endSlotTd}, "tryd.val");
+            llvm::Value* endPtrTd = builder_.CreateLoad(ptrTy(), endSlotTd, "tryd.ep");
+            auto* i8td = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* fcTd = builder_.CreateLoad(i8td, strData, "tryd.fc");
+            llvm::Value* fcWsTd = builder_.CreateICmpULE(
+                fcTd, llvm::ConstantInt::get(i8td, ' '), "tryd.fws");
+            llvm::Value* advTd = builder_.CreateICmpNE(endPtrTd, strData, "tryd.adv");
+            llvm::Value* endChTd = builder_.CreateLoad(i8td, endPtrTd, "tryd.end");
+            llvm::Value* atNulTd = builder_.CreateICmpEQ(
+                endChTd, llvm::ConstantInt::get(i8td, 0), "tryd.nul");
+            llvm::Value* okTd = builder_.CreateAnd(
+                builder_.CreateNot(fcWsTd),
+                builder_.CreateAnd(advTd, atNulTd), "tryd.ok");
+            llvm::Value* selTd = builder_.CreateSelect(
+                okTd, dvTd,
+                llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), 0.0), "tryd.sel");
+            builder_.CreateStore(selTd, outAddrd);
+            return okTd;
+        }
+        // per stdlib §2.3 / #1356: Convert.TryToDecimal(value: string, out result: decimal): bool.
+        if (m == "TryToDecimal" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::StructType* dst = decimalStructType();
+            llvm::AllocaInst* slotDec = entryAlloca(dst);
+            auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* okDec = builder_.CreateCall(fn, {strVal, slotDec}, "trydec.ok");
+            llvm::Type* etdec = nullptr;
+            llvm::Value* outAddrdec = lvalueAddr(*call.args[1].value, etdec);
+            if (outAddrdec) {
+                llvm::Value* resultDec = builder_.CreateLoad(dst, slotDec, "trydec.val");
+                builder_.CreateStore(resultDec, outAddrdec);
+            }
+            return builder_.CreateICmpNE(okDec, builder_.getInt32(0), "trydec.bool");
+        }
+        // per stdlib §2.3 / #1356: Convert.TryToBoolean(value: string, out result: bool): bool.
+        if (m == "TryToBoolean" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            auto* strcmpFnTB = module_->getFunction("strcasecmp");
+            if (!strcmpFnTB) {
+                auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                strcmpFnTB = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
+                                                    "strcasecmp", module_.get());
+            }
+            llvm::Constant* trueStrTB = llvm::ConstantDataArray::getString(llvm_, "true", true);
+            unsigned tidTB = stringLiteralIdx_++;
+            auto* trueGVTB = new llvm::GlobalVariable(*module_, trueStrTB->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, trueStrTB, ".bz.tb.true." + std::to_string(tidTB));
+            llvm::Value* cmpTrueTB = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFnTB, {strData, trueGVTB}), builder_.getInt32(0));
+            llvm::Constant* oneStrTB = llvm::ConstantDataArray::getString(llvm_, "1", true);
+            auto* oneGVTB = new llvm::GlobalVariable(*module_, oneStrTB->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, oneStrTB, ".bz.tb.one." + std::to_string(tidTB));
+            llvm::Value* cmpOneTB = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFnTB, {strData, oneGVTB}), builder_.getInt32(0));
+            llvm::Value* boolResult = builder_.CreateOr(cmpTrueTB, cmpOneTB, "tryb.res");
+            llvm::Type* etb = nullptr;
+            llvm::Value* outAddrb = lvalueAddr(*call.args[1].value, etb);
+            if (outAddrb)
+                builder_.CreateStore(boolResult, outAddrb);
+            // TryToBoolean always succeeds for "true"/"1"/"false"/"0" input; if neither
+            // matches we return false and store false — mirrors Convert.ToBoolean contract.
+            llvm::Constant* falseStrTB = llvm::ConstantDataArray::getString(llvm_, "false", true);
+            auto* falseGVTB = new llvm::GlobalVariable(*module_, falseStrTB->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, falseStrTB, ".bz.tb.false." + std::to_string(tidTB));
+            llvm::Value* cmpFalseTB = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFnTB, {strData, falseGVTB}), builder_.getInt32(0));
+            llvm::Constant* zeroStrTB = llvm::ConstantDataArray::getString(llvm_, "0", true);
+            auto* zeroGVTB = new llvm::GlobalVariable(*module_, zeroStrTB->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, zeroStrTB, ".bz.tb.zero." + std::to_string(tidTB));
+            llvm::Value* cmpZeroTB = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFnTB, {strData, zeroGVTB}), builder_.getInt32(0));
+            // success = matched any of true/1/false/0
+            llvm::Value* okTB = builder_.CreateOr(
+                builder_.CreateOr(cmpTrueTB, cmpOneTB),
+                builder_.CreateOr(cmpFalseTB, cmpZeroTB), "tryb.ok");
+            return okTB;
         }
         // Convert.ToString(n, radix: int): string — radix-based conversion.
         if (m == "ToString" && call.args.size() == 2 &&
@@ -6483,6 +6644,37 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return nullptr;  // unit
         }
     }
+    // per stdlib §2.7 / #1359: static Random.NextInt64/NextBoolean/NextBytes —
+    // legacy static path (falls through to instance handler below for rng. calls).
+    // These branch to libc rand() like the existing static Next path.
+    if (cls == "Random") {
+        if (m == "NextInt64" && call.args.empty()) {
+            // Combine two rand() calls → 64-bit value.
+            auto* randFn2 = module_->getFunction("rand");
+            if (!randFn2) {
+                auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                randFn2 = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "rand", module_.get());
+            }
+            llvm::Value* lo = builder_.CreateZExt(
+                builder_.CreateCall(randFn2, {}, "rng.lo"), i64());
+            llvm::Value* hi = builder_.CreateZExt(
+                builder_.CreateCall(randFn2, {}, "rng.hi"), i64());
+            return builder_.CreateOr(lo, builder_.CreateShl(hi, builder_.getInt64(31)));
+        }
+        if (m == "NextBoolean" && call.args.empty()) {
+            auto* randFnB = module_->getFunction("rand");
+            if (!randFnB) {
+                auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                randFnB = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "rand", module_.get());
+            }
+            llvm::Value* r = builder_.CreateCall(randFnB, {}, "rng.b");
+            return builder_.CreateICmpNE(
+                builder_.CreateAnd(r, builder_.getInt32(1)),
+                builder_.getInt32(0), "rng.bool");
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // stdlib §9.3 / §4.4 fix #521: Decimal — static members and methods.
@@ -6726,6 +6918,29 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, outAddr}, "guid.tryp.ok");
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.tryp.bool");
         }
+        // per stdlib §2.6 / #1357: Guid.FromByteArray(bytes: Array<byte>): Guid
+        // "borrows; requires Length = 16, ArgumentException otherwise" — guard
+        // BEFORE the 16-byte copy (a shorter array would be an out-of-bounds
+        // read in bz_guid_from_bytes).
+        if (m == "FromByteArray" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {arr}, "guid.fb.len");
+            emitGuardThrow(
+                builder_.CreateICmpNE(len, builder_.getInt64(16), "guid.fb.bad"),
+                "ArgumentException");
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            llvm::Value* bytesPtr = builder_.CreateCall(
+                ptrFn, {arr, builder_.getInt64(0), builder_.getInt64(1)},
+                "guid.fb.ptr");
+            llvm::AllocaInst* slot = makeGuidSlot();
+            auto* fn = declareC("bz_guid_from_bytes",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {bytesPtr, slot});
+            return builder_.CreateLoad(gst, slot, "guid.frombytes");
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -6796,6 +7011,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                                   "dt.tryp.ok");
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dt.tryp.bool");
         }
+        // per stdlib §2.5 / #1357: DateTime.FromUnixTimeSeconds(seconds: long): DateTime
+        if (m == "FromUnixTimeSeconds" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* sec = lowerExpr(*call.args[0].value);
+            if (!sec) return nullptr;
+            if (!sec->getType()->isIntegerTy(64))
+                sec = builder_.CreateSExt(sec, i64());
+            auto* fn = declareC("bz_datetime_from_unix_seconds", i64(), {i64()});
+            return builder_.CreateCall(fn, {sec}, "dt.fromux");
+        }
     }
     // ---------------------------------------------------------------------------
     // §2.5 TimeSpan — static factories and Zero constant.
@@ -6830,6 +7054,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "FromMinutes")      return fromDouble(600000000.0);
         if (m == "FromSeconds")      return fromDouble(10000000.0);
         if (m == "FromMilliseconds") return fromDouble(10000.0);
+        // per stdlib §2.5 / #1357: TimeSpan.FromTicks(ticks: long): TimeSpan (identity).
+        if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* v = lowerExpr(*call.args[0].value);
+            if (!v) return nullptr;
+            if (!v->getType()->isIntegerTy(64))
+                v = builder_.CreateSExt(v, i64());
+            return v;
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -7156,6 +7388,35 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                             llvm::Type::getDoubleTy(llvm_), {ptrTy()});
                         return builder_.CreateCall(fn, {rng});
                     }
+                    // per stdlib §2.7 / #1359: NextInt64() → long.
+                    if (mname == "NextInt64" && call.args.empty()) {
+                        auto* fn = declareC("bz_random_next_long", i64(), {ptrTy()});
+                        return builder_.CreateCall(fn, {rng}, "rng.i64");
+                    }
+                    // per stdlib §2.7 / #1359: NextBoolean() → bool.
+                    if (mname == "NextBoolean" && call.args.empty()) {
+                        auto* fn = declareC("bz_random_next_bool", i32(), {ptrTy()});
+                        llvm::Value* r = builder_.CreateCall(fn, {rng}, "rng.b");
+                        return builder_.CreateICmpNE(r, builder_.getInt32(0), "rng.bool");
+                    }
+                    // per stdlib §2.7 / #1359: NextBytes(buffer: Array<byte>) → unit.
+                    if (mname == "NextBytes" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* arr = lowerExpr(*call.args[0].value);
+                        if (!arr) return nullptr;
+                        // Get array length and data pointer.
+                        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                        auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                               {ptrTy(), i64(), i64()});
+                        llvm::Value* arrLen = builder_.CreateCall(lenFn, {arr}, "rng.arrlen");
+                        llvm::Value* arrPtr = builder_.CreateCall(
+                            ptrFn, {arr, builder_.getInt64(0), builder_.getInt64(1)},
+                            "rng.arrptr");
+                        auto* fn = declareC("bz_random_next_bytes",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy(), ptrTy(), i64()});
+                        builder_.CreateCall(fn, {rng, arrPtr, arrLen});
+                        return nullptr;  // unit
+                    }
                 }
             }
         }
@@ -7302,6 +7563,24 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // Deferred: full timezone conversion needs platform TZ APIs.
                     if (mname == "ToUtc" || mname == "ToLocal")
                         return ticks;
+                    // per stdlib §2.5 / #1357: CompareTo(other: DateTime): int.
+                    // Inline: (a > b) - (a < b) on i64.
+                    if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (!other) return nullptr;
+                        if (!other->getType()->isIntegerTy(64))
+                            other = builder_.CreateSExt(other, i64());
+                        llvm::Value* gt = builder_.CreateZExt(
+                            builder_.CreateICmpSGT(ticks, other), i32(), "dt.cmp.gt");
+                        llvm::Value* lt = builder_.CreateZExt(
+                            builder_.CreateICmpSLT(ticks, other), i32(), "dt.cmp.lt");
+                        return builder_.CreateSub(gt, lt, "dt.cmp");
+                    }
+                    // per stdlib §2.5 / #1357: ToUnixTimeSeconds(): long.
+                    if (mname == "ToUnixTimeSeconds" && call.args.empty()) {
+                        auto* fn = declareC("bz_datetime_to_unix_seconds", i64(), {i64()});
+                        return builder_.CreateCall(fn, {ticks}, "dt.toux");
+                    }
                     // per stdlib §2.5 (#1114): ToString() no-arg — ISO 8601
                     // default format "yyyy-MM-ddTHH:mm:ss" (19 chars).
                     // Reuses the same bz_datetime_to_string_fmt helper that
@@ -7327,6 +7606,263 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     }
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // per §2.5 / #1357: TimeSpan instance methods — CompareTo and ToString.
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isTS = recvTy && builtinTypeName(recvTy) == "TimeSpan";
+                if (isTS) {
+                    llvm::Value* ticks = lowerExpr(*ma2->target);
+                    if (!ticks) return nullptr;
+                    const auto& mname = ma2->member;
+                    // CompareTo(other: TimeSpan): int — inline (a>b)-(a<b).
+                    if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (!other) return nullptr;
+                        if (!other->getType()->isIntegerTy(64))
+                            other = builder_.CreateSExt(other, i64());
+                        llvm::Value* gt = builder_.CreateZExt(
+                            builder_.CreateICmpSGT(ticks, other), i32(), "ts.cmp.gt");
+                        llvm::Value* lt = builder_.CreateZExt(
+                            builder_.CreateICmpSLT(ticks, other), i32(), "ts.cmp.lt");
+                        return builder_.CreateSub(gt, lt, "ts.cmp");
+                    }
+                    // ToString(): string — emit "d.hh:mm:ss" format.
+                    if (mname == "ToString" && call.args.empty()) {
+                        // Build "±d.hh:mm:ss" via snprintf in a stack buffer.
+                        auto* i32s  = llvm::Type::getInt32Ty(llvm_);
+                        llvm::Value* dS  = entryAlloca(i32s);
+                        llvm::Value* hS  = entryAlloca(i32s);
+                        llvm::Value* miS = entryAlloca(i32s);
+                        llvm::Value* sS  = entryAlloca(i32s);
+                        llvm::Value* msS = entryAlloca(i32s);
+                        auto* compFn = declareC("bz_timespan_components",
+                            llvm::Type::getVoidTy(llvm_),
+                            {i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                        builder_.CreateCall(compFn, {ticks, dS, hS, miS, sS, msS});
+                        llvm::Value* days  = builder_.CreateLoad(i32s, dS, "ts.d");
+                        llvm::Value* hours = builder_.CreateLoad(i32s, hS, "ts.h");
+                        llvm::Value* mins  = builder_.CreateLoad(i32s, miS, "ts.mi");
+                        llvm::Value* secs  = builder_.CreateLoad(i32s, sS, "ts.s");
+                        // Use snprintf to format; 64-byte buffer is ample.
+                        auto* i8t = llvm::Type::getInt8Ty(llvm_);
+                        auto* buf64 = entryAlloca(llvm::ArrayType::get(i8t, 64));
+                        llvm::Value* bufPtr = builder_.CreateGEP(
+                            llvm::ArrayType::get(i8t, 64), buf64,
+                            {builder_.getInt64(0), builder_.getInt64(0)});
+                        auto* snpFn = module_->getFunction("snprintf");
+                        if (!snpFn) {
+                            auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
+                            snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
+                        }
+                        unsigned sidTS = stringLiteralIdx_++;
+                        llvm::Constant* fmtTS = llvm::ConstantDataArray::getString(llvm_, "%d.%02d:%02d:%02d", true);
+                        auto* fmtGV = new llvm::GlobalVariable(*module_, fmtTS->getType(), true,
+                            llvm::GlobalValue::PrivateLinkage, fmtTS, ".bz.ts.fmt." + std::to_string(sidTS));
+                        fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                        llvm::Value* written = builder_.CreateCall(snpFn,
+                            {bufPtr, builder_.getInt64(64), fmtGV, days, hours, mins, secs});
+                        auto* mallocFn2 = declareC("malloc", ptrTy(), {i64()});
+                        auto* memcpyFn2 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                        llvm::Value* len2 = builder_.CreateSExt(written, i64());
+                        llvm::Value* dataSz2 = builder_.CreateAdd(len2, builder_.getInt64(1));
+                        llvm::Value* dataCopy2 = builder_.CreateCall(mallocFn2, {dataSz2}, "ts.str.data");
+                        builder_.CreateCall(memcpyFn2, {dataCopy2, bufPtr, len2});
+                        llvm::Value* nulPtr2 = builder_.CreateGEP(i8t, dataCopy2, len2);
+                        builder_.CreateStore(llvm::ConstantInt::get(i8t, 0), nulPtr2);
+                        uint64_t strBytesTS = module_->getDataLayout().getTypeAllocSize(stringType());
+                        llvm::Value* strObj2 = builder_.CreateCall(mallocFn2, {builder_.getInt64(strBytesTS)}, "ts.str.obj");
+                        builder_.CreateStore(dataCopy2, builder_.CreateStructGEP(stringType(), strObj2, 0));
+                        builder_.CreateStore(len2, builder_.CreateStructGEP(stringType(), strObj2, 1));
+                        builder_.CreateStore(llvm::ConstantInt::get(i8t, 1), builder_.CreateStructGEP(stringType(), strObj2, 2));
+                        initStringRc(strObj2);
+                        return strObj2;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // per §2.5 / #1357: DateOnly instance methods.
+    // DateOnly is stored as i32 day-number.
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isDO = recvTy && builtinTypeName(recvTy) == "DateOnly";
+                if (isDO) {
+                    llvm::Value* dayNum = lowerExpr(*ma2->target);
+                    if (!dayNum) return nullptr;
+                    if (!dayNum->getType()->isIntegerTy(32))
+                        dayNum = builder_.CreateTrunc(dayNum, i32());
+                    const auto& mname = ma2->member;
+                    // CompareTo(other: DateOnly): int — inline (a>b)-(a<b) on i32.
+                    if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (!other) return nullptr;
+                        if (!other->getType()->isIntegerTy(32))
+                            other = builder_.CreateTrunc(other, i32());
+                        llvm::Value* gt = builder_.CreateZExt(
+                            builder_.CreateICmpSGT(dayNum, other), i32(), "do.cmp.gt");
+                        llvm::Value* lt = builder_.CreateZExt(
+                            builder_.CreateICmpSLT(dayNum, other), i32(), "do.cmp.lt");
+                        return builder_.CreateSub(gt, lt, "do.cmp");
+                    }
+                    // ToString(): string — "yyyy-MM-dd" format.
+                    if (mname == "ToString" && call.args.empty()) {
+                        llvm::Value* dn64 = builder_.CreateSExt(dayNum, i64(), "do.dn64");
+                        llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                        llvm::Value* dticks = builder_.CreateMul(dn64, tpd, "do.ticks");
+                        llvm::Value* fmtStr = lowerStringLiteral("\"yyyy-MM-dd\"", false);
+                        auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(), {i64(), ptrTy()});
+                        return builder_.CreateCall(fn, {dticks, fmtStr}, "do.tostr");
+                    }
+                    // ToDateTime(time: TimeOnly): DateTime — merge day number and ms.
+                    if (mname == "ToDateTime" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* ms = lowerExpr(*call.args[0].value);
+                        if (!ms) return nullptr;
+                        if (!ms->getType()->isIntegerTy(32))
+                            ms = builder_.CreateTrunc(ms, i32());
+                        // ticks = dayNum * TICKS_PER_DAY + ms * TICKS_PER_MS
+                        llvm::Value* dn64 = builder_.CreateSExt(dayNum, i64(), "do.td.dn");
+                        llvm::Value* ms64 = builder_.CreateSExt(ms, i64(), "do.td.ms");
+                        llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                        llvm::Value* tpm = builder_.getInt64(10000LL);
+                        return builder_.CreateAdd(
+                            builder_.CreateMul(dn64, tpd),
+                            builder_.CreateMul(ms64, tpm), "do.todt");
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // per §2.5 / #1357: DateOnly static methods.
+    // ---------------------------------------------------------------------------
+    if (cls == "DateOnly") {
+        // DateOnly.Parse(s: string): DateOnly
+        if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            // Parse date using bz_datetime_try_parse then divide by TICKS_PER_DAY.
+            auto* ticksSlot = entryAlloca(i64());
+            auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.parse.ok");
+            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            auto* okBB2  = llvm::BasicBlock::Create(llvm_, "do.parse.ok", currentFn_);
+            auto* badBB2 = llvm::BasicBlock::Create(llvm_, "do.parse.bad", currentFn_);
+            builder_.CreateCondBr(isOk, okBB2, badBB2);
+            builder_.SetInsertPoint(badBB2);
+            builder_.CreateUnreachable();
+            builder_.SetInsertPoint(okBB2);
+            llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.parsed");
+            llvm::Value* tpd = builder_.getInt64(864000000000LL);
+            return builder_.CreateTrunc(builder_.CreateSDiv(ticks, tpd), i32(), "do.dn");
+        }
+        // DateOnly.TryParse(s: string, out result: DateOnly): bool
+        if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            auto* ticksSlot = entryAlloca(i64());
+            auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.tryp.ok");
+            llvm::Type* etdo = nullptr;
+            llvm::Value* outAddrdo = lvalueAddr(*call.args[1].value, etdo);
+            if (outAddrdo) {
+                llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.tryp.ticks");
+                llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                llvm::Value* dn = builder_.CreateTrunc(
+                    builder_.CreateSDiv(ticks, tpd), i32(), "do.tryp.dn");
+                llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+                llvm::Value* sel = builder_.CreateSelect(okBool, dn, builder_.getInt32(0));
+                builder_.CreateStore(sel, outAddrdo);
+            }
+            return builder_.CreateICmpNE(ok, builder_.getInt32(0), "do.tryp.bool");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // per §2.5 / #1357: TimeOnly instance methods.
+    // TimeOnly is stored as i32 ms from midnight.
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isTO = recvTy && builtinTypeName(recvTy) == "TimeOnly";
+                if (isTO) {
+                    llvm::Value* ms = lowerExpr(*ma2->target);
+                    if (!ms) return nullptr;
+                    if (!ms->getType()->isIntegerTy(32))
+                        ms = builder_.CreateTrunc(ms, i32());
+                    const auto& mname = ma2->member;
+                    // CompareTo(other: TimeOnly): int — inline (a>b)-(a<b) on i32.
+                    if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (!other) return nullptr;
+                        if (!other->getType()->isIntegerTy(32))
+                            other = builder_.CreateTrunc(other, i32());
+                        llvm::Value* gt = builder_.CreateZExt(
+                            builder_.CreateICmpSGT(ms, other), i32(), "to.cmp.gt");
+                        llvm::Value* lt = builder_.CreateZExt(
+                            builder_.CreateICmpSLT(ms, other), i32(), "to.cmp.lt");
+                        return builder_.CreateSub(gt, lt, "to.cmp");
+                    }
+                    // ToString(): string — "HH:mm:ss" format.
+                    if (mname == "ToString" && call.args.empty()) {
+                        auto* fn = declareC("bz_timeonly_to_string", ptrTy(), {i32()});
+                        return builder_.CreateCall(fn, {ms}, "to.tostr");
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // per §2.5 / #1357: TimeOnly static methods.
+    // ---------------------------------------------------------------------------
+    if (cls == "TimeOnly") {
+        // TimeOnly.Parse(s: string): TimeOnly
+        if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            auto* msSlot = entryAlloca(i32());
+            auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.parse.ok");
+            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            auto* tokBB  = llvm::BasicBlock::Create(llvm_, "to.parse.ok", currentFn_);
+            auto* tbadBB = llvm::BasicBlock::Create(llvm_, "to.parse.bad", currentFn_);
+            builder_.CreateCondBr(isOk, tokBB, tbadBB);
+            builder_.SetInsertPoint(tbadBB);
+            builder_.CreateUnreachable();
+            builder_.SetInsertPoint(tokBB);
+            return builder_.CreateLoad(i32(), msSlot, "to.parsed");
+        }
+        // TimeOnly.TryParse(s: string, out result: TimeOnly): bool
+        if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            auto* msSlot = entryAlloca(i32());
+            auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.tryp.ok");
+            llvm::Type* etto = nullptr;
+            llvm::Value* outAddrto = lvalueAddr(*call.args[1].value, etto);
+            if (outAddrto) {
+                llvm::Value* ms = builder_.CreateLoad(i32(), msSlot, "to.tryp.ms");
+                llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+                llvm::Value* sel = builder_.CreateSelect(okBool, ms, builder_.getInt32(0));
+                builder_.CreateStore(sel, outAddrto);
+            }
+            return builder_.CreateICmpNE(ok, builder_.getInt32(0), "to.tryp.bool");
         }
     }
 
