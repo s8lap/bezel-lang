@@ -12,3 +12,4 @@ Conventions:
 | # | Proposal | Status | Tracking |
 |---|----------|--------|----------|
 | 0001 | [Networking and the `Http` client](0001-networking-http.md) | draft | [#1376](https://github.com/s8lap/bezel-lang/issues/1376) |
+- **0002 — The `Http` server** (`0002-http-server.md`): minimal-API/Express-shaped routing over the fetch-symmetric Request→Response vocabulary of 0001; handlers on worker domains with compile-time sendability; draft for owner review.
