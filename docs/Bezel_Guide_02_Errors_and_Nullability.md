@@ -174,7 +174,7 @@ Or collapse it with the operators from §1: `directory.Find("alice")?.Name ?? "s
 **The `Try` pattern** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter:
 
 ```bezel
-private owned _cache: OwnedDictionary<string, Connection>;
+private owned _cache: OwningDictionary<string, Connection>;
 
 method TryGetCached(name: string, out owned conn: Connection?): bool
   if not _cache.ContainsKey(name) then

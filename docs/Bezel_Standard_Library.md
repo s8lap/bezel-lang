@@ -508,7 +508,7 @@ public sealed class Type
 end Type;
 ```
 
-**Kind predicates.** For any `Type`, exactly one of `IsClass`, `IsInterface`, `IsRecord`, `IsEnum`, `IsPrimitive`, `IsInlineArray`, `IsFunctionType` holds. These map the type kinds of language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) onto a runtime predicate surface, with two deliberate flattenings: `string` and the heap array types (`Array<T>`, `OwnedArray<T>`) report `IsClass` (they are reference types — language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) lists `string` and heap arrays as reference types reaching `Object` directly, and treating them as classes here is consistent with how the language and standard library describe them elsewhere); the unit type `()` reports `IsValueType` with none of the seven primary predicates true (it is a degenerate value type and the rare `typeof(())` is not expected in practice, but the surface does not claim a primary kind for it). `IsValueType` is a derived convenience equal to `IsPrimitive or IsEnum or IsRecord or IsInlineArray` (and additionally true for the unit type); it does not add a primary category. The "exactly one of seven" guarantee therefore holds for every type a program can name with `typeof` or obtain from `GetType` except the unit type, which no realistic program reifies.
+**Kind predicates.** For any `Type`, exactly one of `IsClass`, `IsInterface`, `IsRecord`, `IsEnum`, `IsPrimitive`, `IsInlineArray`, `IsFunctionType` holds. These map the type kinds of language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) onto a runtime predicate surface, with two deliberate flattenings: `string` and the heap array types (`Array<T>`, `OwningArray<T>`) report `IsClass` (they are reference types — language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) lists `string` and heap arrays as reference types reaching `Object` directly, and treating them as classes here is consistent with how the language and standard library describe them elsewhere); the unit type `()` reports `IsValueType` with none of the seven primary predicates true (it is a degenerate value type and the rare `typeof(())` is not expected in practice, but the surface does not claim a primary kind for it). `IsValueType` is a derived convenience equal to `IsPrimitive or IsEnum or IsRecord or IsInlineArray` (and additionally true for the unit type); it does not add a primary category. The "exactly one of seven" guarantee therefore holds for every type a program can name with `typeof` or obtain from `GetType` except the unit type, which no realistic program reifies.
 
 **`BaseType`.** Returns the direct superclass of a class type. It is `null` for `Object` (the root has no base), for interface types (interfaces have no base *class*; conformance is queried with `Implements`), for all value types, and for function types. Walking the chain to the root is `t.BaseType`, then `that!.BaseType`, terminating at the `Object` `Type` whose `BaseType` is `null`. For most subtype questions `IsAssignableFrom` is the better tool; `BaseType` is the lower-level primitive, useful mainly for diagnostics that print an inheritance chain.
 
@@ -678,7 +678,7 @@ A **class** can also be synthesized: it declares `: ISerializable`/`: IDeseriali
 ```bezel
 public class Order(id: int): ISerializable, IDeserializable
   public owned Customer: Customer;        // owned: an owning edge, serialized inline
-  public owned Lines: OwnedArray<LineItem>;
+  public owned Lines: OwningArray<LineItem>;
   public readonly property Id: int => id;
   // compiler synthesizes Serialize / Deserialize; each owned child
   // recurses through its own synthesized members
@@ -732,14 +732,14 @@ This is the type-driven serialization model: a class declares `: ISerializable`/
 
 The standard library provides two concrete implementations of the [§2.14](#sec-serialization-vocabulary) agent interfaces: a JSON pair (`JsonSerializer`/`JsonDeserializer`) and a compact binary pair (`BinarySerializer`/`BinaryDeserializer`). Both are ordinary classes implementing `ISerializer`/`IDeserializer`; they introduce no language feature. They live in `System.Serialization` and are *not* auto-imported (unlike the vocabulary interfaces) — a program that performs serialization names the format explicitly with `import System.Serialization`.
 
-Both serializers write to, and both deserializers read from, an `OwnedBuffer<byte>`-backed stream. The serializer accumulates bytes and exposes the result; the deserializer is constructed over a `ReadOnlySpan<byte>` of the encoded form.
+Both serializers write to, and both deserializers read from, an `OwningBuffer<byte>`-backed stream. The serializer accumulates bytes and exposes the result; the deserializer is constructed over a `ReadOnlySpan<byte>` of the encoded form.
 
 ```bezel
 public class JsonSerializer: ISerializer, IDisposable
   public constructor();
   public constructor(options: JsonOptions);
   // ISerializer surface (§2.14) implemented for JSON text.
-  public method ToBytes(): owned OwnedBuffer<byte>;   // UTF-8 encoded result
+  public method ToBytes(): owned OwningBuffer<byte>;   // UTF-8 encoded result
   public method ToString(): string;                   // convenience: UTF-8 → string
 end JsonSerializer;
 
@@ -765,7 +765,7 @@ public record JsonOptions(
 public class BinarySerializer: ISerializer, IDisposable
   public constructor();
   // ISerializer surface (§2.14) implemented for the compact binary format.
-  public method ToBytes(): owned OwnedBuffer<byte>;
+  public method ToBytes(): owned OwningBuffer<byte>;
 end BinarySerializer;
 
 public class BinaryDeserializer: IDeserializer, IDisposable
@@ -786,7 +786,7 @@ end BinaryDeserializer;
 ```bezel
 import System.Serialization;
 
-public method SavePoint(p: Point): owned OwnedBuffer<byte>
+public method SavePoint(p: Point): owned OwningBuffer<byte>
   using var s := new JsonSerializer();
   p.Serialize(s);                       // p implements ISerializable (§2.14)
   return s.ToBytes();                   // ownership of the buffer transfers out
@@ -798,7 +798,7 @@ public method LoadPoint(bytes: ReadOnlySpan<byte>): Point
 end LoadPoint;
 ```
 
-`ToBytes()` returns an `owned OwnedBuffer<byte>` ([§4.14](#sec-owned-buffers-and-spans)) — a fresh buffer whose ownership transfers to the caller; the serializer may be disposed immediately after. `JsonSerializer.ToString()` is a convenience that UTF-8-decodes the same bytes into a `string`. A deserializer constructed over a `ReadOnlySpan<byte>` borrows that span for the deserializer's lifetime; the backing bytes must outlive the `using var d` scope, which the example satisfies because the span parameter outlives the method body.
+`ToBytes()` returns an `owned OwningBuffer<byte>` ([§4.14](#sec-owned-buffers-and-spans)) — a fresh buffer whose ownership transfers to the caller; the serializer may be disposed immediately after. `JsonSerializer.ToString()` is a convenience that UTF-8-decodes the same bytes into a `string`. A deserializer constructed over a `ReadOnlySpan<byte>` borrows that span for the deserializer's lifetime; the backing bytes must outlive the `using var d` scope, which the example satisfies because the span parameter outlives the method body.
 
 **Errors.** Malformed input, type mismatches (a `ReadInt` when the next token is a string), depth-limit violations, and trailing-data conditions raise `SerializationException` (declared in `System.Serialization`). `SerializationException` carries a byte offset (for binary) or line/column (for JSON) to locate the fault. The deserializer interfaces' `Try*`-shaped members (`TryReadNull`) do not throw; every other read member throws on mismatch rather than returning a sentinel, because a deserialization mismatch is a structural error in the input, not an expected control-flow branch.
 
@@ -834,7 +834,7 @@ end Weak;
 ```bezel
 using var cacheEntry := new Shared<ParsedConfig>(Parse(text));
 _index.Add("primary", cacheEntry.Clone());   // the index owns its own handle
-                                             //   (_index: OwnedDictionary<string, Shared<ParsedConfig>>)
+                                             //   (_index: OwningDictionary<string, Shared<ParsedConfig>>)
 Apply(cacheEntry.Get());                     // borrow for the call
 ```
 
@@ -992,7 +992,7 @@ A `ReadOnlyStringSpan` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.m
 
 `ReadOnlyStringSpan` is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features.
 
-**Why a separate type from `ReadOnlySpan<char>`.** `ReadOnlySpan<char>` (stdlib [§4.14](#sec-owned-buffers-and-spans)) views into an `OwnedBuffer<char>` — a contiguous char buffer with each slot occupying `sizeof(char)` bytes. A `string`'s internal storage is adaptive (1, 2, or 4 bytes per code point per language spec [§4.6](Bezel_Language_Spec.md#sec-string)), so a string-backed view cannot share storage with a buffer-backed view. Two source types would force `ReadOnlySpan<T>`'s `Buffer` field to be polymorphic over source type, which would either change the existing record's shape (breaking v0.99-v0.103) or require a general source-polymorphism mechanism that v0.104 does not introduce. The separate `ReadOnlyStringSpan` type leaves `ReadOnlySpan<char>` unchanged and makes the source visible at API boundaries ("does this method want a buffer-backed view or a string-backed view?").
+**Why a separate type from `ReadOnlySpan<char>`.** `ReadOnlySpan<char>` (stdlib [§4.14](#sec-owned-buffers-and-spans)) views into an `OwningBuffer<char>` — a contiguous char buffer with each slot occupying `sizeof(char)` bytes. A `string`'s internal storage is adaptive (1, 2, or 4 bytes per code point per language spec [§4.6](Bezel_Language_Spec.md#sec-string)), so a string-backed view cannot share storage with a buffer-backed view. Two source types would force `ReadOnlySpan<T>`'s `Buffer` field to be polymorphic over source type, which would either change the existing record's shape (breaking v0.99-v0.103) or require a general source-polymorphism mechanism that v0.104 does not introduce. The separate `ReadOnlyStringSpan` type leaves `ReadOnlySpan<char>` unchanged and makes the source visible at API boundaries ("does this method want a buffer-backed view or a string-backed view?").
 
 **Indexer access.** `span[i]` returns the code point at position `Start + i` in the source string, by delegating to the string's indexer (which dispatches on the string's internal storage width). The per-access overhead is small — one range check, one width-dispatched read — and the call site never sees the dispatch. For parsing work where the per-element cost is dominated by compare/branch logic, the overhead is negligible.
 
@@ -1054,7 +1054,7 @@ A `ReadOnlyAsciiByteSpan` is a borrow-bearing record ([§9.7](Bezel_Language_Spe
 
 The type is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features.
 
-**Why a separate type from `ReadOnlySpan<byte>` and `ReadOnlyStringSpan`.** `ReadOnlySpan<byte>` views into an `OwnedBuffer<byte>` and cannot be backed by a string without source polymorphism (the same design problem solved by introducing `ReadOnlyStringSpan` in v0.104). `ReadOnlyStringSpan` views chars, not bytes — it has the right source (a string) but the wrong element type (`char`, 32 bits per element). The new type combines a string source with byte element type, with construction validated to keep the byte cast safe.
+**Why a separate type from `ReadOnlySpan<byte>` and `ReadOnlyStringSpan`.** `ReadOnlySpan<byte>` views into an `OwningBuffer<byte>` and cannot be backed by a string without source polymorphism (the same design problem solved by introducing `ReadOnlyStringSpan` in v0.104). `ReadOnlyStringSpan` views chars, not bytes — it has the right source (a string) but the wrong element type (`char`, 32 bits per element). The new type combines a string source with byte element type, with construction validated to keep the byte cast safe.
 
 **ASCII invariant and the byte cast.** Construction APIs (`String.AsAsciiByteSpan` and `String.TryAsAsciiByteSpan` in [§9.6](#sec-string)) check that every code point in the source is in the range `0..127`. Once constructed, the indexer reads each char via the string's indexer and narrows to byte unconditionally — the ASCII check at construction guarantees no narrowing-overflow exception will fire at access time. The cast `byte(Source[Start + i])` is therefore safe for every index in the span's range.
 
@@ -1081,7 +1081,7 @@ The collection types. None are auto-imported except the iteration-interface fami
 
 The language separates **borrowing** collections (store references the caller continues to own; element disposal is the caller's responsibility) from **owning** collections (own their elements; element disposal is the collection's responsibility). Each kind has its own concrete class and its own interfaces; the two kinds share read-only iteration interfaces (`IEnumerable<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`) because reading produces borrows in either case.
 
-The naming convention: borrowing collection types use their plain names (`Array<T>`, `LinkedList<T>`, etc.); owning collection types are prefixed `Owned…` (`OwnedArray<T>`, `OwnedLinkedList<T>`, etc.). The owning types constrain `where T: class` (and, for `OwnedDictionary<K, V>`, `where V: class`) because ownership only makes sense for class-typed elements.
+The naming convention (v0.168, #1372): borrowing collection types use their plain names (`Array<T>`, `LinkedList<T>`, etc.); owning collection types are prefixed `Owning…` (`OwningArray<T>`, `OwningLinkedList<T>`, etc.) — the prefix names the **element** axis ("a collection that *owns its elements*"), lexically distinct from the `owned` qualifier, which names the **container** axis ("a value *you* own"). `owned OwningArray<Dog>` therefore reads exactly as intended: an owning array that you own; a bare `OwningArray<Dog>` is a borrow of someone else's owning array. Interface members of the owning family carry the standard `I` prefix (`IOwningList`, `IOwningCollection`, `IOwningEnumerable`, `IOwningEnumerator`, and the async pair). The owning types constrain `where T: class` (and, for `OwningDictionary<K, V>`, `where V: class`) because ownership only makes sense for class-typed elements.
 
 <a id="sec-ireadonlycollectiont-ireadonlylistt-and-ilistt"></a>
 <a id="sec-borrowing-collection-interfaces"></a>
@@ -1121,30 +1121,30 @@ The four interfaces form the borrowing collection family. `IReadOnlyCollection<T
 ### 4.2 Owning collection interfaces
 
 ```bezel
-public interface IOwnedCollection<T>: IReadOnlyCollection<T>, IDisposable
+public interface IOwningCollection<T>: IReadOnlyCollection<T>, IDisposable
   where T: class
   readonly property IsReadOnly: bool;
   method Add(owned item: T);
   method Clear();                            // disposes every element
   method Contains(item: T): bool;            // borrow-taking query
   method Remove(item: T): bool;              // disposes the removed element
-end IOwnedCollection;
+end IOwningCollection;
 
-public interface IOwnedList<T>: IReadOnlyList<T>, IOwnedCollection<T>
+public interface IOwningList<T>: IReadOnlyList<T>, IOwningCollection<T>
   where T: class
   property [i: int]: T
     get;
     set(owned);                              // takes owned T; disposes previous value
   end;
   method Insert(index: int, owned item: T);
-end IOwnedList;
+end IOwningList;
 ```
 
 The two owning-collection interfaces. They extend the borrowing read-only interfaces (`IReadOnlyCollection<T>`, `IReadOnlyList<T>`) for unified read-only access, and they additionally extend `IDisposable` because owning collections are themselves owned objects (their `Dispose()` cascades through their elements).
 
 The mutating methods take `owned` parameters where appropriate: `Add` and `Insert` take ownership of the new element; the indexer setter takes ownership and disposes the previous slot value. Read-side methods (`Contains`, the indexer getter, iteration through the read-only-collection ancestor) produce borrows.
 
-The `where T: class` constraint expresses that owning collections are meaningful only for elements carrying a disposal obligation, and the language spec ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)) states the enforced rule: element types are **class and interface types** (nullable-underlying admitted). **Value-typed elements are rejected at the instantiation site** (v0.165, resolving a three-way documentation contradiction in the class-only direction the v0.102 decision records — this paragraph briefly claimed otherwise): a value element has no disposal obligation, so `OwnedArray<int>` says nothing `Array<int>` doesn't; use `Array<T>` or `OwnedBuffer<T>` for value elements. Runtime-managed reference types (`string`, function values) are likewise rejected. Code that wants a borrowing collection uses the unprefixed name (`Array<…>`).
+The `where T: class` constraint expresses that owning collections are meaningful only for elements carrying a disposal obligation, and the language spec ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)) states the enforced rule: element types are **class and interface types** (nullable-underlying admitted). **Value-typed elements are rejected at the instantiation site** (v0.165, resolving a three-way documentation contradiction in the class-only direction the v0.102 decision records — this paragraph briefly claimed otherwise): a value element has no disposal obligation, so `OwningArray<int>` says nothing `Array<int>` doesn't; use `Array<T>` or `OwningBuffer<T>` for value elements. Runtime-managed reference types (`string`, function values) are likewise rejected. Code that wants a borrowing collection uses the unprefixed name (`Array<…>`).
 
 <a id="sec-borrowing-and-owning-collections-relate-via-iiterator-interfaces"></a>
 <a id="sec-how-the-borrowing-and-owning-hierarchies-relate"></a>
@@ -1159,14 +1159,14 @@ end ReportEach;
 
 // Accepts both:
 ReportEach(myArray);          // Array<Connection> → IReadOnlyList<Connection> ✓
-ReportEach(myPool);            // OwnedArray<Connection> → IReadOnlyList<Connection> ✓
+ReportEach(myPool);            // OwningArray<Connection> → IReadOnlyList<Connection> ✓
 ```
 
-The two hierarchies do *not* share mutating interfaces. `IList<T>` (borrowing) and `IOwnedList<T>` (owning) are unrelated types with no subtyping; code that abstracts over "any mutable list" must pick one. This is intentional — the semantic of `Add` differs between the two (borrow-taking vs. owned-taking), so there is no useful single abstraction over both.
+The two hierarchies do *not* share mutating interfaces. `IList<T>` (borrowing) and `IOwningList<T>` (owning) are unrelated types with no subtyping; code that abstracts over "any mutable list" must pick one. This is intentional — the semantic of `Add` differs between the two (borrow-taking vs. owned-taking), so there is no useful single abstraction over both.
 
-For draining iteration that transfers ownership, the owning collections expose `Drain()` returning `OwnedEnumerable<T>` (declared in [§4.13](#sec-owning-enumeration-interfaces)).
+For draining iteration that transfers ownership, the owning collections expose `Drain()` returning `IOwningEnumerable<T>` (declared in [§4.13](#sec-owning-enumeration-interfaces)).
 
-Every collection's element semantics — what `Add`, `Remove`, `Clear`, the indexer, iteration, and `Dispose` do with the elements — derive from the element slot policy of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy): the collection's family and the element type's category determine the slot kind, and the slot kind determines every element operation. The per-type sections below present that table for each concrete type; they introduce no element semantics of their own. The storage primitive embodying the owning column is `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
+Every collection's element semantics — what `Add`, `Remove`, `Clear`, the indexer, iteration, and `Dispose` do with the elements — derive from the element slot policy of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy): the collection's family and the element type's category determine the slot kind, and the slot kind determines every element operation. The per-type sections below present that table for each concrete type; they introduce no element semantics of their own. The storage primitive embodying the owning column is `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
 
 <a id="sec-arrayt"></a>
 ### 4.4 `Array<T>`
@@ -1221,19 +1221,19 @@ end;
 
 A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type is `Array<T>`; it constructs an inline array `[N]T` when the target is an inline array. See language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals) for the contextual-typing rules.
 
-`Array<T>` stores borrows: when the element type is a class, the elements are references whose ownership remains with whoever passed them in. The array's `Dispose()` releases the backing storage but does not dispose the elements. To dispose owned class instances when clearing the collection, either call `DisposeElements()` (which disposes each class-typed element then clears) or use `OwnedArray<T>` ([§4.5](#sec-ownedarrayt)) instead.
+`Array<T>` stores borrows: when the element type is a class, the elements are references whose ownership remains with whoever passed them in. The array's `Dispose()` releases the backing storage but does not dispose the elements. To dispose owned class instances when clearing the collection, either call `DisposeElements()` (which disposes each class-typed element then clears) or use `OwningArray<T>` ([§4.5](#sec-ownedarrayt)) instead.
 
-`Reverse`/`Sort` versus `Reversed`/`Sorted` follow a uniform naming convention: the imperative-verb form (`Reverse`, `Sort`) mutates the receiver in place and returns nothing; the past-participle form (`Reversed`, `Sorted`) leaves the receiver unchanged and returns a fresh `owned Array<T>` with the elements in the new order. The result's ownership mirrors `ToArray(): owned Array<T>` — it is a borrowing array (a fresh backing buffer holding the same element borrows), so the caller is responsible for disposing the array itself, not its elements. `Sorted` comes in two forms, mirroring `Sort`: the comparer-taking method on `Array<T>`, and the parameterless `Sorted()` in the `where T: IComparable<T>` extension that sorts by the natural order. `OwnedArray<T>` deliberately has **no** value copy-forms — neither `Reversed`/`Sorted` nor `ToArray` — because its elements are uniquely owned: a copy would either double-own each element (two arrays claiming the same owned instances) or drain the source (leaving it empty). To reorder an `OwnedArray<T>`, use the in-place `Reverse()`/`Sort()`; to move its elements into a new owning array, drain it (`Drain()`), which transfers ownership and empties the original.
+`Reverse`/`Sort` versus `Reversed`/`Sorted` follow a uniform naming convention: the imperative-verb form (`Reverse`, `Sort`) mutates the receiver in place and returns nothing; the past-participle form (`Reversed`, `Sorted`) leaves the receiver unchanged and returns a fresh `owned Array<T>` with the elements in the new order. The result's ownership mirrors `ToArray(): owned Array<T>` — it is a borrowing array (a fresh backing buffer holding the same element borrows), so the caller is responsible for disposing the array itself, not its elements. `Sorted` comes in two forms, mirroring `Sort`: the comparer-taking method on `Array<T>`, and the parameterless `Sorted()` in the `where T: IComparable<T>` extension that sorts by the natural order. `OwningArray<T>` deliberately has **no** value copy-forms — neither `Reversed`/`Sorted` nor `ToArray` — because its elements are uniquely owned: a copy would either double-own each element (two arrays claiming the same owned instances) or drain the source (leaving it empty). To reorder an `OwningArray<T>`, use the in-place `Reverse()`/`Sort()`; to move its elements into a new owning array, drain it (`Drain()`), which transfers ownership and empties the original.
 
 `AsSpan()` and its overloads return an `ArraySpan<T>` (writable view) over a contiguous range of the array; `AsReadOnlySpan()` returns a `ReadOnlyArraySpan<T>`. These views are non-allocating record constructions and admit `Slice`, search, equality, and bulk-mutation methods. See [§4.15](#sec-arrayspant-readonlyarrayspant) for the full description; note that the mutation surface differs from `Span<T>`'s — it is uniform `Fill`/`CopyFrom`/`Reverse` for all T, without the class/value split that `Span<T>` requires, because `Array<T>` slots store borrows rather than owned values. `AsSpan` returns the writable form by default (matching `Array<T>`'s mutable nature); callers wanting read-only access either call `AsReadOnlySpan` directly or call `.AsReadOnly()` on the writable form. The four overload signatures of each form accept range parameters in the same style as v0.104's `string.AsSpan()`: no-arg (full used range, `0..<Count`), `(start)` (from offset to end), `(start, length)`, or `(r: Range<int>)`. Bounds-check semantics follow the standard Bezel convention: `IndexOutOfRangeException` if `start` or `length` is out of range against the array's `Count`.
 
 <a id="sec-ownedarrayt"></a>
-### 4.5 `OwnedArray<T>`
+### 4.5 `OwningArray<T>`
 
 Owning resizable array. Owns its elements; disposal cascades through them.
 
 ```bezel
-public class OwnedArray<T>: IOwnedList<T> where T: class
+public class OwningArray<T>: IOwningList<T> where T: class
   public constructor();
   public constructor(capacity: int);
 
@@ -1246,7 +1246,7 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   end;
 
   public method Add(owned item: T);
-  public method AddRange(owned items: OwnedArray<T>);   // drains items into self
+  public method AddRange(owned items: OwningArray<T>);   // drains items into self
   public method Insert(index: int, owned item: T);
   public method RemoveAt(index: int);                    // disposes the removed element
   public method Remove(item: T): bool;                   // borrow-taking query;
@@ -1264,33 +1264,33 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   public method PopLast(): owned T;                      // = PopAt(Count - 1); raises if empty
   public method TryPopFirst(out owned item: T): bool;
   public method TryPopLast(out owned item: T): bool;
-  public method Drain(): OwnedEnumerable<T>;             // iteration drains the source
-end OwnedArray;
+  public method Drain(): IOwningEnumerable<T>;             // iteration drains the source
+end OwningArray;
 
-public extension OwnedArray<T> where T: class, IComparable<T>
+public extension OwningArray<T> where T: class, IComparable<T>
   public method Sort();
 end;
 ```
 
-`OwnedArray<T>` owns each element. `Add`, `Insert`, and the indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's own `Dispose()` dispose the affected elements. `Sort`'s comparer parameter takes borrows of T (the comparer doesn't consume; it inspects).
+`OwningArray<T>` owns each element. `Add`, `Insert`, and the indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's own `Dispose()` dispose the affected elements. `Sort`'s comparer parameter takes borrows of T (the comparer doesn't consume; it inspects).
 
 The indexer getter produces a borrow of the slot's owned element; the borrow is valid until the slot is mutated (by indexer set, RemoveAt, Clear, or any operation that disposes the slot's contents). To take an element out, use `PopAt(i)` (returns owned T and removes the slot) or `move arr[i]` (returns owned T and leaves the slot in moved-from state; the caller must reassign before the next exit point — see language spec [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression)).
 
-`Drain()` returns an `OwnedEnumerable<T>` ([§4.13](#sec-owning-enumeration-interfaces)) whose iteration transfers ownership of each element to the consumer. A `for var x in arr.Drain() do ... end` loop has owned iteration variables and consumes the array; the spec §28.3 discharge rules apply per iteration (an undischarged element auto-drops at the body's end with the must-use warning).
+`Drain()` returns an `IOwningEnumerable<T>` ([§4.13](#sec-owning-enumeration-interfaces)) whose iteration transfers ownership of each element to the consumer. A `for var x in arr.Drain() do ... end` loop has owned iteration variables and consumes the array; the spec §28.3 discharge rules apply per iteration (an undischarged element auto-drops at the body's end with the must-use warning).
 
-There is no `ToArray()` on `OwnedArray<T>` that produces a non-owning copy: copying the array would manufacture duplicate ownership of each element. To produce a fresh `OwnedArray<T>` with the same elements, the source array must be drained — the original ceases to own its elements.
+There is no `ToArray()` on `OwningArray<T>` that produces a non-owning copy: copying the array would manufacture duplicate ownership of each element. To produce a fresh `OwningArray<T>` with the same elements, the source array must be drained — the original ceases to own its elements.
 
-`OwnedArray<T>` does not declare `DisposeElements()` — disposing the array automatically disposes every element. The method would be redundant.
+`OwningArray<T>` does not declare `DisposeElements()` — disposing the array automatically disposes every element. The method would be redundant.
 
-A collection literal `[c1, c2, c3]` with target type `OwnedArray<Connection>` constructs an owning array and transfers ownership of each element in:
+A collection literal `[c1, c2, c3]` with target type `OwningArray<Connection>` constructs an owning array and transfers ownership of each element in:
 
 ```bezel
-public method Build(): owned OwnedArray<Connection>
+public method Build(): owned OwningArray<Connection>
   return [
     Connect("a"),                          // each Connect returns owned Connection
     Connect("b"),
     Connect("c")
-  ];                                       // collection literal targets OwnedArray<Connection>
+  ];                                       // collection literal targets OwningArray<Connection>
 end Build;
 ```
 
@@ -1298,11 +1298,11 @@ end Build;
 <a id="sec-reference-implementation"></a>
 #### Reference implementation
 
-`OwnedArray<T>` composes over `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)) in pure Bezel; the standard library provides this implementation directly, and user code is welcome to inspect or extend it.
+`OwningArray<T>` composes over `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)) in pure Bezel; the standard library provides this implementation directly, and user code is welcome to inspect or extend it.
 
 ```bezel
-public class OwnedArray<T>: IOwnedList<T> where T: class
-  private owned _storage: OwnedBuffer<T>;
+public class OwningArray<T>: IOwningList<T> where T: class
+  private owned _storage: OwningBuffer<T>;
   private _count: int := 0;
 
   public constructor()
@@ -1310,7 +1310,7 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   end constructor;
 
   public constructor(capacity: int)
-    _storage := new OwnedBuffer<T>(if capacity > 0 then capacity else 1);
+    _storage := new OwningBuffer<T>(if capacity > 0 then capacity else 1);
   end constructor;
 
   public readonly property Count: int => _count;
@@ -1373,7 +1373,7 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   end BoundsCheck;
 
   private method GrowTo(newCapacity: int)
-    var fresh := new OwnedBuffer<T>(newCapacity);
+    var fresh := new OwningBuffer<T>(newCapacity);
     for var i in 0..<_count do
       var moved := move _storage[i];                 // moved: T? (owned)
       _storage[i] := null;                            // restore moved-from slot
@@ -1387,16 +1387,16 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   // No destructor declared; the compiler generates the default Dispose
   // which disposes _storage's contents (every non-null slot's owned T)
   // and the buffer's storage block, in that order.
-end OwnedArray;
+end OwningArray;
 ```
 
-The implementation is straightforward Bezel: a class with an owned `OwnedBuffer<T>` field, a count, and the standard ownership-transferring operations. The `move`-and-null pattern from [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) of the language spec discharges every slot before reassignment; the compiler verifies the field-restoration rule statically.
+The implementation is straightforward Bezel: a class with an owned `OwningBuffer<T>` field, a count, and the standard ownership-transferring operations. The `move`-and-null pattern from [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) of the language spec discharges every slot before reassignment; the compiler verifies the field-restoration rule statically.
 
 `GrowTo` is the resize operation. It allocates a fresh buffer, moves every live element from the old buffer to the new one (nulling the old slot after each move to satisfy the restoration rule), then disposes the old buffer. The old buffer's destructor sees only null slots and does no further work.
 
-`Drain()`, `PopFirst()`, `PopLast()`, and the rest follow the same pattern: take from a slot via `move`, restore the slot with `null`, adjust `_count`. None of the operations require compiler-intrinsic knowledge of `OwnedArray<T>` itself — the intrinsic surface is confined to `OwnedBuffer<T>`.
+`Drain()`, `PopFirst()`, `PopLast()`, and the rest follow the same pattern: take from a slot via `move`, restore the slot with `null`, adjust `_count`. None of the operations require compiler-intrinsic knowledge of `OwningArray<T>` itself — the intrinsic surface is confined to `OwningBuffer<T>`.
 
-The implementation example above omits some methods for brevity; the production standard library version provides the full surface listed in the class declaration above, all built over the same `OwnedBuffer<T>` primitive.
+The implementation example above omits some methods for brevity; the production standard library version provides the full surface listed in the class declaration above, all built over the same `OwningBuffer<T>` primitive.
 
 <a id="sec-linkedlistt"></a>
 ### 4.6 `LinkedList<T>`
@@ -1435,17 +1435,17 @@ end LinkedListNode;
 
 `LinkedListNode<T>` instances are owned by their containing `LinkedList<T>`. Methods returning `LinkedListNode<T>` return a borrow whose lifetime is the list's lifetime.
 
-A `LinkedList<T>` may be constructed with a sequence literal (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)); textual order is head-to-tail: `using var l: LinkedList<int> := [10, 20, 30];` produces a list whose `First` is `10` and `Last` is `30`. The owning form `OwnedLinkedList<T>` accepts the same literal with element expressions producing owned values.
+A `LinkedList<T>` may be constructed with a sequence literal (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)); textual order is head-to-tail: `using var l: LinkedList<int> := [10, 20, 30];` produces a list whose `First` is `10` and `Last` is `30`. The owning form `OwningLinkedList<T>` accepts the same literal with element expressions producing owned values.
 
 `List<T>` is not defined in this version. The name is reserved.
 
 <a id="sec-ownedlinkedlistt"></a>
-### 4.7 `OwnedLinkedList<T>`
+### 4.7 `OwningLinkedList<T>`
 
 Owning doubly-linked list.
 
 ```bezel
-public class OwnedLinkedList<T>: IOwnedCollection<T> where T: class
+public class OwningLinkedList<T>: IOwningCollection<T> where T: class
   public constructor();
 
   public readonly property Count: int;
@@ -1471,18 +1471,18 @@ public class OwnedLinkedList<T>: IOwnedCollection<T> where T: class
   public method PopLast(): owned T;
   public method TryPopFirst(out owned item: T): bool;
   public method TryPopLast(out owned item: T): bool;
-  public method Drain(): OwnedEnumerable<T>;
-end OwnedLinkedList;
+  public method Drain(): IOwningEnumerable<T>;
+end OwningLinkedList;
 ```
 
-`LinkedListNode<T>` (declared in [§4.6](#sec-linkedlistt)) is reused. On `OwnedLinkedList<T>`, the node's `Value` property returns a borrow of the node's element; the node still owns the element until the node is removed. To take an element out, use `RemoveNode` (which disposes), `PopFirst` / `PopLast` (transfer ownership to caller), or `Drain()`.
+`LinkedListNode<T>` (declared in [§4.6](#sec-linkedlistt)) is reused. On `OwningLinkedList<T>`, the node's `Value` property returns a borrow of the node's element; the node still owns the element until the node is removed. To take an element out, use `RemoveNode` (which disposes), `PopFirst` / `PopLast` (transfer ownership to caller), or `Drain()`.
 
 The `move` operator does not extend to linked-list nodes in this version — removing a value from a specific node would leave the node in an inconsistent state, and the surrounding-node-pointer integrity makes the move-out-and-restore pattern impractical. Future revisions may add a node-level move form.
 
 <a id="sec-dictionaryk-v"></a>
 ### 4.8 `Dictionary<K, V>`
 
-Borrowing hash-based map. `K` must be **equality-bearing** (spec §3.6/§8.3) — enforced at the instantiation site per §3.6 rule 2: a `Dictionary<K, V>` (or `OwnedDictionary<K, V>`) whose `K` is a record that is neither auto-equality-bearing nor declares user equality is rejected with a diagnostic naming the property. (Added in v0.158, replacing the previous unenforceable prose requirement.)
+Borrowing hash-based map. `K` must be **equality-bearing** (spec §3.6/§8.3) — enforced at the instantiation site per §3.6 rule 2: a `Dictionary<K, V>` (or `OwningDictionary<K, V>`) whose `K` is a record that is neither auto-equality-bearing nor declares user equality is rejected with a diagnostic naming the property. (Added in v0.158, replacing the previous unenforceable prose requirement.)
 
 ```bezel
 public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
@@ -1520,7 +1520,7 @@ end IEqualityComparer;
 
 Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `TryGetValue` for safe lookup.
 
-The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwnedDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member.
+The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwningDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member.
 
 Iteration over a `Dictionary<K, V>` — `for var entry in dict do ... end` — yields `DictionaryEntry<K, V>` values (the element type of the `ICollection<DictionaryEntry<K, V>>` conformance), one per live entry in a single pass, in insertion order. `entry.Key` and `entry.Value` read the entry; for class-typed values, `entry.Value` is a *borrow* of the stored value — the dictionary retains ownership (the borrowing column of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). Removing a key and re-adding it places it at the end of the iteration order. `Clear()` resets the order. `Contains(key)` is an alias for `ContainsKey(key)`, enabling the `in` operator (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) to test key membership: `key in dict` is equivalent to `dict.ContainsKey(key)`.
 
@@ -1536,12 +1536,12 @@ using var ages: Dictionary<string, int> := [
 The key expressions have type `K`, the value expressions type `V`. Literal element order is the insertion order, which is observable because iteration is insertion-ordered. Duplicate keys that are all compile-time constants are a compile error; otherwise the last occurrence wins. The empty dictionary is `[]` with a `Dictionary<K, V>`-typed target.
 
 <a id="sec-owneddictionaryk-v"></a>
-### 4.9 `OwnedDictionary<K, V>`
+### 4.9 `OwningDictionary<K, V>`
 
 Owning hash-based map. Owns its values; keys are value-like (typically `string`, `int`, or a record with value equality). The typical owning-map form.
 
 ```bezel
-public class OwnedDictionary<K, V>: IDisposable where V: class
+public class OwningDictionary<K, V>: IDisposable where V: class
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<K>);
@@ -1566,12 +1566,12 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
   // Drain
   public method PopValue(key: K): owned V;     // raises if not present
   public method TryPopValue(key: K, out owned value: V): bool;
-  public method Drain(): OwnedEnumerable<DrainedEntry<K, V>>;
+  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
                                                // iteration drains the dictionary;
                                                //   each yielded entry owns its Value
 
   public method Clear();                        // disposes every value
-end OwnedDictionary;
+end OwningDictionary;
 
 public class DrainedEntry<K, V>: IDisposable where V: class
   public constructor(key: K, owned value: V);  // ownership of value transfers in
@@ -1581,13 +1581,13 @@ public class DrainedEntry<K, V>: IDisposable where V: class
 end DrainedEntry;
 ```
 
-`OwnedDictionary<K, V>` requires `V: class` (the value type is owned). Keys can be any type with the standard equality contract.
+`OwningDictionary<K, V>` requires `V: class` (the value type is owned). Keys can be any type with the standard equality contract.
 
-The interface conformance is `IDisposable` only — not `IOwnedCollection<DictionaryEntry<K, V>>`. The `DictionaryEntry<K, V>` record (used by the borrowing `Dictionary<K, V>` in [§4.8](#sec-dictionaryk-v)) is a record, and records cannot have an owned `Value` field per language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields); a borrowing entry view over an owning dictionary would hand out a borrow of a value the dictionary still owns, which is the upcast-iteration behavior, not an ownership-transferring drain. For the ownership-transferring case, `Drain()` (below) yields `DrainedEntry<K, V>` — a *class*, which per the same [§28.5](Bezel_Language_Spec.md#sec-owned-fields) rule *may* own its `Value`. Default `for var entry in ownedDict do` iteration is not provided **on `OwnedDictionary<K, V>`** — its common intent is ownership transfer, and a borrowing look-don't-take entry view over an owning dictionary is a separate decision deliberately not taken here; use either the key-iteration pattern (borrowing) or `Drain()` (ownership-transferring). (The borrowing `Dictionary<K, V>` *does* provide single-pass entry iteration — [§4.8](#sec-dictionaryk-v).)
+The interface conformance is `IDisposable` only — not `IOwningCollection<DictionaryEntry<K, V>>`. The `DictionaryEntry<K, V>` record (used by the borrowing `Dictionary<K, V>` in [§4.8](#sec-dictionaryk-v)) is a record, and records cannot have an owned `Value` field per language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields); a borrowing entry view over an owning dictionary would hand out a borrow of a value the dictionary still owns, which is the upcast-iteration behavior, not an ownership-transferring drain. For the ownership-transferring case, `Drain()` (below) yields `DrainedEntry<K, V>` — a *class*, which per the same [§28.5](Bezel_Language_Spec.md#sec-owned-fields) rule *may* own its `Value`. Default `for var entry in ownedDict do` iteration is not provided **on `OwningDictionary<K, V>`** — its common intent is ownership transfer, and a borrowing look-don't-take entry view over an owning dictionary is a separate decision deliberately not taken here; use either the key-iteration pattern (borrowing) or `Drain()` (ownership-transferring). (The borrowing `Dictionary<K, V>` *does* provide single-pass entry iteration — [§4.8](#sec-dictionaryk-v).)
 
 ```bezel
 // Borrowing key-iteration, one value taken at a time:
-public method DrainAndProcess(dict: OwnedDictionary<string, Connection>)
+public method DrainAndProcess(dict: OwningDictionary<string, Connection>)
   using var keys := new Array<string>(dict.Count);
   for var key in dict.Keys do
     keys.Add(key);
@@ -1600,7 +1600,7 @@ public method DrainAndProcess(dict: OwnedDictionary<string, Connection>)
 end DrainAndProcess;
 
 // Single-call drain — each entry owns its value:
-public method DrainAndProcess2(dict: OwnedDictionary<string, Connection>)
+public method DrainAndProcess2(dict: OwningDictionary<string, Connection>)
   for var entry in dict.Drain() do
     using var e := entry;                      // entry is owned; bind to discharge
     Process(e.Key, e.Value);                   // e.Value is the owned Connection
@@ -1609,33 +1609,33 @@ public method DrainAndProcess2(dict: OwnedDictionary<string, Connection>)
 end DrainAndProcess2;
 ```
 
-`Drain()` returns `OwnedEnumerable<DrainedEntry<K, V>>` ([§4.13](#sec-owning-enumeration-interfaces)). Iterating it transfers ownership of each `DrainedEntry<K, V>` to the consumer; the entry is a class that owns its `Value`, so binding the iteration variable with `using var` (or otherwise discharging it) disposes both the entry shell and, via the standard owned-field cascade (language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields)), the contained value. Partial iteration drains only the entries yielded; the rest remain in the dictionary. This is the single-call drain; no language feature beyond the existing owning-class and `OwnedEnumerable<T>` machinery is required — `DrainedEntry<K, V>` owns its `Value` exactly as any class owns an `owned` field. The `Key` is carried by value (or as a borrow for class-typed K, following the standard field rules).
+`Drain()` returns `IOwningEnumerable<DrainedEntry<K, V>>` ([§4.13](#sec-owning-enumeration-interfaces)). Iterating it transfers ownership of each `DrainedEntry<K, V>` to the consumer; the entry is a class that owns its `Value`, so binding the iteration variable with `using var` (or otherwise discharging it) disposes both the entry shell and, via the standard owned-field cascade (language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields)), the contained value. Partial iteration drains only the entries yielded; the rest remain in the dictionary. This is the single-call drain; no language feature beyond the existing owning-class and `IOwningEnumerable<T>` machinery is required — `DrainedEntry<K, V>` owns its `Value` exactly as any class owns an `owned` field. The `Key` is carried by value (or as a borrow for class-typed K, following the standard field rules).
 
 `GetOrAdd(key, factory)`'s factory produces an `owned V`; the dictionary stores the value (taking ownership) and the call returns a borrow of the now-stored value.
 
-There is no `DisposeElements()` on `OwnedDictionary<K, V>` — the dictionary's `Dispose()` cascade handles every value disposal.
+There is no `DisposeElements()` on `OwningDictionary<K, V>` — the dictionary's `Dispose()` cascade handles every value disposal.
 
 The `Keys` and `Values` properties return read-only borrowing views; their type is `IReadOnlyCollection<K>` and `IReadOnlyCollection<V>` (the unmodified types, since reading produces borrows). Code that needs to mutate the dictionary calls `Add`, `Remove`, etc. directly.
 
-**Construction via collection literal.** An `OwnedDictionary<K, V>` may be constructed with the dictionary-literal form `[k1: v1, ...]`; each value expression must produce an `owned V`, and ownership transfers into the dictionary:
+**Construction via collection literal.** An `OwningDictionary<K, V>` may be constructed with the dictionary-literal form `[k1: v1, ...]`; each value expression must produce an `owned V`, and ownership transfers into the dictionary:
 
 ```bezel
-using var pool: OwnedDictionary<string, Connection> := [
+using var pool: OwningDictionary<string, Connection> := [
   "primary": Connect("p"),
   "backup":  Connect("b")
 ];
 ```
 
-If a literal contains duplicate keys that are not all compile-time constants, the last value wins and each displaced earlier value is disposed at construction (consistent with the runtime last-write-wins rule). The empty owned dictionary is `[]` with an `OwnedDictionary<K, V>`-typed target.
+If a literal contains duplicate keys that are not all compile-time constants, the last value wins and each displaced earlier value is disposed at construction (consistent with the runtime last-write-wins rule). The empty owned dictionary is `[]` with an `OwningDictionary<K, V>`-typed target.
 
-`OwnedDictionary` does **not** support owned keys (`OwnedDictionary<owned K, V>` and similar forms are not provided). Realistic key types are value-like (string, int, records, etc.); cases for owned class-typed keys are rare to nonexistent in practice, and the v0.96-era four-way Add declaration that admitted them was contortion for a use case that didn't motivate the complexity.
+`OwningDictionary` does **not** support owned keys (`OwningDictionary<owned K, V>` and similar forms are not provided). Realistic key types are value-like (string, int, records, etc.); cases for owned class-typed keys are rare to nonexistent in practice, and the v0.96-era four-way Add declaration that admitted them was contortion for a use case that didn't motivate the complexity.
 
 <a id="sec-owneddictionaryk-v-reference-implementation"></a>
 #### Reference implementation
 
-`OwnedDictionary<K, V>` composes over `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)) in pure Bezel. The implementation is more involved than `OwnedArray<T>`'s because mutation through a chain of borrowed pointers is incompatible with Bezel's borrow-lifetime tracker (see "Note on chain mutation" below); the implementation works in terms of *drain-and-rebuild* on each bucket.
+`OwningDictionary<K, V>` composes over `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)) in pure Bezel. The implementation is more involved than `OwningArray<T>`'s because mutation through a chain of borrowed pointers is incompatible with Bezel's borrow-lifetime tracker (see "Note on chain mutation" below); the implementation works in terms of *drain-and-rebuild* on each bucket.
 
-The structure: each bucket of an `OwnedBuffer<Entry<K, V>>` holds an owned `Entry<K, V>` (or null), where each entry has an `owned Next: Entry<K, V>?` field forming a chain of synonym-hash entries. The `Value` field is declared nullable (`owned Value: V?`) so the `move`-and-null restoration pattern can be used during take operations; in committed state every entry's `Value` is non-null.
+The structure: each bucket of an `OwningBuffer<Entry<K, V>>` holds an owned `Entry<K, V>` (or null), where each entry has an `owned Next: Entry<K, V>?` field forming a chain of synonym-hash entries. The `Value` field is declared nullable (`owned Value: V?`) so the `move`-and-null restoration pattern can be used during take operations; in committed state every entry's `Value` is non-null.
 
 ```bezel
 // Internal entry type.
@@ -1649,8 +1649,8 @@ private class Entry<K, V> where V: class
   end constructor;
 end Entry;
 
-public class OwnedDictionary<K, V>: IDisposable where V: class
-  private owned _buckets: OwnedBuffer<Entry<K, V>>;
+public class OwningDictionary<K, V>: IDisposable where V: class
+  private owned _buckets: OwningBuffer<Entry<K, V>>;
   private _count: int := 0;
   private _comparer: IEqualityComparer<K>;
 
@@ -1662,7 +1662,7 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
     // (Bezel's borrow tracker rejects walks-with-mutation; see note below).
     // Reverse the chain as we walk; if we don't find the key, the new entry
     // is prepended to the reversed chain — chain reversal is unobservable
-    // because OwnedDictionary doesn't promise insertion order.
+    // because OwningDictionary doesn't promise insertion order.
     var chain := move _buckets[idx];
     _buckets[idx] := null;
     var rebuilt: Entry<K, V>? := null;
@@ -1725,20 +1725,20 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
   // No destructor declared; the compiler generates the default Dispose,
   // which cascades through _buckets → each Entry → each Entry's owned
   // Next and Value, recursively disposing the whole map.
-end OwnedDictionary;
+end OwningDictionary;
 ```
 
 The structural insight: **every bucket mutation is expressed as taking the chain head with `move`, walking the owned chain as local state, and storing a rebuilt chain back into the bucket**. No method mutates a chain through a borrow into shared storage. Every `move buf[i]` and `move entry.X` is followed by an explicit restoration (`buf[i] := newValue`, `entry.X := null` or `entry.X := newOwner`). The compiler verifies the field-restoration rule statically.
 
 **Note on chain mutation.** A naïve implementation might walk the chain with a borrow `probe: Entry<K, V>?` and surgically modify links (`prev.Next := probe.Next`, etc.). Bezel's borrow-lifetime tracker rejects this pattern: `probe`'s borrow source is rooted in `_buckets[idx]`, and mutating any link along the chain — or mutating the slot itself — invalidates the borrow chain, after which subsequent reads of `probe.X` are borrow-after-mutation errors. The drain-and-rebuild pattern sidesteps the issue by walking the chain as owned local state. The cost is `O(chain length)` work per mutation rather than `O(1)`. In practice, chain lengths are bounded by the dictionary's load factor (typically ≤ 8), so the constant factor is small; for use cases where this cost is unacceptable, an open-addressing implementation can be substituted without changing the public API.
 
-**Note on iteration order.** The drain-and-rebuild pattern reverses chain order on every bucket mutation. Iteration over `OwnedDictionary<K, V>` therefore yields entries in an order that depends on insertion-and-mutation history rather than purely on insertion order. The standard library makes no insertion-order guarantee for `OwnedDictionary` (in contrast to `Dictionary<K, V>` at [§4.8](#sec-dictionaryk-v), which does); programs that need ordered iteration use a different collection.
+**Note on iteration order.** The drain-and-rebuild pattern reverses chain order on every bucket mutation. Iteration over `OwningDictionary<K, V>` therefore yields entries in an order that depends on insertion-and-mutation history rather than purely on insertion order. The standard library makes no insertion-order guarantee for `OwningDictionary` (in contrast to `Dictionary<K, V>` at [§4.8](#sec-dictionaryk-v), which does); programs that need ordered iteration use a different collection.
 
-**Why no compiler intrinsic for `OwnedDictionary`.** None of the operations above require compiler-intrinsic knowledge of `OwnedDictionary<K, V>`. Every `move` goes through the field-restoration rule that the compiler enforces on `move buf[i]` and on `move entry.X`. The intrinsic surface of the owning-collection family is once again confined to `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
+**Why no compiler intrinsic for `OwningDictionary`.** None of the operations above require compiler-intrinsic knowledge of `OwningDictionary<K, V>`. Every `move` goes through the field-restoration rule that the compiler enforces on `move buf[i]` and on `move entry.X`. The intrinsic surface of the owning-collection family is once again confined to `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
 
 <a id="sec-sett"></a>
 <a id="sec-sett-and-ownedsett"></a>
-### 4.10 `Set<T>` and `OwnedSet<T>`
+### 4.10 `Set<T>` and `OwningSet<T>`
 
 Borrowing and owning hash-based sets. `T` must be **equality-bearing** (spec §3.6/§8.3), enforced at the instantiation site per §3.6 rule 2 — same rule as `Dictionary<K, V>` keys (§4.8). (Added in v0.158.)
 
@@ -1758,12 +1758,12 @@ public class Set<T>: ICollection<T>
   public method IsSupersetOf(other: IEnumerable<T>): bool;
 end Set;
 
-public class OwnedSet<T>: IOwnedCollection<T> where T: class
+public class OwningSet<T>: IOwningCollection<T> where T: class
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<T>);
 
-  // IOwnedCollection<T> operations plus:
+  // IOwningCollection<T> operations plus:
   public method TryAdd(owned item: T): bool;          // returns whether added
                                                        //   (false if duplicate;
                                                        //   passed item is disposed)
@@ -1771,20 +1771,20 @@ public class OwnedSet<T>: IOwnedCollection<T> where T: class
   public method Take(query: T): owned T;               // borrow-taking query;
                                                        //   returns owned matched
   public method TryTake(query: T, out owned removed: T?): bool;
-  public method Drain(): OwnedEnumerable<T>;
+  public method Drain(): IOwningEnumerable<T>;
 
-  public method UnionWith(owned other: OwnedSet<T>);   // drains other into self;
+  public method UnionWith(owned other: OwningSet<T>);   // drains other into self;
                                                        //   duplicates disposed
   public method IntersectWith(other: IEnumerable<T>);  // disposes elements not in other
   public method ExceptWith(other: IEnumerable<T>);     // disposes elements in other
   public method IsSubsetOf(other: IEnumerable<T>): bool;
   public method IsSupersetOf(other: IEnumerable<T>): bool;
-end OwnedSet;
+end OwningSet;
 ```
 
-`OwnedSet<T>` inherits `Add(owned item: T)` from `IOwnedCollection<T>` — this form returns `()` and silently disposes the item on duplicate. For callers that want to know whether the add succeeded, `TryAdd(owned item: T): bool` returns the insertion result; on `false` (duplicate), the passed-in item is disposed. The separate name avoids the return-type conformance issue ([§11.2](Bezel_Language_Spec.md#sec-interface-declaration) of the language spec requires exact return-type match on overrides; the borrowing `Set<T>` similarly inherits `Add(item: T)` returning `()` and provides `TryAdd(item: T): bool` for the bool-returning case).
+`OwningSet<T>` inherits `Add(owned item: T)` from `IOwningCollection<T>` — this form returns `()` and silently disposes the item on duplicate. For callers that want to know whether the add succeeded, `TryAdd(owned item: T): bool` returns the insertion result; on `false` (duplicate), the passed-in item is disposed. The separate name avoids the return-type conformance issue ([§11.2](Bezel_Language_Spec.md#sec-interface-declaration) of the language spec requires exact return-type match on overrides; the borrowing `Set<T>` similarly inherits `Add(item: T)` returning `()` and provides `TryAdd(item: T): bool` for the bool-returning case).
 
-`OwnedSet<T>.Add` is the case where the duplicate-rejection rule has an ownership consequence. When the caller passes `owned item` and the set already contains an equal element, `Add` returns `()` and *disposes the passed-in item* — the caller relinquished ownership at the call site, and the set has no use for the duplicate. Callers who need to react to the duplicate path should call `TryAdd` instead, or pre-check with `Contains`:
+`OwningSet<T>.Add` is the case where the duplicate-rejection rule has an ownership consequence. When the caller passes `owned item` and the set already contains an equal element, `Add` returns `()` and *disposes the passed-in item* — the caller relinquished ownership at the call site, and the set has no use for the duplicate. Callers who need to react to the duplicate path should call `TryAdd` instead, or pre-check with `Contains`:
 
 ```bezel
 if not pool.Contains(candidate) then
@@ -1795,11 +1795,11 @@ end;
 
 `Take(query: T)` finds the equal element in the set, removes it, and returns ownership. The query and the stored element are equal by the set's `Equals` rule but may be distinct instances. `TryTake` is the no-throw variant.
 
-A `Set<T>` may be constructed with a sequence literal (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)); duplicates (per `T`'s equality contract) are silently collapsed, the first textual occurrence retained: `using var s: Set<int> := [1, 2, 2, 3];` yields `{1, 2, 3}`. For `OwnedSet<T>`, each later duplicate's owned element is disposed at construction. The empty set is `[]` with a `Set<T>`-typed (or `OwnedSet<T>`-typed) target.
+A `Set<T>` may be constructed with a sequence literal (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)); duplicates (per `T`'s equality contract) are silently collapsed, the first textual occurrence retained: `using var s: Set<int> := [1, 2, 2, 3];` yields `{1, 2, 3}`. For `OwningSet<T>`, each later duplicate's owned element is disposed at construction. The empty set is `[]` with a `Set<T>`-typed (or `OwningSet<T>`-typed) target.
 
 <a id="sec-stackt-and-queuet"></a>
 <a id="sec-stackt-ownedstackt-queuet-and-ownedqueuet"></a>
-### 4.11 `Stack<T>`, `OwnedStack<T>`, `Queue<T>`, and `OwnedQueue<T>`
+### 4.11 `Stack<T>`, `OwningStack<T>`, `Queue<T>`, and `OwningQueue<T>`
 
 LIFO and FIFO collections.
 
@@ -1813,7 +1813,7 @@ public class Stack<T>: IReadOnlyCollection<T>   // v0.165 (#1354): the v0.94 own
   public method TryPeek(out item: T): bool;
 end Stack;
 
-public class OwnedStack<T>: IOwnedCollection<T> where T: class
+public class OwningStack<T>: IOwningCollection<T> where T: class
   public constructor();
   public method Push(owned item: T);
   public method Pop(): owned T;                   // raises if empty; transfers out
@@ -1821,8 +1821,8 @@ public class OwnedStack<T>: IOwnedCollection<T> where T: class
   public method TryPop(out owned item: T): bool;
   public method TryPeek(out item: T): bool;       // out is borrow
   public method Clear();                           // disposes every element
-  public method Drain(): OwnedEnumerable<T>;
-end OwnedStack;
+  public method Drain(): IOwningEnumerable<T>;
+end OwningStack;
 
 public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public constructor();
@@ -1834,7 +1834,7 @@ public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public method TryPeek(out item: T): bool;
 end Queue;
 
-public class OwnedQueue<T>: IOwnedCollection<T> where T: class
+public class OwningQueue<T>: IOwningCollection<T> where T: class
   public constructor();
   public method Enqueue(owned item: T);
   public method Dequeue(): owned T;
@@ -1842,8 +1842,8 @@ public class OwnedQueue<T>: IOwnedCollection<T> where T: class
   public method TryDequeue(out owned item: T): bool;
   public method TryPeek(out item: T): bool;       // out is borrow
   public method Clear();                           // disposes every element
-  public method Drain(): OwnedEnumerable<T>;
-end OwnedQueue;
+  public method Drain(): IOwningEnumerable<T>;
+end OwningQueue;
 ```
 
 For class T on the borrowing forms, `Pop`, `Peek`, and `Dequeue` produce borrows whose source is the same as the source of whatever was pushed or enqueued; the stack and queue are transit points, not sources. Storing the popped value in a long-lived field of another object is a borrow-lifetime violation per language spec [§28.6](Bezel_Language_Spec.md#sec-leak-prevention).
@@ -1852,8 +1852,8 @@ On the owning forms, `Pop` and `Dequeue` return ownership; the collection no lon
 
 **Construction via collection literal.** All four types accept a sequence literal (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)). The ordering convention matters and differs between stack and queue:
 
-- `Queue<T>` / `OwnedQueue<T>`: the first literal element is at the front (dequeued first). `using var q: Queue<int> := [1, 2, 3];` dequeues `1`, `2`, `3` in that order.
-- `Stack<T>` / `OwnedStack<T>`: the literal lists elements bottom-to-top — the first element is pushed first (ends up at the bottom), the last element is on top (popped first). `using var s: Stack<int> := [1, 2, 3];` pops `3`, `2`, `1` in that order.
+- `Queue<T>` / `OwningQueue<T>`: the first literal element is at the front (dequeued first). `using var q: Queue<int> := [1, 2, 3];` dequeues `1`, `2`, `3` in that order.
+- `Stack<T>` / `OwningStack<T>`: the literal lists elements bottom-to-top — the first element is pushed first (ends up at the bottom), the last element is on top (popped first). `using var s: Stack<int> := [1, 2, 3];` pops `3`, `2`, `1` in that order.
 
 The bottom-to-top reading for stacks was chosen so that the literal's left-to-right order matches the push order; a reader can trace `[1, 2, 3]` as "push 1, push 2, push 3." For owning forms, element expressions must produce owned values. The empty collection is `[]` with the corresponding typed target.
 
@@ -1892,45 +1892,45 @@ end IAsyncEnumerator;
 ### 4.13 Owning enumeration interfaces
 
 ```bezel
-public interface OwnedEnumerable<T>: IDisposable where T: class
-  method GetOwnedEnumerator(): owned OwnedEnumerator<T>;
-end OwnedEnumerable;
+public interface IOwningEnumerable<T>: IDisposable where T: class
+  method GetOwningEnumerator(): owned IOwningEnumerator<T>;
+end IOwningEnumerable;
 
-public interface OwnedEnumerator<T>: IDisposable where T: class
+public interface IOwningEnumerator<T>: IDisposable where T: class
   method TakeCurrent(): owned T;        // transfers ownership (v0.161; was destructive property Current)
   method MoveNext(): bool;
-end OwnedEnumerator;
+end IOwningEnumerator;
 ```
 
-The owning iteration interfaces. `OwnedEnumerator<T>.TakeCurrent()` (v0.161 — replaces the destructive `Current` property) transfers ownership of the most-recently-yielded value to the caller after a successful `MoveNext`; a second take without an intervening advance, or a take before the first advance/after exhaustion, raises `InvalidOperationException` (spec §29.1). The for-loop desugaring at language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) calls `TakeCurrent()` exactly once per iteration.
+The owning iteration interfaces. `IOwningEnumerator<T>.TakeCurrent()` (v0.161 — replaces the destructive `Current` property) transfers ownership of the most-recently-yielded value to the caller after a successful `MoveNext`; a second take without an intervening advance, or a take before the first advance/after exhaustion, raises `InvalidOperationException` (spec §29.1). The for-loop desugaring at language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) calls `TakeCurrent()` exactly once per iteration.
 
-A `for var x in src do ... end` where `src` is an `OwnedEnumerable<T>` produces owned iteration variables. The loop body must discharge each `x` on every normal-exit edge (fall-through, `break`, `continue`, `return`); the standard owned-local discharge rules ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) apply. On exception edges the iteration variable is auto-disposed by the implicit `try`/`finally` rule of [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) "Exception-path discharge."
+A `for var x in src do ... end` where `src` is an `IOwningEnumerable<T>` produces owned iteration variables. The loop body must discharge each `x` on every normal-exit edge (fall-through, `break`, `continue`, `return`); the standard owned-local discharge rules ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) apply. On exception edges the iteration variable is auto-disposed by the implicit `try`/`finally` rule of [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) "Exception-path discharge."
 
 These interfaces are auto-imported alongside the borrowing iteration family.
 
 The async variants:
 
 ```bezel
-public interface OwnedAsyncEnumerable<T>: IAsyncDisposable where T: class
-  method GetOwnedAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned OwnedAsyncEnumerator<T>;
-end OwnedAsyncEnumerable;
+public interface IOwningAsyncEnumerable<T>: IAsyncDisposable where T: class
+  method GetOwningAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IOwningAsyncEnumerator<T>;
+end IOwningAsyncEnumerable;
 
-public interface OwnedAsyncEnumerator<T>: IAsyncDisposable where T: class
+public interface IOwningAsyncEnumerator<T>: IAsyncDisposable where T: class
   method TakeCurrent(): owned T;        // transfers ownership (v0.161)
   method MoveNextAsync(): Task<bool>;
-end OwnedAsyncEnumerator;
+end IOwningAsyncEnumerator;
 ```
 
-`OwnedAsyncEnumerable<T>` is the return type for async iterator methods that yield owned values (asynchronously-produced owned resources, async drain operations on owning collections). The `TakeCurrent()` rule applies to `OwnedAsyncEnumerator<T>` the same way (relative to `MoveNextAsync`); `await for var x in src do ... end` produces owned iteration variables; the spec §28.3 discharge rules (auto-drop with must-use warning) apply in the body.
+`IOwningAsyncEnumerable<T>` is the return type for async iterator methods that yield owned values (asynchronously-produced owned resources, async drain operations on owning collections). The `TakeCurrent()` rule applies to `IOwningAsyncEnumerator<T>` the same way (relative to `MoveNextAsync`); `await for var x in src do ... end` produces owned iteration variables; the spec §28.3 discharge rules (auto-drop with must-use warning) apply in the body.
 
-A type may implement both `IEnumerable<T>` and `OwnedEnumerable<T>`. `OwnedArray<T>` does so: default iteration via `IEnumerable<T>` yields borrows of T (the standard read-only-iteration semantics); drain iteration via `OwnedEnumerable<T>` yields owned T values that the consumer must discharge. The for-loop desugaring picks based on the static type of the source expression: `for var x in arr do` desugars via `IEnumerable<T>` (borrowing); `for var x in arr.Drain() do` desugars via `OwnedEnumerable<T>` (owning).
+A type may implement both `IEnumerable<T>` and `IOwningEnumerable<T>`. `OwningArray<T>` does so: default iteration via `IEnumerable<T>` yields borrows of T (the standard read-only-iteration semantics); drain iteration via `IOwningEnumerable<T>` yields owned T values that the consumer must discharge. The for-loop desugaring picks based on the static type of the source expression: `for var x in arr do` desugars via `IEnumerable<T>` (borrowing); `for var x in arr.Drain() do` desugars via `IOwningEnumerable<T>` (owning).
 
 
 <a id="sec-owned-buffers-and-spans"></a>
 <a id="sec-ownedbuffert-spant-readonlyspant"></a>
-### 4.14 `OwnedBuffer<T>`, `Span<T>`, `ReadOnlySpan<T>`
+### 4.14 `OwningBuffer<T>`, `Span<T>`, `ReadOnlySpan<T>`
 
-A runtime-sized storage primitive and two non-owning view types built over it. Together they are the foundation over which the resizable owning collections (`OwnedArray<T>`, `OwnedDictionary<K, V>`, etc.) compose, and they give user code a safe way to express "a fixed-but-runtime-sized buffer of slots" without any `unsafe` mechanism.
+A runtime-sized storage primitive and two non-owning view types built over it. Together they are the foundation over which the resizable owning collections (`OwningArray<T>`, `OwningDictionary<K, V>`, etc.) compose, and they give user code a safe way to express "a fixed-but-runtime-sized buffer of slots" without any `unsafe` mechanism.
 
 The slot semantics dispatch on T's category:
 
@@ -1942,12 +1942,12 @@ The class-typed semantics were the v0.99–v0.101 design; v0.102 generalizes by 
 **What is not admitted.** Runtime-managed reference types (`string`, function types) are not admitted as T — they have no disposal obligation, so the "owning" semantics add nothing, and they are stored more naturally in borrowing collections (`Array<string>`, `Array<(int) -> int>`). Move-only value types (currently only the owning inline arrays `[N owned]T` and `[N owned]T?`, [§15.3](Bezel_Language_Spec.md#sec-move-only-value-types) of the language spec) are also not admitted in v0.102 — the slot semantics for buffers of move-only types require additional design work and are deferred (see [§18](Bezel_Design_Rationale.md#sec-things-deferred) in the rationale).
 
 <a id="sec-ownedbuffert"></a>
-#### `OwnedBuffer<T>`
+#### `OwningBuffer<T>`
 
 The declaration's surface depends on T's category. For class-typed T:
 
 ```bezel
-public class OwnedBuffer<T>: IEnumerable<T?>            // class T only
+public class OwningBuffer<T>: IEnumerable<T?>            // class T only
   public constructor(length: int);                       // all slots null
   public constructor(length: int, init: (int) -> owned T);
 
@@ -1971,13 +1971,13 @@ public class OwnedBuffer<T>: IEnumerable<T?>            // class T only
   public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
-end OwnedBuffer;
+end OwningBuffer;
 ```
 
 For value-typed T:
 
 ```bezel
-public class OwnedBuffer<T>                              // no IEnumerable conformance
+public class OwningBuffer<T>                              // no IEnumerable conformance
                                                           //   (value-typed; see "Iteration" below)
   public constructor(length: int);                       // all slots default(T)
                                                           //   requires T to have a default value
@@ -2003,22 +2003,22 @@ public class OwnedBuffer<T>                              // no IEnumerable confo
   public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
-end OwnedBuffer;
+end OwningBuffer;
 ```
 
 The two presentations are different specializations of the same generic class. The compiler resolves T's category at instantiation and emits the appropriate slot semantics. Users see the form corresponding to the T they instantiate.
 
-**Class-typed T (unchanged from v0.99).** `OwnedBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T?` (a nullable reference). Once allocated, `Length` is immutable. Non-null slots are owned by the buffer; the buffer's destructor disposes every non-null slot in implementation-defined order. The single-argument constructor produces a buffer with all slots initialized to `null`. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, taking ownership of each returned value. The indexer's setter takes ownership of the assigned value and disposes whatever the slot previously held. `move buf[i]` is admitted and produces an owned `T?` value, leaving the slot in moved-from state; the field-restoration rule of [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) applies. The natural restoration for a nullable slot is `buf[i] := null`.
+**Class-typed T (unchanged from v0.99).** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T?` (a nullable reference). Once allocated, `Length` is immutable. Non-null slots are owned by the buffer; the buffer's destructor disposes every non-null slot in implementation-defined order. The single-argument constructor produces a buffer with all slots initialized to `null`. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, taking ownership of each returned value. The indexer's setter takes ownership of the assigned value and disposes whatever the slot previously held. `move buf[i]` is admitted and produces an owned `T?` value, leaving the slot in moved-from state; the field-restoration rule of [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) applies. The natural restoration for a nullable slot is `buf[i] := null`.
 
-**Value-typed T (new in v0.102).** `OwnedBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T` directly (no nullability wrapper). Once allocated, `Length` is immutable. The single-argument constructor requires T to have a default value (every primitive does; records with default-able fields do; enums with a zero-equivalent member do; user-defined types without defaults do not). It initializes every slot to `default(T)`. For types without a default, only the two-argument constructor with an explicit init function is admitted. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, copying the returned value into the slot. The indexer's setter overwrites the slot's previous value with the new one — no disposal is performed (values are not owned). `move buf[i]` is not admitted; values are read with the plain indexer and copied at the use site.
+**Value-typed T (new in v0.102).** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T` directly (no nullability wrapper). Once allocated, `Length` is immutable. The single-argument constructor requires T to have a default value (every primitive does; records with default-able fields do; enums with a zero-equivalent member do; user-defined types without defaults do not). It initializes every slot to `default(T)`. For types without a default, only the two-argument constructor with an explicit init function is admitted. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, copying the returned value into the slot. The indexer's setter overwrites the slot's previous value with the new one — no disposal is performed (values are not owned). `move buf[i]` is not admitted; values are read with the plain indexer and copied at the use site.
 
 The "Owned" in the name refers to the buffer-class's ownership of *its allocated storage*, not to slot-level ownership. For class-typed T, the buffer also owns its slot contents (the ownership semantics that motivated the name). For value-typed T, the buffer owns only its allocation; the slot contents are just data. In both cases the buffer is `IDisposable`: its destructor releases the allocation. The name is retained for continuity with the v0.99 design and for the class-typed case where slot-ownership remains the dominant concern.
 
 **Span views (v0.109).** `AsSpan()` and its overloads return a `Span<T>` (writable view) over a contiguous range of the buffer; `AsReadOnlySpan()` returns a `ReadOnlySpan<T>`. These views are non-allocating record constructions and admit the standard span surface (`Slice`, indexer, search, equality, bulk mutation per T's category). The methods are pure ergonomics — `buf.AsSpan(0, 100)` reads more naturally than `new Span<T>(buf, 0, 100)` and matches the established pattern from v0.104's `string.AsSpan()` and v0.107's `Array<T>.AsSpan()`. `AsSpan` returns the writable form by default (matching the buffer's mutability); callers wanting read-only access either call `AsReadOnlySpan` directly or call `.AsReadOnly()` on the writable form. The four overload signatures of each form accept range parameters: no-arg (full buffer, `0..<Length`), `(start)` (from offset to end), `(start, length)`, or `(r: Range<int>)`. Bounds-check semantics follow the standard Bezel convention: `IndexOutOfRangeException` if `start` or `length` is out of range against the buffer's `Length`.
 
-**Iteration.** For class-typed T, `OwnedBuffer<T>` implements `IEnumerable<T?>`; iteration yields borrows of `T?` (slot contents, possibly null). The `for var x in buf do ... end` form works both via the enumerator protocol and via the direct-indexed-loop optimization that [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) permits for concretely-typed sources. For value-typed T, `OwnedBuffer<T>` does *not* implement `IEnumerable<T>` (the type-parameter-category dispatch would require conditional interface implementation, which Bezel does not currently provide as a general mechanism). `for var x in buf do ... end` over a value-typed OwnedBuffer desugars to a direct indexed loop per the [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) extension; the iteration variable has type T and is a copy of the slot. Users who need IEnumerable<T> conformance on a value-typed buffer can wrap or convert.
+**Iteration.** For class-typed T, `OwningBuffer<T>` implements `IEnumerable<T?>`; iteration yields borrows of `T?` (slot contents, possibly null). The `for var x in buf do ... end` form works both via the enumerator protocol and via the direct-indexed-loop optimization that [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) permits for concretely-typed sources. For value-typed T, `OwningBuffer<T>` does *not* implement `IEnumerable<T>` (the type-parameter-category dispatch would require conditional interface implementation, which Bezel does not currently provide as a general mechanism). `for var x in buf do ... end` over a value-typed OwningBuffer desugars to a direct indexed loop per the [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) extension; the iteration variable has type T and is a copy of the slot. Users who need IEnumerable<T> conformance on a value-typed buffer can wrap or convert.
 
-**Why this is a compiler-known primitive.** The `OwnedBuffer<T>` class needs intrinsic-level support primarily for one operation: **allocation of N slots where N is a runtime constructor parameter**. There is no user-level Bezel syntax for "a class field holding a runtime-determined-size array of slots"; inline arrays `[N owned]T?` and `[N]T` require compile-time N. The remaining surface (the indexer's interaction with the `move` expression form for class T, the destructor's per-slot disposal pass for class T, the iteration support) reuses mechanisms that `OwnedArray<T>` and similar collections already exercise, just operating on the runtime-sized backing. The intrinsic boundary of the owning-collection family shrinks to this one class.
+**Why this is a compiler-known primitive.** The `OwningBuffer<T>` class needs intrinsic-level support primarily for one operation: **allocation of N slots where N is a runtime constructor parameter**. There is no user-level Bezel syntax for "a class field holding a runtime-determined-size array of slots"; inline arrays `[N owned]T?` and `[N]T` require compile-time N. The remaining surface (the indexer's interaction with the `move` expression form for class T, the destructor's per-slot disposal pass for class T, the iteration support) reuses mechanisms that `OwningArray<T>` and similar collections already exercise, just operating on the runtime-sized backing. The intrinsic boundary of the owning-collection family shrinks to this one class.
 
 **Disposal.** For class-typed T, the buffer's destructor disposes every non-null slot. Slot-disposal order within a single buffer is implementation-defined. For value-typed T, the destructor releases the backing storage but performs no per-slot work. Both cases satisfy the `IDisposable` contract; both are non-trivial-dispose ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types) of the language spec) in the sense that the user must discharge the buffer (typically via `using var` or by storing it as an `owned` field of a longer-lived class).
 
@@ -2027,12 +2027,12 @@ The "Owned" in the name refers to the buffer-class's ownership of *its allocated
 <a id="sec-spant"></a>
 #### `Span<T>`
 
-The declaration's surface, like `OwnedBuffer<T>`'s, depends on T's category.
+The declaration's surface, like `OwningBuffer<T>`'s, depends on T's category.
 
 For class-typed T:
 
 ```bezel
-public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
   // class T
 
   // Indexer (bounds-checked against span Length as of v0.105).
@@ -2090,7 +2090,7 @@ end Span;
 For value-typed T:
 
 ```bezel
-public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
   // value T (primitive, record, enum, non-move-only inline array)
 
   // Indexer (bounds-checked against span Length as of v0.105).
@@ -2137,11 +2137,11 @@ public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnl
 end Span;
 ```
 
-A `Span<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal) of the language spec) viewing into a contiguous range of an `OwnedBuffer<T>`. The `Buffer` field carries a borrow of an `OwnedBuffer<T>`; per the borrow-bearing-record rule, the span's lifetime is bounded by the borrow's source, so a span cannot outlive the buffer it views.
+A `Span<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal) of the language spec) viewing into a contiguous range of an `OwningBuffer<T>`. The `Buffer` field carries a borrow of an `OwningBuffer<T>`; per the borrow-bearing-record rule, the span's lifetime is bounded by the borrow's source, so a span cannot outlive the buffer it views.
 
 `Span<T>` is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features.
 
-**Read access.** For class T: `span[i]` returns a borrow of the slot's value (which is `T?` because the underlying buffer's slots are nullable). For value T: `span[i]` returns a borrow of the slot (`T`, non-nullable). The borrow's source is the underlying `OwnedBuffer<T>` (transitively reached through the span's `Buffer` field). For class T with potentially-null slots, programs that view into a buffer known to have non-null contents at every slot can use `span[i]!` for the null-forgiving access, raising `NullReferenceException` if the slot is null.
+**Read access.** For class T: `span[i]` returns a borrow of the slot's value (which is `T?` because the underlying buffer's slots are nullable). For value T: `span[i]` returns a borrow of the slot (`T`, non-nullable). The borrow's source is the underlying `OwningBuffer<T>` (transitively reached through the span's `Buffer` field). For class T with potentially-null slots, programs that view into a buffer known to have non-null contents at every slot can use `span[i]!` for the null-forgiving access, raising `NullReferenceException` if the slot is null.
 
 The indexer bounds-checks against the span's `Length` (not just the underlying buffer's length) as of v0.105. If `i < 0` or `i >= Length`, `IndexOutOfRangeException` is thrown. The check fires even when `Start + i` would be in the underlying buffer's range — the point of the span's range restriction is to enforce that callers cannot read outside the slice the span advertises. Earlier revisions (v0.99-v0.104) silently delegated to the buffer's indexer, which only checked against the buffer's length; this was a latent correctness bug, fixed in v0.105.
 
@@ -2187,7 +2187,7 @@ The declaration's surface mirrors `Span<T>`'s but exposes only the read-side ope
 For class-typed T:
 
 ```bezel
-public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
   // class T
 
   public property [i: int]: T?
@@ -2215,7 +2215,7 @@ end ReadOnlySpan;
 For value-typed T:
 
 ```bezel
-public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
   // value T
 
   public property [i: int]: T
@@ -2257,7 +2257,7 @@ A read-only counterpart to `Span<T>`. Mechanically, `ReadOnlySpan<T>` is the sam
 
 ```bezel
 public class FrameBuffer
-  private owned _pixels: OwnedBuffer<Pixel>;
+  private owned _pixels: OwningBuffer<Pixel>;
   private readonly _width: int;
 
   // Width and Height as needed; Pixel is assumed to be a class type.
@@ -2406,7 +2406,7 @@ The unsigned variants follow by casting through the matching unsigned type at th
 
 Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start, Length)` range. The natural companion to `Array<T>.AsSpan()` and `Array<T>.AsReadOnlySpan()` for passing a sub-range of an array to a method without copying.
 
-`ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwnedBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwnedBuffer<T>` owns its slots for class T, while `Array<T>` borrows them.
+`ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwningBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwningBuffer<T>` owns its slots for class T, while `Array<T>` borrows them.
 
 **Byte-buffer accessors (v0.165, #1358):** the §4.14 endianness-aware extension family is mirrored onto this family — all `Read*{Little,Big}Endian`/`TryRead*` forms on `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>`, and the `Write*`/`TryWrite*` forms on `ArraySpan<byte>`, with identical semantics (no offset parameters; slice first). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy.
 
@@ -2462,15 +2462,15 @@ An `ArraySpan<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec
 
 `ArraySpan<T>` is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features.
 
-**Read access.** `span[i]` returns the value at position `Start + i` in the source array. The return type follows the array's element type — `T` is whatever the array was instantiated with (a class type for `Array<MyClass>`, a nullable class type for `Array<MyClass?>`, a value type for `Array<int>`). Unlike `Span<T>` over `OwnedBuffer<T>`, there is no `T?` wrapping; the source array does not store nullable wrappers for class T (the array stores borrows directly, and a non-nullable `Array<MyClass>` has non-null borrow slots).
+**Read access.** `span[i]` returns the value at position `Start + i` in the source array. The return type follows the array's element type — `T` is whatever the array was instantiated with (a class type for `Array<MyClass>`, a nullable class type for `Array<MyClass?>`, a value type for `Array<int>`). Unlike `Span<T>` over `OwningBuffer<T>`, there is no `T?` wrapping; the source array does not store nullable wrappers for class T (the array stores borrows directly, and a non-nullable `Array<MyClass>` has non-null borrow slots).
 
-**Write access.** `span[i] := value` stores `value` into the source array's slot at `Start + i`. For class T (whether nullable or not), the assigned value is a borrow — no ownership transfer; the previous slot contents are not disposed (they were borrows, not owned values). For value T, the value is copied into the slot. The setter takes the value with the default parameter convention (no `owned` modifier); this differs from `Span<T>`'s class-T setter, which takes `owned T?` because the underlying `OwnedBuffer<T>` owns its slots.
+**Write access.** `span[i] := value` stores `value` into the source array's slot at `Start + i`. For class T (whether nullable or not), the assigned value is a borrow — no ownership transfer; the previous slot contents are not disposed (they were borrows, not owned values). For value T, the value is copied into the slot. The setter takes the value with the default parameter convention (no `owned` modifier); this differs from `Span<T>`'s class-T setter, which takes `owned T?` because the underlying `OwningBuffer<T>` owns its slots.
 
-`move arrSpan[i]` is **not admitted** for any T. Borrowed slots have no ownership to transfer; the plain indexer-get is the only read form. This differs from class-typed `Span<T>` (which admits `move` because `OwnedBuffer<T>` slots are owned).
+`move arrSpan[i]` is **not admitted** for any T. Borrowed slots have no ownership to transfer; the plain indexer-get is the only read form. This differs from class-typed `Span<T>` (which admits `move` because `OwningBuffer<T>` slots are owned).
 
 **Bounds-check semantics.** The indexer bounds-checks against the span's `Length` (not just the underlying array's `Count`); `IndexOutOfRangeException` is thrown if `i < 0` or `i >= Length`. The same rule applies to the setter. This matches the v0.105 bounds-check rule for `Span<T>`/`ReadOnlySpan<T>` and the v0.104/v0.106 rules for the string-backed spans.
 
-**Iteration.** `for var x in arrSpan do ... end` is admitted. The desugaring is a direct indexed loop over the span's range, parallel to the OwnedBuffer-backed span rule of language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for). The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying array, reached through the span's `Source` field).
+**Iteration.** `for var x in arrSpan do ... end` is admitted. The desugaring is a direct indexed loop over the span's range, parallel to the OwningBuffer-backed span rule of language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for). The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying array, reached through the span's `Source` field).
 
 **Search and equality.** `IndexOf` walks the span's range, returning the first index whose slot equals `value`, or `-1` if none. `Contains` returns `IndexOf(value) >= 0`. The comparison uses `Equals` per the standard convention. `SequenceEqual(other: ArraySpan<T>)` compares two writable array spans pairwise; the `ReadOnlyArraySpan<T>` overload supports comparison across the access-mode boundary without requiring an `AsReadOnly()` call at the comparison site.
 
@@ -2480,7 +2480,7 @@ An `ArraySpan<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec
 
 **Construction.** Callers construct `ArraySpan<T>` via the `AsSpan()` family on `Array<T>` ([§4.4](#sec-arrayt)) rather than via the constructor directly. The direct constructor is admitted but is rarely needed.
 
-**Caveat: array mutation during span lifetime.** Unlike `OwnedBuffer<T>` (which has a fixed `Length`), `Array<T>`'s `Count` can change during the array's lifetime via `Add`, `Insert`, `Remove`, `RemoveAt`, and `Clear`. A span's `Length` is fixed at construction; subsequent mutation of the underlying array does not update the span. If the array shrinks below `Start + Length` after the span was constructed, accesses through the span (which pass the span's bounds check but then index into the array beyond its new `Count`) will throw `IndexOutOfRangeException` from the array's own bounds check. If the array grows or its contents shift via `Insert` or `RemoveAt`, the span's `(Start, Length)` continues to point at the same logical positions in the array — which may now hold different elements than the span originally viewed. This is a real footgun and a structural difference from the `OwnedBuffer<T>`-backed spans (whose underlying buffer cannot resize). The intended usage pattern is short-lived spans: construct the span, pass it to a method that reads or writes through it, return — without resizing the source array in between. Programs that need a stable view across mutations should copy the relevant range into a fresh `OwnedBuffer<T>` or `Array<T>` instead.
+**Caveat: array mutation during span lifetime.** Unlike `OwningBuffer<T>` (which has a fixed `Length`), `Array<T>`'s `Count` can change during the array's lifetime via `Add`, `Insert`, `Remove`, `RemoveAt`, and `Clear`. A span's `Length` is fixed at construction; subsequent mutation of the underlying array does not update the span. If the array shrinks below `Start + Length` after the span was constructed, accesses through the span (which pass the span's bounds check but then index into the array beyond its new `Count`) will throw `IndexOutOfRangeException` from the array's own bounds check. If the array grows or its contents shift via `Insert` or `RemoveAt`, the span's `(Start, Length)` continues to point at the same logical positions in the array — which may now hold different elements than the span originally viewed. This is a real footgun and a structural difference from the `OwningBuffer<T>`-backed spans (whose underlying buffer cannot resize). The intended usage pattern is short-lived spans: construct the span, pass it to a method that reads or writes through it, return — without resizing the source array in between. Programs that need a stable view across mutations should copy the relevant range into a fresh `OwningBuffer<T>` or `Array<T>` instead.
 
 <a id="sec-readonlyarrayspant"></a>
 #### `ReadOnlyArraySpan<T>`
@@ -2544,7 +2544,7 @@ end IReadOnlySpan;
 
 | Concrete type | Implements |
 |---|---|
-| `Span<T>` for class T | `IReadOnlySpan<T?>` (OwnedBuffer slots are nullable) |
+| `Span<T>` for class T | `IReadOnlySpan<T?>` (OwningBuffer slots are nullable) |
 | `Span<T>` for value T | `IReadOnlySpan<T>` |
 | `ReadOnlySpan<T>` for class T | `IReadOnlySpan<T?>` |
 | `ReadOnlySpan<T>` for value T | `IReadOnlySpan<T>` |
@@ -2553,7 +2553,7 @@ end IReadOnlySpan;
 | `ReadOnlyStringSpan` | `IReadOnlySpan<char>` |
 | `ReadOnlyAsciiByteSpan` | `IReadOnlySpan<byte>` |
 
-A method that wants to accept any read-only span of `MyClass` typically takes `IReadOnlySpan<MyClass?>` (which matches both OwnedBuffer-backed nullable-slot spans and Array-backed `MyClass?` spans). Code holding a non-nullable Array span (`ArraySpan<MyClass>`) cannot pass it to that parameter directly — it implements `IReadOnlySpan<MyClass>`, not `IReadOnlySpan<MyClass?>` — because the interface's TElement parameter is invariant. Authors who want full breadth across nullability provide two overloads (one for `IReadOnlySpan<T>`, one for `IReadOnlySpan<T?>`); authors who want the nullable form should use it consistently and accept that callers may need an explicit conversion at the boundary.
+A method that wants to accept any read-only span of `MyClass` typically takes `IReadOnlySpan<MyClass?>` (which matches both OwningBuffer-backed nullable-slot spans and Array-backed `MyClass?` spans). Code holding a non-nullable Array span (`ArraySpan<MyClass>`) cannot pass it to that parameter directly — it implements `IReadOnlySpan<MyClass>`, not `IReadOnlySpan<MyClass?>` — because the interface's TElement parameter is invariant. Authors who want full breadth across nullability provide two overloads (one for `IReadOnlySpan<T>`, one for `IReadOnlySpan<T?>`); authors who want the nullable form should use it consistently and accept that callers may need an explicit conversion at the boundary.
 
 **Boxing and lifetime.** Spans are borrow-bearing records ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal) of the language spec). A span passed as an `IReadOnlySpan<TElement>` parameter is boxed per the standard rule for borrow-bearing records (language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)): the boxed copy holds the same borrows as the original, the boxed value's lifetime is bounded by the source of every borrow it carries, and the compiler enforces that the boxed value does not escape the source scope. The interface parameter therefore admits any span whose source outlives the call frame — which is the common case for synchronous calls — without further annotation.
 
@@ -2602,7 +2602,7 @@ end SortedDictionary;
 
 Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
 
-Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwnedSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (rationale changelog, v0.136).
+Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (rationale changelog, v0.136).
 
 <a id="sec-sorted-set"></a>
 ### 4.18 `SortedSet<T>` (added in v0.136)
@@ -2843,8 +2843,8 @@ public class Mutex
   public constructor();
   public method Acquire(): owned Lock;
   public method TryAcquire(timeout: TimeSpan): owned Lock?;
-  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Lock>;
-  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwnedTask<Lock?>;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<Lock>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<Lock?>;
 end Mutex;
 
 public class Lock
@@ -2872,7 +2872,7 @@ end;
 
 **Sendability (specified in v0.138).** `Mutex` is *sendable* (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) and internally synchronized — like `Channel<T>` ([§6.9](#sec-channel)), it may be reached by multiple domains simultaneously; that is its purpose. `Lock` is **not** sendable: a held guard is bound to the acquiring domain and is released there (moving a held lock between domains would decouple acquisition from release and break the `using var` discipline that makes the guard idiom sound).
 
-`AcquireAsync` and `TryAcquireAsync` are the async counterparts. `AcquireAsync` returns a `OwnedTask<Lock>` (Pattern B, single-consumer); `TryAcquireAsync` returns `OwnedTask<Lock?>` — the same nullable shape inside a Pattern B task. Consumers write:
+`AcquireAsync` and `TryAcquireAsync` are the async counterparts. `AcquireAsync` returns a `OwningTask<Lock>` (Pattern B, single-consumer); `TryAcquireAsync` returns `OwningTask<Lock?>` — the same nullable shape inside a Pattern B task. Consumers write:
 
 ```bezel
 using var guard := await mutex.AcquireAsync();
@@ -2896,8 +2896,8 @@ public class Semaphore
 
   public method Acquire(): owned SemaphoreToken;
   public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
-  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwnedTask<SemaphoreToken>;
-  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwnedTask<SemaphoreToken?>;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken?>;
 end Semaphore;
 
 public class SemaphoreToken
@@ -2905,7 +2905,7 @@ public class SemaphoreToken
 end SemaphoreToken;
 ```
 
-`AcquireAsync` returns `OwnedTask<SemaphoreToken>`; awaiters consume the task under Pattern B (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)) — the await must appear in an owned-consuming context. The natural call site:
+`AcquireAsync` returns `OwningTask<SemaphoreToken>`; awaiters consume the task under Pattern B (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)) — the await must appear in an owned-consuming context. The natural call site:
 
 ```bezel
 using var token := await sem.AcquireAsync();
@@ -3018,13 +3018,13 @@ For no-payload events (declared without a type, e.g. `public static event Applic
 `Subscription` (the return type of `Subscribe`) is declared in [§2.11](#sec-subscription) and lives in the auto-imported `System` module. v0.76 moved it from `System.Threading` so that all register-and-unregister APIs returning a `Subscription` work without requiring an explicit threading-module import.
 
 <a id="sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet"></a>
-### 6.6 `TaskCompletionSource<T>` and `OwnedTaskCompletionSource<T>`
+### 6.6 `TaskCompletionSource<T>` and `OwningTaskCompletionSource<T>`
 
 See [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) of the language spec.
 
 ```bezel
 // For non-class T (value types, string, runtime-managed reference types).
-// Instantiating with a class T is a compile error pointing to OwnedTaskCompletionSource<T>.
+// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>.
 public class TaskCompletionSource<T>
   public constructor();
   public readonly property Task: Task<T>;
@@ -3039,9 +3039,9 @@ public class TaskCompletionSource<T>
 end TaskCompletionSource;
 
 // For class T. Result is transferred via `owned` parameter; produced task is Pattern B.
-public class OwnedTaskCompletionSource<T> where T: class
+public class OwningTaskCompletionSource<T> where T: class
   public constructor();
-  public readonly property Task: OwnedTask<T>;
+  public readonly property Task: OwningTask<T>;
 
   public method SetResult(owned result: T);
   public method SetException(exception: Exception);
@@ -3050,7 +3050,7 @@ public class OwnedTaskCompletionSource<T> where T: class
   public method TrySetResult(owned result: T): bool;
   public method TrySetException(exception: Exception): bool;
   public method TrySetCancelled(): bool;
-end OwnedTaskCompletionSource;
+end OwningTaskCompletionSource;
 
 // Non-generic form for void-completion tasks
 public class TaskCompletionSource
@@ -3077,7 +3077,7 @@ public class Task
   public static method FromResult<T>(value: T): Task<T>;
 
   // For class T. Produces a Pattern B task; awaiters consume under `using var x := await ...`.
-  public static method FromOwnedResult<T>(owned value: T): OwnedTask<T> where T: class;
+  public static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
 
   // For any T: a faulted task never produces its result, so the Pattern A vs
   // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
@@ -3096,12 +3096,12 @@ public class Task
   // For non-class T (value types, string, runtime-managed reference types).
   public static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;
 
-  // For class T. Aggregates OwnedTask<T> results into an owned array of owned elements.
+  // For class T. Aggregates OwningTask<T> results into an owned array of owned elements.
   // The caller transfers ownership of the input array (and its tasks) to WhenAllOwned;
-  // the returned task produces an owned OwnedArray<T>.
+  // the returned task produces an owned OwningArray<T>.
   public static method WhenAllOwned<T>(
-    owned tasks: OwnedArray<OwnedTask<T>>
-  ): OwnedTask<OwnedArray<T>> where T: class;
+    owned tasks: OwningArray<OwningTask<T>>
+  ): OwningTask<OwningArray<T>> where T: class;
 
   public static method WhenAny(tasks: Array<Task>): Task<int>;   // index of the first task to complete (v0.162)
   public static method FireAndForget(owned task: Task);
@@ -3110,7 +3110,7 @@ end Task;
 
 `FireAndForget` registers a continuation that logs any exception the task produces via `Debug.WriteLine`, then disposes the task. The calling code relinquishes ownership (the parameter is `owned`); the runtime supervises the task's lifecycle.
 
-The parameter type `Task` accepts any subtype: `Task`, `Task<T>`, and `OwnedTask<T>` all satisfy the parameter. For `OwnedTask<T>` (Pattern B), the runtime's task disposal cascades through any unconsumed owned result — `FireAndForget(someOwnedTask)` is semantically "let it run to completion; if it produces a result, dispose it; if it produces an exception, log it." This is the right pattern when the caller wants the underlying operation to complete its side effects (e.g., an async write whose `OwnedTask<WriteHandle>` would normally yield a handle, but the caller doesn't need the handle).
+The parameter type `Task` accepts any subtype: `Task`, `Task<T>`, and `OwningTask<T>` all satisfy the parameter. For `OwningTask<T>` (Pattern B), the runtime's task disposal cascades through any unconsumed owned result — `FireAndForget(someOwningTask)` is semantically "let it run to completion; if it produces a result, dispose it; if it produces an exception, log it." This is the right pattern when the caller wants the underlying operation to complete its side effects (e.g., an async write whose `OwningTask<WriteHandle>` would normally yield a handle, but the caller doesn't need the handle).
 
 **`FireAndForget` is the only supported way to discard a `Task`** as of v0.66. The discard form `_ := someAsyncCall();` is rejected at compile time because `Task` has a destructor that handles continuation cleanup; the discard would skip it. The two legal patterns are:
 
@@ -3126,28 +3126,28 @@ The exception-logging mechanism for `FireAndForget` is implementation-defined; i
 <a id="sec-fromexception-and-fromcancelled-for-class-t"></a>
 #### `FromException` and `FromCancelled` for class T
 
-These factories are correctly typed as `Task<T>` regardless of whether T is a class type. A faulted or cancelled task never produces a result value — `await` on such a task re-raises the original exception (`FromException`) or `OperationCanceledException` (`FromCancelled`). Because no value flows from producer to awaiter, the Pattern A vs Pattern B distinction that motivates `OwnedTask<T>` does not apply. `Task.FromException<FileStream>(ex)` produces `Task<FileStream>`, not `OwnedTask<FileStream>`; the awaiter never observes a `FileStream` instance and so has no ownership to discharge.
+These factories are correctly typed as `Task<T>` regardless of whether T is a class type. A faulted or cancelled task never produces a result value — `await` on such a task re-raises the original exception (`FromException`) or `OperationCanceledException` (`FromCancelled`). Because no value flows from producer to awaiter, the Pattern A vs Pattern B distinction that motivates `OwningTask<T>` does not apply. `Task.FromException<FileStream>(ex)` produces `Task<FileStream>`, not `OwningTask<FileStream>`; the awaiter never observes a `FileStream` instance and so has no ownership to discharge.
 
-Code that needs an immediately-faulted task in a context expecting `OwnedTask<T>` should construct one through `OwnedTaskCompletionSource<T>` ([§6.6](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)):
+Code that needs an immediately-faulted task in a context expecting `OwningTask<T>` should construct one through `OwningTaskCompletionSource<T>` ([§6.6](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)):
 
 ```bezel
-using var src := new OwnedTaskCompletionSource<MyClass>();
+using var src := new OwningTaskCompletionSource<MyClass>();
 src.SetException(ex);
-return src.Task;       // typed as OwnedTask<MyClass>
+return src.Task;       // typed as OwningTask<MyClass>
 ```
 
-The TCS path is heavier than `FromException` and is only needed when the static return type of the calling method is `OwnedTask<T>`.
+The TCS path is heavier than `FromException` and is only needed when the static return type of the calling method is `OwningTask<T>`.
 
 <a id="sec-whenall-for-class-t-whenallowned"></a>
 #### `WhenAll` for class T: `WhenAllOwned`
 
-The generic `WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>` aggregates results from non-class T (value types, `string`, runtime-managed reference types). For class T held by `OwnedTask<T>`, use `WhenAllOwned<T>`:
+The generic `WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>` aggregates results from non-class T (value types, `string`, runtime-managed reference types). For class T held by `OwningTask<T>`, use `WhenAllOwned<T>`:
 
 ```bezel
-public async method LoadAllConfigs(paths: Array<string>): OwnedTask<OwnedArray<Config>>
-  var tasks := new OwnedArray<OwnedTask<Config>>();
+public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray<Config>>
+  var tasks := new OwningArray<OwningTask<Config>>();
   for var path in paths do
-    tasks.Add(LoadConfigAsync(path));    // each task is OwnedTask<Config>; transfers in
+    tasks.Add(LoadConfigAsync(path));    // each task is OwningTask<Config>; transfers in
   end;
   return await Task.WhenAllOwned(tasks); // tasks consumed; returned array owns the configs
 end LoadAllConfigs;
@@ -3155,19 +3155,19 @@ end LoadAllConfigs;
 
 The caller's pattern matches `WhenAll`: build an array of tasks, await `WhenAllOwned`, receive an array of results. The differences are in the type and ownership flow:
 
-- The input array is `OwnedArray<OwnedTask<Config>>`, not `Array<OwnedTask<Config>>`. Each element is itself owned (OwnedTask<T> for class T is single-consumer per language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal); the array owns its tasks for the duration).
-- The input parameter is `owned OwnedArray<...>`: the caller transfers ownership of the array (and its contents) to `WhenAllOwned`. After the call, the caller no longer holds the array.
-- The result is `OwnedTask<OwnedArray<Config>>`: a Pattern B task whose result is an owned array of owned configs. The caller awaits with `using var`, gaining scope-bound disposal of the whole structure.
+- The input array is `OwningArray<OwningTask<Config>>`, not `Array<OwningTask<Config>>`. Each element is itself owned (OwningTask<T> for class T is single-consumer per language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal); the array owns its tasks for the duration).
+- The input parameter is `owned OwningArray<...>`: the caller transfers ownership of the array (and its contents) to `WhenAllOwned`. After the call, the caller no longer holds the array.
+- The result is `OwningTask<OwningArray<Config>>`: a Pattern B task whose result is an owned array of owned configs. The caller awaits with `using var`, gaining scope-bound disposal of the whole structure.
 
 Implementation sketch (illustrative, not part of the public contract):
 
 ```bezel
 public static async method WhenAllOwned<T>(
-  owned tasks: OwnedArray<OwnedTask<T>>
-): OwnedTask<OwnedArray<T>> where T: class
+  owned tasks: OwningArray<OwningTask<T>>
+): OwningTask<OwningArray<T>> where T: class
   using var taskArray := tasks;                       // owned param to using var; disposes at end
-  var results := new OwnedArray<T>(capacity := taskArray.Count);
-  for var task in taskArray.Drain() do                // drain yields owned OwnedTask<T>
+  var results := new OwningArray<T>(capacity := taskArray.Count);
+  for var task in taskArray.Drain() do                // drain yields owned OwningTask<T>
     results.Add(await task);                          // await produces owned T (Pattern B);
                                                       //   Add(owned item) is an owned-consuming
                                                       //   context, satisfying §30.5
@@ -3176,14 +3176,14 @@ public static async method WhenAllOwned<T>(
 end WhenAllOwned;
 ```
 
-The implementation uses `OwnedArray<T>.Drain()` to take ownership of each task out of the input array, awaits each (Pattern B), and transfers the awaited result into the result array via `Add(owned item)`. The pattern works because every collection slot in the chain is an owned-element slot, and because `Add(owned item)` is an owned-consuming context that admits `await` directly per the loosened Pattern B rule (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The for-loop's iteration variable `task` is owned (per the new rule for iterators returning `OwnedEnumerable<T>`, language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) — "Iterator yield ownership"), and is consumed by the await on each iteration.
+The implementation uses `OwningArray<T>.Drain()` to take ownership of each task out of the input array, awaits each (Pattern B), and transfers the awaited result into the result array via `Add(owned item)`. The pattern works because every collection slot in the chain is an owned-element slot, and because `Add(owned item)` is an owned-consuming context that admits `await` directly per the loosened Pattern B rule (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The for-loop's iteration variable `task` is owned (per the new rule for iterators returning `IOwningEnumerable<T>`, language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) — "Iterator yield ownership"), and is consumed by the await on each iteration.
 
 For genuine concurrency (the underlying tasks running in parallel), the caller should start the tasks *before* passing the array to `WhenAllOwned`. Each task's underlying operation begins when the task is constructed; awaiting blocks for completion. The `WhenAllOwned` body awaits sequentially, but the tasks themselves run in parallel because they were started earlier.
 
-For producer-consumer pipelines that yield owned values incrementally, an async iterator remains the clean idiom. When the iterator's return type is `OwnedAsyncEnumerable<T>`, the consumer takes ownership of each yielded value, with the standard owned-discharge rules applying to the iteration variable inside the `await for` body (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) — "Iterator yield ownership"):
+For producer-consumer pipelines that yield owned values incrementally, an async iterator remains the clean idiom. When the iterator's return type is `IOwningAsyncEnumerable<T>`, the consumer takes ownership of each yielded value, with the standard owned-discharge rules applying to the iteration variable inside the `await for` body (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) — "Iterator yield ownership"):
 
 ```bezel
-public async method OpenFiles(paths: Array<string>): OwnedAsyncEnumerable<FileStream>
+public async method OpenFiles(paths: Array<string>): IOwningAsyncEnumerable<FileStream>
   for var path in paths do
     yield return await OpenFileAsync(path);
   end;
@@ -3217,11 +3217,11 @@ public static class Domain
       where A: notnull;                                    // A sendable value type or string
 
   // Class-typed result: ownership transfers to the awaiter (Pattern B).
-  public static method Spawn<R>(entry: () -> owned R): owned OwnedTask<R>
+  public static method Spawn<R>(entry: () -> owned R): owned OwningTask<R>
       where R: class;                                      // R sendable (compiler-checked)
-  public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwnedTask<R>
+  public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
       where A: class, R: class;
-  public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwnedTask<R>
+  public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwningTask<R>
       where A: notnull, R: class;
 
   // Value-typed or string result (Pattern A).
@@ -3234,7 +3234,7 @@ public static class Domain
 end Domain;
 ```
 
-The `where` clauses above are the declared constraints; sendability is the stronger compiler-checked requirement and is diagnosed at the call site naming the failing rule (it is not expressible as a `where` constraint — it is a derived type property). For more than one argument, pass a sendable class aggregating them, an `OwnedArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
+The `where` clauses above are the declared constraints; sendability is the stronger compiler-checked requirement and is diagnosed at the call site naming the failing rule (it is not expressible as a `where` constraint — it is a derived type property). For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
 
 The join handle completes when the entry's task completes. A fault in the entry surfaces at the join as `DomainFaultedException`:
 
@@ -3254,7 +3254,7 @@ There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-
 
 Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex` ([§6.2](#sec-mutex-and-lock), v0.138) they are the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)).
 
-The signature surface dispatches on T's category, as with `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
+The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 
 ```bezel
 public class Channel<T>: IDisposable                       // the receiving end; class T form
@@ -3265,7 +3265,7 @@ public class Channel<T>: IDisposable                       // the receiving end;
 
   public method NewSender(): owned ChannelSender<T>;       // mint a sender endpoint
 
-  public method Receive(): OwnedTask<T>;                   // await transfers ownership of one item
+  public method Receive(): OwningTask<T>;                   // await transfers ownership of one item
   public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
 end Channel;
 
@@ -3326,7 +3326,7 @@ public abstract class Stream
 
   // Convenience methods
   public method ReadAll(): owned Array<byte>;            // reads from current position to end
-  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Array<byte>>;
+  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwningTask<Array<byte>>;
 end Stream;
 
 

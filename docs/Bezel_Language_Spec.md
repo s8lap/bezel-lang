@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.167 — July 2026**
+**Version 0.168 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -141,11 +141,11 @@ import System.Collections.Generic;
 
 The following names are visible in every source file without import.
 
-**Language primitives.** `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`, `string`. The unit type `()`. `Object`, `Array<T>`, `OwnedArray<T>`. Inline arrays `[N]T` (with size N as part of the type). `Type`. `IDisposable`, `IAsyncDisposable`. `IEnumerable<out T>`, `IEnumerator<out T>`, `IAsyncEnumerable<out T>`, `IAsyncEnumerator<out T>`. `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`. `IReadOnlyCollection<out T>`, `IReadOnlyList<out T>`, `ICollection<T>`, `IList<T>`, `IOwnedCollection<T>`, `IOwnedList<T>`. `Task`, `Task<T>`, `OwnedTask<T>`. `Subscription`. `CancellationToken`. `IEvent<out T>`, `IAsyncEvent<out T>`. The exception types listed in [§31.4](#sec-standard-exception-types).
+**Language primitives.** `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`, `string`. The unit type `()`. `Object`, `Array<T>`, `OwningArray<T>`. Inline arrays `[N]T` (with size N as part of the type). `Type`. `IDisposable`, `IAsyncDisposable`. `IEnumerable<out T>`, `IEnumerator<out T>`, `IAsyncEnumerable<out T>`, `IAsyncEnumerator<out T>`. `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`. `IReadOnlyCollection<out T>`, `IReadOnlyList<out T>`, `ICollection<T>`, `IList<T>`, `IOwningCollection<T>`, `IOwningList<T>`. `Task`, `Task<T>`, `OwningTask<T>`. `Subscription`. `CancellationToken`. `IEvent<out T>`, `IAsyncEvent<out T>`. The exception types listed in [§31.4](#sec-standard-exception-types).
 
 `Subscription` is declared in `System` (standard library [§2.11](Bezel_Standard_Library.md#sec-subscription)) and is auto-imported. It is the return type of event `.Subscribe()` methods and `CancellationToken.Register()` — operations that pervade idiomatic Bezel code. `CancellationToken` is also auto-imported (despite living in `System.Threading`) because it appears in the `await for ... with` desugaring ([§30.7](#sec-asynchronous-programming-async-iterators)), in default parameter values on standard async methods, and in `IAsyncEnumerable<T>.GetAsyncEnumerator` — making it a de-facto language-level type. `IEvent<T>` and `IAsyncEvent<T>` are auto-imported because they are the public types of every event member viewed from outside the declaring class ([§24.3](#sec-the-type-of-an-event-member)); requiring an explicit `import System.Threading` to subscribe to any event would defeat the design. Importing `System.Threading` is not required to use `Subscription`, `CancellationToken`, `IEvent<T>`, or `IAsyncEvent<T>`; it is required for `CancellationTokenSource`, `Mutex`, `EventSource<T>`, `AsyncEventSource<T>`, and the other threading types.
 
-The iteration-interface family — `IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, `ICollection<T>`, `IList<T>`, plus the owning variants `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`, `IOwnedCollection<T>`, `IOwnedList<T>` — is auto-imported because these interfaces participate in core language constructs: `IEnumerable<T>` and the async variant in the `for` and `await for` desugarings ([§29.2](#sec-desugaring-of-for)); the read-only and mutating interfaces in standard-library types' inheritance clauses (`Array<T>: IList<T>`, `OwnedArray<T>: IOwnedList<T>`, etc.) and in pattern-frequent variable type ascriptions. The stdlib documents their full declarations in [§4](Bezel_Standard_Library.md#sec-system-collections-generic); the language treats them as primitives for visibility purposes, in the same way it treats `Array<T>` and `Object` (also documented in stdlib but always visible).
+The iteration-interface family — `IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, `ICollection<T>`, `IList<T>`, plus the owning variants `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`, `IOwningCollection<T>`, `IOwningList<T>` — is auto-imported because these interfaces participate in core language constructs: `IEnumerable<T>` and the async variant in the `for` and `await for` desugarings ([§29.2](#sec-desugaring-of-for)); the read-only and mutating interfaces in standard-library types' inheritance clauses (`Array<T>: IList<T>`, `OwningArray<T>: IOwningList<T>`, etc.) and in pattern-frequent variable type ascriptions. The stdlib documents their full declarations in [§4](Bezel_Standard_Library.md#sec-system-collections-generic); the language treats them as primitives for visibility purposes, in the same way it treats `Array<T>` and `Object` (also documented in stdlib but always visible).
 
 **Auto-imported standard library.** `System` (for `Console`, `Math`, `Convert`, `Environment`, `DateTime`, `TimeSpan`, `Guid`, `Random`, `IComparable<T>`, `IEquatable<T>`, `IDisposable`, `IAsyncDisposable`, `ISerializer`, `IDeserializer`, `ISerializable`, `IDeserializable`) and `System.Text` (for `StringBuilder`).
 
@@ -204,13 +204,13 @@ Bezel types fall into these kinds:
 - **Enums** — user-defined value types backed by an integer constant. ([§10](#sec-enums))
 - **Classes** — user-defined reference types with inheritance and disposal. ([§11](#sec-classes-and-interfaces)–[§12](#sec-inheritance-and-dispatch))
 - **Interfaces** — user-defined contracts. An interface variable is a reference; its underlying value may be a class instance, a boxed record, a boxed enum, or a boxed primitive ([§3.2](#sec-reference-vs-value-types), [§8.6](#sec-boxing)). ([§11](#sec-classes-and-interfaces))
-- **Arrays** — `[N]T` (inline, value-typed, fixed compile-time size) and `Array<T>` / `OwnedArray<T>` (heap-allocated, class types, may be used resizably or fixed). ([§15](#sec-arrays))
+- **Arrays** — `[N]T` (inline, value-typed, fixed compile-time size) and `Array<T>` / `OwningArray<T>` (heap-allocated, class types, may be used resizably or fixed). ([§15](#sec-arrays))
 - **Function types** — `(T1, ..., Tn) -> R`, reference types. ([§27](#sec-lambdas-and-function-types))
 - **The unit type `()`** — exactly one value, also written `()`.
 
 Additionally, *type aliases* ([§27.8](#sec-type-aliases)) may be declared at module level. An alias is not a separate kind of type; it is a naming convenience for an existing one. Identity, equality, and method dispatch all see through the alias.
 
-Every type derives from `Object`. Primitives, records, enums, inline arrays, the unit type, and value-typed instances generally derive via boxing ([§8.6](#sec-boxing)); classes, interfaces, `string`, heap arrays (`Array<T>`, `OwnedArray<T>`), and function types are reference types whose values are already heap-allocated and reach `Object` directly through the inheritance chain.
+Every type derives from `Object`. Primitives, records, enums, inline arrays, the unit type, and value-typed instances generally derive via boxing ([§8.6](#sec-boxing)); classes, interfaces, `string`, heap arrays (`Array<T>`, `OwningArray<T>`), and function types are reference types whose values are already heap-allocated and reach `Object` directly through the inheritance chain.
 
 <a id="sec-reference-vs-value-types"></a>
 ### 3.2 Reference vs. value types
@@ -219,7 +219,7 @@ Every type is exactly one of two storage classes. The classification is total an
 
 A **value type** is copied on assignment; each variable holds an independent value. Records, enums, primitives, inline arrays (`[N]T`, including `[N]T?` and `[N owned]T?`/`[N owned]T`), and the unit type are value types. (Owning inline arrays are a special sub-category — *move-only value types* — that transfer rather than copy on assignment; see [§15.3](#sec-move-only-value-types).)
 
-A **reference type** is shared on assignment; multiple variables may refer to the same heap-allocated object. Classes (including heap-array classes `Array<T>` and `OwnedArray<T>`), interfaces, `string`, and function types are reference types.
+A **reference type** is shared on assignment; multiple variables may refer to the same heap-allocated object. Classes (including heap-array classes `Array<T>` and `OwningArray<T>`), interfaces, `string`, and function types are reference types.
 
 An interface-typed variable holds a reference: to a class instance directly, to a record value boxed at assignment ([§8.6](#sec-boxing)), to an enum value boxed at assignment, or to a primitive value boxed at assignment. Interfaces play two roles simultaneously — as **contracts** (specifying the operations a conforming type must provide) and as **reference types** (variables of interface type are heap references with the standard reference semantics). The roles compose rather than conflict: the contract aspect determines which types satisfy a given interface; the reference-type aspect determines what an interface-typed variable holds and how it is shared.
 
@@ -690,7 +690,7 @@ For fields of value type (primitives, records, enums, inline arrays, the unit ty
 
 For fields of nullable reference type (declared with `?`), the must-initialize rule is satisfied vacuously by `null`: nullable reference fields are implicitly initialized to `null`.
 
-For fields of non-nullable reference type — class types (including `Array<T>`, `OwnedArray<T>`), interfaces, `string`, function types, declared without `?` — there is no default value, so the must-initialize rule is enforced strictly: the field requires either a field initializer or assignment in every constructor (for instance fields) or in the static constructor (for static fields). The compiler emits a definite-assignment error if neither path supplies a value.
+For fields of non-nullable reference type — class types (including `Array<T>`, `OwningArray<T>`), interfaces, `string`, function types, declared without `?` — there is no default value, so the must-initialize rule is enforced strictly: the field requires either a field initializer or assignment in every constructor (for instance fields) or in the static constructor (for static fields). The compiler emits a definite-assignment error if neither path supplies a value.
 
 The same three-way split applies in the standard `var`-declaration case: a value-typed local can be declared without an initializer (gets the default); a nullable local can be declared without an initializer (gets `null`); a non-nullable reference-typed local must be assigned before it is read.
 
@@ -701,7 +701,7 @@ Inside an unconstrained generic body, `T` is treated conservatively as possibly 
 
 `where T: notnull` restricts T to non-nullable types. Inside the body, `T` is non-nullable.
 
-`where T: class` restricts T to non-nullable reference types — classes (including `Array<T>`, `OwnedArray<T>`), interfaces, `string`, function types.
+`where T: class` restricts T to non-nullable reference types — classes (including `Array<T>`, `OwningArray<T>`), interfaces, `string`, function types.
 
 `where T: value` restricts T to non-nullable value types — records, enums, primitives, inline arrays (all forms, including `[N owned]…` owning forms), and the unit type. A nullable value type (e.g. `int?`) does not satisfy the constraint ([§14.2](#sec-constraints)); inside the body, T is the non-nullable value type and `T?` is its nullable companion. Inside the body, operations that copy T (assignment, parameter passing by value, returning by value) are checked at instantiation: for move-only inline arrays ([§15.3](#sec-move-only-value-types)), copy operations are replaced by moves, and any operation the generic body uses that requires copy semantics (e.g., reading T twice without an intervening assignment) is rejected at instantiation with a message naming the move-only type.
 
@@ -750,7 +750,7 @@ end Object;
 
 `Object` is a compiler intrinsic; method bodies are provided by the runtime. The declaration above defines the public surface. User code cannot redeclare or replace `Object`.
 
-`Object` is the universal root. Every type derives from it: classes (including heap-array classes `Array<T>` and `OwnedArray<T>`) directly through the inheritance chain, with `string`, interfaces, and function types reaching `Object` similarly via their reference-type heap representation; records, enums, primitives, inline arrays, and the unit type derive via boxing ([§8.6](#sec-boxing)) when used in `Object`-typed positions (subject to the inline-array boxing rules in [§8.6](#sec-boxing-of-inline-arrays)).
+`Object` is the universal root. Every type derives from it: classes (including heap-array classes `Array<T>` and `OwningArray<T>`) directly through the inheritance chain, with `string`, interfaces, and function types reaching `Object` similarly via their reference-type heap representation; records, enums, primitives, inline arrays, and the unit type derive via boxing ([§8.6](#sec-boxing)) when used in `Object`-typed positions (subject to the inline-array boxing rules in [§8.6](#sec-boxing-of-inline-arrays)).
 
 <a id="sec-gettype"></a>
 ### 8.2 `GetType`
@@ -829,7 +829,7 @@ Boxing a borrow-bearing record ([§9.7](#sec-records-and-disposal)) is subject t
 
 Non-owning inline arrays (`[N]T` and `[N]T?`) are ordinary value types and box per the general rule. When the element type is a reference type, the boxed array carries borrows; the same borrow-lifetime constraints apply as for boxed borrow-bearing records (above).
 
-Move-only inline arrays (`[N owned]T` and `[N owned]T?`) cannot be boxed. Boxing a value type copies the value into a heap wrapper, but move-only types forbid copying ([§15.3](#sec-move-only-value-types)). A program that needs the contents of an owning inline array to cross a boxed-value boundary must explicitly transfer ownership — typically by draining the inline array into a heap collection (`OwnedArray<T>`), which is itself a class type and is passed by reference rather than boxed.
+Move-only inline arrays (`[N owned]T` and `[N owned]T?`) cannot be boxed. Boxing a value type copies the value into a heap wrapper, but move-only types forbid copying ([§15.3](#sec-move-only-value-types)). A program that needs the contents of an owning inline array to cross a boxed-value boundary must explicitly transfer ownership — typically by draining the inline array into a heap collection (`OwningArray<T>`), which is itself a class type and is passed by reference rather than boxed.
 
 <a id="sec-dispose-is-not-on-object"></a>
 ### 8.7 `Dispose` is not on `Object`
@@ -1038,7 +1038,7 @@ A type is **serialization-eligible** — a derived type property ([§3.6](#sec-d
 - **Enums** are always serialization-eligible. The synthesized form writes the member *name* as a string (via `WriteString`) and reads it back by matching against the declared members; a value that is not a declared constant (a "raw" enum value, [§10](#sec-enums)) raises `SerializationException` on write and on read. Writing the name rather than the underlying integer makes the encoded form stable against reordering or renumbering of members and self-describing in text formats; programs that need the integer form serialize `int(e)` (or the underlying-typed cast) explicitly through a hand-written `Serialize`.
 - **Positional records** ([§9.1](#sec-positional-records)) are serialization-eligible when every positional field's type is serialization-eligible. The synthesized form is an object whose field names are the positional-field names in declaration order.
 - **Body records** ([§9.2](#sec-body-records)) are serialization-eligible under exactly the auto-equality membership conditions of [§9.2](#sec-body-records) — the §9.2 member list and admissible-component rule are the single normative statement, applied here unchanged — *and* additionally every auto-property's type is serialization-eligible. The serialized components are the auto-properties in declaration order; computed (expression-bodied) properties are not serialized, exactly as they do not participate in equality or `ToString`.
-- A component type is **serialization-eligible** when it is: a primitive (`bool`, the integer types, `float`, `double`, `decimal`, `char`); `string`; an enum; another serialization-eligible record; a serialization-eligible **synthesized class** (a class that declares `ISerializable`/`IDeserializable` and whose serialized components are each serialization-eligible, below); a `Shared<T>` or `Weak<T>` whose `T` is a serialization-eligible class; a nullable `T?` whose `T` is serialization-eligible (encoded as the value or `WriteNull`/`TryReadNull`); or a standard sequence collection (`Array<T>`, `OwnedArray<T>`, `LinkedList<T>`, etc., and inline arrays `[N]T`) whose element type is serialization-eligible (encoded with `BeginArray`/`EndArray`). A standard dictionary (`Dictionary<K, V>`, `OwnedDictionary<K, V>`) is serialization-eligible when both `K` and `V` are serialization-eligible (encoded as an array of key/value pairs to admit non-string keys uniformly).
+- A component type is **serialization-eligible** when it is: a primitive (`bool`, the integer types, `float`, `double`, `decimal`, `char`); `string`; an enum; another serialization-eligible record; a serialization-eligible **synthesized class** (a class that declares `ISerializable`/`IDeserializable` and whose serialized components are each serialization-eligible, below); a `Shared<T>` or `Weak<T>` whose `T` is a serialization-eligible class; a nullable `T?` whose `T` is serialization-eligible (encoded as the value or `WriteNull`/`TryReadNull`); or a standard sequence collection (`Array<T>`, `OwningArray<T>`, `LinkedList<T>`, etc., and inline arrays `[N]T`) whose element type is serialization-eligible (encoded with `BeginArray`/`EndArray`). A standard dictionary (`Dictionary<K, V>`, `OwningDictionary<K, V>`) is serialization-eligible when both `K` and `V` are serialization-eligible (encoded as an array of key/value pairs to admit non-string keys uniformly).
 
 A type that declares `: ISerializable` or `: IDeserializable` but is **not** serialization-eligible is a **compile error at the conformance declaration**, naming the first offending member and the reason (mirroring the auto-equality non-membership error of [§9.2](#sec-body-records), but reported at the declaration rather than the use site, because the conformance declaration is the explicit opt-in and the obstruction should be reported where the promise is made). The error names the remedy: remove the conformance, make the offending component serializable, or hand-write `Serialize`/`Deserialize` (which suppresses synthesis — see below).
 
@@ -1361,12 +1361,12 @@ The "must match exactly" rule above applies to every position where `owned` may 
 
 - **`owned` as a parameter modifier** (e.g. `M(owned t: T)`). Interface declaring `M(owned t: T)` requires implementation to declare `M(owned t: T)`. Either both have `owned` or neither does.
 - **`owned` on an `out` parameter** (e.g. `M(out owned t: T)`). Interface declaring `M(out owned t: T)` requires implementation to declare `M(out owned t: T)`; interface declaring `M(out t: T)` requires implementation to declare `M(out t: T)`.
-- **Use of an owning generic type** (e.g. `M(): OwnedTask<T>`). Interface declaring `M(): OwnedTask<T>` requires implementation to declare `M(): OwnedTask<T>`; interface declaring `M(): Task<T>` requires implementation to declare `M(): Task<T>`. (Per [§14.4](#sec-owned-as-a-generic-argument), `OwnedTask<T>` and `Task<T>` are distinct named types with no implicit conversion; the same applies to `OwnedArray<T>` vs `Array<T>` and the other owning/borrowing collection pairs.)
+- **Use of an owning generic type** (e.g. `M(): OwningTask<T>`). Interface declaring `M(): OwningTask<T>` requires implementation to declare `M(): OwningTask<T>`; interface declaring `M(): Task<T>` requires implementation to declare `M(): Task<T>`. (Per [§14.4](#sec-owned-as-a-generic-argument), `OwningTask<T>` and `Task<T>` are distinct named types with no implicit conversion; the same applies to `OwningArray<T>` vs `Array<T>` and the other owning/borrowing collection pairs.)
 - **`owned` inside function-type parameters or return types** (e.g. `M(callback: (owned T) -> ())`). Same rule — exact match.
 
 A mismatch in any position is a compile error at the implementing class. Two reasons for the strict rule:
 
-1. **Loosening from `owned T` to `T` in a return type would leak ownership.** If the interface declares `Acquire(): OwnedTask<Connection>` and the implementation declares `Acquire(): Task<Connection>`, callers calling through the interface receive `OwnedTask<Connection>` per the static type and write `using var c := await source.Acquire();`. But the implementation produced a Pattern A task whose result is borrowed — the `using var` would dispose a borrow whose source is the task, which is also being disposed, leaving the disposal pattern incoherent.
+1. **Loosening from `owned T` to `T` in a return type would leak ownership.** If the interface declares `Acquire(): OwningTask<Connection>` and the implementation declares `Acquire(): Task<Connection>`, callers calling through the interface receive `OwningTask<Connection>` per the static type and write `using var c := await source.Acquire();`. But the implementation produced a Pattern A task whose result is borrowed — the `using var` would dispose a borrow whose source is the task, which is also being disposed, leaving the disposal pattern incoherent.
 
 2. **Tightening from `T` to `owned T` in a parameter would create undischarged ownership.** If the interface declares `Send(payload: T)` and the implementation declares `Send(owned payload: T)`, callers calling through the interface pass a borrow per the interface contract, but the implementation expects ownership transfer. The implementation would attempt to take ownership of a value the caller intended to retain, leaving the value's original owner with a dangling reference.
 
@@ -1808,7 +1808,7 @@ The `where` clause restricts the substitutions a type parameter accepts:
 |---|---|
 | *(none)* | Any type, nullable or not. T is treated conservatively as possibly nullable. |
 | `where T: notnull` | Non-nullable types only (value or reference). A nullable type, value or reference, is excluded. |
-| `where T: class` | Non-nullable reference types only — classes (including `Array<T>`, `OwnedArray<T>`, and other heap collection types), interfaces, `string`, function types. |
+| `where T: class` | Non-nullable reference types only — classes (including `Array<T>`, `OwningArray<T>`, and other heap collection types), interfaces, `string`, function types. |
 | `where T: value` | Non-nullable value types — records, enums, primitives, inline arrays (all forms), the unit type. A nullable value type (e.g. `int?`) does **not** satisfy `value`. Generic body must use only move-compatible operations on T if T may be a move-only inline array ([§15.3](#sec-move-only-value-types)). |
 | `where T: SomeClass` | Non-nullable subtypes of `SomeClass` (the class itself and its descendants). Class types only; interfaces do not extend classes in Bezel. |
 | `where T: IFoo` | Non-nullable types conforming to `IFoo`: classes implementing it, records implementing it, and interfaces extending it. See "Interface conformance" below. |
@@ -1876,10 +1876,10 @@ See [§12.9](#sec-variance).
 
 Specifically: the following are **not valid types** as of v0.97:
 
-- `Array<owned T>`, `LinkedList<owned T>`, `Set<owned T>`, `Stack<owned T>`, `Queue<owned T>`, `Dictionary<owned K, V>`, `Dictionary<K, owned V>`, `Dictionary<owned K, owned V>` — replaced by named owning collection types (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)): `OwnedArray<T>`, `OwnedLinkedList<T>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedDictionary<K, V>` (with `V: class`).
-- `Task<owned T>` — replaced by `OwnedTask<T>` (stdlib [§6](Bezel_Standard_Library.md#sec-system-threading)).
-- `IEnumerable<owned T>`, `IEnumerator<owned T>`, `IAsyncEnumerable<owned T>`, `IAsyncEnumerator<owned T>` — replaced by `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`.
-- `IList<owned T>`, `ICollection<owned T>` — replaced by `IOwnedList<T>`, `IOwnedCollection<T>`.
+- `Array<owned T>`, `LinkedList<owned T>`, `Set<owned T>`, `Stack<owned T>`, `Queue<owned T>`, `Dictionary<owned K, V>`, `Dictionary<K, owned V>`, `Dictionary<owned K, owned V>` — replaced by named owning collection types (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)): `OwningArray<T>`, `OwningLinkedList<T>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningDictionary<K, V>` (with `V: class`).
+- `Task<owned T>` — replaced by `OwningTask<T>` (stdlib [§6](Bezel_Standard_Library.md#sec-system-threading)).
+- `IEnumerable<owned T>`, `IEnumerator<owned T>`, `IAsyncEnumerable<owned T>`, `IAsyncEnumerator<owned T>` — replaced by `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`.
+- `IList<owned T>`, `ICollection<owned T>` — replaced by `IOwningList<T>`, `IOwningCollection<T>`.
 
 In every case, the v0.97 type is a separate named class or interface declared in the standard library. The pattern is uniform: where v0.96 (and earlier revisions back to v0.78) used `<owned T>` to express "the owned-element form of this generic," v0.97 uses an explicit `Owned…` type with its own declaration, members, and inheritance.
 
@@ -1894,19 +1894,19 @@ The admissible positions for `owned` are enumerated in [§28.1](#sec-where-the-o
 
 Generic methods and types can constrain their parameters to class types via `where T: class` ([§14.2](#sec-constraints)). A class type C satisfies `where T: class`. A generic method with a `where T: class` constraint may be called with T = C; the call site supplies a value of type C (whether the value is owned or a borrow at that site is determined by the declaration position of the parameter the call argument flows into, not by T's identity).
 
-Generic types that store class-typed values do not, by themselves, become "owning" by having a class type argument. `Array<MyClass>` stores borrows of `MyClass` — references whose ownership remains with whoever passed them in. To get an owning collection, the user reaches for `OwnedArray<MyClass>` — a different class with different semantics.
+Generic types that store class-typed values do not, by themselves, become "owning" by having a class type argument. `Array<MyClass>` stores borrows of `MyClass` — references whose ownership remains with whoever passed them in. To get an owning collection, the user reaches for `OwningArray<MyClass>` — a different class with different semantics.
 
-**Class-only restriction on owning generics.** Most standard-library owning types (`OwnedArray<T>`, `OwnedLinkedList<T>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedDictionary<K, V>`, `OwnedTask<T>`, `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`, `IOwnedCollection<T>`, `IOwnedList<T>`) restrict their element type T to **class and interface types** (v0.165; the next paragraph's interface admission was always intended — the former "proper class types" phrase contradicted it). Value types are rejected at the instantiation site. The `where T: class` constraint in their declarations is a slight imprecision — per [§14.2](#sec-constraints) `where T: class` admits all non-nullable reference types (classes, interfaces, `string`, function types) — but the standard-library owning types are compiler-enforced to reject the runtime-managed reference types (`string`, function values). The reason: those types are runtime-managed ([§28.9](#sec-runtime-managed-types)) and have no disposal obligation; owning them is degenerate. The error message at instantiation names the rejected type and points the reader to the relevant stdlib section.
+**Class-only restriction on owning generics.** Most standard-library owning types (`OwningArray<T>`, `OwningLinkedList<T>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningDictionary<K, V>`, `OwningTask<T>`, `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`, `IOwningCollection<T>`, `IOwningList<T>`) restrict their element type T to **class and interface types** (v0.165; the next paragraph's interface admission was always intended — the former "proper class types" phrase contradicted it). Value types are rejected at the instantiation site. The `where T: class` constraint in their declarations is a slight imprecision — per [§14.2](#sec-constraints) `where T: class` admits all non-nullable reference types (classes, interfaces, `string`, function types) — but the standard-library owning types are compiler-enforced to reject the runtime-managed reference types (`string`, function values). The reason: those types are runtime-managed ([§28.9](#sec-runtime-managed-types)) and have no disposal obligation; owning them is degenerate. The error message at instantiation names the rejected type and points the reader to the relevant stdlib section.
 
-`OwnedBuffer<T>`, `Span<T>`, and `ReadOnlySpan<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) are exceptions to this restriction as of v0.102. They admit T to be either class-typed (with ownership semantics as above) or value-typed (with plain value semantics — no per-slot ownership, no Dispose cascade, no `move` admission). They still reject the runtime-managed reference types (`string`, function values) and move-only value types (the owning inline arrays `[N owned]T` and `[N owned]T?`, [§15.3](#sec-move-only-value-types)).
+`OwningBuffer<T>`, `Span<T>`, and `ReadOnlySpan<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) are exceptions to this restriction as of v0.102. They admit T to be either class-typed (with ownership semantics as above) or value-typed (with plain value semantics — no per-slot ownership, no Dispose cascade, no `move` admission). They still reject the runtime-managed reference types (`string`, function values) and move-only value types (the owning inline arrays `[N owned]T` and `[N owned]T?`, [§15.3](#sec-move-only-value-types)).
 
-**Nullable class types and interfaces are admitted.** The owning-type instantiation rule checks the *underlying* type, not the nullable-wrapper. `OwnedTask<Lock?>` (a Pattern B task whose result is `owned Lock | null`) is admitted because `Lock` is a class type; the nullability of the result is independent of the disposal obligation. The same applies to interface types: `OwnedArray<IConnection>` is admitted because `IConnection` may be implemented by class types with real disposal obligations; iteration produces borrows of `IConnection`, and `Add(owned)` takes ownership of an `IConnection` reference whose runtime dispatch resolves to a real class's `Dispose()` at disposal time.
+**Nullable class types and interfaces are admitted.** The owning-type instantiation rule checks the *underlying* type, not the nullable-wrapper. `OwningTask<Lock?>` (a Pattern B task whose result is `owned Lock | null`) is admitted because `Lock` is a class type; the nullability of the result is independent of the disposal obligation. The same applies to interface types: `OwningArray<IConnection>` is admitted because `IConnection` may be implemented by class types with real disposal obligations; iteration produces borrows of `IConnection`, and `Add(owned)` takes ownership of an `IConnection` reference whose runtime dispatch resolves to a real class's `Dispose()` at disposal time.
 
-A user-defined generic type that needs to own its elements composes over `OwnedArray<T>` (or another `Owned…` collection type):
+A user-defined generic type that needs to own its elements composes over `OwningArray<T>` (or another `Owned…` collection type):
 
 ```bezel
-public class OwnedCache<T> where T: class
-  private owned _items: OwnedArray<T>;
+public class OwningCache<T> where T: class
+  private owned _items: OwningArray<T>;
 
   public constructor() _items := new(); end;
 
@@ -1914,10 +1914,10 @@ public class OwnedCache<T> where T: class
     _items.Add(item);
   end Add;
 
-  public method Drain(): OwnedEnumerable<T>
+  public method Drain(): IOwningEnumerable<T>
     return _items.Drain();
   end Drain;
-end OwnedCache;
+end OwningCache;
 ```
 
 This composition pattern works under the existing field-ownership and generic-type rules; no special mechanism is required. User-defined generic types with class-typed parameters that don't store anything owned (read-only views, transformations) just declare their members in the normal way.
@@ -1933,7 +1933,7 @@ Rationale [§52](Bezel_Design_Rationale.md#sec-v0-77-to-v0-78-changelog) through
 Bezel provides two array kinds:
 
 - **Inline arrays** `[N]T` — value-typed, fixed size set at compile time, stored inline in their enclosing context (stack frame, class storage, or record layout). No heap allocation, no `Dispose`.
-- **Heap arrays** `Array<T>` and `OwnedArray<T>` — class types from the standard library, allocated with `new`, require disposal. May be used at fixed size (by not calling resize methods) or resizably (the natural use).
+- **Heap arrays** `Array<T>` and `OwningArray<T>` — class types from the standard library, allocated with `new`, require disposal. May be used at fixed size (by not calling resize methods) or resizably (the natural use).
 
 The two kinds serve different purposes. Inline arrays are a value-type storage primitive: they live in the place that holds them, copy by value (when copyable), and have no allocation cost. Heap arrays are the general-purpose container family: they grow and shrink, support iteration protocols, and carry the ownership obligations associated with their allocated storage.
 
@@ -2001,7 +2001,7 @@ An owning inline array is a *move-only* value type ([§15.3](#sec-move-only-valu
 
 When an owning inline array's lifetime ends, the array's auto-dispose pass disposes each non-null slot. For locals, this happens at scope end via the standard owned-local discharge ([§28.3](#sec-local-variables-ownership-and-borrows)); for class fields, the enclosing class's destructor invokes the disposal.
 
-The `move arr[i]` form is admitted on both `[N owned]T?` and `[N owned]T` slots ([§28.11](#sec-collections-do-not-own-elements)). For nullable slots, the field-restoration rule is satisfied by assigning `null` to the slot. For non-nullable slots, restoration requires assigning a fresh owned T (e.g., a constructor call, another moved value, or a borrow promoted to ownership via a factory) — the same rule as for non-nullable `OwnedArray<T>` slots ([§4.5](Bezel_Standard_Library.md#sec-ownedarrayt) of the standard library). Code that needs "leave the slot empty after take" requires the nullable form; non-nullable slots must always hold a value at every observable point.
+The `move arr[i]` form is admitted on both `[N owned]T?` and `[N owned]T` slots ([§28.11](#sec-collections-do-not-own-elements)). For nullable slots, the field-restoration rule is satisfied by assigning `null` to the slot. For non-nullable slots, restoration requires assigning a fresh owned T (e.g., a constructor call, another moved value, or a borrow promoted to ownership via a factory) — the same rule as for non-nullable `OwningArray<T>` slots ([§4.5](Bezel_Standard_Library.md#sec-ownedarrayt) of the standard library). Code that needs "leave the slot empty after take" requires the nullable form; non-nullable slots must always hold a value at every observable point.
 
 <a id="sec-inline-array-members"></a>
 <a id="sec-members-and-operations"></a>
@@ -2032,7 +2032,7 @@ Inline arrays of class-typed, interface-typed, record-typed, or runtime-managed-
 <a id="sec-heap-arrays"></a>
 ### 15.2 Heap arrays
 
-`Array<T>` and `OwnedArray<T>` are the heap-allocated array types, documented in standard library [§4.4](Bezel_Standard_Library.md#sec-arrayt) and [§4.5](Bezel_Standard_Library.md#sec-ownedarrayt) respectively. They are class types allocated with `new` and requiring disposal via `using var`, owned field, or explicit `.Dispose()`.
+`Array<T>` and `OwningArray<T>` are the heap-allocated array types, documented in standard library [§4.4](Bezel_Standard_Library.md#sec-arrayt) and [§4.5](Bezel_Standard_Library.md#sec-ownedarrayt) respectively. They are class types allocated with `new` and requiring disposal via `using var`, owned field, or explicit `.Dispose()`.
 
 Both support resizing operations. Users who want fixed-size discipline simply do not call resizing methods; the array's `Count` matches its construction-time capacity throughout its lifetime. The language does not provide a separate "fixed-size heap array" type; the discipline of not resizing is sufficient.
 
@@ -2046,7 +2046,7 @@ using var snapshot: Array<int> := [1, 2, 3];
 // snapshot.Count == 3 throughout its lifetime; no Add calls
 
 // Owning heap array
-using var pool: OwnedArray<Connection> := [
+using var pool: OwningArray<Connection> := [
   Connect("a"), Connect("b"), Connect("c")
 ];
 ```
@@ -2094,7 +2094,7 @@ A collection literal has no standalone type. It is well-typed only in a context 
 ```bezel
 var a: [3]int := [1, 2, 3];                       // inline array
 using var b: Array<int> := [1, 2, 3];             // heap array
-using var c: OwnedArray<Connection> := [          // owning heap array
+using var c: OwningArray<Connection> := [          // owning heap array
   Connect("a"), Connect("b"), Connect("c")
 ];
 
@@ -2112,29 +2112,29 @@ var x := [1, 2, 3];        // ERROR: cannot infer target type
 The target types that admit collection literals are:
 
 - Inline arrays `[N]T`, `[N]T?`, `[N owned]T`, `[N owned]T?` (the literal must have exactly N elements; for owning targets, each element expression must produce an owned value).
-- `Array<T>` (heap-borrowing) and `OwnedArray<T>` (heap-owning).
-- `Set<T>` and `OwnedSet<T>` (sets).
-- `LinkedList<T>` and `OwnedLinkedList<T>` (doubly-linked lists).
-- `Stack<T>` and `OwnedStack<T>` (LIFO stacks).
-- `Queue<T>` and `OwnedQueue<T>` (FIFO queues).
-- `Dictionary<K, V>` and `OwnedDictionary<K, V>` (dictionaries; key-value pair syntax `[k: v, ...]`).
+- `Array<T>` (heap-borrowing) and `OwningArray<T>` (heap-owning).
+- `Set<T>` and `OwningSet<T>` (sets).
+- `LinkedList<T>` and `OwningLinkedList<T>` (doubly-linked lists).
+- `Stack<T>` and `OwningStack<T>` (LIFO stacks).
+- `Queue<T>` and `OwningQueue<T>` (FIFO queues).
+- `Dictionary<K, V>` and `OwningDictionary<K, V>` (dictionaries; key-value pair syntax `[k: v, ...]`).
 - Any user-defined type declaring the `FromCollectionLiteral` static factory ([§15.4.1](#sec-the-user-defined-sequence-literal-protocol)); sequence-literal form only.
 
-The **sequence literal** form `[e1, e2, ...]` (bare expressions) targets every sequence-shaped type above — inline arrays, `Array<T>`/`OwnedArray<T>`, `Set<T>`/`OwnedSet<T>`, `LinkedList<T>`/`OwnedLinkedList<T>`, `Stack<T>`/`OwnedStack<T>`, `Queue<T>`/`OwnedQueue<T>`, and user-defined types per [§15.4.1](#sec-the-user-defined-sequence-literal-protocol). The **dictionary literal** form `[k1: v1, k2: v2, ...]` (colon-separated pairs) targets only the built-in `Dictionary<K, V>` and `OwnedDictionary<K, V>`. The two forms are syntactically distinguished by whether the elements contain a top-level colon; a literal cannot mix bare expressions and colon pairs (doing so is a compile error).
+The **sequence literal** form `[e1, e2, ...]` (bare expressions) targets every sequence-shaped type above — inline arrays, `Array<T>`/`OwningArray<T>`, `Set<T>`/`OwningSet<T>`, `LinkedList<T>`/`OwningLinkedList<T>`, `Stack<T>`/`OwningStack<T>`, `Queue<T>`/`OwningQueue<T>`, and user-defined types per [§15.4.1](#sec-the-user-defined-sequence-literal-protocol). The **dictionary literal** form `[k1: v1, k2: v2, ...]` (colon-separated pairs) targets only the built-in `Dictionary<K, V>` and `OwningDictionary<K, V>`. The two forms are syntactically distinguished by whether the elements contain a top-level colon; a literal cannot mix bare expressions and colon pairs (doing so is a compile error).
 
 **Element-order semantics by target.** The literal's textual element order maps to the target's natural construction order:
 
-- Inline arrays, `Array<T>`, `OwnedArray<T>`, `LinkedList<T>`, `OwnedLinkedList<T>`: elements are stored in textual order; index 0 (or the list head) is the first literal element.
-- `Queue<T>`, `OwnedQueue<T>`: the first literal element is at the front of the queue (the next to be dequeued); the last literal element is at the back. `[1, 2, 3]` dequeues `1`, then `2`, then `3`.
-- `Stack<T>`, `OwnedStack<T>`: the first literal element is pushed first and ends up at the bottom; the last literal element is on top (the next to be popped). `[1, 2, 3]` pops `3`, then `2`, then `1`. This matches the reading "the literal lists elements bottom-to-top."
-- `Set<T>`, `OwnedSet<T>`: order is not semantically meaningful; duplicates are collapsed (see below). Iteration order of the resulting set follows the set type's documented iteration order (stdlib [§4.10](Bezel_Standard_Library.md#sec-sett-and-ownedsett)), not the literal order.
-- `Dictionary<K, V>`, `OwnedDictionary<K, V>`: insertion order follows textual order; this matters because dictionary iteration is insertion-ordered (stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v)).
+- Inline arrays, `Array<T>`, `OwningArray<T>`, `LinkedList<T>`, `OwningLinkedList<T>`: elements are stored in textual order; index 0 (or the list head) is the first literal element.
+- `Queue<T>`, `OwningQueue<T>`: the first literal element is at the front of the queue (the next to be dequeued); the last literal element is at the back. `[1, 2, 3]` dequeues `1`, then `2`, then `3`.
+- `Stack<T>`, `OwningStack<T>`: the first literal element is pushed first and ends up at the bottom; the last literal element is on top (the next to be popped). `[1, 2, 3]` pops `3`, then `2`, then `1`. This matches the reading "the literal lists elements bottom-to-top."
+- `Set<T>`, `OwningSet<T>`: order is not semantically meaningful; duplicates are collapsed (see below). Iteration order of the resulting set follows the set type's documented iteration order (stdlib [§4.10](Bezel_Standard_Library.md#sec-sett-and-ownedsett)), not the literal order.
+- `Dictionary<K, V>`, `OwningDictionary<K, V>`: insertion order follows textual order; this matters because dictionary iteration is insertion-ordered (stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v)).
 
-For owning targets, the literal's element expressions must produce owned values; ownership transfers from each expression into the constructed collection. This applies uniformly to `OwnedArray<T>`, `OwnedLinkedList<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedSet<T>`, and `OwnedDictionary<K, V>` (value position).
+For owning targets, the literal's element expressions must produce owned values; ownership transfers from each expression into the constructed collection. This applies uniformly to `OwningArray<T>`, `OwningLinkedList<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningSet<T>`, and `OwningDictionary<K, V>` (value position).
 
-For `Set<T>`, the literal elements must have type `T`. Duplicate elements (per `T`'s equality contract) are silently collapsed; the first occurrence in textual order is retained. For `OwnedSet<T>`, duplicates are silently collapsed and each later duplicate's owned element is disposed at construction (the set retains only the first instance per equality class).
+For `Set<T>`, the literal elements must have type `T`. Duplicate elements (per `T`'s equality contract) are silently collapsed; the first occurrence in textual order is retained. For `OwningSet<T>`, duplicates are silently collapsed and each later duplicate's owned element is disposed at construction (the set retains only the first instance per equality class).
 
-For `Dictionary<K, V>` and `OwnedDictionary<K, V>`, each element in the literal uses `key: value` syntax: the sub-expression left of the colon is the key (type `K`), the sub-expression right of the colon is the value (type `V`). Duplicate keys are a compile error when all duplicate keys are compile-time constants; when duplicates are not statically detectable, the last value in textual order wins, and for `OwnedDictionary` the displaced earlier value is disposed at construction. The key-value pair syntax is recognized only when the target type is `Dictionary<K, V>` or `OwnedDictionary<K, V>`; in any other target context a colon inside a literal element is a compile error.
+For `Dictionary<K, V>` and `OwningDictionary<K, V>`, each element in the literal uses `key: value` syntax: the sub-expression left of the colon is the key (type `K`), the sub-expression right of the colon is the value (type `V`). Duplicate keys are a compile error when all duplicate keys are compile-time constants; when duplicates are not statically detectable, the last value in textual order wins, and for `OwningDictionary` the displaced earlier value is disposed at construction. The key-value pair syntax is recognized only when the target type is `Dictionary<K, V>` or `OwningDictionary<K, V>`; in any other target context a colon inside a literal element is a compile error.
 
 **Examples.**
 
@@ -2172,8 +2172,8 @@ using var labels: Dictionary<Point, string> := [
 ];
 
 // Owning collections — element expressions must produce owned values
-using var conns: OwnedArray<Connection> := [Connect("a"), Connect("b")];
-using var pool:  OwnedDictionary<string, Connection> := [
+using var conns: OwningArray<Connection> := [Connect("a"), Connect("b")];
+using var pool:  OwningDictionary<string, Connection> := [
   "primary": Connect("p"),
   "backup":  Connect("b")
 ];
@@ -2183,7 +2183,7 @@ using var pool:  OwnedDictionary<string, Connection> := [
 
 **Why `[k: v, ...]` rather than an alternative.** The colon-pair syntax was chosen over the arrow form `[k => v]` (which would overload the `=>` token already used for case arms and expression-bodied accessors), over a brace form `{k: v}` (which would introduce a fourth bracket kind competing for visual distinctness, where `[]` already carries collection-literal meaning), and over a tuple-list form `[(k, v), ...]` (which requires tuple types Bezel does not provide; the named-record workaround `[Pair(k, v), ...]` is verbose and reads as a list of pairs rather than a mapping). The colon-pair form is compact, familiar from JSON/Python/Swift/Ruby, visually distinct from the bare sequence literal, and reuses no token in a conflicting role. See rationale [§5.16](Bezel_Design_Rationale.md#sec-collection-literals-for-complex-collections).
 
-User-defined collection types opt into sequence-literal construction via the protocol of [§15.4.1](#sec-the-user-defined-sequence-literal-protocol). The dictionary-literal form `[k: v, ...]` remains restricted to the built-in `Dictionary<K, V>` and `OwnedDictionary<K, V>`; a user-extensible dictionary-literal protocol is deferred (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)).
+User-defined collection types opt into sequence-literal construction via the protocol of [§15.4.1](#sec-the-user-defined-sequence-literal-protocol). The dictionary-literal form `[k: v, ...]` remains restricted to the built-in `Dictionary<K, V>` and `OwningDictionary<K, V>`; a user-extensible dictionary-literal protocol is deferred (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)).
 
 <a id="sec-user-defined-collection-literal-protocol"></a>
 <a id="sec-the-user-defined-sequence-literal-protocol"></a>
@@ -2200,19 +2200,19 @@ public static method FromCollectionLiteral(elements: ReadOnlySpan<T>): owned C<T
 **Owning form.** For a type `C<T>` that owns its elements (`where T: class`):
 
 ```bezel
-public static method FromCollectionLiteral(elements: owned OwnedArray<T>): owned C<T>;
+public static method FromCollectionLiteral(elements: owned OwningArray<T>): owned C<T>;
 ```
 
-Exactly one of the two forms may be declared on a given type. Declaring both is a compile error (the literal's element-expression ownership would not unambiguously select a target). The method must be `public`, must be `static`, must be declared directly on the collection type (not inherited from a base class or supplied by an extension block), and must return `owned C<T>` where `C<T>` is the enclosing type at its own arity. The element type is read directly from the parameter's element type — `T` in `ReadOnlySpan<T>` or `OwnedArray<T>` — and is the type against which every literal element expression is checked.
+Exactly one of the two forms may be declared on a given type. Declaring both is a compile error (the literal's element-expression ownership would not unambiguously select a target). The method must be `public`, must be `static`, must be declared directly on the collection type (not inherited from a base class or supplied by an extension block), and must return `owned C<T>` where `C<T>` is the enclosing type at its own arity. The element type is read directly from the parameter's element type — `T` in `ReadOnlySpan<T>` or `OwningArray<T>` — and is the type against which every literal element expression is checked.
 
 **Lowering.** For a sequence literal `[e1, e2, ..., en]` with determined target type `C<U>` that declares `FromCollectionLiteral`:
 
 - *Borrowing form.* The compiler materializes a temporary `ReadOnlySpan<U>` over the n element values (the storage for the span may be stack-allocated; its lifetime encloses only the `FromCollectionLiteral` call) and emits `C<U>.FromCollectionLiteral(thatSpan)`. Each `ei` is type-checked against `U` and must be implicitly convertible to it. The temporary span and its backing storage are released after the call returns; the factory must not retain the span beyond its own execution (the span is a borrow-bearing value subject to [§28.6](#sec-leak-prevention) — storing it in the constructed collection's field is a borrow-lifetime violation, diagnosed in the factory body, not at the literal site).
-- *Owning form.* The compiler materializes a temporary `owned OwnedArray<U>`, evaluates each `ei` (which must produce an owned `U`) and transfers it into the temporary in textual order, then emits `C<U>.FromCollectionLiteral(thatArray)` transferring ownership of the temporary array into the call. The factory drains the array (typically via the array's `move`-based element extraction) and is responsible for the array's discharge per the standard owned-parameter rules ([§28.3](#sec-local-variables-ownership-and-borrows)). If element evaluation throws partway, the already-evaluated owned elements and the partially-filled temporary array are disposed by the standard exception-path discharge ([§28.3](#sec-local-variables-ownership-and-borrows)), exactly as for an `OwnedArray<U>` literal.
+- *Owning form.* The compiler materializes a temporary `owned OwningArray<U>`, evaluates each `ei` (which must produce an owned `U`) and transfers it into the temporary in textual order, then emits `C<U>.FromCollectionLiteral(thatArray)` transferring ownership of the temporary array into the call. The factory drains the array (typically via the array's `move`-based element extraction) and is responsible for the array's discharge per the standard owned-parameter rules ([§28.3](#sec-local-variables-ownership-and-borrows)). If element evaluation throws partway, the already-evaluated owned elements and the partially-filled temporary array are disposed by the standard exception-path discharge ([§28.3](#sec-local-variables-ownership-and-borrows)), exactly as for an `OwningArray<U>` literal.
 
-The empty literal `[]` targeting such a type is admitted: the borrowing form receives an empty `ReadOnlySpan<U>`; the owning form receives an empty `OwnedArray<U>`. The factory is responsible for handling the empty case (it always must, since an empty collection is a valid general input).
+The empty literal `[]` targeting such a type is admitted: the borrowing form receives an empty `ReadOnlySpan<U>`; the owning form receives an empty `OwningArray<U>`. The factory is responsible for handling the empty case (it always must, since an empty collection is a valid general input).
 
-**Result ownership.** `FromCollectionLiteral` returns `owned C<U>`; the literal expression therefore produces an owned value, subject to the standard owned-result discharge rules ([§28.3](#sec-local-variables-ownership-and-borrows)) — identical to the ownership treatment of a built-in `Array<U>` / `OwnedArray<U>` literal.
+**Result ownership.** `FromCollectionLiteral` returns `owned C<U>`; the literal expression therefore produces an owned value, subject to the standard owned-result discharge rules ([§28.3](#sec-local-variables-ownership-and-borrows)) — identical to the ownership treatment of a built-in `Array<U>` / `OwningArray<U>` literal.
 
 **Recognition category.** This is name-based recognition: the compiler looks up a specifically-named `public static` method with a recognized signature. It is distinct from the interface-based iteration protocol ([§29.1](#sec-the-protocol)) and from the single structural-dispatch rule for `Contains` / `in` ([§17.5](#sec-the-in-operator)). The dictionary-literal form is *not* covered by this protocol; only the bare sequence-literal form `[e1, ..., en]` participates. Rationale [§5.16](Bezel_Design_Rationale.md#sec-collection-literals-for-complex-collections) explains the choice of mechanism, the contrast with C#'s `[CollectionBuilder]` attribute, and the forward-compatibility path to an interface-based form should static interface members be added.
 
@@ -2251,7 +2251,7 @@ using var empty: RingBuffer<int> := [];
 | Member | Used by | Meaning |
 |---|---|---|
 | `.Length` | `[N]T` (inline), `string` | Size, compile-time constant for inline arrays |
-| `.Count` | `Array<T>`, `OwnedArray<T>`, and other resizable collections | Current size; may change for resizable collections |
+| `.Count` | `Array<T>`, `OwningArray<T>`, and other resizable collections | Current size; may change for resizable collections |
 
 Heap arrays expose `.Count`. A heap array used in fixed-size discipline still has `.Count`, equal to its capacity, throughout its lifetime; the language does not enforce immutability of `.Count`, only the user's discipline.
 
@@ -2262,13 +2262,13 @@ Range slicing `arr[a..b]`, `arr[..b]`, `arr[a..]`, `arr[..]` is supported on `Ar
 
 Out-of-bounds endpoints raise `IndexOutOfRangeException`. An empty range produces an empty array.
 
-Slicing is not supported on inline arrays in this version. A copy-returning slice would need the range bounds to be compile-time constants (the result type `[K]T` encodes its length in the type), and a borrowing slice would need a span type over inline-array storage — but no inline-array span type exists (`Span<T>` and `ReadOnlySpan<T>` view `OwnedBuffer<T>`; `ArraySpan<T>` views heap `Array<T>`; none views `[N]T`). A span over inline arrays is deferred indefinitely (rationale [§5.15](Bezel_Design_Rationale.md#sec-owned-buffers-and-spans), [§18](Bezel_Design_Rationale.md#sec-things-deferred)). Users who want a sub-range of an inline array iterate the index range explicitly:
+Slicing is not supported on inline arrays in this version. A copy-returning slice would need the range bounds to be compile-time constants (the result type `[K]T` encodes its length in the type), and a borrowing slice would need a span type over inline-array storage — but no inline-array span type exists (`Span<T>` and `ReadOnlySpan<T>` view `OwningBuffer<T>`; `ArraySpan<T>` views heap `Array<T>`; none views `[N]T`). A span over inline arrays is deferred indefinitely (rationale [§5.15](Bezel_Design_Rationale.md#sec-owned-buffers-and-spans), [§18](Bezel_Design_Rationale.md#sec-things-deferred)). Users who want a sub-range of an inline array iterate the index range explicitly:
 
 ```bezel
 for var i in 2..5 do Process(arr[i]); end;
 ```
 
-Slicing is not admitted on `OwnedArray<T>`. The copy-returning semantics would manufacture a second owner for each owned element, violating the ownership contract. Users who want a range-bounded ownership transfer use `Drain()` plus filtering, or a sequence of `PopAt` calls. Users who want a borrowing view of a sub-range iterate the index range explicitly — the indexer-get produces a borrow, which respects ownership without taking it.
+Slicing is not admitted on `OwningArray<T>`. The copy-returning semantics would manufacture a second owner for each owned element, violating the ownership contract. Users who want a range-bounded ownership transfer use `Drain()` plus filtering, or a sequence of `PopAt` calls. Users who want a borrowing view of a sub-range iterate the index range explicitly — the indexer-get produces a borrow, which respects ownership without taking it.
 
 Multi-dimensional arrays are deferred to a future revision. The current spec does not provide `T[,]` or `[N, M]T`-style multi-dimensional inline arrays.
 
@@ -2608,7 +2608,7 @@ dict[key] := v + 1;
 
 The same desugaring applies to `--`. The same desugaring applies to `+=`, `-=`, and the other compound assignments on indexer slots, with the operator changed accordingly.
 
-When the indexer's element type is a class T whose `operator ++` / `operator --` returns a new instance, the desugaring would assign a fresh owned value to a slot. For a non-owning collection (`Array<MyClass>`), the slot does not own its content per [§28.11](#sec-collections-do-not-own-elements), so the assignment of an owned `new`-result to a non-owned slot would leak; per [§28.6](#sec-leak-prevention), this is rejected at compile time. For an owned-element collection (`OwnedArray<MyClass>`), the slot owns its content; the assignment disposes the previous value and installs the new one (per [§28.11](#sec-collections-do-not-own-elements)'s indexer-set rule), which is the same rule as for an owned-field reassignment. `arr[i]++` is therefore admitted on `OwnedArray<MyClass>` when MyClass overloads `operator ++`, and rejected on `Array<MyClass>`. The asymmetry is the same as for direct slot assignment.
+When the indexer's element type is a class T whose `operator ++` / `operator --` returns a new instance, the desugaring would assign a fresh owned value to a slot. For a non-owning collection (`Array<MyClass>`), the slot does not own its content per [§28.11](#sec-collections-do-not-own-elements), so the assignment of an owned `new`-result to a non-owned slot would leak; per [§28.6](#sec-leak-prevention), this is rejected at compile time. For an owned-element collection (`OwningArray<MyClass>`), the slot owns its content; the assignment disposes the previous value and installs the new one (per [§28.11](#sec-collections-do-not-own-elements)'s indexer-set rule), which is the same rule as for an owned-field reassignment. `arr[i]++` is therefore admitted on `OwningArray<MyClass>` when MyClass overloads `operator ++`, and rejected on `Array<MyClass>`. The asymmetry is the same as for direct slot assignment.
 
 <a id="sec-the-new-operator"></a>
 ### 17.7 The `new` operator
@@ -3565,10 +3565,10 @@ end;
 
 Both call sites are unambiguous; the resolution is by call-site syntax.
 
-The implementation of the take-form (the `out owned` overload) uses [§28.8.1](#sec-the-move-expression)'s `move` expression on the pool's internal owned-element collection to transfer ownership from pool to caller. A typical body using a `OwnedDictionary<string, Connection>` for the pool storage has the shape:
+The implementation of the take-form (the `out owned` overload) uses [§28.8.1](#sec-the-move-expression)'s `move` expression on the pool's internal owned-element collection to transfer ownership from pool to caller. A typical body using a `OwningDictionary<string, Connection>` for the pool storage has the shape:
 
 ```bezel
-private owned _cache: OwnedDictionary<string, Connection>;
+private owned _cache: OwningDictionary<string, Connection>;
 
 public method TryGetCached(name: string, out owned conn: Connection?): bool
   if not _cache.ContainsKey(name) then
@@ -3591,9 +3591,9 @@ end;
 
 The `!` is the documentation point: the API contract is "true return implies c is non-null," and the caller asserts that explicitly. A future revision that adds *flow-sensitive nullability narrowing across `out` parameters* would let the caller write `UseConnection(c)` without the `!`, but in this version the explicit `!` is required.
 
-The `PopValue` method on `OwnedDictionary<K, V>` ([§28.11](#sec-collections-do-not-own-elements), std lib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)) removes the entry and returns ownership of the value. After the call, the pool no longer holds the connection; the `out owned` parameter `conn` carries the obligation to the caller.
+The `PopValue` method on `OwningDictionary<K, V>` ([§28.11](#sec-collections-do-not-own-elements), std lib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)) removes the entry and returns ownership of the value. After the call, the pool no longer holds the connection; the `out owned` parameter `conn` carries the obligation to the caller.
 
-For pool implementations that prefer index-based storage, `OwnedArray<Connection>.PopAt(i)` provides the analogous take-and-remove operation. For the simplest case of a single-slot cache, an `owned Connection?` field with `move _slot!` followed by `_slot := null` (per [§28.8.1](#sec-the-move-expression)'s nullable-field detach pattern) is also valid — the choice between dictionary, array, and single-field forms is about how the pool indexes its connections, not about how ownership flows out.
+For pool implementations that prefer index-based storage, `OwningArray<Connection>.PopAt(i)` provides the analogous take-and-remove operation. For the simplest case of a single-slot cache, an `owned Connection?` field with `move _slot!` followed by `_slot := null` (per [§28.8.1](#sec-the-move-expression)'s nullable-field detach pattern) is also valid — the choice between dictionary, array, and single-field forms is about how the pool indexes its connections, not about how ownership flows out.
 
 <a id="sec-implicit-conversion-ranking"></a>
 #### Implicit conversions and tie-breaking
@@ -4059,19 +4059,19 @@ The implicit setter parameter is `value`. Each accessor uses `=> expression` or 
 
 Accessor visibility ([§13.6](#sec-accessor-visibility)) may make a getter or setter more restrictive than the property as a whole.
 
-**Explicit setter parameter modifier.** The setter's implicit `value` parameter has no modifier by default and takes a borrow of the property's declared type. For owning collections (like `OwnedArray<T>`'s indexer setter) the setter needs to take ownership of the new value (and dispose the previous slot value). Write an explicit `set(owned)` parameter spec to declare an owned-taking setter:
+**Explicit setter parameter modifier.** The setter's implicit `value` parameter has no modifier by default and takes a borrow of the property's declared type. For owning collections (like `OwningArray<T>`'s indexer setter) the setter needs to take ownership of the new value (and dispose the previous slot value). Write an explicit `set(owned)` parameter spec to declare an owned-taking setter:
 
 ```bezel
-public class OwnedArray<T> where T: class
+public class OwningArray<T> where T: class
   public property [i: int]: T
     get;                     // implicit value: T, borrow-returning
     set(owned);              // explicit owned: takes owned T;
                              //   disposes previous slot value
   end;
-end OwnedArray;
+end OwningArray;
 ```
 
-The spelling `set(owned)` keeps the implicit name `value`; the spelling `set(owned x)` renames the parameter to `x`. The parameter's type is always the property's declared type, so it is not repeated. The form is admitted on block-form properties and indexers; abstract/interface accessor bodies (`;`-terminated) carry the spec the same way (`set(owned);`). The standard-library owning collection types (`OwnedArray<T>`, `OwnedDictionary<K, V>`) use this form for their indexer setters; the owning-collection interfaces (`IOwnedList<T>`) declare it on their abstract indexer setters.
+The spelling `set(owned)` keeps the implicit name `value`; the spelling `set(owned x)` renames the parameter to `x`. The parameter's type is always the property's declared type, so it is not repeated. The form is admitted on block-form properties and indexers; abstract/interface accessor bodies (`;`-terminated) carry the spec the same way (`set(owned);`). The standard-library owning collection types (`OwningArray<T>`, `OwningDictionary<K, V>`) use this form for their indexer setters; the owning-collection interfaces (`IOwningList<T>`) declare it on their abstract indexer setters.
 
 <a id="sec-indexers"></a>
 ### 23.4 Indexers
@@ -4876,7 +4876,7 @@ The discard form `_ := expr;` ([§17.13](#sec-the-discard-_)) is restricted acco
 | Inline arrays `[N]T` (without `owned` slots) | No | Value type; stored inline in enclosing context; no separate allocation to dispose ([§15.1](#sec-inline-arrays)) |
 | Inline arrays `[N owned]T?` or `[N owned]T` (with `owned` slots) | No, indirectly | Move-only value type; the array's host (class field, local) discharges by disposing each (non-null) slot ([§15.3](#sec-move-only-value-types)) |
 | `Array<T>` and other borrowing collections | Yes — class types | Dispose releases backing storage; elements are borrows and are not disposed ([§28.11](#sec-collections-do-not-own-elements)) |
-| `OwnedArray<T>` and other owning collections | Yes — class types | Dispose cascades through owned elements ([§28.11](#sec-collections-do-not-own-elements)) |
+| `OwningArray<T>` and other owning collections | Yes — class types | Dispose cascades through owned elements ([§28.11](#sec-collections-do-not-own-elements)) |
 
 <a id="sec-where-the-owned-modifier-can-appear"></a>
 ### 28.1 Where the `owned` modifier can appear
@@ -4896,8 +4896,8 @@ The `owned` modifier appears in specific declaration positions. It is **admissib
 The modifier is **not admissible** in the following positions:
 
 - **Record fields.** Records cannot have owned fields per [§28.5](#sec-owned-fields).
-- **Inline-array element types.** Writing `[N](owned T)` is not a well-formed syntax — `owned` on inline arrays appears in the slot-marker position `[N owned]T`, not on the element type. To hold owned elements in a resizable collection, use `OwnedArray<T>`.
-- **Generic type arguments.** This version does not admit `owned` on generic type arguments ([§14.4](#sec-owned-as-a-generic-argument)). Use named owning collection types (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)) or `OwnedTask<T>` (stdlib [§6](Bezel_Standard_Library.md#sec-system-threading)) when the use case requires an owning generic.
+- **Inline-array element types.** Writing `[N](owned T)` is not a well-formed syntax — `owned` on inline arrays appears in the slot-marker position `[N owned]T`, not on the element type. To hold owned elements in a resizable collection, use `OwningArray<T>`.
+- **Generic type arguments.** This version does not admit `owned` on generic type arguments ([§14.4](#sec-owned-as-a-generic-argument)). Use named owning collection types (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)) or `OwningTask<T>` (stdlib [§6](Bezel_Standard_Library.md#sec-system-threading)) when the use case requires an owning generic.
 
 Function-type parameters and return types *do* admit `owned` — `(owned T) -> ()` is the function-type form of `method M(owned t: T)`, and is a distinct type from `(T) -> ()` per [§27.1](#sec-function-types). The modifier is part of the function type's identity.
 
@@ -5002,7 +5002,7 @@ The ownership state of an expression is determined by the expression form:
 |---|---|
 | `null` literal | Context-typed. The literal is admissible in any position whose declared type is nullable. For ownership: `null` has no value to own, so it is **compatible with either an owned target or a borrowed target**. Assigning `null` to an owned location leaves that location in the owned-currently-null state (disposal of null is a no-op). Assigning `null` to a borrowed location is the borrowed-currently-null value with no source. For a local declared `var x: T? := null;`, the local's ownership state is determined by the *next* non-null assignment to `x`: assigning an owned value makes `x` owned thereafter; assigning a borrowed value makes `x` borrowed. Before that next assignment, `x` is in a polymorphic null state that supports either subsequent transition. Locals that remain at null for their entire lifetime are statically dead-storable; the compiler may emit a warning but the program is well-formed. |
 | `new T(...)` | Owned |
-| Collection literal (`[1, 2, 3]`) targeting a reference type (`Array<T>`, `OwnedArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc.) | Owned |
+| Collection literal (`[1, 2, 3]`) targeting a reference type (`Array<T>`, `OwningArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc.) | Owned |
 | Collection literal (`[1, 2, 3]`) targeting an inline-array type (`[N]T`, including `[N owned]T?`) | Not applicable — produces a value. For move-only `[N owned]…` targets, the value is move-only ([§15.3](#sec-move-only-value-types)). |
 | Method call returning `owned T` | Owned |
 | Method call returning `T` (no `owned`) | Borrowed — instance method: source is the receiver; static method: no source, treated as owned with a warning (see *Factory methods* below) |
@@ -5010,7 +5010,7 @@ The ownership state of an expression is determined by the expression form:
 | `move obj.f` where `f` is `owned` | Owned. Field is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression)). |
 | Field access `obj.f` where `f` is not `owned` | Borrowed (source: `obj`) |
 | Indexer access `coll[i]` | Borrowed (source: `coll`) |
-| `move coll[i]` where `coll` is an owning collection that admits slot-move (heap: `OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedBuffer<T>` for class-typed T, or a `Span<T>` view into a class-typed `OwnedBuffer<T>`; inline: `[N owned]T?`, `[N owned]T`) | Owned. Slot is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)). For `OwnedBuffer<T>` / `Span<T>` with value-typed T, `move coll[i]` is not admitted (values have no ownership to transfer). `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan`, and `ReadOnlyAsciiByteSpan` do not admit `move` for any T (`ReadOnlySpan<T>` and the string-backed forms have no writable indexer; the `Array<T>`-backed spans have borrowed slots with no ownership to transfer). |
+| `move coll[i]` where `coll` is an owning collection that admits slot-move (heap: `OwningArray<T>`, `OwningDictionary<K, V>`, `OwningBuffer<T>` for class-typed T, or a `Span<T>` view into a class-typed `OwningBuffer<T>`; inline: `[N owned]T?`, `[N owned]T`) | Owned. Slot is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)). For `OwningBuffer<T>` / `Span<T>` with value-typed T, `move coll[i]` is not admitted (values have no ownership to transfer). `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan`, and `ReadOnlyAsciiByteSpan` do not admit `move` for any T (`ReadOnlySpan<T>` and the string-backed forms have no writable indexer; the `Array<T>`-backed spans have borrowed slots with no ownership to transfer). |
 | Local-variable read `x` where `x` is owned (a class-typed owned local, or a local of move-only value type per [§15.3](#sec-move-only-value-types)) | When the read appears in an owned-consuming position (assignment to an owned slot, return under an `owned` return type, an `owned` argument; for move-only locals, any assignment to an owning location), the read transfers ownership out of `x` and `x` becomes moved-from (see *Move semantics*). When the read appears in a borrow-consuming position (a non-`owned` argument, an indexer or property access, or — for move-only locals — a borrow of the value through indexing or equality comparison), `x` retains ownership and the value is borrowed for the consuming operation. |
 | Local-variable read `x` where `x` is borrowed | Borrowed (source: same as `x`'s source) |
 | Parameter `p` declared `owned p: T` | Owned |
@@ -5034,7 +5034,7 @@ When the method has a structural borrow source — an **instance** method, whose
 
 The compiler determines the borrow source as follows: for an instance method, the default source is the receiver; for a static method, there is no default source. When the compiler cannot identify a source for a non-`owned` class-typed return from a static method, it treats the return as owned and emits a warning recommending that the callee add `owned` to its return type. Implementations are encouraged to add `owned` annotations to static factory methods proactively.
 
-**Iterator methods are exempt from this warning.** A method whose body uses `yield return` or `yield break` (synchronous or async, returning `IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>` per [§29.3](#sec-iterator-methods)) is a factory by construction — its return is the freshly-constructed state machine — and the natural return type is the iterable interface, not `owned IEnumerable<T>` (or `owned OwnedEnumerable<T>`). The factory rule applies to iterator-method return values exactly as it does to other sourceless static returns: callers must discharge the ownership obligation (typically via the for-loop's implicit `using var __source` binding). The warning is suppressed because adding `owned` to every iterator return type would be redundant noise. The standard library's iterator-returning methods (`IEnumerable<T>` extensions like `Where`, `Select`, etc., and the owning-collection `Drain()` methods returning `OwnedEnumerable<T>`) follow this convention.
+**Iterator methods are exempt from this warning.** A method whose body uses `yield return` or `yield break` (synchronous or async, returning `IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, or `IOwningAsyncEnumerator<T>` per [§29.3](#sec-iterator-methods)) is a factory by construction — its return is the freshly-constructed state machine — and the natural return type is the iterable interface, not `owned IEnumerable<T>` (or `owned IOwningEnumerable<T>`). The factory rule applies to iterator-method return values exactly as it does to other sourceless static returns: callers must discharge the ownership obligation (typically via the for-loop's implicit `using var __source` binding). The warning is suppressed because adding `owned` to every iterator return type would be redundant noise. The standard library's iterator-returning methods (`IEnumerable<T>` extensions like `Where`, `Select`, etc., and the owning-collection `Drain()` methods returning `IOwningEnumerable<T>`) follow this convention.
 
 <a id="sec-move-semantics-for-owned-locals"></a>
 #### Move semantics for owned locals
@@ -5062,7 +5062,7 @@ A borrowed value's lifetime is the lifetime of its *source*. The compiler enforc
 
 - A borrowed local may not be returned from a method whose return type is `owned`.
 - A borrowed local may not be returned from a method at all unless the return type is the same kind of borrow with a clearly-defined source (in this version, that means: receiver-borrows from extension methods, value-typed returns, and runtime-managed returns).
-- A method's return type that names an **owning-collection or owning-wrapper type** (`OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`, `OwnedLinkedList<T>`, `OwnedTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) follows the *same* owned-vs-borrow rule as any other reference return (the *Producers* table above): declared `owned`, the caller takes ownership; declared **without** `owned`, the result is a **borrow** with a documented source (the `Owned*` type name denotes *element* ownership, orthogonal to the container ownership the `owned` qualifier governs — [§5.11](Bezel_Design_Rationale.md#sec-owning-collections)). The borrow-return restrictions then apply unchanged: a bare owning-collection *field* read may be returned (its source is the receiver, [§28.6](#sec-leak-prevention)); a borrowed *local* or *parameter* with no source that outlives the call may **not** be returned; a `move`d field or a freshly-produced owning value must be returned through an `owned` return type. A borrow returned this way carries the capability restriction of [§28.6](#sec-borrowed-owning-collections) — the caller may not `Dispose` it (the owner does); it may otherwise be read and mutated like any borrowed collection.
+- A method's return type that names an **owning-collection or owning-wrapper type** (`OwningArray<T>`, `OwningDictionary<K, V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningLinkedList<T>`, `OwningTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) follows the *same* owned-vs-borrow rule as any other reference return (the *Producers* table above): declared `owned`, the caller takes ownership; declared **without** `owned`, the result is a **borrow** with a documented source (the `Owned*` type name denotes *element* ownership, orthogonal to the container ownership the `owned` qualifier governs — [§5.11](Bezel_Design_Rationale.md#sec-owning-collections)). The borrow-return restrictions then apply unchanged: a bare owning-collection *field* read may be returned (its source is the receiver, [§28.6](#sec-leak-prevention)); a borrowed *local* or *parameter* with no source that outlives the call may **not** be returned; a `move`d field or a freshly-produced owning value must be returned through an `owned` return type. A borrow returned this way carries the capability restriction of [§28.6](#sec-borrowed-owning-collections) — the caller may not `Dispose` it (the owner does); it may otherwise be read and mutated like any borrowed collection.
 - A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference. **The assignment-site check is structural and decidable** — parameter-sourced and receiver-sourced borrows are admissible; scope-bound locals and temporaries are rejected. **The residual is trust:** whether the caller-side source actually outlives the object is the programmer's obligation, not a compile-time guarantee; a violation is caught as `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior in unchecked mode.
 - A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted.
 - The same capture-and-escape rule applies to **method references** ([§27.6](#sec-method-references)) that bind an instance receiver: `obj.Method` produces a function value whose captured environment includes `obj`. If `obj` is a borrow, the resulting function value is subject to the closure-escape rules above as if `obj` had been captured by an explicit lambda. The function value's runtime-managed status ([§28.9](#sec-runtime-managed-types)) governs the *function value's own* lifetime; it does not relax the lifetime constraints on borrows captured by the function value.
@@ -5195,24 +5195,24 @@ A class with only owned-bearing fields (`owned` class/interface fields and/or ow
 
 The compiler enforces:
 
-- A *bare read* of an owned field may be returned through a **non-`owned`** return type as a **borrow** of the field — its source is the receiver, exactly as for `return this` (*Methods returning `this`* below). The caller receives a borrow it may not dispose, may not store in an `owned` location, and may not use past the receiver's lifetime; the field's owner (the receiver's destructor) still disposes it. This is leak-free and double-free-free, and applies uniformly to a class-typed owned field and to an owning-collection field (`owned _items: OwnedArray<T>`).
-- **Transferring** an owned field's value out — `move`-ing it ([§28.8.1](#sec-the-move-expression)), or returning it through an `owned` return type — is the only way to hand the caller ownership, and a `move`d owned field returned through a non-`owned` return is an **error** (the moved value would escape with no owner). A freshly-produced owning value (`return new OwnedArray<T>(...)`) returned through a non-`owned` return is likewise an error unless the return type is `owned`.
+- A *bare read* of an owned field may be returned through a **non-`owned`** return type as a **borrow** of the field — its source is the receiver, exactly as for `return this` (*Methods returning `this`* below). The caller receives a borrow it may not dispose, may not store in an `owned` location, and may not use past the receiver's lifetime; the field's owner (the receiver's destructor) still disposes it. This is leak-free and double-free-free, and applies uniformly to a class-typed owned field and to an owning-collection field (`owned _items: OwningArray<T>`).
+- **Transferring** an owned field's value out — `move`-ing it ([§28.8.1](#sec-the-move-expression)), or returning it through an `owned` return type — is the only way to hand the caller ownership, and a `move`d owned field returned through a non-`owned` return is an **error** (the moved value would escape with no owner). A freshly-produced owning value (`return new OwningArray<T>(...)`) returned through a non-`owned` return is likewise an error unless the return type is `owned`.
 - An owned field's value may not be assigned to a non-owned field of any other class.
 - A **freshly-produced owned value** — a `new` expression, a call returning `owned T`, a `move` expression, or an owned operator result — stored into a non-`owned` (borrow) field is an **error**: the field does not own its referent, so the fresh value would be left with no owner and leak. Declare the field `owned` (the containing object then disposes it, [§28.5](#sec-owned-fields)), or hand the value to a method that takes it `owned`. This is the storing-side counterpart of the non-`owned`-return rule above: a fresh owned value may not escape into any non-owning location.
 - A **property or indexer getter** may not return a freshly-produced owned value. A getter is a borrow-producing position — properties and indexers do not carry `owned` ([§23](#sec-properties-and-indexers); the `owned` modifier applies only to fields), so its return is always a borrow — and a fresh owned value returned through it would escape with no owner and leak. Expose the factory as a **method returning `owned T`** instead, which can hand the caller ownership.
 
 ```bezel
-public method GetTransactions(): OwnedArray<Transaction>
+public method GetTransactions(): OwningArray<Transaction>
   return _transactions;     // OK (v0.151): borrows the field — the caller may
                             //   read/iterate it but not dispose or drain it.
 end GetTransactions;
 
-public method TakeTransactions(): owned OwnedArray<Transaction>
+public method TakeTransactions(): owned OwningArray<Transaction>
   return move _transactions;  // transfer: the field is left moved-from and must
                               //   be restored before the method returns.
 end TakeTransactions;
 
-public method LeakTransactions(): OwnedArray<Transaction>
+public method LeakTransactions(): OwningArray<Transaction>
   return move _transactions;  // ERROR: a `move`d field through a non-`owned`
                               //   return escapes with no owner.
 end LeakTransactions;
@@ -5240,7 +5240,7 @@ Passing an owned field as an argument is permitted; the callee borrows for the d
 
 A borrow of an owning collection — produced by returning a bare owning-collection field (above), or by any borrow-producing read of one — may not be **disposed**. `Dispose()` on a borrow is a compile error: the borrower does not own the container, and the actual owner (the `using var`, the owned local, or the object whose field this is) disposes the container and cascades to its elements at scope/destructor end. A borrower's `Dispose()` would free the container a second time — a double-free.
 
-Every *other* operation remains available, exactly as on any borrowed collection. The mutation and ownership-transfer operations — the owning `Add` / `Insert`, the ownership-taking indexer-set, `Remove*`, `Clear`, `Drain`, `Pop*` / `Dequeue` — are **memory-safe on a borrow**: each preserves the dispose-exactly-once invariant (an element transferred out is owned by its new holder; the owner then disposes a smaller or empty container), and Bezel already admits them on a borrowed collection — the idiomatic *pass-and-fill* pattern `method Fill(a: OwnedArray<T>) a.Add(…)` takes a borrowed `OwnedArray<T>` and adds to it ([§28.8](#sec-ownership-transfer)). The read operations (indexer-get, `Count` / `Length`, `Contains`, iteration, the borrowing LINQ queries) are likewise available. The owning collection types deliberately have **no** value-copy materializers (`ToArray` / `Sorted` / `Reversed` / `ToSet` / `ToDictionary`) at all — uniquely-owned elements cannot be copied out of the container without double-owning or draining them (stdlib [§4.5](Bezel_Standard_Library.md#sec-ownedarrayt)) — so those operations are not part of the surface on a borrow or otherwise. Only `Dispose` is restricted. An *owned* owning collection (a `using var`, an owned field accessed by its owner, a `move`d value) additionally admits `Dispose`.
+Every *other* operation remains available, exactly as on any borrowed collection. The mutation and ownership-transfer operations — the owning `Add` / `Insert`, the ownership-taking indexer-set, `Remove*`, `Clear`, `Drain`, `Pop*` / `Dequeue` — are **memory-safe on a borrow**: each preserves the dispose-exactly-once invariant (an element transferred out is owned by its new holder; the owner then disposes a smaller or empty container), and Bezel already admits them on a borrowed collection — the idiomatic *pass-and-fill* pattern `method Fill(a: OwningArray<T>) a.Add(…)` takes a borrowed `OwningArray<T>` and adds to it ([§28.8](#sec-ownership-transfer)). The read operations (indexer-get, `Count` / `Length`, `Contains`, iteration, the borrowing LINQ queries) are likewise available. The owning collection types deliberately have **no** value-copy materializers (`ToArray` / `Sorted` / `Reversed` / `ToSet` / `ToDictionary`) at all — uniquely-owned elements cannot be copied out of the container without double-owning or draining them (stdlib [§4.5](Bezel_Standard_Library.md#sec-ownedarrayt)) — so those operations are not part of the surface on a borrow or otherwise. Only `Dispose` is restricted. An *owned* owning collection (a `using var`, an owned field accessed by its owner, a `move`d value) additionally admits `Dispose`.
 
 This is narrower than a full read-only restriction, and deliberately so: Bezel's borrowed collections are already mutable (pass-and-fill is a core idiom), so the only operation a borrow-return newly makes unsound is the container `Dispose` — which is the one this rule forbids.
 
@@ -5533,7 +5533,7 @@ The following types are exempt from manual disposal. Their `Dispose()` is a no-o
 
   Capturing a *move-only* local (an owning inline array, [§15.3](#sec-move-only-value-types)) follows the same rule: the closure captures a borrow of the move-only value whose source is the local's enclosing scope. The closure may not outlive that scope. A move-only capture cannot be a copy (copying is forbidden for move-only types) and cannot be a move (the local is still in scope and accessible via its name; moving into the closure would leave the local in moved-from state in surprising ways). The borrow form is the only consistent option. Reads of slots through the captured borrow are admitted; `move arr[i]` through the captured borrow is not (the closure does not own the array). Programs that need to consume slot contents through a closure must arrange for the closure to take an owned-parameter argument and invoke it with `move`d slots from outside.
 
-Note that **inline arrays** `[N]T` (see [§15.1](#sec-inline-arrays)) are not on this list. Inline arrays are value types, stored inline in their enclosing context; they have no separate allocation to reclaim and no disposal contract independent of their host. Inline arrays with owned slots (`[N owned]T?`) are move-only value types ([§15.3](#sec-move-only-value-types)) that participate in the ownership system as part of their host's lifecycle. Earlier revisions of this specification described a runtime-managed fixed-size-array form `T[]` here; that form has been retired in favor of inline arrays and the heap arrays `Array<T>` / `OwnedArray<T>` ([§15.2](#sec-heap-arrays)).
+Note that **inline arrays** `[N]T` (see [§15.1](#sec-inline-arrays)) are not on this list. Inline arrays are value types, stored inline in their enclosing context; they have no separate allocation to reclaim and no disposal contract independent of their host. Inline arrays with owned slots (`[N owned]T?`) are move-only value types ([§15.3](#sec-move-only-value-types)) that participate in the ownership system as part of their host's lifecycle. Earlier revisions of this specification described a runtime-managed fixed-size-array form `T[]` here; that form has been retired in favor of inline arrays and the heap arrays `Array<T>` / `OwningArray<T>` ([§15.2](#sec-heap-arrays)).
 
 The compiler does not warn about undisposed runtime-managed values and does not require them to appear in `using var` or `owned` declarations.
 
@@ -5563,19 +5563,19 @@ public class Box<T>
   // No destructor, no owned fields. Box<T> is trivial-dispose for any T.
 end Box;
 
-public class OwnedBox<T> where T: class
+public class OwningBox<T> where T: class
   public owned Value: T;
-  // Has an owned field. OwnedBox<T> is NOT trivial-dispose for any T.
-end OwnedBox;
+  // Has an owned field. OwningBox<T> is NOT trivial-dispose for any T.
+end OwningBox;
 
 _ := new Box<int>();              // OK (trivial-dispose)
 _ := new Box<MyClass>();          // OK (trivial-dispose; Box doesn't own its T)
-_ := new OwnedBox<MyClass>();     // ERROR (owned T field; non-trivial-dispose)
+_ := new OwningBox<MyClass>();     // ERROR (owned T field; non-trivial-dispose)
 ```
 
-Per-instantiation analysis means trivial-dispose status is computed *after* type substitution, so a generic class's trivial-dispose status follows from how it uses T, not from T's own properties. The standard collection types — `Array<T>`, `Dictionary<K, V>`, `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>` — are trivial-dispose for every non-owned choice of type argument because they do not own their elements ([§28.11](#sec-collections-do-not-own-elements)). A program that holds `Array<MyClass>` may discard the array (the elements remain owned by their original sources, unaffected by the array's reclaim); a program that holds `OwnedBox<MyClass>` may not (the box's owned T field requires disposal).
+Per-instantiation analysis means trivial-dispose status is computed *after* type substitution, so a generic class's trivial-dispose status follows from how it uses T, not from T's own properties. The standard collection types — `Array<T>`, `Dictionary<K, V>`, `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>` — are trivial-dispose for every non-owned choice of type argument because they do not own their elements ([§28.11](#sec-collections-do-not-own-elements)). A program that holds `Array<MyClass>` may discard the array (the elements remain owned by their original sources, unaffected by the array's reclaim); a program that holds `OwningBox<MyClass>` may not (the box's owned T field requires disposal).
 
-The owned-element variants of the standard collection types — `OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, etc. — are **not** trivial-dispose: they own their elements and disposal cascades through to the elements. A program that holds `OwnedArray<MyClass>` *must* discharge the array's ownership through one of the standard mechanisms; the implicit reclaim is not sufficient because element disposal needs to run. `OwnedBuffer<T>` is similarly non-trivial-dispose: for class-typed T, its destructor cascades through every non-null slot; for value-typed T, the cascade is empty but the buffer's allocation still must be released.
+The owned-element variants of the standard collection types — `OwningArray<T>`, `OwningDictionary<K, V>`, `OwningSet<T>`, etc. — are **not** trivial-dispose: they own their elements and disposal cascades through to the elements. A program that holds `OwningArray<MyClass>` *must* discharge the array's ownership through one of the standard mechanisms; the implicit reclaim is not sufficient because element disposal needs to run. `OwningBuffer<T>` is similarly non-trivial-dispose: for class-typed T, its destructor cascades through every non-null slot; for value-typed T, the cascade is empty but the buffer's allocation still must be released.
 
 The rule does not require the generic to be parameterized only by type arguments that are *themselves* trivial-dispose. `Array<MyClass>` is trivial-dispose even if `MyClass` is not, because the array's own surface contains nothing that needs disposal — `MyClass` instances are owned elsewhere, and the array's reclaim doesn't dispose them. The key question is **does the generic class itself need to do disposal work**, not whether its element type does.
 
@@ -5642,9 +5642,9 @@ Bezel has two families of collection types:
 
 - **Borrowing collections** (`Array<T>`, `LinkedList<T>`, `Dictionary<K, V>`, `Set<T>`, `Stack<T>`, `Queue<T>`) store references that the caller continues to own. The collection's `Dispose()` releases the backing storage but does **not** dispose the elements. Element disposal is the caller's responsibility, typically arranged via `DisposeElements()` or an explicit iteration.
 
-- **Owning collections** (`OwnedArray<T>`, `OwnedLinkedList<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`) own their elements. The collection's `Dispose()` cascades through every element. `Add` takes ownership; the indexer setter disposes the previous slot value before installing the new one; `Remove`/`RemoveAt`/`Clear` dispose the affected elements. Owning collections require `where T: class` (and, for `OwnedDictionary<K, V>`, `where V: class`) — owning makes sense only for class-typed values.
+- **Owning collections** (`OwningArray<T>`, `OwningLinkedList<T>`, `OwningDictionary<K, V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`) own their elements. The collection's `Dispose()` cascades through every element. `Add` takes ownership; the indexer setter disposes the previous slot value before installing the new one; `Remove`/`RemoveAt`/`Clear` dispose the affected elements. Owning collections require `where T: class` (and, for `OwningDictionary<K, V>`, `where V: class`) — owning makes sense only for class-typed values.
 
-The two families are declared separately in the standard library ([§4](Bezel_Standard_Library.md#sec-system-collections-generic)). A program chooses the form that matches the intended ownership semantics. There is no implicit conversion between the two families; an `OwnedArray<Connection>` is not an `Array<Connection>` and vice versa.
+The two families are declared separately in the standard library ([§4](Bezel_Standard_Library.md#sec-system-collections-generic)). A program chooses the form that matches the intended ownership semantics. There is no implicit conversion between the two families; an `OwningArray<Connection>` is not an `Array<Connection>` and vice versa.
 
 <a id="sec-element-slot-policy"></a>
 #### The element slot policy
@@ -5672,7 +5672,7 @@ The slot kind alone determines what every element operation does:
 | ownership out | *(none — nothing owned)* | *(none)* | *(none)* | `move coll[i]`, the `Pop*` family, `Drain()` |
 | `DisposeElements()` | equivalent to `Clear()` | equivalent to `Clear()` | disposes every class-typed element, then empties | *(not declared — `Dispose()` already cascades)* |
 
-The per-collection clauses in the remainder of this section and in the standard library document ([§4](Bezel_Standard_Library.md#sec-system-collections-generic)) are presentations of this table for each concrete type; they do not introduce element semantics of their own, and a per-collection statement that diverges from the table is a defect in this specification. The storage embodiment of the owning column is `OwnedBuffer<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the primitive over which the resizable owning collections compose; the borrowing family's storage remains a compiler intrinsic in this revision, because a user-expressible borrow-storing primitive needs its own borrow-lifetime rules (storing borrows in fields is otherwise rejected, [§28.3](#sec-local-variables-ownership-and-borrows)) — that design is deferred, recorded in the rationale.
+The per-collection clauses in the remainder of this section and in the standard library document ([§4](Bezel_Standard_Library.md#sec-system-collections-generic)) are presentations of this table for each concrete type; they do not introduce element semantics of their own, and a per-collection statement that diverges from the table is a defect in this specification. The storage embodiment of the owning column is `OwningBuffer<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the primitive over which the resizable owning collections compose; the borrowing family's storage remains a compiler intrinsic in this revision, because a user-expressible borrow-storing primitive needs its own borrow-lifetime rules (storing borrows in fields is otherwise rejected, [§28.3](#sec-local-variables-ownership-and-borrows)) — that design is deferred, recorded in the rationale.
 
 <a id="sec-borrowing-collections"></a>
 #### Borrowing collections
@@ -5702,7 +5702,7 @@ class BankAccount
 end BankAccount;
 ```
 
-`owned` on the field handles container disposal; the destructor adds the element-disposal step. This pattern is valid and appropriate when the class wants explicit control over element disposal (perhaps because not every element should be disposed, or because the cleanup is interleaved with other work). For the common case where the class *always* owns every element and disposes them all together, `OwnedArray<Transaction>` is the cleaner choice — the destructor's explicit `DisposeElements()` call is replaced by the automatic cascade.
+`owned` on the field handles container disposal; the destructor adds the element-disposal step. This pattern is valid and appropriate when the class wants explicit control over element disposal (perhaps because not every element should be disposed, or because the cleanup is interleaved with other work). For the common case where the class *always* owns every element and disposes them all together, `OwningArray<Transaction>` is the cleaner choice — the destructor's explicit `DisposeElements()` call is replaced by the automatic cascade.
 
 For asymmetric ownership in a dictionary (a class owning the values but not the keys, or vice versa), iterate explicitly:
 
@@ -5718,7 +5718,7 @@ The standard library does not provide separate `DisposeKeys` or `DisposeValues` 
 <a id="sec-owning-collections"></a>
 #### Owning collections
 
-An owning collection (`OwnedArray<T>`, `OwnedDictionary<K, V>`, `OwnedStack<T>`, etc.) owns its elements. The standard library [§4](Bezel_Standard_Library.md#sec-system-collections-generic) declares the owning-collection family. The signature changes that distinguish owning from borrowing collections are:
+An owning collection (`OwningArray<T>`, `OwningDictionary<K, V>`, `OwningStack<T>`, etc.) owns its elements. The standard library [§4](Bezel_Standard_Library.md#sec-system-collections-generic) declares the owning-collection family. The signature changes that distinguish owning from borrowing collections are:
 
 - **`Add(owned item: T)`** accepts an owned argument. The caller transfers ownership to the collection.
 - **`Insert(index: int, owned item: T)`** likewise.
@@ -5734,17 +5734,17 @@ User-written *property setters* over an owned field are also method bodies and m
 
 In addition, owning collections expose **drain methods** that transfer ownership of elements out of the collection:
 
-- **`PopAt(index: int): owned T`** removes the element at the given index and returns it as owned. The slot is closed (subsequent indices shift down for sequence types; the dictionary entry is removed for `OwnedDictionary`).
-- **`PopFirst(): owned T`** and **`PopLast(): owned T`** for the common cases on `OwnedArray`, `OwnedLinkedList`. `OwnedStack.Pop` and `OwnedQueue.Dequeue` are the equivalent operations for those types, returning `owned T`.
-- **`Drain(): OwnedEnumerable<T>`** returns an iterable that drains the source as it is iterated. After full iteration, the source collection is empty. Partial iteration drains only the elements yielded; the rest remain. The user iterates with `for var item in coll.Drain() do ... end;`, where `item` is owned; the §28.3 discharge rules apply in the loop body (`using var u := item;` is the typical form; an undischarged item auto-drops at body end with the must-use warning).
+- **`PopAt(index: int): owned T`** removes the element at the given index and returns it as owned. The slot is closed (subsequent indices shift down for sequence types; the dictionary entry is removed for `OwningDictionary`).
+- **`PopFirst(): owned T`** and **`PopLast(): owned T`** for the common cases on `OwningArray`, `OwningLinkedList`. `OwningStack.Pop` and `OwningQueue.Dequeue` are the equivalent operations for those types, returning `owned T`.
+- **`Drain(): IOwningEnumerable<T>`** returns an iterable that drains the source as it is iterated. After full iteration, the source collection is empty. Partial iteration drains only the elements yielded; the rest remain. The user iterates with `for var item in coll.Drain() do ... end;`, where `item` is owned; the §28.3 discharge rules apply in the loop body (`using var u := item;` is the typical form; an undischarged item auto-drops at body end with the must-use warning).
 
 `DisposeElements()` is **not** declared on owning collections. Disposing the collection already disposes the elements; the explicit method would be redundant.
 
-Default iteration `for var item in coll do ... end` (where `coll` has static type `OwnedArray<T>`, etc.) produces *borrows* of each element via the collection's `IEnumerable<T>` conformance. The collection still owns its elements after iteration. To consume, iterate over `coll.Drain()`, which has static type `OwnedEnumerable<T>` and yields owned values.
+Default iteration `for var item in coll do ... end` (where `coll` has static type `OwningArray<T>`, etc.) produces *borrows* of each element via the collection's `IEnumerable<T>` conformance. The collection still owns its elements after iteration. To consume, iterate over `coll.Drain()`, which has static type `IOwningEnumerable<T>` and yields owned values.
 
 ```bezel
 public method UseEach()
-  using var pool := new OwnedArray<Connection>();
+  using var pool := new OwningArray<Connection>();
   pool.Add(Connect("primary"));      // ownership transfers in
   pool.Add(Connect("secondary"));     // ownership transfers in
 
@@ -5762,7 +5762,7 @@ public method UseEach()
 end UseEach;
 ```
 
-When an owning collection is itself disposed (whether at the end of a `using var` scope, in a destructor's auto-dispose pass, or at static-program-exit for a static `owned` field), every element it still holds is disposed first, then the backing storage is freed. The element-disposal order is implementation-defined for unordered collections (`OwnedDictionary`, `OwnedSet`), and is reverse-insertion-order for ordered collections (`OwnedArray`, `OwnedLinkedList`, `OwnedStack`, `OwnedQueue`).
+When an owning collection is itself disposed (whether at the end of a `using var` scope, in a destructor's auto-dispose pass, or at static-program-exit for a static `owned` field), every element it still holds is disposed first, then the backing storage is freed. The element-disposal order is implementation-defined for unordered collections (`OwningDictionary`, `OwningSet`), and is reverse-insertion-order for ordered collections (`OwningArray`, `OwningLinkedList`, `OwningStack`, `OwningQueue`).
 
 <a id="sec-move-on-a-collection-slot"></a>
 #### `move` on a collection slot
@@ -5771,21 +5771,21 @@ The `move` expression form ([§28.8.1](#sec-the-move-expression)) extends to own
 
 The `move coll[i]` form is admitted on:
 
-- Owning heap collections that support indexer syntax — `OwnedArray<T>`, `OwnedDictionary<K, V>`, and `OwnedBuffer<T>` for class-typed T (the dynamic-size owning storage primitive, stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)). `OwnedBuffer<T>` for value-typed T does *not* admit `move` — values have no ownership to transfer; the plain indexer-get suffices.
-- `Span<T>` for class-typed T (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), which delegates to the underlying `OwnedBuffer<T>`. `move span[i]` is equivalent to `move span.Buffer[span.Start + i]` — it takes ownership of the slot's value and leaves the slot in moved-from state in the *underlying buffer*, not in the span (the span is a stateless view; it carries no slot state of its own). As of v0.105, `move span[i]` bounds-checks against `span.Length` before delegating; if `i < 0` or `i >= span.Length`, `IndexOutOfRangeException` is thrown and no slot is moved-from. This matches the bounds-check behavior of the span's plain indexer-get and indexer-set. The field-restoration rule applies to the buffer slot in the usual way; the natural restoration is `span[i] := null`. `Span<T>` for value-typed T does not admit `move` (mirroring the underlying buffer). `ReadOnlySpan<T>` does not admit `move` for any T (it exposes no writable indexer and no take operation).
+- Owning heap collections that support indexer syntax — `OwningArray<T>`, `OwningDictionary<K, V>`, and `OwningBuffer<T>` for class-typed T (the dynamic-size owning storage primitive, stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)). `OwningBuffer<T>` for value-typed T does *not* admit `move` — values have no ownership to transfer; the plain indexer-get suffices.
+- `Span<T>` for class-typed T (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), which delegates to the underlying `OwningBuffer<T>`. `move span[i]` is equivalent to `move span.Buffer[span.Start + i]` — it takes ownership of the slot's value and leaves the slot in moved-from state in the *underlying buffer*, not in the span (the span is a stateless view; it carries no slot state of its own). As of v0.105, `move span[i]` bounds-checks against `span.Length` before delegating; if `i < 0` or `i >= span.Length`, `IndexOutOfRangeException` is thrown and no slot is moved-from. This matches the bounds-check behavior of the span's plain indexer-get and indexer-set. The field-restoration rule applies to the buffer slot in the usual way; the natural restoration is `span[i] := null`. `Span<T>` for value-typed T does not admit `move` (mirroring the underlying buffer). `ReadOnlySpan<T>` does not admit `move` for any T (it exposes no writable indexer and no take operation).
 - Owning inline arrays — both `[N owned]T?` and `[N owned]T` (see [§15.1.1](#sec-owning-inline-arrays)).
 
 `Array<T>`, `Dictionary<K, V>`, and the other borrowing collections do not admit `move coll[i]` — their slots hold borrows, not owned values; there is no ownership to transfer. The same applies to `ArraySpan<T>` and `ReadOnlyArraySpan<T>` (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), which view into a borrowing `Array<T>` source: `move arrSpan[i]` is rejected at compile time. The string-backed read-only span types `ReadOnlyStringSpan` (stdlib [§3.3](Bezel_Standard_Library.md#sec-readonlystringspan)) and `ReadOnlyAsciiByteSpan` (stdlib [§3.4](Bezel_Standard_Library.md#sec-readonlyasciibytespan)) also do not admit `move` — strings are immutable and their character data is reference-shared; no ownership transfer applies. The plain indexer-get is the only read form for all these types.
 
-`OwnedStack<T>`, `OwnedQueue<T>`, `OwnedLinkedList<T>`, and `OwnedSet<T>` do not have indexers (`stack[i]`, `linkedList[i]`, etc. do not parse), so `move` cannot syntactically apply to their slots. These structured-or-unordered collection types provide their own ownership-out methods (`Pop`, `Dequeue`, `Take`, etc.) that perform the equivalent take-and-discharge in a single call.
+`OwningStack<T>`, `OwningQueue<T>`, `OwningLinkedList<T>`, and `OwningSet<T>` do not have indexers (`stack[i]`, `linkedList[i]`, etc. do not parse), so `move` cannot syntactically apply to their slots. These structured-or-unordered collection types provide their own ownership-out methods (`Pop`, `Dequeue`, `Take`, etc.) that perform the equivalent take-and-discharge in a single call.
 
-The field-restoration rule applies: the slot must be reassigned before the surrounding method exits. For nullable element types (`OwnedArray<T>` internally storing `T?`, `OwnedDictionary<K, V>`, `[N owned]T?`, `OwnedBuffer<T>` for class-typed T which stores `T?`), assigning `null` to a moved-from slot satisfies the rule. For non-nullable element types (`[N owned]T`), restoration requires assigning a fresh owned T value — a constructor call, another moved value, or a borrow promoted to ownership. Code that needs "leave the slot empty after take" must use the nullable form. (For value-typed `OwnedBuffer<T>` the rule is moot — `move buf[i]` is not admitted, so no restoration obligation arises.)
+The field-restoration rule applies: the slot must be reassigned before the surrounding method exits. For nullable element types (`OwningArray<T>` internally storing `T?`, `OwningDictionary<K, V>`, `[N owned]T?`, `OwningBuffer<T>` for class-typed T which stores `T?`), assigning `null` to a moved-from slot satisfies the rule. For non-nullable element types (`[N owned]T`), restoration requires assigning a fresh owned T value — a constructor call, another moved value, or a borrow promoted to ownership. Code that needs "leave the slot empty after take" must use the nullable form. (For value-typed `OwningBuffer<T>` the rule is moot — `move buf[i]` is not admitted, so no restoration obligation arises.)
 
 **Indexer setter on a moved-from slot.** When the slot is in moved-from state, assigning to it through the indexer setter does *not* trigger the owned-setter's "dispose previous value" semantics — the previous value was already taken out by `move`, so there is no previous value to dispose. The slot transitions directly from moved-from to holding the new value. This matches owned-field/local reassignment ([§28.7](#sec-reassigning-owned-fields)): a moved-from location accepts the new value with nothing to dispose. The compiler's per-slot moved-from tracking is what makes this distinguishable from a non-moved-from slot, where the setter does dispose the previous value.
 
 The compiler tracks moved-from state per slot when the index is a compile-time constant or a local read. For variable indices that the compiler cannot prove are constant within the method, the analysis is conservative: after `move coll[i]` with a non-constant `i`, the *entire collection* is treated as having one or more slots in moved-from state. The admissible restoration operations depend on the collection kind:
 
-- For heap owning collections (`OwnedArray<T>`, `OwnedDictionary<K, V>`, and class-typed `OwnedBuffer<T>`): `coll[j] := value` for any `j` (treated as restoration of one slot if `j` matches the moved index, or as unrelated reassignment otherwise), `coll.Clear()` for those that provide it, or `coll.Dispose()` (which dispose the entire collection, satisfying the obligation by destruction). `OwnedBuffer<T>` does not provide `Clear()` directly; the equivalent is a loop assigning `null` to every slot or simply disposing the buffer.
+- For heap owning collections (`OwningArray<T>`, `OwningDictionary<K, V>`, and class-typed `OwningBuffer<T>`): `coll[j] := value` for any `j` (treated as restoration of one slot if `j` matches the moved index, or as unrelated reassignment otherwise), `coll.Clear()` for those that provide it, or `coll.Dispose()` (which dispose the entire collection, satisfying the obligation by destruction). `OwningBuffer<T>` does not provide `Clear()` directly; the equivalent is a loop assigning `null` to every slot or simply disposing the buffer.
 - For inline owning arrays (`[N owned]T?` or `[N owned]T`): `arr[j] := value` for any `j` (for nullable forms, `arr[j] := null` is also a valid restoration that marks slots empty). Inline arrays have no `Clear()` or `Dispose()` method (they are value types, not classes); restoration is per-slot assignment only.
 
 The `PopAt` family of methods covers the common case where the user wants to take an element out and let the collection close the gap; `move coll[i]` is the building block for advanced cases where the slot is taken and immediately reassigned to a new value:
@@ -5804,9 +5804,9 @@ The same exception-safety rules apply: any throwable expression between the move
 <a id="sec-compatibility-between-borrowing-and-owning-forms"></a>
 #### Compatibility between borrowing and owning forms
 
-`Array<T>` and `OwnedArray<T>` are distinct, unrelated types. There is no implicit conversion between them in either direction. A program that has an `OwnedArray<T>` and needs to expose it as a borrowing surface (`Array<T>`) must drain the owning array (consuming each owned element) and rebuild a borrowing array of borrows; the spec provides no shorthand for this because the operation always loses information (the original owner of each element is the caller's responsibility once drained).
+`Array<T>` and `OwningArray<T>` are distinct, unrelated types. There is no implicit conversion between them in either direction. A program that has an `OwningArray<T>` and needs to expose it as a borrowing surface (`Array<T>`) must drain the owning array (consuming each owned element) and rebuild a borrowing array of borrows; the spec provides no shorthand for this because the operation always loses information (the original owner of each element is the caller's responsibility once drained).
 
-The most common case where this conversion is *not* what the programmer wants: passing an `OwnedArray<T>` to a method expecting `Array<T>`. The intent is usually "let the callee read the elements" — for which the answer is to expose `IEnumerable<T>`, `IReadOnlyCollection<T>`, or `IReadOnlyList<T>` (the borrowing views). Both `Array<T>` and `OwnedArray<T>` implement these read-only iteration interfaces, so a consumer signature using one of them accepts either source:
+The most common case where this conversion is *not* what the programmer wants: passing an `OwningArray<T>` to a method expecting `Array<T>`. The intent is usually "let the callee read the elements" — for which the answer is to expose `IEnumerable<T>`, `IReadOnlyCollection<T>`, or `IReadOnlyList<T>` (the borrowing views). Both `Array<T>` and `OwningArray<T>` implement these read-only iteration interfaces, so a consumer signature using one of them accepts either source:
 
 ```bezel
 public method ReportEach(items: IEnumerable<Connection>)
@@ -5814,10 +5814,10 @@ public method ReportEach(items: IEnumerable<Connection>)
 end ReportEach;
 
 public method UseOwnedPool()
-  using var pool := new OwnedArray<Connection>();
+  using var pool := new OwningArray<Connection>();
   pool.Add(Connect("a"));
   pool.Add(Connect("b"));
-  ReportEach(pool);     // OK: OwnedArray<Connection> implements IEnumerable<Connection>
+  ReportEach(pool);     // OK: OwningArray<Connection> implements IEnumerable<Connection>
                         //     iteration yields borrows
 end UseOwnedPool;
 ```
@@ -5830,11 +5830,11 @@ public method ReportEachGeneric<T>(items: IEnumerable<T>) where T: class
 end ReportEachGeneric;
 
 // Call with Array<Connection>: T inferred as Connection.
-// Call with OwnedArray<Connection>: T inferred as Connection.
+// Call with OwningArray<Connection>: T inferred as Connection.
 // Same generic instantiation for both source forms.
 ```
 
-The borrowing-iteration interfaces (`IEnumerable<T>`, `IReadOnlyList<T>`, `IReadOnlyCollection<T>`) are the shared abstractions between the two collection families. The mutating interfaces (`ICollection<T>`/`IList<T>` for borrowing; `IOwnedCollection<T>`/`IOwnedList<T>` for owning) are separate hierarchies, intentionally so — `Add` has different semantics in each (borrow-taking vs. owned-taking). Code that abstracts over mutation must pick one hierarchy.
+The borrowing-iteration interfaces (`IEnumerable<T>`, `IReadOnlyList<T>`, `IReadOnlyCollection<T>`) are the shared abstractions between the two collection families. The mutating interfaces (`ICollection<T>`/`IList<T>` for borrowing; `IOwningCollection<T>`/`IOwningList<T>` for owning) are separate hierarchies, intentionally so — `Add` has different semantics in each (borrow-taking vs. owned-taking). Code that abstracts over mutation must pick one hierarchy.
 
 <a id="sec-asynchronous-disposal"></a>
 ### 28.12 Asynchronous disposal
@@ -5888,7 +5888,7 @@ second.Get().Ping();                                           // borrow of the 
 
 The semantics, stated against the existing model:
 
-- **Handles are ordinary owned class instances.** Every rule of this chapter applies to a handle unchanged: it is produced owned (by `new Shared<T>(...)` or `Clone()`), discharged by `using var`, an `owned` field, an `owned` parameter or return, `move`, or explicit `Dispose()`; branch joins, exception-path discharge, and the leak-prevention rules of [§28.6](#sec-leak-prevention) see nothing new. A handle may be stored in owning collections (`OwnedArray<Shared<T>>`) like any class instance. The *only* novel behavior is inside the compiler-known type: the shared count, and last-one-disposes.
+- **Handles are ordinary owned class instances.** Every rule of this chapter applies to a handle unchanged: it is produced owned (by `new Shared<T>(...)` or `Clone()`), discharged by `using var`, an `owned` field, an `owned` parameter or return, `move`, or explicit `Dispose()`; branch joins, exception-path discharge, and the leak-prevention rules of [§28.6](#sec-leak-prevention) see nothing new. A handle may be stored in owning collections (`OwningArray<Shared<T>>`) like any class instance. The *only* novel behavior is inside the compiler-known type: the shared count, and last-one-disposes.
 - **`new Shared<T>(owned value: T)`** consumes an owned T — the constructor is an owned-consuming position like any other ([§28.3](#sec-local-variables-ownership-and-borrows)); after construction the handle's disposal obligation *is* the value's. `T` must be a proper class type; runtime-managed and value types are rejected at instantiation ([§14.4](#sec-owned-as-a-generic-argument) pattern — they have no disposal obligation to share).
 - **`Clone(): owned Shared<T>`** produces a new handle and increments the count. Cost and intent are visible at the call site; there is no implicit handle duplication anywhere in the language (assigning a handle moves or borrows it per the ordinary rules — it never silently clones).
 - **`Get(): T`** produces a *borrow of the underlying value whose source is the handle*, valid while that handle lives — the same shape as the owning-collection indexer-get ([§28.11](#sec-element-slot-policy) owned column: borrow out, source: the collection). The borrow does not extend the value's lifetime; the handle does. [§28.6](#sec-leak-prevention)'s owned-field-return rule is not violated: `Get()` is the compiler-known accessor dispensation that owning-collection reads already have.
@@ -5930,22 +5930,22 @@ Calling `GetEnumerator()` produces a fresh enumerator positioned just before the
 <a id="sec-current-semantics-on-borrowing-and-owning-enumerators"></a>
 #### `Current` semantics on borrowing and owning enumerators
 
-`IEnumerator<T>` and `OwnedEnumerator<T>` (declared in stdlib [§4.12](Bezel_Standard_Library.md#sec-borrowing-enumeration-interfaces), [§4.13](Bezel_Standard_Library.md#sec-owning-enumeration-interfaces)) are distinct interfaces with different `Current` semantics:
+`IEnumerator<T>` and `IOwningEnumerator<T>` (declared in stdlib [§4.12](Bezel_Standard_Library.md#sec-borrowing-enumeration-interfaces), [§4.13](Bezel_Standard_Library.md#sec-owning-enumeration-interfaces)) are distinct interfaces with different `Current` semantics:
 
 - **`IEnumerator<T>.Current`** is **non-destructive**: it returns a borrow of the most-recently-yielded value, which the enumerator continues to own (if it has ownership of the source) or re-borrow (if the source is borrow-based). Multiple reads between `MoveNext` calls produce additional borrows of the same value. The async variant `IAsyncEnumerator<T>.Current` has the same non-destructive semantics relative to `MoveNextAsync`.
 
-- **`OwnedEnumerator<T>.TakeCurrent()`** (v0.161 — was the destructive property `Current: owned T`) is an ordinary **owned-returning method**: after a successful `MoveNext`, `TakeCurrent()` transfers ownership of the most-recently-yielded value to the caller, leaving the enumerator's internal slot empty; the result follows the standard [§28.1](#sec-where-the-owned-modifier-can-appear)/[§28.3](#sec-local-variables-ownership-and-borrows) owned-return rules (discharge or auto-drop-with-warning — no special carve-out needed). A second take without an intervening advance, or a take before the first advance / after exhaustion, raises **`InvalidOperationException`** (previously undefined behavior). The redesign removes the language's only *destructive property getter* — a getter that moved out of a field violated [§28.6](#sec-leak-prevention) as written, and [§23](#sec-properties-and-indexers) itself prescribes "an explicit method that returns the owned value" for transfer-out semantics. The async variant is `OwnedAsyncEnumerator<T>.TakeCurrent()` relative to `MoveNextAsync`.
+- **`IOwningEnumerator<T>.TakeCurrent()`** (v0.161 — was the destructive property `Current: owned T`) is an ordinary **owned-returning method**: after a successful `MoveNext`, `TakeCurrent()` transfers ownership of the most-recently-yielded value to the caller, leaving the enumerator's internal slot empty; the result follows the standard [§28.1](#sec-where-the-owned-modifier-can-appear)/[§28.3](#sec-local-variables-ownership-and-borrows) owned-return rules (discharge or auto-drop-with-warning — no special carve-out needed). A second take without an intervening advance, or a take before the first advance / after exhaustion, raises **`InvalidOperationException`** (previously undefined behavior). The redesign removes the language's only *destructive property getter* — a getter that moved out of a field violated [§28.6](#sec-leak-prevention) as written, and [§23](#sec-properties-and-indexers) itself prescribes "an explicit method that returns the owned value" for transfer-out semantics. The async variant is `IOwningAsyncEnumerator<T>.TakeCurrent()` relative to `MoveNextAsync`.
 
-`OwnedEnumerator<T>` is reached via:
-- `OwnedEnumerable<T>.GetOwnedEnumerator()` — typically called by the for-loop desugaring when the source is `OwnedEnumerable<T>`.
-- Drain methods on owning collections (`OwnedArray<T>.Drain()` etc.) — their return type is `OwnedEnumerable<T>`, and the resulting enumerator is `OwnedEnumerator<T>`.
-- Iterator methods using `yield return` whose declared return type is `OwnedEnumerable<T>` (or async equivalents).
+`IOwningEnumerator<T>` is reached via:
+- `IOwningEnumerable<T>.GetOwningEnumerator()` — typically called by the for-loop desugaring when the source is `IOwningEnumerable<T>`.
+- Drain methods on owning collections (`OwningArray<T>.Drain()` etc.) — their return type is `IOwningEnumerable<T>`, and the resulting enumerator is `IOwningEnumerator<T>`.
+- Iterator methods using `yield return` whose declared return type is `IOwningEnumerable<T>` (or async equivalents).
 
-Default iteration over an owning collection (`for var x in coll do ... end` where `coll: OwnedArray<C>`) uses the collection's `IEnumerable<C>` conformance — the borrowing path — and produces borrows of C. To opt into owned-transferring iteration, call `coll.Drain()` (which returns `OwnedEnumerable<C>`) and iterate over the result. The for-loop desugaring at [§29.2](#sec-desugaring-of-for) picks based on the static type of the source expression: a source typed `IEnumerable<T>` desugars via `IEnumerator<T>` (non-destructive); a source typed `OwnedEnumerable<T>` desugars via `OwnedEnumerator<T>` (destructive).
+Default iteration over an owning collection (`for var x in coll do ... end` where `coll: OwningArray<C>`) uses the collection's `IEnumerable<C>` conformance — the borrowing path — and produces borrows of C. To opt into owned-transferring iteration, call `coll.Drain()` (which returns `IOwningEnumerable<C>`) and iterate over the result. The for-loop desugaring at [§29.2](#sec-desugaring-of-for) picks based on the static type of the source expression: a source typed `IEnumerable<T>` desugars via `IEnumerator<T>` (non-destructive); a source typed `IOwningEnumerable<T>` desugars via `IOwningEnumerator<T>` (destructive).
 
 The for-loop desugaring reads `__enumerator.Current` exactly once per iteration, matching the destructive-read semantics naturally on the owning path. The destructive read is invisible to user code that uses `for` or `await for` loops — the loop body sees `var x := __enumerator.Current` (or its `for var x in ...` equivalent), and `x` is owned and subject to the standard discharge rules. Users who call `MoveNext`/`MoveNextAsync` and read `Current` manually (outside a loop form) need to be aware that `Current` is single-use per advance for the owning variant.
 
-Implementations of `OwnedEnumerator<T>` or `OwnedAsyncEnumerator<T>` may choose either of two storage strategies for the most-recently-yielded value: store it in a private owned field that is moved out by `Current`'s getter (using the [§28.8.1](#sec-the-move-expression) `move` form internally), or maintain the value in transient state that exists only between the advance call and the next `Current` read. Both strategies satisfy the contract; the choice is implementation-detail.
+Implementations of `IOwningEnumerator<T>` or `IOwningAsyncEnumerator<T>` may choose either of two storage strategies for the most-recently-yielded value: store it in a private owned field that is moved out by `Current`'s getter (using the [§28.8.1](#sec-the-move-expression) `move` form internally), or maintain the value in transient state that exists only between the advance call and the next `Current` read. Both strategies satisfy the contract; the choice is implementation-detail.
 
 <a id="sec-desugaring-of-for"></a>
 ### 29.2 Desugaring of `for`
@@ -5969,12 +5969,12 @@ do
 end;
 ```
 
-When `source` is typed as `OwnedEnumerable<T>` (or implements it), the desugaring uses the owning-enumerator path:
+When `source` is typed as `IOwningEnumerable<T>` (or implements it), the desugaring uses the owning-enumerator path:
 
 ```bezel
 do
   using var __source := source;
-  using var __enumerator := __source.GetOwnedEnumerator();
+  using var __enumerator := __source.GetOwningEnumerator();
   while __enumerator.MoveNext() do
     var x := __enumerator.TakeCurrent();     // x is owned; §28.3 rules apply
                                               //   on every body-exit edge
@@ -5985,7 +5985,7 @@ end;
 
 The iteration variable `x` is a **plain owned local**, not a `using var`. This is intentional: the user must be able to discharge `x` by moving it into another owned slot (e.g., `dest.Add(x)`, `using var c := x` for scope-bound disposal, or `return x`), and `using var` would forbid the move. The compiler enforces the discharge requirement by treating the loop body as a scope whose every exit edge (fall-through to the next iteration, `break`, `continue`, `return`, `throw`) must dispose or move `x`. The "fall-through to the next iteration" edge is checked the same way as the body's end: at the closing `end` of the body, `x` must be in moved-from or disposed state. The compiler-generated check is identical to the [§28.3](#sec-local-variables-ownership-and-borrows) owned-local discharge rule applied to the iteration variable.
 
-The choice is made by the static type of `source`. If `source`'s static type implements both `IEnumerable<T>` and `OwnedEnumerable<T>` (as `OwnedArray<T>` does), the desugaring uses the `IEnumerable<T>` path — default iteration is borrowing. To opt into the owning path, the source must be expressed at static type `OwnedEnumerable<T>`, typically by calling `.Drain()` on an owning collection.
+The choice is made by the static type of `source`. If `source`'s static type implements both `IEnumerable<T>` and `IOwningEnumerable<T>` (as `OwningArray<T>` does), the desugaring uses the `IEnumerable<T>` path — default iteration is borrowing. To opt into the owning path, the source must be expressed at static type `IOwningEnumerable<T>`, typically by calling `.Drain()` on an owning collection.
 
 Both `__source` and `__enumerator` are disposed on every exit path. The loop variable is freshly bound each iteration. `break` exits the surrounding `do ... end`, triggering disposal of both. `continue` jumps to the next `MoveNext` call.
 
@@ -5997,19 +5997,19 @@ When `source` is a `Range<T>` value ([§16.3](#sec-the-ranget-type)), the compil
 
 When `source` has inline-array type (`[N]T`, including the borrow-bearing and owning slot-marker forms), the desugaring is a direct indexed loop over the array's slots — inline arrays do not implement `IEnumerable<T>` and the enumerator path of [§29.2](#sec-desugaring-of-for) does not apply ([§15.1.2](#sec-inline-array-members)). The iteration variable's type and ownership state follow the slot kind: a copy for value-typed slots, a borrow for class-typed slots (whether the slot marker is `owned` or not — for owning slots the array retains ownership, and the loop body sees a borrow that does not consume the slot). Direct `move arr[i]` inside the loop body is admitted, but the field-restoration rule ([§28.8.1](#sec-the-move-expression)) applies: every moved-from slot must be reassigned before the surrounding method exits. Iterating an `[N owned]T` non-nullable owning array and moving from every slot without restoration is therefore rejected; the typical pattern for "consume every slot" uses `[N owned]T?` and assigns `null` after each move.
 
-When `source` has type `Span<T>` or `ReadOnlySpan<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the desugaring is also a direct indexed loop over the span's range, parallel to the inline-array case. Spans do not implement `IEnumerable<T?>` — the enumerator returned by `IEnumerable<T>.GetEnumerator()` is an ordinary class instance that would need to hold a borrow of the underlying buffer across its own lifetime, which the borrow tracker cannot bound through the enumerator interface — so the enumerator path of this section does not apply. The iteration variable's type follows the span's slot type: `T?` for class-typed T (the loop body sees a borrow of each slot's value, possibly null) and `T` for value-typed T (the loop body sees a borrow of the slot — effectively a value copy for primitive T). The borrow's source is the underlying `OwnedBuffer<T>`, reached transitively through the span's `Buffer` field. Direct `move span[i]` inside the loop body is admitted for class-typed `Span<T>` (not for value-typed `Span<T>`, not for any `ReadOnlySpan<T>`); the same field-restoration rule applies to the underlying buffer slot, and the typical restoration is `span[i] := null`.
+When `source` has type `Span<T>` or `ReadOnlySpan<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the desugaring is also a direct indexed loop over the span's range, parallel to the inline-array case. Spans do not implement `IEnumerable<T?>` — the enumerator returned by `IEnumerable<T>.GetEnumerator()` is an ordinary class instance that would need to hold a borrow of the underlying buffer across its own lifetime, which the borrow tracker cannot bound through the enumerator interface — so the enumerator path of this section does not apply. The iteration variable's type follows the span's slot type: `T?` for class-typed T (the loop body sees a borrow of each slot's value, possibly null) and `T` for value-typed T (the loop body sees a borrow of the slot — effectively a value copy for primitive T). The borrow's source is the underlying `OwningBuffer<T>`, reached transitively through the span's `Buffer` field. Direct `move span[i]` inside the loop body is admitted for class-typed `Span<T>` (not for value-typed `Span<T>`, not for any `ReadOnlySpan<T>`); the same field-restoration rule applies to the underlying buffer slot, and the typical restoration is `span[i] := null`.
 
-When `source` has type `OwnedBuffer<T>` for value-typed T (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the desugaring is a direct indexed loop, parallel to the span case. The iteration variable's type is T and the loop body sees a borrow of each slot's value. (For class-typed `OwnedBuffer<T>`, the type implements `IEnumerable<T?>` and the standard enumerator path applies, with the optimization-elision rule above; the observable result is the same as a direct-indexed loop.)
+When `source` has type `OwningBuffer<T>` for value-typed T (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the desugaring is a direct indexed loop, parallel to the span case. The iteration variable's type is T and the loop body sees a borrow of each slot's value. (For class-typed `OwningBuffer<T>`, the type implements `IEnumerable<T?>` and the standard enumerator path applies, with the optimization-elision rule above; the observable result is the same as a direct-indexed loop.)
 
 When `source` has type `ReadOnlyStringSpan` (stdlib [§3.3](Bezel_Standard_Library.md#sec-readonlystringspan)), the desugaring is a direct indexed loop, parallel to the `ReadOnlySpan<T>` case. `ReadOnlyStringSpan` does not implement `IEnumerable<char>` — the enumerator returned by `IEnumerable<T>.GetEnumerator()` is an ordinary class instance that would need to hold the span (or its borrow of the source string) across its own lifetime, and the borrow tracker cannot bound that lifetime through the enumerator interface. The iteration variable's type is `char` and the loop body sees a copy of each code point (chars are value-typed primitives). The borrow's source is the underlying `string`, reached through the span's `Source` field.
 
 When `source` has type `ReadOnlyAsciiByteSpan` (stdlib [§3.4](Bezel_Standard_Library.md#sec-readonlyasciibytespan)), the desugaring is a direct indexed loop, parallel to the `ReadOnlyStringSpan` case above. The iteration variable's type is `byte` and the loop body sees a copy of each byte (the byte produced by the cast `byte(Source[Start + i])`, safe per the ASCII invariant established at span construction). The borrow's source is the underlying `string`, reached through the span's `Source` field.
 
-When `source` has type `ArraySpan<T>` or `ReadOnlyArraySpan<T>` (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), the desugaring is a direct indexed loop, parallel to the `Span<T>` / `ReadOnlySpan<T>` case. Neither type implements `IEnumerable<T>` — the same enumerator-escape reasoning given for `ReadOnlyStringSpan` above applies. The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying `Array<T>`, reached through the span's `Source` field). The iteration-variable type follows the array's element type directly — `T` is whatever the array was instantiated with (no `T?` wrapping, unlike the OwnedBuffer-backed span case for class T, because `Array<T>` slots store borrows rather than owned nullable references). `move arrSpan[i]` is not admitted in the loop body for any T, since `Array<T>` slots are borrows with no ownership to transfer.
+When `source` has type `ArraySpan<T>` or `ReadOnlyArraySpan<T>` (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), the desugaring is a direct indexed loop, parallel to the `Span<T>` / `ReadOnlySpan<T>` case. Neither type implements `IEnumerable<T>` — the same enumerator-escape reasoning given for `ReadOnlyStringSpan` above applies. The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying `Array<T>`, reached through the span's `Source` field). The iteration-variable type follows the array's element type directly — `T` is whatever the array was instantiated with (no `T?` wrapping, unlike the OwningBuffer-backed span case for class T, because `Array<T>` slots store borrows rather than owned nullable references). `move arrSpan[i]` is not admitted in the loop body for any T, since `Array<T>` slots are borrows with no ownership to transfer.
 
 When `source` has type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)), the desugaring is a direct indexed loop over `0..<source.Length`, accessing each element via `source[i]`. The iteration variable's type is `TElement`. Indexer and `Length` access through the interface are virtual dispatches (vtable lookup, indirect call); the iteration is correspondingly slower than iterating a concrete span type. Authors writing inner loops should iterate over concrete span types where peak per-element throughput matters; the interface-typed for-loop is the convenient form for code where breadth across span sources is more important than performance. The lifetime constraint is the standard one: the `IReadOnlySpan<TElement>` value (a boxed borrow-bearing record per the rule of [§8.6](#sec-boxing-of-borrow-bearing-records)) may not outlive the source of the underlying span's borrow, which the compiler tracks through the boxed-value lifetime constraint.
 
-More generally, the compiler may elide the `IEnumerable`/`IEnumerator` protocol and the associated heap allocation whenever it can prove that the observable behavior is identical to the desugared form. For heap arrays (`Array<T>`, `OwnedArray<T>`) and strings, the compiler is expected to emit direct indexed loops as an optimization (these types do implement `IEnumerable<T>`, but the protocol is elided when the compiler can see the type concretely). For inline arrays (`[N]T`), the direct indexed loop is mandatory rather than optimizational — inline arrays are not class types and do not implement `IEnumerable<T>` at all ([§15.1.2](#sec-inline-array-members)). For range literals with constant endpoints, the compiler emits tight counted loops with no allocation. These optimizations ensure that the common `for` patterns — iterating an array, a string, or a numeric range — incur no disposal overhead from `IEnumerator<T>: IDisposable`.
+More generally, the compiler may elide the `IEnumerable`/`IEnumerator` protocol and the associated heap allocation whenever it can prove that the observable behavior is identical to the desugared form. For heap arrays (`Array<T>`, `OwningArray<T>`) and strings, the compiler is expected to emit direct indexed loops as an optimization (these types do implement `IEnumerable<T>`, but the protocol is elided when the compiler can see the type concretely). For inline arrays (`[N]T`), the direct indexed loop is mandatory rather than optimizational — inline arrays are not class types and do not implement `IEnumerable<T>` at all ([§15.1.2](#sec-inline-array-members)). For range literals with constant endpoints, the compiler emits tight counted loops with no allocation. These optimizations ensure that the common `for` patterns — iterating an array, a string, or a numeric range — incur no disposal overhead from `IEnumerator<T>: IDisposable`.
 
 <a id="sec-iterator-yield-ownership"></a>
 #### Iterator yield ownership
@@ -6022,9 +6022,9 @@ The behavior of `yield return expression;` depends on the static type of the yie
 
   This is the rule that has applied since v0.78. It is the appropriate model for iterators whose consumers borrow each value briefly and discard it: filtering, formatting, dispatching to handlers.
 
-- **Owned class-typed expression yielded from an iterator returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`.** The yield transfers ownership *through* the enumerator to the consumer on each `MoveNext()` (or `MoveNextAsync()` for the async case). The enumerator does not retain ownership between yields — the value is handed off as part of the advance boundary. The consumer's iteration variable in `for var x in src do ... end` (or `await for var x in src do ... end` for the async case) is **owned**; the [§28.3](#sec-owned-local-discharge-requirement) discharge rules apply in the loop body on every body-exit edge. Falling off the body still owning the value auto-drops it at the body's end for that iteration, with the must-use warning identifying the iteration variable and pointing at the standard remedies (`using var u := x;` for scope-bound disposal, an `owned`-consuming method call, an explicit `x.Dispose()`, or `_ := x;`).
+- **Owned class-typed expression yielded from an iterator returning `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, or `IOwningAsyncEnumerator<T>`.** The yield transfers ownership *through* the enumerator to the consumer on each `MoveNext()` (or `MoveNextAsync()` for the async case). The enumerator does not retain ownership between yields — the value is handed off as part of the advance boundary. The consumer's iteration variable in `for var x in src do ... end` (or `await for var x in src do ... end` for the async case) is **owned**; the [§28.3](#sec-owned-local-discharge-requirement) discharge rules apply in the loop body on every body-exit edge. Falling off the body still owning the value auto-drops it at the body's end for that iteration, with the must-use warning identifying the iteration variable and pointing at the standard remedies (`using var u := x;` for scope-bound disposal, an `owned`-consuming method call, an explicit `x.Dispose()`, or `_ := x;`).
 
-  This is the model for iterators whose consumers take ownership of each value: drain operations on owning collections (synchronous), async iterators producing owned resources (async pipelines such as `OwnedAsyncEnumerable<FileStream>`).
+  This is the model for iterators whose consumers take ownership of each value: drain operations on owning collections (synchronous), async iterators producing owned resources (async pipelines such as `IOwningAsyncEnumerable<FileStream>`).
 
   The [§28.3](#sec-local-variables-ownership-and-borrows) discharge rules apply on every *normal-exit* edge from the loop body. The iteration variable is a local of the body's scope, and the standard owned-local rules — including v0.150's auto-drop with the must-use warning — apply to it directly: `break`, `continue`, `return`, `yield break`, and fall-through to the next iteration all count as normal-exit edges; on each, the iteration variable is either discharged by the program or auto-dropped with the warning. The same rule applies inside an `await for` body. On *exception* edges — whether from an explicit `throw` or from a method call that propagates an exception out of the body — the iteration variable is auto-disposed by the implicit `try`/`finally` rule of [§28.3](#sec-local-variables-ownership-and-borrows) "Exception-path discharge"; no user-written discharge is required for the exception case. Code that conditionally `break`s before the natural discharge point must move the discharge before the conditional, typically by binding the iteration variable to a `using var` immediately on entry to the body:
 
@@ -6044,11 +6044,11 @@ The behavior of `yield return expression;` depends on the static type of the yie
 
   When the iterator method's body sources the yielded values from an owning collection (the typical implementation of `Drain()`), it does so via the collection's removal operations — `PopFirst()`, `PopAt(i)`, `Pop()`, `Dequeue()`, etc. These operations remove and return the owned element in a single step, leaving the collection in a consistent post-call state without invoking the field-restoration rule. A naïve implementation using `move coll[i]` per slot without reassignment would *not* compile: each `move` leaves the slot in moved-from state, and the field-restoration rule ([§28.8.1](#sec-the-move-expression)) requires reassignment before the iterator method exits. The `Pop`-style operations sidestep the issue by removing the slot rather than emptying it. If the iterator is disposed before exhaustion — `break`, exception, manual `Dispose()` — the source collection's state is "consumed elements gone, remaining elements intact," consistent with the prefix actually iterated.
 
-- **Borrowed class-typed expression.** The yield is a re-borrow whose source is the original borrow's source. The lifetime constraint propagates: the iterator's enumerator may not outlive the source. The compiler enforces this by attaching the borrow source to the enumerator's lifetime, just as for any other borrow-bearing structure. This case applies regardless of whether the iterator's return type is `IEnumerable<T>` or `OwnedEnumerable<T>` — but the latter is unusual; an iterator declared to yield owned T but yielding borrows would have to source the ownership from somewhere, typically by wrapping each borrow in a fresh allocation, which is rarely the intent.
+- **Borrowed class-typed expression.** The yield is a re-borrow whose source is the original borrow's source. The lifetime constraint propagates: the iterator's enumerator may not outlive the source. The compiler enforces this by attaching the borrow source to the enumerator's lifetime, just as for any other borrow-bearing structure. This case applies regardless of whether the iterator's return type is `IEnumerable<T>` or `IOwningEnumerable<T>` — but the latter is unusual; an iterator declared to yield owned T but yielding borrows would have to source the ownership from somewhere, typically by wrapping each borrow in a fresh allocation, which is rarely the intent.
 
-- **Value-typed, `string`-typed, or runtime-managed expression.** No ownership transfers. The yield is a copy (for value types) or a shared reference (for `string` and other runtime-managed types). The enumerator does not dispose anything for these yield types; the next `MoveNext` simply produces the next value. The consumer's iteration variable is a copy (value types) or shared reference (runtime-managed) by the standard rules of those type kinds. The iterator's return type for these cases is `IEnumerable<T>`; the `OwnedEnumerable<T>` form is not available because `OwnedEnumerable<T>` requires `T: class` (stdlib [§4.13](Bezel_Standard_Library.md#sec-owning-enumeration-interfaces)). The class-only requirement is uniform across the owning collection family — owning makes sense only for class-typed values.
+- **Value-typed, `string`-typed, or runtime-managed expression.** No ownership transfers. The yield is a copy (for value types) or a shared reference (for `string` and other runtime-managed types). The enumerator does not dispose anything for these yield types; the next `MoveNext` simply produces the next value. The consumer's iteration variable is a copy (value types) or shared reference (runtime-managed) by the standard rules of those type kinds. The iterator's return type for these cases is `IEnumerable<T>`; the `IOwningEnumerable<T>` form is not available because `IOwningEnumerable<T>` requires `T: class` (stdlib [§4.13](Bezel_Standard_Library.md#sec-owning-enumeration-interfaces)). The class-only requirement is uniform across the owning collection family — owning makes sense only for class-typed values.
 
-When the body holds a borrow across a `MoveNext` (or `MoveNextAsync`) boundary — for example, by stashing the iteration variable in an outer field — the borrow becomes invalid as soon as the next advance runs. This is the standard borrow-lifetime rule ([§28.3](#sec-local-variables-ownership-and-borrows)) applied to iterator-yielded values. To retain a yielded value across iterations, the consumer must materialize it explicitly: dispose-and-replace into an owned slot if the producer documents the yield as transferable, or copy if the value is a record. This rule applies to the *first* of the owned-class-typed cases above (iterator returns `IEnumerable<T>` or `IAsyncEnumerable<T>` and yields owned values); for iterators returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`, the iteration variable is owned and the consumer is responsible for it for the body's duration regardless of advance timing — the value's lifetime is bounded by the consumer's discharge, not by the enumerator's next call.
+When the body holds a borrow across a `MoveNext` (or `MoveNextAsync`) boundary — for example, by stashing the iteration variable in an outer field — the borrow becomes invalid as soon as the next advance runs. This is the standard borrow-lifetime rule ([§28.3](#sec-local-variables-ownership-and-borrows)) applied to iterator-yielded values. To retain a yielded value across iterations, the consumer must materialize it explicitly: dispose-and-replace into an owned slot if the producer documents the yield as transferable, or copy if the value is a record. This rule applies to the *first* of the owned-class-typed cases above (iterator returns `IEnumerable<T>` or `IAsyncEnumerable<T>` and yields owned values); for iterators returning `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, or `IOwningAsyncEnumerator<T>`, the iteration variable is owned and the consumer is responsible for it for the body's duration regardless of advance timing — the value's lifetime is bounded by the consumer's discharge, not by the enumerator's next call.
 
 Disposing the enumerator (`break` from a `for` or `await for` loop, exhaustion, or `Dispose()`/`DisposeAsync()` on a manually-held enumerator) disposes any outstanding yielded value the iterator owns. For yield types that the iterator does not own (value types, `string`, runtime-managed types, or any case where ownership transfers to the consumer per the rules above), there is nothing for the enumerator to dispose.
 
@@ -6194,7 +6194,7 @@ end;
 <a id="sec-async-iterators"></a>
 ### 29.13 Async iterators
 
-`await for` iterates `IAsyncEnumerable<T>` (borrowing) and `OwnedAsyncEnumerable<T>` (owning) sources. See [§30.7](#sec-asynchronous-programming-async-iterators).
+`await for` iterates `IAsyncEnumerable<T>` (borrowing) and `IOwningAsyncEnumerable<T>` (owning) sources. See [§30.7](#sec-asynchronous-programming-async-iterators).
 
 ---
 
@@ -6210,11 +6210,11 @@ A method declared `async` may use `await`. The return type must be one of:
 
 - `Task` — no result value.
 - `Task<T>` for some type T — a result of type T, with no transferable ownership obligation on the awaiter.
-- `OwnedTask<T>` for some class type T — a result whose ownership transfers to the awaiter ([§30.5](#sec-result-lifetime-and-task-disposal)).
+- `OwningTask<T>` for some class type T — a result whose ownership transfers to the awaiter ([§30.5](#sec-result-lifetime-and-task-disposal)).
 - `IAsyncEnumerable<T>` — for re-iterable async iterators that contain `yield return` ([§30.7](#sec-asynchronous-programming-async-iterators)). The yielded values are borrowed by the consumer.
 - `IAsyncEnumerator<T>` — for single-use async iterators with borrowed-by-consumer values.
-- `OwnedAsyncEnumerable<T>` for class T — for async iterators that yield owned values; each consumer iteration variable is owned; the §28.3 discharge rules (auto-drop with the must-use warning) apply in the loop body.
-- `OwnedAsyncEnumerator<T>` for class T — single-use owned-yielding async iterator.
+- `IOwningAsyncEnumerable<T>` for class T — for async iterators that yield owned values; each consumer iteration variable is owned; the §28.3 discharge rules (auto-drop with the must-use warning) apply in the loop body.
+- `IOwningAsyncEnumerator<T>` for class T — single-use owned-yielding async iterator.
 
 ```bezel
 public async method DownloadAsync(url: string): Task<string>
@@ -6254,7 +6254,7 @@ Behavior:
 
 <a id="sec-the-task-and-taskt-types"></a>
 <a id="sec-the-task-taskt-and-ownedtaskt-types"></a>
-### 30.3 The `Task`, `Task<T>`, and `OwnedTask<T>` types
+### 30.3 The `Task`, `Task<T>`, and `OwningTask<T>` types
 
 ```bezel
 public class Task
@@ -6274,33 +6274,33 @@ public class Task<T>: Task
   public readonly property Result: T;
 end Task;
 
-public class OwnedTask<T>: Task where T: class
+public class OwningTask<T>: Task where T: class
   // Owning task: result transfers ownership to the awaiter (Pattern B).
   // Single-consumer by type.
   public readonly property Result: T;
-                    // v0.162 (#1379): reading Result on a COMPLETED OwnedTask
+                    // v0.162 (#1379): reading Result on a COMPLETED OwningTask
                     // in an owned-consuming position transfers ownership
                     // exactly like `await` (the result buffer is consumed;
                     // a second read/await raises InvalidOperationException).
                     // Subject to the same §30.3 blocking rules as Task<T>.Result:
                     // legal on an incomplete task only outside domains.
-end OwnedTask;
+end OwningTask;
 ```
 
 `Wait()` and `Result` are synchronous escape hatches for **code running outside any domain** — in practice, the synchronous portion of program startup: a non-`async` `Main`, and code it calls directly on the main thread. There, they block the calling thread until the task completes; the pool's workers drain the task's domain concurrently, so completion makes progress (this is the same mechanism by which the runtime itself drives an `async Main`, [§33.2](#sec-signatures)).
 
 **Inside a domain continuation — equivalently, anywhere `await` is available or the caller was reached from one — a blocking wait on an incomplete task is an error (v0.162).** A domain executes its continuations serially to completion ([§30.13](#sec-runtime-model)); a continuation blocked in `Wait()`/`Result` freezes its domain, and any awaited chain whose completion routes through that domain can never finish: a deterministic deadlock, not a hazard. The compiler rejects `Wait()` and `Result` lexically inside `async` methods and `async` lambdas (there, `await` is strictly superior and always available). Where static rejection cannot see the call (a non-`async` helper invoked from a continuation), the runtime raises `InvalidOperationException` at the call site instead of parking: *"blocking wait inside a domain continuation; the domain can never advance — await the task, or query IsCompleted."* Reading `Result` on a **completed** task is always legal and non-blocking: on a faulted task it re-raises the exception; on a cancelled task it raises `OperationCanceledException`.
 
-`OwnedTask<T>` does not expose a `Result` property — the result is single-consumer and ownership-transferring, so a "read result" operation would have no well-defined semantics (a second read would yield a moved-from value). Consumers must `await` an `OwnedTask<T>` in an owned-consuming position to obtain the result (see [§30.5](#sec-result-lifetime-and-task-disposal) Pattern B).
+`OwningTask<T>` does not expose a `Result` property — the result is single-consumer and ownership-transferring, so a "read result" operation would have no well-defined semantics (a second read would yield a moved-from value). Consumers must `await` an `OwningTask<T>` in an owned-consuming position to obtain the result (see [§30.5](#sec-result-lifetime-and-task-disposal) Pattern B).
 
-`Task`, `Task<T>`, and `OwnedTask<T>` are classes — they require disposal, with the patterns described in [§30.5](#sec-result-lifetime-and-task-disposal). Listing `IDisposable` explicitly in the inheritance clause would be redundant since every class implicitly implements it ([§28.2](#sec-the-idisposable-contract)). The `destructor;` form above follows the standard library documentation-shorthand convention (stdlib [§1](Bezel_Standard_Library.md#sec-conventions)); the actual destructor body is provided by the runtime and runs the continuation-cleanup logic described in [§30.10](#sec-standard-library-task-helpers) (the `FireAndForget` and `using var`-disposal-without-await cases).
+`Task`, `Task<T>`, and `OwningTask<T>` are classes — they require disposal, with the patterns described in [§30.5](#sec-result-lifetime-and-task-disposal). Listing `IDisposable` explicitly in the inheritance clause would be redundant since every class implicitly implements it ([§28.2](#sec-the-idisposable-contract)). The `destructor;` form above follows the standard library documentation-shorthand convention (stdlib [§1](Bezel_Standard_Library.md#sec-conventions)); the actual destructor body is provided by the runtime and runs the continuation-cleanup logic described in [§30.10](#sec-standard-library-task-helpers) (the `FireAndForget` and `using var`-disposal-without-await cases).
 
 <a id="sec-multiple-awaiters"></a>
 ### 30.4 Multiple awaiters
 
 A `Task` or `Task<T>` may be awaited from multiple places, sequentially or concurrently. Every awaiter sees the same eventual state. The underlying computation runs once. Continuations resume in unspecified order, but never concurrently with one another within a domain ([§30.13](#sec-runtime-model)).
 
-`OwnedTask<T>` is single-consumer per the Pattern B rules in [§30.5](#sec-result-lifetime-and-task-disposal): **the first await spends the task regardless of outcome** (v0.162 — success, fault, or cancellation), and a second await raises `InvalidOperationException`. (The "awaiting a faulted task re-raises" rule of [§30.9](#sec-exceptions-in-async-methods) applies to `Task`/`Task<T>` and to the *first* await of an `OwnedTask<T>` only.) Sharing an `OwnedTask<T>` across multiple potential awaiters is not the intended pattern. For fan-out with a class-typed result, use `Task<T>` (Pattern A); for single-consumer ownership-transferring resource production, use `OwnedTask<T>` (Pattern B).
+`OwningTask<T>` is single-consumer per the Pattern B rules in [§30.5](#sec-result-lifetime-and-task-disposal): **the first await spends the task regardless of outcome** (v0.162 — success, fault, or cancellation), and a second await raises `InvalidOperationException`. (The "awaiting a faulted task re-raises" rule of [§30.9](#sec-exceptions-in-async-methods) applies to `Task`/`Task<T>` and to the *first* await of an `OwningTask<T>` only.) Sharing an `OwningTask<T>` across multiple potential awaiters is not the intended pattern. For fan-out with a class-typed result, use `Task<T>` (Pattern A); for single-consumer ownership-transferring resource production, use `OwningTask<T>` (Pattern B).
 
 <a id="sec-result-lifetime-and-task-disposal"></a>
 ### 30.5 Result lifetime and task disposal
@@ -6314,10 +6314,10 @@ The task owns any class-typed result it produces. The pattern by which a result 
 - `Task<T>` for **class** T: the task may be awaited from multiple places. Every awaiter receives a borrow of the same underlying result. The result's lifetime is tied to the task — disposing the task disposes the result. This is **Pattern A**.
 
   **Pattern A result slots are of two kinds (v0.162).** When the async body produced a *fresh owned value* (a `return` of an owned expression), the task **owns the result** and its destructor disposes it directly. When the body did `return await <Pattern A source>`, the result is a *borrow through the source task* — the task cannot own what it borrowed; instead, ownership of the **source task** transfers into the outer task's state (a **chained** slot), and the outer destructor disposes the chained source task, never the borrowed result directly. "Disposing the task disposes the result" thereby holds *transitively*, and every Pattern A borrow has a defined owner at every link of the chain.
-- `OwnedTask<T>` for **class** T: the task produces a single owned result. Awaiting transfers ownership to the awaiter. The task may be awaited at most once for a successful (non-faulted, non-cancelled) result. This is **Pattern B**.
-- `OwnedTask<T>` for value type, `string`, or runtime-managed T: a compile error. `owned` on a non-class result is meaningless.
+- `OwningTask<T>` for **class** T: the task produces a single owned result. Awaiting transfers ownership to the awaiter. The task may be awaited at most once for a successful (non-faulted, non-cancelled) result. This is **Pattern B**.
+- `OwningTask<T>` for value type, `string`, or runtime-managed T: a compile error. `owned` on a non-class result is meaningless.
 
-`OwnedTask<T>` is the right choice for resource acquisition — operations whose entire purpose is to produce a fresh, single-consumer resource (a connection, a lock token, a parsed document). `Task<T>` is the right choice for fan-out: multiple subscribers reading the same eventual result.
+`OwningTask<T>` is the right choice for resource acquisition — operations whose entire purpose is to produce a fresh, single-consumer resource (a connection, a lock token, a parsed document). `Task<T>` is the right choice for fan-out: multiple subscribers reading the same eventual result.
 
 <a id="sec-consumer-side-rules"></a>
 #### Consumer-side rules
@@ -6342,8 +6342,8 @@ The principle resolves into the following examples of admitted task-expression p
 - **A reference to a `using var` or `await using var`-bound local** of static type `Task<T>`. The canonical form. The await produces a borrow whose source is the local; the borrow is valid within the local's scope.
 - **A reference to an `owned` parameter** of the enclosing method, of static type `Task<T>`. The parameter's lifetime spans the method body; the borrow is valid within the body.
 - **A reference to an `owned` field** of `this`, of static type `Task<T>`. The field's lifetime spans `this`'s lifetime, and the borrow is valid within method calls on `this`.
-- **An indexer access on an owning collection** whose static type is `OwnedArray<Task<T>>` (or analogous), where the collection itself occupies an owning location. The await produces a borrow whose source is the collection; the borrow is valid within the collection's lifetime. The same applies to dictionary indexer access into `OwnedDictionary<K, Task<T>>`.
-- **An iteration variable** in `for var task in tasks do ... end` where `tasks` is `Array<Task<T>>` or `OwnedArray<Task<T>>` (borrowing iteration, not Drain). Each `task` is a borrow whose source is `tasks`; the await within the loop body produces a borrow valid for the loop body.
+- **An indexer access on an owning collection** whose static type is `OwningArray<Task<T>>` (or analogous), where the collection itself occupies an owning location. The await produces a borrow whose source is the collection; the borrow is valid within the collection's lifetime. The same applies to dictionary indexer access into `OwningDictionary<K, Task<T>>`.
+- **An iteration variable** in `for var task in tasks do ... end` where `tasks` is `Array<Task<T>>` or `OwningArray<Task<T>>` (borrowing iteration, not Drain). Each `task` is a borrow whose source is `tasks`; the await within the loop body produces a borrow valid for the loop body.
 - **A producer call directly inside `return` of an async method whose return type is `Task<U>` for class U** (Pattern A) — i.e., `return await Producer();`. The producer's task is owned by the enclosing state machine; the borrow flows into the outer Pattern A task's result slot, whose lifetime is bounded by the outer task.
 
 The principle the list illustrates: any expression that produces an owned-task value (whether obtained directly or by borrowing into an owning slot) has a source the compiler can name. The principle also rejects: bare producer calls in argument or other expression positions, e.g. `Process(await Producer())` or `var x := await Producer();` without binding the task first. The borrowed result of these forms would have no syntactically-visible source whose lifetime the compiler can bound. The fix is to bind the producer's result to a `using var` first:
@@ -6375,18 +6375,18 @@ ProcessResponse(response);
 
 A bare `var x := await someTask;` where `someTask` is not in one of the admitted positions is a compile error. The error message identifies the offending await and references the principle above; the typical fix is to introduce a `using var task := Producer(); var x := await task;` pair.
 
-**`OwnedTask<T>` for class T (Pattern B):** the await must appear in an **owned-consuming context**. Owned-consuming contexts are positions in the AST where the type system requires the value reaching that position to be discharged. They include:
+**`OwningTask<T>` for class T (Pattern B):** the await must appear in an **owned-consuming context**. Owned-consuming contexts are positions in the AST where the type system requires the value reaching that position to be discharged. They include:
 
 - The right-hand side of `using var x := await ...` or `await using var x := await ...` — the canonical form. Ownership of the result transfers to the declared local.
 - The right-hand side of `var x := await ...` — `var` introduces an owned local of class type T when the right-hand side is owned, and the standard owned-local discharge rules ([§28.3](#sec-local-variables-ownership-and-borrows)) apply to `x` from the binding point forward.
 - The right-hand side of an assignment to an owned-element collection slot via the indexer setter (`coll[i] := await ...`), or to an `owned` field that is in moved-from state at the assignment point (`field := await ...` after `move field`).
 - An argument expression bound to an `owned` parameter of a method call, e.g., `coll.Add(await someTask)` where `Add(owned item: T)`.
-- A `return` expression in a method whose return type is `owned T` (or whose return type wraps `owned T` such as `OwnedTask<T>`).
-- A `yield return` expression in an iterator method whose return type is `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`. Ownership transfers from the yielding method through the enumerator to the consumer per [§29.2](#sec-desugaring-of-for) "Iterator yield ownership."
+- A `return` expression in a method whose return type is `owned T` (or whose return type wraps `owned T` such as `OwningTask<T>`).
+- A `yield return` expression in an iterator method whose return type is `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, or `IOwningAsyncEnumerator<T>`. Ownership transfers from the yielding method through the enumerator to the consumer per [§29.2](#sec-desugaring-of-for) "Iterator yield ownership."
 
 The task is disposed implicitly without disposing its result; it cannot be awaited again, and a second await raises `InvalidOperationException`.
 
-The await operator on a `OwnedTask<T>` for class T is itself **owned-consuming with respect to its operand**: when the awaited expression is an owned task value (an owned local of `OwnedTask<T>`, an iteration variable from draining an `OwnedArray<OwnedTask<T>>`, an `owned` parameter, or any other owned-typed expression of `OwnedTask<T>`), the await consumes the task as part of the operation and satisfies the discharge requirement on the operand — **on all outgoing edges of the await, including the fault/cancel (exception) edge** (v0.162): after a faulted first await, an owned operand is moved-from per [§28.3](#sec-local-variables-ownership-and-borrows), and a retry requires binding a fresh task. The implicit task-disposal that the runtime performs is the same operation that satisfies the type system's discharge rule; one is the runtime view, the other is the static-analysis view of the same event.
+The await operator on a `OwningTask<T>` for class T is itself **owned-consuming with respect to its operand**: when the awaited expression is an owned task value (an owned local of `OwningTask<T>`, an iteration variable from draining an `OwningArray<OwningTask<T>>`, an `owned` parameter, or any other owned-typed expression of `OwningTask<T>`), the await consumes the task as part of the operation and satisfies the discharge requirement on the operand — **on all outgoing edges of the await, including the fault/cancel (exception) edge** (v0.162): after a faulted first await, an owned operand is moved-from per [§28.3](#sec-local-variables-ownership-and-borrows), and a retry requires binding a fresh task. The implicit task-disposal that the runtime performs is the same operation that satisfies the type system's discharge rule; one is the runtime view, the other is the static-analysis view of the same event.
 
 In practice this means the natural patterns work without explicit task disposal:
 
@@ -6397,13 +6397,13 @@ for var task in taskArray.Drain() do
 end;
 
 // Local variable of owned task type
-var theTask := SomeFactory();   // theTask: owned OwnedTask<T>
+var theTask := SomeFactory();   // theTask: owned OwningTask<T>
 using var result := await theTask;  // theTask discharged by the await
 ```
 
 In neither case does the user need a separate `using var` to discharge the task itself — the await's implicit disposal *is* the discharge.
 
-Pattern B tasks are single-consumer by type — once awaited they are spent, and sharing a `OwnedTask<T>` across multiple potential awaiters is not the intended pattern. In the typical case the operand is owned (an owned local, an owned parameter, or an iteration variable from draining an array of tasks), and the discharge rule applies as described above. When the operand is borrowed, the await still disposes the task implicitly per the runtime semantics, but no discharge is owed for it. The `using var task := SomeFactory(); var x := await task;` shape, where `task` is `using var`-bound and then awaited, is one common form; the await's implicit disposal happens first, and the using-var's disposal at scope end is a no-op per the idempotency rule ([§28.2](#sec-the-idisposable-contract)).
+Pattern B tasks are single-consumer by type — once awaited they are spent, and sharing a `OwningTask<T>` across multiple potential awaiters is not the intended pattern. In the typical case the operand is owned (an owned local, an owned parameter, or an iteration variable from draining an array of tasks), and the discharge rule applies as described above. When the operand is borrowed, the await still disposes the task implicitly per the runtime semantics, but no discharge is owed for it. The `using var task := SomeFactory(); var x := await task;` shape, where `task` is `using var`-bound and then awaited, is one common form; the await's implicit disposal happens first, and the using-var's disposal at scope end is a no-op per the idempotency rule ([§28.2](#sec-the-idisposable-contract)).
 
 ```bezel
 // Canonical form: using-var binding
@@ -6416,10 +6416,10 @@ var token := await semaphore.AcquireAsync();
 TransferToHelper(token);    // owned local consumed by owned parameter
 
 // Direct ownership transfer to a method call accepting owned
-results.Add(await loadTask);     // results: OwnedArray<T>; Add takes owned
+results.Add(await loadTask);     // results: OwningArray<T>; Add takes owned
 
 // Direct return
-public async method Acquire(): OwnedTask<Connection>
+public async method Acquire(): OwningTask<Connection>
   return await ConnectAsync(url);     // owned T flows to owned T return
 end Acquire;
 ```
@@ -6437,12 +6437,12 @@ await connection.SendAsync(data);
 // At end of scope: connection.DisposeAsync() awaited.
 ```
 
-For a `OwnedTask<T>` not awaited in an owned-consuming context — for example, an `await` whose result is discarded, or appears in a non-owned-consuming expression position — the await is a compile error. The error message names the owned-consuming positions admitted by the rule above and points to the `using var` form as the canonical choice.
+For a `OwningTask<T>` not awaited in an owned-consuming context — for example, an `await` whose result is discarded, or appears in a non-owned-consuming expression position — the await is a compile error. The error message names the owned-consuming positions admitted by the rule above and points to the `using var` form as the canonical choice.
 
 <a id="sec-disposing-an-unconsumed-ownedtaskt"></a>
-#### Disposing an unconsumed `OwnedTask<T>`
+#### Disposing an unconsumed `OwningTask<T>`
 
-If a `OwnedTask<T>` is dropped or disposed before its result has been transferred — for example, by `using var` on the task itself with no await — disposing the task disposes the result if one was produced. This makes "fire and forget then drop" safe for owned-result tasks.
+If a `OwningTask<T>` is dropped or disposed before its result has been transferred — for example, by `using var` on the task itself with no await — disposing the task disposes the result if one was produced. This makes "fire and forget then drop" safe for owned-result tasks.
 
 ```bezel
 do
@@ -6457,9 +6457,9 @@ When the task has not completed at the point of disposal, the `Dispose()` call a
 A task that has been awaited and faulted, or awaited and cancelled, has no owned result to dispose; disposal is a no-op for the result.
 
 <a id="sec-multiple-awaits-on-ownedtaskt"></a>
-#### Multiple awaits on `OwnedTask<T>`
+#### Multiple awaits on `OwningTask<T>`
 
-A `OwnedTask<T>` is single-consumer by type. Awaiting one twice raises `InvalidOperationException` on the second await even when the first await completed successfully — the result has already been moved out.
+A `OwningTask<T>` is single-consumer by type. Awaiting one twice raises `InvalidOperationException` on the second await even when the first await completed successfully — the result has already been moved out.
 
 For a `Task<T>` (no `owned`) for class T, multiple awaits are permitted ([§30.4](#sec-multiple-awaiters)); each receives a borrow.
 
@@ -6468,26 +6468,26 @@ For a `Task<T>` (no `owned`) for class T, multiple awaits are permitted ([§30.4
 
 The factory `Task.FromResult<T>(value: T)` produces a completed task whose result is `value`. It is restricted to non-class T (value types, `string`, runtime-managed reference types); calling it with a class-typed T is a compile error.
 
-For class T, use `Task.FromOwnedResult<T>(owned value: T): OwnedTask<T>` instead. The caller transfers ownership of `value` to the task; the produced task is Pattern B (single-consumer, owned result), and consumers await it under the `using var x := await ...` shape:
+For class T, use `Task.FromOwnedResult<T>(owned value: T): OwningTask<T>` instead. The caller transfers ownership of `value` to the task; the produced task is Pattern B (single-consumer, owned result), and consumers await it under the `using var x := await ...` shape:
 
 ```bezel
 Task.FromResult(42);                               // T = int, value-typed
 Task.FromResult("done");                           // T = string, runtime-managed
-Task.FromOwnedResult<MyClass>(new MyClass());      // T = MyClass, returns OwnedTask<MyClass>
+Task.FromOwnedResult<MyClass>(new MyClass());      // T = MyClass, returns OwningTask<MyClass>
 ```
 
-The same split applies to `TaskCompletionSource<T>`: the standard form is for non-class T (value, string, runtime-managed) and produces `Task<T>`; `OwnedTaskCompletionSource<T> where T: class` is the form for class T and produces `OwnedTask<T>`. See [§30.10](#sec-standard-library-task-helpers) and [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet).
+The same split applies to `TaskCompletionSource<T>`: the standard form is for non-class T (value, string, runtime-managed) and produces `Task<T>`; `OwningTaskCompletionSource<T> where T: class` is the form for class T and produces `OwningTask<T>`. See [§30.10](#sec-standard-library-task-helpers) and [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet).
 
-There is no factory for producing a Pattern A `Task<T>` of class T from an externally-supplied owned value; Pattern A class-typed tasks arise from async methods whose body returns a value (the compiler inserts the appropriate ownership transfer into the task's slot) and from awaiting other Pattern A sources. Imperative completion of a Pattern A class-typed task is a future-revision question; the cases that motivate it are uncommon, and the available patterns (writing an async wrapper that awaits an `OwnedTaskCompletionSource` and re-publishes the result) cover the practical needs.
+There is no factory for producing a Pattern A `Task<T>` of class T from an externally-supplied owned value; Pattern A class-typed tasks arise from async methods whose body returns a value (the compiler inserts the appropriate ownership transfer into the task's slot) and from awaiting other Pattern A sources. Imperative completion of a Pattern A class-typed task is a future-revision question; the cases that motivate it are uncommon, and the available patterns (writing an async wrapper that awaits an `OwningTaskCompletionSource` and re-publishes the result) cover the practical needs.
 
 <a id="sec-idiom-async-resource-acquisition"></a>
 #### Idiom: async resource acquisition
 
-The combination of `OwnedTask<T>` and Pattern B is what makes resource-acquisition APIs natural:
+The combination of `OwningTask<T>` and Pattern B is what makes resource-acquisition APIs natural:
 
 ```bezel
 public class Semaphore
-  public async method AcquireAsync(): OwnedTask<SemaphoreToken>;
+  public async method AcquireAsync(): OwningTask<SemaphoreToken>;
 end Semaphore;
 
 // Caller:
@@ -6510,14 +6510,14 @@ end;
 
 var quick: (string) -> Task<int> := async (url) => await CountBytesAsync(url);
 
-var loader: (string) -> OwnedTask<Resource> := async (path) => do
+var loader: (string) -> OwningTask<Resource> := async (path) => do
   return await LoadResourceAsync(path);     // Pattern B return; the lambda's
                                              //   state machine forwards the
                                              //   owned Resource through.
 end;
 ```
 
-The function type of an async lambda has a `Task`, `Task<T>`, or `OwnedTask<T>` return type. The choice follows the same rules as for async methods ([§30.1](#sec-async-methods)): `Task` for void, `Task<T>` for borrowing or value-typed results, `OwnedTask<T>` for class-typed results that transfer ownership to the awaiter (Pattern B; see [§30.5](#sec-result-lifetime-and-task-disposal)).
+The function type of an async lambda has a `Task`, `Task<T>`, or `OwningTask<T>` return type. The choice follows the same rules as for async methods ([§30.1](#sec-async-methods)): `Task` for void, `Task<T>` for borrowing or value-typed results, `OwningTask<T>` for class-typed results that transfer ownership to the awaiter (Pattern B; see [§30.5](#sec-result-lifetime-and-task-disposal)).
 
 <a id="sec-asynchronous-programming-async-iterators"></a>
 ### 30.7 Async iterators
@@ -6574,10 +6574,10 @@ The `with token` clause passes `token` as the argument to `GetAsyncEnumerator(to
 <a id="sec-async-iteration-with-owned-yields"></a>
 #### Async iteration with owned yields
 
-For async iterators that produce owned values, declare the return type as `OwnedAsyncEnumerable<T>` (where `T: class`) and `await for` over the result:
+For async iterators that produce owned values, declare the return type as `IOwningAsyncEnumerable<T>` (where `T: class`) and `await for` over the result:
 
 ```bezel
-public async method OpenFilesAsync(paths: IEnumerable<string>): OwnedAsyncEnumerable<FileStream>
+public async method OpenFilesAsync(paths: IEnumerable<string>): IOwningAsyncEnumerable<FileStream>
   for var path in paths do
     yield return await OpenAsync(path);    // each yielded FileStream is owned
   end;
@@ -6591,9 +6591,9 @@ public async method ProcessAllAsync(paths: IEnumerable<string>): Task
 end ProcessAllAsync;
 ```
 
-The `await for` desugaring picks `GetOwnedAsyncEnumerator()` (and `TakeCurrent()`, v0.161) when the source has static type `OwnedAsyncEnumerable<T>`. Each iteration variable is owned; the §28.3 discharge rules apply on every exit edge of the loop body — the same rule as for synchronous `for` over `OwnedEnumerable<T>` ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). When the source implements both `IAsyncEnumerable<T>` and `OwnedAsyncEnumerable<T>`, the static type of the source expression selects the desugaring; default iteration uses `IAsyncEnumerable<T>` (borrowing), and the owning path requires the source to be typed `OwnedAsyncEnumerable<T>` explicitly.
+The `await for` desugaring picks `GetOwningAsyncEnumerator()` (and `TakeCurrent()`, v0.161) when the source has static type `IOwningAsyncEnumerable<T>`. Each iteration variable is owned; the §28.3 discharge rules apply on every exit edge of the loop body — the same rule as for synchronous `for` over `IOwningEnumerable<T>` ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). When the source implements both `IAsyncEnumerable<T>` and `IOwningAsyncEnumerable<T>`, the static type of the source expression selects the desugaring; default iteration uses `IAsyncEnumerable<T>` (borrowing), and the owning path requires the source to be typed `IOwningAsyncEnumerable<T>` explicitly.
 
-The `with token` clause works the same way for owning async iterators — `await for var fs in OpenFilesAsync(paths) with token do ...` passes the token to `GetOwnedAsyncEnumerator(token)`.
+The `with token` clause works the same way for owning async iterators — `await for var fs in OpenFilesAsync(paths) with token do ...` passes the token to `GetOwningAsyncEnumerator(token)`.
 
 **`await` inside `finally` (clarified in v0.137).** Inside an async iterator, `await` may not appear in a `finally` block — a compile error. The `yield` placement restrictions of [§29.6](#sec-restrictions-inside-try-catch-finally) apply unchanged; this rule additionally restricts `await`, and only inside async *iterators* (an ordinary `async` method may await in its `finally`, [§30.9](#sec-exception-handling-in-async-methods)). The reason is disposal: when a consumer abandons iteration early, the iterator's pending `finally` blocks run synchronously inside `Dispose` ([§29.7](#sec-disposal-of-partially-consumed-iterators)) — there is no async driver at that point, so a suspension inside the `finally` would have nowhere to resume; the continuation would be silently discarded, which is precisely the defined-fault philosophy's forbidden outcome. A `finally` that needs asynchronous cleanup awaits *before* yielding (hoisting the resource acquisition), or the type implements the cleanup in its `Dispose` path. This mirrors the catch-guard rule of [§30.9](#sec-exception-handling-in-async-methods): positions evaluated during synchronous unwinding or dispatch are synchronous.
 ### 30.8 Cancellation
@@ -6668,24 +6668,24 @@ end;
 The standard library provides:
 
 - `Task.FromResult<T>(value: T): Task<T>` — completed task with a value. Restricted to non-class T (value types, `string`, runtime-managed reference types). For class T, see `Task.FromOwnedResult` below; calling `FromResult` with a class-typed T is a compile error pointing to the owned variant.
-- `Task.FromOwnedResult<T>(owned value: T): OwnedTask<T> where T: class` — completed Pattern B task whose owned result is `value`. The caller transfers ownership of `value` to the task. Awaiters consume the task under Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): the await must appear in an owned-consuming context (`using var`, an `owned` parameter, an `owned` return, etc.), and ownership transfers to that context. Use this when constructing a completed task from a freshly-acquired or freshly-constructed class instance that the awaiter should own.
+- `Task.FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class` — completed Pattern B task whose owned result is `value`. The caller transfers ownership of `value` to the task. Awaiters consume the task under Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): the await must appear in an owned-consuming context (`using var`, an `owned` parameter, an `owned` return, etc.), and ownership transfers to that context. Use this when constructing a completed task from a freshly-acquired or freshly-constructed class instance that the awaiter should own.
 - `Task.FromException<T>(exception: Exception): Task<T>` and the non-generic `Task` form.
 - `Task.FromCancelled<T>(): Task<T>` and the non-generic form.
 - `Task.Delay(milliseconds: int): Task` and `Task.Delay(duration: TimeSpan): Task`, plus overloads of each taking a `CancellationToken`.
 - `Task.WhenAll(tasks: Array<Task>): Task` — completes when all tasks complete.
 - `Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>` — homogeneous result type for non-class T.
-- `Task.WhenAllOwned<T>(owned tasks: OwnedArray<OwnedTask<T>>): OwnedTask<OwnedArray<T>> where T: class` — Pattern B aggregator. The caller transfers ownership of the array (and its tasks); the result is an owned array of owned elements. Each task is awaited in turn (sequentially in the implementation, but the underlying operations run concurrently because the tasks were started before being passed in). See std lib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers) for a worked example.
+- `Task.WhenAllOwned<T>(owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>> where T: class` — Pattern B aggregator. The caller transfers ownership of the array (and its tasks); the result is an owned array of owned elements. Each task is awaited in turn (sequentially in the implementation, but the underlying operations run concurrently because the tasks were started before being passed in). See std lib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers) for a worked example.
 - `Task.WhenAny(tasks: Array<Task>): Task<int>` — completes when the first task completes, yielding the **index** of the winner in `tasks` (v0.162 — was `Task<Task>`, which was unconstructible under this section's own rules: no factory produces a Pattern A `Task<T>` of class T from an externally-supplied value, and its destructor semantics were unsound; the input array is already indexable, so the index identifies the winner with no ownership question).
 - `Task.FireAndForget(owned task: Task)` — registers a continuation that logs or handles any exception the task produces, then disposes the task. The calling code relinquishes ownership; the runtime supervises the task's lifecycle. **`Task.FireAndForget` is the only supported way to discard a `Task` value** — the discard form `_ := someAsyncCall();` is rejected at compile time because `Task` has a destructor, and abandoning a `Task` reference would skip its continuation cleanup. The two legal patterns for "I don't want to await this task" are `Task.FireAndForget(call())` (supervised: exceptions thrown by the task are logged) and `using var t := call();` (unsupervised: the task is disposed at scope end without blocking, and any exceptions it raises are silently swallowed; see [§30.5](#sec-result-lifetime-and-task-disposal) for the disposal-of-unconsumed-task semantics).
 
 These compose with the rest of the async machinery; awaiting them works like awaiting any other task.
 
 <a id="sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet"></a>
-### 30.11 `TaskCompletionSource<T>` and `OwnedTaskCompletionSource<T>`
+### 30.11 `TaskCompletionSource<T>` and `OwningTaskCompletionSource<T>`
 
 A `TaskCompletionSource<T>` produces a task whose state is controlled imperatively. The standard use is wrapping callback-based or event-based APIs into awaitable form.
 
-The split into two classes — one for non-class T, one for class T with ownership transfer — exists for the same reason as the `FromResult` / `FromOwnedResult` split. For non-class T (value, string, runtime-managed), the produced `Task<T>` carries no ownership across the await boundary; the standard `TaskCompletionSource<T>` is sufficient. For class T, the result must be owned by something — and the natural shape is for the produced task to be Pattern B (`OwnedTask<T>`, [§30.5](#sec-result-lifetime-and-task-disposal)): the source takes ownership of the result on completion, and the eventual awaiter takes ownership through the `using var x := await ...` shape. `OwnedTaskCompletionSource<T> where T: class` produces this shape.
+The split into two classes — one for non-class T, one for class T with ownership transfer — exists for the same reason as the `FromResult` / `FromOwnedResult` split. For non-class T (value, string, runtime-managed), the produced `Task<T>` carries no ownership across the await boundary; the standard `TaskCompletionSource<T>` is sufficient. For class T, the result must be owned by something — and the natural shape is for the produced task to be Pattern B (`OwningTask<T>`, [§30.5](#sec-result-lifetime-and-task-disposal)): the source takes ownership of the result on completion, and the eventual awaiter takes ownership through the `using var x := await ...` shape. `OwningTaskCompletionSource<T> where T: class` produces this shape.
 
 <a id="sec-taskcompletionsourcet-—-for-non-class-t"></a>
 #### `TaskCompletionSource<T>` — for non-class T
@@ -6694,7 +6694,7 @@ The split into two classes — one for non-class T, one for class T with ownersh
 public class TaskCompletionSource<T>
   // Intrinsic restriction: T must be a value type, string, or other
   // runtime-managed reference type. Instantiating with a class T is a
-  // compile error pointing to OwnedTaskCompletionSource<T>.
+  // compile error pointing to OwningTaskCompletionSource<T>.
   public constructor();
   public readonly property Task: Task<T>;
 
@@ -6711,12 +6711,12 @@ end TaskCompletionSource;
 A non-generic `TaskCompletionSource` (for `Task` with no result) has the same shape minus the `result` parameter on `SetResult`/`TrySetResult`.
 
 <a id="sec-ownedtaskcompletionsourcet-—-for-class-t"></a>
-#### `OwnedTaskCompletionSource<T>` — for class T
+#### `OwningTaskCompletionSource<T>` — for class T
 
 ```bezel
-public class OwnedTaskCompletionSource<T> where T: class
+public class OwningTaskCompletionSource<T> where T: class
   public constructor();
-  public readonly property Task: OwnedTask<T>;
+  public readonly property Task: OwningTask<T>;
 
   public method SetResult(owned result: T);
   public method SetException(exception: Exception);
@@ -6725,10 +6725,10 @@ public class OwnedTaskCompletionSource<T> where T: class
   public method TrySetResult(owned result: T): bool;
   public method TrySetException(exception: Exception): bool;
   public method TrySetCancelled(): bool;
-end OwnedTaskCompletionSource;
+end OwningTaskCompletionSource;
 ```
 
-The `where T: class` constraint excludes value types, string, and runtime-managed reference types. The caller transfers ownership of `result` to the source via the `owned` parameter; the source forwards ownership into the produced `OwnedTask<T>`. The awaiter consumes the task under Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): one consumer takes ownership of the result via `using var x := await source.Task;`. A second await raises `InvalidOperationException`.
+The `where T: class` constraint excludes value types, string, and runtime-managed reference types. The caller transfers ownership of `result` to the source via the `owned` parameter; the source forwards ownership into the produced `OwningTask<T>`. The awaiter consumes the task under Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): one consumer takes ownership of the result via `using var x := await source.Task;`. A second await raises `InvalidOperationException`.
 
 If `TrySetResult` returns `false` because the task is already in a terminal state, the implementation disposes `result` before returning. The caller has no further obligation — ownership was transferred at the call, and the implementation is responsible for releasing it on every path. The same applies if `TrySetException` or `TrySetCancelled` returns `false` while a previous `SetResult` already took ownership of a result; the existing result remains owned by the task.
 
@@ -6739,7 +6739,7 @@ The `Task` exposed by either source observes the source's state. The `Set*` meth
 
 If the source is disposed before the task completes, the task is automatically transitioned to a faulted state with `InvalidOperationException("source disposed before completion")`.
 
-If the source is disposed after `SetResult` was called, the task continues to expose the result; awaiters are unaffected. For `OwnedTaskCompletionSource<T>`, the produced result is now owned by the task, not the source — disposing the source has no effect on the result.
+If the source is disposed after `SetResult` was called, the task continues to expose the result; awaiters are unaffected. For `OwningTaskCompletionSource<T>`, the produced result is now owned by the task, not the source — disposing the source has no effect on the result.
 
 Pattern — wrapping a **one-shot** callback API (the registration invokes the callback at most once; illustrative API):
 
@@ -6760,8 +6760,8 @@ end ReadSectorAsync;
 Pattern — wrapping a class-typed result with ownership transfer:
 
 ```bezel
-public async method LoadResourceAsync(path: string): OwnedTask<Resource>
-  using var tcs := new OwnedTaskCompletionSource<Resource>();
+public async method LoadResourceAsync(path: string): OwningTask<Resource>
+  using var tcs := new OwningTaskCompletionSource<Resource>();
 
   StartLoadInBackground(path, (loaded: owned Resource) => do
     tcs.TrySetResult(loaded);                      // ownership moves into tcs's task
@@ -6774,7 +6774,7 @@ public async method LoadResourceAsync(path: string): OwnedTask<Resource>
 end LoadResourceAsync;
 ```
 
-The outer async method's return type `OwnedTask<Resource>` and the inner `OwnedTaskCompletionSource<Resource>.Task` (which is `OwnedTask<Resource>`) align: the `await` performs the Pattern B move out of the inner task, and the outer `return` moves the same value into the outer task's result slot. A caller of `LoadResourceAsync` then writes:
+The outer async method's return type `OwningTask<Resource>` and the inner `OwningTaskCompletionSource<Resource>.Task` (which is `OwningTask<Resource>`) align: the `await` performs the Pattern B move out of the inner task, and the outer `return` moves the same value into the outer task's result slot. A caller of `LoadResourceAsync` then writes:
 
 ```bezel
 using var r := await LoadResourceAsync("/etc/foo");
@@ -6865,7 +6865,7 @@ A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-pr
   3. The class has no function-typed fields, no `Object`-typed or interface-typed fields (boxed contents and runtime types behind interfaces cannot be statically verified), and no non-`owned` class-typed fields (a back-reference aliases an object owned in the origin domain).
   Mutually-recursive `owned` references among sendable classes are admitted; the property is evaluated coinductively (assume the types under test sendable, then check the rules). A sendable class instance crosses as an **owned transfer** — the entire ownership tree under it moves with it, and rule 2 guarantees that tree contains everything the instance can reach.
 - **Interface types** are never sendable (rule 3's reasoning, applied at the root).
-- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwnedBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwnedTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, and `Weak<T>` are domain-local and not sendable; **`Shared<T>` is sendable iff `T` is sendable and internally synchronized** (the v0.140 rule of [§28.13](#sec-shared-ownership) — `Shared<Mutex>` is the cross-domain sharing idiom; for every other `T` it remains domain-local — this list previously predated that amendment, v0.163/#1364); of the [§30.12](#sec-thread-synchronization) types, `Mutex`, `Semaphore`, and the atomics are **sendable** (internally synchronized — stdlib §6.2–§6.4; that is their purpose) while `Lock` guards are domain-bound and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
+- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwningBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwningTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, and `Weak<T>` are domain-local and not sendable; **`Shared<T>` is sendable iff `T` is sendable and internally synchronized** (the v0.140 rule of [§28.13](#sec-shared-ownership) — `Shared<Mutex>` is the cross-domain sharing idiom; for every other `T` it remains domain-local — this list previously predated that amendment, v0.163/#1364); of the [§30.12](#sec-thread-synchronization) types, `Mutex`, `Semaphore`, and the atomics are **sendable** (internally synchronized — stdlib §6.2–§6.4; that is their purpose) while `Lock` guards are domain-bound and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
 
 Sendability of a generic instantiation is checked at the instantiation or call site under the rules of [§3.6](#sec-derived-type-properties); diagnostics name the property ("not sendable"), the offending type, and the failing rule.
 
@@ -6877,8 +6877,8 @@ Sendability of a generic instantiation is checked at the instantiation or call s
 ```bezel
 // Representative forms; the stdlib section declares the full set.
 Domain.Spawn(entry: () -> ()): owned Task
-Domain.Spawn<R>(entry: () -> owned R): owned OwnedTask<R>            // R: sendable class
-Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwnedTask<R>
+Domain.Spawn<R>(entry: () -> owned R): owned OwningTask<R>            // R: sendable class
+Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
 Domain.Spawn<R>(entry: () -> R): owned Task<R>                       // R: sendable value type
 ```
 
@@ -6887,7 +6887,7 @@ The compiler enforces at the call site:
 - **The entry must be capture-free**: a non-capturing lambda or a static method reference. A capturing lambda or an instance method reference is rejected — captures and receivers are borrows of the origin domain ([§28.9](#sec-runtime-managed-types)). Data enters the new domain only through the explicit `arg` parameters, which must be of sendable types; class-typed arguments are `owned` and are moved through the spawn into the entry's parameter.
 - **Argument and result types must be sendable**, per the rules above.
 
-The join handle is an ordinary task of the spawning domain. Awaiting an `OwnedTask<R>` join follows Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): single consumer, ownership of the (sendable) result transfers to the awaiter — the existing single-consumer transfer semantics are exactly the cross-domain join semantics, unchanged. `Task`/`Task<R>` joins follow Pattern A.
+The join handle is an ordinary task of the spawning domain. Awaiting an `OwningTask<R>` join follows Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): single consumer, ownership of the (sendable) result transfers to the awaiter — the existing single-consumer transfer semantics are exactly the cross-domain join semantics, unchanged. `Task`/`Task<R>` joins follow Pattern A.
 
 **Faults.** An exception that propagates out of the entry does not cross the boundary as an object (exception classes are not in general sendable). The join instead raises `DomainFaultedException` (stdlib [§6.8](Bezel_Standard_Library.md#sec-domain)), whose `Message` and `FaultStackTrace` carry copies of the original exception's message and stack-trace text (`string`s — sendable). Programs that need richer fault data return it as a sendable result or send it over a channel.
 
@@ -6919,7 +6919,7 @@ Normative semantics (full API: stdlib [§6.9](Bezel_Standard_Library.md#sec-chan
 
 - **`new Channel<T>()`** creates an unbounded channel. **`NewSender(): owned ChannelSender<T>`** mints a sender endpoint; any number may be minted, and each is an independently owned, sendable object. The channel and its senders share an internal core whose synchronization is the implementation's responsibility and invisible to programs.
 - **`Send(owned item: T)`** (class-typed T; for sendable value types and `string` the parameter is unmodified) appends the item, transferring ownership into the channel. Unbounded channels never block on send. Sending on a closed channel raises `ChannelClosedException`.
-- **`Receive()`** is asynchronous — `OwnedTask<T>` for class-typed T (Pattern B: awaiting transfers ownership of the item to the receiver), `Task<T>` otherwise. If the channel is empty and open, the receive completes when an item arrives; if empty and closed, it raises `ChannelClosedException`. **`TryReceive(out owned item: T?): bool`** is the non-blocking form (Try pattern; `out using var` at the call site); it returns `false` when no item is available — consult **`IsClosed`** to distinguish empty-but-open from closed.
+- **`Receive()`** is asynchronous — `OwningTask<T>` for class-typed T (Pattern B: awaiting transfers ownership of the item to the receiver), `Task<T>` otherwise. If the channel is empty and open, the receive completes when an item arrives; if empty and closed, it raises `ChannelClosedException`. **`TryReceive(out owned item: T?): bool`** is the non-blocking form (Try pattern; `out using var` at the call site); it returns `false` when no item is available — consult **`IsClosed`** to distinguish empty-but-open from closed.
 - **Closing.** Disposing the last `ChannelSender<T>` *closes* the channel: items already sent remain receivable (the channel drains), and after the drain, receives raise `ChannelClosedException`. Disposing the `Channel<T>` itself closes it immediately and disposes every undelivered class-typed item in reverse insertion order (the owned column of [§28.11](#sec-element-slot-policy)); subsequent sends raise `ChannelClosedException`.
 - **Ordering.** Items from one sender are received in the order sent; items from different senders interleave in an unspecified but consistent total order (each item is received exactly once).
 
@@ -7263,7 +7263,7 @@ Only the following types may appear in `extern` method signatures:
 - The unit type `()` — valid as a return type only, mapped to C `void`. An FFI declaration with no `:` clause produces a unit-returning method; an explicit `: ()` is also accepted and means the same thing.
 - Function types `(...) -> T` whose parameters and return type are themselves FFI-compatible.
 
-Not allowed: Bezel `string` (use `CString` or `WString`), `char` (use `int` or `byte` and convert), classes, records, interfaces, generic type parameters, `Array<T>`, `OwnedArray<T>`, inline arrays whose element type is not FFI-compatible.
+Not allowed: Bezel `string` (use `CString` or `WString`), `char` (use `int` or `byte` and convert), classes, records, interfaces, generic type parameters, `Array<T>`, `OwningArray<T>`, inline arrays whose element type is not FFI-compatible.
 
 `char` is excluded because Bezel's `char` is a 32-bit Unicode scalar value, while C `char` is conventionally an 8-bit byte and platform character types vary further (Windows `wchar_t` is 16 bits, Unix `wchar_t` is 32 bits but with different encoding assumptions). No single mapping is correct across the relevant ABIs; passing `int` (for full code points) or `byte` (for ASCII / opaque bytes) and converting on the Bezel side is unambiguous.
 
@@ -7397,7 +7397,7 @@ The Bezel compiler guarantees:
 - Arguments passed to an `extern` method are of the declared types.
 - The return value, if any, is treated as the declared type.
 - The calling convention used matches the `convention` clause (or default).
-- Function pointers passed across the boundary are valid for at least the duration of the call. **Registrations that outlive the call (v0.163):** a static-method/non-capturing-lambda callback has no environment and its code address is process-lifetime — such a pointer *may* be retained by native code (signal handlers, event loops, plugin hooks) and remains valid until process exit; there is nothing to pin and nothing to unregister on the Bezel side. What Bezel-side state such a callback may touch is governed by the domain rules ([§30.14](#sec-sendable-types)): a callback invoked from a foreign thread is outside every domain and must confine itself to [§30.12](#sec-thread-synchronization)-synchronized state and `OwnedTaskCompletionSource` completion — the same discipline as any foreign thread.
+- Function pointers passed across the boundary are valid for at least the duration of the call. **Registrations that outlive the call (v0.163):** a static-method/non-capturing-lambda callback has no environment and its code address is process-lifetime — such a pointer *may* be retained by native code (signal handlers, event loops, plugin hooks) and remains valid until process exit; there is nothing to pin and nothing to unregister on the Bezel side. What Bezel-side state such a callback may touch is governed by the domain rules ([§30.14](#sec-sendable-types)): a callback invoked from a foreign thread is outside every domain and must confine itself to [§30.12](#sec-thread-synchronization)-synchronized state and `OwningTaskCompletionSource` completion — the same discipline as any foreign thread.
 
 The programmer is responsible for:
 
@@ -7916,7 +7916,7 @@ GenericArg      ::= Type
                               /* In v0.97 and later, `owned` is not admitted on
                                  generic type arguments; the owned-bearing
                                  collection and task types are separate named
-                                 classes (`OwnedArray<T>`, `OwnedTask<T>`, etc.).
+                                 classes (`OwningArray<T>`, `OwningTask<T>`, etc.).
                                  See §14.4. */
 FunctionType    ::= "(" (FuncParamType ("," FuncParamType)*)? ")" "->" "owned"? Type
                               /* The optional `owned` on the return marks
@@ -8164,10 +8164,10 @@ MoveExpr        ::= "move" PrimaryExpr
                                  the named field is `owned`; or (b) an
                                  indexer access `PrimaryExpr "[" Expression "]"`
                                  where the receiver is an owning collection
-                                 admitting slot-level move (`OwnedArray<T>`,
-                                 `OwnedDictionary<K, V>`, `OwnedBuffer<T>`
+                                 admitting slot-level move (`OwningArray<T>`,
+                                 `OwningDictionary<K, V>`, `OwningBuffer<T>`
                                  for class-typed T, `Span<T>` over class-typed
-                                 `OwnedBuffer<T>`, or an owning inline array
+                                 `OwningBuffer<T>`, or an owning inline array
                                  `[N owned]…`). Both rejections are compile
                                  errors. See §28.8.1 and §28.11. */
 
@@ -8393,7 +8393,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Boxing a borrow-bearing record or a borrow-carrying inline array is subject to the same borrow-lifetime constraints as the unboxed value; the boxed value may not escape the source scope ([§8.6](#sec-boxing)). Move-only inline arrays (owning forms) cannot be boxed.
 - `default(T)` is rejected for non-nullable reference types, for records whose declared fields include non-nullable references, and for inline arrays whose element type is a non-nullable reference type (including `[N owned]T` non-nullable owning forms).
 - `default(T)` on an enum type with no declared zero-value constant produces a compiler warning.
-- A collection literal targeting a reference type (`Array<T>`, `OwnedArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc., or a user-defined type via the `FromCollectionLiteral` factory of [§15.4.1](#sec-the-user-defined-sequence-literal-protocol)) produces an owned value; the result must reach an owned location ([§28.3](#sec-local-variables-ownership-and-borrows)). For the user-defined case the owned value is the factory's `owned C<T>` return. A collection literal targeting an inline-array type (`[N]T`) produces a value, with the usual value-type rules; ownership obligations apply only when the array has `[N owned]…` slots ([§15.3](#sec-move-only-value-types)).
+- A collection literal targeting a reference type (`Array<T>`, `OwningArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc., or a user-defined type via the `FromCollectionLiteral` factory of [§15.4.1](#sec-the-user-defined-sequence-literal-protocol)) produces an owned value; the result must reach an owned location ([§28.3](#sec-local-variables-ownership-and-borrows)). For the user-defined case the owned value is the factory's `owned C<T>` return. A collection literal targeting an inline-array type (`[N]T`) produces a value, with the usual value-type rules; ownership obligations apply only when the array has `[N owned]…` slots ([§15.3](#sec-move-only-value-types)).
 - Nullable field access without copying to a local is rejected; only local variables are narrowed ([§7.4](#sec-member-access-on-nullable-values)).
 - An `end`-label that is supplied — an identifier for named constructs, or a construct keyword (with operator token where applicable) for keyword-labelled constructs — must match the construct it closes; a mismatch is a compile error. The unlabelled form `end;` is always valid ([§1.6](#sec-statements-and-termination)).
 - A `sealed abstract` class may be subclassed only within its declaring module; external subclasses are rejected.
@@ -8420,7 +8420,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Owned values may not escape: *transferring* an owned field out (a `move`, or a fresh owning value) requires an `owned` return type; a bare owned-field read may be returned through a non-`owned` return as a borrow of the receiver ([§28.6](#sec-leak-prevention)); assigning an owned value to a non-owned field of another object is rejected.
 - A `new` expression's result, and any owned local, is disposed exactly once on every path: it either reaches an owned location / explicit `Dispose()` / `move` / return, or is **auto-dropped at scope end** ([§28.3](#sec-owned-local-discharge-requirement)). An implicit auto-drop of a plain-`var` owned local raises a **must-use warning** (not an error); the warning is suppressed by `using var`, explicit disposal, discard, move, or return. Discard `_ := …` of an owned class or move-only value is permitted (disposes at end of statement). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
 - A static method returning a class type without `owned` and without an identifiable borrow source produces an owned value; the same discharge rules as `new` apply ([§28.3](#sec-local-variables-ownership-and-borrows)).
-- An owning-collection or owning-wrapper return type (`OwnedArray<T>`, `Shared<T>`, etc.) declared without `owned` produces a **borrow** (the `Owned*` name denotes element ownership, orthogonal to the `owned` container qualifier); the general borrow-return rules apply — a bare owning-collection *field* read is returnable (source: receiver), a borrowed local/parameter with no outliving source is not, and a `move`d field or fresh owning value requires an `owned` return ([§28.3](#sec-local-variables-ownership-and-borrows), [§28.6](#sec-leak-prevention)).
+- An owning-collection or owning-wrapper return type (`OwningArray<T>`, `Shared<T>`, etc.) declared without `owned` produces a **borrow** (the `Owned*` name denotes element ownership, orthogonal to the `owned` container qualifier); the general borrow-return rules apply — a bare owning-collection *field* read is returnable (source: receiver), a borrowed local/parameter with no outliving source is not, and a `move`d field or fresh owning value requires an `owned` return ([§28.3](#sec-local-variables-ownership-and-borrows), [§28.6](#sec-leak-prevention)).
 - A *borrowed* owning collection may not be **disposed**: `Dispose()` on a borrow is a compile error (the owner disposes the container — a borrower's `Dispose` would double-free it). Every other operation, including the mutating / transferring ones (`Add`/`Insert`/`Remove*`/`Clear`/`Drain`/`Pop*`/indexer-set), is memory-safe on a borrow and remains available (Bezel's borrowed collections are mutable — the pass-and-fill idiom). ([§28.6](#sec-borrowed-owning-collections)).
 - An unbound owned temporary — the result of an `owned`-returning producer that is not bound, `move`d, returned, or transferred, used only by borrowing operations within its expression — is disposed exactly once at the end of that full expression, after its uses complete ([§28.3](#sec-unbound-owned-temporaries)).
 - `using var` variables may not be reassigned.
@@ -8433,14 +8433,14 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A class implementing `IAsyncDisposable` without a destructor receives a compiler warning ([§28.12](#sec-asynchronous-disposal)).
 - The `move x.f` expression ([§28.8.1](#sec-the-move-expression)) is permitted only when `f` is an owned instance field; the field is left in moved-from state. Within the surrounding method, every control-flow path from the move site to the method's exit (normal return, throw, fall-through, `yield break`) must execute an assignment `x.f := value;` between the move and the exit — including paths exited by exceptions raised by intervening throwable expressions. Failure to satisfy the rule is a compile error.
 - The `move coll[i]` expression ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)) is permitted only when `coll` is an owned-element collection; the slot is left in moved-from state. The same field-restoration rule applies, with constant indices tracked per-slot and non-constant indices tracked conservatively at the whole-collection level.
-- Owned-element collections (`OwnedArray<T>`, `OwnedDictionary<K, V>`, etc.) own their elements: `Add` accepts owned arguments, the indexer-set disposes the previous value, `Remove`/`RemoveAt`/`Clear` dispose elements, and `Dispose` cascades to every element. The `Drain` method transfers ownership of elements out of the collection in iteration order. Default iteration produces borrows; ownership is transferred only via `Drain` or the dedicated `Pop*` methods ([§28.11](#sec-collections-do-not-own-elements)).
-- Iterator yield ownership is determined by the iterator method's declared return type ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). For an iterator returning `IEnumerable<T>` or `IAsyncEnumerable<T>` that yields owned class-typed values, the enumerator owns each yielded value and the consumer's iteration variable is a borrow. For an iterator returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`, ownership transfers from enumerator to consumer at each `MoveNext` (or `MoveNextAsync`); the consumer's iteration variable is owned; it is discharged by the program or auto-dropped at the body's end with the must-use warning (§28.3).
+- Owned-element collections (`OwningArray<T>`, `OwningDictionary<K, V>`, etc.) own their elements: `Add` accepts owned arguments, the indexer-set disposes the previous value, `Remove`/`RemoveAt`/`Clear` dispose elements, and `Dispose` cascades to every element. The `Drain` method transfers ownership of elements out of the collection in iteration order. Default iteration produces borrows; ownership is transferred only via `Drain` or the dedicated `Pop*` methods ([§28.11](#sec-collections-do-not-own-elements)).
+- Iterator yield ownership is determined by the iterator method's declared return type ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). For an iterator returning `IEnumerable<T>` or `IAsyncEnumerable<T>` that yields owned class-typed values, the enumerator owns each yielded value and the consumer's iteration variable is a borrow. For an iterator returning `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, or `IOwningAsyncEnumerator<T>`, ownership transfers from enumerator to consumer at each `MoveNext` (or `MoveNextAsync`); the consumer's iteration variable is owned; it is discharged by the program or auto-dropped at the body's end with the must-use warning (§28.3).
 
 <a id="sec-appendix-c-generics"></a>
 ### C.4 Generics
 
 - `where T: notnull` substitutions are non-nullable types; a nullable type, value or reference, does not satisfy the constraint.
-- `where T: class` substitutions are non-nullable reference types: classes (including `Array<T>`, `OwnedArray<T>`), interfaces, `string`, function types.
+- `where T: class` substitutions are non-nullable reference types: classes (including `Array<T>`, `OwningArray<T>`), interfaces, `string`, function types.
 - `where T: value` substitutions are non-nullable value types: records, enums, primitives, inline arrays (all forms, including owning `[N owned]…` forms — see [§15.3](#sec-move-only-value-types) for restrictions on copy operations in the generic body), the unit type. A nullable value type (e.g. `int?`) does not satisfy the constraint ([§14.2](#sec-constraints)).
 - `where T: SomeClass` substitutions are non-nullable subtypes of `SomeClass` — class types only (no interfaces, since interfaces do not extend classes).
 - `where T: IFoo` substitutions are non-nullable types conforming to `IFoo` per the [§14.2](#sec-constraints) conformance rule: classes implementing it (directly or by inheritance), records implementing it directly, and interfaces extending it (directly or transitively).
@@ -8448,7 +8448,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Inside an unconstrained generic body, `T` is treated conservatively as possibly nullable.
 - `?` is idempotent under substitution: `T?` with T = `U?` denotes `U?` (no two-level optional; [§7.10](#sec-generics-and-nullability)).
 - Type-bound constraints (`where T: class`, `where T: SomeClass`, `where T: IFoo`) and `where T: notnull` make T non-nullable inside the body.
-- `owned` is not admitted on generic type arguments ([§14.4](#sec-owned-as-a-generic-argument)). The owning collection and task types are separate named classes (`OwnedArray<T>`, `OwnedTask<T>`, etc., declared in stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic) and [§6](Bezel_Standard_Library.md#sec-system-threading)); each carries `where T: class` (or `where V: class` for `OwnedDictionary<K, V>`) as part of its declaration.
+- `owned` is not admitted on generic type arguments ([§14.4](#sec-owned-as-a-generic-argument)). The owning collection and task types are separate named classes (`OwningArray<T>`, `OwningTask<T>`, etc., declared in stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic) and [§6](Bezel_Standard_Library.md#sec-system-threading)); each carries `where T: class` (or `where V: class` for `OwningDictionary<K, V>`) as part of its declaration.
 
 <a id="sec-methods-constructors-and-accessors"></a>
 ### C.5 Methods, constructors, and accessors
@@ -8475,8 +8475,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `await using` appears only inside async contexts.
 - The `with` clause in `await for ... with token` must be of type `CancellationToken`.
 - Awaiting a `Task<T>` for class T (Pattern A) requires the awaited task expression to occupy one of the admitted owning locations defined in [§30.5](#sec-result-lifetime-and-task-disposal), **including**: a reference to a `using var`/`await using var`-bound local of `Task<T>`, an `owned` parameter, an `owned` field of `this`, an indexer access on an owning collection of `Task<T>`, or an iteration variable from a borrowing iteration over an array of tasks. A producer call whose result is directly consumed by a Pattern A return in the enclosing async method is also admitted. A bare `var x := await Producer();` whose `Producer()` returns `Task<T>` for class T and whose result isn't in one of the admitted positions is rejected — the borrowed result would have no source.
-- `await` on a `OwnedTask<T>` (Pattern B) must appear in an owned-consuming context — a `using var` (or `await using var`) right-hand side, an `owned` parameter argument, an `owned` return expression, or any other position the type system requires the resulting value to be discharged. The first await spends an `OwnedTask<T>` regardless of outcome (v0.162). When the operand is **owned**, the await consumes it on all edges and a second await is rejected at compile time as a moved-from read ([§28.3](#sec-local-variables-ownership-and-borrows)); when the operand is **borrowed** (e.g. a `using var`-bound task), the second await cannot be statically prevented and raises `InvalidOperationException` at runtime.
-- `OwnedTask<T>` is a compile error when T is not a class type. The argument-type check is performed during type checking; the diagnostic identifies the non-class argument and points at [§14.4](#sec-owned-as-a-generic-argument).
+- `await` on a `OwningTask<T>` (Pattern B) must appear in an owned-consuming context — a `using var` (or `await using var`) right-hand side, an `owned` parameter argument, an `owned` return expression, or any other position the type system requires the resulting value to be discharged. The first await spends an `OwningTask<T>` regardless of outcome (v0.162). When the operand is **owned**, the await consumes it on all edges and a second await is rejected at compile time as a moved-from read ([§28.3](#sec-local-variables-ownership-and-borrows)); when the operand is **borrowed** (e.g. a `using var`-bound task), the second await cannot be statically prevented and raises `InvalidOperationException` at runtime.
+- `OwningTask<T>` is a compile error when T is not a class type. The argument-type check is performed during type checking; the diagnostic identifies the non-class argument and points at [§14.4](#sec-owned-as-a-generic-argument).
 
 <a id="sec-patterns-and-case"></a>
 ### C.7 Patterns and `case`
@@ -8554,14 +8554,14 @@ An implementation may also conform at "Core plus named features" (e.g., *Core + 
 | Feature | Specification sections | Standard-library sections |
 |---|---|---|
 | **Events** | [§24](#sec-events) | `EventSource<T>`, `IEvent<T>`, `AsyncEventSource<T>`, `IAsyncEvent<T>`, `Subscription` (stdlib [§2.11](Bezel_Standard_Library.md#sec-subscription)) |
-| **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire — including domains, spawning, and channels ([§30.13](#sec-runtime-model)–[§30.15](#sec-channels)); [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwnedTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, `Domain`, `Channel<T>`/`ChannelSender<T>`, the async forms of IO and sequence operations |
+| **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire — including domains, spawning, and channels ([§30.13](#sec-runtime-model)–[§30.15](#sec-channels)); [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwningTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, `Domain`, `Channel<T>`/`ChannelSender<T>`, the async forms of IO and sequence operations |
 | **Serialization synthesis** | [§9.8](#sec-serialization-synthesis) | stdlib §2.14–2.15 |
 | **Foreign Function Interface** | [§32](#sec-foreign-function-interface); the FFI clauses of [§15.1.3](#sec-inline-array-ffi) | — |
-| **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwnedBuffer`/`Span` slots) | stdlib §3.3–3.4, §4.14–4.16 |
+| **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwningBuffer`/`Span` slots) | stdlib §3.3–3.4, §4.14–4.16 |
 | **Sequence operations (LINQ-style)** | — | stdlib §5 entire |
 | **Shared ownership** | [§28.13](#sec-shared-ownership) | `Shared<T>`, `Weak<T>` (stdlib §2.16) |
 
-Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12 and §28.13), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `OwnedEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
+Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12 and §28.13), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `IOwningEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
 
 <a id="sec-feature-dependencies"></a>
 ### D.3 Dependencies and closure
