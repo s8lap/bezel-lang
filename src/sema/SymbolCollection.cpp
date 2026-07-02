@@ -1,7 +1,9 @@
 #include "sema/SymbolCollection.hpp"
 
 #include "ast/Node.hpp"
+#include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
+#include "sema/TypeRef.hpp"
 
 namespace bezel::sema {
 
@@ -343,6 +345,93 @@ bool isAutoPropertySymbol(const Symbol* m) {
     return true;
 }
 
+// §9.2 v0.158: resolve a record storage component (an auto-property, a body
+// field, or a §9.1 positional field) to its declared TypeRef. Returns null when
+// the type is not resolvable (an imported member with no local ast::Type node
+// and no side-table entry) — the caller then treats the component conservatively
+// as admissible.
+static const TypeRef* storageComponentType(const Symbol* m,
+                                           const SemaContext& ctx) {
+    if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
+        // §9.1 positional field: type rides on the Param.
+        if (fs->posParam && fs->posParam->type)
+            return ctx.resolvedType(*fs->posParam->type);
+        // Body field: the ast::FieldDecl carries the type.
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+            if (fd->type) return ctx.resolvedType(*fd->type);
+        return ctx.importedMemberType(m);
+    }
+    if (auto* ps = dynamic_cast<const PropertySymbol*>(m)) {
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+            if (pd->type) return ctx.resolvedType(*pd->type);
+        return ctx.importedMemberType(m);
+    }
+    return nullptr;
+}
+
+// §9.2 v0.158 admissible-component-type predicate (one recursive rule, applied
+// per storage component):
+//   - a primitive value type, an enum, or `string`;
+//   - another record that is itself auto-equality-bearing (recursively);
+//   - `T?` where `T` is admissible (the null-safe `=` of §8.4/§7.11);
+//   - a non-owning inline array `[N]T`/`[N]T?` whose element is admissible
+//     (element-by-element per §8.3's inline-array rows).
+// A class/interface/`Object`/function value/owning-inline-array component is NOT
+// admissible (they are reference or move-only types, not structural value
+// components). An unresolvable component type (null / Error / an unresolved
+// generic parameter) is treated conservatively as admissible so a generic body
+// or an imported record is never over-rejected — §3.6 rule 2 re-checks concrete
+// generic arguments at each instantiation. `depth` guards the (already
+// type-finite) record recursion.
+//
+// (v0.158 removed the former "sealed reference type with content equality"
+// clause; its only instance, `string`, is admitted explicitly above.)
+static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
+                                      int depth) {
+    using K = TypeRef::Kind;
+    if (!ty || depth > 32) return true;  // unresolved / recursion guard: conservative
+    // `T?` where T is admissible.
+    if (ty->nullable) {
+        TypeRef stripped = *ty;
+        stripped.nullable = false;
+        return isAdmissibleComponentType(&stripped, ctx, depth + 1);
+    }
+    switch (ty->kind) {
+        case K::Error:
+            return true;                      // suppress cascade
+        case K::Unit:
+        case K::Function:
+            return false;
+        case K::Primitive:
+            // A primitive value type or `string` is admissible; `Object` (the
+            // root class) is a reference type and is NOT.
+            return ty->primitive != PrimitiveType::Object;
+        case K::InlineArray:
+            // A NON-OWNING inline array `[N]T`/`[N]T?` with an admissible
+            // element. A move-only owning inline array (`[N owned]T`, §15.3) is
+            // not admissible.
+            if (ty->arrayOwned) return false;
+            return isAdmissibleComponentType(ty->arrayElement, ctx, depth + 1);
+        case K::Named: {
+            const TypeSymbol* decl = ty->declaration;
+            if (!decl) return true;           // unresolved generic param / imported builtin
+            if (decl->kind == ast::TypeDeclKind::Enum) return true;
+            if (decl->kind == ast::TypeDeclKind::Record) {
+                // Another record — admissible iff it is itself
+                // auto-equality-bearing (a positional/combined record always
+                // synthesizes equality; a body record must pass §9.2).
+                if (decl->hasPositionalFields) return true;
+                if (auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl))
+                    if (td->hasPositionalFields) return true;
+                return isAutoEqualityBearingBodyRecord(decl, ctx);
+            }
+            // class / interface — reference types are not admissible.
+            return false;
+        }
+    }
+    return true;
+}
+
 // §9.2: auto-equality eligibility for a body record. The spec's membership
 // rule ("A body-only record receives auto-generated `=`, `<>`, `GetHashCode`,
 // and `ToString` over its auto-properties … when every member of the record
@@ -362,16 +451,23 @@ bool isAutoPropertySymbol(const Symbol* m) {
 // disqualifier remains out of scope; computed (expression-bodied / block)
 // properties are treated as non-disqualifying (the spec's stated default for
 // the trivial forms).
-bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
+bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
+                                     const SemaContext& ctx) {
     if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
     // §9.3: a record with positional fields is positional / combined form; it
     // gets the §9.1 positional synthesis, not this body-record path.
+    if (rec->hasPositionalFields) return false;
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
         if (td->hasPositionalFields) return false;
 
     for (const Symbol* m : rec->members) {
-        // An auto-property is the participating storage — always eligible.
-        if (isAutoPropertySymbol(m)) continue;
+        // An auto-property is the participating storage — eligible only when its
+        // declared type is an admissible component type (§9.2 v0.158).
+        if (isAutoPropertySymbol(m)) {
+            if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
+                return false;
+            continue;
+        }
         // A non-auto property (expression-bodied or block-form) is a computed
         // member: it does not contribute storage and does not disqualify.
         if (dynamic_cast<const PropertySymbol*>(m)) continue;
@@ -380,17 +476,22 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
         if (dynamic_cast<const FieldSymbol*>(m)) return false;
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
             // A manually-declared equality member suppresses the auto package
-            // (§8.5 / §9.2): Equals / GetHashCode / ToString, or an `=`/`<>`
-            // operator overload.
+            // (§9.2): an `Equals`/`GetHashCode` method, or an `=`/`<>` operator
+            // overload.
             if (meth->isOperator) {
                 if (meth->operatorToken == "=" || meth->operatorToken == "<>")
                     return false;
                 continue;  // any other operator overload is fine (§9.2)
             }
-            if (meth->name == "Equals" || meth->name == "GetHashCode" ||
-                meth->name == "ToString")
+            // §9.2 v0.158 (narrowed, was #1249-A): a `ToString` override alone no
+            // longer disqualifies — it suppresses only auto-`ToString` (the
+            // author took over formatting, not equality). Auto-`Equals`/
+            // `GetHashCode`/`=` remain; `.ToString()` dispatches to the override
+            // (codegen prefers the user method). Only `Equals`/`GetHashCode`
+            // (the equality surface) still disqualify.
+            if (meth->name == "Equals" || meth->name == "GetHashCode")
                 return false;
-            continue;  // ordinary methods do not disqualify (§9.2)
+            continue;  // ordinary methods (and `ToString`) do not disqualify (§9.2)
         }
         // §9.2 (#770): a constructor disqualifies auto-equality when its body
         // "performs work other than property initialization." A TRIVIAL body is
@@ -458,6 +559,31 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
         }
     }
     return false;
+}
+
+// §3.6 / §8.3 (v0.158, #1338): see Symbol.hpp. A type is equality-bearing unless
+// it is a record that neither synthesizes equality nor declares user equality.
+bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
+    if (!ty) return true;                              // unresolved: conservative
+    // The underlying type carries the equality contract; a nullable key `K?`
+    // is equality-bearing iff `K` is (the null-safe `=` of §8.4 handles null).
+    if (ty->kind != TypeRef::Kind::Named || !ty->declaration)
+        return true;  // primitive / string / unit / inline array / function /
+                      // unresolved (generic param, imported builtin) — all bear
+                      // consistent equality.
+    const TypeSymbol* ts = ty->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record)
+        return true;  // class (reference identity), interface, enum — all bear
+                      // consistent Equals/GetHashCode.
+    // A record: equality-bearing iff it synthesizes equality (positional /
+    // combined §9.1, or an auto-equality-bearing body record §9.2) or declares
+    // user equality (an `operator =`/`<>` overload — its §25.2 co-declared
+    // `Equals(T)`/`GetHashCode` companions are separately enforced).
+    if (ts->hasPositionalFields) return true;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+        if (td->hasPositionalFields) return true;
+    return isAutoEqualityBearingBodyRecord(ts, ctx) ||
+           recordHasUserDeclaredEquality(ts);
 }
 
 bool collectSymbols(const ast::SourceFile& src, SemaContext& ctx) {

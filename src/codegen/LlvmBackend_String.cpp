@@ -2554,6 +2554,22 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
         val->getType()->isStructTy())
         return emitRecordHashCode(val, fieldTy->declaration);
+    // Inline array (§8.3 / §9.2 v0.158): "Hash combining element hashes in slot
+    // order." Fold each slot's hash (h = h*31 + elemHash), the same order and
+    // combiner as the record/positional hash — consistent with the element-wise
+    // equality of emitInlineArrayEquality so equal arrays hash identically.
+    if (fieldTy && fieldTy->kind == K::InlineArray &&
+        val->getType()->isArrayTy()) {
+        auto* at = llvm::cast<llvm::ArrayType>(val->getType());
+        llvm::Value* h = builder_.getInt32(17);   // non-zero seed
+        for (unsigned i = 0; i < at->getNumElements(); ++i) {
+            llvm::Value* ei = builder_.CreateExtractValue(val, {i});
+            llvm::Value* eh = emitValueHashCode(ei, fieldTy->arrayElement);
+            h = builder_.CreateAdd(
+                builder_.CreateMul(h, builder_.getInt32(31)), eh);
+        }
+        return h;
+    }
     // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
     // class/interface) is a plain `ptr` with a real null. A null field hashes
     // to a fixed sentinel (0) rather than dereferencing it (bug A); a non-null

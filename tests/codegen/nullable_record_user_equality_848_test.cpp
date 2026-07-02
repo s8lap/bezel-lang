@@ -29,7 +29,9 @@ int run(const std::string& prog) {
     auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
-// Point overloading `=`/`<>` (§25.2 requires both together).
+// Point overloading `=`/`<>` (§25.2 requires both together, and — v0.158 — a
+// consistent `Equals(T)` + `override GetHashCode`; the co-declared members match
+// the operator's field-by-field semantics).
 const char* kPoint =
     "module M; "
     "record Point(X: int, Y: int) "
@@ -37,16 +39,21 @@ const char* kPoint =
     "    a.X = b.X and a.Y = b.Y; "
     "  public static method operator <>(a: Point, b: Point): bool => "
     "    a.X <> b.X or a.Y <> b.Y; "
+    "  public method Equals(other: Point): bool => X = other.X and Y = other.Y; "
+    "  public override method GetHashCode(): int => X * 31 + Y; "
     "end Point; ";
 // #1248: Pt overloads `=`/`<>` comparing ONLY X (ignoring Y) so tests can
 // distinguish the custom operator from structural field-by-field equality: two
 // Pt values with the same X but different Y compare equal by the custom operator
-// but NOT equal structurally.  Both operators are declared per §25.2.
+// but NOT equal structurally.  Both operators are declared per §25.2; the v0.158
+// co-declared `Equals(T)`/`GetHashCode` keep the X-only semantics consistent.
 const char* kPt =
     "module M; "
     "record Pt(X: int, Y: int) "
     "  public static method operator =(a: Pt, b: Pt): bool => a.X = b.X; "
     "  public static method operator <>(a: Pt, b: Pt): bool => a.X <> b.X; "
+    "  public method Equals(other: Pt): bool => X = other.X; "
+    "  public override method GetHashCode(): int => X; "
     "end Pt; ";
 }  // namespace
 
@@ -116,6 +123,8 @@ BEZEL_TEST(nullable_record_user_equality_848, reference_field_record_vs_null) {
         "record Named(Name: string, Id: int) "
         "  public static method operator =(a: Named, b: Named): bool => a.Id = b.Id; "
         "  public static method operator <>(a: Named, b: Named): bool => a.Id <> b.Id; "
+        "  public method Equals(other: Named): bool => Id = other.Id; "
+        "  public override method GetHashCode(): int => Id; "
         "end Named; "
         "class C public static method Main(): int "
         "  var a: Named? := new Named(\"alice\", 1); "

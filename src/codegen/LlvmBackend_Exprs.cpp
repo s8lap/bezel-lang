@@ -375,7 +375,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             positional = td->hasPositionalFields;
                         bool autoBearing =
                             positional ||
-                            sema::isAutoEqualityBearingBodyRecord(ts);
+                            sema::isAutoEqualityBearingBodyRecord(ts, ctx_);
                         if (toStr) {
                             // Spill the record value to an alloca so we have a ptr.
                             llvm::AllocaInst* spill = entryAlloca(ev->getType());

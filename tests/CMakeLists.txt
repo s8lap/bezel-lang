@@ -145,6 +145,7 @@ set(BEZEL_TEST_SOURCES
     sema/record_restrictions_test.cpp
     sema/record_base_restrictions_test.cpp
     sema/record_equality_eligibility_test.cpp
+    sema/equality_v0158_test.cpp
     sema/builtin_types_test.cpp
     sema/builtin_exceptions_test.cpp
     sema/string_member_diagnostic_test.cpp

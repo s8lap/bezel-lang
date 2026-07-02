@@ -819,6 +819,21 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             "instead.");
                     }
                 }
+                // §3.6 / §8.3 (v0.158, #1338): record a hash-container key /
+                // element instantiation (`Dictionary`/`OwnedDictionary` key K,
+                // `Set`/`OwnedSet` element T) so checkHashContainerKeys can
+                // verify — after all member types are resolved — that it is
+                // equality-bearing. Deferred (not checked inline) because a
+                // record key's auto-equality-bearing property depends on the
+                // record's own members, which may resolve after this site.
+                std::string_view hashRole;
+                if (first == "Set" || first == "OwnedSet")
+                    hashRole = "element";
+                else if (first == "Dictionary" || first == "OwnedDictionary")
+                    hashRole = "key";
+                if (!hashRole.empty() && !ref.genericArgs.empty())
+                    hashContainerSites_.push_back(
+                        {first, hashRole, ref.genericArgs[0], &t});
                 // §16.5 / issue #922: Range<T> is a compiler-intrinsic record.
                 // An explicit annotation `Range<int>` must resolve to the SAME
                 // TypeRef shape as the inferred form `var r := 1..5` — both

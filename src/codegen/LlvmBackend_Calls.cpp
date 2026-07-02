@@ -525,7 +525,7 @@ const sema::TypeSymbol* Emitter::recordTypeOfRef(const sema::TypeRef* ref) {
     bool positional = false;
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
         positional = td->hasPositionalFields;
-    if (positional || sema::isAutoEqualityBearingBodyRecord(ts))
+    if (positional || sema::isAutoEqualityBearingBodyRecord(ts, ctx_))
         return ts;
     return nullptr;  // an ineligible body record has no auto equality (§9.2)
 }
@@ -8628,7 +8628,7 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
         positional = td->hasPositionalFields;
     bool autoBearing =
-        positional || sema::isAutoEqualityBearingBodyRecord(ts);
+        positional || sema::isAutoEqualityBearingBodyRecord(ts, ctx_);
 
     if (isToString && !autoBearing)
         // §8.5: an ineligible body record's ToString is the type-name default.

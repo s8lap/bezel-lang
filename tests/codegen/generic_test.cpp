@@ -427,6 +427,10 @@ BEZEL_TEST(codegen_generic, user_defined_operator_eq_record) {
         "  public static method operator <>(a: V, b: V): bool "
         "    return a.X <> b.X or a.Y <> b.Y; "
         "  end operator <>; "
+        // §25.2 v0.158 co-declaration: an overloaded `=`/`<>` (homogeneous
+        // operands) requires a consistent `Equals(T)` + `override GetHashCode`.
+        "  public method Equals(other: V): bool => X = other.X and Y = other.Y; "
+        "  public override method GetHashCode(): int => X * 31 + Y; "
         "end V; "
         "class Program "
         "  public static method Main(): int "

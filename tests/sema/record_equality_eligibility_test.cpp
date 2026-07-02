@@ -176,7 +176,8 @@ BEZEL_TEST(sema_record_equality, ineligible_user_equals_accepted_spec_9_2) {
 
 // §9.2 / §8.4: an ineligible body record that declares its own `=` / `<>`
 // operator overloads is excluded from the error — `=` dispatches to the
-// user-declared operator.
+// user-declared operator.  Per §25.2 v0.158 the homogeneous `=`/`<>` overload
+// requires a co-declared `Equals(T)` + `override GetHashCode`.
 BEZEL_TEST(sema_record_equality, ineligible_user_operator_eq_accepted_spec_8_4) {
     auto r = parseSema(
         "module M; "
@@ -186,6 +187,8 @@ BEZEL_TEST(sema_record_equality, ineligible_user_operator_eq_accepted_spec_8_4) 
         "  public constructor(x: int) X := x; end constructor; "
         "  public static method operator =(a: Tagged, b: Tagged): bool => true; "
         "  public static method operator <>(a: Tagged, b: Tagged): bool => false; "
+        "  public method Equals(other: Tagged): bool => true; "
+        "  public override method GetHashCode(): int => 0; "
         "end Tagged; "
         "class C public method M() "
         "  var a := new Tagged(1); var b := new Tagged(2); "

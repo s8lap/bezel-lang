@@ -6151,14 +6151,16 @@ private:
     // issue #343 / §4.8: if the type's key generic arg (genericArgs[idx]) is a
     // record (a value type with synthesized GetHashCode/Equals), return its
     // TypeSymbol; otherwise null (string/int keys use the existing fast paths).
-    static const sema::TypeSymbol* recordKeyType(const sema::TypeRef* collTy,
-                                                 unsigned idx);
+    // Non-static: routes through isAutoEqualityBearingBodyRecord, which needs
+    // ctx_ to resolve component types (§9.2 v0.158).
+    const sema::TypeSymbol* recordKeyType(const sema::TypeRef* collTy,
+                                          unsigned idx);
 
     // issue #343 / §9.1 / §9.2: if `ref` itself resolves to an
     // equality-bearing record type (positional or auto-equality body record),
     // return its TypeSymbol; otherwise null. Used to route a record *element*
     // sequence (e.g. lazy LINQ Distinct) through structural equality.
-    static const sema::TypeSymbol* recordTypeOfRef(const sema::TypeRef* ref);
+    const sema::TypeSymbol* recordTypeOfRef(const sema::TypeRef* ref);
 
     // issue #343 / §8.3: build C-ABI trampolines over a record key type's
     // synthesized hash / equality for the generic dict/set runtime variant.

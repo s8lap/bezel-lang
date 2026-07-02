@@ -2100,7 +2100,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
             TypeSymbol* ts = memberTargetType(operand);
             if (ts && ts->kind == ast::TypeDeclKind::Record &&
-                !isAutoEqualityBearingBodyRecord(ts) &&
+                !isAutoEqualityBearingBodyRecord(ts, ctx_) &&
                 !recordHasUserDeclaredEquality(ts)) {
                 // §9.3: skip positional / combined-form records (they get §9.1
                 // positional value equality, not the body-record rule).

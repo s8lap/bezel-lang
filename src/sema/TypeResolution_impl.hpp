@@ -212,6 +212,14 @@ private:
     void checkOperatorGroups();  // §25.2: comparison/equality operator groups
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
     void checkEqualsHashCodePairing();
+    // §25.2 (v0.158, #1338): a record/enum that overloads `=`/`<>` with BOTH
+    // operands of the declaring type must also declare `Equals(T)` and
+    // `override GetHashCode`.  Heterogeneous-operand overloads are exempt.
+    void checkEqualityCoDeclaration();
+    // §3.6 / §8.3 (v0.158, #1338): every recorded `Dictionary<K,V>` /
+    // `OwnedDictionary<K,V>` key (K) and `Set<T>` / `OwnedSet<T>` element (T)
+    // must be equality-bearing (§3.6 rule 2, at the instantiation site).
+    void checkHashContainerKeys();
 
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
@@ -486,6 +494,20 @@ private:
         const ast::Type* site = nullptr;             // the `Box<IFoo>` node
     };
     std::vector<GenericInstantiation> instantiations_;
+
+    // §3.6 / §8.3 (v0.158, #1338): one hash-container instantiation site whose
+    // key/element must be equality-bearing. Recorded while resolving a
+    // `Dictionary`/`OwnedDictionary`/`Set`/`OwnedSet` `Named<...>` annotation;
+    // validated by checkHashContainerKeys() after every member type is resolved
+    // (a record key's auto-equality-bearing property depends on the record's own
+    // members being resolved, which may happen after this site is visited).
+    struct HashContainerSite {
+        std::string_view container;   // "Dictionary" / "Set" / …
+        std::string_view property;    // "key" / "element" (for the diagnostic)
+        TypeRef* keyRef = nullptr;    // the K / T type argument
+        const ast::Type* site = nullptr;  // the annotation node (span)
+    };
+    std::vector<HashContainerSite> hashContainerSites_;
 
     // §14.2: record deferred obligations for an inner instantiation whose
     // argument `argAst` is a generic parameter of the type currently being

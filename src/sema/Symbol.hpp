@@ -24,6 +24,10 @@ namespace bezel::sema {
 
 struct TypeRef;  // see TypeRef.hpp; forward-declared so LocalSymbol can
                  // point at one without dragging the full header in.
+class SemaContext;  // see SemaContext.hpp; forward-declared so the §9.2
+                    // auto-equality helpers can resolve component types
+                    // without a circular include (SemaContext.hpp includes
+                    // this header).
 
 // Per-symbol scope identifier. Assigned by the symbol-collection pass in
 // scope-DFS order so a larger ScopeId is always nested inside a smaller
@@ -266,18 +270,36 @@ struct ExternDeclSymbol : Symbol {
 // auto-property storage.
 bool isAutoPropertySymbol(const Symbol* m);
 
-// §9.2 auto-equality eligibility for a *body record* (a record with no
-// positional fields). Returns true iff the record is "auto-equality-bearing":
-// every member is an auto-property, a method, an expression-bodied or
-// block-form (computed) property, a constructor, or a non-equality operator
-// overload — and the record declares no explicit field storage, no `Equals`/
-// `GetHashCode`/`ToString` method, and no `=`/`<>` operator overload. An
-// eligible body record receives the §9.2/§8.5 auto-equality package
-// (`Equals`, `GetHashCode`, `ToString`) over its auto-properties.
+// §9.2 (v0.158) auto-equality eligibility for a *body record* (a record with
+// no positional fields). Returns true iff the record is "auto-equality-bearing":
+// every member is an auto-property whose type is an **admissible component
+// type**, a method, an expression-bodied or block-form (computed) property, a
+// constructor, or a non-equality operator overload — and the record declares no
+// explicit field storage, no `override Equals`/`GetHashCode` method, and no
+// `=`/`<>` operator overload. An eligible body record receives the §9.2/§8.5
+// auto-equality package (`Equals`, `GetHashCode`, `ToString`) over its
+// auto-properties.
+//
+// Admissible component types (one recursive rule, §9.2 v0.158): a primitive,
+// enum, or `string`; another auto-equality-bearing record; `T?` where T is
+// admissible; a non-owning inline array `[N]T`/`[N]T?` with admissible element.
+// A class/interface/`Object`/function/owning-inline-array component makes the
+// record ineligible.
+//
+// v0.158 narrowing (was #1249-A): an `override` of `ToString` alone no longer
+// disqualifies — it suppresses only auto-`ToString`; auto-`Equals`/`GetHashCode`
+// remain. An `override` of `Equals` or `GetHashCode` is still a full
+// disqualifier.
+//
+// The SemaContext resolves each component's declared type; when a component's
+// type cannot be resolved (an imported record without an accessible member type,
+// or an unresolved generic parameter) the component is treated conservatively as
+// admissible — matching the pre-v0.158 lenient behaviour and never over-rejecting.
 //
 // Returns false for positional / combined-form records (they get the §9.1
 // positional synthesis instead) and for non-record types.
-bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec);
+bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
+                                     const SemaContext& ctx);
 
 // §9.2/§8.4: does this type declare its own equality member, i.e. an
 // `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`
@@ -288,5 +310,18 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec);
 // valid on it (they dispatch to the user's member), so it must be excluded
 // from the §9.2 non-auto-equality compile error. Returns false for null.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
+
+// §3.6 / §8.3 (v0.158, #1338): the **equality-bearing** derived type property —
+// the classification a hash-container key/element must satisfy (`Dictionary<K,V>`
+// / `OwnedDictionary<K,V>` keys, `Set<T>` / `OwnedSet<T>` elements). Per §3.6's
+// table: "every type except a record that is neither auto-equality-bearing nor
+// declares user equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per
+// the §25.2 co-declaration rule)". So every primitive, string, enum, class,
+// interface, function value, and inline array is equality-bearing; a record is
+// equality-bearing iff it is positional/combined (§9.1 always synthesizes
+// equality), is an auto-equality-bearing body record (§9.2), or declares
+// `operator =`/`<>`. A null or unresolved type is treated as equality-bearing
+// (conservative — never over-rejects at an instantiation site).
+bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
 
 } // namespace bezel::sema

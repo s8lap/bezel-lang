@@ -137,6 +137,12 @@ void Resolver::run(const ast::SourceFile& src) {
     checkOperatorGroups();
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
     checkEqualsHashCodePairing();
+    // §25.2 (v0.158, #1338): a record/enum overloading `=`/`<>` (homogeneous
+    // operands) must also declare `Equals(T)` + `override GetHashCode`.
+    checkEqualityCoDeclaration();
+    // §3.6 / §8.3 (v0.158, #1338): hash-container keys/elements must be
+    // equality-bearing (runs after all member types are resolved).
+    checkHashContainerKeys();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
     // Slice S19: overloads must differ in signature.

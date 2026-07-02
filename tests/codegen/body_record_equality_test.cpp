@@ -226,3 +226,64 @@ BEZEL_TEST(codegen_body_record, interpolation_ineligible_type_name_spec_8_5) {
         "  return (1 if $\"{a}\" = \"HasField\" else 0); "
         "end Main; end C;"), 1);
 }
+
+// ─── §9.2 v0.158: new admissible component kinds (value correctness) ─────────
+
+// §9.2 v0.158 / §8.4: a `T?` (nullable-primitive) auto-property is an admissible
+// component; the synthesized `=` uses the null-safe component comparison
+// (both-present compares payloads; both-null equal; one-null unequal).
+BEZEL_TEST(codegen_body_record, nullable_component_equality_spec_9_2_v0158) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record R "
+        "  public property V: int?; "
+        "  public constructor(v: int?) V := v; end constructor; "
+        "end R; "
+        "class C public static method Main(): int "
+        "  var a := new R(5); var b := new R(5); "
+        "  var c := new R(9); "
+        "  var n1 := new R(null); var n2 := new R(null); "
+        "  if a = b and n1 = n2 and not (a = c) and not (a = n1) then "
+        "    return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §9.2 v0.158 / §8.3: a non-owning inline-array (`[N]T`) component is admissible;
+// the synthesized `=` compares element-by-element and equal records hash equal
+// (the hash-equality invariant over the new inline-array hash fold). A positional
+// record is used here because it exercises the identical emitStructEquality /
+// emitRecordHashCode machinery over the inline-array storage component and its
+// compiler-generated constructor stores the inline array reliably. (The §9.2
+// eligibility of an inline-array *auto-property* in a body record is covered in
+// tests/sema/equality_v0158_test.cpp.)
+BEZEL_TEST(codegen_body_record, inline_array_component_equality_spec_9_2_v0158) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record R(A: [3]int); "
+        "class C public static method Main(): int "
+        "  var a := new R([1, 2, 3]); var b := new R([1, 2, 3]); "
+        "  var c := new R([1, 2, 9]); "
+        "  if a.Equals(b) and not a.Equals(c) "
+        "     and a.GetHashCode() = b.GetHashCode() then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §9.2 v0.158 / §8.5: an `override ToString` alone keeps auto-equality — `=`
+// still compares structurally, while `ToString` dispatches to the override.
+BEZEL_TEST(codegen_body_record, tostring_override_keeps_equality_spec_9_2_v0158) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record R "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  public override method ToString(): string => \"custom\"; "
+        "end R; "
+        "class C public static method Main(): int "
+        "  var a := new R(7); var b := new R(7); var c := new R(8); "
+        "  if a = b and not (a = c) and a.ToString() = \"custom\" then "
+        "    return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}

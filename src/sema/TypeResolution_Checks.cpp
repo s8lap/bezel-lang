@@ -1157,6 +1157,96 @@ void Resolver::checkEqualsHashCodePairing() {
     }
 }
 
+// §25.2 (v0.158, #1338): "A record or enum that overloads `=`/`<>` with both
+// operands of the declaring type must also declare `Equals(T)` and
+// `override GetHashCode` — the same discipline, and the same diagnostic style,
+// as §8.3's Equals→GetHashCode pairing." The three surfaces (`=`, `Equals`,
+// hashing) can otherwise silently diverge exactly where it hurts: `a = b` true
+// while a `Set<T>` treats them as distinct. Heterogeneous-operand overloads
+// (`T = U`) carry no such obligation. The compiler-intrinsic IntPtr/UIntPtr
+// operator declarations predate and are exempt.
+void Resolver::checkEqualityCoDeclaration() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        if (t->kind != ast::TypeDeclKind::Record &&
+            t->kind != ast::TypeDeclKind::Enum)
+            continue;
+        // §25.2: the compiler-intrinsic pointer-sized integer records are exempt.
+        if (t->name == "IntPtr" || t->name == "UIntPtr") continue;
+
+        MethodSymbol* homoOp = nullptr;   // first homogeneous `=`/`<>` overload
+        bool hasEquals = false, hasGetHashCode = false;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms) continue;
+            if (ms->isOperator &&
+                (ms->operatorToken == "=" || ms->operatorToken == "<>")) {
+                if (homoOp || ms->params.size() != 2) continue;
+                // Homogeneous iff BOTH operands resolve to the declaring type.
+                bool bothT = true;
+                for (Symbol* psym : ms->params) {
+                    auto* p = dynamic_cast<ParameterSymbol*>(psym);
+                    const TypeRef* pt = (p && p->declType)
+                        ? ctx_.resolvedType(*p->declType) : nullptr;
+                    if (!pt || pt->kind != TypeRef::Kind::Named ||
+                        pt->declaration != t) { bothT = false; break; }
+                }
+                if (bothT) homoOp = ms;
+            } else if (!ms->isOperator && ms->name == "Equals" &&
+                       ms->params.size() == 1) {
+                // Any single-parameter `Equals` (whether `Equals(T)` or
+                // `Equals(Object?)`) states the equality surface (§25.2 lists
+                // both as reachable via `.Equals(...)`).
+                hasEquals = true;
+            } else if (!ms->isOperator && ms->name == "GetHashCode" &&
+                       ms->params.empty()) {
+                hasGetHashCode = true;
+            }
+        }
+        if (homoOp && !(hasEquals && hasGetHashCode)) {
+            std::string kind = (t->kind == ast::TypeDeclKind::Enum)
+                ? "an enum" : "a record";
+            ctx_.diagnostics().report(
+                Severity::Error, homoOp->declLoc,
+                kind + " that overloads `=` must also declare `Equals(T)` and "
+                "`override GetHashCode` (\xC2\xA7""25.2)");
+        }
+    }
+}
+
+// §3.6 / §8.3 (v0.158, #1338): a `Dictionary<K,V>` / `OwnedDictionary<K,V>` key
+// (K) and a `Set<T>` / `OwnedSet<T>` element (T) must be **equality-bearing**.
+// The sites are recorded during name resolution (resolveNamed) and validated
+// here — after every member type is resolved — because a record key's
+// auto-equality-bearing property depends on the record's own members being
+// resolved, which may happen after the container annotation is visited (§3.6
+// rule 2: per-instantiation, at the instantiation site).
+void Resolver::checkHashContainerKeys() {
+    std::unordered_set<const ast::Type*> reported;
+    for (const HashContainerSite& s : hashContainerSites_) {
+        if (isEqualityBearing(s.keyRef, ctx_)) continue;
+        if (s.site && !reported.insert(s.site).second) continue;  // dedup per site
+        // The only non-equality-bearing case is a record that neither
+        // synthesizes equality nor declares user equality.
+        const TypeSymbol* rec = s.keyRef ? s.keyRef->declaration : nullptr;
+        std::string keyName =
+            rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
+        ctx_.diagnostics().report(
+            Severity::Error,
+            s.site ? s.site->span.begin : SourceLocation{},
+            std::string("`") + std::string(s.container) +
+            "` requires an equality-bearing " + std::string(s.property) +
+            " type, but the type argument " + keyName +
+            " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): it is a "
+            "record that is neither auto-equality-bearing (\xC2\xA7""9.2) nor "
+            "declares custom equality (`operator =`/`<>` with `Equals(T)` and "
+            "`override GetHashCode`, \xC2\xA7""25.2). Give it an "
+            "auto-equality-bearing form, or declare custom equality.");
+    }
+}
+
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     auto reportInstance = [&](std::string_view kind,
                               std::string_view name) {

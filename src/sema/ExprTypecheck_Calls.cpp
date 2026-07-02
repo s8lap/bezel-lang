@@ -8520,7 +8520,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl))
                     positional = td->hasPositionalFields;
                 if (!positional &&
-                    !isAutoEqualityBearingBodyRecord(targetType) &&
+                    !isAutoEqualityBearingBodyRecord(targetType, ctx_) &&
                     !recordHasUserDeclaredEquality(targetType)) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
