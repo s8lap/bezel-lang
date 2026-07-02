@@ -5,9 +5,10 @@
 //   - 10 in (10..0 step -1) returned false (10 is the inclusive Start)
 //   - IsEmpty(0..10 step -1) returned false (direction disagrees with step
 //     sign → empty iteration, §16 L2333)
-// IsEmpty now branches on the step sign; Contains/`in` use [min(Start,End),
-// max(Start,End)] (Step-independent, §16 L2316) excluding the End endpoint when
-// half-open. Found by adversarial discovery sweep #6.
+// IsEmpty now branches on the step sign; Contains/`in` (v0.162, fix #1340)
+// use nonempty-AND-[min(Start,End),max(Start,End)] — IsEmpty (direction-aware)
+// gates membership, so a stepped descending range is nonempty and Contains
+// works correctly.  Found by adversarial discovery sweep #6.
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 

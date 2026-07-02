@@ -2169,13 +2169,34 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
         // (an unterminated case.end block, issue #738).
         if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
             if (auto* re =
-                    dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get()))
+                    dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get())) {
                 if (re->step)
                     ctx_.diagnostics().report(
                         Severity::Error, p->span.begin,
                         "`step` is not legal in a `case` range pattern — a "
                         "pattern tests membership and a stride has no meaning "
                         "(§16.4)");
+                // §16.6 (v0.162, fix #1340): a stepless range pattern with
+                // constant integer bounds that are reversed (lo > hi for a
+                // closed `lo..hi`, or lo >= hi for a half-open `lo..<hi`)
+                // can NEVER match — the pattern's extent is empty in the
+                // default ascending direction.  Warn at the pattern site so
+                // the author sees it immediately ("reversed bounds" mirrors
+                // the Rust / Python convention for this diagnostic).
+                if (!re->step && re->lo && re->hi) {
+                    auto loV = foldIntConstExprTC(*re->lo);
+                    auto hiV = foldIntConstExprTC(*re->hi);
+                    if (loV && hiV) {
+                        bool neverMatches =
+                            re->inclusive ? (*loV > *hiV) : (*loV >= *hiV);
+                        if (neverMatches)
+                            ctx_.diagnostics().report(
+                                Severity::Warning, p->span.begin,
+                                "this pattern never matches \xe2\x80\x94 "
+                                "bounds are reversed (§16.6)");
+                    }
+                }
+            }
         }
         // §19.3 / §19.6: an unguarded `_` is a catch-all and must be the last
         // arm; an earlier one makes every following arm unreachable. (A guarded

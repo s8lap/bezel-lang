@@ -127,6 +127,7 @@ set(BEZEL_TEST_SOURCES
     sema/case_exhaustiveness_test.cpp
     sema/case_common_type_nullable_747_test.cpp
     sema/case_pattern_literal_range_1153_test.cpp
+    sema/range_reversed_pattern_warn_1340_test.cpp
     sema/multi_base_test.cpp
     sema/abstract_instantiation_test.cpp
     sema/inheritance_cycle_test.cpp
@@ -612,6 +613,9 @@ set(BEZEL_TEST_SOURCES
     codegen/null_cond_value_method_1075_test.cpp
     codegen/indexer_vtable_dispatch_1080_test.cpp
     codegen/range_descending_step_1092_test.cpp
+    # --- fix #1340 (§16.3 v0.162): Contains/`in` require nonempty range; reversed
+    #     constant patterns warn; stepless literal and variable paths updated ---
+    codegen/range_contains_nonempty_1340_test.cpp
     codegen/delegate_call_argcheck_1093_test.cpp
     codegen/const_qualified_ref_1095_test.cpp
     codegen/operator_operand_order_1096_test.cpp
