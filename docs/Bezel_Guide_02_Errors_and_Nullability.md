@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification v0.135.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.157.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 
@@ -33,7 +33,7 @@ if maybe <> null then
 end;
 ```
 
-One rule that bites people: **narrowing applies to locals only, never to fields or properties.** A field can be changed by another thread between the check and the use, so the compiler will not narrow it. Copy it to a local first:
+One rule that bites people: **narrowing applies to locals only, never to fields or properties.** A field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it. Copy it to a local first:
 
 ```bezel
 var local := _field;               // copy

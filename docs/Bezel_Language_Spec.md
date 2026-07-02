@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.156 — July 2026**
+**Version 0.157 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -244,7 +244,7 @@ Static members of the standard library type are accessible through either form: 
 
 `Object` has no lowercase keyword alias. Keyword aliases are reserved for primitive value types; `Object` is a class and is referenced as `Object` unconditionally. Code coming from C#, where `object` is a keyword for `System.Object`, should write `Object` in Bezel.
 
-The PascalCase standard-library names in the table above (`Boolean`, `Byte`, `SByte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Single`, `Double`, `Decimal`, `Char`, `String`) are **reserved type names**: a program may not declare a user type (class, record, enum, interface, or type alias) whose name is one of them. Each names a compiler-known primitive (or `string`) through its lowercase keyword alias, and the dual-form rule above makes the PascalCase form interchangeable with the keyword everywhere a type is named; allowing a user type to take one of these names would let a declaration silently shadow the primitive at some use sites and not others, producing a different value than the author intended. Declaring such a type is a compile error directing the author to choose a different name. (This does not reserve other standard-library type names — only the PascalCase aliases of the primitive value types and `String`; an ordinary library type such as `Array` or `Stream` may still be shadowed by a user type under the normal name-resolution rules.)
+The PascalCase standard-library names in the table above (`Boolean`, `Byte`, `SByte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Single`, `Double`, `Decimal`, `Char`, `String`) are **reserved type names**: a program may not declare a user type (class, record, enum, interface, or type alias) whose name is one of them. Each names a compiler-known primitive (or `string`) through its lowercase keyword alias, and the dual-form rule above makes the PascalCase form interchangeable with the keyword everywhere a type is named — except the enum underlying-type position, which requires the keyword form ([§10.3](#sec-explicit-underlying-types), Appendix A.3 EnumInheritance); allowing a user type to take one of these names would let a declaration silently shadow the primitive at some use sites and not others, producing a different value than the author intended. Declaring such a type is a compile error directing the author to choose a different name. (This does not reserve other standard-library type names — only the PascalCase aliases of the primitive value types and `String`; an ordinary library type such as `Array` or `Stream` may still be shadowed by a user type under the normal name-resolution rules.)
 
 <a id="sec-operators-on-primitive-types"></a>
 ### 3.5 Operators on primitive types
@@ -594,7 +594,7 @@ The narrowing of a variable is invalidated if the variable is reassigned within 
 <a id="sec-narrowing-applies-to-locals-only"></a>
 #### Narrowing applies to locals only
 
-The compiler narrows only local variables — never fields or properties. A field readable by another thread, or one capturable by a closure, may be reassigned to `null` between a null check and a subsequent use, producing a TOCTOU (time-of-check / time-of-use) bug that the compiler cannot prevent.
+The compiler narrows only local variables — never fields or properties. A field may be reassigned to `null` between a null check and a subsequent use by paths the compiler cannot see: a method call whose body (directly, or through another reference to the same object) writes the field, a closure invoked in between, re-entrant code reached from the checked expression itself, or — across an `await` — another continuation of the same domain interleaving at the suspension point ([§30.13](#sec-runtime-model)); foreign threads introduced through the FFI ([§32](#sec-foreign-function-interface), [§30.12](#sec-thread-synchronization)) are the residual concurrent case. Narrowing a field would therefore manufacture TOCTOU (time-of-check / time-of-use) bugs the compiler cannot prevent.
 
 The standard pattern is to copy a nullable field to a local before narrowing:
 
@@ -1667,12 +1667,13 @@ end Helper;
 <a id="sec-class-members"></a>
 ### 13.3 Class members
 
-Every class member must declare its visibility explicitly, with two exceptions:
+Every class member must declare its visibility explicitly, with three exceptions:
 
 - A `static constructor` carries no visibility keyword (the runtime is the only caller; see [§22.7](#sec-constructors)).
+- A `polymorphic` registry declaration carries no visibility keyword (it is a compiler-consumed serialization map, not a callable member; see [§9.8](#sec-serialization-synthesis) and Appendix A.3).
 - A `destructor` carries no visibility keyword. A destructor is an implementation hook called by the compiler-generated `Dispose()` method; it is not directly callable by user code. The customization point is `destructor`; the public surface is `Dispose()` (see [§28.4](#sec-the-destructor)).
 
-Outside these two cases, omitting the visibility keyword is a compile error.
+Outside these three cases, omitting the visibility keyword is a compile error.
 
 Interface members do not declare visibility; they are implicitly public.
 
@@ -1691,7 +1692,7 @@ Bezel does not provide combined forms (no `protected internal`, no `private prot
 <a id="sec-accessor-visibility"></a>
 ### 13.6 Accessor visibility
 
-A property or indexer's `get` or `set` may carry its own visibility, which must be more restrictive than the property's overall visibility:
+A property or indexer's `get` or `set` may carry its own visibility, which must not be *less* restrictive than the property's overall visibility (equal visibility is permitted, though redundant; the useful form is a more restrictive accessor):
 
 ```bezel
 public property Name: string
@@ -2788,7 +2789,7 @@ The discard statement's legality depends on the static type of `expression`:
   _ := items.ToArray();        // OK: the fresh owned array is disposed at end of statement
   ```
 
-  The difference from `using var _ := expression;` is **disposal timing**, not legality: `_ := …` disposes at end of *statement*; `using var _ := …` disposes at end of *scope*. Both work for any class type. (Before v0.150, discard of a non-trivial-dispose class was a compile error; auto-drop, [§28.3](#sec-owned-local-discharge-requirement), makes the obligation always satisfiable, so the discard simply names the immediate-disposal point.)
+  The difference from `using var _ := expression;` is **disposal timing**, not legality: `_ := …` disposes at end of *statement*; `using var _ := …` disposes at end of *scope*. Both work for any class type. (Corollary: because `_ := expr;` is lexically a discard statement, a local *declared* `var _` can never be re-assigned — any later `_ := expr;` is a new discard, not an assignment to it. `_` bindings are write-once by construction.) (Before v0.150, discard of a non-trivial-dispose class was a compile error; auto-drop, [§28.3](#sec-owned-local-discharge-requirement), makes the obligation always satisfiable, so the discard simply names the immediate-disposal point.)
 
 - **Interface-typed expressions:** discard is **permitted** and disposes the value at the end of the discard statement, calling `Dispose()` on the *runtime* type (disposal is virtual). Because the discard disposes rather than abandons, the cross-module hazard that made this an error before v0.150 — an interface reference may bind any conforming implementation, and a future implementation in another module may add a non-trivial destructor — no longer applies: whatever the runtime type, `_ := expr;` disposes it correctly. `using var _ := expr;` remains available when end-of-*scope* (rather than end-of-statement) disposal is wanted.
 
@@ -3061,7 +3062,7 @@ Arms are comma-separated. A trailing comma after the last arm is optional.
 
 **Type patterns without binding:** `string`, `int`, `Dog`. Subtypes match: a `Dog` value matches an `Animal` pattern.
 
-**Type patterns with binding:** `var n: int`, `var d: Dog`. The bound name is in scope only within that arm's body.
+**Type patterns with binding:** `var n: int`, `var d: Dog`. The bound name is in scope in that arm's `when` guard and body (matching the `catch`-arm rule, [§31.2](#sec-catch-arms)).
 
 **Record destructuring:** `Point(x, y)`, `MyRecord(a, b, c)`. The type name followed by parenthesized bindings matches the type and binds positional fields by position. The number of bindings must match the record's positional-field count. Individual positions may be discarded with `_`: `Point(_, y)`. Destructuring patterns compose with `when` guards and with subtype matching.
 
@@ -3420,7 +3421,7 @@ This rule lets default-value expressions be non-constant:
 
 ```bezel
 public method OpenAsync(path: string, timeout: TimeSpan := TimeSpan.FromSeconds(30))
-public method LogAt(message: string, when: DateTime := DateTime.Now)
+public method LogAt(message: string, at: DateTime := DateTime.Now)
 public method NewBuffer(size: int := 4096, fill: byte := 0)
 ```
 
@@ -3436,7 +3437,7 @@ A default-value expression must be type-compatible with the parameter's declared
 - be a literal, constant, or `default(T)`;
 - call static methods, including factory methods that return owned instances;
 - read other static state (with the usual static-initialization rules);
-- read other parameters appearing **earlier** in the same parameter list (e.g. `M(a: int, b: int = a + 1)` is permitted; later-parameter forward references are not).
+- read other parameters appearing **earlier** in the same parameter list (e.g. `M(a: int, b: int := a + 1)` is permitted; later-parameter forward references are not).
 
 A default-value expression may not:
 
@@ -3478,7 +3479,7 @@ This carve-out exists for `out` specifically. `ref` parameters do not admit `own
 The common use is a "try" method that exposes both shapes:
 
 ```bezel
-public class ConnectionPool
+public class ConnectionPool  // declaration sketch; method bodies elided
   // Try to fetch a cached connection; caller borrows from the pool.
   public method TryGetCached(name: string, out conn: Connection?): bool;
 
@@ -5239,7 +5240,7 @@ Implicit boxing ([§8.6](#sec-boxing)) is **not** subject to this rule. When a v
 
 `move x.f` reads the value of an owned field `x.f` as an owned value, transferring ownership to the read site and leaving the field in *moved-from* state. `move coll[i]` is the analogous form for an owned-element collection slot ([§28.11](#sec-collections-do-not-own-elements)); the rules below are written for the field case and apply to the collection-slot case with "field" read as "slot." Local variables already support the move-on-read semantics described in [§28.3](#sec-local-variables-ownership-and-borrows) and do not use the `move` keyword. Static fields are not eligible — their lifetime is process-bound, and moving out of them would create the same restoration obligation across method boundaries that the rules below specifically scope to a single method.
 
-The `move` expression's static type is the slot's element type (the `T` in `owned T`); the result is owned and must be discharged like any other owned value.
+The `move` expression's static type is the slot's element type (the `T` in `owned T`); the result is owned and is subject to the standard [§28.3](#sec-local-variables-ownership-and-borrows) discharge rules like any other owned value.
 
 <a id="sec-the-field-restoration-rule"></a>
 #### The field-restoration rule
@@ -5649,7 +5650,7 @@ In addition, owning collections expose **drain methods** that transfer ownership
 
 - **`PopAt(index: int): owned T`** removes the element at the given index and returns it as owned. The slot is closed (subsequent indices shift down for sequence types; the dictionary entry is removed for `OwnedDictionary`).
 - **`PopFirst(): owned T`** and **`PopLast(): owned T`** for the common cases on `OwnedArray`, `OwnedLinkedList`. `OwnedStack.Pop` and `OwnedQueue.Dequeue` are the equivalent operations for those types, returning `owned T`.
-- **`Drain(): OwnedEnumerable<T>`** returns an iterable that drains the source as it is iterated. After full iteration, the source collection is empty. Partial iteration drains only the elements yielded; the rest remain. The user iterates with `for var item in coll.Drain() do ... end;`, where `item` is owned and must be discharged inside the loop body (`using var u := item;` is the typical form).
+- **`Drain(): OwnedEnumerable<T>`** returns an iterable that drains the source as it is iterated. After full iteration, the source collection is empty. Partial iteration drains only the elements yielded; the rest remain. The user iterates with `for var item in coll.Drain() do ... end;`, where `item` is owned; the §28.3 discharge rules apply in the loop body (`using var u := item;` is the typical form; an undischarged item auto-drops at body end with the must-use warning).
 
 `DisposeElements()` is **not** declared on owning collections. Disposing the collection already disposes the elements; the explicit method would be redundant.
 
@@ -5935,11 +5936,11 @@ The behavior of `yield return expression;` depends on the static type of the yie
 
   This is the rule that has applied since v0.78. It is the appropriate model for iterators whose consumers borrow each value briefly and discard it: filtering, formatting, dispatching to handlers.
 
-- **Owned class-typed expression yielded from an iterator returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`.** The yield transfers ownership *through* the enumerator to the consumer on each `MoveNext()` (or `MoveNextAsync()` for the async case). The enumerator does not retain ownership between yields — the value is handed off as part of the advance boundary. The consumer's iteration variable in `for var x in src do ... end` (or `await for var x in src do ... end` for the async case) is **owned** and must be discharged inside the loop body. Falling off the body without discharging is a compile error, with an error message identifying the iteration variable and pointing at the standard remedies (`using var u := x;` for scope-bound disposal, an `owned`-consuming method call, or an explicit `x.Dispose()`).
+- **Owned class-typed expression yielded from an iterator returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`.** The yield transfers ownership *through* the enumerator to the consumer on each `MoveNext()` (or `MoveNextAsync()` for the async case). The enumerator does not retain ownership between yields — the value is handed off as part of the advance boundary. The consumer's iteration variable in `for var x in src do ... end` (or `await for var x in src do ... end` for the async case) is **owned**; the [§28.3](#sec-owned-local-discharge-requirement) discharge rules apply in the loop body on every body-exit edge. Falling off the body still owning the value auto-drops it at the body's end for that iteration, with the must-use warning identifying the iteration variable and pointing at the standard remedies (`using var u := x;` for scope-bound disposal, an `owned`-consuming method call, an explicit `x.Dispose()`, or `_ := x;`).
 
   This is the model for iterators whose consumers take ownership of each value: drain operations on owning collections (synchronous), async iterators producing owned resources (async pipelines such as `OwnedAsyncEnumerable<FileStream>`).
 
-  The discharge requirement applies on every *normal-exit* edge from the loop body. The iteration variable is a local of the body's scope, and the standard owned-local discharge rules ([§28.3](#sec-local-variables-ownership-and-borrows)) apply to it directly: `break`, `continue`, `return`, `yield break`, and fall-through to the next iteration all count as normal-exit edges. The compiler requires the iteration variable to be discharged on every such edge between the binding point and the exit. The same rule applies inside an `await for` body. On *exception* edges — whether from an explicit `throw` or from a method call that propagates an exception out of the body — the iteration variable is auto-disposed by the implicit `try`/`finally` rule of [§28.3](#sec-local-variables-ownership-and-borrows) "Exception-path discharge"; no user-written discharge is required for the exception case. Code that conditionally `break`s before the natural discharge point must move the discharge before the conditional, typically by binding the iteration variable to a `using var` immediately on entry to the body:
+  The [§28.3](#sec-local-variables-ownership-and-borrows) discharge rules apply on every *normal-exit* edge from the loop body. The iteration variable is a local of the body's scope, and the standard owned-local rules — including v0.150's auto-drop with the must-use warning — apply to it directly: `break`, `continue`, `return`, `yield break`, and fall-through to the next iteration all count as normal-exit edges; on each, the iteration variable is either discharged by the program or auto-dropped with the warning. The same rule applies inside an `await for` body. On *exception* edges — whether from an explicit `throw` or from a method call that propagates an exception out of the body — the iteration variable is auto-disposed by the implicit `try`/`finally` rule of [§28.3](#sec-local-variables-ownership-and-borrows) "Exception-path discharge"; no user-written discharge is required for the exception case. Code that conditionally `break`s before the natural discharge point must move the discharge before the conditional, typically by binding the iteration variable to a `using var` immediately on entry to the body:
 
   ```bezel
   for var conn in pool.Drain() do
@@ -6026,6 +6027,8 @@ An iterator method may take `owned` parameters. The state machine takes ownershi
 
 The body may treat the `owned` parameter as it would in any other method. The example below uses `using var` to make scope-bounded disposal explicit; this transfers ownership from the parameter to the local, after which the parameter is in moved-from state and the state machine's auto-dispose does not run for it (the local's `using var` does the work):
 
+*(`StreamReader`, `AtEnd`, and `ReadLine(): string` are illustrative — the example shows the owned-parameter shape, not a reader API in the standard library; within the illustration `ReadLine()` returns a non-nullable `string`.)*
+
 ```bezel
 public method ReadAndClose(owned reader: StreamReader): IEnumerable<string>
   using var r := reader;                  // ownership moves: parameter → local
@@ -6039,6 +6042,8 @@ end ReadAndClose;
 If the body does not move ownership out, the state machine disposes the parameter at iterator disposal — after `using var` cleanups within the body and after `finally` clauses. The order across multiple owned parameters is reverse declaration order, mirroring [§28.4](#sec-the-destructor)'s destructor rule.
 
 The same machinery handles iterator parameters of move-only value type (owning inline arrays, [§15.3](#sec-move-only-value-types)). The parameter is moved into the state machine at construction time; the body sees a move-only local; at iterator disposal, the state machine auto-disposes the array's remaining non-moved-from slots in the same pass that handles owned class-typed parameters. Slots the body moved out of (via `move arr[i]` and onward transfer) are not in the state machine's responsibility set; the field-restoration rule of [§28.8.1](#sec-the-move-expression) governs the body's discipline.
+
+*(Same illustrative reader API as above.)*
 
 ```bezel
 public method Echo(owned source: StreamReader): IEnumerable<string>
@@ -6114,7 +6119,7 @@ A method declared `async` may use `await`. The return type must be one of:
 - `OwnedTask<T>` for some class type T — a result whose ownership transfers to the awaiter ([§30.5](#sec-result-lifetime-and-task-disposal)).
 - `IAsyncEnumerable<T>` — for re-iterable async iterators that contain `yield return` ([§30.7](#sec-asynchronous-programming-async-iterators)). The yielded values are borrowed by the consumer.
 - `IAsyncEnumerator<T>` — for single-use async iterators with borrowed-by-consumer values.
-- `OwnedAsyncEnumerable<T>` for class T — for async iterators that yield owned values; each consumer iteration variable is owned and must be discharged inside the loop body.
+- `OwnedAsyncEnumerable<T>` for class T — for async iterators that yield owned values; each consumer iteration variable is owned; the §28.3 discharge rules (auto-drop with the must-use warning) apply in the loop body.
 - `OwnedAsyncEnumerator<T>` for class T — single-use owned-yielding async iterator.
 
 ```bezel
@@ -6316,7 +6321,7 @@ public async method Acquire(): OwnedTask<Connection>
 end Acquire;
 ```
 
-A bare `var x := await someTask;` *does* compile under v0.90: `x` is an owned local, and the standard owned-local discharge rules then require `x` to reach an owned location before scope exit. The compile error appears later — at scope exit, if `x` was never discharged. Earlier (pre-v0.89) versions rejected `var x := await someTask` outright at the await site; v0.90 defers to the standard owned-local rules instead, which produces the same safety with a more uniform diagnostic.
+A bare `var x := await someTask;` *does* compile under v0.90: `x` is an owned local, and the standard owned-local discharge rules then require `x` to reach an owned location before scope exit. Since v0.150 an `x` never discharged auto-drops at scope exit with the must-use warning (through v0.149 this was a compile error at scope exit). Earlier (pre-v0.89) versions rejected `var x := await someTask` outright at the await site; v0.90 defers to the standard owned-local rules instead, which produces the same safety with a more uniform diagnostic.
 
 The earlier (pre-v0.89) wording of this rule required the await to be the immediate operand of `using var` or `await using var` specifically. v0.89 loosened the rule to admit any owned-consuming context; v0.90 simplifies the list by recognizing that `var x := <owned>` is itself an owned-consuming context (it produces an owned local). The rule's safety is unchanged: every owned-consuming context is one whose type system already requires the produced value to be discharged.
 
@@ -6429,7 +6434,7 @@ end ReadLinesAsync;
 
 ```bezel
 interface IAsyncEnumerable<out T>
-  method GetAsyncEnumerator(token: CancellationToken): owned IAsyncEnumerator<T>;
+  method GetAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IAsyncEnumerator<T>;
 end IAsyncEnumerable;
 
 interface IAsyncEnumerator<out T>: IAsyncDisposable
@@ -6483,7 +6488,7 @@ public async method ProcessAllAsync(paths: IEnumerable<string>): Task
 end ProcessAllAsync;
 ```
 
-The `await for` desugaring picks `GetOwnedAsyncEnumerator()` (and the destructive `Current`) when the source has static type `OwnedAsyncEnumerable<T>`. Each iteration variable is owned and must be discharged on every exit edge of the loop body — the same rule as for synchronous `for` over `OwnedEnumerable<T>` ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). When the source implements both `IAsyncEnumerable<T>` and `OwnedAsyncEnumerable<T>`, the static type of the source expression selects the desugaring; default iteration uses `IAsyncEnumerable<T>` (borrowing), and the owning path requires the source to be typed `OwnedAsyncEnumerable<T>` explicitly.
+The `await for` desugaring picks `GetOwnedAsyncEnumerator()` (and the destructive `Current`) when the source has static type `OwnedAsyncEnumerable<T>`. Each iteration variable is owned; the §28.3 discharge rules apply on every exit edge of the loop body — the same rule as for synchronous `for` over `OwnedEnumerable<T>` ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). When the source implements both `IAsyncEnumerable<T>` and `OwnedAsyncEnumerable<T>`, the static type of the source expression selects the desugaring; default iteration uses `IAsyncEnumerable<T>` (borrowing), and the owning path requires the source to be typed `OwnedAsyncEnumerable<T>` explicitly.
 
 The `with token` clause works the same way for owning async iterators — `await for var fs in OpenFilesAsync(paths) with token do ...` passes the token to `GetOwnedAsyncEnumerator(token)`.
 
@@ -7642,6 +7647,9 @@ AccessorBody    ::= "=>" (Expression | AssignmentStmt | "do" Statement* "end") "
                                  form. */
 
 IndexerDecl     ::= Visibility "static"? VirtualKind?
+                              /* "static" is over-admitted here and rejected
+                                 semantically: indexers may not be static
+                                 (§23.5). */
                     "readonly"? "property" "[" ParamList "]" ":" Type
                     PropertyBody
                               /* IndexerDecl reuses PropertyBody, whose block
@@ -8136,7 +8144,7 @@ The following keywords from [§B.1](#sec-reserved-keywords) carry meaning only i
 |---|---|---|
 | `value` | The `where T: value` constraint; the implicit setter parameter | Anywhere else: as a property name, a parameter name, etc. |
 | `notnull` | The `where T: notnull` constraint | Anywhere else: as an identifier |
-| `step` | After a range expression in `for` and lambda contexts | Anywhere else |
+| `step` | After a range expression | Anywhere else |
 | `convention` | After the library name in an `extern` block header | Anywhere else |
 | `get`, `set` | Property and indexer accessor declarations (block form) and auto-property accessor visibility shorthand | Anywhere else |
 | `operator` | After `static method` in an operator overload declaration | Anywhere else |
@@ -8199,7 +8207,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 <a id="sec-appendix-c-visibility"></a>
 ### C.2 Visibility
 
-- Every class member declares its visibility explicitly, except `static constructor` and `destructor` (which carry no visibility keyword).
+- Every class member declares its visibility explicitly, except `static constructor`, `destructor`, and the `polymorphic` registry (which carry no visibility keyword).
 - Every type appearing in a member's signature — field type, parameter type, return type, property type, indexer parameter and result type, event payload type, types named in `where` constraints — is at least as visible as the member. The rule applies at every visibility level except `private`, which is unconstrained.
 - A class's base class and implemented interfaces are at least as visible as the class.
 - Top-level types are `public` or `internal` only.
@@ -8211,7 +8219,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 
 - `Dispose()` is generated for every non-static class.
 - The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls execute disposal exactly once ([§28.2](#sec-the-idisposable-contract)).
-- Owned fields are restricted to class-typed fields (not `string`, not value types).
+- Owned fields are restricted to class- or interface-typed fields ([§28.5](#sec-owned-fields); not `string`, not function types, not value types).
 - Owned values may not escape: *transferring* an owned field out (a `move`, or a fresh owning value) requires an `owned` return type; a bare owned-field read may be returned through a non-`owned` return as a borrow of the receiver ([§28.6](#sec-leak-prevention)); assigning an owned value to a non-owned field of another object is rejected.
 - A `new` expression's result, and any owned local, is disposed exactly once on every path: it either reaches an owned location / explicit `Dispose()` / `move` / return, or is **auto-dropped at scope end** ([§28.3](#sec-owned-local-discharge-requirement)). An implicit auto-drop of a plain-`var` owned local raises a **must-use warning** (not an error); the warning is suppressed by `using var`, explicit disposal, discard, move, or return. Discard `_ := …` of an owned class or move-only value is permitted (disposes at end of statement). For trivial-dispose classes, no discharge is required. Implicit boxing is not subject to this rule ([§28.8](#sec-ownership-transfer)).
 - A static method returning a class type without `owned` and without an identifiable borrow source produces an owned value; the same discharge rules as `new` apply ([§28.3](#sec-local-variables-ownership-and-borrows)).
@@ -8229,7 +8237,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - The `move x.f` expression ([§28.8.1](#sec-the-move-expression)) is permitted only when `f` is an owned instance field; the field is left in moved-from state. Within the surrounding method, every control-flow path from the move site to the method's exit (normal return, throw, fall-through, `yield break`) must execute an assignment `x.f := value;` between the move and the exit — including paths exited by exceptions raised by intervening throwable expressions. Failure to satisfy the rule is a compile error.
 - The `move coll[i]` expression ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)) is permitted only when `coll` is an owned-element collection; the slot is left in moved-from state. The same field-restoration rule applies, with constant indices tracked per-slot and non-constant indices tracked conservatively at the whole-collection level.
 - Owned-element collections (`OwnedArray<T>`, `OwnedDictionary<K, V>`, etc.) own their elements: `Add` accepts owned arguments, the indexer-set disposes the previous value, `Remove`/`RemoveAt`/`Clear` dispose elements, and `Dispose` cascades to every element. The `Drain` method transfers ownership of elements out of the collection in iteration order. Default iteration produces borrows; ownership is transferred only via `Drain` or the dedicated `Pop*` methods ([§28.11](#sec-collections-do-not-own-elements)).
-- Iterator yield ownership is determined by the iterator method's declared return type ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). For an iterator returning `IEnumerable<T>` or `IAsyncEnumerable<T>` that yields owned class-typed values, the enumerator owns each yielded value and the consumer's iteration variable is a borrow. For an iterator returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`, ownership transfers from enumerator to consumer at each `MoveNext` (or `MoveNextAsync`); the consumer's iteration variable is owned and must be discharged inside the loop body. Falling off the body without discharging is a compile error.
+- Iterator yield ownership is determined by the iterator method's declared return type ([§29.2](#sec-desugaring-of-for) "Iterator yield ownership"). For an iterator returning `IEnumerable<T>` or `IAsyncEnumerable<T>` that yields owned class-typed values, the enumerator owns each yielded value and the consumer's iteration variable is a borrow. For an iterator returning `OwnedEnumerable<T>`, `OwnedEnumerator<T>`, `OwnedAsyncEnumerable<T>`, or `OwnedAsyncEnumerator<T>`, ownership transfers from enumerator to consumer at each `MoveNext` (or `MoveNextAsync`); the consumer's iteration variable is owned; it is discharged by the program or auto-dropped at the body's end with the must-use warning (§28.3).
 
 <a id="sec-appendix-c-generics"></a>
 ### C.4 Generics

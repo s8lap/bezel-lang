@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification v0.135.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.157.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -114,7 +114,7 @@ Note this is plain `var`, not `using var`. Ownership is tracked on the value no 
 using var s := factory.CloneBuffer();   // caller now owns it, disposes it
 ```
 
-**When would you use `using var` here instead?** Only for exception safety. The plain-`var` form above is correct *only if nothing between `new` and `return` can throw* — if `CopyFrom` could throw, `fresh` would be a `new`-result that never reached an owned location on the throwing path, which the compiler rejects as a leak. Writing `using var fresh := new Buffer();` fixes that: `using var` disposes its value *only on paths where ownership is still held at scope exit*. On the normal path, `return fresh` moves ownership out (it reaches the `owned` return), so there is nothing left for `using var` to dispose — it does **not** double-dispose. On the exception path, ownership never transferred, so `using var` disposes `fresh` during unwinding. `using var` means "dispose if still owned here," not "dispose unconditionally at the end." Use plain `var` when the body between `new` and `return` cannot throw; use `using var` when it can.
+**When would you use `using var` here instead?** Not for this factory shape at all. `using var` means *scope-pinned*: its value is disposed at this block's end and can never be moved out — `using var fresh := new Buffer(); … return fresh;` is a compile error ("cannot move out of `using var`"; spec §28.3). The factory idiom is plain `var`, and it is already exception-safe as written: if `CopyFrom` throws, `fresh` is a live owned value on the unwinding path and the exception-path discharge (spec §28.3) disposes it during unwinding — you write no cleanup code. And if some normal path drops `fresh` without returning it, it auto-drops at scope end with the must-use warning rather than leaking. The division of labor is intent: `using var` when the value should live and die in this scope; plain `var` when ownership will move on.
 
 This is the one legal way to get an owned value past a method boundary. The compiler enforces the symmetry: an `owned` field cannot be returned through a non-`owned` return type (that would be a silent leak of the container's resource):
 
@@ -152,7 +152,7 @@ method Rotate()
 end Rotate;                            // old disposed here
 ```
 
-Forgetting to reassign `_log` is a compile error, not a runtime surprise. The same `move` form works on owning-collection slots (`move buffer[i]`); see Guide 4.
+Forgetting to reassign `_log` is a compile error, not a runtime surprise. The same `move` form works on owning-collection slots (`move buffer[i]`); see spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
 
 ---
 
@@ -309,7 +309,7 @@ using var owned_x := x;           // adopt for scoped disposal
 owned_x.Process();
 ```
 
-Pick A when the value is short-lived and you only need to read it; pick B when the value must outlive the `if`. A `var` that is owned but not yet under `using var` is still tracked — the compiler rejects the program if it is neither disposed nor transferred, so the obligation cannot be silently dropped. The error message at a bad merge names the variable and the disagreeing branches.
+Pick A when the value is short-lived and you only need to read it; pick B when the value must outlive the `if`. A `var` that is owned but not yet under `using var` is still tracked — if it is neither disposed nor transferred, it auto-drops at scope end and the compiler raises the must-use warning (spec §28.3), so a drop is never silent. The mixed-ownership *merge* itself remains a hard error; its message names the variable and the disagreeing branches.
 
 ---
 

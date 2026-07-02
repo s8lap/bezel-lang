@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.156 — July 2026**
+**Companion to the Bezel Language Specification, v0.157 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -175,13 +175,13 @@ public static class Environment
 
   public static method GetEnvironmentVariable(name: string): string?;
   public static method SetEnvironmentVariable(name: string, value: string?);
-  public static method GetEnvironmentVariables(): Dictionary<string, string>;
+  public static method GetEnvironmentVariables(): owned Dictionary<string, string>;
 
   public static method Exit(exitCode: int);
 end Environment;
 ```
 
-`GetEnvironmentVariables()` returns a `Dictionary<string, string>`. Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; callers using the return value typically `import System.Collections.Generic;` to access dictionary members.
+`GetEnvironmentVariables()` returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; callers using the return value typically `import System.Collections.Generic;` to access dictionary members.
 
 <a id="sec-datetime-timespan-dateonly-timeonly"></a>
 ### 2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`
@@ -1200,7 +1200,7 @@ end;
 
 The indexer getter produces a borrow of the slot's owned element; the borrow is valid until the slot is mutated (by indexer set, RemoveAt, Clear, or any operation that disposes the slot's contents). To take an element out, use `PopAt(i)` (returns owned T and removes the slot) or `move arr[i]` (returns owned T and leaves the slot in moved-from state; the caller must reassign before the next exit point — see language spec [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression)).
 
-`Drain()` returns an `OwnedEnumerable<T>` ([§4.13](#sec-owning-enumeration-interfaces)) whose iteration transfers ownership of each element to the consumer. A `for var x in arr.Drain() do ... end` loop has owned iteration variables and consumes the array. Falling off the loop body without discharging each iteration variable is a compile error.
+`Drain()` returns an `OwnedEnumerable<T>` ([§4.13](#sec-owning-enumeration-interfaces)) whose iteration transfers ownership of each element to the consumer. A `for var x in arr.Drain() do ... end` loop has owned iteration variables and consumes the array; the spec §28.3 discharge rules apply per iteration (an undischarged element auto-drops at the body's end with the must-use warning).
 
 There is no `ToArray()` on `OwnedArray<T>` that produces a non-owning copy: copying the array would manufacture duplicate ownership of each element. To produce a fresh `OwnedArray<T>` with the same elements, the source array must be drained — the original ceases to own its elements.
 
@@ -1844,7 +1844,7 @@ public interface OwnedAsyncEnumerator<T>: IAsyncDisposable where T: class
 end OwnedAsyncEnumerator;
 ```
 
-`OwnedAsyncEnumerable<T>` is the return type for async iterator methods that yield owned values (asynchronously-produced owned resources, async drain operations on owning collections). The destructive-Current rule applies to `OwnedAsyncEnumerator<T>` the same way; `await for var x in src do ... end` produces owned iteration variables that must be discharged in the body.
+`OwnedAsyncEnumerable<T>` is the return type for async iterator methods that yield owned values (asynchronously-produced owned resources, async drain operations on owning collections). The destructive-Current rule applies to `OwnedAsyncEnumerator<T>` the same way; `await for var x in src do ... end` produces owned iteration variables; the spec §28.3 discharge rules (auto-drop with must-use warning) apply in the body.
 
 A type may implement both `IEnumerable<T>` and `OwnedEnumerable<T>`. `OwnedArray<T>` does so: default iteration via `IEnumerable<T>` yields borrows of T (the standard read-only-iteration semantics); drain iteration via `OwnedEnumerable<T>` yields owned T values that the consumer must discharge. The for-loop desugaring picks based on the static type of the source expression: `for var x in arr do` desugars via `IEnumerable<T>` (borrowing); `for var x in arr.Drain() do` desugars via `OwnedEnumerable<T>` (owning).
 
@@ -2751,7 +2751,7 @@ public class TimeoutException: Exception
 end TimeoutException;
 ```
 
-Raised by operations that exceed a deadline. Distinct from `OperationCanceledException`, which signals cancellation by an explicit `CancellationToken`; `TimeoutException` is for time-budget exhaustion where no token is involved. Library methods accepting a `TimeSpan` timeout typically raise this when the deadline elapses without the operation completing. Available without import, but only when `System.Threading` is imported — it is not in the auto-imported set.
+Raised by operations that exceed a deadline. Distinct from `OperationCanceledException`, which signals cancellation by an explicit `CancellationToken`; `TimeoutException` is for time-budget exhaustion where no token is involved. Library methods accepting a `TimeSpan` timeout typically raise this when the deadline elapses without the operation completing. Declared in `System.Threading`; available once that module is imported (it is not in the auto-imported set).
 
 <a id="sec-mutex-and-lock"></a>
 ### 6.2 `Mutex` and `Lock`

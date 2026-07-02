@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.156 — July 2026**
+**Companion to the Bezel Language Specification, v0.157 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -83,6 +83,24 @@ The motivation is honest opt-out for fire-and-forget patterns and for deliberate
 
 `_` is a sink, not a binding. It cannot be read.
 
+<a id="sec-the-value-position-conditional"></a>
+### 3.3 The value-position conditional is value-first (`a if c else b`)
+
+The expression form of selection is Python's postfix conditional — `value if condition else fallback` — while the statement form is condition-first (`if c then … else … end;`). The two word orders differ deliberately; the choice was re-examined and confirmed in 2026-07 (issue #1373).
+
+Why value-first in expression position: there, the *value* is the point — the dominant idiom is a default with an override (`var port := requested if requested > 0 else 8080;`), which reads in exactly the order the reader cares about. The form cannot dangle (the `else` is mandatory, so totality is syntactically visible), and it is familiar from Python. The recorded cost: the word-order asymmetry against the statement form occasionally trips an author writing one where they meant the other (erratum #748); this is accepted.
+
+Alternatives considered and declined: a prefix expression form `if c then a else b end` (heavier in expression position and adds `end`-noise inside nested expressions; the value-first reading was judged the better fit for the default-with-override idiom); C's `c ? a : b` (two more sigils in a language that spells `and`/`or`/`not` as words).
+
+<a id="sec-compound-assignment-spelling"></a>
+### 3.4 Compound assignment is spelled `+=`, not `+:=`
+
+Assignment is `:=` and equality is `=` (the Pascal family), yet compound assignment uses the C-family spellings `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `??=`. This is a deliberate seam, recorded here (2026-07) after review flagged it as the one unrecorded operator-family mix.
+
+Considered: `+:=` and friends (Pascal-pure — declined: unfamiliar to effectively every working programmer, visually noisy, and without precedent in any language programmers arrive from); omitting compound assignment entirely (the Ada position — declined: read-modify-write is pervasive in the systems code Bezel targets, and its absence produces `x := x + 1` ceremony with no safety gain, while the compound forms come with the §17.6 evaluate-the-target-once guarantee, which the expanded spelling does not give).
+
+The `=` glyph inside `+=` never collides with equality: compound forms exist only in statement position (`AssignmentStmt`), a position where an equality expression cannot begin, so neither humans nor the parser encounter an ambiguity. Familiarity won over purity; the cost is aesthetic only.
+
 <a id="sec-memory-management"></a>
 ## 4. Memory management
 
@@ -125,7 +143,9 @@ Rust's borrow checker enforces single-writer-or-many-readers at compile time. Mo
 
 `owned` marks a field, parameter, or return as on the disposal hook for its containing object. The compiler enforces that owned values reach an owned location and don't escape to non-owned references. Use-after-dispose is not statically prevented; it's caught at runtime via the idempotent `Dispose()` rule.
 
-Trade-off: programmers can write data races and aliasing bugs that Rust would reject. They can also write a working web server in 200 lines without `Arc<Mutex<T>>`.
+Trade-off: programmers can write aliasing bugs that Rust would reject. They can also write a working web server in 200 lines without `Arc<Mutex<T>>`.
+
+*(Supersession notes, v0.157.* Two of this section's original claims have been overtaken by later decisions and are preserved above only where still true. **Data races:** as first written, this section accepted that programmers could write data races; since v0.131–v0.133 the domain model closed that hole — continuations are serial per domain and no mutable state is reachable from two domains ([§12.5](#sec-execution-domains-why-the-async-model-is-serial-per-domain), [§12.6](#sec-sendability-spawning-and-channels)), so data races are no longer expressible in safe code and the remaining trade-off is aliasing/use-after-dispose, caught at runtime. **Discharge errors:** the original hard "must discharge every owned value" compile error became the affine auto-drop-with-warning model in v0.150–v0.152 — see [§5.23](#sec-the-affine-model).)*
 
 <a id="sec-dispose-is-not-on-object"></a>
 ### 5.2 `Dispose` is not on `Object`
@@ -680,13 +700,30 @@ Every step is ordinary ownership-valid code: `Downgrade()` yields an `owned Weak
 
 **The staging.** The migration follows the same additive-then-resolving discipline as every prior serialization stage. `Shared<T>`/`Weak<T>` are first admitted to the recursive serialization-eligibility set (purely additive: a class with these fields enters the identity path; every existing `owned`+borrow class is unaffected). Then the graph-shape clauses are removed, the field types having superseded them, the test surface migrated to express shape through types, and the `serialized cyclic` positive tests — which never had an ownership-valid producer — retired rather than rewritten. The `$id`/`$ref` envelope is unchanged throughout, so the one behavioural difference a user can observe is the intended one: a `Shared<T>` value's disposal happens at the last handle's release, anywhere in the program, rather than at a single owner's destruction — a contract of the shared-ownership type ([§5.21](#sec-shared-t)) made visible through serialization, not a regression in it.
 
+<a id="sec-the-affine-model"></a>
+### 5.23 The affine model: auto-drop with a must-use warning
+
+*(This section hoists the load-bearing reasoning of the v0.150–v0.152 revisions out of the [§19 changelog](#sec-changelog) — which is not part of the language definition — into the rationale body, per the 2026-07 documentation review. The changelog entries remain the detailed record.)*
+
+Bezel's ownership model was originally strict-linear on the normal path: an owned local that reached scope end undischarged — neither moved, returned, stored, nor disposed — was a hard compile error. Three pressures broke that position:
+
+1. **The language was already affine at the seams.** The exception path has always disposed live owned values during unwinding (nobody proposes a compile error for "an exception happened while you held a resource"), and v0.149 made *unbound owned temporaries* auto-dispose at end of statement. That left the absurdity that *naming* a value changed whether the program compiled: `new Foo().Use();` compiled while `var a := new Foo(); a.Use();` was an error — a refactoring hazard with no safety content.
+2. **The error rejected sound programs.** Every program it rejected had a perfectly defined meaning (dispose at scope end) that the exception path already implemented.
+3. **Precedent.** Rust — the reference point for compile-time ownership — is affine: values drop at scope end, and "you probably meant to use this" is a lint (`#[must_use]`), not a rejection. Strict linearity (Austral-style) buys explicitness at the price of ceremony on every early return and every conditionally-consumed value.
+
+The resolution (v0.150 for locals, v0.152 for `owned` parameters) is uniform **affine auto-drop**: an owned value still held at a normal scope exit is disposed there, implicitly, by the same mechanism the exception edge already used — with a **must-use warning** on the implicit drop of a plain `var`. The two declaration forms keep distinct intent: `using var` means scope-pinned (never movable, no warning — you said what you meant); plain `var` means movable, warned if implicitly dropped. The discard `_ := expr;` ([§3.2](#sec-the-discard-_)) becomes the explicit "dispose this now" form. Exactly-once disposal on every path is preserved throughout — the move analysis marks transferred values moved-from, and scope-end disposal skips them.
+
+What was deliberately *kept* strict: `Task`/`Task<T>` discard stays an error (abandoning a running operation is a semantic decision, routed to `Task.FireAndForget`); moving out of a `using var` stays an error (scope-pinning is the form's entire meaning); and the §28.8.1 field-restoration rule is untouched (fields are object state, not scope state — auto-drop of a *field* would be a use-after-free generator, not a convenience).
+
+The trade recorded honestly: the compile-time "you forgot to discharge" error is gone, replaced by a warning. Programs that leak by *intent-mismatch* (the author believed something consumed the value) now compile with a diagnostic instead of failing. Implementation experience since v0.150 supports the choice — the warning has proven sufficient signal in practice, and an entire class of false-positive discharge errors (branch-dependent consumption) disappeared with it.
+
 <a id="sec-nullability"></a>
 ## 6. Nullability
 
 <a id="sec-field-narrowing-is-not-safe-across-threads"></a>
-### 6.1 Field narrowing is not safe across threads
+### 6.1 Field narrowing is not safe across statements
 
-`if user <> null then user.Method() end;` works for locals because the compiler knows nothing else can reassign them. For fields, the same code is a compile error: another thread can write `null` to the field between the check and the use.
+`if user <> null then user.Method() end;` works for locals because the compiler knows nothing else can reassign them. For fields, the same code is a compile error — not primarily because of threads (since v0.131 a domain's continuations are serial, [§12.5](#sec-execution-domains-why-the-async-model-is-serial-per-domain)), but because the field can be reassigned between the check and the use by paths the compiler cannot see: a method call whose body writes the field (directly or through an alias to the same object), a closure invoked in between, re-entrant code reached from the check's own expression, or — across an `await` — any other continuation of the same domain interleaving at the suspension point. Foreign threads introduced through the FFI remain a residual case ([§16](#sec-ffi), spec §30.12). A local has none of these writers, so narrowing it is sound.
 
 The compiler does not narrow fields. The recommended pattern is to copy the field to a local before checking:
 
@@ -946,11 +983,11 @@ The interaction between async and ownership is the hardest design problem in the
 The producer's return type carries the choice:
 
 - `Task<T>` for class T means fan-out. Every awaiter borrows. The task must be held in `using var` for the borrow to be valid.
-- `Task<owned T>` for class T means single-consumer. One awaiter takes ownership; the task is consumed by `using var x := await t;`. A second await raises `InvalidOperationException`.
+- `OwnedTask<T>` for class T means single-consumer. One awaiter takes ownership; the task is consumed by `using var x := await t;`. A second await raises `InvalidOperationException`.
 
 The rule reduces to "whatever the type says." Producers commit in their signature; consumers' obligations follow from that signature. There is no syntactic peek at the await context.
 
-The motivating case is `Semaphore.AcquireAsync(): Task<owned SemaphoreToken>` — an operation whose entire purpose is to produce a fresh, single-consumer token. The consumer writes the only syntactic shape that compiles:
+The motivating case is `Semaphore.AcquireAsync(): OwnedTask<SemaphoreToken>` — an operation whose entire purpose is to produce a fresh, single-consumer token. The consumer writes the only syntactic shape that compiles:
 
 ```bezel
 using var token := await sem.AcquireAsync();
@@ -960,7 +997,9 @@ DoCriticalWork();
 Producers who want both shapes declare two methods with distinct names.
 
 <a id="sec-choosing-between-taskt-and-taskowned-t"></a>
-### 12.2 Choosing between `Task<T>` and `Task<owned T>`
+### 12.2 Choosing between `Task<T>` and `OwnedTask<T>`
+
+*(Spelling note: revisions v0.78–v0.96 wrote Pattern B as `Task<owned T>`; v0.97 replaced the `<owned T>` generic-argument mechanism with the named `Owned*` types — see [§5.11](#sec-owning-collections) and spec §14.4. §12.1–§12.2 were originally written in the old spelling and are stated here in the current one; the semantics are unchanged.)*
 
 The choice between Pattern A and Pattern B is the producer's — it goes in the method signature and determines what every caller must do. The decision tree below is from the producer's perspective.
 
@@ -977,12 +1016,12 @@ public async method FetchNameAsync(): Task<string>   // string — no pattern
 
 The hallmark of a resource-acquisition operation: the caller asked the system to create, open, connect, or acquire something, and the caller is the one who must close, release, or dispose it when done. The operation's purpose is to hand over a resource.
 
-If yes → **Pattern B: `Task<owned T>`**
+If yes → **Pattern B: `OwnedTask<T>`**
 
 ```bezel
-public async method ConnectAsync(url: string): Task<owned Connection>
-public async method AcquireAsync(): Task<owned SemaphoreToken>
-public async method OpenAsync(path: string): Task<owned FileStream>
+public async method ConnectAsync(url: string): OwnedTask<Connection>
+public async method AcquireAsync(): OwnedTask<SemaphoreToken>
+public async method OpenAsync(path: string): OwnedTask<FileStream>
 ```
 
 The caller writes:
@@ -1034,7 +1073,7 @@ public async method GetCachedItemAsync(key: string): Task<CacheEntry>
 | Question | Answer | Pattern | Return type |
 |---|---|---|---|
 | Result is value type / string / runtime-managed? | Yes | Neither | `Task<T>` |
-| Operation produces a fresh resource the caller must dispose? | Yes | B | `Task<owned T>` |
+| Operation produces a fresh resource the caller must dispose? | Yes | B | `OwnedTask<T>` |
 | Multiple consumers may read the same result? | Yes | A | `Task<T>` |
 | Result is borrowed from an existing owner? | Yes | A | `Task<T>` |
 
@@ -7225,6 +7264,38 @@ Language spec: §29.11 (single-consumption lazy queries); §8.6 (the `IReadOnlyS
 Source-breaking only for code that was already wrong or relied on an unspecified value. A `.Set(...)` call on a collection now reports an unknown-member error (use the indexer `coll[k] := v` or the type's insertion method). A no-argument `DateTime.ToString()` that previously produced an empty/garbage string (and crashed when its result was used) now returns the ISO 8601 rendering. Nothing sound stops compiling.
 
 ---
+
+<a id="sec-v0-156-to-v0-157-changelog"></a>
+### v0.157 changelog (v0.156 → v0.157)
+
+v0.157 is the **documentation-currency revision**: it brings every body section of the five documents up to date with decisions already landed (chiefly the v0.97 `Owned*` naming and the v0.150–v0.152 affine model), corrects the mechanical defects catalogued by the 2026-07 documentation review, and records previously-unrecorded syntax decisions. It changes no language capability. (Issues: #1317, #1318, #1319, #1329, #1330, #1361, #1373, plus the recording halves of #1343.)
+
+#### Currency sweep (stale-premise text updated in place)
+
+- **Rationale §12.1–§12.2** respelled from the retired `Task<owned T>` to `OwnedTask<T>` with a spelling note; §12.2 retitled (#1317). Historical/changelog mentions untouched.
+- **Affine-model echoes swept** (#1329): spec §29.2 (iteration-variable discharge — twice), §30.1, §30.5, Appendix C.3, and stdlib §4.5/§4.13 no longer state the pre-v0.150 "compile error" rule; all now delegate to §28.3's auto-drop-with-must-use-warning. *Compiler note:* the implementation still hard-errors on an undischarged owned **iteration variable** (the §28.3 auto-drop machinery requires a plain local); this revision is spec-ahead-of-implementation on that path, as v0.151 was for Part C — the compiler follow-up is tracked in #1329.
+- **Guide 1** (#1330): §5's factory guidance rewritten — the old text taught `using var fresh; … return fresh;`, which the spec rejects ("cannot move out of `using var`"), and pre-affine leak-error framing; it now teaches plain-`var` factories (exception-safe via the §28.3 exception-path discharge) and `using var` as scope-pinned. §7's closing rewritten for auto-drop. §6's dangling "Guide 4" reference now cites spec §28.8.1/§28.11 (#1319).
+- **Field-narrowing justification re-led** (rationale §6.1, spec §7, Guide 2 §1): the "another thread" rationale is incoherent under the serial-domain model (v0.131); the operative reasons are unseen writers — method calls, aliases, closures, re-entrancy, and continuation interleaving at `await` — with FFI threads as the residual concurrent case.
+- **Rationale §5.1** gains a supersession note (data races closed by the domain model §12.5/§12.6; the discharge error superseded by the affine model).
+- **Both guides re-pinned** to the current revision (#1318), with the standing rule below.
+
+#### New rationale body sections
+
+- **§3.3 The value-position conditional is value-first** — records the owner ruling on #1373: the Python-style `a if c else b` is kept deliberately; the prefix `if c then a else b end` expression form and C's `?:` are recorded as considered-and-declined; the statement/expression word-order asymmetry is the accepted cost.
+- **§3.4 Compound assignment is spelled `+=`, not `+:=`** — records the deliberate C-family seam in the Pascal-family operator set (#1343 recording half), with `+:=` and no-compound-assignment as considered-and-declined.
+- **§5.23 The affine model** — hoists the v0.150–v0.152 why-affine reasoning from this changelog (which is "not part of the language definition") into the rationale body (#1330).
+
+#### Mechanical defect sweep (#1361)
+
+Spec §22.5 (example parameter renamed `when`→`at` — `when` is unconditionally reserved; the `b: int = a + 1` default respelled `:=`, re-applying the v0.79 fix); §22.6 (ConnectionPool sketch marked bodies-elided); §29.8 (illustrative-API disclaimers on both StreamReader examples); §B.2 (`step` reserved-context row corrected); Appendix C.3 (owned fields are class- **or interface**-typed, per §28.5); §13.6 (accessor visibility: **equal** visibility is permitted — aligned to the implemented rule; only *less restrictive* is an error); §13.3 + C.2 (the `polymorphic` registry recorded as the third no-visibility member); §30.7 (interface sketch gains the decided `token := CancellationToken.None` default, matching stdlib §4.12); §19.3 (a type-pattern binding is in scope in the arm's **guard** and body, as §19.4's own example requires); §17.13 (corollary recorded: a `var _` binding can never be re-assigned); A.4 (IndexerDecl's over-admitted `"static"` annotated as semantically rejected per §23.5). Stdlib §6.1 (the self-contradictory TimeoutException availability sentence); §2.4 (`GetEnvironmentVariables(): owned Dictionary<string, string>` per the §1 fresh-instance convention — compiler alignment tracked with #1361).
+
+#### Standing rule adopted (docs workflow)
+
+A revision that changes a premise must touch every body section that stated that premise (grep for the old vocabulary as part of mechanical validation), and the guides are re-validated and re-pinned at each revision that touches material they teach.
+
+#### Migration
+
+None. No capability, grammar, or behavior change; the §13.6 wording aligns the spec to the already-implemented rule.
 
 ## 20. Closing
 
