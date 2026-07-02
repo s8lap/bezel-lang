@@ -45,6 +45,43 @@ class Api
 end Api;
 ```
 
+### 2.1 Handlers as ordinary named methods (no lambdas required)
+
+The handler parameter is just a function type, and Bezel already converts method references to function values (spec §27.6) — so endpoint bodies can be normal methods, registered by name. No controllers, no attributes, no reflection: registration stays explicit code.
+
+```bezel
+class TodoApi
+  private readonly _repo: Locked<Dictionary<int, Todo>>;   // proposal 0003
+  public constructor(owned repo: Locked<Dictionary<int, Todo>>)
+    _repo := owned repo;
+  end constructor;
+
+  public async method GetById(req: HttpRequest): Task<owned HttpResponse>
+    var id := int.Parse(req.Param("id"));
+    using var g := await _repo.LockAsync();
+    return case g.Value.TryGetValue(id, out var todo) of
+      true => Http.Json(todo!),
+      _    => Http.Status(404)
+    end;
+  end GetById;
+
+  public async method Create(req: HttpRequest): Task<owned HttpResponse>
+    var todo := await req.Json<Todo>();
+    using var g := await _repo.LockAsync();
+    g.Value.Add(todo.Id, todo);
+    return Http.Json(todo, status := 201);
+  end Create;
+end TodoApi;
+
+// composition root — constructor wiring, no DI container (DECLINED.md D-0001)
+var api := new TodoApi(new(new Dictionary<int, Todo>()));
+app.Get("/todos/{id}", api.GetById);     // bound instance-method reference
+app.Post("/todos", api.Create);
+app.Get("/health", Health.Check);        // static-method reference — capture-free
+```
+
+A static-method reference is capture-free, hence trivially sendable. A **bound** instance reference (`api.GetById`) captures `api`, so the §30.14 sendability check applies to `api`'s type at registration — which is precisely the guarantee controllers never had: a "controller" whose fields would data-race across concurrent requests is a *compile error at the registration line*, not a production incident. This is the endpoint-grouping story: a plain class holding synchronized/sendable dependencies, its methods registered explicitly. Route groups (`app.Group("/todos")`) remain deferred (§6) as pure sugar over this.
+
 Things to notice:
 
 - `Http.Text(...)`, `Http.Json(...)`, `Http.Status(404)` are the response **constructors** — the server-direction mirror of the client's response *accessors*. One `HttpResponse` type, two directions, exactly like the web-standard `Response`.
