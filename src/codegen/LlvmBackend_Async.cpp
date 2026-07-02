@@ -684,10 +684,22 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             auto* okBB = llvm::BasicBlock::Create(llvm_, "main.ok", fn);
             builder_.CreateCondBr(mainErr, errBB, okBB);
             builder_.SetInsertPoint(errBB);
+            // #1366 / §33.3: a faulted awaited-Main task. Unlike the synchronous
+            // no-handler boundary, the fault exception object is NOT live here —
+            // the async resume/await machinery has already disposed+freed it by
+            // the time Main's outer frame observes the fault (a use-after-free if
+            // read). Pass null so the runtime prints the bare "Unhandled
+            // exception" header and exits 70 (the pre-v0.163 async behavior). A
+            // richer async report would require the await path to preserve the
+            // fault object's message/CauseChain to a sendable record first
+            // (tracked as a follow-up).
             auto* unhandledFn = declareC("bz_unhandled_exception",
-                                         llvm::Type::getVoidTy(llvm_), {});
+                                         llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy(), ptrTy()});
             unhandledFn->setDoesNotReturn();
-            builder_.CreateCall(unhandledFn, {});
+            builder_.CreateCall(unhandledFn,
+                {llvm::ConstantPointerNull::get(ptrTy()),
+                 llvm::ConstantPointerNull::get(ptrTy())});
             builder_.CreateUnreachable();
             builder_.SetInsertPoint(okBB);
             llvm::Value* res = nullptr;
@@ -1457,7 +1469,10 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             llvm::Value* excObj = cb.CreateCall(
                 callocTy, callocFnV,
                 {llvm::ConstantInt::get(i64(), 1),
-                 llvm::ConstantInt::get(i64(), 16)},
+                 // §31.4: the uniform exception block (kExcObjSize) — a
+                 // smaller alloc would make the CauseChain@24 / ParamName@32
+                 // reads (catch arms, uncaught report) read out of bounds.
+                 llvm::ConstantInt::get(i64(), kExcObjSize)},
                 "tc.excobj");
             auto vit = builtinVtable_.find("InvalidOperationException");
             if (vit != builtinVtable_.end())

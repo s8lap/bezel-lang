@@ -3433,6 +3433,27 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // recognition is extended to cover the user-class case via
     // hasBuiltinExceptionBase.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // §31.4: ExceptionInfo.TypeName/.Message/.StackTrace — a 24-byte record
+        // field, NOT a built-in-exception object. Intercept before the Message
+        // handler below, whose isBuiltinExceptionType (declaration == null) would
+        // otherwise mis-treat the ExceptionInfo value as an exception object and
+        // GEP offset 8 on a struct value (malformed IR).
+        if (ma->target &&
+            (ma->member == "TypeName" || ma->member == "Message" ||
+             ma->member == "StackTrace")) {
+            const sema::TypeRef* rtt = ctx_.exprType(*ma->target);
+            bool isExcInfo = rtt && rtt->kind == sema::TypeRef::Kind::Named &&
+                !rtt->declaration &&
+                ((rtt->importedName == "ExceptionInfo") ||
+                 (rtt->astNode && rtt->astNode->name &&
+                  !rtt->astNode->name->parts.empty() &&
+                  rtt->astNode->name->parts.back() == "ExceptionInfo"));
+            if (isExcInfo) {
+                unsigned fieldIdx = ma->member == "TypeName" ? 0
+                                  : ma->member == "Message"  ? 1 : 2;
+                return lowerExceptionInfoField(*ma->target, fieldIdx);
+            }
+        }
         if (ma->target && ma->member == "Message") {
             auto* tt = ctx_.exprType(*ma->target);
             // Case A: receiver is a built-in exception TypeRef (no user declaration).
@@ -3491,6 +3512,35 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     llvm::ConstantPointerNull::get(ptrTy()));
                 llvm::Value* emptyStr = lowerStringLiteral("\"\"", false);
                 return builder_.CreateSelect(isNull, emptyStr, msgPtr);
+            }
+        }
+        // §31.4 (v0.162/v0.163): the built-in Exception surface beyond Message.
+        //  * StackTrace — the "" stub (no debug info yet).
+        //  * CauseChain — the #811 snapshot at offset kExcCauseOffset (a
+        //    bz_array_t* of ExceptionInfo; null → empty, safe: bz_array_len(null)
+        //    == 0 and any index is out of bounds).
+        //  * ParamName  — offset kExcParamOffset (bz_string*; null when absent).
+        //  * ExceptionInfo.TypeName/.Message/.StackTrace — fields 0/1/2 of the
+        //    24-byte record element.
+        if (ma->target) {
+            auto* rtt = ctx_.exprType(*ma->target);
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            if (ma->member == "StackTrace" && isBuiltinExceptionTypeRef(rtt)) {
+                return lowerStringLiteral("\"\"", false);
+            }
+            if (ma->member == "CauseChain" && isBuiltinExceptionTypeRef(rtt)) {
+                llvm::Value* excObj = lowerExpr(*ma->target);
+                if (!excObj) return nullptr;
+                llvm::Value* ccSlot = builder_.CreateGEP(
+                    i8Ty, excObj, builder_.getInt64(kExcCauseOffset));
+                return builder_.CreateLoad(ptrTy(), ccSlot, "exc.causechain");
+            }
+            if (ma->member == "ParamName" && isBuiltinExceptionTypeRef(rtt)) {
+                llvm::Value* excObj = lowerExpr(*ma->target);
+                if (!excObj) return nullptr;
+                llvm::Value* pnSlot = builder_.CreateGEP(
+                    i8Ty, excObj, builder_.getInt64(kExcParamOffset));
+                return builder_.CreateLoad(ptrTy(), pnSlot, "exc.paramname");
             }
         }
         // stdlib §2.17 / §31.4 (#1107/#11-13): `ex.InnerException` on a
@@ -8141,6 +8191,79 @@ void Emitter::prePopulateBasePositionalFields(
 }
 
 
+llvm::Value* Emitter::emitExcCauseSnapshot(llvm::Value* cause,
+                                           bool causeIsBuiltin) {
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    // Virtual ToString (vtable slot 3): vtable = cause[0]; ToString = vtable[3].
+    // For a built-in exception this is the §8.5 default — its type name.
+    llvm::Value* vtable = builder_.CreateLoad(ptrTy(), cause, "cause.vt");
+    llvm::Value* tsSlot = builder_.CreateGEP(
+        ptrTy(), vtable, builder_.getInt64(3), "cause.ts.slot");
+    llvm::Value* tsFn = builder_.CreateLoad(ptrTy(), tsSlot, "cause.ts.fn");
+    auto* tsFnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* typeName =
+        builder_.CreateCall(tsFnTy, tsFn, {cause}, "cause.tn");
+    // Message @ kExcMsgOffset.
+    llvm::Value* msg = builder_.CreateLoad(ptrTy(),
+        builder_.CreateGEP(i8Ty, cause, builder_.getInt64(kExcMsgOffset)),
+        "cause.msg");
+    // Nested chain @ kExcCauseOffset — only a built-in cause has this slot.
+    llvm::Value* nested =
+        causeIsBuiltin
+            ? builder_.CreateLoad(ptrTy(),
+                  builder_.CreateGEP(i8Ty, cause,
+                      builder_.getInt64(kExcCauseOffset)),
+                  "cause.nested")
+            : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptrTy()));
+    auto* fn = declareC("bz_exc_causechain_link", ptrTy(),
+                        {ptrTy(), ptrTy(), ptrTy()});
+    return builder_.CreateCall(fn, {typeName, msg, nested}, "cc.link");
+}
+
+
+llvm::Value* Emitter::lowerExceptionInfoField(const ast::Expr& target,
+                                              unsigned fieldIdx) {
+    // ExceptionInfo lowers to a 24-byte {TypeName, Message, StackTrace} record
+    // of three bz_string* (LlvmBackend_Layout.cpp).
+    auto* eiTy = llvm::StructType::get(llvm_, {ptrTy(), ptrTy(), ptrTy()});
+    // Common case: `<array>[i]` where <array> is Array<ExceptionInfo>. Copy the
+    // element out with bz_array_get (bounds-checked) and read the field.
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target)) {
+        if (ix->target && !ix->indices.empty() && ix->indices[0].value) {
+            llvm::Value* arr = lowerExpr(*ix->target);
+            llvm::Value* idx = lowerExpr(*ix->indices[0].value);
+            if (!arr || !idx) return nullptr;
+            llvm::Value* idx64 = idx->getType() == i64()
+                ? idx
+                : builder_.CreateSExt(idx, i64(), "ei.idx64");
+            // §15.1: bounds-check (unsigned, so a negative index is rejected too).
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {arr}, "ei.len");
+            emitGuardThrow(builder_.CreateICmpUGE(idx64, len, "ei.oor"),
+                           "IndexOutOfRangeException");
+            llvm::AllocaInst* tmp = entryAlloca(eiTy);
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(getFn,
+                {arr, idx64, tmp, builder_.getInt64(24)});
+            llvm::Value* fp =
+                builder_.CreateStructGEP(eiTy, tmp, fieldIdx, "ei.fld");
+            return builder_.CreateLoad(ptrTy(), fp, "ei.val");
+        }
+    }
+    // Fallback: an addressable ExceptionInfo value — lower it and re-store to a
+    // temp so the field can be GEP'd.
+    if (llvm::Value* v = lowerExpr(target)) {
+        llvm::AllocaInst* tmp = entryAlloca(eiTy);
+        builder_.CreateStore(v, tmp);
+        llvm::Value* fp =
+            builder_.CreateStructGEP(eiTy, tmp, fieldIdx, "ei.fld");
+        return builder_.CreateLoad(ptrTy(), fp, "ei.val");
+    }
+    return nullptr;
+}
+
+
 llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // §17.7 `new(args)` shorthand: there is no explicit `ne.type` — the target
     // type is inferred from context (the LHS annotation / assignment target) and
@@ -8187,18 +8310,62 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             std::string n(tnode->name->parts.back());
             auto vit = builtinVtable_.find(n);
             if (vit != builtinVtable_.end()) {
-                // 16 bytes: slot0=vtable, slot1=message string ptr
+                // §31.4: kExcObjSize block — vtable@0, Message@8, CauseChain@24,
+                // ParamName@32 (calloc zeroes the unused slots).
                 llvm::Value* obj = builder_.CreateCall(
-                    callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
+                    callocFn(),
+                    {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
                 builder_.CreateStore(vit->second, obj);
-                // Store message string if a first argument was provided.
+                auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                // arg0 = message (string).
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* msgStr = lowerExpr(*ne.args[0].value);
                     if (msgStr) {
-                        auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
                         llvm::Value* msgSlot = builder_.CreateGEP(
-                            i8Ty2, obj, builder_.getInt64(8));
+                            i8Ty2, obj, builder_.getInt64(kExcMsgOffset));
                         builder_.CreateStore(msgStr, msgSlot);
+                    }
+                }
+                // arg1 distinguishes the two-argument constructors by static type
+                // (§31.4): a `string` second argument is ArgumentException's
+                // paramName (→ ParamName@32); anything else is the (message,
+                // cause) overload's cause, snapshotted into CauseChain@24 (#811).
+                if (ne.args.size() >= 2 && ne.args[1].value) {
+                    const sema::TypeRef* a1ty = ctx_.exprType(*ne.args[1].value);
+                    bool argIsString = a1ty &&
+                        a1ty->kind == sema::TypeRef::Kind::Primitive &&
+                        a1ty->primitive == sema::PrimitiveType::String;
+                    if (argIsString) {
+                        llvm::Value* pn = lowerExpr(*ne.args[1].value);
+                        if (pn) {
+                            llvm::Value* pnSlot = builder_.CreateGEP(
+                                i8Ty2, obj, builder_.getInt64(kExcParamOffset));
+                            builder_.CreateStore(pn, pnSlot);
+                        }
+                    } else {
+                        // (message, cause): snapshot the borrowed cause (#811).
+                        llvm::Value* cause = lowerExpr(*ne.args[1].value);
+                        if (cause) {
+                            // §31.4: a USER exception subclass also carries
+                            // the full built-in header (classStruct), so its
+                            // nested CauseChain@24 is readable too.
+                            bool hasHdr = isBuiltinExceptionType(a1ty) ||
+                                (a1ty && a1ty->declaration &&
+                                 hasBuiltinExceptionBase(a1ty->declaration));
+                            llvm::Value* chain = emitExcCauseSnapshot(
+                                cause, /*causeIsBuiltin=*/hasHdr);
+                            llvm::Value* ccSlot = builder_.CreateGEP(
+                                i8Ty2, obj, builder_.getInt64(kExcCauseOffset));
+                            builder_.CreateStore(chain, ccSlot);
+                            // §31.1: the cause is BORROWED only for the snapshot.
+                            // A fresh `new` temp in argument position is owned by
+                            // no one afterwards — dispose+reclaim it now (its data
+                            // is already copied). A named variable / field cause
+                            // stays with its own owner (not a NewExpr → skipped).
+                            if (dynamic_cast<const ast::NewExpr*>(
+                                    ne.args[1].value.get()))
+                                emitDisposeAndReclaim(cause);
+                        }
                     }
                 }
                 return obj;

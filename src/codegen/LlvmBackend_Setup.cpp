@@ -2090,6 +2090,20 @@ void Emitter::setupBuiltinExceptions() {
         dispTy, llvm::Function::InternalLinkage, "bz$exDispose",
         module_.get());
     {
+        // The SHARED no-op disposer for built-in exceptions AND every value-type
+        // box (record / primitive / span box, §8.6). It stays a pure no-op: a
+        // built-in exception owns nothing that its Dispose must free.
+        //
+        // §31.4/#811 note: the CauseChain snapshot a `(message, cause)` exception
+        // holds is NOT freed here. An exception object has several disposal /
+        // reclaim paths (catch-arm dispose, scope-end dispose, and the async
+        // fault-propagation free in bz$async$*$Resume), and they are not a single
+        // idempotent site — a Dispose that read/free'd CauseChain@24 double-freed
+        // it (and read freed memory) on the async path. So the CauseChain is left
+        // to be reclaimed by process exit, exactly like the runtime-owned
+        // TypeInitializationException.InnerException (§22.13, above). This is a
+        // small, bounded leak confined to a caught-and-disposed exception that was
+        // constructed WITH a cause; tracked as a follow-up.
         auto* bb = llvm::BasicBlock::Create(llvm_, "entry",
                                             builtinDisposeFn_);
         llvm::IRBuilder<> b(bb);
@@ -2283,9 +2297,10 @@ llvm::Value* Emitter::constValueForPatternName(
 void Emitter::emitThrowBuiltin(const char* name) {
     auto vit = builtinVtable_.find(name);
     if (vit == builtinVtable_.end()) return;
-    // 16-byte object: slot0=vtable, slot1=empty message ptr (calloc zeros it).
+    // §31.4: kExcObjSize object; slot0=vtable, message/causechain/paramname
+    // slots left null by calloc (a guard-thrown exception carries none).
     llvm::Value* obj = builder_.CreateCall(
-        callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
+        callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
     builder_.CreateStore(vit->second, obj);
     builder_.CreateStore(obj, emitExcSlot());
     emitUnwindDisposals();
@@ -2964,9 +2979,15 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     collectInstanceStorage(ts, storage);
     std::vector<llvm::Type*> specFieldTys;
     specFieldTys.push_back(ptrTy());           // [0] vtable ptr
-    if (hasBuiltinExceptionBase(ts))
-        specFieldTys.push_back(ptrTy());       // [1] message ptr (rare for generics)
-    specFieldTys.push_back(disposedFlagTy());  // [1 or 2] disposed flag
+    if (hasBuiltinExceptionBase(ts)) {
+        // §31.4: full built-in exception header (see classStruct) — rare for
+        // generics, but the key must match specializedStructs_ exactly.
+        specFieldTys.push_back(ptrTy());       // [1] Message
+        specFieldTys.push_back(ptrTy());       // [2] InnerException
+        specFieldTys.push_back(ptrTy());       // [3] CauseChain
+        specFieldTys.push_back(ptrTy());       // [4] ParamName
+    }
+    specFieldTys.push_back(disposedFlagTy());  // [1 or 5] disposed flag
     for (const sema::Symbol* m : storage)
         specFieldTys.push_back(storageType(m));
 
@@ -3341,10 +3362,17 @@ llvm::BasicBlock* Emitter::propagateBB() {
         // caught/handled path (unwindTarget_ set → not propagateBB) are
         // untouched, so finally + owned-local unwind disposal still run.
         if (currentFn_->getName() == "main") {
+            // #1366 / §33.3: hand the in-flight exception (and the built-in
+            // exception vtable table, so the runtime reads §31.4 fields only on
+            // objects that have that layout) to the runtime for the report +
+            // exit(70).
+            llvm::Value* exc =
+                builder_.CreateLoad(ptrTy(), emitExcSlot(), "uncaught.exc");
             auto* fn = declareC("bz_unhandled_exception",
-                                llvm::Type::getVoidTy(llvm_), {});
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
             fn->setDoesNotReturn();
-            builder_.CreateCall(fn, {});
+            builder_.CreateCall(fn, {exc, builtinExcVtableTablePtr()});
             builder_.CreateUnreachable();
         } else {
             emitImplicitReturn(currentFn_);
@@ -4542,14 +4570,15 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
         auto vit = builtinVtable_.find("TypeInitializationException");
         if (vit != builtinVtable_.end()) {
             llvm::Value* tie = builder_.CreateCall(
-                callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+                callocFn(),
+                {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
             // vtable at offset 0
             builder_.CreateStore(vit->second, tie);
             // message at offset 8: null (calloc zeroed it)
-            // InnerException at offset 16
+            // InnerException at offset 16 (kExcInnerOffset)
             auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
             llvm::Value* innerSlot =
-                builder_.CreateGEP(i8Ty, tie, builder_.getInt64(16));
+                builder_.CreateGEP(i8Ty, tie, builder_.getInt64(kExcInnerOffset));
             builder_.CreateStore(origExc, innerSlot);
             builder_.CreateStore(tie, emitExcSlot());
         }
@@ -5489,13 +5518,51 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         // direct AST base is a built-in exception.
         if (!isThis && !call->args.empty() && call->args[0].value &&
             hasBuiltinExceptionBase(cs->parent) && currentThis_) {
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
             llvm::Value* msgVal = lowerExpr(*call->args[0].value);
             if (msgVal) {
                 // message_ptr is at byte offset 8 — store directly via byte GEP.
-                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* msgSlot = builder_.CreateGEP(
-                    i8Ty, currentThis_, builder_.getInt64(8));
+                    i8Ty, currentThis_, builder_.getInt64(kExcMsgOffset));
                 builder_.CreateStore(msgVal, msgSlot);
+            }
+            // §31.4 / #811: the two-argument base overloads, discriminated by
+            // the second argument's static type exactly like the built-in
+            // `new` path (LlvmBackend_Exprs.cpp): a `string` second argument
+            // is ArgumentException's paramName (→ ParamName@32); an exception
+            // second argument is the (message, cause) overload — snapshot the
+            // borrowed cause into CauseChain@24. The user-subclass object
+            // mirrors the full built-in header (classStruct), so these byte
+            // offsets are in-bounds. The cause here is normally the user
+            // ctor's own borrowed parameter — never disposed by this path.
+            if (call->args.size() >= 2 && call->args[1].value) {
+                const sema::TypeRef* a1ty = ctx_.exprType(*call->args[1].value);
+                bool argIsString = a1ty &&
+                    a1ty->kind == sema::TypeRef::Kind::Primitive &&
+                    a1ty->primitive == sema::PrimitiveType::String;
+                if (argIsString) {
+                    llvm::Value* pn = lowerExpr(*call->args[1].value);
+                    if (pn) {
+                        llvm::Value* pnSlot = builder_.CreateGEP(
+                            i8Ty, currentThis_,
+                            builder_.getInt64(kExcParamOffset));
+                        builder_.CreateStore(pn, pnSlot);
+                    }
+                } else {
+                    llvm::Value* cause = lowerExpr(*call->args[1].value);
+                    if (cause) {
+                        bool hasHdr = isBuiltinExceptionType(a1ty) ||
+                            (a1ty && a1ty->declaration &&
+                             hasBuiltinExceptionBase(a1ty->declaration));
+                        llvm::Value* chain = emitExcCauseSnapshot(
+                            cause,
+                            /*causeIsBuiltin=*/hasHdr);
+                        llvm::Value* ccSlot = builder_.CreateGEP(
+                            i8Ty, currentThis_,
+                            builder_.getInt64(kExcCauseOffset));
+                        builder_.CreateStore(chain, ccSlot);
+                    }
+                }
             }
         }
         return;
@@ -14651,6 +14718,24 @@ llvm::Value* Emitter::vtableTablePtr() {
         llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(arrTy, entries), "bz$vtable$table");
     return vtableTableGV_;
+}
+
+
+// §33.3 / #1366: publish (once) a null-terminated table of the built-in
+// exception vtables. bz_unhandled_exception uses it to gate the §31.4 field
+// reads (message@8, CauseChain@24) to objects that actually have that layout.
+llvm::Value* Emitter::builtinExcVtableTablePtr() {
+    if (excVtableTableGV_) return excVtableTableGV_;
+    std::vector<llvm::Constant*> entries;
+    for (const auto& [name, gv] : builtinVtable_)
+        entries.push_back(llvm::ConstantExpr::getPointerCast(gv, ptrTy()));
+    entries.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // terminator
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), entries.size());
+    excVtableTableGV_ = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(arrTy, entries), "bz$exc$vtable$table");
+    return excVtableTableGV_;
 }
 
 

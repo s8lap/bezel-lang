@@ -5084,7 +5084,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             if (vit != builtinVtable_.end()) {
                                 llvm::Value* obj = builder_.CreateCall(
                                     callocFn(),
-                                    {builder_.getInt64(1), builder_.getInt64(16)},
+                                    {builder_.getInt64(1), builder_.getInt64(kExcObjSize)},
                                     "oce.obj");
                                 builder_.CreateStore(vit->second, obj);
                                 emitThrowValue(obj);
@@ -6322,7 +6322,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 oceVtable = builder_.CreateBitCast(vit->second, ptrTy());
             auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
             llvm::Value* oce = builder_.CreateCall(
-                callocFn, {builder_.getInt64(1), builder_.getInt64(16)}, "oce");
+                callocFn, {builder_.getInt64(1), builder_.getInt64(kExcObjSize)}, "oce");
             builder_.CreateStore(oceVtable, oce);  // slot 0 = vtable
             auto* allocFn = declareC("bz_task_alloc", ptrTy(), {});
             llvm::Value* task =

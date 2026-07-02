@@ -794,6 +794,20 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 if (kTy && vTy)
                     return llvm::StructType::get(llvm_, {kTy, vTy});
             }
+            // §31.4: ExceptionInfo(TypeName, Message, StackTrace) — the built-in
+            // record element of Exception.CauseChain. No user TypeSymbol
+            // (declaration == null); recognise it by name (astNode or
+            // importedName == "ExceptionInfo") and lower it to three consecutive
+            // bz_string* — a 24-byte {ptr,ptr,ptr} value, the layout the runtime
+            // snapshot (bz_exc_causechain_link) writes and the field-access
+            // codegen reads. Gives Array<ExceptionInfo> an element size of 24.
+            if (!rt->declaration &&
+                ((rt->astNode && rt->astNode->name &&
+                  !rt->astNode->name->parts.empty() &&
+                  rt->astNode->name->parts.back() == "ExceptionInfo") ||
+                 rt->importedName == "ExceptionInfo")) {
+                return llvm::StructType::get(llvm_, {ptrTy(), ptrTy(), ptrTy()});
+            }
             // stdlib §5 (#758): a lazy-LINQ enumerable sentinel TypeRef (Named
             // kind, null declaration/astNode, empty importedName, non-empty
             // genericArgs) is a heap `bz_lazy_t*`, not a value type — it falls
@@ -874,13 +888,17 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         collectInstanceStorage(t, storage);
         std::vector<llvm::Type*> specFieldTys;
         specFieldTys.push_back(ptrTy());            // [0] vtable pointer
-        // #595: a class that directly inherits a built-in exception inserts the
-        // inherited message-ptr slot at [1] so byte offset 8 matches the built-in
-        // exception layout (vtable + message_ptr at offset 0/8).  The disposed
-        // flag moves to [2] in that case.
-        if (hasBuiltinExceptionBase(t))
-            specFieldTys.push_back(ptrTy());        // [1] inherited message ptr
-        specFieldTys.push_back(disposedFlagTy());   // [1 or 2] disposed run-once flag
+        // #595 / §31.4: a class that directly inherits a built-in exception
+        // mirrors the FULL 40-byte built-in header (Message@8, Inner@16,
+        // CauseChain@24, ParamName@32) — see classStruct. The disposed flag
+        // moves to [5] in that case.
+        if (hasBuiltinExceptionBase(t)) {
+            specFieldTys.push_back(ptrTy());        // [1] inherited Message
+            specFieldTys.push_back(ptrTy());        // [2] InnerException
+            specFieldTys.push_back(ptrTy());        // [3] CauseChain
+            specFieldTys.push_back(ptrTy());        // [4] ParamName
+        }
+        specFieldTys.push_back(disposedFlagTy());   // [1 or 5] disposed run-once flag
         for (const sema::Symbol* m : storage)
             specFieldTys.push_back(storageType(m));
         // Cache lookup: specializedStructs_[t][specFieldTys] → existing
@@ -987,17 +1005,26 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     std::vector<llvm::Type*> fieldTys;
     // CG17: slot 0 is the hidden vtable pointer.
     fieldTys.push_back(ptrTy());
-    // #595 / §12 / §31: a user class that directly inherits a built-in exception
-    // (e.g. `class ErrA: Exception`) needs to share the Exception object layout
-    // so that `e.Message` reads the same slot regardless of whether `e` is typed
-    // as the user class or as the built-in base.  Built-in exceptions are laid out
-    // as [vtable_ptr, message_ptr] (16 raw bytes, no TypeSymbol, no disposed flag).
-    // We honour that layout by inserting the message-ptr at slot 1 BEFORE the
-    // disposed flag, giving: [vtable(0), message_ptr(1), disposed(2), own_fields…].
-    // disposedFlagIndex() returns 2 for such classes so the disposer and disposal
-    // checks GEP to the right slot automatically.
-    if (hasBuiltinExceptionBase(t))
-        fieldTys.push_back(ptrTy());          // [1] inherited message ptr (ptr)
+    // #595 / §12 / §31.4: a user class that directly inherits a built-in
+    // exception (e.g. `class ErrA: Exception`) needs to share the FULL built-in
+    // exception object layout so the base-Exception member reads/writes hit the
+    // same byte offsets regardless of whether `e` is typed as the user class or
+    // as the built-in base. Built-in exceptions are a uniform kExcObjSize
+    // (40-byte) block: [0]=vtable, [8]=Message, [16]=InnerException(TIE),
+    // [24]=CauseChain, [32]=ParamName. Mirror all four data slots BEFORE the
+    // disposed flag, giving: [vtable(0), message(1), inner(2), causechain(3),
+    // paramname(4), disposed(5), own_fields…]. disposedFlagIndex() returns 5
+    // for such classes so the disposer and disposal checks GEP the right slot.
+    // (Before v0.163 only the message slot was mirrored; `base(msg, cause)`
+    // then wrote CauseChain@24 into the disposed flag / past the block, and
+    // `e.CauseChain` on a user instance read out of bounds — the exception-
+    // surface merge-gate heap-overflow finding.)
+    if (hasBuiltinExceptionBase(t)) {
+        fieldTys.push_back(ptrTy());          // [1] inherited Message @8
+        fieldTys.push_back(ptrTy());          // [2] InnerException @16 (unused)
+        fieldTys.push_back(ptrTy());          // [3] CauseChain @24
+        fieldTys.push_back(ptrTy());          // [4] ParamName @32
+    }
     // §28.2 / §28.6: the per-object i8 "disposed" run-once flag.  It sits at a
     // fixed index in every class (1 normally, 2 for builtin-exception-derived
     // classes — see disposedFlagIndex), calloc-zeroed to 0 = not-disposed.
@@ -1025,14 +1052,15 @@ llvm::Type* Emitter::disposedFlagTy() { return llvm::Type::getInt8Ty(llvm_); }
 // fields).  Uniform across the hierarchy and generic specializations, so the
 // shared generated Dispose accesses it correctly.
 //
-// For user classes that directly inherit a built-in exception type (§12 / §31):
-// slot 2 — because slot 1 is occupied by the inherited message-ptr that mirrors
-// the built-in exception's [vtable, message_ptr] layout at byte offsets 0 and 8.
-// Moving the disposed flag to slot 2 ensures byte offset 8 always carries the
-// message pointer, so `e.Message` reads the same slot whether `e` is typed as
-// the user class or as the built-in Exception base type.
+// For user classes that directly inherit a built-in exception type (§12 /
+// §31.4): slot 5 — slots 1..4 are occupied by the inherited Message /
+// InnerException / CauseChain / ParamName pointers that mirror the built-in
+// exception's uniform 40-byte layout (byte offsets 8/16/24/32). Keeping the
+// full header ensures every base-Exception member read/write hits the same
+// byte offset whether the object is typed as the user class or as the
+// built-in Exception base type.
 unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* t) {
-    if (t && hasBuiltinExceptionBase(t)) return 2u;
+    if (t && hasBuiltinExceptionBase(t)) return 5u;
     return 1u;
 }
 

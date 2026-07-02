@@ -61,7 +61,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // IOException(...)`. Hierarchy is in builtinExceptionHierarchy() (codegen).
         n == "TimeoutException" || n == "IOException" ||
         n == "FileNotFoundException" || n == "DirectoryNotFoundException" ||
-        n == "EndOfStreamException" || n == "PathTooLongException") {
+        n == "EndOfStreamException" || n == "PathTooLongException" ||
+        // §31.4 (v0.162): the ExceptionInfo record — the element type of
+        // Exception.CauseChain. A zero-arity built-in value type with three
+        // string fields (TypeName, Message, StackTrace); resolves without import
+        // so `var info: ExceptionInfo := ex.CauseChain[0]` type-checks.
+        n == "ExceptionInfo") {
         return 0;
     }
     if (n == "Task") return kBuiltinTaskLike;

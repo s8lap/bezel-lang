@@ -7329,6 +7329,83 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // §31.4 (v0.162/v0.163): the built-in Exception surface beyond Message —
+        // StackTrace (string), CauseChain (Array<ExceptionInfo>),
+        // ArgumentException.ParamName (string?), and the ExceptionInfo record's
+        // TypeName/Message/StackTrace fields (string). None has a user TypeSymbol;
+        // type them by name here, mirroring the Message handler above. A built-in
+        // exception is a declaration-less Named type whose name ends in
+        // "Exception"; ExceptionInfo is the declaration-less "ExceptionInfo".
+        {
+            auto excBuiltinName = [](const TypeRef* t) -> std::string_view {
+                if (t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+                    t->astNode && t->astNode->name &&
+                    !t->astNode->name->parts.empty())
+                    return t->astNode->name->parts.back();
+                return {};
+            };
+            auto isExcType = [&](const TypeRef* t) {
+                std::string_view n = excBuiltinName(t);
+                return n.size() >= 9 && n.substr(n.size() - 9) == "Exception";
+            };
+            auto isExcInfo = [&](const TypeRef* t) {
+                return excBuiltinName(t) == "ExceptionInfo";
+            };
+            const TypeRef* rtt = ma.target ? ctx_.exprType(*ma.target) : nullptr;
+            if (ma.member == "StackTrace" && (isExcType(rtt) || isExcInfo(rtt))) {
+                ctx_.setExprType(
+                    &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                return;
+            }
+            if ((ma.member == "TypeName" || ma.member == "Message") &&
+                isExcInfo(rtt)) {
+                ctx_.setExprType(
+                    &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                return;
+            }
+            if (ma.member == "ParamName") {
+                std::string_view n = excBuiltinName(rtt);
+                if (n == "ArgumentException" || n == "ArgumentNullException") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
+                                              PrimitiveType::String,
+                                              /*nullable=*/true));
+                    return;
+                }
+            }
+            if (ma.member == "CauseChain" && isExcType(rtt)) {
+                // Build a synthetic Array<ExceptionInfo> TypeRef (program-lifetime
+                // static astNodes, the pattern makeConcreteCollectionResult uses):
+                // Array so `.Count`/indexing resolve, ExceptionInfo element so
+                // `chain[i].TypeName` type-checks.
+                static const ast::Type* kArrayNode = []() -> ast::Type* {
+                    auto* qn = new ast::QualifiedName;
+                    qn->parts.push_back("Array");
+                    auto* t = new ast::Type;
+                    t->kind = ast::TypeKind::Named;
+                    t->name.reset(qn);
+                    return t;
+                }();
+                static const ast::Type* kExcInfoNode = []() -> ast::Type* {
+                    auto* qn = new ast::QualifiedName;
+                    qn->parts.push_back("ExceptionInfo");
+                    auto* t = new ast::Type;
+                    t->kind = ast::TypeKind::Named;
+                    t->name.reset(qn);
+                    return t;
+                }();
+                auto* elem = ctx_.makeTypeRef();
+                elem->kind = TypeRef::Kind::Named;
+                elem->declaration = nullptr;
+                elem->astNode = kExcInfoNode;
+                auto* arr = ctx_.makeTypeRef();
+                arr->kind = TypeRef::Kind::Named;
+                arr->declaration = nullptr;
+                arr->astNode = kArrayNode;
+                arr->genericArgs.push_back(elem);
+                ctx_.setExprType(&ma, arr);
+                return;
+            }
+        }
         // issue #494 / §29.2 / §29.3: `e.Current` property access where `e` is
         // typed as the builtin IEnumerator<T> (no sema TypeDecl). Current returns
         // T (the first generic arg). Typing this lets `var x := e.Current` and

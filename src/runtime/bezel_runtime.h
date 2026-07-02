@@ -1185,12 +1185,17 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
 // code (70 = EX_SOFTWARE, "internal software error", BSD sysexits.h) is an
 // implementation choice — the spec pins only "not the normal-completion code".
 // Declared [[noreturn]]: it never returns to the caller.
+//
+// v0.163 / #1366: takes the in-flight exception object (and the null-terminated
+// table of built-in exception vtables) so §33.3's report (type, message, stack
+// trace, CauseChain) can be printed before exiting. The table gates the §31.4
+// field reads to objects with that layout.
 #ifdef __cplusplus
 [[noreturn]]
 #else
 _Noreturn
 #endif
-void bz_unhandled_exception(void);
+void bz_unhandled_exception(void* exc, void** excVtableTable);
 
 // fix #492 / §31.1 / §2.6: the per-thread in-flight exception pointer.
 // Made thread_local by fix #704 (see below).

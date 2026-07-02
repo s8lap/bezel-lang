@@ -4876,7 +4876,7 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
         if (vit != builtinVtable_.end()) {
             llvm::Value* oce = builder_.CreateCall(
                 callocFn(),
-                {builder_.getInt64(1), builder_.getInt64(16)}, "afor.oce");
+                {builder_.getInt64(1), builder_.getInt64(kExcObjSize)}, "afor.oce");
             builder_.CreateStore(vit->second, oce);
             emitThrowValue(oce);
         } else {

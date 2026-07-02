@@ -1552,11 +1552,14 @@ void bz_random_next_bytes(void* rp, uint8_t* buf, int64_t len) {
 // - FormatException: same mechanism, separate vtable (fe_vtable), used by
 //   bz_decimal_parse_cstr for malformed input.
 
-// Helper: allocate a minimal 16-byte exception object {vtable*, null} and
-// store it in bz_exc (the global pending-exception slot).
+// Helper: allocate a built-in exception object {vtable*, ...} (§31.4 layout,
+// message/causechain/paramname slots left null by calloc) and store it in bz_exc
+// (the global pending-exception slot). The block size matches codegen's
+// kExcObjSize so the base-Exception getters (CauseChain @ 24) read a valid slot.
+static const int64_t BZ_EXC_OBJ_SIZE = 40;
 static void bz_set_exc(void* vtable) {
     if (!vtable) return;
-    void** obj = static_cast<void**>(calloc(1, 16));
+    void** obj = static_cast<void**>(calloc(1, (size_t)BZ_EXC_OBJ_SIZE));
     memcpy(obj, &vtable, sizeof(void*));
     extern thread_local void* bz_exc;
     bz_exc = obj;
@@ -7974,18 +7977,162 @@ extern "C" void** bz_itable_lookup(void** itmap, void* iface_td) {
     return nullptr;  // unreachable for a typed program
 }
 
-// per §33.3 / §22.13 (line 3845): the runtime's interception point for an
-// exception that escapes Main with no enclosing handler. Codegen emits a call to
-// this from Main's top-level no-handler propagation block (in place of the old
-// `ret i32 0`, which conflated abnormal termination with normal completion /
-// `return 0`). It reports the failure to stderr and terminates the process with
-// a non-zero exit code so the OS / shell / CI observe the abnormal state. Exit
-// code 70 = EX_SOFTWARE ("internal software error", BSD sysexits.h): a clean,
-// deterministic exit (not a signal); the spec pins only "not the normal-
-// completion code 0", so the exact value is an implementation choice (recorded
-// in the commit message).
-extern "C" void bz_unhandled_exception(void) {
-    fputs("Unhandled exception\n", stderr);
+// §31.4 (v0.162/v0.163) built-in exception object layout — byte offsets that
+// must match the codegen constants in LlvmBackend_impl.hpp (kExc*Offset):
+//   [0] vtable  [8] Message  [16] InnerException(TIE)  [24] CauseChain
+//   [32] ParamName
+static const int64_t BZ_EXC_MSG_OFFSET   = 8;
+static const int64_t BZ_EXC_CAUSE_OFFSET = 24;
+
+// §31.4 ExceptionInfo record — the {TypeName, Message, StackTrace} value type
+// codegen lowers to three consecutive bz_string* (a 24-byte {ptr,ptr,ptr}
+// record), stored inline in the Array<ExceptionInfo> CauseChain.
+struct bz_excinfo_t { void* typeName; void* message; void* stackTrace; };
+
+// A process-lifetime, shared empty bz_string carrying the SENTINEL rc so
+// retain/release are no-ops and it is never freed. Used for the §31.4 StackTrace
+// stub ("") and to normalise a null Message to "" inside a snapshot.
+static void* bz_rt_empty_string() {
+    static struct EmptyStr {
+        uint8_t buf[BZ_STRING_SIZEOF];
+        EmptyStr() {
+            memset(buf, 0, sizeof(buf));
+            buf[16] = 1;  // width = 1 (UTF-8 bytes); data=null, len=0
+            int64_t sentinel = BZ_STRING_RC_SENTINEL;
+            memcpy(buf + BZ_STRING_RC_OFFSET, &sentinel, sizeof(int64_t));
+        }
+    } e;
+    return e.buf;
+}
+
+// §31.4 / #811 snapshot-chaining: build a fresh Array<ExceptionInfo> for the
+// (message, cause) constructor. The new chain is
+//   [ {causeTypeName, causeMessage, ""} ]  ++  nested
+// where `nested` is the cause's own CauseChain (or null) — outermost cause
+// first, flattened. Every stored string is bz_string_retain'd so the snapshot
+// survives the borrowed cause's disposal (§31.1: the cause is never retained as
+// an instance). The snapshot array itself is reclaimed at process exit (see the
+// disposal note above — it is not freed per-exception to stay crash-safe across
+// the multiple exception disposal/reclaim paths).
+extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
+                                        void* nested) {
+    auto* nchain = (bz_array_t*)nested;
+    int64_t ncount = nchain ? nchain->count : 0;
+    auto* arr = (bz_array_t*)bz_array_alloc_count_n(
+        (int64_t)sizeof(bz_excinfo_t), 1 + ncount);
+    auto* elems = (bz_excinfo_t*)arr->data;
+    void* empty = bz_rt_empty_string();
+    void* tn = causeTypeName ? causeTypeName : empty;
+    void* mg = causeMessage ? causeMessage : empty;
+    bz_string_retain(tn);
+    bz_string_retain(mg);
+    elems[0].typeName   = tn;
+    elems[0].message    = mg;
+    elems[0].stackTrace = empty;   // §31.4 stub — "" pre-debug-info
+    if (nchain) {
+        auto* src = (bz_excinfo_t*)nchain->data;
+        for (int64_t i = 0; i < ncount; i++) {
+            void* st = src[i].stackTrace ? src[i].stackTrace : empty;
+            bz_string_retain(src[i].typeName);
+            bz_string_retain(src[i].message);
+            bz_string_retain(st);
+            elems[1 + i].typeName   = src[i].typeName;
+            elems[1 + i].message    = src[i].message;
+            elems[1 + i].stackTrace = st;
+        }
+    }
+    return arr;
+}
+
+// §31.4/#811 note: a CauseChain snapshot is intentionally NOT freed when its
+// owning exception is disposed. An exception object has several disposal/reclaim
+// paths (catch-arm dispose, scope-end dispose, and the async fault-propagation
+// free in bz$async$*$Resume) that are not one idempotent site, so a Dispose that
+// freed CauseChain@24 double-freed it (and read freed memory) on the async path.
+// The CauseChain is therefore reclaimed by process exit, exactly like the
+// runtime-owned TypeInitializationException.InnerException (§22.13). A small,
+// bounded leak confined to a caught-and-disposed exception constructed WITH a
+// cause; see the codegen note in setupBuiltinExceptions.
+
+// Write a bz_string's UTF-8 bytes to `f` (nothing for a null / empty string).
+static void bz_rt_fput_bzstring(void* s, FILE* f) {
+    if (!s) return;
+    char* data; int64_t len;
+    memcpy(&data, (uint8_t*)s, sizeof(void*));         // data @ 0
+    memcpy(&len,  (uint8_t*)s + 8, sizeof(int64_t));   // len  @ 8
+    if (data && len > 0) fwrite(data, 1, (size_t)len, f);
+}
+
+static int64_t bz_rt_strlen(void* s) {
+    if (!s) return 0;
+    int64_t len; memcpy(&len, (uint8_t*)s + 8, sizeof(int64_t));
+    return len;
+}
+
+// per §33.3 / §22.13 (line 3845) / #1366: the runtime's interception point for
+// an exception that escapes Main with no enclosing handler. Codegen emits a call
+// to this from Main's top-level no-handler propagation block (in place of the
+// old `ret i32 0`, which conflated abnormal termination with normal completion /
+// `return 0`), passing the in-flight exception object. §33.3 (v0.163) requires
+// the runtime to print the exception's type, message, stack trace, and
+// CauseChain (§31.4) to stderr, then exit 70 (EX_SOFTWARE, BSD sysexits.h). The
+// exact format string is implementation-defined; type/message/chain content is
+// normative. The type name is the exception's virtual ToString (vtable slot 3),
+// which for a built-in exception is the §8.5 default — its type name.
+extern "C" void bz_unhandled_exception(void* exc, void** excVtableTable) {
+    FILE* f = stderr;
+    if (!exc) {  // defensive: no in-flight object (should not happen)
+        fputs("Unhandled exception\n", f);
+        exit(70);
+    }
+    // Virtual ToString (vtable slot 3) is safe for any class instance — the type
+    // name (§8.5 default for a built-in exception). The Message@8 / CauseChain@24
+    // reads have the §31.4 built-in layout only; gate them on the object's vtable
+    // being one of the built-in exception vtables so a user class thrown uncaught
+    // (arbitrary layout / size) is reported by type name alone, never by an
+    // out-of-bounds field read.
+    void* vtable; memcpy(&vtable, exc, sizeof(void*));
+    bool builtinExc = false;
+    if (excVtableTable) {
+        for (void** p = excVtableTable; *p; ++p)
+            if (*p == vtable) { builtinExc = true; break; }
+    }
+    void* toStrFnP; memcpy(&toStrFnP, (uint8_t*)vtable + 3 * sizeof(void*),
+                           sizeof(void*));
+    typedef void* (*bz_tostr_fn)(void*);
+    void* typeName = toStrFnP ? ((bz_tostr_fn)toStrFnP)(exc) : nullptr;
+
+    fputs("Unhandled exception", f);
+    if (bz_rt_strlen(typeName) > 0) { fputs(": ", f); bz_rt_fput_bzstring(typeName, f); }
+    if (builtinExc) {
+        void* message; memcpy(&message, (uint8_t*)exc + BZ_EXC_MSG_OFFSET,
+                              sizeof(void*));
+        if (bz_rt_strlen(message) > 0) {
+            fputs(": ", f);
+            bz_rt_fput_bzstring(message, f);
+        }
+    }
+    fputc('\n', f);
+
+    // §31.4 CauseChain (already snapshotted at construction) — render each record
+    // outermost-cause-first. Only a built-in exception has the CauseChain slot.
+    if (builtinExc) {
+        void* chain;
+        memcpy(&chain, (uint8_t*)exc + BZ_EXC_CAUSE_OFFSET, sizeof(void*));
+        if (chain) {
+            auto* arr = (bz_array_t*)chain;
+            auto* elems = (bz_excinfo_t*)arr->data;
+            for (int64_t i = 0; i < arr->count; i++) {
+                fputs("Caused by: ", f);
+                bz_rt_fput_bzstring(elems[i].typeName, f);
+                if (bz_rt_strlen(elems[i].message) > 0) {
+                    fputs(": ", f);
+                    bz_rt_fput_bzstring(elems[i].message, f);
+                }
+                fputc('\n', f);
+            }
+        }
+    }
     exit(70);
 }
 
@@ -8204,7 +8351,7 @@ extern "C" int32_t bz_ctoken_throw_if_cancelled(void* token) {
 // pointer is supplied by codegen so the runtime does not need to know the LLVM
 // vtable global's address.
 static void* bz_task_make_oce(void* oce_vtable) {
-    void* obj = calloc(1, 16);
+    void* obj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
     memcpy(obj, &oce_vtable, sizeof(void*));  // slot 0 = vtable
     return obj;
 }
@@ -8420,7 +8567,7 @@ void bz_channel_send(void* chp, void* item, void* cce_vtable) {
             }
             // Build a ChannelClosedException object and store in bz_exc.
             if (cce_vtable) {
-                void* excObj = calloc(1, 16);
+                void* excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
                 memcpy(excObj, &cce_vtable, sizeof(void*));
                 extern thread_local void* bz_exc;
                 bz_exc = excObj;
@@ -8492,7 +8639,7 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
         // Fault: ChannelClosedException.
         void* excObj = nullptr;
         if (cce_vtable) {
-            excObj = calloc(1, 16);
+            excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
             memcpy(excObj, &cce_vtable, sizeof(void*));
         }
         bz_task_complete_error_obj(task, excObj);
@@ -8554,7 +8701,7 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
     for (auto& r : pending) {
         void* excObj = nullptr;
         if (cce_vtable) {
-            excObj = calloc(1, 16);
+            excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
             memcpy(excObj, &cce_vtable, sizeof(void*));
         }
         bz_task_complete_error_obj(r.task, excObj);
@@ -8690,7 +8837,7 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                     memcpy(&msg_ptr, (char*)fault_exc + 8, sizeof(void*));
                     if (msg_ptr) bz_string_retain(msg_ptr);
                 }
-                dfe_obj = calloc(1, 16);
+                dfe_obj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
                 memcpy(dfe_obj, &sc->dfe_vtable, sizeof(void*));
                 if (msg_ptr) memcpy((char*)dfe_obj + 8, &msg_ptr, sizeof(void*));
                 // Dispose the original fault exception. Dynamic dispatch via
@@ -12168,7 +12315,7 @@ int32_t bz_tcs_try_set_cancelled(void* t, void* oce_vtable) {
         return 0;
     // Build an OperationCanceledException object: 16-byte {vtable, null-msg}.
     if (oce_vtable) {
-        void* exc = calloc(1, 16);
+        void* exc = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
         if (exc) {
             *(void**)exc = oce_vtable;
             bz_task_complete_error_obj(tcs->inner_task, exc);
@@ -12190,7 +12337,7 @@ void bz_tcs_fault_if_pending(void* t, void* ioe_vtable) {
         return;
     // Build an InvalidOperationException: 16-byte {vtable, null-msg}.
     if (ioe_vtable) {
-        void* exc = calloc(1, 16);
+        void* exc = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
         if (exc) {
             *(void**)exc = ioe_vtable;
             bz_task_complete_error_obj(tcs->inner_task, exc);

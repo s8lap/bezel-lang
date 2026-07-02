@@ -707,7 +707,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* excObj = cb.CreateCall(
                 callocTy, callocFnV,
                 {llvm::ConstantInt::get(i64(), 1),
-                 llvm::ConstantInt::get(i64(), 16)},
+                 // §31.4: the uniform exception block (kExcObjSize) — a
+                 // smaller alloc would make the CauseChain@24 / ParamName@32
+                 // reads (catch arms, uncaught report) read out of bounds.
+                 llvm::ConstantInt::get(i64(), kExcObjSize)},
                 "tc.excobj");
             auto vit = builtinVtable_.find("InvalidOperationException");
             if (vit != builtinVtable_.end())

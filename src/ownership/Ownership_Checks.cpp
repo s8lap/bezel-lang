@@ -1910,6 +1910,67 @@ void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
 // #430 addresses the observable symptom at the escape site.
 // ---------------------------------------------------------------------------
 
+// §31.2.4 / #811 (v0.162): true when `n` names a built-in exception type.
+// Mirrors isBuiltinExceptionTypeName in ExprTypecheck_Exprs.cpp (kept in sync).
+static bool ownershipIsBuiltinExceptionName(std::string_view n) {
+    return n == "Exception"              ||
+           n == "ArgumentException"      ||
+           n == "ArgumentNullException"  ||
+           n == "ArithmeticException"    ||
+           n == "OverflowException"      ||
+           n == "DivideByZeroException"  ||
+           n == "InvalidOperationException" ||
+           n == "NotImplementedException"   ||
+           n == "NullReferenceException"    ||
+           n == "IndexOutOfRangeException"  ||
+           n == "KeyNotFoundException"      ||
+           n == "MatchFailureException"     ||
+           n == "OperationCanceledException"||
+           n == "TypeInitializationException" ||
+           n == "FormatException"           ||
+           n == "StackOverflowException"    ||
+           n == "TimeoutException"          ||
+           n == "IOException"               ||
+           n == "FileNotFoundException"     ||
+           n == "DirectoryNotFoundException"||
+           n == "EndOfStreamException"      ||
+           n == "PathTooLongException";
+}
+
+// §31.2.4 / #811 (v0.162): true when `rt` is a built-in exception type or a
+// user class that (transitively) derives from one. Mirrors
+// inheritsBuiltinException in ExprTypecheck_Exprs.cpp.
+static bool ownershipIsExceptionClassRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (!rt->declaration) {
+        // Builtin exceptions have no sema TypeDecl — match by name.
+        if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+            return ownershipIsBuiltinExceptionName(rt->astNode->name->parts.back());
+        if (!rt->importedName.empty())
+            return ownershipIsBuiltinExceptionName(rt->importedName);
+        return false;
+    }
+    for (const sema::TypeSymbol* cur = rt->declaration; cur;) {
+        if (cur->kind != ast::TypeDeclKind::Class) return false;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl)) {
+            for (const auto& bt : td->baseTypes) {
+                if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                if (ownershipIsBuiltinExceptionName(bt->name->parts.back()))
+                    return true;
+            }
+        }
+        const sema::TypeSymbol* next = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes) {
+            if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
+                next = b;
+                break;
+            }
+        }
+        cur = next;
+    }
+    return false;
+}
+
 sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
     const ast::NewExpr& ne) const {
     // Resolve the constructor declaration to identify owned vs non-owned params.
@@ -1931,6 +1992,16 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
             }
         }
     }
+    // §31.2.4 / #811 (v0.162): when the CONSTRUCTED type is itself an
+    // exception, an exception-typed argument is the CAUSE position of the
+    // snapshot-chaining constructor — "ex borrowed for the ctor call; snapshot
+    // taken, instance not retained" (the spec's §31.2.4 wrap-and-rethrow
+    // example is exactly `throw new DataAccessException("...", ex)` from a
+    // catch arm). The builtin base ctor copies the chain and retains nothing;
+    // a user subclass can only read or forward the borrow (§28.3 makes storing
+    // a borrow in a field inexpressible), so the escape is not a dangle.
+    const bool constructedIsException =
+        ne.type && ownershipIsExceptionClassRef(ctx_.resolvedType(*ne.type));
     std::size_t pos = 0;
     for (const auto& a : ne.args) {
         if (!a.value) { ++pos; continue; }
@@ -1942,6 +2013,12 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
             cd && pos < cd->params.size() &&
             (cd->params[pos].modifier == "owned" ||
              cd->params[pos].modifier == "out owned");
+        // §31.2.4 cause position: skip (see constructedIsException above).
+        if (constructedIsException &&
+            ownershipIsExceptionClassRef(ctx_.exprType(*a.value))) {
+            ++pos;
+            continue;
+        }
         if (!paramIsOwned) {
             // Only flag BARE identifier arguments — a value/string projection
             // like `ex.Message` is a MemberAccessExpr, not a bare identifier,

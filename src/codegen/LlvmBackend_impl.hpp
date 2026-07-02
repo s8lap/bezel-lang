@@ -1013,6 +1013,7 @@ private:
     // no user TypeSymbol). A shared no-op Dispose serves all of them.
     std::unordered_map<std::string, llvm::GlobalVariable*> builtinDesc_;
     std::unordered_map<std::string, llvm::GlobalVariable*> builtinVtable_;
+    // Shared no-op Dispose for built-in exceptions AND every value-type box.
     llvm::Function* builtinDisposeFn_ = nullptr;
 
     // CG30: computed integer value of each enum constant (§10).
@@ -1285,6 +1286,13 @@ private:
     llvm::GlobalVariable* vtableTableGV_ = nullptr;
     // §8.6 / §12.7 (#417): emit (once) and return the bz$vtable$table global.
     llvm::Value* vtableTablePtr();
+    // §33.3 / #1366: null-terminated table of just the BUILT-IN exception
+    // vtables. bz_unhandled_exception scans it to decide whether the uncaught
+    // object has the §31.4 built-in layout (message@8, CauseChain@24) before
+    // reading those slots — a user class thrown uncaught (any layout) is
+    // reported by type name only, never by an out-of-bounds field read.
+    llvm::GlobalVariable* excVtableTableGV_ = nullptr;
+    llvm::Value* builtinExcVtableTablePtr();
     // #481 / §12.1 / §12.5 / §23: a virtual vtable slot is either a virtual
     // METHOD or a virtual PROPERTY accessor (getter or setter). A `virtual`/
     // `abstract`/`override` property's get (and set, when present) each occupy
@@ -3097,6 +3105,43 @@ private:
     // const — the pattern is then a type-test / enum constant handled
     // elsewhere, or deferred.
     llvm::Value* constValueForPatternName(const ast::QualifiedName* name);
+
+    // §31.4 (v0.162/v0.163) built-in exception object layout. A directly-
+    // constructed built-in exception (rt->declaration == null) is a single
+    // calloc'd block whose slots are, at these fixed byte offsets:
+    //   [0]  vtable ptr
+    //   [8]  Message      — bz_string*  (null → "")
+    //   [16] InnerException — TypeInitializationException only (§22.13); other
+    //        types leave it null. Kept at its historical offset so the TIE
+    //        wrapper and the InnerException getter are unchanged.
+    //   [24] CauseChain   — bz_array_t* of ExceptionInfo (null → empty), the
+    //        #811 snapshot built by the (message, cause) constructor.
+    //   [32] ParamName    — bz_string* (ArgumentException; null when absent).
+    // The block is a uniform kExcObjSize bytes for every built-in exception so
+    // the base-Exception getters (CauseChain at 24) read a valid slot on any of
+    // them; calloc zeroes the unused slots. Growing (never moving) the block
+    // keeps every existing read (Message@8, InnerException@16) intact.
+    static constexpr int64_t kExcObjSize        = 40;
+    static constexpr int64_t kExcMsgOffset      = 8;
+    static constexpr int64_t kExcInnerOffset    = 16;
+    static constexpr int64_t kExcCauseOffset    = 24;
+    static constexpr int64_t kExcParamOffset    = 32;
+
+    // §31.4 / #811: build the CauseChain snapshot for `new Exception(msg, cause)`
+    // from the (already-lowered) borrowed `cause` object. Reads the cause's type
+    // name (virtual ToString, vtable slot 3), its Message (offset 8) and — for a
+    // built-in cause — its own CauseChain (offset 24), and returns a fresh
+    // Array<ExceptionInfo> = [ {typeName, message, ""} ] ++ cause.CauseChain via
+    // the runtime bz_exc_causechain_link. `causeIsBuiltin` gates the nested-chain
+    // read: a user-derived exception has no CauseChain slot at offset 24.
+    llvm::Value* emitExcCauseSnapshot(llvm::Value* cause, bool causeIsBuiltin);
+
+    // §31.4: read field `fieldIdx` (TypeName=0, Message=1, StackTrace=2) of an
+    // ExceptionInfo value named by `target`. Handles the common `chain[i]` index
+    // form directly (bounds-checked bz_array_get into a temp, then field GEP) and
+    // an addressable ExceptionInfo local as a fallback.
+    llvm::Value* lowerExceptionInfoField(const ast::Expr& target,
+                                         unsigned fieldIdx);
 
     // Returns true if `tt` is a Named type with no user declaration, i.e.,
     // one of the built-in exception types (Exception, ArgumentException, …).
