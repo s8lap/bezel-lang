@@ -1885,23 +1885,25 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
             clause.typeParam = current_.text;
             advance();
         }
-        // Modifier-constraint form: `is owned` / `is not owned`.
-        if (consumeKeyword("is")) {
-            const bool isNot = consumeKeyword("not");
-            if (consumeKeyword("owned")) {
-                clause.modifierConstraint = isNot ? "not owned" : "owned";
-            } else {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected 'owned' in ModifierConstraint "
-                    "(only `is owned` / `is not owned` are supported)");
-            }
+        // The pre-v0.97 `where T is owned` / `where T is not owned` modifier-
+        // constraint form is retired (§A.3 GenericConstraints, §14.4);
+        // constraints bound types only. Emit a specific diagnostic and consume
+        // the stale tokens so downstream parsing recovers cleanly.
+        if (isKeyword("is")) {
+            SourceLocation isLoc = current_.location;
+            advance(); // consume `is`
+            consumeKeyword("not"); // consume optional `not` if present
+            consumeKeyword("owned"); // consume `owned` if present
+            diagnostics_.report(
+                Severity::Error, isLoc,
+                "the pre-v0.97 `where T is owned` constraint form was removed; "
+                "constraints bound types (§14.2)");
             all.push_back(std::move(clause));
             continue;
         }
         if (!consumePunctuator(":")) {
             diagnostics_.report(Severity::Error, current_.location,
-                                "expected ':' or 'is' in generic constraint");
+                                "expected ':' in generic constraint");
         }
 
         auto parseConstraintItem = [&]() -> ast::ConstraintItem {

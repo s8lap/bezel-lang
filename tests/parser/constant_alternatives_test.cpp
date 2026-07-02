@@ -105,3 +105,44 @@ BEZEL_TEST(parser_const_alt, alternatives_with_when_guard) {
             "case x of { 1, 2 when (x > 0) => \"pos-low\" "
             "| _ => \"other\" } end"));
 }
+
+// §A.8 / #1341 (v0.158): Constant admits "-"? (IntLiteral | FloatLiteral),
+// so negative numeric literals must be accepted in ConstantPattern
+// alternatives lists.
+
+BEZEL_TEST(parser_const_alt, single_negative_int) {
+    // A single negative constant as the whole arm pattern.
+    BEZEL_EXPECT_EQ(
+        renderCase("case x -1 => \"neg\", _ => \"other\" end"),
+        std::string(
+            "case x of { (-1) => \"neg\" | _ => \"other\" } end"));
+}
+
+BEZEL_TEST(parser_const_alt, two_negative_int_alternatives) {
+    // #1341: `-2, -3` must parse as two ConstantPattern alternatives.
+    BEZEL_EXPECT_EQ(
+        renderCase("case x -2, -3 => \"small neg\", _ => \"other\" end"),
+        std::string(
+            "case x of { (-2), (-3) => \"small neg\" "
+            "| _ => \"other\" } end"));
+}
+
+BEZEL_TEST(parser_const_alt, mixed_positive_and_negative_alternatives) {
+    // A mix of positive and negative constants in one alternatives list.
+    BEZEL_EXPECT_EQ(
+        renderCase(
+            "case x -1, 0, 1 => \"near zero\", _ => \"other\" end"),
+        std::string(
+            "case x of { (-1), 0, 1 => \"near zero\" "
+            "| _ => \"other\" } end"));
+}
+
+BEZEL_TEST(parser_const_alt, negative_first_arm_then_positive_arm) {
+    // Each arm is independent; verify the arm boundary is correct.
+    BEZEL_EXPECT_EQ(
+        renderCase(
+            "case x -1 => \"minus one\", 1 => \"one\", _ => \"other\" end"),
+        std::string(
+            "case x of { (-1) => \"minus one\" | 1 => \"one\" "
+            "| _ => \"other\" } end"));
+}

@@ -1,13 +1,17 @@
-// Spec-derived parser tests for the §A.3 GenericConstraints modifier-form:
+// Spec-derived parser tests for §A.3 GenericConstraints.
+//
+// v0.97 retired the `where T is owned` / `where T is not owned` modifier-
+// constraint form together with `<owned T>` generic arguments (§14.4).
+// The grammar now reads:
 //
 //   GenericConstraints ::= "where" Identifier ":" Constraint ("," Constraint)*
-//                        | "where" Identifier "is" ModifierConstraint
-//   ModifierConstraint ::= "owned" | "not" "owned"
+//   Constraint ::= "class" | "value" | "notnull" | "new" "(" ")" | Type
 //
-// Slice 54 adds the `is owned` / `is not owned` form (§14.4). The regular
-// `:`-form path is unchanged and still parsed first; if `is` follows the
-// type-parameter Identifier instead, the parser takes the modifier-form
-// path and records `modifierConstraint` instead of `items`.
+// These tests verify that:
+//   - The retired `is owned` / `is not owned` form is REJECTED with the
+//     specific diagnostic naming §14.2 (tests below that flip what was
+//     "accepted" in slice-54 era).
+//   - The colon-form (`where T: class`) still works (regression).
 
 #include <string>
 
@@ -25,45 +29,33 @@ const bezel::ast::TypeDecl* extractTypeDecl(
         r.sourceFile->topDecls[0].get());
 }
 
-const bezel::ast::MethodDecl* firstMethod(
-    const bezel::test::ParseResult& r) {
-    const auto* td = extractTypeDecl(r);
-    if (!td || td->members.empty()) return nullptr;
-    return dynamic_cast<const bezel::ast::MethodDecl*>(
-        td->members[0].get());
+// Return true when any error diagnostic mentions the v0.97 retirement.
+bool hasRetirementError(const bezel::test::ParseResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("pre-v0.97") != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 } // namespace
 
+// §A.3 / §14.4 (v0.97): `where T is owned` must now be REJECTED — the form
+// was retired and the parser emits "the pre-v0.97 `where T is owned`
+// constraint form was removed; constraints bound types (§14.2)".
 BEZEL_TEST(parser_modifier_constraint, where_T_is_owned_on_class) {
     auto r = parseAll(
         "module M; public class C<T> where T is owned end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    const auto* td = extractTypeDecl(r);
-    if (td) {
-        BEZEL_EXPECT_EQ(td->genericConstraints.size(), std::size_t(1));
-        if (td->genericConstraints.size() == 1) {
-            BEZEL_EXPECT_EQ(
-                td->genericConstraints[0].typeParam,
-                std::string_view("T"));
-            BEZEL_EXPECT_EQ(
-                td->genericConstraints[0].modifierConstraint,
-                std::string_view("owned"));
-            BEZEL_EXPECT_TRUE(td->genericConstraints[0].items.empty());
-        }
-    }
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasRetirementError(r));
 }
 
 BEZEL_TEST(parser_modifier_constraint, where_T_is_not_owned_on_class) {
     auto r = parseAll(
         "module M; public class C<T> where T is not owned end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    const auto* td = extractTypeDecl(r);
-    if (td && td->genericConstraints.size() == 1) {
-        BEZEL_EXPECT_EQ(
-            td->genericConstraints[0].modifierConstraint,
-            std::string_view("not owned"));
-    }
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasRetirementError(r));
 }
 
 BEZEL_TEST(parser_modifier_constraint, on_method) {
@@ -71,42 +63,33 @@ BEZEL_TEST(parser_modifier_constraint, on_method) {
         "module M; public class C "
         "public method M<T>() where T is owned => 0; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    const auto* md = firstMethod(r);
-    if (md && md->genericConstraints.size() == 1) {
-        BEZEL_EXPECT_EQ(
-            md->genericConstraints[0].modifierConstraint,
-            std::string_view("owned"));
-    }
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasRetirementError(r));
 }
 
 BEZEL_TEST(parser_modifier_constraint, multiple_clauses_mixed) {
+    // The colon-form clause should parse; the retired `is owned` clause
+    // must emit a retirement diagnostic.
     auto r = parseAll(
         "module M; public class C<T, U> "
         "where T: class "
         "where U is owned "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasRetirementError(r));
     const auto* td = extractTypeDecl(r);
-    if (td) {
-        BEZEL_EXPECT_EQ(td->genericConstraints.size(), std::size_t(2));
-        if (td->genericConstraints.size() == 2) {
-            // First clause: regular-form `where T: class`.
-            BEZEL_EXPECT_TRUE(
-                td->genericConstraints[0].modifierConstraint.empty());
-            BEZEL_EXPECT_EQ(
-                td->genericConstraints[0].items.size(), std::size_t(1));
-            // Second clause: modifier-form `where U is owned`.
-            BEZEL_EXPECT_EQ(
-                td->genericConstraints[1].modifierConstraint,
-                std::string_view("owned"));
-        }
+    // The colon-form clause for T should still have been recorded.
+    if (td && !td->genericConstraints.empty()) {
+        BEZEL_EXPECT_TRUE(
+            td->genericConstraints[0].modifierConstraint.empty());
+        BEZEL_EXPECT_EQ(
+            td->genericConstraints[0].items.size(), std::size_t(1));
     }
 }
 
 BEZEL_TEST(parser_modifier_constraint, regular_form_still_works) {
     // Regression: the `where T: class` regular form must continue to take
-    // the items path.
+    // the items path without errors.
     auto r = parseAll(
         "module M; public class C<T> where T: class end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

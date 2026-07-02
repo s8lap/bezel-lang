@@ -1167,16 +1167,33 @@ bool Parser::isConstantStart(const Token& t) const {
         (t.text == "true" || t.text == "false" || t.text == "null")) {
         return true;
     }
+    // A.8 (v0.158): Constant admits a leading '-' before a numeric literal
+    // (`"-"? (IntLiteral | FloatLiteral)`), so '-' can begin a Constant.
+    // Callers that have two-token lookahead may refine further; here a bare
+    // '-' is conservatively accepted since in pattern-alternative position
+    // it can only start a negative numeric constant.
+    if (t.kind == TokenKind::Punctuator && t.text == "-") return true;
     // Identifier — could begin a QualifiedName Constant — but `_` is the
     // DiscardPattern, not a Constant.
     return t.kind == TokenKind::Identifier && t.text != "_";
 }
 
 std::unique_ptr<ast::Expr> Parser::parseConstantExpr() {
-    // A.8 Constant. Literals go through parsePrimaryExpression; QualifiedName
-    // is rebuilt as the equivalent IdentifierExpr / MemberAccessExpr chain.
-    // Note: `null` is a keyword the lexer emits as TokenKind::Keyword, and
-    // parsePrimaryExpression handles it as NullLiteral.
+    // A.8 Constant. Admits a leading '-' before IntLiteral/FloatLiteral
+    // (§A.8, v0.158: `"-"? (IntLiteral | FloatLiteral)`).
+    // Other literals and QualifiedNames go through parsePrimaryExpression;
+    // QualifiedName is rebuilt as the equivalent IdentifierExpr/MemberAccess
+    // chain. Note: `null` is a keyword the lexer emits as TokenKind::Keyword,
+    // and parsePrimaryExpression handles it as NullLiteral.
+    if (isPunctuator("-")) {
+        // Negative numeric constant: consume '-', then the literal.
+        const Token opTok = current_;
+        advance(); // consume '-'
+        auto u = std::make_unique<ast::UnaryExpr>();
+        u->op = opTok.text;
+        u->operand = parsePrimaryExpression(); // expects IntLiteral/FloatLiteral
+        return std::unique_ptr<ast::Expr>(u.release());
+    }
     if (current_.kind == TokenKind::Identifier) {
         auto qn = parseQualifiedName();
         return qualifiedNameToExpr(std::move(qn));
