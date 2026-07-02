@@ -133,6 +133,12 @@ Adopted v0.168 (#1372; the stronger remedy #1334 hedged toward). `OwnedArray<T>`
 
 Folded in (per the v0.165 #1359 deferral): the owning **interfaces** gain the standard `I` prefix — `IOwningEnumerable`/`IOwningEnumerator` (and the async pair), `IOwningList`/`IOwningCollection` — since they were the stdlib's only unprefixed interfaces; `GetOwnedEnumerator()` follows as `GetOwningEnumerator()`. Method names that describe an owned **argument** — `AppendOwned`, `FromOwnedResult` — keep `Owned`: there the word correctly names the qualifier axis (the value being passed is owned), not the element axis. The inline-array slot marker is deliberately **not** touched (a separate decision, recorded here as deferred, not declined). Historical changelog entries in this document retain the names as they were at each revision.
 
+### 3.10 Ownership transfer is marked at ordinary call sites
+
+Adopted v0.169 (#1348 — an adversarially-verified review finding, not a rejected-then-revived design; no prior recorded decision had weighed a call-site marker). The gap: `ref` and `out` require call-site keywords, `move` announces a field take-out at the read site (§5.10), yet passing a named owned binding to an `owned` parameter — the mode that leaves the argument *moved-from* — was invisible: `M(value)`. The spec paid for the invisibility twice: §22.6's owned-overload ban and the stdlib's dual naming (`Append`/`AppendOwned`) both exist because the call site couldn't distinguish the forms.
+
+The marker reuses grammar the language already reserved: Appendix A.7's `ArgModifiers` carried an orphaned bare-`owned` alternative with no prose semantics — v0.169 defines it rather than inventing syntax. `M(owned x)` is required exactly when a **named owned binding** is consumed (an owned local or `owned` parameter); **fresh producers** (`new`, owned-returning calls, `move obj._f`) stay unmarked because no live binding is invalidated — the marker announces invalidation, not the parameter's mode. `owned` was preferred over a `move` spelling: it fills the reserved slot, mirrors `out owned var x`, and avoids relaxing MoveExpr's deliberate field-only operand restriction (§5.10). The §22.6 overload ban deliberately stands — its own carve-out criterion is now satisfiable, but lifting it drags stdlib renames and resolution rules along; that is a recorded follow-on, adopted separately or not at all.
+
 <a id="sec-memory-management"></a>
 ## 4. Memory management
 
@@ -7510,6 +7516,18 @@ v0.168 is the **owning-rename revision** — the third breaking-syntax adoption 
 #### Migration
 
 Breaking but purely textual: a global, word-boundary rename over the map above (no semantics change; the two-axis model of §5.11 stands unmodified). The conformance corpus, compiler type registry, diagnostics, and the project's test/example sources are migrated with this revision's compiler train; the compiler emits a renamed-type hint when an old name fails to resolve.
+
+<a id="sec-v0-168-to-v0-169-changelog"></a>
+### v0.169 changelog (v0.168 → v0.169)
+
+v0.169 is the **call-site transfer-marker revision** — the fourth breaking-syntax adoption from the review (#1348).
+
+- **`M(owned x)`** (§22.3, §28.3, §28.8, A.7): passing a **named owned binding** to an `owned` parameter requires the `owned` call-site marker; fresh producers stay unmarked. The previously-orphaned A.7 bare-`owned` `ArgModifiers` alternative is defined (it had no prose semantics — itself a latent grammar/prose inconsistency). Diagnostics name the fix in both directions (missing marker on a named binding; spurious marker on a borrow/fresh producer/non-owned position). New rationale [§3.10](#).
+- **§22.6 overload ban stands** (recorded follow-on): the marker satisfies the ban's carve-out criterion for named bindings, but lifting the ban is deliberately not part of this revision.
+
+#### Migration
+
+Breaking, compiler-guided: every call passing a named owned binding to an `owned` parameter gains `owned` at the argument (the missing-marker diagnostic points at each site). Fresh-producer arguments are untouched. The conformance corpus and the project's test/example sources are migrated with this revision's compiler train.
 
 ## 20. Closing
 

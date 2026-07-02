@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.168 — July 2026**
+**Version 0.169 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3434,7 +3434,7 @@ public method Max(a: int, b: int): int => a if a > b else b;
 
 - `ref` — pass by reference. The caller writes `ref` at the call site. The variable must be initialized before the call.
 - `out` — output parameter. The caller writes `out`. The variable need not be initialized before the call. The callee must assign every `out` parameter on every exit path; failing to do so is a compile error.
-- `owned` — ownership transfer. See [§28.8](#sec-ownership-transfer).
+- `owned` — ownership transfer. See [§28.8](#sec-ownership-transfer). **Call-site marker (v0.169, #1348):** when the argument is a **named owned binding** — an owned local or an `owned` parameter, which the call leaves moved-from — the caller writes `owned` at the call site: `M(owned x)`. A **fresh producer** — a `new` expression, a call returning `owned T`, an operator result, or a `move obj._field` — stays unmarked: no live binding is invalidated, so there is nothing to announce. Omitting the marker on a named owned binding is a compile error naming the fix ("this call consumes `x`; write `M(owned x)`"); writing it on a borrow, a fresh producer, or a non-`owned` parameter position is likewise an error. This restores the visibility rule the other destructive modes already follow (`ref`/`out` at call sites, `move` at field-read sites, rationale §5.10): the most destructive passing mode is no longer the only unmarked one.
 - `out owned` — output parameter that produces an owned value. The callee assigns an owned value through the parameter; the caller receives ownership and must discharge it (typically with `out using var` at the call site, [§22.4](#sec-inline-out-declarations)). The combination `out owned` is the only modifier compound; the others are mutually exclusive.
 
 <a id="sec-inline-out-declarations"></a>
@@ -3521,7 +3521,7 @@ Methods and constructors may be overloaded by parameter list. Overload resolutio
 <a id="sec-owned-and-overload-resolution"></a>
 #### `owned` and overload resolution
 
-`owned` on an **ordinary parameter** (without `out`) does *not* participate in overload resolution. Two overloads that differ only by `owned` on a parameter — e.g. `M(t: T)` and `M(owned t: T)` — are a compile error. The reason is that ordinary `owned` describes a contract about the argument's lifetime rather than its type; the call-site syntax (`M(value)`) does not visibly distinguish the two forms, so permitting them as overloads would force the caller to know the resolution outcome to write a correct ownership transfer. APIs that need both ownership-transferring and borrowing forms must use distinct method names — `Append` versus `AppendOwned`, or the `FromResult` / `FromOwnedResult` pattern.
+`owned` on an **ordinary parameter** (without `out`) does *not* participate in overload resolution. Two overloads that differ only by `owned` on a parameter — e.g. `M(t: T)` and `M(owned t: T)` — are a compile error. The reason is that ordinary `owned` describes a contract about the argument's lifetime rather than its type; the call-site syntax (`M(value)`) does not visibly distinguish the two forms, so permitting them as overloads would force the caller to know the resolution outcome to write a correct ownership transfer. APIs that need both ownership-transferring and borrowing forms must use distinct method names — `Append` versus `AppendOwned`, or the `FromResult` / `FromOwnedResult` pattern. *(v0.169 note: the call-site marker `M(owned x)` (§22.3, #1348) makes the two forms visibly distinct for named-binding arguments, satisfying this paragraph's own carve-out criterion — but the overload ban deliberately **stands** for now; lifting it drags stdlib renames and resolution rules with it and is recorded as a follow-on, not adopted here.)*
 
 `owned` on an **`out` parameter** is different: the call-site syntax visibly distinguishes the two cases. `out var x` produces a borrow location; `out using var x` (or the inline `out owned var x`, [§22.4](#sec-inline-out-declarations)) produces an owned location. The static distinction is observable at the call site, so resolution can proceed without ambiguity.
 
@@ -5039,7 +5039,7 @@ The compiler determines the borrow source as follows: for an instance method, th
 <a id="sec-move-semantics-for-owned-locals"></a>
 #### Move semantics for owned locals
 
-Reading an owned local `x` in a position that requires an owned value (assigning to an owned slot, returning under an `owned` return, passing as an `owned` argument) **transfers ownership out of `x`**. After the transfer, `x` is in the **moved-from** state: it may not be read again until reassigned, and it has no disposal obligation. Reading an owned local in a position that accepts a borrow leaves `x` unchanged.
+Reading an owned local `x` in a position that requires an owned value (assigning to an owned slot, returning under an `owned` return, passing as an `owned` argument) **transfers ownership out of `x`**. After the transfer, `x` is in the **moved-from** state: it may not be read again until reassigned, and it has no disposal obligation. Reading an owned local in a position that accepts a borrow leaves `x` unchanged. In the owned-argument case the transfer is spelled at the call site: `M(owned x)` ([§22.3](#sec-parameter-modifiers), v0.169) — the assignment and return positions need no marker (the `:=`/`return` context is itself the announcement), and a fresh producer passed as an argument needs none either.
 
 ```bezel
 public method Wrap(s: Stream): owned Wrapper
@@ -5512,7 +5512,7 @@ public method TransferToHelperSafe()
   var fresh := new Stream();
   var taken := move _resource;
   _resource := fresh;                      // restore before the call that may throw
-  TakeOwnership(taken);                    // owned argument, no field state at risk
+  TakeOwnership(owned taken);              // owned argument (call-site marker, §22.3), no field state at risk
 end TransferToHelperSafe;
 ```
 
@@ -7855,6 +7855,11 @@ ArgModifiers    ::= "ref"
                   | "out" "using" "var"
                   | "out" "owned" "var"
                   | "owned"
+                              /* Bare "owned" marks ownership transfer of a
+                                 NAMED owned binding to an `owned` parameter —
+                                 `M(owned x)` (v0.169, #1348, §22.3). Required
+                                 for named owned bindings; rejected on fresh
+                                 producers, borrows, and non-owned positions. */
 ArgExpression   ::= Expression | "_"
                               /* The "_" alternative is admitted by the grammar
                                  in any argument position; it is semantically
