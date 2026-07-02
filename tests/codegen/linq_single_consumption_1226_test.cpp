@@ -327,3 +327,94 @@ BEZEL_TEST(linq_single_consumption_1226,
         "  return a.Where((x) => x > 1).Count(); "
         "end Main; end C;"), 2);
 }
+
+// ── §29.11 point 2 (#1353): applying a further deferred op consumes `q` ───
+
+// §29.11 v0.165 / #1353: `var q2 := q.Select(f)` consumes the binding `q`.
+// A subsequent for-loop over `q` must be a static compile error.
+BEZEL_TEST(linq_single_consumption_1226,
+           da_rejects_chain_then_enumeration_spec_29_11_pt2) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 0); "
+        "  var q2 := q.Select((x) => x * 2); "  // consumes q
+        "  var s := 0; "
+        "  for var x in q do s := s + x; end; "  // DA error: q consumed
+        "  return s; "
+        "end Main; end C;"), true);
+}
+
+// §29.11 v0.165 / #1353: chaining once into q2 then using q2 once is fine
+// (no false positive on q2).
+BEZEL_TEST(linq_single_consumption_1226,
+           da_accepts_chain_single_use_spec_29_11_pt2) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 0); "
+        "  var q2 := q.Select((x) => x * 2); "  // q consumed, q2 fresh
+        "  var s := 0; "
+        "  for var x in q2 do s := s + x; end; "  // OK: q2 consumed once
+        "  return s; "
+        "end Main; end C;"), false);
+}
+
+// §29.11 v0.165 / #1353: chaining then applying a second chain on q (already
+// consumed by first chain) is a static error.
+BEZEL_TEST(linq_single_consumption_1226,
+           da_rejects_double_chain_spec_29_11_pt2) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 0); "
+        "  var q2 := q.Select((x) => x * 2); "  // q consumed
+        "  var q3 := q.Skip(1); "               // DA error: q already consumed
+        "  var s := 0; "
+        "  for var x in q3 do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), true);
+}
+
+// ── §29.11 point 3 (#1353): passing query as IEnumerable<T> arg consumes it ─
+
+// §29.11 v0.165 / #1353: passing `q` to a method that takes IEnumerable<int>
+// consumes the binding; a subsequent for-loop over `q` is a static error.
+// Use ToArray() (which takes IEnumerable<T>) as a proxy method that accepts
+// a lazy query — passing q to ToArray() is a valid IEnumerable<T> argument.
+// Note: a chained q.ToArray() (Point 1 terminal) is the same effect; here
+// we test passing q as an argument to a NEW constructor or a LINQ operator
+// that takes IEnumerable<T> explicitly (e.g. a.Concat(q)).
+BEZEL_TEST(linq_single_consumption_1226,
+           da_rejects_ienumerable_arg_then_enumeration_spec_29_11_pt3) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 0); "
+        "  var b := new Array<int>(); "
+        "  var merged := b.Concat(q); "  // q passed as IEnumerable<int> arg → consumed
+        "  var s := 0; "
+        "  for var x in q do s := s + x; end; "  // DA error: q consumed
+        "  return s; "
+        "end Main; end C;"), true);
+}
+
+// §29.11 v0.165 / #1353: passing `q` as argument once is fine (no false positive).
+BEZEL_TEST(linq_single_consumption_1226,
+           da_accepts_single_ienumerable_arg_spec_29_11_pt3) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where((x) => x > 0); "
+        "  var b := new Array<int>(); "
+        "  var merged := b.Concat(q); "  // q consumed (first use, OK)
+        "  var s := 0; "
+        "  for var x in merged do s := s + x; end; "  // merged is a fresh lazy, OK
+        "  return s; "
+        "end Main; end C;"), false);
+}

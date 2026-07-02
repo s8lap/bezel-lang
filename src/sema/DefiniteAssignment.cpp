@@ -103,6 +103,25 @@ private:
                !ty->astNode && !ty->genericArgs.empty() && ty->importedName.empty();
     }
 
+    // §29.11 / #1353: mark a bound lazy local as consumed (or report a
+    // compile error if it was already consumed). `context` briefly describes
+    // the consumption point for the diagnostic ("enumeration", "LINQ chain",
+    // "IEnumerable<T> argument"). per §29.11 v0.165
+    void markLazyConsumed(const ast::IdentifierExpr& id,
+                          const char* context) {
+        if (consumedLazy_.count(id.name)) {
+            ctx_.diagnostics().report(
+                Severity::Error, id.span.begin,
+                std::string("bound lazy query `") + std::string(id.name) +
+                "` was already consumed — a lazy LINQ pipeline is "
+                "single-consumption (§29.11); use `.ToArray()` to "
+                "materialise it for multiple uses (consumed again via " +
+                context + ")");
+        } else {
+            consumedLazy_.insert(id.name);
+        }
+    }
+
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
             if (ld->initializer) visitExpr(*ld->initializer);
@@ -273,17 +292,9 @@ private:
                 if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         fs->iterable.get())) {
                     if (isLazyEnumerableExprType(*fs->iterable)) {
-                        if (consumedLazy_.count(id->name)) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, id->span.begin,
-                                std::string("second enumeration of bound lazy "
-                                    "query `") + std::string(id->name) +
-                                "` — a lazy LINQ pipeline is single-consumption "
-                                "(§29.11); use `.ToArray()` to materialise it "
-                                "for multiple enumerations");
-                        } else {
-                            consumedLazy_.insert(id->name);
-                        }
+                        // §29.11 point 1: enumeration (for-in) consumes the
+                        // bound lazy. Use markLazyConsumed for consistency.
+                        markLazyConsumed(*id, "for-in enumeration");
                     }
                 }
                 visitExpr(*fs->iterable);
@@ -407,6 +418,35 @@ private:
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // §29.11 point 2 (#1353): applying a further deferred LINQ
+            // operator to a bound lazy local consumes that local.  Detect
+            // by: call result type is lazy-enumerable AND the callee is a
+            // MemberAccessExpr whose receiver is a lazy-enumerable identifier.
+            // Example: `var q2 := q.Select(f)` — q is consumed here.
+            // per §29.11 v0.165
+            if (isLazyEnumerableExprType(e)) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce->callee.get())) {
+                    if (ma->target) {
+                        if (const auto* rid =
+                                dynamic_cast<const ast::IdentifierExpr*>(
+                                    ma->target.get())) {
+                            if (isLazyEnumerableExprType(*ma->target)) {
+                                // Check DA assignment (read) first, then
+                                // mark the bound lazy as consumed.
+                                checkRead(*rid);
+                                markLazyConsumed(*rid, "LINQ chain operator");
+                                // Visit the call's own args (lambda/predicates)
+                                // — but not the callee identifier again.
+                                for (const auto& a : ce->args) {
+                                    visitCallArg(a);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             if (ce->callee) visitExpr(*ce->callee);
             for (const auto& a : ce->args) {
                 visitCallArg(a);
@@ -497,6 +537,21 @@ private:
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
                 assigned_.insert(id->name);
                 return;  // pure write — not a read
+            }
+        }
+        // §29.11 point 3 (#1353): passing a bound lazy query as an argument
+        // (not ref/out) consumes it — the single-enumeration right transfers
+        // to the callee.  In well-typed Bezel the parameter type must be
+        // IEnumerable<T> (or a supertype), so any non-ref/non-out lazy arg
+        // is a Point 3 consumption. per §29.11 v0.165
+        if (a.modifier != "ref") {  // not a ref arg (ref is still a read)
+            if (const auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                if (isLazyEnumerableExprType(*a.value)) {
+                    checkRead(*id);  // DA assignment check
+                    markLazyConsumed(*id, "IEnumerable<T> argument");
+                    return;  // consumed — treated as a read+consume
+                }
             }
         }
         visitExpr(*a.value);
