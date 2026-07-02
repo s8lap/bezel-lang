@@ -1,15 +1,15 @@
-// Codegen tests for OwnedDictionary<K,V>.Remove(key) and
-// OwnedLinkedList<T>.Remove(item) disposal correctness.
+// Codegen tests for OwningDictionary<K,V>.Remove(key) and
+// OwningLinkedList<T>.Remove(item) disposal correctness.
 //
 // Three bugs (M1 / M2 / M3):
 //
-//   M1 (leak §4.9): OwnedDictionary<K,V>.Remove(key) freed only the key; the
+//   M1 (leak §4.9): OwningDictionary<K,V>.Remove(key) freed only the key; the
 //      removed owned value's destructor never ran.
 //      Fix: add bz_dict_remove_str_disposing / bz_dict_remove_gen_disposing
 //      runtime functions that call dispose_val on the value before unlinking;
 //      pass owningDictValueDisposer from the codegen (as Clear already does).
 //
-//   M2 (no-op §4.6/§4.3): OwnedLinkedList<T>.Remove(item) had no m == "Remove"
+//   M2 (no-op §4.6/§4.3): OwningLinkedList<T>.Remove(item) had no m == "Remove"
 //      case in tryLowerLinkedListInstanceCall → fell through to nullptr → silent
 //      no-op. Fix: add the case, using Find + RemoveNode as the pattern.
 //
@@ -18,8 +18,8 @@
 //      crashing the LLVM IR verifier. Fixing M2 (returning a proper i1 bool) also
 //      fixes M3.
 //
-// Tests derive from stdlib §4.9 (OwnedDictionary), §4.6 (LinkedList), §4.3
-// (IOwnedCollection.Remove).
+// Tests derive from stdlib §4.9 (OwningDictionary), §4.6 (LinkedList), §4.3
+// (IOwningCollection.Remove).
 
 #include <cstdio>
 #include <cstdlib>
@@ -135,7 +135,7 @@ std::string prog(const std::string& mainBody) {
 }  // namespace
 
 // ===========================================================================
-// M1 — OwnedDictionary<string, V>.Remove(key) must dispose the value (§4.9)
+// M1 — OwningDictionary<string, V>.Remove(key) must dispose the value (§4.9)
 // ===========================================================================
 
 // stdlib §4.9: Remove(key: K): bool — disposes the removed value.
@@ -144,7 +144,7 @@ std::string prog(const std::string& mainBody) {
 // destructor counter stayed 0 → test returned 0 instead of 1.
 BEZEL_TEST(owned_collection_remove_M1, owned_dict_str_remove_disposes_value) {
     expectDisposedAndLeakFree(prog(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"x\", move (new R())); "
         "d.Remove(\"x\"); "
         "return R._n;"),        // 1 — destructor ran exactly once on Remove
@@ -159,7 +159,7 @@ BEZEL_TEST(owned_collection_remove_M1,
     BEZEL_EXPECT_EQ(run(prog(
         "var afterRemove := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R())); "
         "  d.Add(\"b\", move (new R())); "
         "  d.Remove(\"a\"); "
@@ -173,7 +173,7 @@ BEZEL_TEST(owned_collection_remove_M1,
 BEZEL_TEST(owned_collection_remove_M1,
            owned_dict_str_remove_returns_true_on_hit) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"x\", move (new R())); "
         "var hit := d.Remove(\"x\"); "
         "return int(hit);")),   // 1
@@ -184,7 +184,7 @@ BEZEL_TEST(owned_collection_remove_M1,
 BEZEL_TEST(owned_collection_remove_M1,
            owned_dict_str_remove_absent_key_returns_false_no_dispose) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"x\", move (new R())); "
         "var hit := d.Remove(\"missing\"); "
         "return int(hit) * 10 + R._n;")),  // 0*10+0 = 0 (not found, not disposed)
@@ -192,11 +192,11 @@ BEZEL_TEST(owned_collection_remove_M1,
 }
 
 // stdlib §4.9 / generic-key path (int key via bz_dict_remove_gen_disposing):
-// OwnedDictionary<int, V>.Remove(key) also disposes the value.
+// OwningDictionary<int, V>.Remove(key) also disposes the value.
 BEZEL_TEST(owned_collection_remove_M1,
            owned_dict_int_remove_disposes_value) {
     expectDisposedAndLeakFree(prog(
-        "using var d := new OwnedDictionary<int, R>(); "
+        "using var d := new OwningDictionary<int, R>(); "
         "d.Add(1, move (new R())); "
         "d.Remove(1); "
         "return R._n;"),        // 1 — destructor ran exactly once
@@ -207,7 +207,7 @@ BEZEL_TEST(owned_collection_remove_M1,
 BEZEL_TEST(owned_collection_remove_M1,
            owned_dict_int_remove_returns_true_on_hit) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var d := new OwnedDictionary<int, R>(); "
+        "using var d := new OwningDictionary<int, R>(); "
         "d.Add(1, move (new R())); "
         "var hit := d.Remove(1); "
         "return int(hit);")),   // 1
@@ -233,7 +233,7 @@ BEZEL_TEST(owned_collection_remove_M1,
 }
 
 // ===========================================================================
-// M2 — OwnedLinkedList<T>.Remove(item) must find, dispose, and unlink (§4.6/§4.3)
+// M2 — OwningLinkedList<T>.Remove(item) must find, dispose, and unlink (§4.6/§4.3)
 // ===========================================================================
 
 // stdlib §4.6 / §4.3: Remove(item): bool — disposes the matched element and
@@ -242,7 +242,7 @@ BEZEL_TEST(owned_collection_remove_M1,
 BEZEL_TEST(owned_collection_remove_M2,
            owned_linkedlist_remove_disposes_element) {
     expectDisposedAndLeakFree(prog(
-        "using var lst := new OwnedLinkedList<R>(); "
+        "using var lst := new OwningLinkedList<R>(); "
         "var r := new R(); "
         "var b := r; "
         "lst.AddLast(move r); "
@@ -258,7 +258,7 @@ BEZEL_TEST(owned_collection_remove_M2,
     BEZEL_EXPECT_EQ(run(
         "module M; class R end R; "
         "class C public static method Main(): int "
-        "  using var lst := new OwnedLinkedList<R>(); "
+        "  using var lst := new OwningLinkedList<R>(); "
         "  var r := new R(); var b := r; "
         "  lst.AddLast(move r); "
         "  lst.Remove(b); "
@@ -273,7 +273,7 @@ BEZEL_TEST(owned_collection_remove_M2,
     BEZEL_EXPECT_EQ(run(
         "module M; class R end R; "
         "class C public static method Main(): int "
-        "  using var lst := new OwnedLinkedList<R>(); "
+        "  using var lst := new OwningLinkedList<R>(); "
         "  var r := new R(); var b := r; "
         "  lst.AddLast(move r); "
         "  var hit := lst.Remove(b); "
@@ -288,7 +288,7 @@ BEZEL_TEST(owned_collection_remove_M2,
 BEZEL_TEST(owned_collection_remove_M2,
            owned_linkedlist_remove_absent_item_returns_false_no_dispose) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var lst := new OwnedLinkedList<R>(); "
+        "using var lst := new OwningLinkedList<R>(); "
         "var r1 := new R(); var b1 := r1; "
         "lst.AddLast(move r1); "
         "var r2 := new R(); var b2 := r2; "
@@ -307,7 +307,7 @@ BEZEL_TEST(owned_collection_remove_M2,
     BEZEL_EXPECT_EQ(run(prog(
         "var afterRemove := -1; "
         "do "
-        "  using var lst := new OwnedLinkedList<R>(); "
+        "  using var lst := new OwningLinkedList<R>(); "
         "  var r1 := new R(); var b1 := r1; "
         "  lst.AddLast(move r1); "
         "  var r2 := new R(); var b2 := r2; "
@@ -350,7 +350,7 @@ BEZEL_TEST(owned_collection_remove_M3,
     BEZEL_EXPECT_EQ(run(
         "module M; class R end R; "
         "class C public static method Main(): int "
-        "  using var lst := new OwnedLinkedList<R>(); "
+        "  using var lst := new OwningLinkedList<R>(); "
         "  var r := new R(); var b := r; "
         "  lst.AddLast(move r); "
         "  var removed := lst.Remove(b); "
@@ -365,7 +365,7 @@ BEZEL_TEST(owned_collection_remove_M3,
     BEZEL_EXPECT_EQ(run(
         "module M; class R end R; "
         "class C public static method Main(): int "
-        "  using var lst := new OwnedLinkedList<R>(); "
+        "  using var lst := new OwningLinkedList<R>(); "
         "  var r := new R(); var b := r; "
         "  lst.AddLast(move r); "
         "  using var probe := new R(); "  // not stored in lst

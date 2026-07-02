@@ -17,8 +17,8 @@
 // BORROWING span — `ArraySpan<T>` / `ReadOnlyArraySpan<T>` (views over a
 // borrowing `Array<T>`) or a read-only span (`ReadOnlySpan<T>`,
 // `IReadOnlySpan<T>`, `ReadOnlyStringSpan`, `ReadOnlyAsciiByteSpan`). The OWNING
-// `Span<T>` (over an `OwnedBuffer`) and the concrete owning collections
-// (`move OwnedArray[i]`) stay accepted, and a plain span indexer-get (no `move`)
+// `Span<T>` (over an `OwningBuffer`) and the concrete owning collections
+// (`move OwningArray[i]`) stay accepted, and a plain span indexer-get (no `move`)
 // stays accepted.
 
 #include "support/ownership_support.hpp"
@@ -90,14 +90,14 @@ BEZEL_TEST(move_borrowing_span_slot_871, move_through_readonly_array_span_reject
 // POSITIVE — the legal forms stay accepted (no over-rejection).
 // =============================================================================
 
-// §28.11: `move owner[0]` on a CONCRETE `OwnedArray<Cell>` is an enumerated
+// §28.11: `move owner[0]` on a CONCRETE `OwningArray<Cell>` is an enumerated
 // admitting receiver — still accepted. The span gate must not touch it.
 BEZEL_TEST(move_borrowing_span_slot_871, move_through_owned_array_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Cell public constructor() end; destructor end; end Cell; "
         "class C public static method Main(): int "
-        "  using var owner := new OwnedArray<Cell>(); "
+        "  using var owner := new OwningArray<Cell>(); "
         "  owner.Add(move (new Cell())); "
         "  using var x := move owner[0]; "
         "  return 0; "

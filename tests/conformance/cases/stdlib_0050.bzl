@@ -7,7 +7,7 @@ public class Stack<T>: ICollection<T>
   public method TryPeek(out item: T): bool;
 end Stack;
 
-public class OwnedStack<T>: IOwnedCollection<T> where T: class
+public class OwningStack<T>: IOwningCollection<T> where T: class
   public constructor();
   public method Push(owned item: T);
   public method Pop(): owned T;                   // raises if empty; transfers out
@@ -15,8 +15,8 @@ public class OwnedStack<T>: IOwnedCollection<T> where T: class
   public method TryPop(out owned item: T): bool;
   public method TryPeek(out item: T): bool;       // out is borrow
   public method Clear();                           // disposes every element
-  public method Drain(): OwnedEnumerable<T>;
-end OwnedStack;
+  public method Drain(): IOwningEnumerable<T>;
+end OwningStack;
 
 public class Queue<T>: ICollection<T>
   public constructor();
@@ -27,7 +27,7 @@ public class Queue<T>: ICollection<T>
   public method TryPeek(out item: T): bool;
 end Queue;
 
-public class OwnedQueue<T>: IOwnedCollection<T> where T: class
+public class OwningQueue<T>: IOwningCollection<T> where T: class
   public constructor();
   public method Enqueue(owned item: T);
   public method Dequeue(): owned T;
@@ -35,5 +35,5 @@ public class OwnedQueue<T>: IOwnedCollection<T> where T: class
   public method TryDequeue(out owned item: T): bool;
   public method TryPeek(out item: T): bool;       // out is borrow
   public method Clear();                           // disposes every element
-  public method Drain(): OwnedEnumerable<T>;
-end OwnedQueue;
+  public method Drain(): IOwningEnumerable<T>;
+end OwningQueue;

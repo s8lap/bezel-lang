@@ -106,7 +106,7 @@ struct CFGBlock {
     // for` loop, `forBodyEntry` points at the originating `ForStmt`. The
     // ownership pass uses it to seed the iteration variable as Owned at the
     // body entry of EACH iteration when the loop's iterable is an owning
-    // enumerable (`OwnedEnumerable<T>` / `OwnedAsyncEnumerable<T>`), so the
+    // enumerable (`IOwningEnumerable<T>` / `IOwningAsyncEnumerable<T>`), so the
     // standard §28.3 owned-local discharge check rejects an undischarged
     // iteration variable ("Iterator yield ownership", §29.2). Null for every
     // other block (including a borrowing for-loop's body entry — the seeding
@@ -180,7 +180,7 @@ struct CFGBlock {
     // state machine has completion exits BEYOND the synchronous ones: besides
     // normal return and fault/exception (the latter already modelled by
     // `exceptionSuccs`), the task can be **abandoned** (dropped without being
-    // awaited to completion — §30.5 "Disposing an unconsumed `OwnedTask<T>`")
+    // awaited to completion — §30.5 "Disposing an unconsumed `OwningTask<T>`")
     // or **cancelled** (§30.8 — observed at an `await` as
     // `OperationCanceledException`). On those completion edges the state-
     // machine frame disposes every owned local stored in it (every

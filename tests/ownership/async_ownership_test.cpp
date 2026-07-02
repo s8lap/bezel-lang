@@ -27,7 +27,7 @@
 //      (§30.5: a `using var`-bound local, an `owned` parameter, an `owned`
 //      field, an owning-collection slot, a borrowing-iteration variable, or a
 //      Pattern-A `return await Producer()`). Otherwise the borrowed result
-//      would have no source and the await is rejected. For `OwnedTask<T>`
+//      would have no source and the await is rejected. For `OwningTask<T>`
 //      (Pattern B), the await must appear in an owned-consuming context
 //      (§30.5: `using var`/`await using var` RHS, `var` RHS, owned-field /
 //      owned-slot assignment RHS, `owned` parameter argument, `owned` return,
@@ -51,14 +51,14 @@ namespace {
 // return the three task shapes, plus a class C hosting the async method under
 // test. Using non-async producer bodies (`=> null`) keeps the producer free
 // of its own ownership diagnostics; only the awaiting method `M` is tested.
-// `Conn` / `T` are class types so `OwnedTask<Conn>` / `Task<Conn>` are the
+// `Conn` / `T` are class types so `OwningTask<Conn>` / `Task<Conn>` are the
 // class-typed Pattern B / Pattern A forms. A `Use(c: Conn)` borrow-consuming
 // helper sits alongside `M` for the argument-position tests.
 std::string wrap(const std::string& body, const std::string& sig = "M(): Task") {
     return std::string("module M; "
         "class Conn end Conn; class T end T; "
         "class Producer "
-        "  public method MakeOwned(): OwnedTask<Conn> => null; "
+        "  public method MakeOwned(): OwningTask<Conn> => null; "
         "  public method MakeShared(): Task<Conn> => null; "
         "  public method MakeUnit(): Task => null; "
         "end Producer; "
@@ -236,7 +236,7 @@ BEZEL_TEST(async_own_patternA, await_value_typed_task_any_position_clean) {
 // (2b) Pattern B await-site (§30.5 Consumer-side; Appendix C.6).
 // ---------------------------------------------------------------------------
 
-// Pattern B: awaiting a class-typed `OwnedTask<T>` in a `using var`-RHS
+// Pattern B: awaiting a class-typed `OwningTask<T>` in a `using var`-RHS
 // owned-consuming context (ownership transfers to `x`) is the canonical form —
 // clean. // per §30.5
 BEZEL_TEST(async_own_patternB, await_into_using_var_clean) {
@@ -245,7 +245,7 @@ BEZEL_TEST(async_own_patternB, await_into_using_var_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Pattern B: awaiting an `OwnedTask<T>` in a BARE expression-statement
+// Pattern B: awaiting an `OwningTask<T>` in a BARE expression-statement
 // position is NOT an owned-consuming context — the transferred result is
 // dropped without discharge. Diagnosed. // per §30.5, Appendix C.6
 BEZEL_TEST(async_own_patternB, await_in_bare_expr_position_diagnosed) {
@@ -289,16 +289,16 @@ BEZEL_TEST(async_own_patternB, second_await_of_consumed_task_diagnosed) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// Pattern B: `return await Producer()` from an `OwnedTask<T>`-returning async
+// Pattern B: `return await Producer()` from an `OwningTask<T>`-returning async
 // method forwards the owned result through the state machine (§30.5 line
 // ~6143) — an owned `return` is an owned-consuming context. Clean. // per §30.5
 BEZEL_TEST(async_own_patternB, return_await_owned_clean) {
     auto r = parseAndCheckOwnership(wrap(
-        "return await p.MakeOwned(); ", "M(): OwnedTask<Conn>"));
+        "return await p.MakeOwned(); ", "M(): OwningTask<Conn>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Pattern B: awaiting an `OwnedTask<T>` into an `owned` argument (`Sink` takes
+// Pattern B: awaiting an `OwningTask<T>` into an `owned` argument (`Sink` takes
 // `owned c`) is an owned-consuming context — the result transfers into the
 // call. Clean. // per §30.5
 BEZEL_TEST(async_own_patternB, await_into_owned_arg_clean) {
@@ -307,7 +307,7 @@ BEZEL_TEST(async_own_patternB, await_into_owned_arg_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Pattern B: awaiting an `OwnedTask<T>` into a NON-owned argument (`Use`
+// Pattern B: awaiting an `OwningTask<T>` into a NON-owned argument (`Use`
 // borrows `c`) is NOT an owned-consuming context — the transferred result is
 // dropped. Diagnosed. // per §30.5, Appendix C.6
 BEZEL_TEST(async_own_patternB, await_into_borrow_arg_diagnosed) {

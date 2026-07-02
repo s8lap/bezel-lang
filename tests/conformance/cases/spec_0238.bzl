@@ -4,5 +4,5 @@ for var task in taskArray.Drain() do
 end;
 
 // Local variable of owned task type
-var theTask := SomeFactory();   // theTask: owned OwnedTask<T>
+var theTask := SomeFactory();   // theTask: owned OwningTask<T>
 using var result := await theTask;  // theTask discharged by the await

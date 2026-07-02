@@ -155,8 +155,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 }
             }
             // §29.2 / §28.3 v0.157 (#1329): affine auto-drop for owned ITERATION
-            // VARIABLES. A `for var x in OwnedEnumerable<T>` / `await for var x in
-            // OwnedAsyncEnumerable<T>` iteration variable whose ownership obligation
+            // VARIABLES. A `for var x in IOwningEnumerable<T>` / `await for var x in
+            // IOwningAsyncEnumerable<T>` iteration variable whose ownership obligation
             // reaches a body-exit edge (i.e. is still Owned in endState via the
             // loop back-edge / skip-edge) is auto-dropped per-iteration at body-end
             // with the must-use warning, matching the §28.3 auto-drop for regular
@@ -299,7 +299,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         }
     }
     // §29.2 / §28.3 v0.157 (#1329) addendum — break-only loop bodies.
-    // A `for var x in OwnedEnumerable<T>` body that always exits via `break`
+    // A `for var x in IOwningEnumerable<T>` body that always exits via `break`
     // never propagates item=Owned to the loop's `after` block: the break edge is
     // not a loopEdge (it is not a back-edge or the header's zero-trip skip-edge),
     // so `unionKeys=false` at the `after` block's entry merge prevents new symbols
@@ -1259,7 +1259,7 @@ FlowState MethodOwnership::runDataflow(
 void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // §29.2 (#834) "Iterator yield ownership": when this block is the
     // body-entry of a `for`/`await for` loop whose iterable is an owning
-    // enumerable (`OwnedEnumerable<T>` / `OwnedAsyncEnumerable<T>`), the
+    // enumerable (`IOwningEnumerable<T>` / `IOwningAsyncEnumerable<T>`), the
     // iteration variable `x` is a *plain owned local* — "owned and must be
     // discharged inside the loop body. Falling off the body without
     // discharging is a compile error." Seed `x` as Owned at the body entry of
@@ -1349,10 +1349,10 @@ void MethodOwnership::seedOwnedIterVar(const ast::ForStmt& fs) {
 }
 
 // §29.2 (#834): true when the for-loop's iterable has static type
-// `OwnedEnumerable<T>` or `OwnedAsyncEnumerable<T>` (the owning-enumerator
+// `IOwningEnumerable<T>` or `IOwningAsyncEnumerable<T>` (the owning-enumerator
 // desugaring path). Detected by the resolved iterable type's name-head,
 // mirroring the owned-call classification at producerState (which name-checks
-// `OwnedEnumerable` among the always-owned handle heads). A Named TypeRef
+// `IOwningEnumerable` among the always-owned handle heads). A Named TypeRef
 // carries its name either on the AST node (`astNode->name->parts`) or, for an
 // imported type, in `importedName`; check both. Any other iterable kind
 // (Array<T>/IEnumerable<T> borrowing, range, inline array, string, span)
@@ -1367,7 +1367,7 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
         head = tt->astNode->name->parts.front();
     else if (!tt->importedName.empty())
         head = tt->importedName;
-    return head == "OwnedEnumerable" || head == "OwnedAsyncEnumerable";
+    return head == "IOwningEnumerable" || head == "IOwningAsyncEnumerable";
 }
 
 // §29.2 (#834): find the LocalSymbol ExprTypecheck created for `fs`'s
@@ -1641,7 +1641,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
         return OwnershipState::PolyNull;
     }
-    // Async-readiness 3c (§30.5 Pattern B): `await <OwnedTask<T>>` for class T
+    // Async-readiness 3c (§30.5 Pattern B): `await <OwningTask<T>>` for class T
     // produces an OWNED value — ownership transfers from the task to the
     // awaiter. The standard §28.3 owned-local discharge rules then apply to the
     // binding (§30.5 line ~6148: "`x` is an owned local subject to standard
@@ -1658,8 +1658,8 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         }
     }
     // §28.6 / §28.11 (#1107 finding D): a `move X` whose value is an OWNING
-    // COLLECTION (OwnedArray/OwnedStack/OwnedQueue/OwnedSet/OwnedDictionary/
-    // OwnedLinkedList) transfers the CONTAINER ownership the source local holds
+    // COLLECTION (OwningArray/OwningStack/OwningQueue/OwningSet/OwningDictionary/
+    // OwningLinkedList) transfers the CONTAINER ownership the source local holds
     // to the result — the result is Owned (the target must dispose the container
     // and cascade to its elements, §28.11). Without this, `var arr2 := move arr1`
     // falls through to the owning-collection name-head fallback below, which
@@ -1694,7 +1694,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     if (md) {
                         if (md->returnOwned) return OwnershipState::Owned;
                         // §28.6 / §5.11 (#1008 Part C): a USER method returning a
-                        // non-`owned` owning COLLECTION (OwnedArray, …) yields a
+                        // non-`owned` owning COLLECTION (OwningArray, …) yields a
                         // BORROW (the `Owned*` name denotes ELEMENT ownership,
                         // orthogonal to the container ownership the `owned`
                         // qualifier governs). Do NOT fall through to the builtin
@@ -1704,7 +1704,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                         // return is a genuine borrow (a bare receiver-field
                         // read), never a fresh/`move`d/owned value, so this never
                         // under-disposes an owned result. Owning WRAPPERS
-                        // (OwnedTask, Shared, …) keep consumer-owns semantics —
+                        // (OwningTask, Shared, …) keep consumer-owns semantics —
                         // they fall through to the name-head fallback (Owned),
                         // and a borrow through them stays the #1007 reject.
                         if (const sema::TypeRef* rt = ctx_.exprType(e))
@@ -1754,11 +1754,11 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                 !retTy->astNode->name->parts.empty()) {
                 std::string_view head = retTy->astNode->name->parts.front();
                 if (head == "Shared"          || head == "Weak"            ||
-                    head == "ChannelSender"    || head == "OwnedTask"       ||
-                    head == "OwnedArray"       || head == "OwnedDictionary" ||
-                    head == "OwnedSet"         || head == "OwnedStack"      ||
-                    head == "OwnedQueue"       || head == "OwnedLinkedList" ||
-                    head == "OwnedEnumerable"  ||
+                    head == "ChannelSender"    || head == "OwningTask"       ||
+                    head == "OwningArray"       || head == "OwningDictionary" ||
+                    head == "OwningSet"         || head == "OwningStack"      ||
+                    head == "OwningQueue"       || head == "OwningLinkedList" ||
+                    head == "IOwningEnumerable"  ||
                     head == "CancellationTokenSource") {
                     return OwnershipState::Owned;
                 }
@@ -2220,34 +2220,34 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
 // the two stay aligned. // per §28.3, §5.11
 bool MethodOwnership::isOwningTypeNameHead(std::string_view head) {
     return head == "Shared"          || head == "Weak"            ||
-           head == "ChannelSender"    || head == "OwnedTask"       ||
-           head == "OwnedArray"       || head == "OwnedDictionary" ||
-           head == "OwnedSet"         || head == "OwnedStack"      ||
-           head == "OwnedQueue"       || head == "OwnedLinkedList" ||
-           head == "OwnedEnumerable"  ||
+           head == "ChannelSender"    || head == "OwningTask"       ||
+           head == "OwningArray"       || head == "OwningDictionary" ||
+           head == "OwningSet"         || head == "OwningStack"      ||
+           head == "OwningQueue"       || head == "OwningLinkedList" ||
+           head == "IOwningEnumerable"  ||
            head == "CancellationTokenSource";
 }
 
 // §28.6 / §5.11 (#1008 Part C): the owning *collections* — the borrow-return and
-// capability rules of Part C apply to these. The owning *wrappers* (OwnedTask,
-// Shared, Weak, ChannelSender, OwnedEnumerable, CancellationTokenSource) have
+// capability rules of Part C apply to these. The owning *wrappers* (OwningTask,
+// Shared, Weak, ChannelSender, IOwningEnumerable, CancellationTokenSource) have
 // consumer-owns semantics Part C does not change: a non-`owned` wrapper return
 // stays an owned producer (a borrow through it is the #1007 double-free hazard,
 // still rejected), and the read-only capability restriction does not apply.
 bool MethodOwnership::isOwningCollectionNameHead(std::string_view head) {
-    return head == "OwnedArray"  || head == "OwnedDictionary" ||
-           head == "OwnedSet"    || head == "OwnedStack"      ||
-           head == "OwnedQueue"  || head == "OwnedLinkedList";
+    return head == "OwningArray"  || head == "OwningDictionary" ||
+           head == "OwningSet"    || head == "OwningStack"      ||
+           head == "OwningQueue"  || head == "OwningLinkedList";
 }
 
-// §28.3 / §28.6 / §5.11 (#1007): a method declared `: OwnedArray<T>` (or any
+// §28.3 / §28.6 / §5.11 (#1007): a method declared `: OwningArray<T>` (or any
 // owning-collection / owning-wrapper return type) WITHOUT the `owned` qualifier
 // hands the caller a value the caller tracks as OWNED — the caller must
 // discharge it (a `using var` binding disposes it; a plain `var` errors if it
 // is dropped). If the returned expression is a BORROW (a non-`owned` parameter,
 // a borrowed local, or a plain field read), that borrow is laundered into a
 // second owner: both the original owner and the caller dispose the same value,
-// a double-free (#1007). The element-ownership the `OwnedArray` type name
+// a double-free (#1007). The element-ownership the `OwningArray` type name
 // denotes (§5.11) is a SEPARATE axis from the container ownership the `owned`
 // qualifier governs — so a bare (non-`owned`) owning-collection return that
 // returns a borrow must be rejected, exactly as a borrowed `Array<T>` return is
@@ -2267,8 +2267,8 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
     std::string head(returnType_->name->parts.front());
     if (!isOwningTypeNameHead(head)) return;
     if (!isOwningCollectionNameHead(head)) {
-        // Owning WRAPPER (OwnedTask, Shared, Weak, ChannelSender,
-        // OwnedEnumerable, CancellationTokenSource): consumer-owns semantics are
+        // Owning WRAPPER (OwningTask, Shared, Weak, ChannelSender,
+        // IOwningEnumerable, CancellationTokenSource): consumer-owns semantics are
         // unchanged by Part C — a non-`owned` wrapper return is an OWNED producer
         // (the caller disposes it), and a BORROW returned that way is laundered
         // into a second owner (the #1007 double-free). Reject the borrow; allow
@@ -2326,7 +2326,7 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         if (un->op == "move") return;
     // A borrowed PARAMETER or LOCAL, or a field of another object — a borrow
     // whose source does not outlive the call
-    // (`Identity(a: OwnedArray<T>): OwnedArray<T> => a`, or `return local._items`).
+    // (`Identity(a: OwningArray<T>): OwningArray<T> => a`, or `return local._items`).
     if (ownedArgSourceIsBorrow(e) || exprIsOwnedFieldRead(e)) {
         report(
             Severity::Error, e.span.begin,
@@ -2370,13 +2370,13 @@ void MethodOwnership::checkBorrowedOwningCollectionCapability(
     // dispose-exactly-once (a transferred element is owned by its new holder;
     // the owner then disposes a smaller/empty container) — and Bezel already
     // admits them on a borrowed collection (the pass-and-fill `a.Add(...)`
-    // pattern where `a` is a borrowed `OwnedArray<T>` parameter, §28.8). So only
+    // pattern where `a` is a borrowed `OwningArray<T>` parameter, §28.8). So only
     // `Dispose` is restricted here; the rest follow normal borrowed-collection
     // semantics. // per §28.6
     if (callee.member != "Dispose") return;
     const ast::Expr* recv = callee.target.get();
     if (!recv) return;
-    // The receiver must statically be an owning-collection type (OwnedArray, …);
+    // The receiver must statically be an owning-collection type (OwningArray, …);
     // the same operations on a plain Array<T>/List<T> or a borrowed plain class
     // are unaffected.
     const sema::TypeRef* rt = ctx_.exprType(*recv);
@@ -2396,7 +2396,7 @@ void MethodOwnership::checkBorrowedOwningCollectionCapability(
                     dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
                 if (tid->name == "this") return;
     } else if (rsym) {
-        // An owned LOCAL (`using var` / `var a := new OwnedArray()`) or an
+        // An owned LOCAL (`using var` / `var a := new OwningArray()`) or an
         // `owned` PARAMETER is in the Owned state in `states_`; a borrowed
         // local/param (e.g. `var items := h.GetItems()`) is Borrowed → reject.
         auto it = states_.find(rsym);
@@ -2510,7 +2510,7 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
             // §28.3 / §5.11 (#1007): an expression-bodied method `M(): T => E`
             // is exactly `return E` for ownership purposes — but the full block
             // dataflow is not run on it. Run the narrow borrow-returned-through-
-            // owning-type check so `Identity(a): OwnedArray<T> => a` (the #1007
+            // owning-type check so `Identity(a): OwningArray<T> => a` (the #1007
             // double-free) is rejected at its definition site, the same as the
             // block-body `return a;` form. Seed the params so a borrowed param /
             // owned param is classified correctly, then apply only this check

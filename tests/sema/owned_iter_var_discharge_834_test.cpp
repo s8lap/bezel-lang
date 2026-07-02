@@ -1,5 +1,5 @@
 // fix #834 / §29.2 "Iterator yield ownership": the iteration variable of a
-// `for`/`await for` loop over an OwnedEnumerable<T> / OwnedAsyncEnumerable<T>
+// `for`/`await for` loop over an IOwningEnumerable<T> / IOwningAsyncEnumerable<T>
 // is a PLAIN OWNED LOCAL and "must be discharged inside the loop body.
 // Falling off the body without discharging is a compile error."
 //
@@ -24,7 +24,7 @@ using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
-// A disposable Box class plus an iterator method returning OwnedEnumerable<Box>
+// A disposable Box class plus an iterator method returning IOwningEnumerable<Box>
 // (the owning-enumeration / drain path). `body` is the for-loop body that each
 // test varies. A valid Main entry point is supplied so the program is complete.
 std::string withOwnedFor(const std::string& body) {
@@ -35,7 +35,7 @@ std::string withOwnedFor(const std::string& body) {
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(); "
         "  end Gen; "
         "  public static method Run(c: bool): int "
@@ -48,7 +48,7 @@ std::string withOwnedFor(const std::string& body) {
         "end C;";
 }
 
-// Async variant: an async iterator returning OwnedAsyncEnumerable<Box>,
+// Async variant: an async iterator returning IOwningAsyncEnumerable<Box>,
 // consumed by an `await for`. `body` varies per test.
 std::string withOwnedAwaitFor(const std::string& body) {
     return std::string(
@@ -58,7 +58,7 @@ std::string withOwnedAwaitFor(const std::string& body) {
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static async method Gen(): OwnedAsyncEnumerable<Box> "
+        "  public static async method Gen(): IOwningAsyncEnumerable<Box> "
         "    yield return new Box(); "
         "  end Gen; "
         "  public static async method Run(c: bool): Task "
@@ -148,7 +148,7 @@ BEZEL_TEST(owned_iter_var_discharge_834, undischarged_break_warns) {
 }
 
 // §29.2 / §28.3 v0.157 / #1329 / #834 (async form): `await for` over an
-// OwnedAsyncEnumerable<Box> with the iteration variable not discharged — must
+// IOwningAsyncEnumerable<Box> with the iteration variable not discharged — must
 // emit the auto-drop WARNING (not an error, matching the sync form).
 BEZEL_TEST(owned_iter_var_discharge_834, undischarged_async_warns) {
     auto r = parseAndCheckOwnership(withOwnedAwaitFor(""));
@@ -204,13 +204,13 @@ BEZEL_TEST(owned_iter_var_discharge_834, range_for_loop_accepted) {
 
 // §29.2 / §30.5 / §30.4 / #834 (the WhenAllOwned over-reject guard, stdlib
 // §2.13): the §29.2 drain-and-await pattern — `for var task in arr.Drain() do
-// results.Add(await task) end` over an OwnedArray<OwnedTask<T>> in a GENERIC
+// results.Add(await task) end` over an OwningArray<OwningTask<T>> in a GENERIC
 // async method. The owned iteration variable `task` is discharged by the
 // `await task` inside the `Add(owned item)` owned-consuming context: awaiting
-// an `OwnedTask<...>` consumes the single-consumer task (§30.5/§30.4). This
+// an `OwningTask<...>` consumes the single-consumer task (§30.5/§30.4). This
 // must be ACCEPTED. The seeding of `task` as owned (the #834 fix) made this
 // program reachable; the consume of `await task` in an argument position (and
-// for a generic OwnedTask<T> whose result class kind awaitTaskKind cannot
+// for a generic OwningTask<T> whose result class kind awaitTaskKind cannot
 // prove) must be recognized, else this conformance-clean program is wrongly
 // rejected. This is the headline regression to guard against over-rejection.
 BEZEL_TEST(owned_iter_var_discharge_834, drain_and_await_generic_accepted) {
@@ -218,10 +218,10 @@ BEZEL_TEST(owned_iter_var_discharge_834, drain_and_await_generic_accepted) {
         "module M; "
         "class C "
         "  public static async method WhenAllOwned<T>("
-        "    owned tasks: OwnedArray<OwnedTask<T>>"
-        "  ): OwnedTask<OwnedArray<T>> where T: class "
+        "    owned tasks: OwningArray<OwningTask<T>>"
+        "  ): OwningTask<OwningArray<T>> where T: class "
         "    using var taskArray := tasks; "
-        "    var results := new OwnedArray<T>(capacity := taskArray.Count); "
+        "    var results := new OwningArray<T>(capacity := taskArray.Count); "
         "    for var task in taskArray.Drain() do "
         "      results.Add(await task); "
         "    end; "

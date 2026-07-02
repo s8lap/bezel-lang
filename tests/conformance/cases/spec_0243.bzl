@@ -1,5 +1,5 @@
 public class Semaphore
-  public async method AcquireAsync(): OwnedTask<SemaphoreToken>;
+  public async method AcquireAsync(): OwningTask<SemaphoreToken>;
 end Semaphore;
 
 // Caller:

@@ -5,7 +5,7 @@
 // element of an owning collection as an owned value, leaving the slot in
 // moved-from state." Spec §28.8.1: the moved-from slot must be left in a state
 // the owner's later disposal skips. Spec §28.11's restoration rules and the
-// OwnedArray reference implementation (stdlib §4.5) make the moved-from slot
+// OwningArray reference implementation (stdlib §4.5) make the moved-from slot
 // observable as a NULL slot: "the compiler generates the default Dispose which
 // disposes _storage's contents (every non-null slot's owned T)" and "the old
 // buffer's destructor sees only null slots and does no further work."
@@ -60,7 +60,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_move_slot_disposes_once) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterX := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  do "
         "    using var x := move a[0]; "
@@ -105,7 +105,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_move_slot_other_elements_dispose_o
     BEZEL_EXPECT_EQ(runResource(
         "var afterX := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
@@ -124,7 +124,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_move_middle_slot) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterX := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
@@ -148,7 +148,7 @@ BEZEL_TEST(move_coll_slot_28_11, owned_array_move_then_restore_slot) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterX := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  do "
@@ -169,7 +169,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_moved_element_value_preserved) {
         "module M; "
         "class R public V: int := 0; end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Get(0).V := 42; "               // mutate the stored element
         "  using var x := move a[0]; "
@@ -186,7 +186,7 @@ BEZEL_TEST(move_coll_slot_28_11, borrowing_indexer_get_does_not_take_ownership) 
     BEZEL_EXPECT_EQ(runResource(
         "var v := 0; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  v := a.Get(0).GetHashCode(); "    // touch a[0] as a borrow
@@ -208,7 +208,7 @@ BEZEL_TEST(move_coll_slot_28_11, borrowing_indexer_expr_read_keeps_ownership) {
         "class C public static method Main(): int "
         "  var v := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R())); "
         "    a.Add(move (new R())); "
         "    v := a[0].V; "                   // borrow read, slot retained
@@ -217,7 +217,7 @@ BEZEL_TEST(move_coll_slot_28_11, borrowing_indexer_expr_read_keeps_ownership) {
         "end Main; end C;"), 72);
 }
 
-// §28.11 / §4.9: the same slot-take semantics for an OwnedDictionary value.
+// §28.11 / §4.9: the same slot-take semantics for an OwningDictionary value.
 // `move d[k]` transfers the value to x; the dictionary's Dispose must skip the
 // moved-from (now null) value. x disposes it; the dict disposes the other entry.
 // Total 2, each once. Encoded <afterX>*10 + <total> = 12. Before the fix:
@@ -226,7 +226,7 @@ BEZEL_TEST(move_coll_slot_28_11, owned_dict_move_slot_disposes_once) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterX := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d[\"a\"] := move (new R()); "
         "  d[\"b\"] := move (new R()); "
         "  do "

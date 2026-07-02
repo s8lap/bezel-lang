@@ -1,4 +1,4 @@
-// Codegen — Dictionary<K,V>.Clear() and OwnedDictionary<K,V>.Clear()
+// Codegen — Dictionary<K,V>.Clear() and OwningDictionary<K,V>.Clear()
 // (stdlib §4.8 / §4.9).
 //
 // stdlib §4.8 (`Dictionary<K, V>`): "public method Clear();". The borrowing
@@ -8,7 +8,7 @@
 // an aggregate too wide for the inttoptr slot); Clear must reclaim each surviving
 // box (value storage, nothing to dispose inside — a record is a value type).
 //
-// stdlib §4.9 (`OwnedDictionary<K, V> where V: class`): "public method Clear();
+// stdlib §4.9 (`OwningDictionary<K, V> where V: class`): "public method Clear();
 // // disposes every value". The owning dictionary owns its values; Clear
 // disposes every surviving value EXACTLY ONCE. The table stays allocated and
 // usable afterward (Count is 0), so a value re-added after Clear is disposed once
@@ -210,7 +210,7 @@ BEZEL_TEST(dict_clear_4_8, record_value_boxes_reclaimed_on_clear) {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedDictionary<K,V>.Clear() (§4.9) — disposes every value exactly once.
+// OwningDictionary<K,V>.Clear() (§4.9) — disposes every value exactly once.
 // ---------------------------------------------------------------------------
 
 // §4.9: "Clear(); // disposes every value". Three owned values; Clear disposes
@@ -221,7 +221,7 @@ BEZEL_TEST(owned_dict_clear_4_9, str_key_clear_disposes_every_value_once) {
     expectValueAndLeakFree(prog(
         "var afterClear := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R())); "
         "  d.Add(\"b\", move (new R())); "
         "  d.Add(\"c\", move (new R())); "
@@ -238,7 +238,7 @@ BEZEL_TEST(owned_dict_clear_4_9, generic_key_clear_disposes_every_value_once) {
     expectValueAndLeakFree(prog(
         "var afterClear := -1; "
         "do "
-        "  using var d := new OwnedDictionary<int, R>(); "
+        "  using var d := new OwningDictionary<int, R>(); "
         "  d.Add(1, move (new R())); "
         "  d.Add(2, move (new R())); "
         "  d.Clear(); "
@@ -256,7 +256,7 @@ BEZEL_TEST(owned_dict_clear_4_9, reusable_after_clear_still_owns_values) {
     expectValueAndLeakFree(prog(
         "var afterClear := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R())); "
         "  d.Add(\"b\", move (new R())); "
         "  d.Clear(); "
@@ -266,12 +266,12 @@ BEZEL_TEST(owned_dict_clear_4_9, reusable_after_clear_still_owns_values) {
         "return afterClear * 10 + R._n;"), 23);
 }
 
-// §4.9: Clear on an empty OwnedDictionary is a no-op — no destructor runs, the
+// §4.9: Clear on an empty OwningDictionary is a no-op — no destructor runs, the
 // scope-end Dispose finds an empty table → R._n stays 0.
 BEZEL_TEST(owned_dict_clear_4_9, clear_on_empty_disposes_nothing) {
     expectValueAndLeakFree(prog(
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Clear(); "
         "end; "
         "return R._n;"), 0);

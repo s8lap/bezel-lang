@@ -1,4 +1,4 @@
-public class OwnedBuffer<T>: IEnumerable<T?>            // class T only
+public class OwningBuffer<T>: IEnumerable<T?>            // class T only
   public constructor(length: int);                       // all slots null
   public constructor(length: int, init: (int) -> owned T);
 
@@ -22,4 +22,4 @@ public class OwnedBuffer<T>: IEnumerable<T?>            // class T only
   public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
-end OwnedBuffer;
+end OwningBuffer;

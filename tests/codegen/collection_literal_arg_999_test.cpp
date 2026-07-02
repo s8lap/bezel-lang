@@ -14,7 +14,7 @@
 // disposes the temp per the parameter's mode (§28.3):
 //   - BORROW parameter (`a: Array<int>`): the temp is an owned local disposed
 //     exactly once at scope exit, on the normal AND unwind paths.
-//   - `owned` parameter (`owned a: OwnedArray<int>`): ownership transfers into
+//   - `owned` parameter (`owned a: OwningArray<int>`): ownership transfers into
 //     the callee — the caller registers NO disposal (no double-free).
 //
 // These tests verify (1) ordinary-method value correctness (Count / for-in sum /
@@ -220,17 +220,17 @@ const char* kBorrowDict =
     "  end Main; "
     "end C;";
 
-// §15.4 / §28.3: an `owned OwnedArray<N>` parameter. Ownership TRANSFERS from
+// §15.4 / §28.3: an `owned OwningArray<N>` parameter. Ownership TRANSFERS from
 // the materialized temp into the callee (no caller disposal — no double-free).
 // The callee discharges it via `using var`. Count must be 3.
-// (Migrated from OwnedArray<int> → OwnedArray<N> per stdlib §4.2/#1327.)
+// (Migrated from OwningArray<int> → OwningArray<N> per stdlib §4.2/#1327.)
 const char* kOwnedArrayTransfer =
     "module M; "
     "class N public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; end N; "
     "class C "
-    "  public static method Take(owned a: OwnedArray<N>): int "
-    "    using var local: OwnedArray<N> := a; return local.Count; "
+    "  public static method Take(owned a: OwningArray<N>): int "
+    "    using var local: OwningArray<N> := a; return local.Count; "
     "  end Take; "
     "  public static method Main(): int "
     "    return C.Take([new N(1), new N(2), new N(3)]); "
@@ -278,14 +278,14 @@ const char* kBorrowStringLoopLeakFree =
 
 // §15.4 / §28.3: owned-arg literal transfer looped — the callee disposes the
 // transferred collection exactly once; the caller does NOT (no double-free).
-// (Migrated from OwnedArray<int> → OwnedArray<N> per stdlib §4.2/#1327.)
+// (Migrated from OwningArray<int> → OwningArray<N> per stdlib §4.2/#1327.)
 const char* kOwnedLoopLeakFree =
     "module M; "
     "class N public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; end N; "
     "class C "
-    "  public static method Take(owned a: OwnedArray<N>): int "
-    "    using var local: OwnedArray<N> := a; return local.Count; "
+    "  public static method Take(owned a: OwningArray<N>): int "
+    "    using var local: OwningArray<N> := a; return local.Count; "
     "  end Take; "
     "  public static method Main(): int "
     "    var i: int := 0; var t: int := 0; "

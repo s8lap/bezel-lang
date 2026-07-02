@@ -1,7 +1,7 @@
 // Spec-derived tests for fix #746 (R41 clusters E and G) — four missing
 // diagnostics that were silently accepted (FALSE_ACCEPT) or reached codegen
 // (IR_FAIL):
-//   E: range slicing on an inline array `[N]T` (§15.6) / on `OwnedArray<T>`
+//   E: range slicing on an inline array `[N]T` (§15.6) / on `OwningArray<T>`
 //      (§15.6) must be rejected.
 //   G: a `try` with neither catch nor finally (§31.2) / an empty interpolation
 //      hole `{}` (§18.5) must be rejected.
@@ -42,17 +42,17 @@ BEZEL_TEST(r41_diagnostics_746, inline_array_range_slice_rejected) {
     BEZEL_EXPECT_TRUE(hasMsg(r, "inline array"));
 }
 
-// §15.6 (E): an OwnedArray<T> range slice is rejected.
+// §15.6 (E): an OwningArray<T> range slice is rejected.
 BEZEL_TEST(r41_diagnostics_746, owned_array_range_slice_rejected) {
     auto r = parseSemaAll(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var oa := new OwnedArray<int>(); "
+        "  using var oa := new OwningArray<int>(); "
         "  oa.Add(10); "
         "  using var s := oa[0..1]; "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(hasMsg(r, "OwnedArray"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "OwningArray"));
 }
 
 // §15.6: a plain (non-range) index on those types is NOT rejected.

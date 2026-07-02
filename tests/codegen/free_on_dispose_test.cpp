@@ -214,7 +214,7 @@ const char* kExceptionPath =
     "  end Main; "
     "end R;";
 
-// stdlib §4.5 + §28: an OwnedArray<R> disposes each owned class element exactly
+// stdlib §4.5 + §28: an OwningArray<R> disposes each owned class element exactly
 // once at scope end and reclaims each element's block (the owning-collection
 // element path, distinct from the dynamic-dispatch path).
 const char* kOwnedArray =
@@ -223,7 +223,7 @@ const char* kOwnedArray =
     "  destructor _n := _n + 1; end destructor; "
     "end R; "
     "class C public static method Main(): int "
-    "  do using var a := new OwnedArray<R>(); "
+    "  do using var a := new OwningArray<R>(); "
     "     a.Add(move (new R())); a.Add(move (new R())); a.Add(move (new R())); "
     "  end; return R._n; "
     "end Main; end C;";

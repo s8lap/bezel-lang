@@ -1,5 +1,5 @@
 // Codegen — record/dict-backed Set: the set-algebra and LINQ cases #351/#381
-// deferred (issue #389). stdlib §4.10 Set<T>/OwnedSet<T>, §5 LINQ.
+// deferred (issue #389). stdlib §4.10 Set<T>/OwningSet<T>, §5 LINQ.
 //
 // What #351 already landed (collection_keys_test.cpp): record-Set Clear, and
 // UnionWith/ExceptWith/IsSubsetOf/IsSupersetOf when `other` is a same-typed
@@ -11,7 +11,7 @@
 //      remove from self every key not in that snapshot — no mutate-while-iterate
 //      hazard). The dict-backed Set holds value-semantic elements (records,
 //      primitives, enums, strings — genericBackingType), never disposable class
-//      instances (OwnedSet<T> where T: class is array-backed and not wired
+//      instances (OwningSet<T> where T: class is array-backed and not wired
 //      here), so there is no element disposal on the dict-backed path.
 //
 //   2. Set-algebra where `other` is a NON-Set IEnumerable<T> (e.g. Array<T>):

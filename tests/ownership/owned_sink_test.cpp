@@ -14,7 +14,7 @@
 //
 // The under-enforcement this file pins down: the ownership pass admitted
 // a *borrow* where an `owned` argument was required (e.g.
-// `OwnedArray<T>.Add(owned item)`, the owning-collection `set(owned)`
+// `OwningArray<T>.Add(owned item)`, the owning-collection `set(owned)`
 // indexer). A borrow handed to an owned sink would be disposed by the
 // sink AND by its real owner — a double-dispose. The POSITIVE cases below
 // must stay ACCEPTED (no over-rejection of valid `move`/`new`/owned-call
@@ -243,9 +243,9 @@ BEZEL_TEST(owned_sink, new_ctor_borrowed_param_rejected) {
 
 // ---- Built-in owning-collection sinks (stdlib §4.5) ----------------------
 //
-// The built-in `OwnedArray<T>` has no AST declaration the analysis can read,
+// The built-in `OwningArray<T>` has no AST declaration the analysis can read,
 // so its owned-taking methods are recognized by receiver-type + method name.
-// These pin the issue's headline case (`OwnedArray<T>.Add(owned item)`).
+// These pin the issue's headline case (`OwningArray<T>.Add(owned item)`).
 
 namespace {
 // Wrap a method body in a class with a disposable element type `R`.
@@ -254,50 +254,50 @@ std::string bi(const std::string& method) {
 }
 } // namespace
 
-// stdlib §4.5: `OwnedArray<T>.Add` takes ownership; `move x` of an owned local
+// stdlib §4.5: `OwningArray<T>.Add` takes ownership; `move x` of an owned local
 // is a legal transfer. ACCEPTED.
 BEZEL_TEST(owned_sink, builtin_array_add_move_local_accepted) {
     auto r = parseAndCheckOwnership(bi(
-        "public method M(a: OwnedArray<R>) "
+        "public method M(a: OwningArray<R>) "
         "  var x := new R(); "
         "  a.Add(move x); "
         "end M;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// stdlib §4.5: `OwnedArray<T>.Add(new R())` transfers fresh ownership in.
+// stdlib §4.5: `OwningArray<T>.Add(new R())` transfers fresh ownership in.
 // ACCEPTED.
 BEZEL_TEST(owned_sink, builtin_array_add_new_accepted) {
     auto r = parseAndCheckOwnership(bi(
-        "public method M(a: OwnedArray<R>) "
+        "public method M(a: OwningArray<R>) "
         "  a.Add(new R()); "
         "end M;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// stdlib §4.5: a borrowed parameter handed to `OwnedArray<T>.Add(owned item)`
+// stdlib §4.5: a borrowed parameter handed to `OwningArray<T>.Add(owned item)`
 // is a borrow into an owned sink — double-dispose hazard. REJECTED (§28.8).
 BEZEL_TEST(owned_sink, builtin_array_add_borrow_rejected) {
     auto r = parseAndCheckOwnership(bi(
-        "public method M(a: OwnedArray<R>, b: R) "
+        "public method M(a: OwningArray<R>, b: R) "
         "  a.Add(b); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// stdlib §4.9: `OwnedDictionary<K, V>.Add(key, owned value)` — the owned
+// stdlib §4.9: `OwningDictionary<K, V>.Add(key, owned value)` — the owned
 // argument is the *second* one. A borrow there is REJECTED; the key is an
 // ordinary value and is unaffected.
 BEZEL_TEST(owned_sink, builtin_dict_add_borrow_value_rejected) {
     auto r = parseAndCheckOwnership(bi(
-        "public method M(d: OwnedDictionary<string, R>, b: R) "
+        "public method M(d: OwningDictionary<string, R>, b: R) "
         "  d.Add(\"k\", b); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // stdlib §6.7 / §30.10 (#1121): Task.WhenAllOwned<T>(owned tasks:
-// OwnedArray<OwnedTask<T>>) is an owned sink — passing a bare owned local
+// OwningArray<OwningTask<T>>) is an owned sink — passing a bare owned local
 // `tasks` is an implicit §28.8 transfer that discharges its disposal
 // obligation (the documented `await Task.WhenAllOwned(tasks)` form). Before the
 // fix the intrinsic had no owned-sink entry, so `tasks` was reported as "dropped
@@ -307,9 +307,9 @@ BEZEL_TEST(owned_sink, task_whenallowned_consumes_owned_array_1121) {
         "module M; import System.Collections.Generic; "
         "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
         "class C "
-        "  public static async method Make(v: int): OwnedTask<Res> return new Res(v); end Make; "
-        "  public static async method LoadAll(): OwnedTask<OwnedArray<Res>> "
-        "    var tasks := new OwnedArray<OwnedTask<Res>>(); "
+        "  public static async method Make(v: int): OwningTask<Res> return new Res(v); end Make; "
+        "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
+        "    var tasks := new OwningArray<OwningTask<Res>>(); "
         "    tasks.Add(Make(3)); "
         "    using var wt := Task.WhenAllOwned<Res>(tasks); "
         "    return await wt; "
@@ -326,9 +326,9 @@ BEZEL_TEST(owned_sink, task_whenallowned_explicit_move_accepted_1121) {
         "module M; import System.Collections.Generic; "
         "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
         "class C "
-        "  public static async method Make(v: int): OwnedTask<Res> return new Res(v); end Make; "
-        "  public static async method LoadAll(): OwnedTask<OwnedArray<Res>> "
-        "    var tasks := new OwnedArray<OwnedTask<Res>>(); "
+        "  public static async method Make(v: int): OwningTask<Res> return new Res(v); end Make; "
+        "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
+        "    var tasks := new OwningArray<OwningTask<Res>>(); "
         "    tasks.Add(Make(3)); "
         "    using var wt := Task.WhenAllOwned<Res>(move tasks); "
         "    return await wt; "

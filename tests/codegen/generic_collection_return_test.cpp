@@ -21,7 +21,7 @@
 //        (mirroring the string-interpolation path) and converts the integer.
 //
 // These are spec-valid programs: §14.1 generic methods, §28.8 owned-return /
-// move, §28.3 using-var disposal, stdlib §4.4 Array<T> / §4.5 OwnedArray<T>.
+// move, §28.3 using-var disposal, stdlib §4.4 Array<T> / §4.5 OwningArray<T>.
 // Each test ran (segfault / compiler abort) before the fix and produces the
 // spec-stated value after.
 
@@ -100,7 +100,7 @@ BEZEL_TEST(generic_coll_return_420, array_string_using_var_disposes_clean) {
         "end Main; end C;"), 2);
 }
 
-// [00] §28.8 / stdlib §4.5: an `owned OwnedArray<T>` (T: class) returned from a
+// [00] §28.8 / stdlib §4.5: an `owned OwningArray<T>` (T: class) returned from a
 // generic method. The using-var scope-end disposal must cascade into the owned
 // element exactly once (the element destructor bumps R._n). Before the fix the
 // disposal loaded a corrupt pointer and crashed; after, R._n == 1.
@@ -112,16 +112,16 @@ BEZEL_TEST(generic_coll_return_420, owned_array_generic_return_disposes_element)
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class Util "
-        "  public static method WrapOne<T>(owned item: T): owned OwnedArray<T> "
+        "  public static method WrapOne<T>(owned item: T): owned OwningArray<T> "
         "      where T: class "
-        "    var a := new OwnedArray<T>(); "
+        "    var a := new OwningArray<T>(); "
         "    a.Add(move item); "
         "    return move a; "
         "  end WrapOne; "
         "end Util; "
         "class C public static method Main(): int "
         "  do "
-        "    using var a: OwnedArray<R> := Util.WrapOne(move (new R())); "
+        "    using var a: OwningArray<R> := Util.WrapOne(move (new R())); "
         "  end; "
         "  return R._n; "
         "end Main; end C;"), 1);

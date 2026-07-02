@@ -1,4 +1,4 @@
-public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
   // class T
 
   public property [i: int]: T?

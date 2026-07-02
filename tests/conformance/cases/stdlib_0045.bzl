@@ -1,4 +1,4 @@
-public class OwnedDictionary<K, V>: IDisposable where V: class
+public class OwningDictionary<K, V>: IDisposable where V: class
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<K>);
@@ -23,12 +23,12 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
   // Drain
   public method PopValue(key: K): owned V;     // raises if not present
   public method TryPopValue(key: K, out owned value: V): bool;
-  public method Drain(): OwnedEnumerable<DrainedEntry<K, V>>;
+  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
                                                // iteration drains the dictionary;
                                                //   each yielded entry owns its Value
 
   public method Clear();                        // disposes every value
-end OwnedDictionary;
+end OwningDictionary;
 
 public class DrainedEntry<K, V>: IDisposable where V: class
   public constructor(key: K, owned value: V);  // ownership of value transfers in
@@ -38,7 +38,7 @@ public class DrainedEntry<K, V>: IDisposable where V: class
 end DrainedEntry;
 
 // Borrowing key-iteration, one value taken at a time:
-public method DrainAndProcess(dict: OwnedDictionary<string, Connection>)
+public method DrainAndProcess(dict: OwningDictionary<string, Connection>)
   using var keys := new Array<string>(dict.Count);
   for var key in dict.Keys do
     keys.Add(key);
@@ -51,7 +51,7 @@ public method DrainAndProcess(dict: OwnedDictionary<string, Connection>)
 end DrainAndProcess;
 
 // Single-call drain — each entry owns its value:
-public method DrainAndProcess2(dict: OwnedDictionary<string, Connection>)
+public method DrainAndProcess2(dict: OwningDictionary<string, Connection>)
   for var entry in dict.Drain() do
     using var e := entry;                      // entry is owned; bind to discharge
     Process(e.Key, e.Value);                   // e.Value is the owned Connection

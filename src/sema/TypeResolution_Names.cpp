@@ -4,6 +4,43 @@
 
 namespace bezel::sema {
 
+// v0.168 (#1372): the owning `Owned*` family was renamed `Owning*` (and the
+// owning interfaces gained the standard `I` prefix; `GetOwnedEnumerator`
+// followed as `GetOwningEnumerator`). When an OLD family name fails to resolve,
+// point the user at the new spelling rather than a bare "unresolved type name".
+// See rationale §3.9 / the v0.168 changelog. The map is identical to the docs
+// sweep / scripts/migrate_owning_rename.py.
+static std::string owningRenameHint(std::string_view name) {
+    struct Entry { std::string_view oldName; std::string_view newName; };
+    static const Entry kMap[] = {
+        {"GetOwnedAsyncEnumerator", "GetOwningAsyncEnumerator"},
+        {"GetOwnedEnumerator", "GetOwningEnumerator"},
+        {"IOwnedList", "IOwningList"},
+        {"IOwnedCollection", "IOwningCollection"},
+        {"OwnedAsyncEnumerable", "IOwningAsyncEnumerable"},
+        {"OwnedAsyncEnumerator", "IOwningAsyncEnumerator"},
+        {"OwnedEnumerable", "IOwningEnumerable"},
+        {"OwnedEnumerator", "IOwningEnumerator"},
+        {"OwnedTaskCompletionSource", "OwningTaskCompletionSource"},
+        {"OwnedTask", "OwningTask"},
+        {"OwnedArray", "OwningArray"},
+        {"OwnedBuffer", "OwningBuffer"},
+        {"OwnedDictionary", "OwningDictionary"},
+        {"OwnedSet", "OwningSet"},
+        {"OwnedStack", "OwningStack"},
+        {"OwnedQueue", "OwningQueue"},
+        {"OwnedLinkedList", "OwningLinkedList"},
+    };
+    for (const auto& e : kMap) {
+        if (name == e.oldName) {
+            return std::string("`") + std::string(e.oldName) +
+                   "` was renamed `" + std::string(e.newName) +
+                   "` in v0.168 (#1372)";
+        }
+    }
+    return std::string();
+}
+
 int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "Type" || n == "IDisposable" || n == "IAsyncDisposable" ||
         n == "Subscription" || n == "CancellationToken" ||
@@ -76,16 +113,16 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // distinction between the two is resolved at method-call time via
     // the presence or absence of a generic argument.
     if (n == "TaskCompletionSource") return kBuiltinTaskLike;
-    // §6.6 / issue #974: OwnedTaskCompletionSource<T> — always arity 1.
-    if (n == "OwnedTaskCompletionSource") return 1;
-    if (n == "Array" || n == "OwnedArray" || n == "OwnedTask" ||
+    // §6.6 / issue #974: OwningTaskCompletionSource<T> — always arity 1.
+    if (n == "OwningTaskCompletionSource") return 1;
+    if (n == "Array" || n == "OwningArray" || n == "OwningTask" ||
         n == "IEnumerable" || n == "IEnumerator" ||
         n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
-        n == "OwnedEnumerable" || n == "OwnedEnumerator" ||
-        n == "OwnedAsyncEnumerable" || n == "OwnedAsyncEnumerator" ||
+        n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
+        n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
         n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
         n == "ICollection" || n == "IList" ||
-        n == "IOwnedCollection" || n == "IOwnedList" ||
+        n == "IOwningCollection" || n == "IOwningList" ||
         n == "IEvent" || n == "IAsyncEvent" ||
         // §2.8 / §2.9: auto-imported generic interfaces (stdlib §2.8–§2.9).
         // Registered here so they resolve as base types and field/param types
@@ -94,22 +131,22 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // (Equals(a,b):bool, GetHashCode(value):int); arity 1.
         n == "IComparable" || n == "IEquatable" || n == "IEqualityComparer" ||
         // §3 stdlib collection types (arity 1):
-        n == "Stack" || n == "OwnedStack" ||
-        n == "Queue" || n == "OwnedQueue" ||
-        n == "Set" || n == "OwnedSet" ||
-        n == "LinkedList" || n == "OwnedLinkedList" ||
+        n == "Stack" || n == "OwningStack" ||
+        n == "Queue" || n == "OwningQueue" ||
+        n == "Set" || n == "OwningSet" ||
+        n == "LinkedList" || n == "OwningLinkedList" ||
         // §28.13 / stdlib §2.16: Shared<T> and Weak<T> (arity 1).
         n == "Shared" || n == "Weak" ||
         // §4.6: LinkedListNode<T> is the node handle returned by Add*/Find; it
         // carries a single generic element-type parameter and is resolved
         // without a user TypeDecl (same pattern as the collection types above).
         n == "LinkedListNode" ||
-        // §4.14 / issue #550: OwnedBuffer<T> (e.g. OwnedBuffer<byte> returned
+        // §4.14 / issue #550: OwningBuffer<T> (e.g. OwningBuffer<byte> returned
         // by BinarySerializer.ToBytes() per stdlib §2.15).
-        n == "OwnedBuffer" ||
+        n == "OwningBuffer" ||
         // §4.14-§4.15 / issue #959: the concrete span VALUE types — borrowing
         // spans over Array<T> (ArraySpan/ReadOnlyArraySpan, §4.15) and owning
-        // spans over OwnedBuffer<T> (Span/ReadOnlySpan, §4.14). Each carries a
+        // spans over OwningBuffer<T> (Span/ReadOnlySpan, §4.14). Each carries a
         // single element-type parameter and resolves to a Named TypeRef with a
         // null declaration (no user TypeDecl); codegen lowers them to the shared
         // bz.arrayspan struct {ptr,i32,i32} (lowerTypeRef / isSpanLikeTypeName).
@@ -126,7 +163,7 @@ int Resolver::builtinTypeArity(std::string_view n) {
         return 1;
     }
     // §3 stdlib two-parameter collection types (arity 2):
-    if (n == "Dictionary" || n == "OwnedDictionary") return 2;
+    if (n == "Dictionary" || n == "OwningDictionary") return 2;
     // §4 stdlib sorted collection types (stdlib §4.12/§4.13, v0.165 / #1354):
     // SortedDictionary<K,V> (arity 2) and SortedSet<T> (arity 1).  Both conform
     // to IReadOnlyCollection per the §4 update; registering them lets
@@ -166,7 +203,7 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // §3.3 / issue #883: ReadOnlyStringSpan — a string-backed read-only span
     // (System.Text, auto-imported). Non-generic record viewing a contiguous
     // range of a `string` (Source: string, Start: int, Length: int). Distinct
-    // from ReadOnlySpan<char> (which views an OwnedBuffer<char>) because string
+    // from ReadOnlySpan<char> (which views an OwningBuffer<char>) because string
     // storage is adaptive (1/2/4 bytes per code point — §4.6). Zero-arity.
     if (n == "ReadOnlyStringSpan") return 0;
     // §9.4 / issue #654: Boolean — builtin record aliased by `bool`; zero-arity.
@@ -820,14 +857,14 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // interface wrappers are admitted (the `?` does not change the
                 // underlying type's class-ness).  The owned slot is `T` (slot 0)
                 // for the list/set/stack/queue families and `V` (slot 1, the
-                // value) for `OwnedDictionary<K, V>` (the key K is value-like
+                // value) for `OwningDictionary<K, V>` (the key K is value-like
                 // by design, §28.11).
                 std::size_t ownedSlot = static_cast<std::size_t>(-1);
-                if (first == "OwnedArray" || first == "OwnedSet" ||
-                    first == "OwnedStack" || first == "OwnedQueue" ||
-                    first == "OwnedLinkedList")
+                if (first == "OwningArray" || first == "OwningSet" ||
+                    first == "OwningStack" || first == "OwningQueue" ||
+                    first == "OwningLinkedList")
                     ownedSlot = 0;
-                else if (first == "OwnedDictionary")
+                else if (first == "OwningDictionary")
                     ownedSlot = 1;
                 if (ownedSlot != static_cast<std::size_t>(-1) &&
                     ownedSlot < ref.genericArgs.size()) {
@@ -897,21 +934,24 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             "\xE2\x80\x94 " + badDesc + " has no disposal "
                             "obligation and cannot be owned in an owning "
                             "collection. Use `" +
-                            std::string(first.substr(5)) +
+                            // v0.168 (#1372): strip the 6-char `Owning` prefix
+                            // (was 5-char `Owned`) to name the borrowing
+                            // counterpart (e.g. OwningArray → Array).
+                            std::string(first.substr(6)) +
                             "<\xE2\x80\xA6>` for value elements.");
                     }
                 }
                 // §3.6 / §8.3 (v0.158, #1338): record a hash-container key /
-                // element instantiation (`Dictionary`/`OwnedDictionary` key K,
-                // `Set`/`OwnedSet` element T) so checkHashContainerKeys can
+                // element instantiation (`Dictionary`/`OwningDictionary` key K,
+                // `Set`/`OwningSet` element T) so checkHashContainerKeys can
                 // verify — after all member types are resolved — that it is
                 // equality-bearing. Deferred (not checked inline) because a
                 // record key's auto-equality-bearing property depends on the
                 // record's own members, which may resolve after this site.
                 std::string_view hashRole;
-                if (first == "Set" || first == "OwnedSet")
+                if (first == "Set" || first == "OwningSet")
                     hashRole = "element";
-                else if (first == "Dictionary" || first == "OwnedDictionary")
+                else if (first == "Dictionary" || first == "OwningDictionary")
                     hashRole = "key";
                 if (!hashRole.empty() && !ref.genericArgs.empty())
                     hashContainerSites_.push_back(
@@ -1095,10 +1135,13 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 return;
             }
         }
-        ctx_.diagnostics().report(
-            Severity::Error, t.span.begin,
-            std::string("unresolved type name `") +
-            std::string(first) + "`");
+        {
+            std::string msg = std::string("unresolved type name `") +
+                              std::string(first) + "`";
+            std::string hint = owningRenameHint(first);  // v0.168 (#1372)
+            if (!hint.empty()) msg += "; " + hint;
+            ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+        }
         ref.kind = TypeRef::Kind::Error;
         return;
     }

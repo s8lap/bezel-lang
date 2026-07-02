@@ -546,9 +546,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             }
             if (!consumed) {
-                // §30.5 / §30.4 (#834): an `await <bound owned `OwnedTask`
+                // §30.5 / §30.4 (#834): an `await <bound owned `OwningTask`
                 // local>` ARGUMENT consumes its operand task local — an
-                // `OwnedTask<T>` is single-consumer and the await disposes it
+                // `OwningTask<T>` is single-consumer and the await disposes it
                 // (the implicit task-disposal IS the discharge). This is the
                 // §29.2 `for var task in src.Drain() do results.Add(await task)
                 // end` drain-and-await pattern (stdlib §2.13 `WhenAllOwned<T>`):
@@ -557,7 +557,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // recording the consume here the await arg only reached
                 // checkRead (which does not consume), so `task` was wrongly
                 // reported as dropped without disposal at the loop's end. Gated
-                // on the operand's STATIC TYPE being `OwnedTask` rather than on
+                // on the operand's STATIC TYPE being `OwningTask` rather than on
                 // awaitTaskKind == PatternB, which cannot prove the result type
                 // argument T is a concrete class inside a generic body; the
                 // operand consume does not depend on the result kind.
@@ -985,7 +985,7 @@ bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
     // decides it), but if it is still untyped here, resolve the indexer's
     // declared return type directly and gate on isBorrowableType: a value-typed
     // element (int/record/enum/…) is a copy → not a borrow; a CLASS/borrow-typed
-    // element (e.g. an OwnedArray<R> slot, §28.3) stays a borrow and is still
+    // element (e.g. an OwningArray<R> slot, §28.3) stays a borrow and is still
     // rejected. Built-in collection indexers carry a null `declaration`, so they
     // do not reach this user-type branch — their element typing is handled in
     // sema's IndexExpr path and consumed by the typed branch above.
@@ -2544,17 +2544,17 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
         if (tt->astNode && tt->astNode->name &&
             !tt->astNode->name->parts.empty()) {
             std::string_view cn = tt->astNode->name->parts[0];
-            if (cn != "OwnedArray" && cn != "OwnedDictionary" &&
-                cn != "OwnedBuffer")
+            if (cn != "OwningArray" && cn != "OwningDictionary" &&
+                cn != "OwningBuffer")
                 return false;
             // per §28.11 / §4.5 / §4.14 (#1209): the indexer setter takes
             // ownership only when the element (or dictionary value) type is a
             // class or interface — value-typed elements (primitive, record,
             // enum) are COPIED into the slot, so the assignment is a copy and
             // does NOT consume the RHS local (no owned-sink obligation).
-            // For OwnedDictionary<K,V> the stored value is genericArgs[1];
-            // for OwnedArray<T>/OwnedBuffer<T> the element is genericArgs[0].
-            const std::size_t elemIdx = (cn == "OwnedDictionary") ? 1 : 0;
+            // For OwningDictionary<K,V> the stored value is genericArgs[1];
+            // for OwningArray<T>/OwningBuffer<T> the element is genericArgs[0].
+            const std::size_t elemIdx = (cn == "OwningDictionary") ? 1 : 0;
             if (tt->genericArgs.size() > elemIdx && tt->genericArgs[elemIdx]) {
                 const sema::TypeRef* elemT = tt->genericArgs[elemIdx];
                 return elemT->kind == sema::TypeRef::Kind::Named &&
@@ -2604,7 +2604,7 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         if (tid->name == "Domain" && ma->member == "Spawn")
             return argPos >= 1;
         // stdlib §6.7 / §30.10 (#1121): Task.WhenAllOwned<T>(owned tasks:
-        // OwnedArray<OwnedTask<T>>) takes ownership of its argument array (and
+        // OwningArray<OwningTask<T>>) takes ownership of its argument array (and
         // its tasks) — the documented `await Task.WhenAllOwned(tasks)` form. The
         // owned-arg position (0) is an owned sink, so passing a bare owned local
         // discharges its disposal obligation (an implicit §28.8 transfer, exactly
@@ -2645,17 +2645,17 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         return false;
     }
     const bool isOwning =
-        cn == "OwnedArray" || cn == "OwnedDictionary" ||
-        cn == "OwnedSet" || cn == "OwnedStack" || cn == "OwnedQueue" ||
-        cn == "OwnedLinkedList";
+        cn == "OwningArray" || cn == "OwningDictionary" ||
+        cn == "OwningSet" || cn == "OwningStack" || cn == "OwningQueue" ||
+        cn == "OwningLinkedList";
     if (!isOwning) return false;
     const std::string_view m = ma->member;
     // The owned argument's position per stdlib §4.5 / §4.7 / §4.9.
     if ((m == "Add" || m == "AddFirst" || m == "AddLast" || m == "Push" ||
          m == "Enqueue" || m == "AddRange") &&
-        cn != "OwnedDictionary")
+        cn != "OwningDictionary")
         return argPos == 0;                       // owned item is arg 0
-    if (m == "Add" && cn == "OwnedDictionary")
+    if (m == "Add" && cn == "OwningDictionary")
         return argPos == 1;                       // Add(key, owned value)
     if (m == "Insert")
         return argPos == 1;                       // Insert(index, owned item)
@@ -2685,14 +2685,14 @@ bool MethodOwnership::builtinOutOwnedArg(const ast::Expr* callee,
     const std::string_view m = ma->member;
     // Owning collections — `where T: class`, so the moved-out element is
     // always a disposable reference type (stdlib §4.5 / §4.7 / §4.9).
-    if (cn == "OwnedStack"  && m == "TryPop")      return argPos == 0;
-    if (cn == "OwnedQueue"  && m == "TryDequeue")  return argPos == 0;
-    if (cn == "OwnedLinkedList" &&
+    if (cn == "OwningStack"  && m == "TryPop")      return argPos == 0;
+    if (cn == "OwningQueue"  && m == "TryDequeue")  return argPos == 0;
+    if (cn == "OwningLinkedList" &&
         (m == "TryPopFirst" || m == "TryPopLast")) return argPos == 0;
-    // OwnedSet<T>.TryTake(query, out owned removed: T?) — out-owned at arg 1.
-    if (cn == "OwnedSet"    && m == "TryTake")     return argPos == 1;
-    // OwnedDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
-    if (cn == "OwnedDictionary" && m == "TryPopValue") return argPos == 1;
+    // OwningSet<T>.TryTake(query, out owned removed: T?) — out-owned at arg 1.
+    if (cn == "OwningSet"    && m == "TryTake")     return argPos == 1;
+    // OwningDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
+    if (cn == "OwningDictionary" && m == "TryPopValue") return argPos == 1;
     // Weak<T>.TryUpgrade(out owned s: Shared<T>?) — arg 0 (stdlib §2.16). The
     // accepted call-site form is `out using var s`, which declares a fresh
     // local the dataflow does not track; recognised here for completeness.
@@ -3045,11 +3045,11 @@ bool MethodOwnership::fieldTypeIsBorrowCarrying(const sema::TypeRef* ft) const {
             if (ft->astNode && ft->astNode->name &&
                 !ft->astNode->name->parts.empty()) {
                 std::string_view h = ft->astNode->name->parts.back();
-                if (h == "Array" || h == "OwnedArray" || h == "Dictionary" ||
-                    h == "OwnedDictionary" || h == "List" || h == "LinkedList" ||
-                    h == "OwnedLinkedList" || h == "Set" || h == "OwnedSet" ||
-                    h == "Stack" || h == "OwnedStack" || h == "Queue" ||
-                    h == "OwnedQueue" || h == "OwnedBuffer")
+                if (h == "Array" || h == "OwningArray" || h == "Dictionary" ||
+                    h == "OwningDictionary" || h == "List" || h == "LinkedList" ||
+                    h == "OwningLinkedList" || h == "Set" || h == "OwningSet" ||
+                    h == "Stack" || h == "OwningStack" || h == "Queue" ||
+                    h == "OwningQueue" || h == "OwningBuffer")
                     return true;
             }
             return false;
@@ -3192,7 +3192,7 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
 //   suspend-local lives in the heap-allocated state-machine frame and must be
 //   disposed on EVERY completion path: normal return, fault/exception,
 //   abandonment (the Task dropped without being awaited to completion — §30.5
-//   "Disposing an unconsumed `OwnedTask<T>`"), and cancellation (§30.8,
+//   "Disposing an unconsumed `OwningTask<T>`"), and cancellation (§30.8,
 //   observed at an await as `OperationCanceledException` — §30.9).
 //
 //   This is represented by:
@@ -3230,7 +3230,7 @@ MethodOwnership::AwaitTaskKind
 MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
     if (!await.operand) return AwaitTaskKind::NotTask;
     // 3b attached the operand's resolved task type. A `Task` / `Task<T>` /
-    // `OwnedTask<T>` is a Named TypeRef whose single-part name head is the
+    // `OwningTask<T>` is a Named TypeRef whose single-part name head is the
     // task class. // per §30.3
     const sema::TypeRef* ot = ctx_.exprType(*await.operand);
     if (!ot || ot->kind != sema::TypeRef::Kind::Named || ot->nullable)
@@ -3251,9 +3251,9 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
         if (arg->declaration)
             return arg->declaration->kind == ast::TypeDeclKind::Class;
         // §30.5 / stdlib §3.1 (#1122): a built-in OWNING collection result
-        // (`OwnedArray<T>` etc. — the result type of `Task.WhenAllOwned`) is a
+        // (`OwningArray<T>` etc. — the result type of `Task.WhenAllOwned`) is a
         // heap/reference type that carries a disposal obligation, so an
-        // `OwnedTask<OwnedArray<T>>` is a valid Pattern B: its awaited result
+        // `OwningTask<OwningArray<T>>` is a valid Pattern B: its awaited result
         // must be `using var`-bound and the awaited operand consumed. These
         // resolve to a Named TypeRef with a NULL declaration (built-in), which
         // the declaration-based check above misses — so the await was wrongly
@@ -3261,9 +3261,9 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
         if (arg->astNode && arg->astNode->name &&
             arg->astNode->name->parts.size() == 1) {
             std::string_view an = arg->astNode->name->parts.front();
-            return an == "OwnedArray" || an == "OwnedStack" ||
-                   an == "OwnedQueue" || an == "OwnedLinkedList" ||
-                   an == "OwnedDictionary" || an == "OwnedSet";
+            return an == "OwningArray" || an == "OwningStack" ||
+                   an == "OwningQueue" || an == "OwningLinkedList" ||
+                   an == "OwningDictionary" || an == "OwningSet";
         }
         return false;
     };
@@ -3272,8 +3272,8 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
         return resultIsClass() ? AwaitTaskKind::PatternA
                                : AwaitTaskKind::ValueResult;
     }
-    if (head == "OwnedTask") {
-        // `OwnedTask<T>` is a compile error for non-class T (sema §14.4); when
+    if (head == "OwningTask") {
+        // `OwningTask<T>` is a compile error for non-class T (sema §14.4); when
         // it reaches here for class T it is Pattern B.
         return resultIsClass() ? AwaitTaskKind::PatternB
                                : AwaitTaskKind::NotTask;
@@ -3386,7 +3386,7 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         // `return await ...` — owned-consuming when the method's return type
-        // carries ownership (an `owned T` / `OwnedTask<T>` return). The
+        // carries ownership (an `owned T` / `OwningTask<T>` return). The
         // enclosing method is the one being analysed; an async method whose
         // result is Pattern B forwards the owned result (§30.5 line ~6143).
         // We admit `return await ...` unconditionally: a `return` of an owned
@@ -3622,13 +3622,13 @@ void MethodOwnership::checkAwaitSitesExpr(
                         "Producer(); var r := await t;`)");
                 }
             } else if (k == AwaitTaskKind::PatternB) {
-                // §30.5: the awaited `OwnedTask<T>` must be in an owned-
+                // §30.5: the awaited `OwningTask<T>` must be in an owned-
                 // consuming context, else its transferred result is dropped.
                 // // per §30.5
                 if (consuming.count(ue) == 0) {
                     report(
                         Severity::Error, ue->span.begin,
-                        "awaiting an `OwnedTask<T>` (Pattern B) must appear in "
+                        "awaiting an `OwningTask<T>` (Pattern B) must appear in "
                         "an owned-consuming context — a `using var`/`var` "
                         "binding, an `owned` argument, an owned-field/owned-slot "
                         "assignment, or an owned `return` — otherwise the "
@@ -3696,7 +3696,7 @@ void MethodOwnership::checkAwaitSitesExpr(
     // its body is analysed, not here. Other leaf expressions hold no awaits.
 }
 
-// §30.5 / §30.4 (#834): true when `e`'s static type is an `OwnedTask<...>`
+// §30.5 / §30.4 (#834): true when `e`'s static type is an `OwningTask<...>`
 // (name-head), the single-consumer owning task whose await consumes it. Used
 // to record the operand consume of an `await task` independently of the
 // result-kind gate in awaitTaskKind, which cannot see through a generic result
@@ -3713,7 +3713,7 @@ bool MethodOwnership::operandIsOwnedTaskType(const ast::Expr& e) {
         head = ot->astNode->name->parts.front();
     else if (!ot->importedName.empty())
         head = ot->importedName;
-    return head == "OwnedTask";
+    return head == "OwningTask";
 }
 
 void MethodOwnership::recordAwaitOperandConsume(
@@ -3737,8 +3737,8 @@ void MethodOwnership::recordAwaitOperandConsume(
         // double-consume. // per §30.5, §30.4
         report(
             Severity::Error, loc,
-            std::string("`OwnedTask<T>` `") + std::string(id->name) +
-            "` was already awaited (consumed) — an `OwnedTask<T>` is "
+            std::string("`OwningTask<T>` `") + std::string(id->name) +
+            "` was already awaited (consumed) — an `OwningTask<T>` is "
             "single-consumer; awaiting it again moves out an already-moved "
             "result (§30.5 / §30.4)");
         st->state = OwnershipState::Poisoned;

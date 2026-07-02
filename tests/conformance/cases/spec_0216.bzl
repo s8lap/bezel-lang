@@ -1,5 +1,5 @@
 public method UseEach()
-  using var pool := new OwnedArray<Connection>();
+  using var pool := new OwningArray<Connection>();
   pool.Add(Connect("primary"));      // ownership transfers in
   pool.Add(Connect("secondary"));     // ownership transfers in
 

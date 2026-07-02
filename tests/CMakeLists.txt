@@ -247,7 +247,8 @@ set(BEZEL_TEST_SOURCES
     sema/move_bare_field_restoration_825_test.cpp     # fix #825: §28.8.1 bare `move _field` must trigger field-restoration check
     sema/field_restoration_path_sensitive_867_test.cpp # fix #867: §28.8.1 field-restoration check is path-sensitive (partial restore rejected)
     sema/move_after_move_field_897_898_test.cpp       # fix #897 #898: §28.8.1 a `move` of an already-moved-from owned field is diagnosed at the move site
-    sema/owned_iter_var_discharge_834_test.cpp        # fix #834: §29.2 owned iteration variable of an OwnedEnumerable/OwnedAsyncEnumerable for-loop must be discharged
+    sema/owned_iter_var_discharge_834_test.cpp        # fix #834: §29.2 owned iteration variable of an IOwningEnumerable/IOwningAsyncEnumerable for-loop must be discharged
+    sema/owning_rename_1372_test.cpp                  # v0.168 #1372: Owned* family renamed Owning* (interfaces gain `I`); new names resolve, old names fail with a rename hint (rationale §3.9)
     sema/out_owned_transfer_860_test.cpp              # fix #860: §28.3/§28.11 model the caller-side out-owned transfer — Try*(out owned item) receives ownership; dropping it leaks
     sema/out_owned_condition_892_test.cpp             # fix #892: §28.3 mark out-owned Try* recipients owned in if/while conditions — drop accepted (leak) before fix
     sema/nullable_field_narrowing_862_test.cpp        # fix #862: §7.4 reject nullable-field member access — fields are not narrowable
@@ -766,8 +767,8 @@ set(BEZEL_TEST_SOURCES
     codegen/codegen_unimplemented_hard_error_628_test.cpp
     codegen/owned_dict_drain_628_test.cpp
     codegen/owned_drain_639_test.cpp
-    codegen/owning_enumerator_1349_test.cpp  # fix #1349: TakeCurrent() replaces destructive Current on OwnedEnumerator<T>; IOE on misuse (§29.1 v0.161)
-    codegen/generic_owned_drain_990_test.cpp           # fix #990: §4.5/§14.2 generic OwnedArray/Stack/Queue/LinkedList<T>.Drain() compiles (no ptr→i32 IR_FAIL) and disposes each drained element exactly once
+    codegen/owning_enumerator_1349_test.cpp  # fix #1349: TakeCurrent() replaces destructive Current on IOwningEnumerator<T>; IOE on misuse (§29.1 v0.161)
+    codegen/generic_owned_drain_990_test.cpp           # fix #990: §4.5/§14.2 generic OwningArray/Stack/Queue/LinkedList<T>.Drain() compiles (no ptr→i32 IR_FAIL) and disposes each drained element exactly once
     codegen/owned_collection_accessors_test.cpp
     codegen/user_exception_unqualified_msg_625_test.cpp
     codegen/serialization_synthesis_550_test.cpp
@@ -796,7 +797,7 @@ set(BEZEL_TEST_SOURCES
     #     IEnumerable<T> (interface-typed local / yield-method result) — eliminates
     #     the silent garbage miscompile and enables Where/Select for-in (§5/§29.11) ---
     codegen/ienumerable_vtable_linq_995_test.cpp
-    # --- fix #1002: manual enumerator protocol on Array<T>/OwnedArray<T>
+    # --- fix #1002: manual enumerator protocol on Array<T>/OwningArray<T>
     #     GetEnumerator() — IEnumerator<T> typing + iterator-vtable lowering
     #     (§29.3/§29.11, stdlib §4.4/§4.12); enumerator borrows the array,
     #     disposed exactly once (§28.2) ---
@@ -848,7 +849,7 @@ set(BEZEL_TEST_SOURCES
     codegen/case_typed_binding_unbox_746_test.cpp
     # --- fix #746: implicit numeric conversions (R41 H/I, §5.1) ---
     codegen/implicit_numeric_conv_746_test.cpp
-    # --- fix #746: OwnedStack/Queue Pop/Dequeue disposal (R41 F, §4.11) ---
+    # --- fix #746: OwningStack/Queue Pop/Dequeue disposal (R41 F, §4.11) ---
     codegen/owned_collection_pop_dispose_746_test.cpp
     # --- fix #746: AsSpan(Range) endpoint (R41 J, §4.14) ---
     codegen/asspan_range_746_test.cpp

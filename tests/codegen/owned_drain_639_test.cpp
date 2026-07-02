@@ -1,15 +1,15 @@
-// Codegen — OwnedArray<T>/OwnedLinkedList<T>/OwnedStack<T>/OwnedQueue<T>.Drain()
+// Codegen — OwningArray<T>/OwningLinkedList<T>/OwningStack<T>/OwningQueue<T>.Drain()
 // ownership-transferring for-loop (#639).
 //
-// stdlib §4.5/§4.7/§4.11 v0.135: Drain() returns OwnedEnumerable<T>.
+// stdlib §4.5/§4.7/§4.11 v0.135: Drain() returns IOwningEnumerable<T>.
 // Iterating transfers ownership of each T to the consumer; the loop variable
 // is owned and must be discharged inside the body (§28.11 "iteration order").
 //
 // Drain order per §28.11 / stdlib §4.5/§4.7/§4.11:
-//   OwnedArray<T>      — front-to-back (index 0, 1, ...)
-//   OwnedQueue<T>      — FIFO = front-to-back (dequeue order)
-//   OwnedStack<T>      — LIFO = top-first (pop order)
-//   OwnedLinkedList<T> — head-to-tail
+//   OwningArray<T>      — front-to-back (index 0, 1, ...)
+//   OwningQueue<T>      — FIFO = front-to-back (dequeue order)
+//   OwningStack<T>      — LIFO = top-first (pop order)
+//   OwningLinkedList<T> — head-to-tail
 //
 // Partial drain: break exits; remainder disposed by collection's Dispose().
 // After full drain: collection is empty (Count == 0), reusable via Add/Push/etc.
@@ -157,7 +157,7 @@ std::string makeProgram(const std::string& mainBody) {
 }  // namespace
 
 // ===========================================================================
-// §4.5 / #639: OwnedArray<T>.Drain() — front-to-back order
+// §4.5 / #639: OwningArray<T>.Drain() — front-to-back order
 // ===========================================================================
 
 // §4.5: full drain disposes every element exactly once.
@@ -165,7 +165,7 @@ std::string makeProgram(const std::string& mainBody) {
 // Encoded: R._n after drain == 3.
 BEZEL_TEST(owned_drain_639, ownedarray_full_drain_disposes_all_spec_4_5) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
@@ -179,7 +179,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_full_drain_disposes_all_spec_4_5) {
 // §4.5: after full drain the array is empty (Count == 0).
 BEZEL_TEST(owned_drain_639, ownedarray_full_drain_empties_array_spec_4_5) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
@@ -201,7 +201,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_drain_order_front_to_back_spec_4_5) {
         "  public constructor(n: int) N := n; end constructor; "
         "end Val; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<Val>(); "
+        "  using var arr := new OwningArray<Val>(); "
         "  arr.Add(new Val(1)); "
         "  arr.Add(new Val(2)); "
         "  arr.Add(new Val(3)); "
@@ -225,7 +225,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_partial_drain_break_remainder_disposed_sp
     BEZEL_EXPECT_EQ(run(makeProgram(
         "var afterBreak := -1; "
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
@@ -242,7 +242,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_partial_drain_break_remainder_disposed_sp
 // §4.5: empty array drain — loop body never executes.
 BEZEL_TEST(owned_drain_639, ownedarray_empty_drain_no_iterations_spec_4_5) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "var count := 0; "
         "for var item in arr.Drain() do "
         "  using var u := item; "
@@ -255,7 +255,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_empty_drain_no_iterations_spec_4_5) {
 // §4.5: collection reusable after full drain (Add works, Count increases).
 BEZEL_TEST(owned_drain_639, ownedarray_reusable_after_full_drain_spec_4_5) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
@@ -267,13 +267,13 @@ BEZEL_TEST(owned_drain_639, ownedarray_reusable_after_full_drain_spec_4_5) {
 }
 
 // ===========================================================================
-// §4.7 / #639: OwnedLinkedList<T>.Drain() — head-to-tail order
+// §4.7 / #639: OwningLinkedList<T>.Drain() — head-to-tail order
 // ===========================================================================
 
 // §4.7: full drain disposes all elements exactly once.
 BEZEL_TEST(owned_drain_639, ownedlinkedlist_full_drain_disposes_all_spec_4_7) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var ll := new OwnedLinkedList<R>(); "
+        "using var ll := new OwningLinkedList<R>(); "
         "ll.AddLast(move (new R())); "
         "ll.AddLast(move (new R())); "
         "ll.AddLast(move (new R())); "
@@ -287,7 +287,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_full_drain_disposes_all_spec_4_7) {
 // §4.7: after full drain the list is empty (Count == 0).
 BEZEL_TEST(owned_drain_639, ownedlinkedlist_full_drain_empties_list_spec_4_7) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var ll := new OwnedLinkedList<R>(); "
+        "using var ll := new OwningLinkedList<R>(); "
         "ll.AddLast(move (new R())); "
         "ll.AddLast(move (new R())); "
         "for var item in ll.Drain() do "
@@ -307,7 +307,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_drain_order_head_to_tail_spec_4_7) {
         "  public constructor(n: int) N := n; end constructor; "
         "end Val; "
         "class C public static method Main(): int "
-        "  using var ll := new OwnedLinkedList<Val>(); "
+        "  using var ll := new OwningLinkedList<Val>(); "
         "  ll.AddLast(new Val(1)); "
         "  ll.AddLast(new Val(2)); "
         "  ll.AddLast(new Val(3)); "
@@ -329,7 +329,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_partial_drain_break_remainder_dispos
     BEZEL_EXPECT_EQ(run(makeProgram(
         "var afterBreak := -1; "
         "do "
-        "  using var ll := new OwnedLinkedList<R>(); "
+        "  using var ll := new OwningLinkedList<R>(); "
         "  ll.AddLast(move (new R())); "
         "  ll.AddLast(move (new R())); "
         "  ll.AddLast(move (new R())); "
@@ -346,7 +346,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_partial_drain_break_remainder_dispos
 // §4.7: empty list drain — no iterations.
 BEZEL_TEST(owned_drain_639, ownedlinkedlist_empty_drain_no_iterations_spec_4_7) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var ll := new OwnedLinkedList<R>(); "
+        "using var ll := new OwningLinkedList<R>(); "
         "var count := 0; "
         "for var item in ll.Drain() do "
         "  using var u := item; "
@@ -357,13 +357,13 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_empty_drain_no_iterations_spec_4_7) 
 }
 
 // ===========================================================================
-// §4.11 / #639: OwnedStack<T>.Drain() — LIFO (top-first) order
+// §4.11 / #639: OwningStack<T>.Drain() — LIFO (top-first) order
 // ===========================================================================
 
 // §4.11: full drain disposes all elements exactly once.
 BEZEL_TEST(owned_drain_639, ownedstack_full_drain_disposes_all_spec_4_11) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var s := new OwnedStack<R>(); "
+        "using var s := new OwningStack<R>(); "
         "s.Push(move (new R())); "
         "s.Push(move (new R())); "
         "s.Push(move (new R())); "
@@ -377,7 +377,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_full_drain_disposes_all_spec_4_11) {
 // §4.11: after full drain the stack is empty (Count == 0).
 BEZEL_TEST(owned_drain_639, ownedstack_full_drain_empties_stack_spec_4_11) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var s := new OwnedStack<R>(); "
+        "using var s := new OwningStack<R>(); "
         "s.Push(move (new R())); "
         "s.Push(move (new R())); "
         "for var item in s.Drain() do "
@@ -397,7 +397,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_drain_order_lifo_spec_4_11) {
         "  public constructor(n: int) N := n; end constructor; "
         "end Val; "
         "class C public static method Main(): int "
-        "  using var s := new OwnedStack<Val>(); "
+        "  using var s := new OwningStack<Val>(); "
         "  s.Push(new Val(1)); "
         "  s.Push(new Val(2)); "
         "  s.Push(new Val(3)); "
@@ -419,7 +419,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_partial_drain_break_remainder_disposed_sp
     BEZEL_EXPECT_EQ(run(makeProgram(
         "var afterBreak := -1; "
         "do "
-        "  using var s := new OwnedStack<R>(); "
+        "  using var s := new OwningStack<R>(); "
         "  s.Push(move (new R())); "
         "  s.Push(move (new R())); "
         "  s.Push(move (new R())); "
@@ -436,7 +436,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_partial_drain_break_remainder_disposed_sp
 // §4.11: empty stack drain — no iterations.
 BEZEL_TEST(owned_drain_639, ownedstack_empty_drain_no_iterations_spec_4_11) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var s := new OwnedStack<R>(); "
+        "using var s := new OwningStack<R>(); "
         "var count := 0; "
         "for var item in s.Drain() do "
         "  using var u := item; "
@@ -447,13 +447,13 @@ BEZEL_TEST(owned_drain_639, ownedstack_empty_drain_no_iterations_spec_4_11) {
 }
 
 // ===========================================================================
-// §4.11 / #639: OwnedQueue<T>.Drain() — FIFO (front-first) order
+// §4.11 / #639: OwningQueue<T>.Drain() — FIFO (front-first) order
 // ===========================================================================
 
 // §4.11: full drain disposes all elements exactly once.
 BEZEL_TEST(owned_drain_639, ownedqueue_full_drain_disposes_all_spec_4_11) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var q := new OwnedQueue<R>(); "
+        "using var q := new OwningQueue<R>(); "
         "q.Enqueue(move (new R())); "
         "q.Enqueue(move (new R())); "
         "q.Enqueue(move (new R())); "
@@ -467,7 +467,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_full_drain_disposes_all_spec_4_11) {
 // §4.11: after full drain the queue is empty (Count == 0).
 BEZEL_TEST(owned_drain_639, ownedqueue_full_drain_empties_queue_spec_4_11) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var q := new OwnedQueue<R>(); "
+        "using var q := new OwningQueue<R>(); "
         "q.Enqueue(move (new R())); "
         "q.Enqueue(move (new R())); "
         "for var item in q.Drain() do "
@@ -487,7 +487,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_drain_order_fifo_spec_4_11) {
         "  public constructor(n: int) N := n; end constructor; "
         "end Val; "
         "class C public static method Main(): int "
-        "  using var q := new OwnedQueue<Val>(); "
+        "  using var q := new OwningQueue<Val>(); "
         "  q.Enqueue(new Val(1)); "
         "  q.Enqueue(new Val(2)); "
         "  q.Enqueue(new Val(3)); "
@@ -509,7 +509,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_partial_drain_break_remainder_disposed_sp
     BEZEL_EXPECT_EQ(run(makeProgram(
         "var afterBreak := -1; "
         "do "
-        "  using var q := new OwnedQueue<R>(); "
+        "  using var q := new OwningQueue<R>(); "
         "  q.Enqueue(move (new R())); "
         "  q.Enqueue(move (new R())); "
         "  q.Enqueue(move (new R())); "
@@ -526,7 +526,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_partial_drain_break_remainder_disposed_sp
 // §4.11: empty queue drain — no iterations.
 BEZEL_TEST(owned_drain_639, ownedqueue_empty_drain_no_iterations_spec_4_11) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var q := new OwnedQueue<R>(); "
+        "using var q := new OwningQueue<R>(); "
         "var count := 0; "
         "for var item in q.Drain() do "
         "  using var u := item; "
@@ -540,7 +540,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_empty_drain_no_iterations_spec_4_11) {
 // §4.5 / #639: R27 repro probes — exact match to /tmp/r27/r25*.bzl
 // ===========================================================================
 
-// R27 repro r25b_ownedarray_drain.bzl: OwnedArray drain, sum should be 60.
+// R27 repro r25b_ownedarray_drain.bzl: OwningArray drain, sum should be 60.
 // Pass condition: Main returns 42 (42 if sum = 60 else 91).
 BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
     auto r = runJit(
@@ -551,7 +551,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
         "end Val; "
         "class Program "
         "  public static method Main(): int "
-        "    using var arr := new OwnedArray<Val>(); "
+        "    using var arr := new OwningArray<Val>(); "
         "    arr.Add(new Val(10)); "
         "    arr.Add(new Val(20)); "
         "    arr.Add(new Val(30)); "
@@ -567,7 +567,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
-// R27 repro r25c_owned_collections_drain.bzl: OwnedLinkedList drain, sum=15.
+// R27 repro r25c_owned_collections_drain.bzl: OwningLinkedList drain, sum=15.
 // Pass condition: Main returns 42.
 BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
     auto r = runJit(
@@ -578,7 +578,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
         "end Val; "
         "class Program "
         "  public static method Main(): int "
-        "    using var ll := new OwnedLinkedList<Val>(); "
+        "    using var ll := new OwningLinkedList<Val>(); "
         "    ll.AddLast(new Val(5)); "
         "    ll.AddLast(new Val(10)); "
         "    var sum := 0; "
@@ -593,7 +593,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
-// R27 repro r25d_ownedstack_drain.bzl: OwnedStack drain, sum=15.
+// R27 repro r25d_ownedstack_drain.bzl: OwningStack drain, sum=15.
 // Pass condition: Main returns 42.
 BEZEL_TEST(owned_drain_639, r27_repro_r25d_ownedstack_drain) {
     auto r = runJit(
@@ -604,7 +604,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25d_ownedstack_drain) {
         "end Val; "
         "class Program "
         "  public static method Main(): int "
-        "    using var s := new OwnedStack<Val>(); "
+        "    using var s := new OwningStack<Val>(); "
         "    s.Push(new Val(5)); "
         "    s.Push(new Val(10)); "
         "    var sum := 0; "
@@ -623,10 +623,10 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25d_ownedstack_drain) {
 // §4.5 / #639: ASan — drain transfers ownership correctly (no double-free/leak)
 // ===========================================================================
 
-// ASan: OwnedArray full drain — no leak, no double-free.
+// ASan: OwningArray full drain — no leak, no double-free.
 BEZEL_TEST(owned_drain_639, asan_ownedarray_full_drain_no_leak) {
     int asan = runUnderASan(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
@@ -638,11 +638,11 @@ BEZEL_TEST(owned_drain_639, asan_ownedarray_full_drain_no_leak) {
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
-// ASan: OwnedArray partial drain — remainder disposed exactly once by array.
+// ASan: OwningArray partial drain — remainder disposed exactly once by array.
 BEZEL_TEST(owned_drain_639, asan_ownedarray_partial_drain_no_leak) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
@@ -657,11 +657,11 @@ BEZEL_TEST(owned_drain_639, asan_ownedarray_partial_drain_no_leak) {
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
-// ASan: OwnedStack partial drain — remainder disposed exactly once by stack.
+// ASan: OwningStack partial drain — remainder disposed exactly once by stack.
 BEZEL_TEST(owned_drain_639, asan_ownedstack_partial_drain_no_leak) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var s := new OwnedStack<R>(); "
+        "  using var s := new OwningStack<R>(); "
         "  s.Push(move (new R())); "
         "  s.Push(move (new R())); "
         "  s.Push(move (new R())); "
@@ -676,11 +676,11 @@ BEZEL_TEST(owned_drain_639, asan_ownedstack_partial_drain_no_leak) {
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
-// ASan: OwnedQueue partial drain — remainder disposed exactly once by queue.
+// ASan: OwningQueue partial drain — remainder disposed exactly once by queue.
 BEZEL_TEST(owned_drain_639, asan_ownedqueue_partial_drain_no_leak) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var q := new OwnedQueue<R>(); "
+        "  using var q := new OwningQueue<R>(); "
         "  q.Enqueue(move (new R())); "
         "  q.Enqueue(move (new R())); "
         "  q.Enqueue(move (new R())); "
@@ -695,11 +695,11 @@ BEZEL_TEST(owned_drain_639, asan_ownedqueue_partial_drain_no_leak) {
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
-// ASan: OwnedLinkedList partial drain — remainder disposed once by list.
+// ASan: OwningLinkedList partial drain — remainder disposed once by list.
 BEZEL_TEST(owned_drain_639, asan_ownedlinkedlist_partial_drain_no_leak) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var ll := new OwnedLinkedList<R>(); "
+        "  using var ll := new OwningLinkedList<R>(); "
         "  ll.AddLast(move (new R())); "
         "  ll.AddLast(move (new R())); "
         "  ll.AddLast(move (new R())); "
@@ -731,7 +731,7 @@ BEZEL_TEST(owned_drain_639, asan_ownedlinkedlist_partial_drain_no_leak) {
 // Uses runFull (includes checkOwnership) so ownedIterVarAutoDropAtBodyEnd is set.
 BEZEL_TEST(owned_drain_639, autodrop_fallthrough_disposes_all_spec_29_2_1329) {
     BEZEL_EXPECT_EQ(runFull(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
@@ -749,7 +749,7 @@ BEZEL_TEST(owned_drain_639, autodrop_break_disposes_current_element_spec_29_2_13
     BEZEL_EXPECT_EQ(runFull(makeProgram(
         "var afterBreak := -1; "
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
@@ -767,7 +767,7 @@ BEZEL_TEST(owned_drain_639, autodrop_break_disposes_current_element_spec_29_2_13
 // Three elements, each explicitly disposed: R._n == 3 exactly.
 BEZEL_TEST(owned_drain_639, autodrop_explicit_dispose_no_double_free_spec_29_2_1329) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
@@ -782,7 +782,7 @@ BEZEL_TEST(owned_drain_639, autodrop_explicit_dispose_no_double_free_spec_29_2_1
 // Moved into a using-var sink that disposes it. Three elements: R._n == 3.
 BEZEL_TEST(owned_drain_639, autodrop_move_out_no_double_free_spec_29_2_1329) {
     BEZEL_EXPECT_EQ(run(makeProgram(
-        "using var arr := new OwnedArray<R>(); "
+        "using var arr := new OwningArray<R>(); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
@@ -797,7 +797,7 @@ BEZEL_TEST(owned_drain_639, autodrop_move_out_no_double_free_spec_29_2_1329) {
 BEZEL_TEST(owned_drain_639, asan_autodrop_fallthrough_no_leak_spec_29_2_1329) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
@@ -814,7 +814,7 @@ BEZEL_TEST(owned_drain_639, asan_autodrop_fallthrough_no_leak_spec_29_2_1329) {
 BEZEL_TEST(owned_drain_639, asan_autodrop_break_no_leak_spec_29_2_1329) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
@@ -832,7 +832,7 @@ BEZEL_TEST(owned_drain_639, asan_autodrop_break_no_leak_spec_29_2_1329) {
 BEZEL_TEST(owned_drain_639, asan_autodrop_explicit_dispose_no_double_free_spec_29_2_1329) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
@@ -849,7 +849,7 @@ BEZEL_TEST(owned_drain_639, asan_autodrop_explicit_dispose_no_double_free_spec_2
 BEZEL_TEST(owned_drain_639, asan_autodrop_move_out_no_double_free_spec_29_2_1329) {
     int asan = runUnderASan(makeProgram(
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  for var item in arr.Drain() do "

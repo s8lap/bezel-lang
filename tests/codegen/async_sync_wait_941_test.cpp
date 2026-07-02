@@ -243,7 +243,7 @@ BEZEL_TEST(async_sync_wait_941, result_returned_directly_no_borrow_escape_1175) 
 
 // ---------------------------------------------------------------------------
 // §30.3 (#1175 fix): IsCompleted / IsFaulted / IsCancelled are bool readonly
-// properties on Task (and its subclasses Task<T>, OwnedTask<T>) — spec §30.3.
+// properties on Task (and its subclasses Task<T>, OwningTask<T>) — spec §30.3.
 // Pre-fix these were untyped in sema (no TypeSymbol on the task type);
 // post-fix they are typed bool in resolveMemberAccess so `if t.IsCompleted`
 // and similar uses compile correctly. Test: after Wait(), the completed-and-
@@ -385,8 +385,8 @@ BEZEL_TEST(async_sync_wait_941, wait_in_sync_main_still_accepted_30_3_v0162) {
 }
 
 // ---------------------------------------------------------------------------
-// §30.5 (v0.162 / #1352): OwnedTask spend-on-all-edges.
-// An OwnedTask must be marked spent after the FIRST await on any path —
+// §30.5 (v0.162 / #1352): OwningTask spend-on-all-edges.
+// An OwningTask must be marked spent after the FIRST await on any path —
 // fault as well as success. A second `await t` must raise
 // InvalidOperationException (not replay the original error).
 //
@@ -398,7 +398,7 @@ BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_fault_raises_ioe_1
     // §30.5 v0.162: first await faults (r=1), second await must raise IOE (r=2).
     expectValue941(
         "module M; class C "
-        "  public static async method FaultProducer(): OwnedTask<int> "
+        "  public static async method FaultProducer(): OwningTask<int> "
         "    throw new Exception(\"boom\"); "
         "  end FaultProducer; "
         "  public static async method RunTest(): Task<int> "
@@ -422,13 +422,13 @@ BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_fault_raises_ioe_1
         2);
 }
 
-// §30.5 v0.162: OwnedTask spend-on-success: after a SUCCESSFUL first await,
+// §30.5 v0.162: OwningTask spend-on-success: after a SUCCESSFUL first await,
 // a second await must also raise IOE (not silently return a stale value or crash).
 BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_success_raises_ioe_1352) {
     // §30.5 v0.162: first await succeeds (r=99), second await raises IOE (r=2).
     expectValue941(
         "module M; class C "
-        "  public static async method Produce99(): OwnedTask<int> "
+        "  public static async method Produce99(): OwningTask<int> "
         "    return 99; "
         "  end Produce99; "
         "  public static async method RunTest(): Task<int> "

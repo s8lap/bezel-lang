@@ -9,7 +9,7 @@
 // and Dispose forwarding.
 //
 // Spec: lang §9.8; stdlib §2.14 (ISerializer/IDeserializer), §2.15
-// (BinarySerializer/BinaryDeserializer), §4.14 (OwnedBuffer<T>/Span<T>).
+// (BinarySerializer/BinaryDeserializer), §4.14 (OwningBuffer<T>/Span<T>).
 // Issue #550, tiers 1+2.
 
 #include "codegen/LlvmBackend_impl.hpp"
@@ -2709,7 +2709,7 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         // Serialize/Deserialize bodies; the concrete object is always a
         // BinarySerializer* / BinaryDeserializer* at runtime).
         if (rcn == "ISerializer" || rcn == "IDeserializer") return true;
-        // §4.14 / #636: OwnedBuffer<T>.AsSpan() / AsReadOnlySpan() / Count /
+        // §4.14 / #636: OwningBuffer<T>.AsSpan() / AsReadOnlySpan() / Count /
         // Length are no longer intercepted here.  They are now handled by:
         //   - AsSpan / AsReadOnlySpan: tryLowerArraySpanCall (same path as
         //     Array<T>, delegated so both share one element-width–correct path)
@@ -2985,14 +2985,14 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             return nullptr;
         }
 
-        // §4.14 / #636: OwnedBuffer<T>.AsSpan() / AsReadOnlySpan() / Count /
+        // §4.14 / #636: OwningBuffer<T>.AsSpan() / AsReadOnlySpan() / Count /
         // Length are no longer handled here — they are delegated to:
         //   - AsSpan / AsReadOnlySpan: tryLowerArraySpanCall (same lowering
         //     path as Array<T>; handles all element types with correct
         //     element-width and bounds checks)
         //   - Count / Length: tryLowerCollectionInstanceCall (bz_array_len)
         // Since isSerializationCall no longer flags these calls, this branch
-        // is never reached for OwnedBuffer/Array AsSpan/Count/Length.
+        // is never reached for OwningBuffer/Array AsSpan/Count/Length.
         // The duplicate path has been removed to keep a single lowering path.
     }
 

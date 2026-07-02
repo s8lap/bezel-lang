@@ -31,8 +31,8 @@ using var labels: Dictionary<Point, string> := [
 ];
 
 // Owning collections — element expressions must produce owned values
-using var conns: OwnedArray<Connection> := [Connect("a"), Connect("b")];
-using var pool:  OwnedDictionary<string, Connection> := [
+using var conns: OwningArray<Connection> := [Connect("a"), Connect("b")];
+using var pool:  OwningDictionary<string, Connection> := [
   "primary": Connect("p"),
   "backup":  Connect("b")
 ];

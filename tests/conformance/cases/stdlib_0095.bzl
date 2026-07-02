@@ -18,7 +18,7 @@ public abstract class Stream
 
   // Convenience methods
   public method ReadAll(): owned Array<byte>;            // reads from current position to end
-  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Array<byte>>;
+  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwningTask<Array<byte>>;
 end Stream;
 
 public enum SeekOrigin: byte

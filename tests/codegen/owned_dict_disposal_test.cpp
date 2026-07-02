@@ -1,17 +1,17 @@
-// Codegen — scope-end disposal of an OwnedDictionary<K,V>'s surviving values
-// (issue #394, stdlib §4.9). Companion coverage for OwnedSet<T> (stdlib §4.10),
+// Codegen — scope-end disposal of an OwningDictionary<K,V>'s surviving values
+// (issue #394, stdlib §4.9). Companion coverage for OwningSet<T> (stdlib §4.10),
 // whose class elements are array-backed and already disposed via #362.
 //
 // stdlib §4.9: "Owning hash-based map. Owns its values; keys are value-like."
-// And: "There is no `DisposeElements()` on `OwnedDictionary<K, V>` — the
+// And: "There is no `DisposeElements()` on `OwningDictionary<K, V>` — the
 // dictionary's `Dispose()` cascade handles every value disposal." Keys are NOT
-// owned ("`OwnedDictionary` does not support owned keys"), so only the values
+// owned ("`OwningDictionary` does not support owned keys"), so only the values
 // (V, constrained `V: class`) are disposed at scope end.
 //
-// stdlib §4.10: "`OwnedSet<T>` ... where T: class" — owns its elements; each
+// stdlib §4.10: "`OwningSet<T>` ... where T: class" — owns its elements; each
 // surviving element is disposed once at scope end.
 //
-// The bug (#394): the scope-end `using var` disposal of an OwnedDictionary was
+// The bug (#394): the scope-end `using var` disposal of an OwningDictionary was
 // not wired at all — neither the backing hash table nor its surviving values
 // were freed. #388 wired the SETTER's disposal of a DISPLACED value
 // (bz_dict_set_*_disposing); this file covers the values still present in the
@@ -140,7 +140,7 @@ std::string prog(const std::string& mainBody) {
         "end C;";
 }
 
-// --- OwnedDictionary<string, R> — string-key fast path (§4.9). -------------
+// --- OwningDictionary<string, R> — string-key fast path (§4.9). -------------
 
 // Two owned values added via .Add(k, move v); both survive to scope end. The
 // dictionary's Dispose() cascade disposes both values exactly once. Encoded:
@@ -150,7 +150,7 @@ std::string prog(const std::string& mainBody) {
 const char* kDictStrTwoSurvivors =
     "var inside := -1; "
     "do "
-    "  using var d := new OwnedDictionary<string, R>(); "
+    "  using var d := new OwningDictionary<string, R>(); "
     "  d.Add(\"a\", move (new R())); "
     "  d.Add(\"b\", move (new R())); "
     "  inside := R._n; "
@@ -168,7 +168,7 @@ const char* kDictStrTwoSurvivors =
 const char* kDictStrDisplacedPlusSurvivors =
     "var afterDisplace := -1; "
     "do "
-    "  using var d := new OwnedDictionary<string, R>(); "
+    "  using var d := new OwningDictionary<string, R>(); "
     "  d[\"a\"] := move (new R()); "
     "  d[\"b\"] := move (new R()); "
     "  d[\"c\"] := move (new R()); "
@@ -177,39 +177,39 @@ const char* kDictStrDisplacedPlusSurvivors =
     "end; "
     "return afterDisplace * 10 + R._n;";
 
-// --- OwnedDictionary<int, R> — generic-key path (§4.9 / D3). ---------------
+// --- OwningDictionary<int, R> — generic-key path (§4.9 / D3). ---------------
 
 // An int key uses the generic-key runtime (bz_dict_*_gen). The owned values are
 // still disposed at scope end. Two survivors → 02 (0 inside, 2 after).
 const char* kDictIntTwoSurvivors =
     "var inside := -1; "
     "do "
-    "  using var d := new OwnedDictionary<int, R>(); "
+    "  using var d := new OwningDictionary<int, R>(); "
     "  d.Add(1, move (new R())); "
     "  d.Add(2, move (new R())); "
     "  inside := R._n; "
     "end; "
     "return inside * 10 + R._n;";
 
-// --- OwnedSet<R> — array-backed class elements (§4.10, already via #362). ---
+// --- OwningSet<R> — array-backed class elements (§4.10, already via #362). ---
 
-// OwnedSet<T> where T: class is array-backed (a class element is not a generic-
+// OwningSet<T> where T: class is array-backed (a class element is not a generic-
 // key-eligible value type), so its scope-end disposal already cascades into each
-// element via the OwnedArray element-disposer (#362). This test pins that
+// element via the OwningArray element-disposer (#362). This test pins that
 // behavior so the dict fix does not regress it. Two elements → 02.
 const char* kSetTwoSurvivors =
     "var inside := -1; "
     "do "
-    "  using var s := new OwnedSet<R>(); "
+    "  using var s := new OwningSet<R>(); "
     "  s.Add(move (new R())); "
     "  s.Add(move (new R())); "
     "  inside := R._n; "
     "end; "
     "return inside * 10 + R._n;";
 
-// --- #396: explicit .Dispose() on an OwnedDictionary disposes its values. ---
+// --- #396: explicit .Dispose() on an OwningDictionary disposes its values. ---
 
-// #396 / §4.9 + §28.2: an explicit `d.Dispose()` on an OwnedDictionary<K,V>
+// #396 / §4.9 + §28.2: an explicit `d.Dispose()` on an OwningDictionary<K,V>
 // (V a class) must cascade disposal into its surviving values — exactly as the
 // scope-end (#394) path does. Here both values are disposed BY the explicit
 // call (count 2 read AFTER it, INSIDE the scope), and the using-var's scope-end
@@ -226,7 +226,7 @@ const char* kSetTwoSurvivors =
 const char* kDictExplicitDispose =
     "var inside := -1; "
     "do "
-    "  using var d := new OwnedDictionary<string, R>(); "
+    "  using var d := new OwningDictionary<string, R>(); "
     "  d.Add(\"a\", move (new R())); "
     "  d.Add(\"b\", move (new R())); "
     "  d.Dispose(); "
@@ -235,7 +235,7 @@ const char* kDictExplicitDispose =
     "return inside * 10 + R._n;"; // 2*10 + 2 = 22
 
 // #396 / §4.9: an explicit `this._d.Dispose()` inside a DESTRUCTOR disposes the
-// owned dict field's surviving values once. An owned OwnedDictionary FIELD is
+// owned dict field's surviving values once. An owned OwningDictionary FIELD is
 // not auto-disposed by the destructor's field-disposal pass (that pass handles
 // class objects and array-backed collections, not hash-backed dicts), so the
 // explicit call in the destructor is the only disposal — it must dispose the
@@ -250,9 +250,9 @@ const char* kDictFieldDestructorDispose =
     "  destructor _n := _n + 1; end destructor; "
     "end R; "
     "class Owner "
-    "  private owned _d: OwnedDictionary<string, R>; "
+    "  private owned _d: OwningDictionary<string, R>; "
     "  public constructor() "
-    "    this._d := new OwnedDictionary<string, R>(); "
+    "    this._d := new OwningDictionary<string, R>(); "
     "    this._d.Add(\"a\", move (new R())); "
     "  end constructor; "
     "  destructor this._d.Dispose(); end destructor; "
@@ -264,7 +264,7 @@ const char* kDictFieldDestructorDispose =
 
 }  // namespace
 
-// ---- OwnedDictionary scope-end disposal (§4.9, #394) ---------------------
+// ---- OwningDictionary scope-end disposal (§4.9, #394) ---------------------
 
 BEZEL_TEST(codegen_owned_dict_394, str_key_surviving_values_disposed_4_9) {
     // Both surviving values disposed once at scope end (none disposed inside) →
@@ -287,16 +287,16 @@ BEZEL_TEST(codegen_owned_dict_394, int_key_surviving_values_disposed_4_9) {
     expectDisposedAndLeakFree(prog(kDictIntTwoSurvivors), 2);
 }
 
-// ---- OwnedSet scope-end disposal (§4.10) — regression pin ----------------
+// ---- OwningSet scope-end disposal (§4.10) — regression pin ----------------
 
 BEZEL_TEST(codegen_owned_set_394, class_elements_surviving_disposed_4_10) {
-    // OwnedSet<R> (R a class) is array-backed; its surviving elements are
-    // disposed at scope end via the OwnedArray element-disposer (#362). This
+    // OwningSet<R> (R a class) is array-backed; its surviving elements are
+    // disposed at scope end via the OwningArray element-disposer (#362). This
     // must remain true after the dict fix → 0*10 + 2 = 2.
     expectDisposedAndLeakFree(prog(kSetTwoSurvivors), 2);
 }
 
-// ---- #396: explicit .Dispose() disposes OwnedDictionary values (§4.9, §28.2) -
+// ---- #396: explicit .Dispose() disposes OwningDictionary values (§4.9, §28.2) -
 
 BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_disposes_values_exactly_once_4_9) {
     // Explicit d.Dispose() disposes both values (inside count 2); the using
@@ -314,9 +314,9 @@ BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_of_owned_field_in_destructor
     expectDisposedAndLeakFree(kDictFieldDestructorDispose, 1);
 }
 
-// ---- #1214: OwnedDictionary.Add disposes the rejected value on dup-key throw -
+// ---- #1214: OwningDictionary.Add disposes the rejected value on dup-key throw -
 //
-// §4.8 / §28.3: when OwnedDictionary.Add is called with a key that is already
+// §4.8 / §28.3: when OwningDictionary.Add is called with a key that is already
 // present it must (a) throw ArgumentException and (b) dispose the transferred
 // owned value — ownership was transferred to the call site and the value will
 // not be inserted, so the disposer must run on the throw path or the value leaks.
@@ -333,7 +333,7 @@ BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_of_owned_field_in_destructor
 const char* kOwnedDictStrDupKeyDisposesValue =
     "var inside_throw := -1; "
     "do "
-    "  using var d := new OwnedDictionary<string, R>(); "
+    "  using var d := new OwningDictionary<string, R>(); "
     "  d.Add(\"a\", move (new R())); "
     "  try d.Add(\"a\", move (new R())); "
     "  catch ArgumentException => inside_throw := R._n; end; "
@@ -345,7 +345,7 @@ const char* kOwnedDictStrDupKeyDisposesValue =
 const char* kOwnedDictIntDupKeyDisposesValue =
     "var inside_throw := -1; "
     "do "
-    "  using var d := new OwnedDictionary<int, R>(); "
+    "  using var d := new OwningDictionary<int, R>(); "
     "  d.Add(1, move (new R())); "
     "  try d.Add(1, move (new R())); "
     "  catch ArgumentException => inside_throw := R._n; end; "

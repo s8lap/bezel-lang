@@ -1,11 +1,11 @@
 // Codegen — owned-collection pop/peek/tryadd accessor fixes.
 // Covers issues #642, #643, and #654 (tail A and B).
 //
-// #642: OwnedArray<T>.PopLast() / PopAt(i) / PopFirst() — stdlib §4.5.
-//        OwnedLinkedList<T>.PopFirst() / PopLast()     — stdlib §4.7.
-// #643: OwnedDictionary<K,V>.PopValue(k)              — stdlib §4.9.
-// #654-tail A: OwnedQueue<T>.Peek() returns FIRST (FIFO) element — §4.11.
-// #654-tail B: OwnedSet<T>.TryAdd(owned item) correct Count/bool — §4.10.
+// #642: OwningArray<T>.PopLast() / PopAt(i) / PopFirst() — stdlib §4.5.
+//        OwningLinkedList<T>.PopFirst() / PopLast()     — stdlib §4.7.
+// #643: OwningDictionary<K,V>.PopValue(k)              — stdlib §4.9.
+// #654-tail A: OwningQueue<T>.Peek() returns FIRST (FIFO) element — §4.11.
+// #654-tail B: OwningSet<T>.TryAdd(owned item) correct Count/bool — §4.10.
 //
 // Disposal correctness:
 //   * Pop* transfers ownership out — the popped element is NOT double-disposed.
@@ -44,7 +44,7 @@ int runResource(const std::string& mainBody) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// #642 / stdlib §4.5: OwnedArray<T>.PopLast() returns the last element's value.
+// #642 / stdlib §4.5: OwningArray<T>.PopLast() returns the last element's value.
 // ---------------------------------------------------------------------------
 
 // stdlib §4.5 example: arr = [R(7), R(9)]; PopLast returns R with Val=9.
@@ -57,7 +57,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_poplast_returns_last_element_value) {
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(new R(7)); "
         "  arr.Add(new R(9)); "
         "  using var popped := arr.PopLast(); "
@@ -77,7 +77,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_poplast_count_and_survivor_correct) {
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(new R(7)); "
         "  arr.Add(new R(9)); "
         "  do using var _ := arr.PopLast(); end; "
@@ -94,7 +94,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_poplast_transfers_ownership_no_double
     BEZEL_EXPECT_EQ(runResource(
         "var afterPop := -1; "
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(new R(5)); "
         "  using var popped := arr.PopLast(); "
         "  afterPop := R._n; "           // 0 — not disposed yet
@@ -104,7 +104,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_poplast_transfers_ownership_no_double
 }
 
 // ---------------------------------------------------------------------------
-// #642 / stdlib §4.5: OwnedArray<T>.PopAt(index) — middle element.
+// #642 / stdlib §4.5: OwningArray<T>.PopAt(index) — middle element.
 // ---------------------------------------------------------------------------
 
 // stdlib §4.5: PopAt(1) from [R(1), R(2), R(3)] returns R with Val=2.
@@ -118,7 +118,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_popat_middle_correct_value_and_surviv
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(new R(1)); arr.Add(new R(2)); arr.Add(new R(3)); "
         "  do using var popped := arr.PopAt(1); "
         "    var pv := popped.Val; "
@@ -138,7 +138,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_popat_first_transfers_ownership) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterPop := -1; "
         "do "
-        "  using var arr := new OwnedArray<R>(); "
+        "  using var arr := new OwningArray<R>(); "
         "  arr.Add(new R(1)); arr.Add(new R(2)); "
         "  using var popped := arr.PopAt(0); "
         "  afterPop := R._n; "
@@ -148,7 +148,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_array_popat_first_transfers_ownership) {
 }
 
 // ---------------------------------------------------------------------------
-// #642 / stdlib §4.7: OwnedLinkedList<T>.PopFirst() — front element.
+// #642 / stdlib §4.7: OwningLinkedList<T>.PopFirst() — front element.
 // ---------------------------------------------------------------------------
 
 // stdlib §4.7: PopFirst from a single-element list returns the element.
@@ -161,7 +161,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_linked_list_popfirst_returns_front_value) {
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var oll := new OwnedLinkedList<R>(); "
+        "  using var oll := new OwningLinkedList<R>(); "
         "  oll.AddLast(new R(99)); "
         "  using var pf := oll.PopFirst(); "
         "  if pf.Val = 99 then return 1; end; "
@@ -175,7 +175,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_linked_list_popfirst_transfers_ownership_no
     BEZEL_EXPECT_EQ(runResource(
         "var afterPop := -1; "
         "do "
-        "  using var oll := new OwnedLinkedList<R>(); "
+        "  using var oll := new OwningLinkedList<R>(); "
         "  oll.AddLast(new R(7)); "
         "  using var pf := oll.PopFirst(); "
         "  afterPop := R._n; "
@@ -196,7 +196,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_linked_list_popfirst_count_and_survivor_cor
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var oll := new OwnedLinkedList<R>(); "
+        "  using var oll := new OwningLinkedList<R>(); "
         "  oll.AddLast(new R(10)); oll.AddLast(new R(20)); "
         "  do using var pf := oll.PopFirst(); "
         "    var pv := pf.Val; "
@@ -211,7 +211,7 @@ BEZEL_TEST(owned_coll_acc_642, owned_linked_list_popfirst_count_and_survivor_cor
 }
 
 // ---------------------------------------------------------------------------
-// #643 / stdlib §4.9: OwnedDictionary<K,V>.PopValue(k) — remove and return.
+// #643 / stdlib §4.9: OwningDictionary<K,V>.PopValue(k) — remove and return.
 // ---------------------------------------------------------------------------
 
 // stdlib §4.9: PopValue removes entry and returns owned V without disposing.
@@ -224,7 +224,7 @@ BEZEL_TEST(owned_coll_acc_643, owned_dict_popvalue_returns_correct_value) {
         "  public constructor(h: string) Host := h; end constructor; "
         "end Conn; "
         "class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, Conn>(); "
+        "  using var od := new OwningDictionary<string, Conn>(); "
         "  od.Add(\"b\", new Conn(\"hostB\")); "
         "  using var popped := od.PopValue(\"b\"); "
         "  if popped.Host = \"hostB\" then return 1; end; "
@@ -241,7 +241,7 @@ BEZEL_TEST(owned_coll_acc_643, owned_dict_popvalue_removes_key_count_decrements)
         "  public constructor(h: string) end constructor; "
         "end Conn; "
         "class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, Conn>(); "
+        "  using var od := new OwningDictionary<string, Conn>(); "
         "  od.Add(\"x\", new Conn(\"a\")); "
         "  od.Add(\"y\", new Conn(\"b\")); "
         "  var before := od.ContainsKey(\"x\"); "
@@ -264,7 +264,7 @@ BEZEL_TEST(owned_coll_acc_643, owned_dict_popvalue_transfers_ownership_no_double
         "class C public static method Main(): int "
         "  var afterPop := -1; "
         "  do "
-        "    using var od := new OwnedDictionary<string, V>(); "
+        "    using var od := new OwningDictionary<string, V>(); "
         "    od.Add(\"k\", new V()); "
         "    using var popped := od.PopValue(\"k\"); "
         "    afterPop := V._n; "
@@ -275,7 +275,7 @@ BEZEL_TEST(owned_coll_acc_643, owned_dict_popvalue_transfers_ownership_no_double
 
 // ---------------------------------------------------------------------------
 // #654-tail A / stdlib §4.11: Queue<T>.Peek() returns the FIRST element.
-// (Migrated from OwnedQueue<int> → Queue<int> per stdlib §4.2/#1327: owned
+// (Migrated from OwningQueue<int> → Queue<int> per stdlib §4.2/#1327: owned
 // collections require class element types; int is a value type.)
 // ---------------------------------------------------------------------------
 
@@ -324,7 +324,7 @@ BEZEL_TEST(owned_coll_acc_654a, owned_queue_peek_twice_same_value) {
 
 // stdlib §4.11: Stack<T>.Peek() returns the LAST element (top).
 // Regression guard — fixing Queue Peek must not break Stack Peek.
-// (Migrated from OwnedStack<int> → Stack<int> per stdlib §4.2/#1327.)
+// (Migrated from OwningStack<int> → Stack<int> per stdlib §4.2/#1327.)
 BEZEL_TEST(owned_coll_acc_654a, owned_stack_peek_still_returns_last_element) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
@@ -338,7 +338,7 @@ BEZEL_TEST(owned_coll_acc_654a, owned_stack_peek_still_returns_last_element) {
 }
 
 // ---------------------------------------------------------------------------
-// #654-tail B / stdlib §4.10: OwnedSet<T>.TryAdd(owned item) — Count/bool.
+// #654-tail B / stdlib §4.10: OwningSet<T>.TryAdd(owned item) — Count/bool.
 // ---------------------------------------------------------------------------
 
 // stdlib §4.10: TryAdd a fresh item returns true and Count increments.
@@ -346,7 +346,7 @@ BEZEL_TEST(owned_coll_acc_654a, owned_stack_peek_still_returns_last_element) {
 // Encoded: int(added)*100 + Count*10 → 120.
 BEZEL_TEST(owned_coll_acc_654b, owned_set_tryadd_new_item_true_count_increments) {
     BEZEL_EXPECT_EQ(runResource(
-        "using var os := new OwnedSet<R>(); "
+        "using var os := new OwningSet<R>(); "
         "os.Add(new R(1)); "
         "var added := os.TryAdd(new R(2)); "
         "var cnt := os.Count; "
@@ -354,7 +354,7 @@ BEZEL_TEST(owned_coll_acc_654b, owned_set_tryadd_new_item_true_count_increments)
         120);
 }
 
-// stdlib §4.10: For class-typed OwnedSet, equality is reference identity
+// stdlib §4.10: For class-typed OwningSet, equality is reference identity
 // (§8.3).  Two distinct new R(1) objects are NEVER duplicates — each TryAdd
 // returns true and Count increments.
 // Encoded: int(added)*100 + Count*10 → 120.
@@ -366,7 +366,7 @@ BEZEL_TEST(owned_coll_acc_654b, owned_set_tryadd_distinct_class_objects_both_add
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var os := new OwnedSet<R>(); "
+        "  using var os := new OwningSet<R>(); "
         "  os.Add(new R(1)); "
         "  var added := os.TryAdd(new R(1)); " // distinct pointer → not duplicate → true
         "  var cnt := os.Count; "
@@ -374,14 +374,14 @@ BEZEL_TEST(owned_coll_acc_654b, owned_set_tryadd_distinct_class_objects_both_add
         "end Main; end C;"), 120);
 }
 
-// stdlib §4.10: OwnedSet<class T> disposes all its elements at scope end.
+// stdlib §4.10: OwningSet<class T> disposes all its elements at scope end.
 // Add two distinct R objects via TryAdd; on scope end both are disposed.
 // Encoded: afterAdd * 10 + afterScope → 02 (0 disposed during adds, 2 at end).
 BEZEL_TEST(owned_coll_acc_654b, owned_set_class_elements_disposed_at_scope_end) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterAdd := -1; "
         "do "
-        "  using var os := new OwnedSet<R>(); "
+        "  using var os := new OwningSet<R>(); "
         "  os.TryAdd(new R(1)); "
         "  os.TryAdd(new R(2)); "
         "  afterAdd := R._n; "       // 0 — nothing disposed yet
@@ -402,7 +402,7 @@ BEZEL_TEST(owned_coll_acc_654b, owned_set_tryadd_contains_after_success) {
         "  public constructor(v: int) Val := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var os := new OwnedSet<R>(); "
+        "  using var os := new OwningSet<R>(); "
         "  var added := os.TryAdd(new R(42)); "
         "  var cnt := os.Count; "
         "  return int(added) * 10 + cnt; " // 1*10+1 = 11

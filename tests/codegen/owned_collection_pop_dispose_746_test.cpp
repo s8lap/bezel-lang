@@ -1,9 +1,9 @@
-// Spec-derived tests for fix #746 (R41 cluster F) — OwnedStack<T>.Pop() and
-// OwnedQueue<T>.Dequeue() transfer the owned element to the caller, so a
+// Spec-derived tests for fix #746 (R41 cluster F) — OwningStack<T>.Pop() and
+// OwningQueue<T>.Dequeue() transfer the owned element to the caller, so a
 // `using var` binding of the result disposes it at scope end.
 //
-// Authority: stdlib §4.11 — OwnedStack<T>.Pop(): owned T, OwnedQueue<T>.
-// Dequeue(): owned T. OwnedArray.PopLast / OwnedLinkedList.PopFirst already
+// Authority: stdlib §4.11 — OwningStack<T>.Pop(): owned T, OwningQueue<T>.
+// Dequeue(): owned T. OwningArray.PopLast / OwningLinkedList.PopFirst already
 // demonstrate the pattern.
 //
 // Pre-fix, Pop/Dequeue were absent from the owned-return disposal
@@ -30,13 +30,13 @@ const char* kR =
     "  destructor _n := _n + 1; end destructor; end R; ";
 }  // namespace
 
-// §4.11: a `using var` of OwnedStack.Pop() disposes the popped element.
+// §4.11: a `using var` of OwningStack.Pop() disposes the popped element.
 BEZEL_TEST(owned_collection_pop_746, owned_stack_pop_disposes) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var s := new OwnedStack<R>(); "
+        "    using var s := new OwningStack<R>(); "
         "    s.Push(move (new R())); "
         "    using var top := s.Pop(); "
         "  end; "
@@ -44,13 +44,13 @@ BEZEL_TEST(owned_collection_pop_746, owned_stack_pop_disposes) {
         "end Main; end C;"), 1);
 }
 
-// §4.11: a `using var` of OwnedQueue.Dequeue() disposes the dequeued element.
+// §4.11: a `using var` of OwningQueue.Dequeue() disposes the dequeued element.
 BEZEL_TEST(owned_collection_pop_746, owned_queue_dequeue_disposes) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var q := new OwnedQueue<R>(); "
+        "    using var q := new OwningQueue<R>(); "
         "    q.Enqueue(move (new R())); "
         "    using var front := q.Dequeue(); "
         "  end; "
@@ -65,7 +65,7 @@ BEZEL_TEST(owned_collection_pop_746, dequeue_one_keep_one_disposes_both) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var q := new OwnedQueue<R>(); "
+        "    using var q := new OwningQueue<R>(); "
         "    q.Enqueue(move (new R())); q.Enqueue(move (new R())); "
         "    using var front := q.Dequeue(); "
         "  end; "
@@ -90,7 +90,7 @@ BEZEL_TEST(owned_collection_pop_746, borrowing_stack_pop_no_double_free) {
 }
 
 // ===========================================================================
-// #1199 — OwnedArray<T>.PopAt(index) bounds-checks `index` and raises
+// #1199 — OwningArray<T>.PopAt(index) bounds-checks `index` and raises
 // IndexOutOfRangeException when out of range, mirroring the indexer / ElementAt
 // and the stdlib §4.5 reference (PopAt calls BoundsCheck(index) first:
 // `if i < 0 or i >= _count then throw new IndexOutOfRangeException()`).
@@ -111,7 +111,7 @@ BEZEL_TEST(owned_array_popat_1199, ownedarray_popat_oob_throws_1199) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; import System.Collections.Generic; ") + kCell +
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(5)); "
         "  try "
         "    using var c := a.PopAt(10); "
@@ -126,7 +126,7 @@ BEZEL_TEST(owned_array_popat_1199, ownedarray_popat_negative_throws_1199) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; import System.Collections.Generic; ") + kCell +
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(5)); "
         "  try "
         "    using var c := a.PopAt(-1); "
@@ -142,7 +142,7 @@ BEZEL_TEST(owned_array_popat_1199, ownedarray_popat_empty_throws_1199) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; import System.Collections.Generic; ") + kCell +
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  try "
         "    using var c := a.PopAt(0); "
         "    return c.v; "
@@ -158,7 +158,7 @@ BEZEL_TEST(owned_array_popat_1199, ownedarray_popat_inbounds_ok_1199) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; import System.Collections.Generic; ") + kCell +
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(5)); a.Add(new Cell(7)); a.Add(new Cell(9)); "
         "  using var c := a.PopAt(1); "
         "  return c.v; "  // 7

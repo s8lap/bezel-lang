@@ -18,12 +18,12 @@
 //   * `dict[key] := v` (set) is insert-or-replace: it boxes the record value and
 //     stores the box (replacing — and freeing — any prior box for that key).
 //
-// OwnedDictionary<K, record> is intentionally NOT covered: §4.9 constrains
-// `OwnedDictionary<K, V>` to `where V: class`, so a record (a value type) can
+// OwningDictionary<K, record> is intentionally NOT covered: §4.9 constrains
+// `OwningDictionary<K, V>` to `where V: class`, so a record (a value type) can
 // never be an owning dictionary's value. There is therefore no displaced-record
 // disposal path for the indexer setter to model — the borrowing `Dictionary`
 // is the only collection whose indexer takes a record value. (Decline-with-
-// reason: no test is written for an ill-typed `OwnedDictionary<K, record>`.)
+// reason: no test is written for an ill-typed `OwningDictionary<K, record>`.)
 //
 // Each test is LOAD-BEARING: before the fix the indexer get/set bailed for a
 // record value, so the read fell through to the inline-array path (garbage /

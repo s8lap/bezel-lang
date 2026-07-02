@@ -23,7 +23,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // move-only value-typed local).
         if (registerInlineOwnedArrayDisposal(ld)) return false;
         // §29.11 (#943): a plain `var` holding a vtable-backed re-iterable
-        // IEnumerable<T>/OwnedEnumerable<T> source (a yield-iterator result, or an
+        // IEnumerable<T>/IOwningEnumerable<T> source (a yield-iterator result, or an
         // array/user-class wrapped into one) is disposed once at scope end — the
         // for-in over it clones a fresh enumerator per loop and leaves the source
         // alive so a second loop replays. Checked before the unwind-owned path
@@ -56,8 +56,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // pass flagged for affine auto-drop (Owned at a normal-exit scope end,
         // never discharged on any path) is disposed at scope end on BOTH the
         // normal and unwind edges — the same scope-end disposal a `using var`
-        // gets (registerUsingDisposal handles every kind: class, OwnedArray /
-        // OwnedDictionary collections, etc.). The flag is only set for a never-
+        // gets (registerUsingDisposal handles every kind: class, OwningArray /
+        // OwningDictionary collections, etc.). The flag is only set for a never-
         // moved owner, so the slot is always live at scope end and the disposal
         // is exactly-once. registerUnwindOwnedLocal (the unwind-only path) does
         // NOT cover collections, hence routing the flagged local through the
@@ -246,7 +246,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             }
                         } else if (aaddr) {
                             // #820 / §15.4: a HEAP-collection target (`Array<T>`,
-                            // `OwnedArray<T>`, etc.) lowers to a bare `ptr` slot,
+                            // `OwningArray<T>`, etc.) lowers to a bare `ptr` slot,
                             // not an inline ArrayType — the inline path above
                             // missed it, so `field := [1,2,3]` lowered the
                             // CollectionLiteralExpr (which yields null as a general
@@ -473,8 +473,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     handled = lowerBoxFieldStore(*as->target, addr, rhs,
                                                  as->value.get());
                 // #824 / §28.5 / §28.9: a store into a CLASS `owned` collection
-                // field (OwnedArray<T>/OwnedStack<T>/OwnedQueue<T>/OwnedSet<T>/
-                // OwnedLinkedList<T>/OwnedBuffer<T>/OwnedDictionary<T> etc.)
+                // field (OwningArray<T>/OwningStack<T>/OwningQueue<T>/OwningSet<T>/
+                // OwningLinkedList<T>/OwningBuffer<T>/OwningDictionary<T> etc.)
                 // must dispose the old collection (and its owned elements) BEFORE
                 // overwriting the pointer. Without this the old pointer is lost
                 // and the old collection leaks. Mirrors the string/closure/box
@@ -490,7 +490,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // moved-from slot or a self-assign never disposes), then dispatches
                 // the old object's Dispose and reclaims its block. The new value is
                 // stored after disposal. Must come AFTER the collection helper (which
-                // handles OwnedArray<T> etc. via bz_array_free, not emitDisposeAndReclaim)
+                // handles OwningArray<T> etc. via bz_array_free, not emitDisposeAndReclaim)
                 // and BEFORE the local helper (which only fires for plain locals).
                 if (!handled)
                     handled = lowerOwnedClassFieldStore(*as->target, addr, rhs);
@@ -1133,7 +1133,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         !vt->nullable && vt->astNode && vt->astNode->name &&
                         !vt->astNode->name->parts.empty() &&
                         (vt->astNode->name->parts[0] == "Task" ||
-                         vt->astNode->name->parts[0] == "OwnedTask");
+                         vt->astNode->name->parts[0] == "OwningTask");
                     if (isTaskLocal) {
                         llvm::Type* sty = nullptr;
                         if (llvm::Value* slot = lvalueAddr(*id, sty))
@@ -1470,14 +1470,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // enumerator without materializing it.
         if (lowerLazyLinqFor(*fors)) return false;
         // #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()`
-        // ownership-transferring drain over OwnedArray<T>, OwnedLinkedList<T>,
-        // OwnedStack<T>, OwnedQueue<T>.
+        // ownership-transferring drain over OwningArray<T>, OwningLinkedList<T>,
+        // OwningStack<T>, OwningQueue<T>.
         // Must run BEFORE lowerDictDrainFor and lowerIEnumerableBuiltinFor.
         if (lowerOwnedSeqDrainFor(*fors)) return false;
         // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()`
-        // ownership-transferring drain over OwnedDictionary<K,V>.
+        // ownership-transferring drain over OwningDictionary<K,V>.
         // Must run BEFORE lowerIEnumerableBuiltinFor (which also handles
-        // OwnedEnumerable<T> but via vtable dispatch — incorrect for the
+        // IOwningEnumerable<T> but via vtable dispatch — incorrect for the
         // dict drain case, which uses the bz_dict_drain_next_* runtime).
         if (lowerDictDrainFor(*fors)) return false;
         // §29.2 (B1): `for var x in items` where items is IEnumerable<T>
@@ -2793,7 +2793,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
 
 
 // stdlib §4.13 / §29.2 (#728): `for var x in <LinkedList<T>>` (and
-// OwnedLinkedList<T>). A linked list is NOT array-backed, so lowerArrayFor's
+// OwningLinkedList<T>). A linked list is NOT array-backed, so lowerArrayFor's
 // isCollectionTypeName guard excludes it and it would otherwise hit the
 // not-yet-implemented error. Walk the node chain with the runtime cursor
 // (bz_llist_first_node / bz_llist_node_value_ptr / bz_llist_node_next) already
@@ -3250,7 +3250,7 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
 
 
 // issue #370 / §4.10: `for var x in <set>` over a dict-backed Set<T> /
-// OwnedSet<T>. The set's element routes through the generic hash table (records,
+// OwningSet<T>. The set's element routes through the generic hash table (records,
 // primitives/enums, AND strings — see lowerNew / genericBackingType), so the
 // array-backed for-loop (bz_array_*) would read garbage. Enumerate the table's
 // keys (= the set's elements) instead.
@@ -3261,7 +3261,7 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
         iterTy->astNode->name->parts.empty() || iterTy->declaration)
         return false;
     auto n = iterTy->astNode->name->parts[0];
-    if (n != "Set" && n != "OwnedSet") return false;
+    if (n != "Set" && n != "OwningSet") return false;
     const sema::TypeRef* elemTy =
         genericBackingType(iterTy, 0, /*isSet=*/true, nullptr);
     if (!elemTy) return false;  // not dict-backed → let lowerArrayFor handle it
@@ -3912,20 +3912,20 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
 
 
 // #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()` —
-// ownership-transferring drain over OwnedArray<T>, OwnedLinkedList<T>,
-// OwnedStack<T>, OwnedQueue<T>.
+// ownership-transferring drain over OwningArray<T>, OwningLinkedList<T>,
+// OwningStack<T>, OwningQueue<T>.
 //
-// Detection: the iterable expression has type OwnedEnumerable<T> (set by sema
+// Detection: the iterable expression has type IOwningEnumerable<T> (set by sema
 // for the four collection names above) with genericArgs[0] NOT being a
-// DrainedEntry (which would be the OwnedDictionary case, handled below).
+// DrainedEntry (which would be the OwningDictionary case, handled below).
 // Additionally, the iterable must be a Drain() call whose receiver has one of
 // the four recognised type names.
 //
 // Drain order per §28.11 / stdlib §4.5/§4.7/§4.11:
-//   OwnedArray<T>       — front-to-back (bz_array_drain_next)
-//   OwnedQueue<T>       — FIFO = front-to-back (bz_array_drain_next)
-//   OwnedStack<T>       — LIFO = top-first (bz_array_drain_next_lifo)
-//   OwnedLinkedList<T>  — head-to-tail (bz_llist_drain_next)
+//   OwningArray<T>       — front-to-back (bz_array_drain_next)
+//   OwningQueue<T>       — FIFO = front-to-back (bz_array_drain_next)
+//   OwningStack<T>       — LIFO = top-first (bz_array_drain_next_lifo)
+//   OwningLinkedList<T>  — head-to-tail (bz_llist_drain_next)
 //
 // Runtime shape: a single call to the appropriate drain function per loop
 // iteration.  The function pops one element pointer into *val_out and
@@ -3942,14 +3942,14 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     auto* iterTy = ctx_.exprType(*fs.iterable);
     if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
 
-    // Must be OwnedEnumerable<T>.
+    // Must be IOwningEnumerable<T>.
     std::string_view iterName;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty())
         iterName = iterTy->astNode->name->parts[0];
     else if (!iterTy->importedName.empty())
         iterName = iterTy->importedName;
-    if (iterName != "OwnedEnumerable") return false;
+    if (iterName != "IOwningEnumerable") return false;
 
     // Must have one generic arg T that is NOT DrainedEntry (that's the dict path).
     if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
@@ -3978,8 +3978,8 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
         }
     }
     if (!collExpr) return false;
-    if (collName != "OwnedArray" && collName != "OwnedLinkedList" &&
-        collName != "OwnedStack" && collName != "OwnedQueue")
+    if (collName != "OwningArray" && collName != "OwningLinkedList" &&
+        collName != "OwningStack" && collName != "OwningQueue")
         return false;
 
     // Evaluate the collection object.
@@ -3987,7 +3987,7 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     if (!collObj) return false;
 
     // The element type is always a class pointer (ptrTy()) for owned collections.
-    // #990 / §4.5 / §14.2: in a GENERIC collection (`OwnedArray<T>` with T an
+    // #990 / §4.5 / §14.2: in a GENERIC collection (`OwningArray<T>` with T an
     // unresolved class type parameter) `elemTy` is the bare param `T`.  When this
     // method is lowered as the generic TEMPLATE body (no active substitution),
     // lowerTypeRef(T) returns the i32 placeholder, so the element-slot store below
@@ -4018,12 +4018,12 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
 
     // Choose the drain runtime function name based on the collection kind.
     const char* drainFnName;
-    if (collName == "OwnedLinkedList") {
+    if (collName == "OwningLinkedList") {
         drainFnName = "bz_llist_drain_next";      // pops head → head-to-tail
-    } else if (collName == "OwnedStack") {
+    } else if (collName == "OwningStack") {
         drainFnName = "bz_array_drain_next_lifo"; // pops tail → LIFO
     } else {
-        // OwnedArray and OwnedQueue: both drain front-to-back.
+        // OwningArray and OwningQueue: both drain front-to-back.
         drainFnName = "bz_array_drain_next";      // pops index 0 → FIFO/front-to-back
     }
     // bz_array_drain_next / bz_array_drain_next_lifo / bz_llist_drain_next
@@ -4070,11 +4070,11 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
 
 
 // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()` —
-// ownership-transferring drain iteration over OwnedDictionary<K,V>.
+// ownership-transferring drain iteration over OwningDictionary<K,V>.
 //
-// Detection: the iterable expression has type OwnedEnumerable<DrainedEntry<K,V>>
-// (set by sema for OwnedDictionary<K,V>.Drain()). The first generic arg of
-// OwnedEnumerable<T> is T = DrainedEntry<K,V> with importedName=="DrainedEntry".
+// Detection: the iterable expression has type IOwningEnumerable<DrainedEntry<K,V>>
+// (set by sema for OwningDictionary<K,V>.Drain()). The first generic arg of
+// IOwningEnumerable<T> is T = DrainedEntry<K,V> with importedName=="DrainedEntry".
 //
 // Loop variable layout: a 2-field struct alloca {K key; V* value} — mirroring
 // the DictionaryEntry layout used by lowerDictEntryFor. Field 0 = Key, field 1 =
@@ -4090,7 +4090,7 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
 // Partial drain: break exits the loop leaving remaining entries in the dict.
 // The dict's Dispose() (scope-end) will dispose them via bz_dict_free.
 //
-// Per §4.9: OwnedDictionary makes no insertion-order guarantee; iteration walks
+// Per §4.9: OwningDictionary makes no insertion-order guarantee; iteration walks
 // the order[] array in the natural (insertion-recorded) order as a convenience —
 // the spec does not prohibit this, and the runtime note says the order depends
 // on insertion-and-mutation history (not a strict contract). For correctness,
@@ -4099,15 +4099,15 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     auto* iterTy = ctx_.exprType(*fs.iterable);
     if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
-    // Must be OwnedEnumerable<DrainedEntry<K,V>>.
-    // Check the type name is OwnedEnumerable.
+    // Must be IOwningEnumerable<DrainedEntry<K,V>>.
+    // Check the type name is IOwningEnumerable.
     std::string_view iterName;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty())
         iterName = iterTy->astNode->name->parts[0];
     else if (!iterTy->importedName.empty())
         iterName = iterTy->importedName;
-    if (iterName != "OwnedEnumerable") return false;
+    if (iterName != "IOwningEnumerable") return false;
     // Must have one generic arg = DrainedEntry<K,V>.
     if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
     const sema::TypeRef* entryTy = iterTy->genericArgs[0];
@@ -4120,7 +4120,7 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     const sema::TypeRef* keyTy = entryTy->genericArgs[0];
     const sema::TypeRef* valTy = entryTy->genericArgs[1];
 
-    // The iterable must be a Drain() call on an OwnedDictionary.
+    // The iterable must be a Drain() call on an OwningDictionary.
     // Recover the dictionary object pointer by re-evaluating the target of
     // the Drain() CallExpr.
     const ast::Expr* dictExpr = nullptr;
@@ -4132,7 +4132,7 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     }
     if (!dictExpr) return false;
 
-    // Confirm the target has type OwnedDictionary<K,V>.
+    // Confirm the target has type OwningDictionary<K,V>.
     const sema::TypeRef* dictTy = ctx_.exprType(*dictExpr);
     if (!isDictTypeName(dictTy)) return false;
 
@@ -4247,7 +4247,7 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
         }
 
         // Value: rawValPtr IS the owned class pointer (void* stored directly).
-        // V is always a class (OwnedDictionary<K,V> requires V: class), so
+        // V is always a class (OwningDictionary<K,V> requires V: class), so
         // valLlvm == ptrTy(). No further decoding needed.
         llvm::Value* valDecoded = rawValPtr;
 
@@ -4296,7 +4296,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // Only handle the iteration-interface family.
     if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
         n != "ICollection" && n != "IList" &&
-        n != "OwnedEnumerable")
+        n != "IOwningEnumerable")
         return false;
     // Must have a generic arg to determine element type.
     if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
@@ -4323,8 +4323,8 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // - Everything else → array protocol (assumes bz_array_t*)
     //
     // Invariant (fix #1177 / §4.5 / §12.1): lowerLocalDecl wraps ANY
-    // bz_array_t-backed collection (Array, OwnedArray, OwnedBuffer,
-    // Stack/OwnedStack, Queue/OwnedQueue) and (Owned)LinkedList with
+    // bz_array_t-backed collection (Array, OwningArray, OwningBuffer,
+    // Stack/OwningStack, Queue/OwningQueue) and (Owned)LinkedList with
     // a vtable-backed IEnumerable object whenever the local is declared as
     // IEnumerable<T> (see LlvmBackend_Setup.cpp).  So when this path reaches
     // the vtable-dispatch branch below for an IEnumerable<T> local, the slot
@@ -4343,8 +4343,8 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         };
         // §29.2 (#437): a parameter/local typed as the pure `IEnumerable<T>`
         // interface uses vtable dispatch. buildOrderedArgs wraps any array-
-        // backed collection argument (Array, OwnedArray, OwnedBuffer,
-        // Stack/OwnedStack, Queue/OwnedQueue, LinkedList/OwnedLinkedList)
+        // backed collection argument (Array, OwningArray, OwningBuffer,
+        // Stack/OwningStack, Queue/OwningQueue, LinkedList/OwningLinkedList)
         // at the call site, and lowerLocalDecl (#1177) wraps them at the
         // local-variable initializer site, so every IEnumerable<T>-typed
         // identifier always holds a proper vtable-backed wrapper object.
@@ -4536,7 +4536,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     else
         registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
 
-    // §28.3 / §29.2 (#895): for an `OwnedEnumerable<T>` the loop variable OWNS
+    // §28.3 / §29.2 (#895): for an `IOwningEnumerable<T>` the loop variable OWNS
     // each yielded element — sema requires it to be discharged on a normal body
     // exit (a `for var x in Gen() do end` with no discharge is a compile error).
     // On the EXCEPTION path, though, the current element must be auto-disposed
@@ -4548,7 +4548,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // MoveNext (before any element is read) finds null and skips; an explicit
     // discharge in the body nulls the slot → skip; on normal exhaustion the
     // unwindOnly disposal skips (every element was discharged in the body).
-    if (n == "OwnedEnumerable" && elemTy->isPointerTy() &&
+    if (n == "IOwningEnumerable" && elemTy->isPointerTy() &&
         !disposeStack_.empty()) {
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), varSlot);
         Disposal dv{varSlot, nullptr};
@@ -4578,7 +4578,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     builder_.CreateCondBr(moved, bodyBB, endBB);
 
     // body: call vtable slot 3 (Current for IEnumerable / TakeCurrent for
-    // OwnedEnumerable — §29.1 v0.161 #1349). emitPendingCheck() after the
+    // IOwningEnumerable — §29.1 v0.161 #1349). emitPendingCheck() after the
     // call handles the IOE that TakeCurrent raises on protocol misuse (double-
     // take etc.); for IEnumerable Current the check is a harmless no-op.
     builder_.SetInsertPoint(bodyBB);
@@ -4947,7 +4947,7 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     builder_.CreateCondBr(hasValue, bodyBB, endBB);
 
     // body: x := Current(enum) for IAsyncEnumerable / TakeCurrent(enum) for
-    // OwnedAsyncEnumerable (§29.1 v0.161 #1349; same vtable slot 3).
+    // IOwningAsyncEnumerable (§29.1 v0.161 #1349; same vtable slot 3).
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* enumObj2 = builder_.CreateLoad(ptrTy(), enumSlot);
     llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), enumObj2);

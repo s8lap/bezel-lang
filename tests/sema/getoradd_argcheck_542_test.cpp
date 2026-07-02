@@ -4,7 +4,7 @@
 //
 // Per stdlib §4.8:
 //   public method GetOrAdd(key: K, factory: (K) -> V): V;
-// Per stdlib §4.9 (OwnedDictionary):
+// Per stdlib §4.9 (OwningDictionary):
 //   public method GetOrAdd(key: K, factory: (K) -> owned V): V;
 //
 // Before fix (#542): `d.GetOrAdd("a", 99)` emitted no sema error; codegen
@@ -19,8 +19,8 @@
 //   (b) string literal as factory → error
 //   (c) bool literal as factory → error
 //   (d) valid lambda factory `(k) => 7` → no error
-//   (e) OwnedDictionary: same int-literal rejection → error
-//   (f) OwnedDictionary: valid lambda → no error
+//   (e) OwningDictionary: same int-literal rejection → error
+//   (f) OwningDictionary: valid lambda → no error
 //   (g) LINQ Where/Select with valid lambdas still compile fine (control)
 //   (h) Array<T>.Sorted(comparer) with valid comparer still compiles fine
 
@@ -49,17 +49,17 @@ bool anyDiagContains(const bezel::test::SemaResult& r, std::string_view needle) 
 
 // Wrap a method body in a module/class that has:
 //   d  : Dictionary<string, int>
-//   od : OwnedDictionary<string, Val>  (Val is a class; §4.2/#1327 rejects int)
+//   od : OwningDictionary<string, Val>  (Val is a class; §4.2/#1327 rejects int)
 //   arr: Array<int>
 //   n  : int
 std::string wrap(const std::string& body) {
     return std::string(
         "module M; "
-        "class Val end Val; "       // minimal class for OwnedDictionary value
+        "class Val end Val; "       // minimal class for OwningDictionary value
         "class C "
         "public method M("
         "  d: Dictionary<string, int>, "
-        "  od: OwnedDictionary<string, Val>, "
+        "  od: OwningDictionary<string, Val>, "
         "  arr: Array<int>, "
         "  n: int"
         ") ") + body + " end M; end C;";
@@ -110,21 +110,21 @@ BEZEL_TEST(sema_getoradd_argcheck_542,
 }
 
 // ===========================================================================
-// §4.9 — GetOrAdd on OwnedDictionary<K,V>: same factory requirement
+// §4.9 — GetOrAdd on OwningDictionary<K,V>: same factory requirement
 // ===========================================================================
 
 // §4.9 / #542: passing an int literal as the factory argument to
-// OwnedDictionary.GetOrAdd must also be rejected.
-// od is OwnedDictionary<string, Val>; factory must be (string) -> owned Val.
+// OwningDictionary.GetOrAdd must also be rejected.
+// od is OwningDictionary<string, Val>; factory must be (string) -> owned Val.
 BEZEL_TEST(sema_getoradd_argcheck_542,
            owned_dict_getoradd_int_factory_arg_is_rejected_spec_4_9) {
     auto r = parseSemaAll(wrap("_ := od.GetOrAdd(\"a\", 99);"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §4.9 / #542: a valid lambda factory on OwnedDictionary.GetOrAdd must be
+// §4.9 / #542: a valid lambda factory on OwningDictionary.GetOrAdd must be
 // accepted without errors.
-// od is OwnedDictionary<string, Val>; factory returns owned Val.
+// od is OwningDictionary<string, Val>; factory returns owned Val.
 BEZEL_TEST(sema_getoradd_argcheck_542,
            owned_dict_getoradd_valid_lambda_accepted_spec_4_9) {
     auto r = parseSemaAll(wrap("var v: Val := od.GetOrAdd(\"a\", (k) => new Val());"));

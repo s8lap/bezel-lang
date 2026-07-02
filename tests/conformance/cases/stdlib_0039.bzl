@@ -1,5 +1,5 @@
-public class OwnedArray<T>: IOwnedList<T> where T: class
-  private owned _storage: OwnedBuffer<T>;
+public class OwningArray<T>: IOwningList<T> where T: class
+  private owned _storage: OwningBuffer<T>;
   private _count: int := 0;
 
   public constructor()
@@ -7,7 +7,7 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   end constructor;
 
   public constructor(capacity: int)
-    _storage := new OwnedBuffer<T>(if capacity > 0 then capacity else 1);
+    _storage := new OwningBuffer<T>(if capacity > 0 then capacity else 1);
   end constructor;
 
   public readonly property Count: int => _count;
@@ -70,7 +70,7 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   end BoundsCheck;
 
   private method GrowTo(newCapacity: int)
-    var fresh := new OwnedBuffer<T>(newCapacity);
+    var fresh := new OwningBuffer<T>(newCapacity);
     for var i in 0..<_count do
       var moved := move _storage[i];                 // moved: T? (owned)
       _storage[i] := null;                            // restore moved-from slot
@@ -84,4 +84,4 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   // No destructor declared; the compiler generates the default Dispose
   // which disposes _storage's contents (every non-null slot's owned T)
   // and the buffer's storage block, in that order.
-end OwnedArray;
+end OwningArray;

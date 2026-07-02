@@ -20,14 +20,14 @@
 //   verifier aborts.
 //
 //   Fix (LlvmBackend_Setup.cpp): when the collection literal's resolved target is
-//   a heap, array-backed sequence collection (Array<T> / OwnedArray<T> / Stack /
-//   OwnedStack / Queue / OwnedQueue), MATERIALIZE a real heap collection via the
+//   a heap, array-backed sequence collection (Array<T> / OwningArray<T> / Stack /
+//   OwningStack / Queue / OwningQueue), MATERIALIZE a real heap collection via the
 //   runtime — the SAME bz_array_alloc the `new Array<T>()` path emits plus the
 //   SAME bz_array_add the `.Add(...)` path emits — and store the resulting
 //   pointer. The inline-array path is unchanged for `[N]T` targets.
 //
 //   Spec: §15.4 (collection literals), §15.2 (heap arrays), stdlib §4.4 (Array<T>),
-//   §4.5 (OwnedArray<T>), §28.3 / §28.10 (ownership/disposal of the owned result).
+//   §4.5 (OwningArray<T>), §28.3 / §28.10 (ownership/disposal of the owned result).
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -409,7 +409,7 @@ void expectDisposedAndLeakFree465(const std::string& source, int expectedExit) {
     BEZEL_EXPECT_EQ(lsan, 0);     // 0 == LSan clean (no leak, no UAF/DF)
 }
 
-// §15.4 / §28.10 / stdlib §4.5 / #465: a `using var OwnedArray<Res>` literal of
+// §15.4 / §28.10 / stdlib §4.5 / #465: a `using var OwningArray<Res>` literal of
 // class elements — disposing the array once disposes each element's destructor
 // exactly once (count == 3), and the backing + element blocks are reclaimed
 // (LSan clean: no leak, no double-free).
@@ -420,7 +420,7 @@ const char* kOwnedArrayLiteralDispose =
     "  public constructor(v: int) V := v; end constructor; "
     "  destructor Res.count := Res.count + 1; end destructor; "
     "  public static method Main(): int "
-    "    do using var a: OwnedArray<Res> := "
+    "    do using var a: OwningArray<Res> := "
     "         [new Res(1), new Res(2), new Res(3)]; end; "
     "    return Res.count; "
     "  end Main; "

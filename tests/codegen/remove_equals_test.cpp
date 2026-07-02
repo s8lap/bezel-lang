@@ -1,4 +1,4 @@
-// Codegen — Array<T>/OwnedArray<T>.Remove(item) matches via the element type's
+// Codegen — Array<T>/OwningArray<T>.Remove(item) matches via the element type's
 // EQUALITY, not just reference identity (issue #400).
 //
 // stdlib §4.4/§4.5: `Remove(item): bool` finds and removes the first matching
@@ -9,7 +9,7 @@
 // `Equals`.
 //
 // The Remove query argument is a PURE BORROW (§4.5: "borrow-taking query"): the
-// caller still owns it; Remove only compares. A matched OwnedArray element is
+// caller still owns it; Remove only compares. A matched OwningArray element is
 // DISPOSED exactly once on removal; a borrowing Array's Remove disposes nothing.
 //
 // Disposal is made observable through a static destructor counter returned in
@@ -30,7 +30,7 @@ int run(const std::string& src) {
 
 }  // namespace
 
-// §25.2/§8.3/§8.4: an OwnedArray<Box> element matches an equal-but-DISTINCT Box
+// §25.2/§8.3/§8.4: an OwningArray<Box> element matches an equal-but-DISTINCT Box
 // through the user `Equals` override (not reference identity). The query Box(2)
 // is a different instance from the stored Box(2); reference identity would not
 // match, but value equality (X = X) does. Remove returns true and Count drops to
@@ -48,7 +48,7 @@ BEZEL_TEST(remove_equals_4_5, owned_array_remove_via_user_equals_match) {
         "  public override method GetHashCode(): int => X; "
         "end Box; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Box>(); "
+        "  using var a := new OwningArray<Box>(); "
         "  a.Add(move (new Box(1))); "
         "  a.Add(move (new Box(2))); "
         "  a.Add(move (new Box(3))); "
@@ -124,7 +124,7 @@ BEZEL_TEST(remove_equals_8_3, no_override_reference_identity_distinct_miss) {
         "end Main; end C;"), 88);
 }
 
-// stdlib §4.5: an OwnedArray's MATCHED element is DISPOSED exactly once on
+// stdlib §4.5: an OwningArray's MATCHED element is DISPOSED exactly once on
 // removal; the query argument is a PURE BORROW and is NOT disposed by Remove.
 // The destructor counter R._n is returned. Three elements (1,2,3); Remove(query)
 // matches the stored R(2) via Equals and disposes it (counter 1). The query is
@@ -151,7 +151,7 @@ BEZEL_TEST(remove_equals_4_5, owned_remove_disposes_matched_once_query_borrowed)
         "class C public static method Main(): int "
         "  var afterRemove := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R(1))); "
         "    a.Add(move (new R(2))); "
         "    a.Add(move (new R(3))); "
@@ -196,7 +196,7 @@ BEZEL_TEST(remove_equals_4_4, borrowing_array_remove_disposes_nothing) {
         "end Main; end C;"), 3);
 }
 
-// stdlib §4.5: a Remove MISS on an OwnedArray returns false and disposes NOTHING
+// stdlib §4.5: a Remove MISS on an OwningArray returns false and disposes NOTHING
 // (no element matched). Encoded: <counter after the miss>*10 + <final counter>.
 // query R(9) matches no stored element (1,2,3); after Remove the counter is 0;
 // the array scope-end disposes all 3 stored elements and the query (+1) → 4.
@@ -217,7 +217,7 @@ BEZEL_TEST(remove_equals_4_5, owned_remove_miss_disposes_nothing) {
         "class C public static method Main(): int "
         "  var afterMiss := -1; var removed := true; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R(1))); "
         "    a.Add(move (new R(2))); "
         "    a.Add(move (new R(3))); "

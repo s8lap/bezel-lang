@@ -11,7 +11,7 @@
 // never going through lowerCall.
 //
 // Fix (§29.2 / §29.3): in lowerCall's !ms branch, detect MoveNext/Current on a
-// builtin IEnumerator<T>/OwnedEnumerator<T> receiver and dispatch through the
+// builtin IEnumerator<T>/IOwningEnumerator<T> receiver and dispatch through the
 // iterator vtable directly (slot 2 → i1 for MoveNext, slot 3 → T for Current),
 // matching the vtable layout emitted by emitIteratorMethod. Also type these calls
 // in sema (MoveNext → bool, Current → T) so collectSuspendLocals and annotated

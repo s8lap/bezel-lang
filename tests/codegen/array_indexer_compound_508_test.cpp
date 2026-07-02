@@ -16,7 +16,7 @@
 // Fix: add lowerCollectionIndexerCompound in LlvmBackend_Assign.cpp, called
 // after lowerIndexerCompound; it evaluates receiver+index once, calls
 // bz_array_get to read the current value, applies the operator, and calls
-// bz_array_set (or bz_array_set_disposing for OwnedArray) to write back.
+// bz_array_set (or bz_array_set_disposing for OwningArray) to write back.
 //
 // Tests derived from §17.15 / §4.4. Controls verify that the pre-existing
 // correct paths are undisturbed.

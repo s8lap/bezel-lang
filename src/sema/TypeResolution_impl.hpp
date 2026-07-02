@@ -242,7 +242,7 @@ private:
     // `override GetHashCode`.  Heterogeneous-operand overloads are exempt.
     void checkEqualityCoDeclaration();
     // §3.6 / §8.3 (v0.158, #1338): every recorded `Dictionary<K,V>` /
-    // `OwnedDictionary<K,V>` key (K) and `Set<T>` / `OwnedSet<T>` element (T)
+    // `OwningDictionary<K,V>` key (K) and `Set<T>` / `OwningSet<T>` element (T)
     // must be equality-bearing (§3.6 rule 2, at the instantiation site).
     void checkHashContainerKeys();
 
@@ -522,7 +522,7 @@ private:
 
     // §3.6 / §8.3 (v0.158, #1338): one hash-container instantiation site whose
     // key/element must be equality-bearing. Recorded while resolving a
-    // `Dictionary`/`OwnedDictionary`/`Set`/`OwnedSet` `Named<...>` annotation;
+    // `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` `Named<...>` annotation;
     // validated by checkHashContainerKeys() after every member type is resolved
     // (a record key's auto-equality-bearing property depends on the record's own
     // members being resolved, which may happen after this site is visited).

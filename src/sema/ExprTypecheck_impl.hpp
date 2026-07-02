@@ -211,13 +211,13 @@ private:
     std::vector<TypeRef*> pendingLambdaParamTypes_;
 
     // issue #777 / §30.6: when about to visit an `async` lambda whose expected
-    // function type is `(…) -> Task<T>` / `(…) -> OwnedTask<T>`, this holds the
+    // function type is `(…) -> Task<T>` / `(…) -> OwningTask<T>`, this holds the
     // peeled element type T so the lambda visitor can reject a forgotten `await`
     // (an expression body that produces a `Task` value where T is expected).
     // Null otherwise. Consumed (and cleared) by visitExpr(LambdaExpr).
     TypeRef* pendingLambdaReturnType_ = nullptr;
 
-    // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwnedTask<…>`
+    // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
     // (the async task wrapper). Used to detect a forgotten `await`.
     bool isTaskShapedRef(const TypeRef* t) const;
 
@@ -312,7 +312,7 @@ private:
 
     // async-readiness 3b (§30.1): compute the return-FORM context and the
     // result-assignability type for an `async` method's body by peeling the
-    // task wrapper. `Task` → VoidMethod (no result); `Task<T>` / `OwnedTask<T>`
+    // task wrapper. `Task` → VoidMethod (no result); `Task<T>` / `OwningTask<T>`
     // → ValueMethod with result type T; everything else → VoidMethod.
     void asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
                                TypeRef*& outType);
@@ -807,7 +807,7 @@ private:
     // a borrowing Array<T> — or any read-only span), return that span type name;
     // otherwise the empty string. Such spans' slots hold borrows with no
     // ownership to transfer, so `move span[i]` is rejected at compile time. The
-    // OWNING `Span<T>` (over an `OwnedBuffer`) is NOT matched here.
+    // OWNING `Span<T>` (over an `OwningBuffer`) is NOT matched here.
     std::string moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const;
 
     // §30.14 / §3.6 (#600): sendability derived-type property.

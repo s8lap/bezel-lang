@@ -5,7 +5,7 @@
 // §14.4: the owning family admits both class AND interface element types.
 //
 // Prior to fix #619 the owning-collection element-policy helpers checked for
-// Class only; an OwnedArray<IFoo> or OwnedDictionary<K,IFoo> would silently
+// Class only; an OwningArray<IFoo> or OwningDictionary<K,IFoo> would silently
 // skip element disposal (the backing storage was freed but no destructor ran).
 //
 // Test structure:
@@ -13,8 +13,8 @@
 //   * Two sealed implementing classes ImplA and ImplB, each with a static
 //     destructor counter (_nA, _nB) and a shared total counter (_n).
 //   * All collection operations exercised with interface-typed elements.
-//   * Reverse-insertion order for OwnedArray (§28.11 ordered collections).
-//   * OwnedDictionary: scope-end disposal, Remove, indexer-overwrite, Clear.
+//   * Reverse-insertion order for OwningArray (§28.11 ordered collections).
+//   * OwningDictionary: scope-end disposal, Remove, indexer-overwrite, Clear.
 //   * Move out (PopAt equivalent via move arr[i]) leaves remaining disposal
 //     correct.
 //   * LSan-backed native tests for leak/UAF/double-free assurance.
@@ -165,10 +165,10 @@ std::string prog(const std::string& mainBody) {
 }  // namespace
 
 // ===========================================================================
-// OwnedArray<ICounter> — §28.11 / §14.4
+// OwningArray<ICounter> — §28.11 / §14.4
 // ===========================================================================
 
-// §28.11 owned column / §14.4: OwnedArray<IFace>.Dispose() (scope-end) must
+// §28.11 owned column / §14.4: OwningArray<IFace>.Dispose() (scope-end) must
 // dispose each interface-typed element via vtable dispatch. Two elements (one
 // ImplA, one ImplB) → both destructors run → ImplA._n == 1, ImplB._n == 1,
 // total disposed == 2. Before #619 the elements leaked → ImplA._n + ImplB._n
@@ -178,20 +178,20 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
            owned_array_iface_elements_disposed_on_scope_end) {
     expectDisposedAndLeakFree(prog(
         "do "
-        "  using var a := new OwnedArray<ICounter>(); "
+        "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplB(2))); "
         "end; "
         "return ImplA._nA * 10 + ImplB._nB;"), 11);
 }
 
-// §28.11: OwnedArray<ICounter> disposes ALL elements exactly once — no leak,
+// §28.11: OwningArray<ICounter> disposes ALL elements exactly once — no leak,
 // no double-dispose. Three elements (3 ImplA instances) → _n == 3.
 BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
            owned_array_iface_all_three_disposed_once) {
     expectDisposedAndLeakFree(prog(
         "do "
-        "  using var a := new OwnedArray<ICounter>(); "
+        "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplA(2))); "
         "  a.Add(move (new ImplA(3))); "
@@ -206,7 +206,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
            owned_array_iface_disposes_reverse_insertion_order) {
     expectDisposedAndLeakFree(prog(
         "do "
-        "  using var a := new OwnedArray<ICounter>(); "
+        "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplA(2))); "
         "  a.Add(move (new ImplA(3))); "
@@ -214,7 +214,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
         "return ImplA._log;"), 321);
 }
 
-// §28.11: OwnedArray<IFace>.Clear() disposes every interface element.
+// §28.11: OwningArray<IFace>.Clear() disposes every interface element.
 // Two elements added; Clear() disposes both (count 2); scope-end finds empty
 // array and disposes nothing more (still 2). Encode: afterClear*10+final → 22.
 BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
@@ -222,7 +222,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
     BEZEL_EXPECT_EQ(run(prog(
         "var afterClear := -1; "
         "do "
-        "  using var a := new OwnedArray<ICounter>(); "
+        "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplA(2))); "
         "  a.Clear(); "
@@ -231,7 +231,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
         "return afterClear * 10 + ImplA._n;")), 22);
 }
 
-// §28.11: OwnedArray<IFace>.RemoveAt(i) disposes the removed element only.
+// §28.11: OwningArray<IFace>.RemoveAt(i) disposes the removed element only.
 // Three elements; RemoveAt(1) disposes the middle one (count 1); scope-end
 // disposes the remaining two (count 3). Encode: afterRemove*10+final → 13.
 BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
@@ -239,7 +239,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
     BEZEL_EXPECT_EQ(run(prog(
         "var afterRemove := -1; "
         "do "
-        "  using var a := new OwnedArray<ICounter>(); "
+        "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplA(2))); "
         "  a.Add(move (new ImplA(3))); "
@@ -249,7 +249,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
         "return afterRemove * 10 + ImplA._n;")), 13);
 }
 
-// §28.11: move out of an OwnedArray<IFace> slot via `move a[i]` extracts the
+// §28.11: move out of an OwningArray<IFace> slot via `move a[i]` extracts the
 // element WITHOUT disposing it (caller takes ownership). The remaining element
 // IS disposed when the array goes out of scope. Two elements; move index 0 out
 // (no disposal yet), then scope ends disposing the one remaining element.
@@ -259,7 +259,7 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
     BEZEL_EXPECT_EQ(run(prog(
         "var movedOut: ICounter? := null; "
         "do "
-        "  using var a := new OwnedArray<ICounter>(); "
+        "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplA(2))); "
         "  movedOut := move a[0]; "   // takes ownership of index 0
@@ -270,10 +270,10 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
 }
 
 // ===========================================================================
-// OwnedDictionary<string, ICounter> — §28.11 / §14.4
+// OwningDictionary<string, ICounter> — §28.11 / §14.4
 // ===========================================================================
 
-// §28.11 / §4.9: OwnedDictionary<string, IFace> disposes surviving values at
+// §28.11 / §4.9: OwningDictionary<string, IFace> disposes surviving values at
 // scope end. Two values (ImplA and ImplB) both survive → count 2.
 // Before #619 the values leaked → count 0.
 // Encode: ImplA._nA * 10 + ImplB._nB → 11.
@@ -282,7 +282,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
     expectDisposedAndLeakFree(prog(
         "var inside := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, ICounter>(); "
+        "  using var d := new OwningDictionary<string, ICounter>(); "
         "  d.Add(\"a\", move (new ImplA(1))); "
         "  d.Add(\"b\", move (new ImplB(2))); "
         "  inside := ImplA._nA + ImplB._nB; "  // 0 (nothing disposed yet)
@@ -290,7 +290,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
         "return inside * 100 + ImplA._nA * 10 + ImplB._nB;"), 11);
 }
 
-// §28.11 / §4.9: OwnedDictionary<string, IFace>.Clear() disposes all values.
+// §28.11 / §4.9: OwningDictionary<string, IFace>.Clear() disposes all values.
 // Two survivors; Clear() disposes both (count 2 at afterClear); scope-end
 // finds an empty dict (count still 2). Encode: afterClear*10+final → 22.
 BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
@@ -298,7 +298,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
     BEZEL_EXPECT_EQ(run(prog(
         "var afterClear := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, ICounter>(); "
+        "  using var d := new OwningDictionary<string, ICounter>(); "
         "  d.Add(\"a\", move (new ImplA(1))); "
         "  d.Add(\"b\", move (new ImplA(2))); "
         "  d.Clear(); "
@@ -307,7 +307,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
         "return afterClear * 10 + ImplA._n;")), 22);
 }
 
-// §4.9: OwnedDictionary<string, IFace>.Remove(k) disposes the removed value.
+// §4.9: OwningDictionary<string, IFace>.Remove(k) disposes the removed value.
 // Add two values; Remove("a") disposes that value (count 1); scope-end disposes
 // the remaining "b" (count 2). Encode: afterRemove*10+final → 12.
 BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
@@ -315,7 +315,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
     BEZEL_EXPECT_EQ(run(prog(
         "var afterRemove := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, ICounter>(); "
+        "  using var d := new OwningDictionary<string, ICounter>(); "
         "  d.Add(\"a\", move (new ImplA(1))); "
         "  d.Add(\"b\", move (new ImplA(2))); "
         "  d.Remove(\"a\"); "
@@ -324,7 +324,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
         "return afterRemove * 10 + ImplA._n;")), 12);
 }
 
-// §4.9: indexer-overwrite on OwnedDictionary<string, IFace> disposes the
+// §4.9: indexer-overwrite on OwningDictionary<string, IFace> disposes the
 // displaced value. Overwrite "a" → first ImplA(1) is disposed (count 1);
 // at scope end the two survivors ("a"-second, "b") are disposed (count 3).
 // The displaced value must NOT be disposed again (no double-free).
@@ -334,7 +334,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
     expectDisposedAndLeakFree(prog(
         "var afterDisplace := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, ICounter>(); "
+        "  using var d := new OwningDictionary<string, ICounter>(); "
         "  d[\"a\"] := move (new ImplA(1)); "
         "  d[\"b\"] := move (new ImplA(2)); "
         "  d[\"a\"] := move (new ImplA(3)); "   // displaces ImplA(1)
@@ -344,7 +344,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
 }
 
 // ===========================================================================
-// OwnedDictionary<int, ICounter> — generic-key path (§4.9 / D3)
+// OwningDictionary<int, ICounter> — generic-key path (§4.9 / D3)
 // ===========================================================================
 
 // §28.11 / §4.9: generic-key path must also dispose interface-valued elements.
@@ -354,7 +354,7 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
     expectDisposedAndLeakFree(prog(
         "var inside := -1; "
         "do "
-        "  using var d := new OwnedDictionary<int, ICounter>(); "
+        "  using var d := new OwningDictionary<int, ICounter>(); "
         "  d.Add(1, move (new ImplA(1))); "
         "  d.Add(2, move (new ImplA(2))); "
         "  inside := ImplA._n; "  // 0 (nothing disposed yet)
@@ -363,17 +363,17 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
 }
 
 // ===========================================================================
-// OwnedLinkedList<ICounter> — §28.11 ordered collection / §14.4
+// OwningLinkedList<ICounter> — §28.11 ordered collection / §14.4
 // ===========================================================================
 
-// §28.11: OwnedLinkedList<IFace>.Dispose() disposes elements in reverse-
+// §28.11: OwningLinkedList<IFace>.Dispose() disposes elements in reverse-
 // insertion order. AddLast(ImplA(1)), AddLast(ImplA(2)), AddLast(ImplA(3))
 // → dispose 3 first, then 2, then 1 → _log == 321.
 BEZEL_TEST(owned_llist_iface_619_spec_28_11_14_4,
            owned_llist_iface_disposes_reverse_insertion_order) {
     expectDisposedAndLeakFree(prog(
         "do "
-        "  using var ll := new OwnedLinkedList<ICounter>(); "
+        "  using var ll := new OwningLinkedList<ICounter>(); "
         "  ll.AddLast(move (new ImplA(1))); "
         "  ll.AddLast(move (new ImplA(2))); "
         "  ll.AddLast(move (new ImplA(3))); "
@@ -381,12 +381,12 @@ BEZEL_TEST(owned_llist_iface_619_spec_28_11_14_4,
         "return ImplA._log;"), 321);
 }
 
-// §28.11: all interface-typed elements in OwnedLinkedList disposed exactly once.
+// §28.11: all interface-typed elements in OwningLinkedList disposed exactly once.
 BEZEL_TEST(owned_llist_iface_619_spec_28_11_14_4,
            owned_llist_iface_all_elements_disposed_once) {
     expectDisposedAndLeakFree(prog(
         "do "
-        "  using var ll := new OwnedLinkedList<ICounter>(); "
+        "  using var ll := new OwningLinkedList<ICounter>(); "
         "  ll.AddLast(move (new ImplA(1))); "
         "  ll.AddLast(move (new ImplB(2))); "
         "end; "
@@ -395,7 +395,7 @@ BEZEL_TEST(owned_llist_iface_619_spec_28_11_14_4,
 
 // ===========================================================================
 // #819 / §14.4: a RECORD implementing an interface, added to an
-// OwnedArray<IFace>, must be HEAP-BOXED so a vtable sits at word 0. Before the
+// OwningArray<IFace>, must be HEAP-BOXED so a vtable sits at word 0. Before the
 // fix the raw record bytes were stored in the pointer-sized slot and the element
 // disposer treated the first field as a vtable pointer → SIGSEGV on disposal.
 // (The class-element case above already worked; records are the gap.)
@@ -414,7 +414,7 @@ BEZEL_TEST(owned_coll_iface_819_record_box, record_added_count) {
     BEZEL_EXPECT_EQ(run(
         std::string(kRecordIfaceProg) +
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<IFoo>(); "
+        "  using var arr := new OwningArray<IFoo>(); "
         "  arr.Add(new R(5)); "
         "  return arr.Count; "                         // 1
         "end Main; end C;"), 1);
@@ -425,20 +425,20 @@ BEZEL_TEST(owned_coll_iface_819_record_box, record_dispatch_through_box) {
     BEZEL_EXPECT_EQ(run(
         std::string(kRecordIfaceProg) +
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<IFoo>(); "
+        "  using var arr := new OwningArray<IFoo>(); "
         "  arr.Add(new R(5)); "
         "  return arr[0].Foo(); "                       // 5
         "end Main; end C;"), 5);
 }
 
-// Disposal of an OwnedArray<IFoo> holding boxed records is leak-free and
+// Disposal of an OwningArray<IFoo> holding boxed records is leak-free and
 // crash-free (the boxes are reclaimed exactly once).
 BEZEL_TEST(owned_coll_iface_819_record_box, record_elements_disposed_leak_free) {
     const std::string p =
         std::string(kRecordIfaceProg) +
         "class C public static method Main(): int "
         "  do "
-        "    using var arr := new OwnedArray<IFoo>(); "
+        "    using var arr := new OwningArray<IFoo>(); "
         "    arr.Add(new R(1)); "
         "    arr.Add(new R(2)); "
         "  end; "
@@ -462,7 +462,7 @@ BEZEL_TEST(owned_coll_iface_819_record_box, class_element_unaffected) {
         "  destructor end destructor; "
         "end K; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<IFoo>(); "
+        "  using var arr := new OwningArray<IFoo>(); "
         "  arr.Add(new K(7)); "
         "  return arr[0].Foo(); "                       // 7
         "end Main; end C;"), 7);

@@ -10,15 +10,15 @@
 // The fix has two parts, split by soundness (stdlib §4.1–§4.3):
 //
 //   * SOUND BRIDGE — the array-backed *list* interfaces IReadOnlyList<T> and
-//     IList<T> are implemented ONLY by the array-backed Array<T> / OwnedArray<T>,
+//     IList<T> are implemented ONLY by the array-backed Array<T> / OwningArray<T>,
 //     so an interface-typed receiver carries the same bz_array_t* as the concrete
 //     collection and Count/Add/Clear/Contains/Remove/IndexOf/Insert lower through
 //     the identical bz_array_* runtime — the same bridge the indexer get/set
 //     already use (#401). These now compute the correct value.
 //
 //   * CLEAN DIAGNOSTIC — the *non-list* collection interfaces IReadOnlyCollection
-//     <T> / ICollection<T> / IOwnedCollection<T> (and the owning list interface
-//     IOwnedList<T> for mutation) are genuinely polymorphic: they are implemented
+//     <T> / ICollection<T> / IOwningCollection<T> (and the owning list interface
+//     IOwningList<T> for mutation) are genuinely polymorphic: they are implemented
 //     by collections with INCOMPATIBLE runtime representations (Array → bz_array_t*
 //     count@8; LinkedList → bz_llist_t* count@16; Dictionary/Set → bz_dict_t*),
 //     the interface-typed receiver erases which backing it holds, the structs
@@ -69,7 +69,7 @@ BEZEL_TEST(collection_interface_853, ireadonlylist_count_4_1) {
         "  end Main; end C;"), 3);
 }
 
-// §4.1 / §4.3 (#853): an OwnedArray viewed as IReadOnlyList<T> — the shared
+// §4.1 / §4.3 (#853): an OwningArray viewed as IReadOnlyList<T> — the shared
 // read-only view of an OWNING array-backed collection (§4.3) — reads Count
 // through the interface. The owner disposes elements at scope end.
 BEZEL_TEST(collection_interface_853, ireadonlylist_over_owned_count_4_3) {
@@ -79,7 +79,7 @@ BEZEL_TEST(collection_interface_853, ireadonlylist_over_owned_count_4_3) {
         "class C "
         "  public static method GetCount(c: IReadOnlyList<R>): int => c.Count; "
         "  public static method Main(): int "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R(1))); a.Add(move (new R(2))); "
         "    return GetCount(a); "                          // 2
         "  end Main; end C;"), 2);

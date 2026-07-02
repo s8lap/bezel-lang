@@ -1,3 +1,3 @@
-using var src := new OwnedTaskCompletionSource<MyClass>();
+using var src := new OwningTaskCompletionSource<MyClass>();
 src.SetException(ex);
-return src.Task;       // typed as OwnedTask<MyClass>
+return src.Task;       // typed as OwningTask<MyClass>

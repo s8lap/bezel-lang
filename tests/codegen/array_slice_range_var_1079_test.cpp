@@ -80,13 +80,13 @@ BEZEL_TEST(array_slice_range_var_1079, scalar_index_var_unchanged) {
         "end Main; end C;"), 8);
 }
 
-// §15.6: slicing OwnedArray<T> by a range VARIABLE is rejected, just like the
+// §15.6: slicing OwningArray<T> by a range VARIABLE is rejected, just like the
 // literal form — the copy-returning slice would manufacture a second owner.
 BEZEL_TEST(array_slice_range_var_1079, owned_array_range_var_rejected) {
     BEZEL_EXPECT_TRUE(rejects(
         "module M; class Cell public V: int := 0; end Cell; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<Cell>(); "
+        "  using var arr := new OwningArray<Cell>(); "
         "  var r := 0..1; "
         "  using var s := arr[r]; "
         "  return 0; "

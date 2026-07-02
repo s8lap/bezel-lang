@@ -198,7 +198,7 @@ BEZEL_TEST(own_escape, return_reference_user_indexer_on_using_var_diagnosed) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 GUARD (cardinal risk): a built-in `OwnedArray<R>` slot read
+// §28.3 / §28.11 GUARD (cardinal risk): a built-in `OwningArray<R>` slot read
 // `owner[0]` (R a class) produces a BORROW of the slot (spec §28.3: "the
 // indexer-get produces a borrow"). Reading it from a `using var` owned-array
 // local and returning the bound result is still rejected — the FINDING-[6]
@@ -208,7 +208,7 @@ BEZEL_TEST(own_escape, return_owned_array_slot_on_using_var_diagnosed) {
     auto r = parseAndCheckOwnership(
         "module M; class R public V: int := 0; destructor end destructor; end R; "
         "class C public static method Leak(): R "
-        "  using var owner := new OwnedArray<R>(); "
+        "  using var owner := new OwningArray<R>(); "
         "  owner.Add(move (new R())); "
         "  var v := owner[0]; "
         "  return v; "
@@ -302,7 +302,7 @@ BEZEL_TEST(own_escape, return_string_field_indirect_on_using_var_clean_641) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.9 (#641): OwnedArray<Obj>.PopLast() shape — the exact repro.
+// §28.3 / §28.9 (#641): OwningArray<Obj>.PopLast() shape — the exact repro.
 // `using var popped := arr.PopLast(); return popped.Val;` where Val: int.
 // The direct value-field return from a popped-element `using var` is accepted.
 BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_clean_641) {
@@ -314,7 +314,7 @@ BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_clean_641) {
         "  destructor end destructor; "
         "end Obj; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<Obj>(); "
+        "  using var arr := new OwningArray<Obj>(); "
         "  arr.Add(new Obj(7)); "
         "  arr.Add(new Obj(9)); "
         "  using var popped := arr.PopLast(); "
@@ -323,7 +323,7 @@ BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_clean_641) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.9 (#641): OwnedArray shape — INDIRECT form (the sa_v2b repro).
+// §28.3 / §28.9 (#641): OwningArray shape — INDIRECT form (the sa_v2b repro).
 // `var x := popped.Val; return x;` where Val: int.
 BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_indirect_clean_641) {
     auto r = parseAndCheckOwnership(
@@ -334,7 +334,7 @@ BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_indirect_clean_
         "  destructor end destructor; "
         "end Obj; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<Obj>(); "
+        "  using var arr := new OwningArray<Obj>(); "
         "  arr.Add(new Obj(7)); "
         "  arr.Add(new Obj(9)); "
         "  using var popped := arr.PopLast(); "
@@ -355,7 +355,7 @@ BEZEL_TEST(own_escape, arithmetic_on_copied_field_from_using_var_clean_641) {
         "  destructor end destructor; "
         "end Obj; "
         "class C public static method Main(): int "
-        "  using var arr := new OwnedArray<Obj>(); "
+        "  using var arr := new OwningArray<Obj>(); "
         "  arr.Add(new Obj(5)); "
         "  using var popped := arr.PopLast(); "
         "  var x := popped.Val; "

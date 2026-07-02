@@ -3,9 +3,9 @@ public method ReportEach(items: IEnumerable<Connection>)
 end ReportEach;
 
 public method UseOwnedPool()
-  using var pool := new OwnedArray<Connection>();
+  using var pool := new OwningArray<Connection>();
   pool.Add(Connect("a"));
   pool.Add(Connect("b"));
-  ReportEach(pool);     // OK: OwnedArray<Connection> implements IEnumerable<Connection>
+  ReportEach(pool);     // OK: OwningArray<Connection> implements IEnumerable<Connection>
                         //     iteration yields borrows
 end UseOwnedPool;

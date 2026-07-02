@@ -152,7 +152,7 @@ BEZEL_TEST(channel_640_phantom_members,
 
 // ---------------------------------------------------------------------------
 // (6) §6.9 / §30.15: ch.Receive() — legitimate async method on Channel<T>; no error.
-//     (Receive returns an OwnedTask/Task; just type-check, don't run.)
+//     (Receive returns an OwningTask/Task; just type-check, don't run.)
 // ---------------------------------------------------------------------------
 BEZEL_TEST(channel_640_phantom_members,
            channel_receive_still_allowed_6_9) {

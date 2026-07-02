@@ -18,7 +18,7 @@
 //   2. for each (key, value) pair in the literal, calls the same
 //      bz_dict_set_str / bz_dict_set_gen the `.Add(k, v)` lowering uses.
 // `lowerLocalDecl` now calls this helper when `cl->isDict && declType` resolves
-// to a Dictionary/OwnedDictionary TypeRef.
+// to a Dictionary/OwningDictionary TypeRef.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"

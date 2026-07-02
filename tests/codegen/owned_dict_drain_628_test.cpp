@@ -1,6 +1,6 @@
-// Codegen — OwnedDictionary<K,V>.Drain() owned-consuming for-loop (#628 part 2).
+// Codegen — OwningDictionary<K,V>.Drain() owned-consuming for-loop (#628 part 2).
 //
-// stdlib §4.9 v0.135: Drain() returns OwnedEnumerable<DrainedEntry<K,V>>.
+// stdlib §4.9 v0.135: Drain() returns IOwningEnumerable<DrainedEntry<K,V>>.
 // Iterating it transfers ownership of each DrainedEntry<K,V> to the consumer;
 // the entry owns its Value field (§28.5), so discharging the entry also
 // disposes the value. Partial iteration leaves the remainder in the dictionary
@@ -94,7 +94,7 @@ int runUnderLeakSanitizer(const std::string& source) {
     return 0;
 }
 
-// Resource class + OwnedDictionary<string, R> program template.
+// Resource class + OwningDictionary<string, R> program template.
 std::string strProg(const std::string& mainBody) {
     return
         "module M; "
@@ -118,7 +118,7 @@ std::string strProg(const std::string& mainBody) {
 // Encoded: R._n after loop (expect 3 — each iteration disposes one R).
 BEZEL_TEST(owned_dict_drain_628, full_drain_string_key_disposes_all_values) {
     BEZEL_EXPECT_EQ(run(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"a\", move (new R())); "
         "d.Add(\"b\", move (new R())); "
         "d.Add(\"c\", move (new R())); "
@@ -132,7 +132,7 @@ BEZEL_TEST(owned_dict_drain_628, full_drain_string_key_disposes_all_values) {
 // §4.9: after a full drain the dictionary is empty (Count == 0).
 BEZEL_TEST(owned_dict_drain_628, full_drain_empties_the_dict) {
     BEZEL_EXPECT_EQ(run(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"x\", move (new R())); "
         "d.Add(\"y\", move (new R())); "
         "for var entry in d.Drain() do "
@@ -146,7 +146,7 @@ BEZEL_TEST(owned_dict_drain_628, full_drain_empties_the_dict) {
 // Key "ab" (length 2) + key "cde" (length 3) → sum of lengths = 5.
 BEZEL_TEST(owned_dict_drain_628, entry_key_is_readable) {
     BEZEL_EXPECT_EQ(run(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"ab\", move (new R())); "
         "d.Add(\"cde\", move (new R())); "
         "var total := 0; "
@@ -161,7 +161,7 @@ BEZEL_TEST(owned_dict_drain_628, entry_key_is_readable) {
 // §4.9: entry.Value is the owned class instance, disposed exactly once.
 BEZEL_TEST(owned_dict_drain_628, entry_value_is_owned_and_disposed) {
     BEZEL_EXPECT_EQ(run(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"k\", move (new R())); "
         "for var entry in d.Drain() do "
         "  using var e := entry; "
@@ -178,7 +178,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_break_remainder_in_dict) {
     BEZEL_EXPECT_EQ(run(strProg(
         "var afterBreak := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R())); "
         "  d.Add(\"b\", move (new R())); "
         "  d.Add(\"c\", move (new R())); "
@@ -195,7 +195,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_break_remainder_in_dict) {
 // §4.9: empty dict drain — loop body never executes, returns 0.
 BEZEL_TEST(owned_dict_drain_628, empty_dict_drain_no_iterations) {
     BEZEL_EXPECT_EQ(run(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "var count := 0; "
         "for var entry in d.Drain() do "
         "  using var e := entry; "
@@ -208,7 +208,7 @@ BEZEL_TEST(owned_dict_drain_628, empty_dict_drain_no_iterations) {
 // §4.9: drain count matches Add count (4 entries → 4 iterations).
 BEZEL_TEST(owned_dict_drain_628, drain_iterates_all_entries) {
     BEZEL_EXPECT_EQ(run(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"a\", move (new R())); "
         "d.Add(\"b\", move (new R())); "
         "d.Add(\"c\", move (new R())); "
@@ -226,7 +226,7 @@ BEZEL_TEST(owned_dict_drain_628, drain_iterates_all_entries) {
 // §4.9 / #628 part 2: generic-key (int) variant
 // ===========================================================================
 
-// §4.9: drain over OwnedDictionary<int, R> — generic-key path.
+// §4.9: drain over OwningDictionary<int, R> — generic-key path.
 BEZEL_TEST(owned_dict_drain_628, full_drain_int_key_disposes_all_values) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -235,7 +235,7 @@ BEZEL_TEST(owned_dict_drain_628, full_drain_int_key_disposes_all_values) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var d := new OwnedDictionary<int, R>(); "
+        "  using var d := new OwningDictionary<int, R>(); "
         "  d.Add(1, move (new R())); "
         "  d.Add(2, move (new R())); "
         "  for var entry in d.Drain() do "
@@ -255,7 +255,7 @@ BEZEL_TEST(owned_dict_drain_628, int_key_entry_key_is_readable) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var d := new OwnedDictionary<int, R>(); "
+        "  using var d := new OwningDictionary<int, R>(); "
         "  d.Add(10, move (new R())); "
         "  d.Add(20, move (new R())); "
         "  var total := 0; "
@@ -279,7 +279,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_int_key_remainder_disposed_by_dic
         "class C public static method Main(): int "
         "  var afterBreak := -1; "
         "  do "
-        "    using var d := new OwnedDictionary<int, R>(); "
+        "    using var d := new OwningDictionary<int, R>(); "
         "    d.Add(1, move (new R())); "
         "    d.Add(2, move (new R())); "
         "    for var entry in d.Drain() do "
@@ -300,7 +300,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_int_key_remainder_disposed_by_dic
 // §4.9 / #628 part 2: the drain loop now compiles and runs correctly.
 // (The part-1 test codegen_unimplemented_628.owned_dict_drain_for_is_hard_error
 // verified it WAS a hard error; now it must compile and run.)
-// Migrated from OwnedDictionary<string,int> → OwnedDictionary<string,R> per
+// Migrated from OwningDictionary<string,int> → OwningDictionary<string,R> per
 // stdlib §4.2/#1327 (value types rejected as owned-collection elements).
 BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
     auto r = runJit(
@@ -308,7 +308,7 @@ BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
         "class R public constructor() end constructor; end R; "
         "class C "
         "  public static method Main(): int "
-        "    using var d := new OwnedDictionary<string, R>(); "
+        "    using var d := new OwningDictionary<string, R>(); "
         "    d.Add(\"x\", move (new R())); "
         "    var count := 0; "
         "    for var entry in d.Drain() do "
@@ -329,7 +329,7 @@ BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
 
 BEZEL_TEST(owned_dict_drain_628, lsan_full_drain_no_leak) {
     int lsan = runUnderLeakSanitizer(strProg(
-        "using var d := new OwnedDictionary<string, R>(); "
+        "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"a\", move (new R())); "
         "d.Add(\"b\", move (new R())); "
         "for var entry in d.Drain() do "
@@ -344,7 +344,7 @@ BEZEL_TEST(owned_dict_drain_628, lsan_full_drain_no_leak) {
 BEZEL_TEST(owned_dict_drain_628, lsan_partial_drain_no_leak) {
     int lsan = runUnderLeakSanitizer(strProg(
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R())); "
         "  d.Add(\"b\", move (new R())); "
         "  d.Add(\"c\", move (new R())); "

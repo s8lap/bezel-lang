@@ -21,7 +21,7 @@ GenericArg      ::= Type
                               /* In v0.97 and later, `owned` is not admitted on
                                  generic type arguments; the owned-bearing
                                  collection and task types are separate named
-                                 classes (`OwnedArray<T>`, `OwnedTask<T>`, etc.).
+                                 classes (`OwningArray<T>`, `OwningTask<T>`, etc.).
                                  See §14.4. */
 FunctionType    ::= "(" (FuncParamType ("," FuncParamType)*)? ")" "->" "owned"? Type
                               /* The optional `owned` on the return marks

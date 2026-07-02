@@ -9,8 +9,8 @@ private class Entry<K, V> where V: class
   end constructor;
 end Entry;
 
-public class OwnedDictionary<K, V>: IDisposable where V: class
-  private owned _buckets: OwnedBuffer<Entry<K, V>>;
+public class OwningDictionary<K, V>: IDisposable where V: class
+  private owned _buckets: OwningBuffer<Entry<K, V>>;
   private _count: int := 0;
   private _comparer: IEqualityComparer<K>;
 
@@ -22,7 +22,7 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
     // (Bezel's borrow tracker rejects walks-with-mutation; see note below).
     // Reverse the chain as we walk; if we don't find the key, the new entry
     // is prepended to the reversed chain — chain reversal is unobservable
-    // because OwnedDictionary doesn't promise insertion order.
+    // because OwningDictionary doesn't promise insertion order.
     var chain := move _buckets[idx];
     _buckets[idx] := null;
     var rebuilt: Entry<K, V>? := null;
@@ -85,4 +85,4 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
   // No destructor declared; the compiler generates the default Dispose,
   // which cascades through _buckets → each Entry → each Entry's owned
   // Next and Value, recursively disposing the whole map.
-end OwnedDictionary;
+end OwningDictionary;

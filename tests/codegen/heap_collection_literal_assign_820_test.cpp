@@ -1,5 +1,5 @@
 // fix #820 / §15.4 / §16: a collection literal assigned to a HEAP-collection
-// target (`Array<T>`, `OwnedArray<T>`, ...) in an assignment statement — most
+// target (`Array<T>`, `OwningArray<T>`, ...) in an assignment statement — most
 // notably a constructor-body field assignment `_arr := [1, 2, 3]` — was silently
 // dropped (the inline-array literal path only handles an `[N x elem]` ArrayType
 // slot; a heap collection is a bare `ptr` slot). The field stayed null and the
@@ -49,7 +49,7 @@ BEZEL_TEST(heap_collection_literal_assign_820, array_string_field_ctor_assign) {
         "end Main; end C;"), 2);
 }
 
-// §15.4 / §28.5: an `owned OwnedArray<Cell>` field initialized via a literal in
+// §15.4 / §28.5: an `owned OwningArray<Cell>` field initialized via a literal in
 // the ctor body disposes its owned elements when the owner is disposed (no leak
 // in the ctor-init case — there is no prior value). Cell.n returns to 0.
 BEZEL_TEST(heap_collection_literal_assign_820, owned_array_field_ctor_assign_disposes) {
@@ -59,7 +59,7 @@ BEZEL_TEST(heap_collection_literal_assign_820, owned_array_field_ctor_assign_dis
         "  public constructor() Cell.n := Cell.n + 1; end constructor; "
         "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() _arr := [new Cell(), new Cell()]; end constructor; "
         "  destructor end destructor; "
         "end Box; "

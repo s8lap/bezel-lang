@@ -4,7 +4,7 @@ public class Task
   public static method FromResult<T>(value: T): Task<T>;
 
   // For class T. Produces a Pattern B task; awaiters consume under `using var x := await ...`.
-  public static method FromOwnedResult<T>(owned value: T): OwnedTask<T> where T: class;
+  public static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
 
   // For any T: a faulted task never produces its result, so the Pattern A vs
   // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
@@ -23,12 +23,12 @@ public class Task
   // For non-class T (value types, string, runtime-managed reference types).
   public static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;
 
-  // For class T. Aggregates OwnedTask<T> results into an owned array of owned elements.
+  // For class T. Aggregates OwningTask<T> results into an owned array of owned elements.
   // The caller transfers ownership of the input array (and its tasks) to WhenAllOwned;
-  // the returned task produces an owned OwnedArray<T>.
+  // the returned task produces an owned OwningArray<T>.
   public static method WhenAllOwned<T>(
-    owned tasks: OwnedArray<OwnedTask<T>>
-  ): OwnedTask<OwnedArray<T>> where T: class;
+    owned tasks: OwningArray<OwningTask<T>>
+  ): OwningTask<OwningArray<T>> where T: class;
 
   public static method WhenAny(tasks: Array<Task>): Task<int>;   // index of first-done task (v0.162)
   public static method FireAndForget(owned task: Task);

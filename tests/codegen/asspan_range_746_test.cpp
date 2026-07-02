@@ -1,4 +1,4 @@
-// Spec-derived tests for fix #746 (R41 cluster J) — OwnedBuffer<T>.AsSpan /
+// Spec-derived tests for fix #746 (R41 cluster J) — OwningBuffer<T>.AsSpan /
 // AsReadOnlySpan with a Range<int> argument honours the range's endpoint.
 //
 // Authority: stdlib §4.14 — AsSpan(r: Range<int>): Start = r.Start, Length =
@@ -26,7 +26,7 @@ int run(const std::string& src) {
 BEZEL_TEST(asspan_range_746, inclusive_range_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(10); "
+        "  using var buf := new OwningBuffer<int>(10); "
         "  return buf.AsSpan(2..5).Length; "  // 4, not 8
         "end Main; end C;"), 4);
 }
@@ -35,7 +35,7 @@ BEZEL_TEST(asspan_range_746, inclusive_range_length) {
 BEZEL_TEST(asspan_range_746, half_open_range_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(10); "
+        "  using var buf := new OwningBuffer<int>(10); "
         "  return buf.AsSpan(2..<5).Length; "  // 3
         "end Main; end C;"), 3);
 }
@@ -44,7 +44,7 @@ BEZEL_TEST(asspan_range_746, half_open_range_length) {
 BEZEL_TEST(asspan_range_746, full_inclusive_range) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(10); "
+        "  using var buf := new OwningBuffer<int>(10); "
         "  return buf.AsReadOnlySpan(0..9).Length; "  // 10
         "end Main; end C;"), 10);
 }
@@ -55,7 +55,7 @@ BEZEL_TEST(asspan_range_746, full_inclusive_range) {
 BEZEL_TEST(asspan_range_746, out_of_bounds_end_throws) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(5); "
+        "  using var buf := new OwningBuffer<int>(5); "
         "  try "
         "    var sp := buf.AsSpan(2..10); "  // end 10 > Count 5
         "    return 0; "                       // no throw → fail
@@ -68,7 +68,7 @@ BEZEL_TEST(asspan_range_746, out_of_bounds_end_throws) {
 BEZEL_TEST(asspan_range_746, single_int_start_overload_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(10); "
+        "  using var buf := new OwningBuffer<int>(10); "
         "  return buf.AsSpan(2).Length; "  // 8 = Count - start
         "end Main; end C;"), 8);
 }

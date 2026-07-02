@@ -1,11 +1,11 @@
 // Codegen + sema — #779 / #870 / #907: the OWNING `Span<T>` over an
-// `OwnedBuffer<T>` (stdlib §4.14), distinct from `Array<T>`'s borrowing
+// `OwningBuffer<T>` (stdlib §4.14), distinct from `Array<T>`'s borrowing
 // `ArraySpan<T>` (§4.15).
 //
-// Root cause (pre-fix): `OwnedBuffer<T>.AsSpan()` was mis-typed as the borrowing
+// Root cause (pre-fix): `OwningBuffer<T>.AsSpan()` was mis-typed as the borrowing
 // `ArraySpan<T>` (the #636 shortcut). The owning span's class-typed slots OWN
 // their elements, so the borrowing typing produced three defects:
-//   #870  `OwnedBuffer<classT>.AsSpan().Fill(c)` was accepted (ArraySpan has
+//   #870  `OwningBuffer<classT>.AsSpan().Fill(c)` was accepted (ArraySpan has
 //         Fill for all T) and SIGSEGV'd — one borrowed ref aliased into N owning
 //         slots → double-free. On an owning `Span<classT>` Fill is forbidden.
 //   #907  `move sp[i]` had no codegen branch for the owning span → it fell to a
@@ -14,7 +14,7 @@
 //   #779  `sp[i] := v` went through the non-disposing borrowing-set → the
 //         displaced owned element LEAKED; and Clear/MoveFrom/MoveTo were absent.
 //
-// The fix retypes `OwnedBuffer<T>.AsSpan()` → owning `Span<T>` (§4.14): a
+// The fix retypes `OwningBuffer<T>.AsSpan()` → owning `Span<T>` (§4.14): a
 // disposing indexer-set, an admitted `move sp[i]`, the class-T Clear/MoveFrom/
 // MoveTo intrinsics, and a sema reject of Fill/CopyFrom/CopyTo on class-T. The
 // value-typed Span keeps the value-copy surface (Fill/CopyFrom/CopyTo); the
@@ -52,7 +52,7 @@ BEZEL_TEST(owning_span_779, asspan_length_class_element) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<R>(4); "
+        "  using var buf := new OwningBuffer<R>(4); "
         "  var sp := buf.AsSpan(); "
         "  return sp.Length; "  // 4
         "end Main; end C;"), 4);
@@ -69,7 +69,7 @@ BEZEL_TEST(owning_span_779, indexer_set_disposes_displaced_element) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var buf := new OwnedBuffer<R>(2); "
+        "    using var buf := new OwningBuffer<R>(2); "
         "    buf[0] := new R(1); buf[1] := new R(2); "
         "    var sp := buf.AsSpan(); "
         "    sp[0] := new R(3); "
@@ -83,7 +83,7 @@ BEZEL_TEST(owning_span_779, indexer_set_then_get_reads_new_value) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<R>(2); "
+        "  using var buf := new OwningBuffer<R>(2); "
         "  buf[0] := new R(1); "
         "  var sp := buf.AsSpan(); "
         "  sp[0] := new R(9); "
@@ -102,7 +102,7 @@ BEZEL_TEST(owning_span_779, move_slot_value_correct) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<R>(2); "
+        "  using var buf := new OwningBuffer<R>(2); "
         "  buf[0] := new R(10); buf[1] := new R(11); "
         "  var sp := buf.AsSpan(); "
         "  using var t := move sp[0]; "
@@ -115,7 +115,7 @@ BEZEL_TEST(owning_span_779, move_slot_no_double_free) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var buf := new OwnedBuffer<R>(2); "
+        "    using var buf := new OwningBuffer<R>(2); "
         "    buf[0] := new R(10); buf[1] := new R(11); "
         "    var sp := buf.AsSpan(); "
         "    using var t := move sp[0]; "
@@ -134,7 +134,7 @@ BEZEL_TEST(owning_span_779, clear_disposes_all_slots) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var buf := new OwnedBuffer<R>(2); "
+        "    using var buf := new OwningBuffer<R>(2); "
         "    buf[0] := new R(1); buf[1] := new R(2); "
         "    var sp := buf.AsSpan(); "
         "    sp.Clear(); "
@@ -153,8 +153,8 @@ BEZEL_TEST(owning_span_779, movefrom_transfers_and_disposes_dest) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var a := new OwnedBuffer<R>(2); "
-        "  using var b := new OwnedBuffer<R>(2); "
+        "  using var a := new OwningBuffer<R>(2); "
+        "  using var b := new OwningBuffer<R>(2); "
         "  a[0] := new R(1); a[1] := new R(2); "
         "  b[0] := new R(3); b[1] := new R(4); "
         "  var sa := a.AsSpan(); var sb := b.AsSpan(); "
@@ -171,8 +171,8 @@ BEZEL_TEST(owning_span_779, movefrom_no_leak_no_double_free) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  do "
-        "    using var a := new OwnedBuffer<R>(2); "
-        "    using var b := new OwnedBuffer<R>(2); "
+        "    using var a := new OwningBuffer<R>(2); "
+        "    using var b := new OwningBuffer<R>(2); "
         "    a[0] := new R(1); a[1] := new R(2); "
         "    b[0] := new R(3); b[1] := new R(4); "
         "    var sa := a.AsSpan(); var sb := b.AsSpan(); "
@@ -187,8 +187,8 @@ BEZEL_TEST(owning_span_779, moveto_symmetric) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var a := new OwnedBuffer<R>(2); "
-        "  using var b := new OwnedBuffer<R>(2); "
+        "  using var a := new OwningBuffer<R>(2); "
+        "  using var b := new OwningBuffer<R>(2); "
         "  a[0] := new R(5); a[1] := new R(6); "
         "  b[0] := new R(7); b[1] := new R(8); "
         "  var sa := a.AsSpan(); var sb := b.AsSpan(); "
@@ -205,7 +205,7 @@ BEZEL_TEST(owning_span_779, fill_on_class_span_rejected_870) {
     BEZEL_EXPECT_EQ(rejectedAtCompile(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<R>(2); "
+        "  using var buf := new OwningBuffer<R>(2); "
         "  using var c := new R(1); "
         "  var sp := buf.AsSpan(); "
         "  sp.Fill(c); "
@@ -219,7 +219,7 @@ BEZEL_TEST(owning_span_779, fill_on_class_span_rejected_870) {
 BEZEL_TEST(owning_span_779, fill_on_value_span_works) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(3); "
+        "  using var buf := new OwningBuffer<int>(3); "
         "  var sp := buf.AsSpan(); "
         "  sp.Fill(7); "
         "  return buf[0] + buf[1] + buf[2]; "  // 21
@@ -230,7 +230,7 @@ BEZEL_TEST(owning_span_779, fill_on_value_span_works) {
 BEZEL_TEST(owning_span_779, move_on_value_span_rejected) {
     BEZEL_EXPECT_EQ(rejectedAtCompile(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(2); "
+        "  using var buf := new OwningBuffer<int>(2); "
         "  var sp := buf.AsSpan(); "
         "  var x := move sp[0]; "
         "  return x; "
@@ -241,7 +241,7 @@ BEZEL_TEST(owning_span_779, move_on_value_span_rejected) {
 BEZEL_TEST(owning_span_779, clear_on_value_span_rejected) {
     BEZEL_EXPECT_EQ(rejectedAtCompile(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(2); "
+        "  using var buf := new OwningBuffer<int>(2); "
         "  var sp := buf.AsSpan(); "
         "  sp.Clear(); "
         "  return 0; "
@@ -255,7 +255,7 @@ BEZEL_TEST(owning_span_779, readonly_span_set_rejected) {
     BEZEL_EXPECT_EQ(rejectedAtCompile(
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<R>(2); "
+        "  using var buf := new OwningBuffer<R>(2); "
         "  buf[0] := new R(1); "
         "  var ro := buf.AsReadOnlySpan(); "
         "  ro[0] := new R(2); "

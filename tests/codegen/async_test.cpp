@@ -1836,7 +1836,7 @@ BEZEL_TEST(async_28_12, async_without_await_using_unaffected) {
 //   - The using-var disposal path was gated on `ld->isUsing`, which a plain
 //     `var` never sets.
 //
-// Fix: treat a plain `var` local whose type is Task/Task<T>/OwnedTask<T> the
+// Fix: treat a plain `var` local whose type is Task/Task<T>/OwningTask<T> the
 // same as a `using var` task — register a scope-end `bz_task_fire_and_forget`
 // disposal. The await site NEVER frees a named local (no change there), so
 // exactly-once is guaranteed across all four shapes:
@@ -1977,7 +1977,7 @@ BEZEL_TEST(async_30_5_445, two_plain_var_tasks_awaited_cross_thread_clean) {
 }
 
 // ===========================================================================
-// §30.2 / §14.1 (#444 / #509): `await` requires a Task / Task<T> / OwnedTask<T>
+// §30.2 / §14.1 (#444 / #509): `await` requires a Task / Task<T> / OwningTask<T>
 // operand.  Before #509, `Task.FromResult<int>(42)` was misparsed (§A.7 had no
 // call-site generic type argument syntax) as a chained comparison yielding bool,
 // causing `await bool` (i1) to SIGSEGV in lowerAwait.  After #509, the parser

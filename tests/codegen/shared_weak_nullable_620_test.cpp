@@ -1,20 +1,20 @@
 // Codegen tests for Shared<T>/Weak<T> as declared types in annotations —
 // nullable locals/fields/params, Shared<T> params, Weak<T>? params, and
-// OwnedArray<Shared<T>> iteration (issue #620 / spec §28.13 / stdlib §2.16).
+// OwningArray<Shared<T>> iteration (issue #620 / spec §28.13 / stdlib §2.16).
 //
 // Root cause (#620): "Shared" and "Weak" were absent from lowerTypeRef's
 // builtin-name lists and from isBuiltinTypeRefName().  This caused:
 //   (a) `Shared<T>? := null` → {i8,i32} struct lowering (bare-type-param path)
 //       instead of ptrTy() → LLVM checkGEPType assert crash.
 //   (b) `Shared<T>` parameter type → i32 lowering → bz_shared_get(i32) IR fail.
-//   (c) `for var item in OwnedArray<Shared<T>>` → i32 iteration variable
+//   (c) `for var item in OwningArray<Shared<T>>` → i32 iteration variable
 //       type → bz_shared_get(i32) IR fail.
 //
 // Test groups:
 //   1. Shared<T>? nullable local — = null, <> null, null-check, ?., !
 //   2. Shared<T> parameter — borrowed + field read via Get()
 //   3. Weak<T>? nullable local — = null, <> null
-//   4. OwnedArray<Shared<T>> iteration — values verified by running
+//   4. OwningArray<Shared<T>> iteration — values verified by running
 //   5. Shared<T> owned field in a class — disposed via cascade, LSan clean
 //
 // Spec refs (v0.135):
@@ -286,18 +286,18 @@ BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_weak_nullable_local_nonn
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Group 4: OwnedArray<Shared<T>> iteration.
-// §28.13 / stdlib §4.5 (#620): iterating over OwnedArray<Shared<T>> must
+// Group 4: OwningArray<Shared<T>> iteration.
+// §28.13 / stdlib §4.5 (#620): iterating over OwningArray<Shared<T>> must
 // produce a Shared<T> loop variable typed as ptrTy(), so Get() call compiles
 // as bz_shared_get(ptr), not bz_shared_get(i32).  Values verified by running.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// §28.13 / §4.5 (#620): iterate OwnedArray<Shared<Inner>>, call Get(), sum V.
+// §28.13 / §4.5 (#620): iterate OwningArray<Shared<Inner>>, call Get(), sum V.
 BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_owned_array_iteration_get) {
     std::string src = std::string(kInner) +
         "class C "
         "  public static method Main(): int "
-        "    using var arr := new OwnedArray<Shared<Inner>>(); "
+        "    using var arr := new OwningArray<Shared<Inner>>(); "
         "    var o1 := new Inner(); o1.V := 10; "
         "    using var h1 := new Shared<Inner>(o1); "
         "    arr.Add(h1.Clone()); "
@@ -315,13 +315,13 @@ BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_owned_array_iteration_ge
     BEZEL_EXPECT_EQ(run(src), 30);
 }
 
-// §28.13 / §4.5 (#620): OwnedArray<Shared<Inner>> disposes all handles when
+// §28.13 / §4.5 (#620): OwningArray<Shared<Inner>> disposes all handles when
 // the array is disposed → inner objects disposed; LSan clean.
 BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_owned_array_disposes_handles_lsan) {
     std::string src = std::string(kInner) +
         "class C "
         "  public static method Fill() "
-        "    using var arr := new OwnedArray<Shared<Inner>>(); "
+        "    using var arr := new OwningArray<Shared<Inner>>(); "
         "    var o1 := new Inner(); "
         "    using var h1 := new Shared<Inner>(o1); "
         "    arr.Add(h1.Clone()); "

@@ -107,7 +107,7 @@ BEZEL_TEST(user_ienumerable_dispose_972, two_sequential_loops_each_dispose_once)
         "end Main; end C;"), 2);
 }
 
-// #963 / §28.11 / §29.2: an explicit `x.Dispose()` on an OwnedEnumerable<T>
+// #963 / §28.11 / §29.2: an explicit `x.Dispose()` on an IOwningEnumerable<T>
 // for-loop variable must RECLAIM the element block, not merely run the
 // destructor (the destructor count was already correct pre-fix; the element
 // blocks leaked). The for-loop variable is a LocalSymbol whose decl is the
@@ -122,7 +122,7 @@ BEZEL_TEST(user_ienumerable_dispose_972, owned_enumerable_loopvar_dispose_963) {
         "class R public static n: int := 0; destructor R.n := R.n + 1; "
         "  end destructor; end R; "
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); yield return new R(); "
         "  end Gen; "
         "  public static method Main(): int "

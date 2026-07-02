@@ -22,7 +22,7 @@
 // Batch 4 (#545 hook): elementDisposerArg() added (LlvmBackend_impl.hpp) —
 // the single site that maps (elemTy, owningFamily) → llvm::Value* for every
 // runtime dispose_elem parameter. bz_channel_new migrated onto it; Assign.cpp
-// OwnedDictionary move-out gate migrated from collectionElemIsClass to
+// OwningDictionary move-out gate migrated from collectionElemIsClass to
 // elementPolicyFor; isStringElementArray deleted (inlined into
 // emitArrayRetainStringsIfStringArray which now calls elementPolicyFor directly).
 
@@ -34,10 +34,10 @@ namespace bezel::codegen {
 //
 // Parameters
 //   elemTy      — the resolved sema type of ONE element (genericArgs[0] for
-//                 most collections; genericArgs[1] for an OwnedDictionary
+//                 most collections; genericArgs[1] for an OwningDictionary
 //                 value slot).  Null or Error → Value category (no policy).
 //   owningFamily — true iff the containing collection is in the OWNING family
-//                 (name prefixed "Owned", per the stdlib §4 naming convention).
+//                 (name prefixed "Owning", per the stdlib §4 naming convention).
 //
 // The table from §28.11 v0.134:
 //
@@ -78,7 +78,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
     // §28.13 / stdlib §2.16 (#603): Shared<T> and Weak<T> have null declaration
     // (they are compiler-known builtins, not user TypeDecls). They are ref-counted
     // heap pointers that behave like class instances in collection slots: an
-    // OwnedArray<Shared<T>> OWNS its handles (releases on remove/clear/free) and
+    // OwningArray<Shared<T>> OWNS its handles (releases on remove/clear/free) and
     // a borrowing Array<Shared<T>> just borrows them. Detect by astNode name before
     // the declaration check so they fall into the ClassOwned/ClassBorrow arm, not
     // the Value arm (the fall-through after this block).
@@ -133,7 +133,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
             /*retainRelease=*/false
         };
     }
-    // §28.11 (#868): builtin OWNING-collection element types (OwnedArray<R> etc.
+    // §28.11 (#868): builtin OWNING-collection element types (OwningArray<R> etc.
     // as elements of an outer collection). These have declaration==nullptr
     // (compiler-known builtins, same as Shared/Weak/IGrouping/Subscription) so
     // they fall past the declaration-based class check below → were silently
@@ -147,8 +147,8 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
             return false;
         std::string_view n = t->astNode->name->parts[0];
-        return n == "OwnedArray" || n == "OwnedStack" || n == "OwnedQueue" ||
-               n == "OwnedLinkedList" || n == "OwnedDictionary" || n == "OwnedSet";
+        return n == "OwningArray" || n == "OwningStack" || n == "OwningQueue" ||
+               n == "OwningLinkedList" || n == "OwningDictionary" || n == "OwningSet";
     };
     if (isOwningBuiltinCollection(elemTy)) {
         if (owningFamily) {

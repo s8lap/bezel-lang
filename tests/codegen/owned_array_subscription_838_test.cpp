@@ -1,4 +1,4 @@
-// fix #838 / §2.11 / §28.11: an OwnedArray<Subscription> (or other owning
+// fix #838 / §2.11 / §28.11: an OwningArray<Subscription> (or other owning
 // collection) must dispose its Subscription elements at scope-end / Clear /
 // remove — a Subscription is a runtime-managed handle (bz_subscription_t*)
 // disposed by bz_subscription_dispose, which unsubscribes the handler. The
@@ -29,14 +29,14 @@ const char* kPre =
     "end Button; class C ";
 }  // namespace
 
-// Scope-end disposal of the OwnedArray<Subscription> unsubscribes the handler:
+// Scope-end disposal of the OwningArray<Subscription> unsubscribes the handler:
 // Fire(2) inside scope adds 2; Fire(5) after scope is a no-op → 2 (was 7).
 BEZEL_TEST(owned_array_subscription_838, scope_end_unsubscribes) {
     BEZEL_EXPECT_EQ(run(std::string(kPre) +
         "public static method Main(): int "
         "  using var box := new Box(); using var b := new Button(); "
         "  do "
-        "    using var subs := new OwnedArray<Subscription>(); "
+        "    using var subs := new OwningArray<Subscription>(); "
         "    subs.Add(move b.Clicked.Subscribe((e) => do box.Add(e.N); end)); "
         "    b.Fire(2); "
         "  end; "
@@ -52,7 +52,7 @@ BEZEL_TEST(owned_array_subscription_838, multiple_subscriptions_unsubscribed) {
         "  using var box := new Box(); "
         "  using var b1 := new Button(); using var b2 := new Button(); "
         "  do "
-        "    using var subs := new OwnedArray<Subscription>(); "
+        "    using var subs := new OwningArray<Subscription>(); "
         "    subs.Add(move b1.Clicked.Subscribe((e) => do box.Add(e.N); end)); "
         "    subs.Add(move b2.Clicked.Subscribe((e) => do box.Add(e.N); end)); "
         "    b1.Fire(1); b2.Fire(2); "
@@ -67,7 +67,7 @@ BEZEL_TEST(owned_array_subscription_838, clear_disposes_subscriptions) {
     BEZEL_EXPECT_EQ(run(std::string(kPre) +
         "public static method Main(): int "
         "  using var box := new Box(); using var b := new Button(); "
-        "  using var subs := new OwnedArray<Subscription>(); "
+        "  using var subs := new OwningArray<Subscription>(); "
         "  subs.Add(move b.Clicked.Subscribe((e) => do box.Add(e.N); end)); "
         "  b.Fire(4); "
         "  subs.Clear(); "

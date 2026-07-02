@@ -433,7 +433,7 @@ BEZEL_TEST(async_618_domain_serial, domain_spawn_uaf_stress_fix_632) {
         // child domains are created, enqueued, and drained nearly simultaneously.
         // The UAF (pre-fix) fires when domain_drain re-locks dom->mtx after
         // entry_cont deletes the domain.  We inline each spawn-and-await to
-        // avoid OwnedTask lifetime tracking concerns.
+        // avoid OwningTask lifetime tracking concerns.
         "    await Domain.Spawn(Entry.Run); "
         "    await Domain.Spawn(Entry.Run); "
         "    await Domain.Spawn(Entry.Run); "

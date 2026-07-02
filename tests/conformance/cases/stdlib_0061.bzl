@@ -1,4 +1,4 @@
-public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
   // class T
 
   public property [i: int]: T?
@@ -22,7 +22,7 @@ public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): 
     new ReadOnlySpan<T>(Buffer, this.Start + start, length);
 end ReadOnlySpan;
 
-public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
   // value T
 
   public property [i: int]: T
@@ -50,7 +50,7 @@ public record ReadOnlySpan<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): 
 end ReadOnlySpan;
 
 public class FrameBuffer
-  private owned _pixels: OwnedBuffer<Pixel>;
+  private owned _pixels: OwningBuffer<Pixel>;
   private readonly _width: int;
 
   // Width and Height as needed; Pixel is assumed to be a class type.

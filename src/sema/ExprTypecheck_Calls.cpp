@@ -88,7 +88,7 @@ static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
 }
 
 // per §15.4 (#1174): the admissible TARGET types for a collection literal are a
-// CLOSED list — an inline array, `Array<T>`/`OwnedArray<T>`, `Set`, `Stack`,
+// CLOSED list — an inline array, `Array<T>`/`OwningArray<T>`, `Set`, `Stack`,
 // `Queue`, `LinkedList`, `Dictionary`, and user types declared
 // `FromCollectionLiteral`. A collection INTERFACE
 // (`IEnumerable<T>`/`IList<T>`/`ICollection<T>`/`IReadOnly*`/…) is NOT on that
@@ -125,7 +125,7 @@ static void reportCollectionLiteralInterfaceTarget(
         Severity::Error, loc,
         "a collection literal `[...]` cannot target " + named +
         " — §15.4 admits only a concrete collection target (an inline array, "
-        "`Array<T>`/`OwnedArray<T>`, `Set`, `Stack`, `Queue`, `LinkedList`, "
+        "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, `LinkedList`, "
         "`Dictionary`); construct one of those and pass it (§15.4)");
 }
 
@@ -1849,9 +1849,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     [&] {
                                         const auto& cn =
                                             innerRecvTy->astNode->name->parts[0];
-                                        return cn == "Array" || cn == "OwnedArray" ||
-                                               cn == "Stack" || cn == "OwnedStack" ||
-                                               cn == "Queue" || cn == "OwnedQueue";
+                                        return cn == "Array" || cn == "OwningArray" ||
+                                               cn == "Stack" || cn == "OwningStack" ||
+                                               cn == "Queue" || cn == "OwningQueue";
                                     }();
                                 const auto& im = innerMa->member;
                                 // In-place void collection mutators (§3). These
@@ -2471,11 +2471,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // codegen. Only a DIRECT owning-collection receiver triggers it —
                     // a LINQ query result (`owned.Where(p).ToArray()`) has an
                     // IEnumerable receiver, so colName != Owned* and it stays valid.
-                    // `OwnedBuffer<T>` is exempt (§4.14 gives it owning spans) and is
+                    // `OwningBuffer<T>` is exempt (§4.14 gives it owning spans) and is
                     // not in this set.
-                    if ((colName == "OwnedArray" || colName == "OwnedStack" ||
-                         colName == "OwnedQueue" || colName == "OwnedLinkedList" ||
-                         colName == "OwnedSet" || colName == "OwnedDictionary") &&
+                    if ((colName == "OwningArray" || colName == "OwningStack" ||
+                         colName == "OwningQueue" || colName == "OwningLinkedList" ||
+                         colName == "OwningSet" || colName == "OwningDictionary") &&
                         (m == "ToArray" || m == "ToSet" || m == "ToDictionary")) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
@@ -2496,14 +2496,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // every valid owning-collection method (over-inclusion never
                     // over-rejects — a name valid on a SIBLING owning type is allowed
                     // here too; that finer per-type precision is a follow-up). Scoped
-                    // to the six owning CONTAINER collections (not OwnedBuffer / the
+                    // to the six owning CONTAINER collections (not OwningBuffer / the
                     // owning iterators, whose surfaces differ). Only a DIRECT owning
                     // receiver triggers it; a LINQ query result has an IEnumerable
                     // receiver (colName != Owned*) and is unaffected.
                     bool isOwningContainer =
-                        colName == "OwnedArray" || colName == "OwnedStack" ||
-                        colName == "OwnedQueue" || colName == "OwnedLinkedList" ||
-                        colName == "OwnedSet" || colName == "OwnedDictionary";
+                        colName == "OwningArray" || colName == "OwningStack" ||
+                        colName == "OwningQueue" || colName == "OwningLinkedList" ||
+                        colName == "OwningSet" || colName == "OwningDictionary";
                     if (isOwningContainer) {
                         // §4.8/§4.9 v0.155 (#920/#1112): `.Set()` is not a method
                         // on any collection type; the indexer `coll[i] := v` or
@@ -2522,7 +2522,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         auto allowedOwningMethod = [](std::string_view mm) -> bool {
                             return
                                 // §4.x native owning-collection surface (union over
-                                // OwnedArray/Stack/Queue/LinkedList/Set/Dictionary).
+                                // OwningArray/Stack/Queue/LinkedList/Set/Dictionary).
                                 mm == "Add" || mm == "AddRange" || mm == "AddFirst" ||
                                 mm == "AddLast" || mm == "AddBefore" ||
                                 mm == "AddAfter" || mm == "Insert" ||
@@ -2698,11 +2698,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }  // end else (m != "Set")
                     }
                     // Array/Stack/Queue/Set/LinkedList methods
-                    bool isArrLike = colName == "Array" || colName == "OwnedArray" ||
-                        colName == "Stack" || colName == "OwnedStack" ||
-                        colName == "Queue" || colName == "OwnedQueue" ||
-                        colName == "Set" || colName == "OwnedSet" ||
-                        colName == "LinkedList" || colName == "OwnedLinkedList";
+                    bool isArrLike = colName == "Array" || colName == "OwningArray" ||
+                        colName == "Stack" || colName == "OwningStack" ||
+                        colName == "Queue" || colName == "OwningQueue" ||
+                        colName == "Set" || colName == "OwningSet" ||
+                        colName == "LinkedList" || colName == "OwningLinkedList";
                     if (isArrLike) {
                         if (m == "Length" || m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
@@ -2735,7 +2735,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // per §4.10 stdlib: TryAdd(item: T): bool
                         // §4.11/§4.12 (#725): Stack.TryPop/TryPeek,
                         // Queue.TryDequeue/TryPeek (out item: T): bool.
-                        // §4.5/§4.7 (#831/#1354): OwnedArray/OwnedLinkedList
+                        // §4.5/§4.7 (#831/#1354): OwningArray/OwningLinkedList
                         // TryPopFirst/TryPopLast (out owned item: T): bool.
                         else if (m == "Contains" || m == "TryAdd" ||
                                  m == "TryPop" || m == "TryDequeue" ||
@@ -2892,7 +2892,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Array<T>.Sorted() / Array<T>.Sorted(comparer) —
                         // value-returning copy-forms (past-participle convention).
                         // Return type: owned Array<T> (same element type as receiver).
-                        // Only on Array<T> (not OwnedArray<T>); OwnedArray has unique
+                        // Only on Array<T> (not OwningArray<T>); OwningArray has unique
                         // ownership semantics that make copying its elements unsound.
                         // Sorted() without a comparer requires T: IComparable<T> —
                         // we check here that T is int or string (the concrete types
@@ -2984,7 +2984,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // the result as a closure pointer; a non-function arg (e.g.
                         // an int literal) would produce malformed IR / a crash.
                         // Validate here so the user gets a clear sema error.
-                        if ((colName == "Array" || colName == "OwnedArray") &&
+                        if ((colName == "Array" || colName == "OwningArray") &&
                             m == "Sort" && ce.args.size() == 1 && ce.args[0].value) {
                             const TypeRef* cmpTy =
                                 ctx_.exprType(*ce.args[0].value);
@@ -3001,17 +3001,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                         // stdlib §3 / #472: Reversed() and Sorted() are NOT defined
-                        // on OwnedArray<T> — unique ownership makes a shallow copy
+                        // on OwningArray<T> — unique ownership makes a shallow copy
                         // unsound (elements are owned; a bitwise copy would double-
                         // free). Emit a clear diagnostic so the user knows to convert
                         // to Array<T> first (e.g. with ToArray()).
-                        if (colName == "OwnedArray" &&
+                        if (colName == "OwningArray" &&
                             (m == "Reversed" || m == "Sorted")) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string(m) +
-                                "() is not defined on OwnedArray<T> (§3 / #472). "
-                                "OwnedArray<T> elements are uniquely owned; a shallow "
+                                "() is not defined on OwningArray<T> (§3 / #472). "
+                                "OwningArray<T> elements are uniquely owned; a shallow "
                                 "copy would produce two owners of the same object, "
                                 "violating §28.3 exactly-once disposal. "
                                 "Convert to Array<T> first (e.g. with ToArray()) "
@@ -3171,10 +3171,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // §4.15 (#549): Array<T>.AsSpan() / AsSpan(start) /
                     // AsSpan(start,length) / AsSpan(range) → ArraySpan<T>.
                     // Array<T>.AsReadOnlySpan() and overloads → ReadOnlyArraySpan<T>.
-                    // Only on Array<T> (the borrowing collection); OwnedArray<T>
+                    // Only on Array<T> (the borrowing collection); OwningArray<T>
                     // does not expose AsSpan (its elements are owned — see §4.5).
-                    // §4.14 (#779): OwnedBuffer<T>.AsSpan() → the OWNING Span<T>;
-                    // OwnedBuffer<T>.AsReadOnlySpan() → ReadOnlySpan<T>. These are
+                    // §4.14 (#779): OwningBuffer<T>.AsSpan() → the OWNING Span<T>;
+                    // OwningBuffer<T>.AsReadOnlySpan() → ReadOnlySpan<T>. These are
                     // distinct from Array<T>'s borrowing ArraySpan<T> (§4.15): the
                     // owning span's class-typed slots own their elements, so it
                     // exposes Clear/MoveFrom/MoveTo + a disposing indexer-set +
@@ -3183,35 +3183,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // so codegen routes both through tryLowerArraySpanCall and the
                     // shared isSpanLikeTypeName surface; the owning behaviour is
                     // gated on the "Span" name (isOwningSpanTypeName).
-                    if ((colName == "Array" || colName == "OwnedBuffer" ||
-                         colName == "OwnedArray") &&
+                    if ((colName == "Array" || colName == "OwningBuffer" ||
+                         colName == "OwningArray") &&
                         !recvTy->genericArgs.empty() &&
                         recvTy->genericArgs[0] &&
                         (m == "AsSpan" || m == "AsReadOnlySpan") &&
                         (ce.args.size() <= 2)) {
-                        // §4.5 (#1022): OwnedArray<T> does NOT expose the borrowing
+                        // §4.5 (#1022): OwningArray<T> does NOT expose the borrowing
                         // span views — its elements are uniquely owned, so a span
                         // (whose `sp[i] := x` would overwrite an owned slot without
                         // disposal, §28.11) is deliberately not provided. The gate
-                        // previously excluded OwnedArray, but the call then fell
+                        // previously excluded OwningArray, but the call then fell
                         // through and was accepted, and codegen SILENTLY miscompiled
                         // it to a zeroed span (returns 0 for every index). Reject it
                         // here; the span return type is still set below so the rest
                         // of the typecheck is well-formed (the program is rejected
                         // via the diagnostic).
-                        if (colName == "OwnedArray") {
+                        if (colName == "OwningArray") {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
-                                std::string("`OwnedArray<T>` does not expose `") +
+                                std::string("`OwningArray<T>` does not expose `") +
                                 std::string(m) +
                                 "` — an owning collection's elements are uniquely "
                                 "owned, so a span view (which can overwrite slots) "
                                 "is not provided (§4.5); use a borrowing `Array<T>`,"
                                 " or `Drain` / `PopAt` to transfer ownership out");
                         }
-                        bool owning = (colName == "OwnedBuffer");
+                        bool owning = (colName == "OwningBuffer");
                         // Build synthetic span-type TypeRefs. Array → borrowing
-                        // ArraySpan/ReadOnlyArraySpan (§4.15); OwnedBuffer → owning
+                        // ArraySpan/ReadOnlyArraySpan (§4.15); OwningBuffer → owning
                         // Span/ReadOnlySpan (§4.14).
                         static const ast::Type* kArraySpanNode = []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;
@@ -3256,13 +3256,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tr->genericArgs.push_back(recvTy->genericArgs[0]);
                         ctx_.setExprType(&ce, tr);
                     }
-                    // per §4.6/§4.7: LinkedList<T> / OwnedLinkedList<T> node-based API.
+                    // per §4.6/§4.7: LinkedList<T> / OwningLinkedList<T> node-based API.
                     // AddFirst/AddLast/AddBefore/AddAfter return LinkedListNode<T>.
                     // Find returns LinkedListNode<T>? (nullable).
                     // FirstNode/LastNode properties return LinkedListNode<T>?.
                     // First/Last return T? (nullable element).
                     // RemoveFirst/RemoveLast/RemoveNode → unit.
-                    if ((colName == "LinkedList" || colName == "OwnedLinkedList") &&
+                    if ((colName == "LinkedList" || colName == "OwningLinkedList") &&
                         recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         auto* elemTy = recvTy->genericArgs[0];
                         // Helper: make a LinkedListNode<T> TypeRef (non-null borrow).
@@ -3313,7 +3313,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // issue #1002 / §29.3 / stdlib §4.4/§4.12: a borrowing
                     // collection's `GetEnumerator()` returns `owned
                     // IEnumerator<T>` (declared on IEnumerable<T>, which Array<T>
-                    // and OwnedArray<T> implement). Type the result as the
+                    // and OwningArray<T> implement). Type the result as the
                     // *builtin* IEnumerator<T> sentinel (a Named TypeRef with no
                     // declaration, astNode name = "IEnumerator", genericArgs =
                     // [T]) so the manual-protocol typing for the #494 fix fires:
@@ -3323,10 +3323,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // iterator-vtable enumerator, whose slots 1/2/3 are
                     // Dispose/MoveNext/Current — exactly what the #494 dispatch
                     // and the slot-1 using-var disposal expect. Iterating
-                    // OwnedArray<T> through IEnumerable<T> is borrowing (§4.3:
+                    // OwningArray<T> through IEnumerable<T> is borrowing (§4.3:
                     // shared read-only interfaces yield borrows), so Current is
                     // non-destructive here.
-                    if ((colName == "Array" || colName == "OwnedArray") &&
+                    if ((colName == "Array" || colName == "OwningArray") &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         static const ast::Type* kIEnumeratorNode =
@@ -3346,7 +3346,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, tr);
                     }
                     // #1102C / §29.11: `GetEnumerator()` on a vtable-backed
-                    // IEnumerable<T> / OwnedEnumerable<T> (a yield-method result
+                    // IEnumerable<T> / IOwningEnumerable<T> (a yield-method result
                     // or an interface-typed value, NOT the array-backed
                     // collections handled above) returns IEnumerator<T>. Type the
                     // result as the builtin IEnumerator<T> sentinel so the
@@ -3355,7 +3355,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // i32 default and `if b` emitted a malformed `br i32`. Codegen
                     // returns the receiver unchanged (the source iterator struct
                     // IS the enumerator; its vtable slot 2 = MoveNext).
-                    if ((colName == "IEnumerable" || colName == "OwnedEnumerable") &&
+                    if ((colName == "IEnumerable" || colName == "IOwningEnumerable") &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         static const ast::Type* kIEnumeratorNode2 =
@@ -3375,32 +3375,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, tr);
                     }
                     // issue #494 / §29.2 / §29.3: builtin IEnumerator<T> /
-                    // OwnedEnumerator<T> call-expression methods.
+                    // IOwningEnumerator<T> call-expression methods.
                     //   MoveNext(): bool — advances the iterator (vtable slot 2).
                     // #1349 / §29.1 v0.161: TakeCurrent(): owned T on
-                    // OwnedEnumerator<T> (replaces destructive Current property).
-                    if (colName == "IEnumerator" || colName == "OwnedEnumerator") {
+                    // IOwningEnumerator<T> (replaces destructive Current property).
+                    if (colName == "IEnumerator" || colName == "IOwningEnumerator") {
                         if (m == "MoveNext" && ce.args.empty())
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
-                        // TakeCurrent() on OwnedEnumerator<T> → T (vtable slot 3).
-                        if (colName == "OwnedEnumerator" &&
+                        // TakeCurrent() on IOwningEnumerator<T> → T (vtable slot 3).
+                        if (colName == "IOwningEnumerator" &&
                             m == "TakeCurrent" && ce.args.empty() &&
                             recvTy && !recvTy->genericArgs.empty() &&
                             recvTy->genericArgs[0])
                             ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         // Dispose() → unit; no type needed.
                     }
-                    // #1349 / §29.1 v0.161: GetOwnedEnumerator() on
-                    // OwnedEnumerable<T> → OwnedEnumerator<T> builtin sentinel
+                    // #1349 / §29.1 v0.161: GetOwningEnumerator() on
+                    // IOwningEnumerable<T> → IOwningEnumerator<T> builtin sentinel
                     // (no declaration), so TakeCurrent()/MoveNext() typing fires.
-                    if (colName == "OwnedEnumerable" &&
-                        m == "GetOwnedEnumerator" && ce.args.empty() &&
+                    if (colName == "IOwningEnumerable" &&
+                        m == "GetOwningEnumerator" && ce.args.empty() &&
                         recvTy && !recvTy->genericArgs.empty() &&
                         recvTy->genericArgs[0]) {
                         static const ast::Type* kOwnedEnumeratorNode =
                             []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;
-                            qn->parts.push_back("OwnedEnumerator");
+                            qn->parts.push_back("IOwningEnumerator");
                             auto* t = new ast::Type;
                             t->kind = ast::TypeKind::Named;
                             t->name.reset(qn);
@@ -3414,15 +3414,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, tr);
                     }
                     // issue #759 / §29.3 / §30.7 / stdlib §4.13: builtin
-                    // IAsyncEnumerator<T> / OwnedAsyncEnumerator<T> manual
+                    // IAsyncEnumerator<T> / IOwningAsyncEnumerator<T> manual
                     // protocol. MoveNextAsync(): Task<bool> — advances the async
                     // iterator (vtable slot 2). The `await` typer then peels
                     // Task<bool> → bool. makeTaskTypeRef is defined later in this
                     // function (out of scope here), so build Task<bool> inline.
                     // #1349 / §29.1 v0.161: TakeCurrent() on
-                    // OwnedAsyncEnumerator<T> → T (vtable slot 3).
+                    // IOwningAsyncEnumerator<T> → T (vtable slot 3).
                     if (colName == "IAsyncEnumerator" ||
-                        colName == "OwnedAsyncEnumerator") {
+                        colName == "IOwningAsyncEnumerator") {
                         if (m == "MoveNextAsync" && ce.args.empty()) {
                             auto* taskBool = ctx_.makeTypeRef();
                             taskBool->kind = TypeRef::Kind::Named;
@@ -3437,8 +3437,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.primitiveTypeRef(P::Bool));
                             ctx_.setExprType(&ce, taskBool);
                         }
-                        // TakeCurrent() on OwnedAsyncEnumerator<T> → T (#1349).
-                        if (colName == "OwnedAsyncEnumerator" &&
+                        // TakeCurrent() on IOwningAsyncEnumerator<T> → T (#1349).
+                        if (colName == "IOwningAsyncEnumerator" &&
                             m == "TakeCurrent" && ce.args.empty() &&
                             recvTy && !recvTy->genericArgs.empty() &&
                             recvTy->genericArgs[0])
@@ -3454,7 +3454,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // carrying the source's element type T) exactly like MoveNextAsync
                     // builds Task<bool> above.
                     if (colName == "IAsyncEnumerable" ||
-                        colName == "OwnedAsyncEnumerable") {
+                        colName == "IOwningAsyncEnumerable") {
                         if (m == "GetAsyncEnumerator") {
                             auto* enumTy = ctx_.makeTypeRef();
                             enumTy->kind = TypeRef::Kind::Named;
@@ -3473,7 +3473,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
                     // Dictionary methods
-                    if (colName == "Dictionary" || colName == "OwnedDictionary") {
+                    if (colName == "Dictionary" || colName == "OwningDictionary") {
                         if (m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "ContainsKey" || m == "Remove" || m == "TryGetValue" ||
@@ -3488,7 +3488,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // stdlib §4.8 / §4.9: GetOrAdd(key, factory): V — the
                         // result is the value type V (the second generic arg). For
-                        // OwnedDictionary the result is a BORROW of the stored value
+                        // OwningDictionary the result is a BORROW of the stored value
                         // (§4.9 "returns borrow"); for the borrowing Dictionary it is
                         // the stored value (§4.8). Either way the static type is V,
                         // which the ownership checker treats as Borrowed (no disposal
@@ -3523,15 +3523,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             ctx_.setExprType(&ce, recvTy->genericArgs[1]);
                         }
-                        // #628 / stdlib §4.9 v0.135: OwnedDictionary<K,V>.Drain()
-                        // returns OwnedEnumerable<DrainedEntry<K,V>>.
+                        // #628 / stdlib §4.9 v0.135: OwningDictionary<K,V>.Drain()
+                        // returns IOwningEnumerable<DrainedEntry<K,V>>.
                         // DrainedEntry<K,V> is a synthetic Named TypeRef with
                         // importedName="DrainedEntry" and genericArgs=[K,V]; it is
-                        // wrapped in OwnedEnumerable<> so the for-loop sema sets
+                        // wrapped in IOwningEnumerable<> so the for-loop sema sets
                         // the loop variable's type to DrainedEntry<K,V> (via the
-                        // first generic arg of OwnedEnumerable<T>).
+                        // first generic arg of IOwningEnumerable<T>).
                         // codegen's lowerDictDrainFor detects this iterable shape.
-                        else if (colName == "OwnedDictionary" &&
+                        else if (colName == "OwningDictionary" &&
                                  m == "Drain" && ce.args.empty() &&
                                  recvTy &&
                                  recvTy->genericArgs.size() >= 2 &&
@@ -3546,14 +3546,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             entryTy->importedName = kDrainedEntryName;
                             entryTy->genericArgs.push_back(recvTy->genericArgs[0]); // K
                             entryTy->genericArgs.push_back(recvTy->genericArgs[1]); // V
-                            // Wrap in OwnedEnumerable<DrainedEntry<K,V>>.
+                            // Wrap in IOwningEnumerable<DrainedEntry<K,V>>.
                             // Use a static astNode so lowerIEnumerableBuiltinFor can
-                            // see the name "OwnedEnumerable" and route to the drain
+                            // see the name "IOwningEnumerable" and route to the drain
                             // handler (lowerDictDrainFor checks for DrainedEntry in
                             // the first generic arg BEFORE the builtin path fires).
                             static const ast::Type* kOwnedEnumNode = []() -> ast::Type* {
                                 auto* qn = new ast::QualifiedName;
-                                qn->parts.push_back("OwnedEnumerable");
+                                qn->parts.push_back("IOwningEnumerable");
                                 auto* t = new ast::Type;
                                 t->kind = ast::TypeKind::Named;
                                 t->name.reset(qn);
@@ -3602,25 +3602,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                     }
                     // #639 / stdlib §4.5/§4.7/§4.11 v0.135:
-                    // OwnedArray<T>.Drain(), OwnedLinkedList<T>.Drain(),
-                    // OwnedStack<T>.Drain(), OwnedQueue<T>.Drain() all
-                    // return OwnedEnumerable<T>.
+                    // OwningArray<T>.Drain(), OwningLinkedList<T>.Drain(),
+                    // OwningStack<T>.Drain(), OwningQueue<T>.Drain() all
+                    // return IOwningEnumerable<T>.
                     // T is the first (and only) generic argument of the receiver.
                     // codegen's lowerOwnedSeqDrainFor handles all four;
                     // it detects the collection kind from the receiver type name.
-                    if ((colName == "OwnedArray" ||
-                         colName == "OwnedLinkedList" ||
-                         colName == "OwnedStack" ||
-                         colName == "OwnedQueue") &&
+                    if ((colName == "OwningArray" ||
+                         colName == "OwningLinkedList" ||
+                         colName == "OwningStack" ||
+                         colName == "OwningQueue") &&
                         m == "Drain" && ce.args.empty() &&
                         recvTy &&
                         !recvTy->genericArgs.empty() &&
                         recvTy->genericArgs[0]) {
-                        // Shared static astNode for OwnedEnumerable<T>.
+                        // Shared static astNode for IOwningEnumerable<T>.
                         static const ast::Type* kOwnedEnumSeqNode =
                             []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;
-                            qn->parts.push_back("OwnedEnumerable");
+                            qn->parts.push_back("IOwningEnumerable");
                             auto* t = new ast::Type;
                             t->kind = ast::TypeKind::Named;
                             t->name.reset(qn);
@@ -3896,8 +3896,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tt->astNode = ann;
                         return tt;
                     };
-                    // Helper: build a bare `OwnedTask` TypeRef (astNode name=
-                    // "OwnedTask", no generic args). Mirrors makeTaskTypeRef for
+                    // Helper: build a bare `OwningTask` TypeRef (astNode name=
+                    // "OwningTask", no generic args). Mirrors makeTaskTypeRef for
                     // the §30.5 Pattern B owned-result form so the result lowers
                     // to a ptr task handle (LlvmBackend_Layout lowerTypeRef).
                     auto makeOwnedTaskTypeRef = [&]() -> TypeRef* {
@@ -3907,7 +3907,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         auto* ann = new ast::Type();
                         ann->kind = ast::TypeKind::Named;
                         auto* nm = new ast::QualifiedName();
-                        nm->parts.push_back("OwnedTask");
+                        nm->parts.push_back("OwningTask");
                         ann->name.reset(nm);
                         tt->astNode = ann;
                         return tt;
@@ -3965,7 +3965,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, tt);
                         }
                         // stdlib §6.7 (line 2993) / §30.5 Pattern B:
-                        // Task.FromOwnedResult<T>(owned value: T): OwnedTask<T>
+                        // Task.FromOwnedResult<T>(owned value: T): OwningTask<T>
                         // where T: class. Returns an already-completed OWNED task
                         // carrying the owned value; awaiting it (Pattern B)
                         // transfers ownership of the value to the awaiter. The
@@ -4031,7 +4031,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                             ename = elemTy->astNode->name->parts[0];
                                         else if (elemTy->declaration && !elemTy->declaration->decl)
                                             ename = elemTy->declaration->name;
-                                        if (ename == "Task" || ename == "OwnedTask")
+                                        if (ename == "Task" || ename == "OwningTask")
                                             elemIsTask = true;
                                     }
                                     if (elemIsTask) {
@@ -4069,25 +4069,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, tt);
                         }
                         // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
-                        //   owned tasks: OwnedArray<OwnedTask<T>>
-                        // ): OwnedTask<OwnedArray<T>> where T: class.
+                        //   owned tasks: OwningArray<OwningTask<T>>
+                        // ): OwningTask<OwningArray<T>> where T: class.
                         //
                         // Pattern B aggregator: takes ownership of an
-                        // OwnedArray<OwnedTask<T>> and produces an
-                        // OwnedTask<OwnedArray<T>>. T must be a class type.
-                        // The result type is built as OwnedTask<OwnedArray<T>>
+                        // OwningArray<OwningTask<T>> and produces an
+                        // OwningTask<OwningArray<T>>. T must be a class type.
+                        // The result type is built as OwningTask<OwningArray<T>>
                         // where T is the innermost generic arg of the input.
                         if (m == "WhenAllOwned") {
-                            // Build OwnedTask<OwnedArray<T>> TypeRef.
-                            // Detect T from the arg type: OwnedArray<OwnedTask<T>>.
+                            // Build OwningTask<OwningArray<T>> TypeRef.
+                            // Detect T from the arg type: OwningArray<OwningTask<T>>.
                             TypeRef* T = nullptr;
                             if (!ce.args.empty() && ce.args[0].value) {
                                 TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
-                                // argTy = OwnedArray<OwnedTask<T>>
+                                // argTy = OwningArray<OwningTask<T>>
                                 if (argTy && argTy->kind == TypeRef::Kind::Named &&
                                     !argTy->genericArgs.empty() &&
                                     argTy->genericArgs[0]) {
-                                    TypeRef* elemTy = argTy->genericArgs[0]; // OwnedTask<T>
+                                    TypeRef* elemTy = argTy->genericArgs[0]; // OwningTask<T>
                                     if (elemTy->kind == TypeRef::Kind::Named &&
                                         !elemTy->genericArgs.empty() &&
                                         elemTy->genericArgs[0]) {
@@ -4095,25 +4095,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     }
                                 }
                             }
-                            // Build OwnedArray<T> TypeRef.
+                            // Build OwningArray<T> TypeRef.
                             auto* arrTy = ctx_.makeTypeRef();
                             arrTy->kind = TypeRef::Kind::Named;
                             arrTy->nullable = false;
                             auto* arrAnn = new ast::Type();
                             arrAnn->kind = ast::TypeKind::Named;
                             auto* arrNm = new ast::QualifiedName();
-                            arrNm->parts.push_back("OwnedArray");
+                            arrNm->parts.push_back("OwningArray");
                             arrAnn->name.reset(arrNm);
                             arrTy->astNode = arrAnn;
                             if (T) arrTy->genericArgs.push_back(T);
-                            // Build OwnedTask<OwnedArray<T>> TypeRef.
+                            // Build OwningTask<OwningArray<T>> TypeRef.
                             auto* ownedTaskTy = ctx_.makeTypeRef();
                             ownedTaskTy->kind = TypeRef::Kind::Named;
                             ownedTaskTy->nullable = false;
                             auto* otAnn = new ast::Type();
                             otAnn->kind = ast::TypeKind::Named;
                             auto* otNm = new ast::QualifiedName();
-                            otNm->parts.push_back("OwnedTask");
+                            otNm->parts.push_back("OwningTask");
                             otAnn->name.reset(otNm);
                             ownedTaskTy->astNode = otAnn;
                             ownedTaskTy->genericArgs.push_back(arrTy);
@@ -4127,15 +4127,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // §30.3 (v0.162 / #1362): t.Wait() on a Task / Task<T> receiver
                     // inside an async method or lambda is a compile error — a blocking
                     // wait inside a domain continuation deadlocks (§30.3). Use `await t`.
-                    // Also fires for OwnedTask.Wait() in async context (same deadlock).
+                    // Also fires for OwningTask.Wait() in async context (same deadlock).
                     if (m == "Wait" && ce.args.empty() && inAsyncContext_) {
                         ctx_.diagnostics().report(Severity::Error, ce.span.begin,
                             "use `await t` — blocking waits are not available in "
                             "async code (§30.3)");
                     }
                 }
-                // §30.3 (v0.162 / #1362): OwnedTask.Wait() — same async-context reject.
-                if (colName == "OwnedTask" && m == "Wait" && ce.args.empty() &&
+                // §30.3 (v0.162 / #1362): OwningTask.Wait() — same async-context reject.
+                if (colName == "OwningTask" && m == "Wait" && ce.args.empty() &&
                         inAsyncContext_) {
                     ctx_.diagnostics().report(Severity::Error, ce.span.begin,
                         "use `await t` — blocking waits are not available in "
@@ -4330,7 +4330,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                         bool owningClassSpan = isOwningSpan && elemIsClass;
-                        // The OWNING family (Span/ReadOnlySpan over OwnedBuffer)
+                        // The OWNING family (Span/ReadOnlySpan over OwningBuffer)
                         // with a class element: its slots own their elements, so
                         // the value-copy surface (Fill/CopyFrom/CopyTo) is
                         // forbidden on EITHER the writable or the read-only form.
@@ -4434,7 +4434,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     std::string("`") + std::string(m) +
                                     "` is admitted only on an owning `Span<T>` "
                                     "whose element type is a class (returned by "
-                                    "`OwnedBuffer<classT>.AsSpan()`); `" +
+                                    "`OwningBuffer<classT>.AsSpan()`); `" +
                                     std::string(rcn) + "<T>` has no `" +
                                     std::string(m) + "` (stdlib \xC2\xA7""4.14)");
                             }
@@ -4621,7 +4621,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (rcn == "Channel" && recvTy &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         const TypeRef* elemTy = recvTy->genericArgs[0];
-                        // Helper: build an OwnedTask / OwnedTask<T> TypeRef.
+                        // Helper: build an OwningTask / OwningTask<T> TypeRef.
                         auto makeOwnedTask = [&](const TypeRef* inner) -> TypeRef* {
                             auto* ot = ctx_.makeTypeRef();
                             ot->kind = TypeRef::Kind::Named;
@@ -4629,7 +4629,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             auto* ann = new ast::Type();
                             ann->kind = ast::TypeKind::Named;
                             auto* nm = new ast::QualifiedName();
-                            nm->parts.push_back("OwnedTask");
+                            nm->parts.push_back("OwningTask");
                             ann->name.reset(nm);
                             ot->astNode = ann;
                             if (inner) ot->genericArgs.push_back(const_cast<TypeRef*>(inner));
@@ -4666,7 +4666,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
 
                         if (m == "Receive") {
                             // §30.15: Receive() returns:
-                            //   OwnedTask<T> when T is a class type (owned transfer),
+                            //   OwningTask<T> when T is a class type (owned transfer),
                             //   Task<T>      when T is a value type or string.
                             bool elemIsClass = (elemTy->kind == TypeRef::Kind::Named &&
                                                elemTy->declaration &&
@@ -4759,13 +4759,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync.
                             //
                             // AcquireAsync(token := CancellationToken.None)
-                            //   → OwnedTask<Lock>
+                            //   → OwningTask<Lock>
                             // TryAcquireAsync(timeout: TimeSpan,
                             //                 token := CancellationToken.None)
-                            //   → OwnedTask<Lock?>
+                            //   → OwningTask<Lock?>
                             //
-                            // Build OwnedTask<Lock> / OwnedTask<Lock?> TypeRef.
-                            // Helper: build OwnedTask<T> TypeRef.
+                            // Build OwningTask<Lock> / OwningTask<Lock?> TypeRef.
+                            // Helper: build OwningTask<T> TypeRef.
                             auto makeOwnedTaskOf = [&](TypeRef* inner) -> TypeRef* {
                                 auto* ot = ctx_.makeTypeRef();
                                 ot->kind = TypeRef::Kind::Named;
@@ -4773,18 +4773,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 auto* ann = new ast::Type();
                                 ann->kind = ast::TypeKind::Named;
                                 auto* nm = new ast::QualifiedName();
-                                nm->parts.push_back("OwnedTask");
+                                nm->parts.push_back("OwningTask");
                                 ann->name.reset(nm);
                                 ot->astNode = ann;
                                 if (inner) ot->genericArgs.push_back(inner);
                                 return ot;
                             };
                             if (m == "AcquireAsync") {
-                                // OwnedTask<Lock>
+                                // OwningTask<Lock>
                                 ctx_.setExprType(&ce,
                                     makeOwnedTaskOf(makeLockTypeRef()));
                             } else {
-                                // TryAcquireAsync → OwnedTask<Lock?>
+                                // TryAcquireAsync → OwningTask<Lock?>
                                 auto* lockNullable = makeLockTypeRef();
                                 lockNullable->nullable = true;
                                 ctx_.setExprType(&ce,
@@ -4836,10 +4836,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         } else if (m == "AcquireAsync" || m == "TryAcquireAsync") {
                             // §6.3 / #647 / v0.140:
                             //   AcquireAsync(token := CancellationToken.None)
-                            //     → OwnedTask<SemaphoreToken>
+                            //     → OwningTask<SemaphoreToken>
                             //   TryAcquireAsync(timeout: TimeSpan,
                             //                   token := CancellationToken.None)
-                            //     → OwnedTask<SemaphoreToken?>
+                            //     → OwningTask<SemaphoreToken?>
                             auto makeOwnedTaskOf = [&](TypeRef* inner) -> TypeRef* {
                                 auto* ot = ctx_.makeTypeRef();
                                 ot->kind = TypeRef::Kind::Named;
@@ -4847,18 +4847,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 auto* ann = new ast::Type();
                                 ann->kind = ast::TypeKind::Named;
                                 auto* nm = new ast::QualifiedName();
-                                nm->parts.push_back("OwnedTask");
+                                nm->parts.push_back("OwningTask");
                                 ann->name.reset(nm);
                                 ot->astNode = ann;
                                 if (inner) ot->genericArgs.push_back(inner);
                                 return ot;
                             };
                             if (m == "AcquireAsync") {
-                                // OwnedTask<SemaphoreToken>
+                                // OwningTask<SemaphoreToken>
                                 ctx_.setExprType(&ce,
                                     makeOwnedTaskOf(makeSemTokenTypeRef()));
                             } else {
-                                // TryAcquireAsync → OwnedTask<SemaphoreToken?>
+                                // TryAcquireAsync → OwningTask<SemaphoreToken?>
                                 auto* tokNullable = makeSemTokenTypeRef();
                                 tokNullable->nullable = true;
                                 ctx_.setExprType(&ce,
@@ -4879,7 +4879,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Dispose(): unit; no return type set.
                     }
                     // §6.6 / issue #974: TaskCompletionSource<T> /
-                    // OwnedTaskCompletionSource<T> / TaskCompletionSource
+                    // OwningTaskCompletionSource<T> / TaskCompletionSource
                     // (non-generic) instance methods.
                     // Method set per stdlib §6.6:
                     //   SetResult(result: T) / TrySetResult(result: T): bool
@@ -4887,7 +4887,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     //   SetCancelled() / TrySetCancelled(): bool
                     //   Dispose(): unit (handled by using-var machinery)
                     if ((rcn == "TaskCompletionSource" ||
-                         rcn == "OwnedTaskCompletionSource") && recvTy) {
+                         rcn == "OwningTaskCompletionSource") && recvTy) {
                         if (m == "TrySetResult" || m == "TrySetException" ||
                             m == "TrySetCancelled") {
                             // TrySet* → bool return.
@@ -4977,7 +4977,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Dispose(): unit; no return type set.
                     }
                     // §9.8 / §2.15 / issue #550: BinarySerializer.ToBytes() →
-                    // OwnedBuffer<byte>.  Set on the CallExpr so that inferred-type
+                    // OwningBuffer<byte>.  Set on the CallExpr so that inferred-type
                     // locals (`using var bytes := s.ToBytes()`) pick up the element
                     // type and downstream `bytes.AsReadOnlySpan()` can be intercepted
                     // by isSerializationCall / tryLowerSerializationCall.
@@ -4998,7 +4998,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "ToBytes") {
                             static const ast::Type* kOwnedBufNode2 = []() -> ast::Type* {
                                 auto* qn = new ast::QualifiedName;
-                                qn->parts.push_back("OwnedBuffer");
+                                qn->parts.push_back("OwningBuffer");
                                 auto* t = new ast::Type;
                                 t->kind = ast::TypeKind::Named;
                                 t->name.reset(qn);
@@ -5035,12 +5035,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "(stdlib \xC2\xA7""2.14" "\xE2\x80\x93" "2.15)");
                         }
                     }
-                    // §2.15 / issue #550: JsonSerializer.ToBytes() → OwnedBuffer<byte>.
+                    // §2.15 / issue #550: JsonSerializer.ToBytes() → OwningBuffer<byte>.
                     // JsonSerializer.ToString() → string.
                     if (rcn == "JsonSerializer" && m == "ToBytes") {
                         static const ast::Type* kJserBufNode = []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;
-                            qn->parts.push_back("OwnedBuffer");
+                            qn->parts.push_back("OwningBuffer");
                             auto* t = new ast::Type;
                             t->kind = ast::TypeKind::Named;
                             t->name.reset(qn);
@@ -5063,9 +5063,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 //   1. entry must be capture-free (static ref or non-capturing lambda)
                 //   2. entry args must be sendable value/string or owned sendable class
                 //   3. entry result type (if any) must be sendable
-                // Returns: OwnedTask (void entry) or OwnedTask<R> (R = sendable result).
+                // Returns: OwningTask (void entry) or OwningTask<R> (R = sendable result).
                 if (colName == "Domain" && m == "Spawn" && !ce.args.empty()) {
-                    // Build an OwnedTask TypeRef helper (static, reused below).
+                    // Build an OwningTask TypeRef helper (static, reused below).
                     auto makeOwnedTask = [&](const TypeRef* inner) -> TypeRef* {
                         auto* ot = ctx_.makeTypeRef();
                         ot->kind = TypeRef::Kind::Named;
@@ -5073,7 +5073,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         auto* ann = new ast::Type();
                         ann->kind = ast::TypeKind::Named;
                         auto* nm = new ast::QualifiedName();
-                        nm->parts.push_back("OwnedTask");
+                        nm->parts.push_back("OwningTask");
                         ann->name.reset(nm);
                         ot->astNode = ann;
                         if (inner) ot->genericArgs.push_back(const_cast<TypeRef*>(inner));
@@ -5180,9 +5180,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
 
                     // Type the Spawn call:
-                    //   - void entry → OwnedTask (bare, no T)
-                    //   - owned R entry → OwnedTask<R>
-                    //   - value-type R entry → OwnedTask<R> (value crossed as copy)
+                    //   - void entry → OwningTask (bare, no T)
+                    //   - owned R entry → OwningTask<R>
+                    //   - value-type R entry → OwningTask<R> (value crossed as copy)
                     if (!entryReturnTy || entryReturnTy->kind == TypeRef::Kind::Unit) {
                         ctx_.setExprType(&ce, makeOwnedTask(nullptr));
                     } else {
@@ -6590,7 +6590,7 @@ TypeRef* ExprTC::substituteReturnType(
     // Constructed generic → substitute each generic argument in place.
     // This covers both user-defined generic types (declaration != nullptr, e.g.
     // `Box<T>`) and null-declaration stdlib built-ins (e.g. `Array<T>`,
-    // `OwnedArray<T>`) — both carry the element type parameter in genericArgs.
+    // `OwningArray<T>`) — both carry the element type parameter in genericArgs.
     // issue #564 (§14.1 / §22.1): the `declaration &&` guard was too strict;
     // null-declaration stdlib collections were left unsubstituted, so
     // `MakeTwo<int>(): owned Array<T>` typed the call as `Array<T>` instead of
@@ -6915,7 +6915,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         } else if (dynamic_cast<const ast::IndexExpr*>(ma.target.get())) {
             // per §7.4 (#1161): the target is an index/indexer result
             // (`coll[i].member`) whose element type is nullable — e.g.
-            // `Dictionary<K, V?>`, `Array<T?>`, or `OwnedBuffer<classT>`
+            // `Dictionary<K, V?>`, `Array<T?>`, or `OwningBuffer<classT>`
             // (whose indexer is `T?` per #1157). An index result is not a
             // local variable, so it is never narrowable; the value could be
             // null and a direct `.member` null-derefs at runtime. The bare
@@ -7751,7 +7751,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // typed as the builtin IEnumerator<T> (no sema TypeDecl). Current returns
         // T (the first generic arg). Typing this lets `var x := e.Current` and
         // `s := s + e.Current` infer the element type.
-        // #1349 / §29.1 v0.161: OwnedEnumerator<T> and OwnedAsyncEnumerator<T>
+        // #1349 / §29.1 v0.161: IOwningEnumerator<T> and IOwningAsyncEnumerator<T>
         // no longer have Current — they use TakeCurrent() (a method call). Only
         // the borrowing IEnumerator<T> / IAsyncEnumerator<T> retain the property.
         if (ma.target && ma.member == "Current") {
@@ -7761,7 +7761,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
                     // issue #759: async enumerators also use Current: T.
-                    // #1349: OwnedEnumerator/OwnedAsyncEnumerator excluded.
+                    // #1349: IOwningEnumerator/IOwningAsyncEnumerator excluded.
                     (tt->astNode->name->parts[0] == "IEnumerator" ||
                      tt->astNode->name->parts[0] == "IAsyncEnumerator");
                 if (isBuiltinEnumerator && !tt->genericArgs.empty() &&
@@ -7835,7 +7835,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
                     (tt->astNode->name->parts[0] == "Dictionary" ||
-                     tt->astNode->name->parts[0] == "OwnedDictionary");
+                     tt->astNode->name->parts[0] == "OwningDictionary");
                 std::size_t gi = ma.member == "Keys" ? 0 : 1;
                 if (isDict && tt->genericArgs.size() > gi && tt->genericArgs[gi]) {
                     // Static synthetic astNode for "Array" (program-lifetime).
@@ -7866,7 +7866,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // value (#420's tryLowerConsoleCall workaround). Type these built-in
         // collection properties directly: `Count` is `int` for every collection
         // (ICollection<T>.Count, stdlib §4.3); `Capacity` is `int` for the two
-        // array types that declare it (Array<T>/OwnedArray<T>, stdlib §4.4).
+        // array types that declare it (Array<T>/OwningArray<T>, stdlib §4.4).
         if (ma.target && (ma.member == "Count" || ma.member == "Capacity")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
                 bool isBuiltinColl =
@@ -7877,15 +7877,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ? std::string_view(tt->astNode->name->parts[0])
                     : std::string_view();
                 bool hasCount =
-                    cn == "Array" || cn == "OwnedArray" ||
-                    cn == "Stack" || cn == "OwnedStack" ||
-                    cn == "Queue" || cn == "OwnedQueue" ||
-                    cn == "Set" || cn == "OwnedSet" ||
-                    cn == "LinkedList" || cn == "OwnedLinkedList" ||
-                    cn == "Dictionary" || cn == "OwnedDictionary" ||
-                    // §4.14 / issue #550: OwnedBuffer<T>.Count (bz_array_t-backed).
-                    cn == "OwnedBuffer";
-                bool hasCapacity = cn == "Array" || cn == "OwnedArray";
+                    cn == "Array" || cn == "OwningArray" ||
+                    cn == "Stack" || cn == "OwningStack" ||
+                    cn == "Queue" || cn == "OwningQueue" ||
+                    cn == "Set" || cn == "OwningSet" ||
+                    cn == "LinkedList" || cn == "OwningLinkedList" ||
+                    cn == "Dictionary" || cn == "OwningDictionary" ||
+                    // §4.14 / issue #550: OwningBuffer<T>.Count (bz_array_t-backed).
+                    cn == "OwningBuffer";
+                bool hasCapacity = cn == "Array" || cn == "OwningArray";
                 bool ok = ma.member == "Count" ? hasCount : hasCapacity;
                 if (ok) {
                     ctx_.setExprType(
@@ -7919,7 +7919,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
-        // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-returning properties
+        // per §4.6/§4.7: LinkedList<T>/OwningLinkedList<T> node-returning properties
         // (FirstNode, LastNode, First, Last) and LinkedListNode<T> accessor
         // properties (Value, Next, Previous). None have user TypeSymbols, so the
         // ordinary member-lookup path never types them.
@@ -7931,8 +7931,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             std::string_view llcn = isBuiltinLL
                 ? std::string_view(tt->astNode->name->parts[0]) : std::string_view{};
 
-            // LinkedList<T> / OwnedLinkedList<T> node properties.
-            if ((llcn == "LinkedList" || llcn == "OwnedLinkedList") &&
+            // LinkedList<T> / OwningLinkedList<T> node properties.
+            if ((llcn == "LinkedList" || llcn == "OwningLinkedList") &&
                 !tt->genericArgs.empty() && tt->genericArgs[0]) {
                 auto* elemTy = tt->genericArgs[0];
                 const auto& mbr = ma.member;
@@ -8311,7 +8311,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
-        // §30.3 (#1175): Task<T> / Task / OwnedTask<T> instance readonly property
+        // §30.3 (#1175): Task<T> / Task / OwningTask<T> instance readonly property
         // reads. None of these types has a user TypeSymbol, so the ordinary member-
         // lookup path never types their properties. Without this handler,
         // resolveMemberAccess leaves them untyped, causing two bugs from one root:
@@ -8331,8 +8331,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // Properties typed:
         //   IsCompleted / IsFaulted / IsCancelled → bool  (all three task types)
         //   Result → T (genericArgs[0])                   (Task<T> ONLY; §30.3 explicitly
-        //                                                   rejects OwnedTask<T>.Result —
-        //                                                   OwnedTask consumes via await)
+        //                                                   rejects OwningTask<T>.Result —
+        //                                                   OwningTask consumes via await)
         if (ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
             auto taskTypeNameFn = [](const TypeRef* rt) -> std::string_view {
@@ -8347,12 +8347,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return {};
             };
             std::string_view tn = taskTypeNameFn(tt);
-            bool isAnyTask = (tn == "Task" || tn == "OwnedTask");
+            bool isAnyTask = (tn == "Task" || tn == "OwningTask");
             if (isAnyTask) {
                 const auto& mbr = ma.member;
                 // §30.3: IsCompleted / IsFaulted / IsCancelled are bool properties
                 // declared on the base `Task` class and inherited by Task<T> and
-                // OwnedTask<T> (spec §30.3 class hierarchy). Type them bool so that
+                // OwningTask<T> (spec §30.3 class hierarchy). Type them bool so that
                 // `if t.IsCompleted` and similar expressions resolve correctly.
                 if (mbr == "IsCompleted" || mbr == "IsFaulted" ||
                     mbr == "IsCancelled") {
@@ -8363,7 +8363,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // §30.3 / §30.5 (#1127): Result is T (the task's value type).
                 // Task<T>.Result — the synchronous blocking escape hatch: blocks
                 // the calling thread until the task completes and returns T.
-                // OwnedTask<T>.Result — the same synchronous form for an ownership-
+                // OwningTask<T>.Result — the same synchronous form for an ownership-
                 // transferring result: blocks until complete, then materializes the
                 // owned T pointer (loaded from the task's result buffer) and transfers
                 // ownership to the caller; the caller must `using var`-bind the result.
@@ -8371,7 +8371,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // A bare `Task` (no type argument) has no value to read; leave it
                 // untyped and let codegen handle or reject it.
                 if (mbr == "Result") {
-                    if ((tn == "Task" || tn == "OwnedTask") && tt &&
+                    if ((tn == "Task" || tn == "OwningTask") && tt &&
                         !tt->genericArgs.empty() && tt->genericArgs[0]) {
                         // §30.3 (v0.162 / #1362): .Result inside an async method or
                         // lambda is a compile error — blocking waits deadlock inside
@@ -8389,10 +8389,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
-        // §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T>
+        // §6.6 / issue #974: TaskCompletionSource<T> / OwningTaskCompletionSource<T>
         // / TaskCompletionSource (non-generic) — readonly property `Task`.
         //   TaskCompletionSource<T>.Task   → Task<T>
-        //   OwnedTaskCompletionSource<T>.Task → OwnedTask<T>
+        //   OwningTaskCompletionSource<T>.Task → OwningTask<T>
         //   TaskCompletionSource.Task       → Task
         if (ma.target && ma.member == "Task") {
             auto* tt = ctx_.exprType(*ma.target);
@@ -8406,10 +8406,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             };
             std::string_view tcsn = getTcsName(tt);
             if (tcsn == "TaskCompletionSource" ||
-                tcsn == "OwnedTaskCompletionSource") {
-                // Build a Task<T>/OwnedTask<T>/Task TypeRef.
+                tcsn == "OwningTaskCompletionSource") {
+                // Build a Task<T>/OwningTask<T>/Task TypeRef.
                 const char* taskName =
-                    (tcsn == "OwnedTaskCompletionSource") ? "OwnedTask" : "Task";
+                    (tcsn == "OwningTaskCompletionSource") ? "OwningTask" : "Task";
                 auto* ann = new ast::Type();
                 ann->kind = ast::TypeKind::Named;
                 auto* nm = new ast::QualifiedName();
@@ -8983,19 +8983,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // are compiler-known builtin classes (null `decl`, non-null astNode).
             // Type their return-producing methods so downstream code can infer
             // chain types (e.g. `using var bytes := s.ToBytes()` must know `bytes`
-            // is OwnedBuffer<byte> so `bytes.AsReadOnlySpan()` can be intercepted).
+            // is OwningBuffer<byte> so `bytes.AsReadOnlySpan()` can be intercepted).
             if (cls == "BinarySerializer") {
                 if (m == "ToBytes") {
-                    // Returns OwnedBuffer<byte> (stdlib §2.15).
+                    // Returns OwningBuffer<byte> (stdlib §2.15).
                     // Set on the CallExpr so that inferred-type locals
                     // (`using var bytes := s.ToBytes()`) pick up the type
                     // at line 1692 (`lsym->declType = ctx_.exprType(*ld->initializer)`).
                     // Also set on the MemberAccessExpr callee so that the
-                    // fallback callee-type propagation below picks up OwnedBuffer<byte>
+                    // fallback callee-type propagation below picks up OwningBuffer<byte>
                     // when `m == "ToBytes"` reaches the callee-type propagation block.
                     static const ast::Type* kOwnedBufferAstNode = []() -> ast::Type* {
                         auto* qn = new ast::QualifiedName;
-                        qn->parts.push_back("OwnedBuffer");
+                        qn->parts.push_back("OwningBuffer");
                         auto* t = new ast::Type;
                         t->kind = ast::TypeKind::Named;
                         t->name.reset(qn);
@@ -9018,10 +9018,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // §2.15 / issue #550: JsonSerializer and JsonDeserializer.
             if (cls == "JsonSerializer") {
                 if (m == "ToBytes") {
-                    // Returns OwnedBuffer<byte> (stdlib §2.15).
+                    // Returns OwningBuffer<byte> (stdlib §2.15).
                     static const ast::Type* kJserObNode = []() -> ast::Type* {
                         auto* qn = new ast::QualifiedName;
-                        qn->parts.push_back("OwnedBuffer");
+                        qn->parts.push_back("OwningBuffer");
                         auto* t = new ast::Type;
                         t->kind = ast::TypeKind::Named;
                         t->name.reset(qn);
@@ -9576,7 +9576,7 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
 // §30.14 / §3.6 (#600): sendability derived-type property.
 // Implements the §30.14 table: value-type rule, string, function types,
 // class "transfer-closed" rule, stdlib overrides (Task/Shared/Channel/…),
-// OwnedArray/Array per-element rules. Coinductive via `inProgress`.
+// OwningArray/Array per-element rules. Coinductive via `inProgress`.
 // ===========================================================================
 
 // Helper: extract the builtin-name of a TypeRef whose declaration is null
@@ -9655,7 +9655,7 @@ bool ExprTC::isSendable(const TypeRef* rt,
         std::string_view bname = builtinTypeName(rt);
         if (!bname.empty()) {
             // §30.14 stdlib table: NOT sendable (domain-local or borrow-carrying).
-            //   Task<T>, OwnedTask<T>, Task (bare): domain-local.
+            //   Task<T>, OwningTask<T>, Task (bare): domain-local.
             //   Weak<T>: v0.140 lifted Shared<T> handles but NOT Weak<T> — a
             //     Weak<T> across domains leaves TryUpgrade racing with the last
             //     strong drop on another domain; the CAS in TryUpgrade is safe
@@ -9674,7 +9674,7 @@ bool ExprTC::isSendable(const TypeRef* rt,
             //   / #647: internally synchronized, like Channel<T>.
             // NOTE: Semaphore is NOT in this list — sendable per stdlib §6.3
             //   v0.140 / #647: internally synchronized (same reasoning as Mutex).
-            if (bname == "Task" || bname == "OwnedTask" ||
+            if (bname == "Task" || bname == "OwningTask" ||
                 bname == "Weak" ||
                 bname == "EventSource" || bname == "AsyncEventSource" ||
                 bname == "SemaphoreToken" ||
@@ -9706,17 +9706,17 @@ bool ExprTC::isSendable(const TypeRef* rt,
             }
 
             // §30.14 stdlib table: sendable iff element sendable.
-            //   OwnedArray<T>, OwnedStack<T>, OwnedQueue<T>, OwnedSet<T>,
-            //   OwnedLinkedList<T>, OwnedDictionary<K,V>: owning collections.
-            if (bname == "OwnedArray" || bname == "OwnedStack" ||
-                bname == "OwnedQueue" || bname == "OwnedSet" ||
-                bname == "OwnedLinkedList") {
+            //   OwningArray<T>, OwningStack<T>, OwningQueue<T>, OwningSet<T>,
+            //   OwningLinkedList<T>, OwningDictionary<K,V>: owning collections.
+            if (bname == "OwningArray" || bname == "OwningStack" ||
+                bname == "OwningQueue" || bname == "OwningSet" ||
+                bname == "OwningLinkedList") {
                 // Sendable iff element type is sendable.
                 if (rt->genericArgs.empty() || !rt->genericArgs[0])
                     return false;
                 return isSendable(rt->genericArgs[0], inProgress);
             }
-            if (bname == "OwnedDictionary") {
+            if (bname == "OwningDictionary") {
                 // Both K and V must be sendable.
                 if (rt->genericArgs.size() < 2) return false;
                 if (!rt->genericArgs[0] || !rt->genericArgs[1]) return false;

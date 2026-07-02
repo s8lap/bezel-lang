@@ -2,9 +2,9 @@
 // order (issue #598, §28.11).
 //
 // §28.11 (spec line 5547): "The element-disposal order is
-// implementation-defined for unordered collections (OwnedDictionary, OwnedSet),
-// and is reverse-insertion-order for ordered collections (OwnedArray,
-// OwnedLinkedList, OwnedStack, OwnedQueue)."
+// implementation-defined for unordered collections (OwningDictionary, OwningSet),
+// and is reverse-insertion-order for ordered collections (OwningArray,
+// OwningLinkedList, OwningStack, OwningQueue)."
 //
 // The reproducer from #598: Add Item(1), Item(2), Item(3) to an owning
 // collection. Each item's destructor encodes its id in a static log via
@@ -12,7 +12,7 @@
 // Expected (reverse-insertion = last-in-first-out): 3→2→1 → _log == 321.
 // Before the fix, all four ordered collections disposed forward → _log == 123.
 //
-// OwnedSet is unordered (order is impl-defined); it is NOT tested here.
+// OwningSet is unordered (order is impl-defined); it is NOT tested here.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -50,10 +50,10 @@ int runItems(const std::string& mainBody) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// OwnedArray<T> — §28.11
+// OwningArray<T> — §28.11
 // ---------------------------------------------------------------------------
 
-// §28.11: OwnedArray<T>.Dispose() (via `using var` scope-end) disposes
+// §28.11: OwningArray<T>.Dispose() (via `using var` scope-end) disposes
 // elements in reverse-insertion order. Add(Item(1)); Add(Item(2)); Add(Item(3))
 // → dispose 3 first, then 2, then 1 → _log == 321.
 // Before fix: forward order → _log == 123.
@@ -61,7 +61,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_array_disposes_reverse_insertion_order) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var a := new OwnedArray<Item>(); "
+        "  using var a := new OwningArray<Item>(); "
         "  a.Add(move (new Item(1))); "
         "  a.Add(move (new Item(2))); "
         "  a.Add(move (new Item(3))); "
@@ -69,12 +69,12 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "return Item._log;"), 321);
 }
 
-// §28.11: single-element OwnedArray disposes the single element exactly once.
+// §28.11: single-element OwningArray disposes the single element exactly once.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_array_single_element_disposed_once) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var a := new OwnedArray<Item>(); "
+        "  using var a := new OwningArray<Item>(); "
         "  a.Add(move (new Item(7))); "
         "end; "
         "return Item._log;"), 7);
@@ -92,7 +92,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "end R; "
         "class C public static method Main(): int "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R())); "
         "    a.Add(move (new R())); "
         "    a.Add(move (new R())); "
@@ -102,10 +102,10 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 }
 
 // ---------------------------------------------------------------------------
-// OwnedLinkedList<T> — §28.11
+// OwningLinkedList<T> — §28.11
 // ---------------------------------------------------------------------------
 
-// §28.11: OwnedLinkedList<T>.Dispose() disposes elements in reverse-insertion
+// §28.11: OwningLinkedList<T>.Dispose() disposes elements in reverse-insertion
 // order. AddLast(Item(1)); AddLast(Item(2)); AddLast(Item(3)) → dispose 3
 // first, then 2, then 1 → _log == 321.
 // Before fix: forward (head-to-tail) order → _log == 123.
@@ -113,7 +113,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_linked_list_disposes_reverse_insertion_order) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var ll := new OwnedLinkedList<Item>(); "
+        "  using var ll := new OwningLinkedList<Item>(); "
         "  ll.AddLast(move (new Item(1))); "
         "  ll.AddLast(move (new Item(2))); "
         "  ll.AddLast(move (new Item(3))); "
@@ -121,12 +121,12 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "return Item._log;"), 321);
 }
 
-// §28.11: single-element OwnedLinkedList disposes the single element once.
+// §28.11: single-element OwningLinkedList disposes the single element once.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_linked_list_single_element_disposed_once) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var ll := new OwnedLinkedList<Item>(); "
+        "  using var ll := new OwningLinkedList<Item>(); "
         "  ll.AddLast(move (new Item(7))); "
         "end; "
         "return Item._log;"), 7);
@@ -143,7 +143,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "end R; "
         "class C public static method Main(): int "
         "  do "
-        "    using var ll := new OwnedLinkedList<R>(); "
+        "    using var ll := new OwningLinkedList<R>(); "
         "    ll.AddLast(move (new R())); "
         "    ll.AddLast(move (new R())); "
         "    ll.AddLast(move (new R())); "
@@ -153,10 +153,10 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 }
 
 // ---------------------------------------------------------------------------
-// OwnedQueue<T> — §28.11
+// OwningQueue<T> — §28.11
 // ---------------------------------------------------------------------------
 
-// §28.11: OwnedQueue<T>.Dispose() disposes elements in reverse-insertion
+// §28.11: OwningQueue<T>.Dispose() disposes elements in reverse-insertion
 // order. Enqueue(Item(1)); Enqueue(Item(2)); Enqueue(Item(3)) inserts 1 first
 // (front) and 3 last (back). Reverse-insertion → dispose 3 first, then 2,
 // then 1 → _log == 321.
@@ -165,7 +165,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_queue_disposes_reverse_insertion_order) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var q := new OwnedQueue<Item>(); "
+        "  using var q := new OwningQueue<Item>(); "
         "  q.Enqueue(move (new Item(1))); "
         "  q.Enqueue(move (new Item(2))); "
         "  q.Enqueue(move (new Item(3))); "
@@ -173,12 +173,12 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "return Item._log;"), 321);
 }
 
-// §28.11: single-element OwnedQueue disposes the single element once.
+// §28.11: single-element OwningQueue disposes the single element once.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_queue_single_element_disposed_once) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var q := new OwnedQueue<Item>(); "
+        "  using var q := new OwningQueue<Item>(); "
         "  q.Enqueue(move (new Item(7))); "
         "end; "
         "return Item._log;"), 7);
@@ -195,7 +195,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "end R; "
         "class C public static method Main(): int "
         "  do "
-        "    using var q := new OwnedQueue<R>(); "
+        "    using var q := new OwningQueue<R>(); "
         "    q.Enqueue(move (new R())); "
         "    q.Enqueue(move (new R())); "
         "    q.Enqueue(move (new R())); "
@@ -205,10 +205,10 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 }
 
 // ---------------------------------------------------------------------------
-// OwnedStack<T> — §28.11
+// OwningStack<T> — §28.11
 // ---------------------------------------------------------------------------
 
-// §28.11: OwnedStack<T>.Dispose() disposes elements in reverse-insertion
+// §28.11: OwningStack<T>.Dispose() disposes elements in reverse-insertion
 // order. Push(Item(1)); Push(Item(2)); Push(Item(3)) inserts 1 first (bottom)
 // and 3 last (top). Reverse-insertion means dispose 3 (top/last-in) first,
 // then 2, then 1 → _log == 321. Note: Pop order is 3→2→1 (LIFO), which
@@ -217,7 +217,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_stack_disposes_reverse_insertion_order) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var s := new OwnedStack<Item>(); "
+        "  using var s := new OwningStack<Item>(); "
         "  s.Push(move (new Item(1))); "
         "  s.Push(move (new Item(2))); "
         "  s.Push(move (new Item(3))); "
@@ -225,12 +225,12 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "return Item._log;"), 321);
 }
 
-// §28.11: single-element OwnedStack disposes the single element once.
+// §28.11: single-element OwningStack disposes the single element once.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_stack_single_element_disposed_once) {
     BEZEL_EXPECT_EQ(runItems(
         "do "
-        "  using var s := new OwnedStack<Item>(); "
+        "  using var s := new OwningStack<Item>(); "
         "  s.Push(move (new Item(7))); "
         "end; "
         "return Item._log;"), 7);
@@ -247,7 +247,7 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "end R; "
         "class C public static method Main(): int "
         "  do "
-        "    using var s := new OwnedStack<R>(); "
+        "    using var s := new OwningStack<R>(); "
         "    s.Push(move (new R())); "
         "    s.Push(move (new R())); "
         "    s.Push(move (new R())); "
@@ -257,10 +257,10 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 }
 
 // ---------------------------------------------------------------------------
-// OwnedArray field (owned field in a class) — §28.11 + §28.5
+// OwningArray field (owned field in a class) — §28.11 + §28.5
 // ---------------------------------------------------------------------------
 
-// §28.11 + §28.5: an `owned OwnedArray<T>` field's elements are disposed
+// §28.11 + §28.5: an `owned OwningArray<T>` field's elements are disposed
 // when the owner is disposed. Disposal of the owner triggers the field's
 // backing to be freed, cascading reverse-insertion-order element disposal.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
@@ -274,9 +274,9 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "  destructor _log := _log * 10 + _id; end destructor; "
         "end Item; "
         "class Pool "
-        "  private owned _items: OwnedArray<Item>; "
+        "  private owned _items: OwningArray<Item>; "
         "  public constructor() "
-        "    _items := new OwnedArray<Item>(); "
+        "    _items := new OwningArray<Item>(); "
         "    _items.Add(move (new Item(1))); "
         "    _items.Add(move (new Item(2))); "
         "    _items.Add(move (new Item(3))); "

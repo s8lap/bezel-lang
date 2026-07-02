@@ -127,14 +127,14 @@ BEZEL_TEST(deserializer_arrayspan_1358, file_readallbytes_to_deserializer) {
         "end Main; end C;"), 0);
 }
 
-// An OwnedBuffer<byte> arg to the deserializer is still rejected (§2.15/#631):
+// An OwningBuffer<byte> arg to the deserializer is still rejected (§2.15/#631):
 // the ctor takes a span, not the owning buffer — call .AsReadOnlySpan() first.
 BEZEL_TEST(deserializer_arrayspan_1358, binary_deserializer_owned_buffer_rejected) {
     // per stdlib §2.15 (#631) — unchanged by the #1358 additive twin.
     BEZEL_EXPECT_TRUE(rejects(
         "module M; import System.Collections.Generic; import System.Serialization; "
         "class C public static method Main(): int "
-        "  using var ob := new OwnedBuffer<byte>(4); "
+        "  using var ob := new OwningBuffer<byte>(4); "
         "  using var d := new BinaryDeserializer(ob); "
         "  return 0; "
         "end Main; end C;"));

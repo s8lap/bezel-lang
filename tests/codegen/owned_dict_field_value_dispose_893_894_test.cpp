@@ -1,9 +1,9 @@
-// Codegen — §28.5/§28.11 (#893 #894): an owned OwnedDictionary<K,V> CLASS FIELD
+// Codegen — §28.5/§28.11 (#893 #894): an owned OwningDictionary<K,V> CLASS FIELD
 // disposes its V values on the containing object's disposal and on field
 // reassignment.
 //
 // Root cause: `ownedCollectionFieldType` (LlvmBackend_impl.hpp) did not include
-// dict types (Dictionary/OwnedDictionary), so OwnedDictionary fields were never
+// dict types (Dictionary/OwningDictionary), so OwningDictionary fields were never
 // added to the owned-field disposal list in emitOwnedFieldDisposals; and the
 // field-store disposal path (lowerOwnedCollectionFieldStore) used bz_array_free
 // with genericArgs[0] (the KEY) instead of bz_dict_free with genericArgs[1]
@@ -17,7 +17,7 @@
 // Two kinds (mirroring owned_dict_disposal_test.cpp):
 //   * destructor-count JIT tests (always run): counter proves disposal of the
 //     class V elements exactly once, no double-free (counter never negative).
-//   * OwnedArray/OwnedLinkedList/OwnedStack field regression: must still dispose.
+//   * OwningArray/OwningLinkedList/OwningStack field regression: must still dispose.
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,9 +50,9 @@ int run(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
-// --- #893: owned OwnedDictionary field disposes class V values on disposal ---
+// --- #893: owned OwningDictionary field disposes class V values on disposal ---
 
-// Box with `owned _dict: OwnedDictionary<string, Cell>`. Two entries added in
+// Box with `owned _dict: OwningDictionary<string, Cell>`. Two entries added in
 // ctor. After the Box is disposed, Cell._n must be 0 (both V disposed exactly
 // once). Before #893 the field-disposal pass skipped dict fields → Cell._n = 2.
 const char* k893DictFieldDispose =
@@ -63,9 +63,9 @@ const char* k893DictFieldDispose =
     "  destructor Cell._n := Cell._n - 1; end destructor; "
     "end Cell; "
     "class Box "
-    "  private owned _dict: OwnedDictionary<string, Cell>; "
+    "  private owned _dict: OwningDictionary<string, Cell>; "
     "  public constructor() "
-    "    _dict := new OwnedDictionary<string, Cell>(); "
+    "    _dict := new OwningDictionary<string, Cell>(); "
     "    _dict.Add(\"x\", new Cell()); "
     "    _dict.Add(\"y\", new Cell()); "
     "  end constructor; "
@@ -89,9 +89,9 @@ const char* k893NoDoubleFree =
     "  destructor Cell._n := Cell._n - _id; end destructor; "
     "end Cell; "
     "class Box "
-    "  private owned _dict: OwnedDictionary<string, Cell>; "
+    "  private owned _dict: OwningDictionary<string, Cell>; "
     "  public constructor() "
-    "    _dict := new OwnedDictionary<string, Cell>(); "
+    "    _dict := new OwningDictionary<string, Cell>(); "
     "    _dict.Add(\"a\", new Cell(10)); "
     "    _dict.Add(\"b\", new Cell(1)); "
     "  end constructor; "
@@ -103,7 +103,7 @@ const char* k893NoDoubleFree =
     "  return Cell._n; "
     "end Main; end C;";
 
-// --- #894: reassigning an owned OwnedDictionary field disposes OLD values ---
+// --- #894: reassigning an owned OwningDictionary field disposes OLD values ---
 
 // Box with `owned _d`, one entry. Replace() creates a new dict with a different
 // entry and assigns `_d := d2`. After Replace, old Cell disposed (Cell._n = 1,
@@ -116,13 +116,13 @@ const char* k894DictFieldReassign =
     "  destructor Cell._n := Cell._n - 1; end destructor; "
     "end Cell; "
     "class Box "
-    "  private owned _d: OwnedDictionary<string, Cell>; "
+    "  private owned _d: OwningDictionary<string, Cell>; "
     "  public constructor() "
-    "    _d := new OwnedDictionary<string, Cell>(); "
+    "    _d := new OwningDictionary<string, Cell>(); "
     "    _d.Add(\"k\", new Cell()); "
     "  end constructor; "
     "  public method Replace() "
-    "    var d2 := new OwnedDictionary<string, Cell>(); "
+    "    var d2 := new OwningDictionary<string, Cell>(); "
     "    d2.Add(\"k2\", new Cell()); "
     "    _d := d2; "
     "  end Replace; "
@@ -140,15 +140,15 @@ const char* k894DictFieldReassign =
 
 // --- Value-typed V: rejected at compile per stdlib §4.2/#1327 ---
 
-// stdlib §4.2/#1327: OwnedDictionary<string, int> is now rejected at the
+// stdlib §4.2/#1327: OwningDictionary<string, int> is now rejected at the
 // instantiation site because int is a value type with no disposal obligation.
 // Kept as a REJECTED-AT-COMPILE test to document the new behaviour.
 const char* kValueVNoCrash =
     "module M; "
     "class Box "
-    "  private owned _dict: OwnedDictionary<string, int>; "
+    "  private owned _dict: OwningDictionary<string, int>; "
     "  public constructor() "
-    "    _dict := new OwnedDictionary<string, int>(); "
+    "    _dict := new OwningDictionary<string, int>(); "
     "    _dict.Add(\"x\", 42); "
     "    _dict.Add(\"y\", 99); "
     "  end constructor; "
@@ -187,7 +187,7 @@ const char* kBorrowingDictFieldNoCascade =
     "  return 0; "
     "end Main; end C;";
 
-// --- Regression: OwnedArray field still disposes class elements ---
+// --- Regression: OwningArray field still disposes class elements ---
 
 const char* kOwnedArrayFieldRegression =
     "module M; "
@@ -197,9 +197,9 @@ const char* kOwnedArrayFieldRegression =
     "  destructor Cell._n := Cell._n - 1; end destructor; "
     "end Cell; "
     "class Box "
-    "  private owned _arr: OwnedArray<Cell>; "
+    "  private owned _arr: OwningArray<Cell>; "
     "  public constructor() "
-    "    _arr := new OwnedArray<Cell>(); "
+    "    _arr := new OwningArray<Cell>(); "
     "    _arr.Add(new Cell()); "
     "    _arr.Add(new Cell()); "
     "  end constructor; "
@@ -210,7 +210,7 @@ const char* kOwnedArrayFieldRegression =
     "  return Cell._n; "
     "end Main; end C;";
 
-// --- Regression: OwnedLinkedList field still disposes class elements ---
+// --- Regression: OwningLinkedList field still disposes class elements ---
 
 const char* kOwnedLLFieldRegression =
     "module M; "
@@ -220,9 +220,9 @@ const char* kOwnedLLFieldRegression =
     "  destructor Cell._n := Cell._n - 1; end destructor; "
     "end Cell; "
     "class Box "
-    "  private owned _ll: OwnedLinkedList<Cell>; "
+    "  private owned _ll: OwningLinkedList<Cell>; "
     "  public constructor() "
-    "    _ll := new OwnedLinkedList<Cell>(); "
+    "    _ll := new OwningLinkedList<Cell>(); "
     "    _ll.AddLast(new Cell()); "
     "    _ll.AddLast(new Cell()); "
     "  end constructor; "
@@ -233,7 +233,7 @@ const char* kOwnedLLFieldRegression =
     "  return Cell._n; "
     "end Main; end C;";
 
-// --- Regression: #824 OwnedArray field reassignment disposes old V (existing) ---
+// --- Regression: #824 OwningArray field reassignment disposes old V (existing) ---
 
 const char* k824OwnedArrayReassignRegression =
     "module M; "
@@ -243,13 +243,13 @@ const char* k824OwnedArrayReassignRegression =
     "  destructor Cell._n := Cell._n - 1; end destructor; "
     "end Cell; "
     "class Box "
-    "  private owned _arr: OwnedArray<Cell>; "
+    "  private owned _arr: OwningArray<Cell>; "
     "  public constructor() "
-    "    _arr := new OwnedArray<Cell>(); "
+    "    _arr := new OwningArray<Cell>(); "
     "    _arr.Add(new Cell()); "
     "  end constructor; "
     "  public method Replace() "
-    "    var a2 := new OwnedArray<Cell>(); "
+    "    var a2 := new OwningArray<Cell>(); "
     "    a2.Add(new Cell()); "
     "    _arr := a2; "
     "  end Replace; "
@@ -267,7 +267,7 @@ const char* k824OwnedArrayReassignRegression =
 
 }  // namespace
 
-// ---- #893: owned OwnedDictionary field disposes class V on object disposal ----
+// ---- #893: owned OwningDictionary field disposes class V on object disposal ----
 // §28.5/§28.11, #893
 
 BEZEL_TEST(codegen_owned_dict_field_893, field_disposes_class_v_on_object_disposal) {
@@ -283,7 +283,7 @@ BEZEL_TEST(codegen_owned_dict_field_893, two_entry_no_double_free) {
     BEZEL_EXPECT_EQ(run(k893NoDoubleFree), 0);
 }
 
-// ---- #894: owned OwnedDictionary field reassignment disposes OLD values ------
+// ---- #894: owned OwningDictionary field reassignment disposes OLD values ------
 // §28.5/§28.11, #894
 
 BEZEL_TEST(codegen_owned_dict_field_894, field_reassign_disposes_old_values) {
@@ -296,7 +296,7 @@ BEZEL_TEST(codegen_owned_dict_field_894, field_reassign_disposes_old_values) {
 // ---- Value-typed V: now rejected at instantiation per stdlib §4.2/#1327 ----
 
 BEZEL_TEST(codegen_owned_dict_field_893, value_v_rejected_at_sema_1327) {
-    // stdlib §4.2/#1327: OwnedDictionary<string, int> is rejected at sema
+    // stdlib §4.2/#1327: OwningDictionary<string, int> is rejected at sema
     // (int is a primitive value type with no disposal obligation).
     auto r = runJit(kValueVNoCrash);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -311,21 +311,21 @@ BEZEL_TEST(codegen_owned_dict_field_893, borrowing_dict_field_no_cascade) {
     BEZEL_EXPECT_EQ(run(kBorrowingDictFieldNoCascade), 0);
 }
 
-// ---- Regression: OwnedArray/OwnedLinkedList fields still dispose elements ---
+// ---- Regression: OwningArray/OwningLinkedList fields still dispose elements ---
 
 BEZEL_TEST(codegen_owned_dict_field_893, owned_array_field_regression) {
-    // OwnedArray<Cell> field must still dispose its elements → Cell._n = 0.
+    // OwningArray<Cell> field must still dispose its elements → Cell._n = 0.
     BEZEL_EXPECT_EQ(run(kOwnedArrayFieldRegression), 0);
 }
 
 BEZEL_TEST(codegen_owned_dict_field_893, owned_linkedlist_field_regression) {
-    // OwnedLinkedList<Cell> field must still dispose its elements → Cell._n = 0.
+    // OwningLinkedList<Cell> field must still dispose its elements → Cell._n = 0.
     BEZEL_EXPECT_EQ(run(kOwnedLLFieldRegression), 0);
 }
 
-// ---- Regression: #824 OwnedArray field store still disposes old elements ----
+// ---- Regression: #824 OwningArray field store still disposes old elements ----
 
 BEZEL_TEST(codegen_owned_dict_field_894, owned_array_field_reassign_regression) {
-    // OwnedArray field reassign still disposes old elements → 0 at end.
+    // OwningArray field reassign still disposes old elements → 0 at end.
     BEZEL_EXPECT_EQ(run(k824OwnedArrayReassignRegression), 0);
 }

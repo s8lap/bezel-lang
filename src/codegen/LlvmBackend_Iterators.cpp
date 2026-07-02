@@ -35,7 +35,7 @@ bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
         return false;
     }
     if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
-        n != "ICollection" && n != "IList" && n != "OwnedEnumerable")
+        n != "ICollection" && n != "IList" && n != "IOwningEnumerable")
         return false;
     if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
 
@@ -473,12 +473,12 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         }
     }
 
-    // #1349 / §29.1 v0.161: true when the return type is OwnedEnumerable<T> —
+    // #1349 / §29.1 v0.161: true when the return type is IOwningEnumerable<T> —
     // ownership transfers from the iterator to the consumer at each TakeCurrent()
     // call. TakeCurrent (vtable slot 3) checks for null (before-first-advance /
     // after-exhaustion / double-take) and raises InvalidOperationException.
     // The iterator nulls current_val after transfer and on exhaustion.
-    bool isOwningIter = (retName == "OwnedEnumerable");
+    bool isOwningIter = (retName == "IOwningEnumerable");
 
     // §29 (#1120): true when T is an owned class or interface AND the return type
     // is IEnumerable<T> (or a related non-owning interface) — meaning the
@@ -487,7 +487,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // and on Dispose (break / exhaustion / free).  Records/enums/primitives are
     // value types and never need this.
     //
-    // Excluded: OwnedEnumerable<T> iterators transfer ownership of each yielded
+    // Excluded: IOwningEnumerable<T> iterators transfer ownership of each yielded
     // value to the consumer via TakeCurrent() on each MoveNext call — the consumer
     // (not the enumerator) is responsible for disposing it; the enumerator must
     // NOT also dispose current_val or the result is a double-free.
@@ -497,7 +497,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         elemSemaTy->declaration != nullptr &&
         (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
          elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
-        if (retName != "OwnedEnumerable")
+        if (retName != "IOwningEnumerable")
             elemIsOwnedClass = true;
     }
 
@@ -679,7 +679,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     }
 
     // --- Current: load current_val from struct ---
-    // For OwnedEnumerable<T> iterators this implements TakeCurrent() (vtable slot 3):
+    // For IOwningEnumerable<T> iterators this implements TakeCurrent() (vtable slot 3):
     // check current_val for null (before-first-advance / after-exhaustion /
     // double-take) → raise InvalidOperationException; on success, null the slot
     // and return the value. Per §29.1 v0.161 / #1349.
@@ -850,7 +850,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
             }
-            // #1349 / §29.1 v0.161: for OwnedEnumerable<T> iterators, null
+            // #1349 / §29.1 v0.161: for IOwningEnumerable<T> iterators, null
             // current_val on exhaustion so TakeCurrent raises IOE afterwards.
             // In the normal for-loop protocol TakeCurrent already nulled it, but
             // defensive null on the exhaustion path covers manual-protocol usage
@@ -1001,7 +1001,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // Dispose: the source's current_val is always null (GetEnumerator resets
         // it) so it's a guaranteed no-op for the source.
         //
-        // #1349 / §29.1 v0.161: additionally, for OwnedEnumerable<T> iterators
+        // #1349 / §29.1 v0.161: additionally, for IOwningEnumerable<T> iterators
         // (isOwningIter), the enumerator always owns current_val (no owned-flag
         // needed); if it is non-null when Dispose is called the consumer never
         // called TakeCurrent (manual-protocol abandonment) and we must dispose.
@@ -1019,7 +1019,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateCondBr(isNull, contBB, nonNullBB);
             builder_.SetInsertPoint(nonNullBB);
             if (isOwningIter) {
-                // #1349: OwnedEnumerable<T> — enumerator always owns a
+                // #1349: IOwningEnumerable<T> — enumerator always owns a
                 // non-null current_val (consumer didn't call TakeCurrent);
                 // dispose it unconditionally then null the slot.
                 emitDisposeAndReclaim(yv);

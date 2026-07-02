@@ -177,7 +177,7 @@ BEZEL_TEST(owned_discard_743, subscribe_explicit_dispose_ok_949) {
 }
 
 // ===========================================================================
-// §17.13 / §30.10 (#1014): discarding a `Task` / `Task<T>` / `OwnedTask<T>` is a
+// §17.13 / §30.10 (#1014): discarding a `Task` / `Task<T>` / `OwningTask<T>` is a
 // compile error directing the caller to `Task.FireAndForget` — disposing a task
 // abandons a running operation. `await`ing a task (its result type) and trivial
 // values are unaffected.
@@ -213,13 +213,13 @@ BEZEL_TEST(owned_discard_743, task_void_discard_is_error_1014) {
     BEZEL_EXPECT_TRUE(hasTaskDiscardError(r));
 }
 
-// REJECT: `_ := <OwnedTask<T>>` discard (Pattern B; still a task, FireAndForget).
+// REJECT: `_ := <OwningTask<T>>` discard (Pattern B; still a task, FireAndForget).
 BEZEL_TEST(owned_discard_743, owned_task_discard_is_error_1014) {
     auto r = parseSemaAll(
         "module M; "
         "class R public _h: int := 0; destructor _h := 1; end destructor; end R; "
         "class C "
-        "  public static async method Make(): OwnedTask<R> return new R(); end Make; "
+        "  public static async method Make(): OwningTask<R> return new R(); end Make; "
         "  public static method Main(): int "
         "    _ := Make(); "
         "    return 0; "

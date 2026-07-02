@@ -231,7 +231,7 @@ void Resolver::checkAsyncModifiers() {
 namespace {
 
 // §30.1 / §30.6 / §30.7: the admitted return types for an `async` callable.
-// `Task` / `Task<T>` / `OwnedTask<T>` cover the value/borrow/owned result
+// `Task` / `Task<T>` / `OwningTask<T>` cover the value/borrow/owned result
 // patterns (§30.5); the six async-iterator interfaces (§30.7) cover async
 // `yield`. A bare single-identifier Named type (no nullable, no namespace
 // qualifier) whose head is one of these names is admitted; the generic arity
@@ -242,9 +242,9 @@ bool isAdmittedAsyncReturnType(const ast::Type* rt) {
     if (rt->kind != ast::TypeKind::Named || rt->nullable) return false;
     if (!rt->name || rt->name->parts.size() != 1) return false;
     std::string_view head = rt->name->parts.front();
-    return head == "Task" || head == "OwnedTask" ||
+    return head == "Task" || head == "OwningTask" ||
            head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-           head == "OwnedAsyncEnumerable" || head == "OwnedAsyncEnumerator";
+           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator";
 }
 
 }  // namespace
@@ -262,7 +262,7 @@ void Resolver::checkTypeAsyncModifiers(TypeSymbol* t) {
                 "(§12.6)");
         }
         // §30.1: an `async` method's declared return type must be one of the
-        // admitted async forms (`Task` / `Task<T>` / `OwnedTask<T>`, or an
+        // admitted async forms (`Task` / `Task<T>` / `OwningTask<T>`, or an
         // async-iterator interface, §30.7). A non-async return type — including
         // a missing one (the implicit unit return) — is a compile error. The
         // `async abstract` combination is already diagnosed above; we still run
@@ -273,7 +273,7 @@ void Resolver::checkTypeAsyncModifiers(TypeSymbol* t) {
                 ctx_.diagnostics().report(
                     Severity::Error, m->declLoc,
                     std::string("`async` method `") + std::string(ms->name) +
-                    "` must declare a `Task`, `Task<T>`, or `OwnedTask<T>` "
+                    "` must declare a `Task`, `Task<T>`, or `OwningTask<T>` "
                     "return type (or an async-iterator interface), not a "
                     "non-async return type (§30.1)");
             }
@@ -1256,8 +1256,8 @@ void Resolver::checkEqualityCoDeclaration() {
     }
 }
 
-// §3.6 / §8.3 (v0.158, #1338): a `Dictionary<K,V>` / `OwnedDictionary<K,V>` key
-// (K) and a `Set<T>` / `OwnedSet<T>` element (T) must be **equality-bearing**.
+// §3.6 / §8.3 (v0.158, #1338): a `Dictionary<K,V>` / `OwningDictionary<K,V>` key
+// (K) and a `Set<T>` / `OwningSet<T>` element (T) must be **equality-bearing**.
 // The sites are recorded during name resolution (resolveNamed) and validated
 // here — after every member type is resolved — because a record key's
 // auto-equality-bearing property depends on the record's own members being
@@ -2063,7 +2063,7 @@ Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
                         return TypeCategory::Value;
                 }
             }
-            // Built-in named types (Array, OwnedArray, IEnumerable, …) carry
+            // Built-in named types (Array, OwningArray, IEnumerable, …) carry
             // no user declaration. Every built-in named type in the language
             // is a class or interface — a reference type (§14.2). A generic
             // parameter also lands here, but the caller filters those out via

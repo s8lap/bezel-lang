@@ -1,5 +1,5 @@
 // For non-class T (value types, string, runtime-managed reference types).
-// Instantiating with a class T is a compile error pointing to OwnedTaskCompletionSource<T>.
+// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>.
 public class TaskCompletionSource<T>
   public constructor();
   public readonly property Task: Task<T>;
@@ -14,9 +14,9 @@ public class TaskCompletionSource<T>
 end TaskCompletionSource;
 
 // For class T. Result is transferred via `owned` parameter; produced task is Pattern B.
-public class OwnedTaskCompletionSource<T> where T: class
+public class OwningTaskCompletionSource<T> where T: class
   public constructor();
-  public readonly property Task: OwnedTask<T>;
+  public readonly property Task: OwningTask<T>;
 
   public method SetResult(owned result: T);
   public method SetException(exception: Exception);
@@ -25,7 +25,7 @@ public class OwnedTaskCompletionSource<T> where T: class
   public method TrySetResult(owned result: T): bool;
   public method TrySetException(exception: Exception): bool;
   public method TrySetCancelled(): bool;
-end OwnedTaskCompletionSource;
+end OwningTaskCompletionSource;
 
 // Non-generic form for void-completion tasks
 public class TaskCompletionSource

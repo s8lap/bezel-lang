@@ -1,4 +1,4 @@
-public class OwnedArray<T>: IOwnedList<T> where T: class
+public class OwningArray<T>: IOwningList<T> where T: class
   public constructor();
   public constructor(capacity: int);
 
@@ -11,7 +11,7 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   end;
 
   public method Add(owned item: T);
-  public method AddRange(owned items: OwnedArray<T>);   // drains items into self
+  public method AddRange(owned items: OwningArray<T>);   // drains items into self
   public method Insert(index: int, owned item: T);
   public method RemoveAt(index: int);                    // disposes the removed element
   public method Remove(item: T): bool;                   // borrow-taking query;
@@ -29,9 +29,9 @@ public class OwnedArray<T>: IOwnedList<T> where T: class
   public method PopLast(): owned T;                      // = PopAt(Count - 1); raises if empty
   public method TryPopFirst(out owned item: T): bool;
   public method TryPopLast(out owned item: T): bool;
-  public method Drain(): OwnedEnumerable<T>;             // iteration drains the source
-end OwnedArray;
+  public method Drain(): IOwningEnumerable<T>;             // iteration drains the source
+end OwningArray;
 
-public extension OwnedArray<T> where T: class, IComparable<T>
+public extension OwningArray<T> where T: class, IComparable<T>
   public method Sort();
 end;

@@ -2,14 +2,14 @@
 // `constructor(capacity: int)` reservation.
 //
 // Authority: stdlib §4.4 `Array<T>` declares `public constructor(capacity: int)`
-// and `public readonly property Capacity: int`; §4.5 `OwnedArray<T>` mirrors it.
+// and `public readonly property Capacity: int`; §4.5 `OwningArray<T>` mirrors it.
 //
 // Two defects fixed together here:
 //   1. `.Capacity` had no codegen case, so the read returned an uninitialized
 //      stack slot (garbage). It now reads the backing `bz_array_t.capacity`
 //      via the `bz_array_capacity` runtime accessor.
 //   2. The `constructor(capacity: int)` argument was ignored — every
-//      Array/OwnedArray/Stack/Queue/Set allocated a hardcoded capacity of 16,
+//      Array/OwningArray/Stack/Queue/Set allocated a hardcoded capacity of 16,
 //      so `new Array<int>(8).Capacity` could never reflect the request. The
 //      arg is now honoured (reserving slots without setting Count), falling
 //      back to the default for a non-positive request.
@@ -91,7 +91,7 @@ BEZEL_TEST(array_capacity_741, no_arg_default_capacity) {
         "end C;"), 16);
 }
 
-// OwnedArray<T> exposes Capacity over the same bz_array_t backing.
+// OwningArray<T> exposes Capacity over the same bz_array_t backing.
 BEZEL_TEST(array_capacity_741, owned_array_capacity) {
     // per stdlib §4.5
     BEZEL_EXPECT_EQ(run(
@@ -99,7 +99,7 @@ BEZEL_TEST(array_capacity_741, owned_array_capacity) {
         "class Box public x: int := 0; end Box; "
         "class C "
         "  public static method Main(): int "
-        "    using var a := new OwnedArray<Box>(12); "
+        "    using var a := new OwningArray<Box>(12); "
         "    return a.Capacity; "
         "  end Main; "
         "end C;"), 12);

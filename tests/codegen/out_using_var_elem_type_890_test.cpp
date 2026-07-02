@@ -5,11 +5,11 @@
 //
 // The sema `out using var` branch now derives the element type from the
 // receiver's generic argument for all owning-collection / channel Try* methods:
-//   OwnedStack<T>.TryPop          → T  (arg 0)
-//   OwnedQueue<T>.TryDequeue      → T  (arg 0)
-//   OwnedLinkedList<T>.TryPopFirst → T  (arg 0)
-//   OwnedLinkedList<T>.TryPopLast  → T  (arg 0)
-//   OwnedDictionary<K,V>.TryPopValue → V (arg 1)
+//   OwningStack<T>.TryPop          → T  (arg 0)
+//   OwningQueue<T>.TryDequeue      → T  (arg 0)
+//   OwningLinkedList<T>.TryPopFirst → T  (arg 0)
+//   OwningLinkedList<T>.TryPopLast  → T  (arg 0)
+//   OwningDictionary<K,V>.TryPopValue → V (arg 1)
 //   Weak<T>.TryUpgrade            → Shared<T>  (unchanged — regression check)
 //
 // Value tests — runJit returns the raw int (kept in 0..255).
@@ -46,15 +46,15 @@ const char* kCellHdr =
 }  // namespace
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OwnedStack<T>.TryPop — the primary repro from #890.
+// OwningStack<T>.TryPop — the primary repro from #890.
 // §28.11: item is Cell; item._v == 42 (was rc=255 before the fix).
 // ──────────────────────────────────────────────────────────────────────────────
 
-// §28.11, #890: OwnedStack<Cell>.TryPop — field read through out using var.
+// §28.11, #890: OwningStack<Cell>.TryPop — field read through out using var.
 BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_field_read) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  using var s := new OwnedStack<Cell>(); "
+        "  using var s := new OwningStack<Cell>(); "
         "  s.Push(move (new Cell(42))); "
         "  var got := -1; "
         "  if s.TryPop(out using var item) then "
@@ -64,12 +64,12 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_field_read) {
         "end Main; end C;"), 42);
 }
 
-// §28.11, #890: OwnedStack<Cell>.TryPop — method call on item.
+// §28.11, #890: OwningStack<Cell>.TryPop — method call on item.
 // item.GetV() resolves to Cell.GetV() only if item has the correct type.
 BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_method_call) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  using var s := new OwnedStack<Cell>(); "
+        "  using var s := new OwningStack<Cell>(); "
         "  s.Push(move (new Cell(99))); "
         "  var got := -1; "
         "  if s.TryPop(out using var item) then "
@@ -79,13 +79,13 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_method_call) {
         "end Main; end C;"), 99);
 }
 
-// §28.11, #890: OwnedStack<Cell>.TryPop — item disposed exactly once.
+// §28.11, #890: OwningStack<Cell>.TryPop — item disposed exactly once.
 // Cell.n starts at 0, constructor +1, destructor -1; must end at 0 (no leak).
 BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_disposal_once) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do "
-        "    using var s := new OwnedStack<Cell>(); "
+        "    using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell(1))); "
         "    if s.TryPop(out using var item) then "
         "    end; "
@@ -95,15 +95,15 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_disposal_once) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OwnedQueue<T>.TryDequeue
+// OwningQueue<T>.TryDequeue
 // §28.11, #890: element type derived from genericArgs[0].
 // ──────────────────────────────────────────────────────────────────────────────
 
-// §28.11, #890: OwnedQueue<Cell>.TryDequeue — field read.
+// §28.11, #890: OwningQueue<Cell>.TryDequeue — field read.
 BEZEL_TEST(out_using_var_elem_type_890, owned_queue_trydequeue_field_read) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  using var q := new OwnedQueue<Cell>(); "
+        "  using var q := new OwningQueue<Cell>(); "
         "  q.Enqueue(move (new Cell(77))); "
         "  var got := -1; "
         "  if q.TryDequeue(out using var item) then "
@@ -114,15 +114,15 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_queue_trydequeue_field_read) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OwnedLinkedList<T>.TryPopFirst / TryPopLast
+// OwningLinkedList<T>.TryPopFirst / TryPopLast
 // §28.11, #890: element type derived from genericArgs[0].
 // ──────────────────────────────────────────────────────────────────────────────
 
-// §28.11, #890: OwnedLinkedList<Cell>.TryPopFirst — field read.
+// §28.11, #890: OwningLinkedList<Cell>.TryPopFirst — field read.
 BEZEL_TEST(out_using_var_elem_type_890, owned_linkedlist_trypopfirst_field_read) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  using var ll := new OwnedLinkedList<Cell>(); "
+        "  using var ll := new OwningLinkedList<Cell>(); "
         "  ll.AddLast(move (new Cell(11))); "
         "  ll.AddLast(move (new Cell(22))); "
         "  var got := -1; "
@@ -133,11 +133,11 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_linkedlist_trypopfirst_field_read)
         "end Main; end C;"), 11);
 }
 
-// §28.11, #890: OwnedLinkedList<Cell>.TryPopLast — field read.
+// §28.11, #890: OwningLinkedList<Cell>.TryPopLast — field read.
 BEZEL_TEST(out_using_var_elem_type_890, owned_linkedlist_trypoplast_field_read) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  using var ll := new OwnedLinkedList<Cell>(); "
+        "  using var ll := new OwningLinkedList<Cell>(); "
         "  ll.AddLast(move (new Cell(11))); "
         "  ll.AddLast(move (new Cell(22))); "
         "  var got := -1; "
@@ -149,15 +149,15 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_linkedlist_trypoplast_field_read) 
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OwnedDictionary<K,V>.TryPopValue
+// OwningDictionary<K,V>.TryPopValue
 // §28.11, #890: value type = genericArgs[1] (V).
 // ──────────────────────────────────────────────────────────────────────────────
 
-// §28.11, #890: OwnedDictionary<int,Cell>.TryPopValue — field read on V element.
+// §28.11, #890: OwningDictionary<int,Cell>.TryPopValue — field read on V element.
 BEZEL_TEST(out_using_var_elem_type_890, owned_dict_trypopvalue_field_read) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  using var d := new OwnedDictionary<int, Cell>(); "
+        "  using var d := new OwningDictionary<int, Cell>(); "
         "  d.Add(1, move (new Cell(55))); "
         "  var got := -1; "
         "  if d.TryPopValue(1, out using var v) then "

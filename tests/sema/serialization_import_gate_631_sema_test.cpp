@@ -8,7 +8,7 @@
 //       runtime segfault. Expected: a compile error naming the missing import.
 //
 //   (b) `new BinaryDeserializer(bytes)` where `bytes` is the owned
-//       OwnedBuffer<byte> (instead of the required ReadOnlySpan<byte>)
+//       OwningBuffer<byte> (instead of the required ReadOnlySpan<byte>)
 //       also compiled silently. Expected: a ctor-arg type error.
 //
 // The canonical shape — with import + AsReadOnlySpan() — must still compile
@@ -141,9 +141,9 @@ BEZEL_TEST(sema_serialization_import_gate_631,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// ─── (b) Wrong ctor arg type: OwnedBuffer instead of ReadOnlySpan ────────────
+// ─── (b) Wrong ctor arg type: OwningBuffer instead of ReadOnlySpan ────────────
 
-// §2.15 / #631 (b): passing the raw OwnedBuffer<byte> to new BinaryDeserializer
+// §2.15 / #631 (b): passing the raw OwningBuffer<byte> to new BinaryDeserializer
 // instead of the required ReadOnlySpan<byte> → ctor-arg type error.
 BEZEL_TEST(sema_serialization_import_gate_631,
            binary_deserializer_owned_buffer_arg_is_error_spec_2_15) {
@@ -156,7 +156,7 @@ BEZEL_TEST(sema_serialization_import_gate_631,
         "    using var s := new BinarySerializer(); "
         "    Color.Red.Serialize(s); "
         "    using var bytes := s.ToBytes(); "
-        // Wrong: pass bytes (OwnedBuffer<byte>) directly instead of
+        // Wrong: pass bytes (OwningBuffer<byte>) directly instead of
         // bytes.AsReadOnlySpan() (ReadOnlySpan<byte>).
         "    using var d := new BinaryDeserializer(bytes); "
         "    return 0; "

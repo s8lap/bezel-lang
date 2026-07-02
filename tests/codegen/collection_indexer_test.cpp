@@ -2,8 +2,8 @@
 // stdlib §4.4 / §4.5 / §4.8 / §4.9).
 //
 // Before this fix, sema only typed `IndexExpr` element access for inline arrays
-// `[N]T` and strings; the built-in HEAP collections (Array<T>, OwnedArray<T>,
-// Dictionary<K,V>, OwnedDictionary<K,V>) were NOT typed for `a[i]`. As a
+// `[N]T` and strings; the built-in HEAP collections (Array<T>, OwningArray<T>,
+// Dictionary<K,V>, OwningDictionary<K,V>) were NOT typed for `a[i]`. As a
 // result codegen had no element type to lower against:
 //   * `a[i]` (read) fell to the inline-array GEP path and returned garbage.
 //   * `a[i] := v` (setter) was silently dropped before reaching codegen.
@@ -12,14 +12,14 @@
 //   * Array<T>            (§4.4): `public property [i: int]: T;`
 //                          read returns the slot; setter stores a borrow, NO
 //                          disposal of the previous slot (the array borrows).
-//   * OwnedArray<T>       (§4.5): `[i: int]: T { get; set(owned); }`
+//   * OwningArray<T>       (§4.5): `[i: int]: T { get; set(owned); }`
 //                          getter borrows; setter takes `owned` and DISPOSES
 //                          the previous slot value before storing the new one.
 //   * Dictionary<K,V>     (§4.8): `public property [key: K]: V;`
 //                          read returns the value (`dict[key]` raises
 //                          KeyNotFoundException if absent, §4.8); setter stores
 //                          a borrow, no disposal.
-//   * OwnedDictionary<K,V>(§4.9): `[key: K]: V { get; set(owned); }`
+//   * OwningDictionary<K,V>(§4.9): `[key: K]: V { get; set(owned); }`
 //                          getter borrows; setter takes `owned` and disposes
 //                          the previous value before storing the new one.
 //
@@ -188,7 +188,7 @@ BEZEL_TEST(collection_indexer_388, array_string_indexer_set_get_4_4) {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedArray<T> — §4.5 indexer get/set. Setter takes `owned` and DISPOSES the
+// OwningArray<T> — §4.5 indexer get/set. Setter takes `owned` and DISPOSES the
 // previous slot value (the #381 blocker). This is the load-bearing case.
 // ---------------------------------------------------------------------------
 
@@ -208,7 +208,7 @@ BEZEL_TEST(collection_indexer_388, owned_array_indexer_set_disposes_previous_4_5
         "class C public static method Main(): int "
         "  var afterSet := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R())); "
         "    a.Add(move (new R())); "
         "    a[0] := move (new R()); "
@@ -230,7 +230,7 @@ BEZEL_TEST(collection_indexer_388, owned_array_indexer_set_keeps_count_4_5) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); a.Add(move (new R())); "
         "  a[1] := move (new R()); "
         "  return a.Count * 10 + R._n; "                // count 2, one disposed → 21
@@ -249,7 +249,7 @@ BEZEL_TEST(collection_indexer_388, owned_array_indexer_set_all_slots_4_5) {
         "class C public static method Main(): int "
         "  var afterSets := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R())); a.Add(move (new R())); "
         "    a[0] := move (new R()); "
         "    a[1] := move (new R()); "
@@ -322,11 +322,11 @@ BEZEL_TEST(collection_indexer_388, dict_indexer_missing_key_throws_4_8) {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedDictionary<K,V> — §4.9 indexer get/set. Setter takes `owned` and
-// disposes the previous value (analogous to OwnedArray, §4.5).
+// OwningDictionary<K,V> — §4.9 indexer get/set. Setter takes `owned` and
+// disposes the previous value (analogous to OwningArray, §4.5).
 //
 // NOTE: these tests observe the indexer setter's own disposal of the DISPLACED
-// value, read BEFORE the dictionary's scope-end Dispose. The OwnedDictionary
+// value, read BEFORE the dictionary's scope-end Dispose. The OwningDictionary
 // scope-end value-disposal path (bz_dict_free is currently called with a null
 // dispose_val — see LlvmBackend_Calls.cpp / LlvmBackend_Setup.cpp) is a
 // PRE-EXISTING, separately-tracked gap (marked "Dict/Set disposal is not wired
@@ -348,7 +348,7 @@ BEZEL_TEST(collection_indexer_388, owned_dict_indexer_set_disposes_previous_4_9)
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"k\", move (new R())); "
         "  d[\"k\"] := move (new R()); "                // replace → dispose old
         "  return R._n; "                               // 1 (displaced disposed once)
@@ -364,7 +364,7 @@ BEZEL_TEST(collection_indexer_388, owned_dict_int_key_set_disposes_previous_4_9)
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var d := new OwnedDictionary<int, R>(); "
+        "  using var d := new OwningDictionary<int, R>(); "
         "  d.Add(7, move (new R())); "
         "  d[7] := move (new R()); "                    // replace → dispose old
         "  return R._n; "                               // 1
@@ -381,7 +381,7 @@ BEZEL_TEST(collection_indexer_388, owned_dict_indexer_insert_no_dispose_4_9) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d[\"k\"] := move (new R()); "                // fresh key → no disposal
         "  return R._n * 10 + d.Count; "                // 0*10 + 1 = 1
         "end Main; end C;"), 1);

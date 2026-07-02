@@ -75,7 +75,7 @@ int64_t bz_array_capacity(void* arrp) {
 }
 
 // §4.14: allocate a bz_array_t with n pre-filled (zero-initialized) slots.
-// Used by `new OwnedBuffer<T>(n)` so that index-assignment data[i] := v is valid
+// Used by `new OwningBuffer<T>(n)` so that index-assignment data[i] := v is valid
 // for i in 0..<n without requiring Add() first. All n elements are calloc'd to 0.
 void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
@@ -117,7 +117,7 @@ void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) 
     memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
 }
 
-// issue #388 / stdlib §4.5: OwnedArray<T>'s `set(owned)` indexer — dispose the
+// issue #388 / stdlib §4.5: OwningArray<T>'s `set(owned)` indexer — dispose the
 // element currently at idx (a pointer-sized owned object reference) before
 // overwriting the slot with the new owner. Reading the old pointer before the
 // store guarantees exactly-once disposal of the displaced owner.
@@ -222,7 +222,7 @@ void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     auto* arr = (bz_array_t*)arrp;
     if (dispose_elem && arr->data) {
         // Dispose elements in REVERSE insertion order per §28.11: ordered owning
-        // collections (OwnedArray, OwnedStack, OwnedQueue) dispose last-inserted
+        // collections (OwningArray, OwningStack, OwningQueue) dispose last-inserted
         // first. For pointer-sized elements, elem_size = sizeof(void*).
         // bz_array_free with non-null dispose is for pointer-element arrays only
         // (the codegen ensures this).
@@ -389,7 +389,7 @@ struct bz_dict_t {
     // (from removes). order_count is the used length (including tombstones);
     // order_cap is the allocated size. Iterated in 0..order_count order; -1
     // slots are skipped. Compacted on rehash (tombstones dropped).
-    // OwnedDictionary does NOT promise insertion order (§4.9) but shares this
+    // OwningDictionary does NOT promise insertion order (§4.9) but shares this
     // struct; we still maintain order for it (cheap, harmless).
     int64_t*    order;       // malloc'd array of bucket indices
     int64_t     order_count; // used length (including -1 tombstones)
@@ -586,7 +586,7 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
     d->mod_count++;  // §29.12 / #1232: structural mutation
 }
 
-// issue #388 / stdlib §4.9: OwnedDictionary<string,V>'s `set(owned)` indexer.
+// issue #388 / stdlib §4.9: OwningDictionary<string,V>'s `set(owned)` indexer.
 // If `k` is already present, dispose the value stored under it before replacing
 // it (exactly-once disposal of the displaced owner); a fresh key just inserts.
 void bz_dict_set_str_disposing(void* dp, const char* k, int64_t k_len,
@@ -618,7 +618,7 @@ bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
     return true;
 }
 
-// issue M1 / stdlib §4.9: OwnedDictionary<string,V>.Remove(key) must dispose
+// issue M1 / stdlib §4.9: OwningDictionary<string,V>.Remove(key) must dispose
 // the removed owned value (exactly-once disposal), then unlink the entry.
 // Mirrors bz_dict_clear's per-entry dispose pattern. The non-owning
 // Dictionary.Remove still calls bz_dict_remove_str (no disposer).
@@ -781,7 +781,7 @@ bool bz_dict_remove_gen(void* dp, const void* key) {
     return true;
 }
 
-// issue M1 / stdlib §4.9: OwnedDictionary<K,V>.Remove(key) for generic keys —
+// issue M1 / stdlib §4.9: OwningDictionary<K,V>.Remove(key) for generic keys —
 // dispose the removed owned value (exactly-once), then unlink. Mirrors the
 // string-key bz_dict_remove_str_disposing; the non-owning Dict uses
 // bz_dict_remove_gen (no disposer).
@@ -948,7 +948,7 @@ void bz_dict_values_gen(void* dp, void*** vals_out, int64_t* n_out) {
     if (n_out)    *n_out    = j;
 }
 
-// issue #628 / stdlib §4.9 v0.135: OwnedDictionary<K,V>.Drain() per-entry pop.
+// issue #628 / stdlib §4.9 v0.135: OwningDictionary<K,V>.Drain() per-entry pop.
 //
 // bz_dict_drain_next_str — string-keyed dict (key_size == 0).
 // Pops the next live entry in insertion order from the dict: removes it from
@@ -1020,8 +1020,8 @@ bool bz_dict_drain_next_gen(void* dp, int64_t* cursor,
     return false;
 }
 
-// issue #639 / stdlib §4.5/§4.7/§4.11 v0.135: OwnedArray<T> / OwnedLinkedList<T>
-// / OwnedStack<T> / OwnedQueue<T> .Drain() per-element pop.
+// issue #639 / stdlib §4.5/§4.7/§4.11 v0.135: OwningArray<T> / OwningLinkedList<T>
+// / OwningStack<T> / OwningQueue<T> .Drain() per-element pop.
 //
 // ---------------------------------------------------------------------------
 // §29.12 / issue #1232: modification-epoch accessors.
@@ -1043,8 +1043,8 @@ int64_t bz_dict_get_mod(void* dp) {
 
 // ---------------------------------------------------------------------------
 // bz_array_drain_next — pops index 0 (front-to-back).
-// Used by OwnedArray<T>.Drain() (front-to-back per §28.11 "iteration order")
-// and OwnedQueue<T>.Drain() (FIFO, also front-to-back).
+// Used by OwningArray<T>.Drain() (front-to-back per §28.11 "iteration order")
+// and OwningQueue<T>.Drain() (FIFO, also front-to-back).
 // Returns true if an element was popped into *val_out; false when the array is
 // empty (drain complete). The caller takes ownership of the popped pointer.
 // The element slot is closed by bz_array_remove_at so count shrinks by 1.
@@ -1060,7 +1060,7 @@ bool bz_array_drain_next(void* arrp, void** val_out) {
 }
 
 // bz_array_drain_next_lifo — pops the last element (LIFO / back-to-front).
-// Used by OwnedStack<T>.Drain() which pops in top-first order (the stack's
+// Used by OwningStack<T>.Drain() which pops in top-first order (the stack's
 // Pop order), matching "iteration order" per §28.11.
 bool bz_array_drain_next_lifo(void* arrp, void** val_out) {
     auto* arr = (bz_array_t*)arrp;
@@ -1210,7 +1210,7 @@ bool bz_dict_remove_set_string(void* dp, const void* key) {
 struct bz_llist_node_t {
     bz_llist_node_t* prev;
     bz_llist_node_t* next;
-    // #869 / §28.11: monotonic insertion sequence, so OwnedLinkedList disposal
+    // #869 / §28.11: monotonic insertion sequence, so OwningLinkedList disposal
     // can run in REVERSE-INSERTION order regardless of whether elements were
     // added at the head (AddFirst) or tail (AddLast) — the head/tail POSITION is
     // not insertion order once AddFirst/AddBefore are mixed in.
@@ -1324,7 +1324,7 @@ static void llist_unlink(bz_llist_t* l, bz_llist_node_t* node,
     l->mod_count++;  // §29.12 / #1232: structural mutation (covers all Remove*/Pop*)
     if (dispose_elem) {
         void* vp = (char*)node + sizeof(bz_llist_node_t);
-        // For OwnedLinkedList<T: class>, element bytes hold a pointer; load it.
+        // For OwningLinkedList<T: class>, element bytes hold a pointer; load it.
         void* obj = *(void**)vp;
         if (obj) dispose_elem(obj);
     }
@@ -1452,7 +1452,7 @@ void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
     free(l);
 }
 
-// #639 / stdlib §4.7 v0.135: OwnedLinkedList<T>.Drain() per-element pop.
+// #639 / stdlib §4.7 v0.135: OwningLinkedList<T>.Drain() per-element pop.
 // Pops the head node (front-to-back / head-to-tail per §28.11 "iteration order").
 // Returns the pointer stored inline in the head node into *val_out, then
 // unlinks and frees the node WITHOUT disposal (ownership transferred to caller).
@@ -3675,13 +3675,13 @@ struct bz_task_t {
     std::condition_variable cv;
     bool done = false;
     bool is_error = false;
-    // §30.5 (v0.162 / #1352): OwnedTask single-consumer affine tracking. Set to
+    // §30.5 (v0.162 / #1352): OwningTask single-consumer affine tracking. Set to
     // true after the FIRST await consumes the task (regardless of whether the await
-    // succeeded or faulted). A second await on a spent OwnedTask is diagnosed at
+    // succeeded or faulted). A second await on a spent OwningTask is diagnosed at
     // compile time for the straight-line case (ownership pass); for the general
     // cross-method / cross-catch case the codegen reads is_spent at the await site
     // and raises InvalidOperationException if it is already set. Plain Task<T> (not
-    // OwnedTask<T>) never sets this flag — it can be awaited multiple times.
+    // OwningTask<T>) never sets this flag — it can be awaited multiple times.
     bool is_spent = false;
     char* error_msg = nullptr;
     // §30.9: the ORIGINAL exception object that faulted this task (a Bezel heap
@@ -4241,8 +4241,8 @@ bool bz_task_is_error(void* tp) {
     return task->is_error;
 }
 
-// §30.5 (v0.162 / #1352): OwnedTask single-consumer tracking.
-// bz_task_mark_spent: record that an OwnedTask has been consumed by its first
+// §30.5 (v0.162 / #1352): OwningTask single-consumer tracking.
+// bz_task_mark_spent: record that an OwningTask has been consumed by its first
 // await (whether the await succeeded or faulted). A second await on a spent task
 // should raise InvalidOperationException (checked by the codegen via
 // bz_task_is_spent at the await site).
@@ -4252,7 +4252,7 @@ void bz_task_mark_spent(void* tp) {
     task->is_spent = true;
 }
 
-// bz_task_is_spent: returns true after the first await consumed the OwnedTask.
+// bz_task_is_spent: returns true after the first await consumed the OwningTask.
 bool bz_task_is_spent(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::lock_guard<std::mutex> lk(task->mtx);
@@ -4584,12 +4584,12 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     return aggregate;
 }
 
-// stdlib §6.7 / §30.10: Task.WhenAllOwned<T>(owned tasks: OwnedArray<OwnedTask<T>>):
-//   OwnedTask<OwnedArray<T>> where T: class
+// stdlib §6.7 / §30.10: Task.WhenAllOwned<T>(owned tasks: OwningArray<OwningTask<T>>):
+//   OwningTask<OwningArray<T>> where T: class
 //
 // Pattern B aggregator: caller transfers ownership of the array (and its tasks).
-// Each OwnedTask<T> result is a void* (class pointer, sizeof(void*) bytes); we
-// collect them into a new OwnedArray<T> (a bz_array_t* of pointers). Each input
+// Each OwningTask<T> result is a void* (class pointer, sizeof(void*) bytes); we
+// collect them into a new OwningArray<T> (a bz_array_t* of pointers). Each input
 // task is freed after its result is captured (it is single-consumer, Pattern B).
 // The input array container is freed once all callbacks are registered (after the
 // loop, before returning).
@@ -4607,7 +4607,7 @@ void* bz_task_when_all_owned(void* task_arr) {
     { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
       aggregate->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (n == 0) {
-        // Empty array: complete immediately with an empty OwnedArray<T>.
+        // Empty array: complete immediately with an empty OwningArray<T>.
         void* emptyArr = bz_array_alloc(sizeof(void*), 0);
         aggregate->result = malloc(sizeof(void*));
         memcpy(aggregate->result, &emptyArr, sizeof(void*));
@@ -4646,7 +4646,7 @@ void* bz_task_when_all_owned(void* task_arr) {
                         c->first_error_obj.store(errObj, std::memory_order_release);
                     }
                 } else {
-                    // Capture the result pointer (T*) from the OwnedTask<T>.
+                    // Capture the result pointer (T*) from the OwningTask<T>.
                     // The result is a pointer-sized value stored as void*.
                     void* resPtr = bz_task_await_sync(completedTask);
                     if (resPtr) {
@@ -4656,7 +4656,7 @@ void* bz_task_when_all_owned(void* task_arr) {
                         c->result_bufs[i] = objPtr;
                     }
                 }
-                // Free the OwnedTask<T> — ownership was transferred to us (#451
+                // Free the OwningTask<T> — ownership was transferred to us (#451
                 // Pattern B: single-consumer, the task is spent after this await).
                 bz_task_free(completedTask);
 
@@ -4675,14 +4675,14 @@ void* bz_task_when_all_owned(void* task_arr) {
                         void* errObj = c->first_error_obj.load(std::memory_order_acquire);
                         bz_task_complete_error_obj(c->aggregate, errObj);
                     } else {
-                        // Build OwnedArray<T> from collected result pointers.
+                        // Build OwningArray<T> from collected result pointers.
                         int64_t esz = (int64_t)sizeof(void*);
                         void* resultArr = bz_array_alloc(esz, c->n);
                         for (int64_t j = 0; j < c->n; ++j) {
                             bz_array_add(resultArr, &c->result_bufs[j], esz);
                         }
                         free(c->result_bufs);
-                        // Complete the aggregate with the OwnedArray<T> pointer.
+                        // Complete the aggregate with the OwningArray<T> pointer.
                         bz_task_complete(c->aggregate, &resultArr, sizeof(void*));
                     }
                 }
@@ -8692,7 +8692,7 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
 //         and moves the argument into a heap allocation (or passes it as a
 //         pointer-sized value inline). The spawned domain calls the entry via
 //         the trampoline protocol: entry_fn(arg_ptr) -> result_ptr.
-//         For a void entry (no return), the join OwnedTask is completed with
+//         For a void entry (no return), the join OwningTask is completed with
 //         no result; for an owned-result entry the result pointer IS the result.
 //   D-c6: Element encoding in channel items: class types pass void* (object
 //         pointer, ownership transferred); value types (int/long/double/bool)
@@ -8701,7 +8701,7 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
 //         bz_string_release on Dispose drain -- same as Array<string> per
 //         §28.11 / §28.9). The dispose_elem callback resolves the strategy:
 //         null = value/string-ref (no deep disposal), non-null = class
-//         (vtable Dispose + free) -- mirrors OwnedArray<T> element policy.
+//         (vtable Dispose + free) -- mirrors OwningArray<T> element policy.
 //   D-c7: The spawned domain uses the same BzScheduler thread pool as the main
 //         domain. The pool must be started (bz_scheduler_init) before spawn;
 //         bz_domain_spawn lazy-inits the pool if needed (same as bz_task_delay).
@@ -9032,7 +9032,7 @@ void bz_channel_dispose(void* chp, void* cce_vtable) {
 // dfe_vtable: DomainFaultedException vtable (injected by codegen; null if
 //   the exception vtable is not available).
 //
-// Returns: a bz_task_t* join task (OwnedTask<R> or OwnedTask) that completes
+// Returns: a bz_task_t* join task (OwningTask<R> or OwningTask) that completes
 //   when the spawned domain finishes (or faults).
 // ---------------------------------------------------------------------------
 
@@ -9250,7 +9250,7 @@ void bz_binser_free(void* serp) {
     free(s);
 }
 
-// Transfer accumulated bytes as a fresh OwnedBuffer<byte> (bz_array_t* with
+// Transfer accumulated bytes as a fresh OwningBuffer<byte> (bz_array_t* with
 // elem_size=1).  The serializer's internal buffer is cleared after the copy
 // so further writes start fresh.  Caller owns the returned array.
 void* bz_binser_to_bytes(void* serp) {
@@ -9268,7 +9268,7 @@ void* bz_binser_to_bytes(void* serp) {
     return arr;
 }
 
-// bz_jser_to_bytes: transfer JSON bytes as an OwnedBuffer<byte>.
+// bz_jser_to_bytes: transfer JSON bytes as an OwningBuffer<byte>.
 // Same logic as bz_binser_to_bytes but for JSON kind.
 void* bz_jser_to_bytes(void* serp) {
     return bz_binser_to_bytes(serp);  // same buffer layout; kind tag is ignored
@@ -11280,9 +11280,9 @@ void bz_ser_throw(const char* msg, void* /*ser_exn_vtable*/) {
     bz_exc = block;
 }
 
-// OwnedBuffer<byte> helpers --------------------------------------------------
+// OwningBuffer<byte> helpers --------------------------------------------------
 
-// Allocate an OwnedBuffer<byte> containing a copy of `data[0..len)`.
+// Allocate an OwningBuffer<byte> containing a copy of `data[0..len)`.
 // Returns bz_array_t* (elem_size 1).  Caller owns the result.
 void* bz_owned_buffer_byte_alloc(const uint8_t* data, int64_t len) {
     void* arr = bz_array_alloc(1, len > 0 ? len : 1);
@@ -11294,7 +11294,7 @@ void* bz_owned_buffer_byte_alloc(const uint8_t* data, int64_t len) {
     return arr;
 }
 
-// Return a pointer+length pair from an OwnedBuffer<byte> (bz_array_t* with
+// Return a pointer+length pair from an OwningBuffer<byte> (bz_array_t* with
 // elem_size 1).  The span borrows from the buffer; the buffer must outlive it.
 void bz_owned_buffer_get_span(void* bufp,
                                const uint8_t** data_out,
@@ -11692,7 +11692,7 @@ static bz_task_t* mutex_make_faulted_task(void* oce_vtable) {
 }
 
 // bz_mutex_acquire_async — per §6.2 / #647.
-// Returns a bz_task_t* (OwnedTask<Lock>).
+// Returns a bz_task_t* (OwningTask<Lock>).
 // Fast path (trylock succeeds): already-done task with the lock pointer.
 // Slow path (contested): pool worker blocks, then completes the task.
 void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
@@ -11755,7 +11755,7 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
 }
 
 // bz_mutex_try_acquire_async — per §6.2 / #647.
-// Returns a bz_task_t* (OwnedTask<Lock?>).
+// Returns a bz_task_t* (OwningTask<Lock?>).
 // Result is a bz_lock_t* on success, or a null void* on timeout.
 void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
                                   void* token, void* oce_vtable) {
@@ -12055,7 +12055,7 @@ void bz_semaphore_dispose(void* sp) {
 // ---------------------------------------------------------------------------
 
 // bz_semaphore_acquire_async — per §6.3 / #647.
-// Returns a bz_task_t* (OwnedTask<SemaphoreToken>).
+// Returns a bz_task_t* (OwningTask<SemaphoreToken>).
 void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
     auto* s = (bz_semaphore_t*)sp;
     auto* cs = (bz_cancel_state_t*)token;
@@ -12113,7 +12113,7 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
 }
 
 // bz_semaphore_try_acquire_async — per §6.3 / #647.
-// Returns a bz_task_t* (OwnedTask<SemaphoreToken?>).
+// Returns a bz_task_t* (OwningTask<SemaphoreToken?>).
 // Result is a bz_semaphore_token_t* on success, or null on timeout.
 void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
                                       void* token, void* oce_vtable) {
@@ -12501,7 +12501,7 @@ void bz_buffer_free(void* buf) {
 } // extern "C" (Buffer<T>)
 
 // ---------------------------------------------------------------------------
-// §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+// §6.6 / issue #974: TaskCompletionSource<T> / OwningTaskCompletionSource<T> /
 // TaskCompletionSource (non-generic).
 // bz_tcs_t: holds a pre-allocated inner task and an atomic completion flag.
 // ---------------------------------------------------------------------------
@@ -12510,7 +12510,7 @@ struct bz_tcs_t {
     void*                inner_task; // bz_task_t* owned by this TCS
     std::atomic<int32_t> completed;  // 0 = pending, 1 = terminal state set
     // §28.3 / #1250: disposer for the owned result stored inside the inner task.
-    // Non-null only for OwnedTaskCompletionSource<T:class>. Called by
+    // Non-null only for OwningTaskCompletionSource<T:class>. Called by
     // bz_tcs_dispose_owned_result when the TCS is disposed with a completed,
     // unconsumed owned result (the inner task's result buffer holds the class ptr).
     void (*owned_result_disposer)(void*) = nullptr;
@@ -12606,10 +12606,10 @@ void bz_tcs_free(void* t) {
     delete static_cast<bz_tcs_t*>(t);
 }
 
-// §28.3 / #1250: register the owned-result disposer for OwnedTaskCompletionSource<T:class>.
+// §28.3 / #1250: register the owned-result disposer for OwningTaskCompletionSource<T:class>.
 // `disposer` is a JIT/AOT thunk: void(*)(void*) that calls vtable Dispose and frees
 // the Bezel class object.  Called immediately after bz_tcs_new() for every
-// OwnedTaskCompletionSource<T:class> allocation; no-op for value-type variants.
+// OwningTaskCompletionSource<T:class> allocation; no-op for value-type variants.
 void bz_tcs_set_owned_disposer(void* t, void (*disposer)(void*)) {
     if (!t || !disposer) return;
     static_cast<bz_tcs_t*>(t)->owned_result_disposer = disposer;
@@ -12620,7 +12620,7 @@ void bz_tcs_set_owned_disposer(void* t, void (*disposer)(void*)) {
 // Called just before bz_task_fire_and_forget in the TCS disposal sequence (while the
 // inner task is still alive and accessible via tcs->inner_task).
 // Guards:
-//   • owned_result_disposer == null → not an OwnedTaskCompletionSource<T:class>; skip.
+//   • owned_result_disposer == null → not an OwningTaskCompletionSource<T:class>; skip.
 //   • task->is_error == true       → result was never set (TrySetException / fault); skip.
 //   • task->result == null          → result was already consumed (bz_task_take_result
 //                                     zeroed the buffer at the consume site); skip.
@@ -12676,12 +12676,12 @@ void bz_task_take_result(void* tp) {
     free(buf);
 }
 
-// §30.5 / #1258: dispose an UNCONSUMED owned class result of an OwnedTask<T:class>
+// §30.5 / #1258: dispose an UNCONSUMED owned class result of an OwningTask<T:class>
 // at the task's using-var scope-end disposal, BEFORE bz_task_fire_and_forget /
 // bz_task_free frees the task struct. Mirrors bz_tcs_dispose_owned_result, but the
 // per-type disposer is passed in by codegen (bz_task_t carries no disposer field).
 // Guards:
-//   • disposer == null   → not an OwnedTask<T:class> (Task<T> / no-value task); skip.
+//   • disposer == null   → not an OwningTask<T:class> (Task<T> / no-value task); skip.
 //   • task->is_error     → the async body faulted; no result was produced; skip.
 //   • task->result == null → the result was already consumed (bz_task_take_result
 //                            zeroed the buffer at the await consume site); skip → no

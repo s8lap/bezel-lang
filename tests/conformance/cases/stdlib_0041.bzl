@@ -1,4 +1,4 @@
-public class OwnedLinkedList<T>: IOwnedCollection<T> where T: class
+public class OwningLinkedList<T>: IOwningCollection<T> where T: class
   public constructor();
 
   public readonly property Count: int;
@@ -24,5 +24,5 @@ public class OwnedLinkedList<T>: IOwnedCollection<T> where T: class
   public method PopLast(): owned T;
   public method TryPopFirst(out owned item: T): bool;
   public method TryPopLast(out owned item: T): bool;
-  public method Drain(): OwnedEnumerable<T>;
-end OwnedLinkedList;
+  public method Drain(): IOwningEnumerable<T>;
+end OwningLinkedList;

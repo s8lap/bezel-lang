@@ -1,7 +1,7 @@
-// Codegen — OwnedArray<T>.Remove(item) / Insert / and the Array<T> equivalents
+// Codegen — OwningArray<T>.Remove(item) / Insert / and the Array<T> equivalents
 // (issue #381, stdlib §4.5).
 //
-// stdlib §4.5: "`OwnedArray<T>` owns each element. `Add`, `Insert`, and the
+// stdlib §4.5: "`OwningArray<T>` owns each element. `Add`, `Insert`, and the
 // indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's
 // own `Dispose()` dispose the affected elements." And: "`Remove(item: T): bool;
 // // borrow-taking query; disposes the matched element". And the table:
@@ -42,7 +42,7 @@ int runResource(const std::string& mainBody) {
 
 }  // namespace
 
-// stdlib §4.5: OwnedArray<T>.Remove(item) finds the matching element, DISPOSES
+// stdlib §4.5: OwningArray<T>.Remove(item) finds the matching element, DISPOSES
 // it (exactly once), and removes its slot. The matched element is found via
 // a.Get(1) (a borrow of the stored slot). Encoded: <count right after Remove>
 // *10 + <count after the array's own scope-end Dispose>. Remove disposes 1 of
@@ -52,7 +52,7 @@ BEZEL_TEST(owned_coll_ops_4_5, owned_array_remove_item_disposes_only_matched) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterRemove := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
@@ -69,7 +69,7 @@ BEZEL_TEST(owned_coll_ops_4_5, owned_array_remove_item_returns_true_on_hit) {
         "module M; class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); a.Add(move (new R())); "
         "  var hit := a.Remove(a.Get(0)); "
         "  return int(hit) * 100 + a.Count; "          // 1*100 + 1 = 101
@@ -102,7 +102,7 @@ BEZEL_TEST(owned_coll_ops_4_5, owned_array_remove_item_miss_returns_false) {
         "module M; class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); a.Add(move (new R())); "
         "  using var probe := new R(); "
         "  var hit := a.Remove(probe); "                 // probe is not stored
@@ -110,7 +110,7 @@ BEZEL_TEST(owned_coll_ops_4_5, owned_array_remove_item_miss_returns_false) {
         "end Main; end C;"), 20);
 }
 
-// stdlib §4.5: OwnedArray<T>.Insert(index, item) inserts at the index, shifting
+// stdlib §4.5: OwningArray<T>.Insert(index, item) inserts at the index, shifting
 // later elements up; Count grows by one. Insert does not dispose (a fresh slot
 // is created, not a replacement), so no destructor runs at the Insert point.
 BEZEL_TEST(owned_coll_ops_4_5, owned_array_insert_grows_count) {
@@ -118,7 +118,7 @@ BEZEL_TEST(owned_coll_ops_4_5, owned_array_insert_grows_count) {
         "module M; class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); a.Add(move (new R())); "
         "  a.Insert(1, move (new R())); "
         "  return a.Count * 10 + R._n; "                 // count 3, nothing disposed → 30
@@ -238,7 +238,7 @@ BEZEL_TEST(array_bounds_1200, array_insert_at_count_is_valid_1200) {
         "end Main; end C;"), 3);
 }
 
-// §4.5 (#1200): OwnedArray<T>.RemoveAt obeys the same bounds rule (the guard
+// §4.5 (#1200): OwningArray<T>.RemoveAt obeys the same bounds rule (the guard
 // fires before the element disposer is invoked, so no partial dispose).
 BEZEL_TEST(array_bounds_1200, ownedarray_removeat_oob_throws_1200) {
     BEZEL_EXPECT_EQ(run(
@@ -247,7 +247,7 @@ BEZEL_TEST(array_bounds_1200, ownedarray_removeat_oob_throws_1200) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(new R()); a.Add(new R()); "
         "  try "
         "    a.RemoveAt(10); "        // OOB — guard fires before any dispose

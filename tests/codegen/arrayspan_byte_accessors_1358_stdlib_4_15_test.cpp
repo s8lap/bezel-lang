@@ -89,26 +89,26 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_arrayspan) {
         "end Main; end C;"), 0x12345678);
 }
 
-// Span (OwnedBuffer.AsSpan) — the §4.14 owning-buffer family.
+// Span (OwningBuffer.AsSpan) — the §4.14 owning-buffer family.
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_span) {
     // per stdlib §4.14 (#1358)
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var ob := new OwnedBuffer<byte>(4); "
+        "  using var ob := new OwningBuffer<byte>(4); "
         "  var sp := ob.AsSpan(); "
         "  sp[0] := byte(120); sp[1] := byte(86); sp[2] := byte(52); sp[3] := byte(18); "
         "  return sp.ReadInt32LittleEndian(); "
         "end Main; end C;"), 0x12345678);
 }
 
-// ReadOnlySpan (OwnedBuffer.AsReadOnlySpan).
+// ReadOnlySpan (OwningBuffer.AsReadOnlySpan).
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_readonly_span) {
     // per stdlib §4.14 (#1358)
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var ob := new OwnedBuffer<byte>(4); "
+        "  using var ob := new OwningBuffer<byte>(4); "
         "  var w := ob.AsSpan(); "
         "  w[0] := byte(120); w[1] := byte(86); w[2] := byte(52); w[3] := byte(18); "
         "  return ob.AsReadOnlySpan().ReadInt32LittleEndian(); "
@@ -169,7 +169,7 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, round_trip_int32_be_span) {
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var ob := new OwnedBuffer<byte>(4); "
+        "  using var ob := new OwningBuffer<byte>(4); "
         "  var sp := ob.AsSpan(); "
         "  sp.WriteInt32BigEndian(0x0ABCDE01); "
         "  return sp.ReadInt32BigEndian(); "
@@ -208,7 +208,7 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, round_trip_double_be) {
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var ob := new OwnedBuffer<byte>(8); "
+        "  using var ob := new OwningBuffer<byte>(8); "
         "  var sp := ob.AsSpan(); "
         "  sp.WriteDoubleBigEndian(3.25); "
         "  if sp.ReadDoubleBigEndian() <> 3.25 then return 1; end; "

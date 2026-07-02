@@ -1203,7 +1203,7 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         // `Accessor* "end" ";"` where each Accessor has the abstract body
         // (`;`-terminated), optionally carrying a SetterParamSpec (e.g.
         // `set(owned);`).  This is required for owned-setter declarations on
-        // interface indexers (`IOwnedList<T>`) per §23.3.  The grammar
+        // interface indexers (`IOwningList<T>`) per §23.3.  The grammar
         // appendix A shows only the simple `";"` form for IfaceIndexer /
         // IfaceProperty; the prose of §23.3 extends it.  per §23.3.
         if (isPropertyAccessorStart()) {

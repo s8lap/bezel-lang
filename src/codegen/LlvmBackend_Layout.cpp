@@ -396,7 +396,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // bound parameter — fall through otherwise so the builtin / FFI /
             // declaration checks below run. Previously this returned i32() for
             // ANY no-declaration Named type while a substitution was active,
-            // which clobbered the heap-collection (Array<T>/OwnedArray<T>/…),
+            // which clobbered the heap-collection (Array<T>/OwningArray<T>/…),
             // dictionary, and FFI (IntPtr/CString/…) lowerings to i32 inside a
             // monomorphized generic body. For a generic method returning
             // `owned Array<T>` (§14.1, lowered by emitGenericSpecialization),
@@ -509,29 +509,29 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
                 auto n = rt->astNode->name->parts[0];
-                if (n == "Array" || n == "OwnedArray" ||
-                    // §4.14: OwnedBuffer<T> is heap-allocated (bz_array_t*);
+                if (n == "Array" || n == "OwningArray" ||
+                    // §4.14: OwningBuffer<T> is heap-allocated (bz_array_t*);
                     // without this it fell through to i32 default → IR mismatch.
-                    n == "OwnedBuffer" ||
-                    n == "Dictionary" || n == "OwnedDictionary" ||
-                    n == "Stack" || n == "OwnedStack" ||
-                    n == "Queue" || n == "OwnedQueue" ||
-                    n == "Set" || n == "OwnedSet" ||
-                    n == "LinkedList" || n == "OwnedLinkedList" ||
+                    n == "OwningBuffer" ||
+                    n == "Dictionary" || n == "OwningDictionary" ||
+                    n == "Stack" || n == "OwningStack" ||
+                    n == "Queue" || n == "OwningQueue" ||
+                    n == "Set" || n == "OwningSet" ||
+                    n == "LinkedList" || n == "OwningLinkedList" ||
                     // §4.6: a LinkedListNode<T> variable holds a pointer to the
                     // bz_llist_node_t; it is the node handle / borrow from the list.
                     n == "LinkedListNode" ||
                     n == "StringBuilder" || n == "Random" ||
                     // §29: iteration interfaces are heap-allocated objects.
                     n == "IEnumerable" || n == "IEnumerator" ||
-                    n == "OwnedEnumerable" || n == "OwnedEnumerator" ||
+                    n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
                     n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
-                    n == "OwnedAsyncEnumerable" || n == "OwnedAsyncEnumerator" ||
+                    n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
                     n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
                     n == "ICollection" || n == "IList" ||
-                    n == "IOwnedCollection" || n == "IOwnedList" ||
+                    n == "IOwningCollection" || n == "IOwningList" ||
                     // §30: Task types are also heap-allocated.
-                    n == "Task" || n == "OwnedTask" ||
+                    n == "Task" || n == "OwningTask" ||
                     // per §2.11 / §24.4: a Subscription is a runtime-managed
                     // opaque handle (bz_subscription_t*), returned by
                     // `<event>.Subscribe(...)` / CancellationToken.Register and
@@ -578,10 +578,10 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // (bz_semaphore_token_t*) — same fix applied proactively.
                     n == "Semaphore" || n == "SemaphoreToken" ||
                     // §6.6 / issue #974: TaskCompletionSource<T> /
-                    // OwnedTaskCompletionSource<T> / TaskCompletionSource are
+                    // OwningTaskCompletionSource<T> / TaskCompletionSource are
                     // opaque heap-pointer builtins (bz_tcs_t*). Without this
                     // entry lowerTypeRef would fall through to the i32 default.
-                    n == "TaskCompletionSource" || n == "OwnedTaskCompletionSource" ||
+                    n == "TaskCompletionSource" || n == "OwningTaskCompletionSource" ||
                     // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
                     // heap-pointer builtins (bz_atomic_t*).  Same ptrTy treatment as
                     // Mutex/Semaphore so lowerTypeRef returns ptrTy() not i32.
@@ -630,22 +630,22 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "ReadOnlyStringSpan")
                     return arraySpanStructType();
                 // Heap-pointer types — all stdlib collection/interface/task names.
-                if (n == "Array"       || n == "OwnedArray"     ||
-                    n == "Dictionary"  || n == "OwnedDictionary" ||
-                    n == "Stack"       || n == "OwnedStack"      ||
-                    n == "Queue"       || n == "OwnedQueue"      ||
-                    n == "Set"         || n == "OwnedSet"        ||
-                    n == "LinkedList"  || n == "OwnedLinkedList" ||
+                if (n == "Array"       || n == "OwningArray"     ||
+                    n == "Dictionary"  || n == "OwningDictionary" ||
+                    n == "Stack"       || n == "OwningStack"      ||
+                    n == "Queue"       || n == "OwningQueue"      ||
+                    n == "Set"         || n == "OwningSet"        ||
+                    n == "LinkedList"  || n == "OwningLinkedList" ||
                     n == "LinkedListNode"                        ||
                     n == "StringBuilder" || n == "Random"       ||
                     n == "IEnumerable"   || n == "IEnumerator"  ||
-                    n == "OwnedEnumerable" || n == "OwnedEnumerator" ||
+                    n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
                     n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
-                    n == "OwnedAsyncEnumerable" || n == "OwnedAsyncEnumerator" ||
+                    n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
                     n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
                     n == "ICollection" || n == "IList"           ||
-                    n == "IOwnedCollection" || n == "IOwnedList" ||
-                    n == "Task"        || n == "OwnedTask"       ||
+                    n == "IOwningCollection" || n == "IOwningList" ||
+                    n == "Task"        || n == "OwningTask"       ||
                     n == "Subscription"|| n == "IntPtr"          ||
                     n == "UIntPtr"     || n == "CString"         ||
                     n == "WString"     || n == "RawBytes"        ||
@@ -668,7 +668,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §6.3 / #647: imported Semaphore / SemaphoreToken.
                     n == "Semaphore" || n == "SemaphoreToken" ||
                     // §6.6 / issue #974: imported TCS types.
-                    n == "TaskCompletionSource" || n == "OwnedTaskCompletionSource" ||
+                    n == "TaskCompletionSource" || n == "OwningTaskCompletionSource" ||
                     // §6.4 / #647: imported Atomic<T> and AtomicInteger<T>.
                     n == "Atomic" || n == "AtomicInteger" ||
                     // issue #545: imported Buffer<T> (bz_buffer_hdr_t*).

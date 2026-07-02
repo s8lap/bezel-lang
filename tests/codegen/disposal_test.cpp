@@ -130,14 +130,14 @@ BEZEL_TEST(codegen_cg13, owning_array_indexer_set_bare_owned_local_single_dispos
         "  destructor _n := _n + 1; end destructor; "
         "  public static method Main(): int "
         "    do "
-        "      using var arr := new OwnedArray<C>(); arr.Add(new C()); "
+        "      using var arr := new OwningArray<C>(); arr.Add(new C()); "
         "      var nv := new C(); arr[0] := nv; "          // bare owned local → consumed
         "    end; "
         "    return _n; "                                  // 2
         "  end Main; end C;"), 2);
 }
 
-// #1167: OwnedBuffer indexer-set consumes the bare owned local too (the buffer
+// #1167: OwningBuffer indexer-set consumes the bare owned local too (the buffer
 // was omitted from indexerSetterTakesOwned, so it double-freed).
 BEZEL_TEST(codegen_cg13, owning_buffer_indexer_set_bare_owned_local_single_dispose_1167) {
     BEZEL_EXPECT_EQ(run(
@@ -147,7 +147,7 @@ BEZEL_TEST(codegen_cg13, owning_buffer_indexer_set_bare_owned_local_single_dispo
         "  destructor _n := _n + 1; end destructor; "
         "  public static method Main(): int "
         "    do "
-        "      using var buf := new OwnedBuffer<C>(2); buf[0] := new C(); "
+        "      using var buf := new OwningBuffer<C>(2); buf[0] := new C(); "
         "      var nv := new C(); buf[0] := nv; "
         "    end; "
         "    return _n; "                                  // 2
@@ -163,7 +163,7 @@ BEZEL_TEST(codegen_cg13, owning_array_indexer_set_move_local_single_dispose_1167
         "  destructor _n := _n + 1; end destructor; "
         "  public static method Main(): int "
         "    do "
-        "      using var arr := new OwnedArray<C>(); arr.Add(new C()); "
+        "      using var arr := new OwningArray<C>(); arr.Add(new C()); "
         "      var nv := new C(); arr[0] := move nv; "
         "    end; "
         "    return _n; "                                  // 2
@@ -179,7 +179,7 @@ BEZEL_TEST(codegen_cg13, owning_array_indexer_set_fresh_new_single_dispose_1167)
         "  destructor _n := _n + 1; end destructor; "
         "  public static method Main(): int "
         "    do "
-        "      using var arr := new OwnedArray<C>(); arr.Add(new C()); "
+        "      using var arr := new OwningArray<C>(); arr.Add(new C()); "
         "      arr[0] := new C(); "
         "    end; "
         "    return _n; "                                  // 2

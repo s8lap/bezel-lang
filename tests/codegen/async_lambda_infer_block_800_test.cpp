@@ -1,6 +1,6 @@
 // fix #800 / §30.6: the INFERRED function type of an async lambda now carries the
-// `Task<T>` (or `OwnedTask<T>`) wrapping the spec requires ("The function type of
-// an async lambda has a Task, Task<T>, or OwnedTask<T> return type"). Before,
+// `Task<T>` (or `OwningTask<T>`) wrapping the spec requires ("The function type of
+// an async lambda has a Task, Task<T>, or OwningTask<T> return type"). Before,
 // `var f := async () => do return 1; end` (and the expression form `async () =>
 // 1`) inferred `() -> int`, so `await f()` was rejected ("await requires a Task
 // operand"); only an explicit `f: () -> Task<T>` annotation supplied the wrapping.
@@ -84,7 +84,7 @@ BEZEL_TEST(async_lambda_infer_block_800, inferred_expr_with_await) {
 }
 
 // #800 Layer-2 / §30.5: an inferred expression-bodied async lambda returning a
-// CLASS uses the OwnedTask<T> form — the awaited owned value transfers to the
+// CLASS uses the OwningTask<T> form — the awaited owned value transfers to the
 // awaiter.
 BEZEL_TEST(async_lambda_infer_block_800, inferred_expr_class_result) {
     BEZEL_EXPECT_EQ(runFull(

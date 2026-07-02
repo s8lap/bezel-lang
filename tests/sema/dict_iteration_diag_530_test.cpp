@@ -1,17 +1,17 @@
 // Spec-derived tests for issue #530 / #548 — `for var e in dict` iteration
-// on Dictionary<K,V> and OwnedDictionary<K,V>.
+// on Dictionary<K,V> and OwningDictionary<K,V>.
 //
-// v0.134 (#530): `for var e in d` on BOTH Dictionary and OwnedDictionary
+// v0.134 (#530): `for var e in d` on BOTH Dictionary and OwningDictionary
 // emitted a clear §4.8 diagnostic (direct iteration not provided).
 //
-// v0.135 (#548): the restriction is NARROWED to OwnedDictionary<K,V> only.
+// v0.135 (#548): the restriction is NARROWED to OwningDictionary<K,V> only.
 // Dictionary<K,V> now supports `for var e in d`, yielding
-// DictionaryEntry<K,V> (stdlib §4.8 v0.135).  OwnedDictionary still rejects
+// DictionaryEntry<K,V> (stdlib §4.8 v0.135).  OwningDictionary still rejects
 // direct iteration (stdlib §4.9 v0.135).
 //
 // These tests are updated to reflect the v0.135 widening.  The sema tests
 // that previously checked Dictionary rejection now verify ACCEPTANCE (no error,
-// entry.Key/entry.Value type correctly).  OwnedDictionary rejection is
+// entry.Key/entry.Value type correctly).  OwningDictionary rejection is
 // unchanged.  Control tests remain unaffected.
 
 #include "support/sema_support.hpp"
@@ -46,18 +46,18 @@ bool noDiagContains(const bezel::test::SemaResult& r, std::string_view needle) {
 
 // Helper: wrap body in a module/class/method that has
 //   d: Dictionary<string,int>
-//   od: OwnedDictionary<string,V>  (V is a class; stdlib §4.2/#1327 rejects int)
+//   od: OwningDictionary<string,V>  (V is a class; stdlib §4.2/#1327 rejects int)
 //   arr: Array<int>
 //   s: Set<int>
 //   n: int
 std::string wrap(const std::string& body) {
     return std::string(
         "module M; "
-        "class V end V; "           // minimal class for OwnedDictionary value
+        "class V end V; "           // minimal class for OwningDictionary value
         "class C "
         "public method M("
         "  d: Dictionary<string, int>, "
-        "  od: OwnedDictionary<string, V>, "
+        "  od: OwningDictionary<string, V>, "
         "  arr: Array<int>, "
         "  s: Set<int>, "
         "  n: int"
@@ -99,17 +99,17 @@ BEZEL_TEST(sema_dict_iteration_530, dict_entry_key_access_accepted_v0135_spec_4_
 }
 
 // ===========================================================================
-// §4.9 — OwnedDictionary<K,V> direct iteration must also be rejected
+// §4.9 — OwningDictionary<K,V> direct iteration must also be rejected
 // ===========================================================================
 
-// §4.9 v0.135: `for var e in od` on an OwnedDictionary<string,int> parameter
-// must still be REJECTED (the #530 diagnostic is narrowed to OwnedDictionary
+// §4.9 v0.135: `for var e in od` on an OwningDictionary<string,int> parameter
+// must still be REJECTED (the #530 diagnostic is narrowed to OwningDictionary
 // only in v0.135; Dictionary is now accepted).
 BEZEL_TEST(sema_dict_iteration_530, owned_dict_direct_iteration_rejected_spec_4_9) {
     auto r = parseSemaAll(wrap("for var e in od do n := n + 1; end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    // The diagnostic must mention OwnedDictionary and §4.9.
-    BEZEL_EXPECT_TRUE(anyDiagContains(r, "OwnedDictionary"));
+    // The diagnostic must mention OwningDictionary and §4.9.
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "OwningDictionary"));
     BEZEL_EXPECT_TRUE(noDiagContains(r, "not yet supported in codegen"));
 }
 

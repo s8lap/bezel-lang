@@ -22,7 +22,7 @@
 // The fix:
 //   1. `substituteReturnType`: allow substitution into genericArgs for ANY
 //      Named TypeRef with non-empty genericArgs (not just those with a
-//      non-null declaration).  This covers `Array<T>`, `OwnedArray<T>`, etc.
+//      non-null declaration).  This covers `Array<T>`, `OwningArray<T>`, etc.
 //   2. `typeCall` explicit-typeArgs block (issue #509 / §14.1): always apply
 //      `substituteReturnType` with the built explicit-subst map, so compound
 //      return types like `Array<T>` get their param substituted.

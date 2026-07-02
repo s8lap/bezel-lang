@@ -1,6 +1,6 @@
 // Codegen regression — three collection bugs (issues #522, #523, #524).
 // Spec citations:
-//   §4.10 Set<T> / OwnedSet<T> stdlib:  TryAdd(item: T): bool
+//   §4.10 Set<T> / OwningSet<T> stdlib:  TryAdd(item: T): bool
 //   §4.11 Stack<T> stdlib:              Pop(): T // raises if empty
 //   §4.12 Queue<T> stdlib:              Dequeue(): T // raises if empty
 //   §17.5 (in-operator):               c in s ≡ s.Contains(c)

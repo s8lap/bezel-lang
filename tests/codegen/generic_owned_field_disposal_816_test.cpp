@@ -55,16 +55,16 @@ BEZEL_TEST(generic_owned_field_disposal_816, generic_child_disposes_inherited_ow
         "end Main; end C;"), 0);
 }
 
-// (b) a generic class with an owned OwnedArray<T> field — its elements must be
+// (b) a generic class with an owned OwningArray<T> field — its elements must be
 // disposed (the per-instantiation disposer resolves T to the concrete element).
 BEZEL_TEST(generic_owned_field_disposal_816, generic_owned_array_field_disposes_elements) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
-        "class Container<T> private owned _arr: OwnedArray<T>; "
-        "  public constructor(owned arr: OwnedArray<T>) _arr:=arr; end constructor; "
+        "class Container<T> private owned _arr: OwningArray<T>; "
+        "  public constructor(owned arr: OwningArray<T>) _arr:=arr; end constructor; "
         "  destructor end destructor; end Container; "
         "class C public static method Main(): int "
-        "  var arr := new OwnedArray<Cell>(); "
+        "  var arr := new OwningArray<Cell>(); "
         "  arr.Add(new Cell()); arr.Add(new Cell()); "
         "  do using var c := new Container<Cell>(move arr); end; "
         "  return Cell.n; "  // 0
@@ -108,8 +108,8 @@ BEZEL_TEST(generic_owned_field_disposal_816, value_instantiation_no_spurious_dis
 
 // ===========================================================================
 // #937: a generic class with a bare owned type-PARAMETER field (`owned _v: T`)
-// instantiated with T = a stdlib OWNING COLLECTION (OwnedArray/OwnedStack/
-// OwnedLinkedList/OwnedDictionary). The field was classified as a plain owned
+// instantiated with T = a stdlib OWNING COLLECTION (OwningArray/OwningStack/
+// OwningLinkedList/OwningDictionary). The field was classified as a plain owned
 // class reference (vtable Dispose freed the backing but did not cascade into
 // the elements), so the elements leaked. ownedCollectionFieldType now resolves
 // the type param to its concrete instantiation and routes a collection-typed
@@ -125,29 +125,29 @@ const char* kCellBox =
     "  public constructor(owned v: T) _v := v; end constructor; end Box; ";
 }  // namespace
 
-// T = OwnedArray<Cell>: the array's class element is disposed (no leak).
+// T = OwningArray<Cell>: the array's class element is disposed (no leak).
 BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_array_disposes_elements_937) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCellBox +
         "class Program public static method Main(): int "
         "  do "
-        "    var arr := new OwnedArray<Cell>(); "
+        "    var arr := new OwningArray<Cell>(); "
         "    arr.Add(new Cell()); arr.Add(new Cell()); "
-        "    using var b := new Box<OwnedArray<Cell>>(arr); "
+        "    using var b := new Box<OwningArray<Cell>>(arr); "
         "  end; "
         "  return Cell.n; "  // 0
         "end Main; end Program;"), 0);
 }
 
-// T = OwnedDictionary<string, Cell>: the owned V values are disposed.
+// T = OwningDictionary<string, Cell>: the owned V values are disposed.
 BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_dict_disposes_values_937) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCellBox +
         "class Program public static method Main(): int "
         "  do "
-        "    var d := new OwnedDictionary<string, Cell>(); "
+        "    var d := new OwningDictionary<string, Cell>(); "
         "    d.Add(\"a\", new Cell()); d.Add(\"b\", new Cell()); "
-        "    using var b := new Box<OwnedDictionary<string, Cell>>(d); "
+        "    using var b := new Box<OwningDictionary<string, Cell>>(d); "
         "  end; "
         "  return Cell.n; "  // 0
         "end Main; end Program;"), 0);

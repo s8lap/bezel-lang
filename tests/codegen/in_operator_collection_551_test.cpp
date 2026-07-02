@@ -6,7 +6,7 @@
 //   taking one compatible parameter and returning `bool` qualifies.
 //   The result is `bool`. Supported receiver types include Array<T>, Stack<T>,
 //   Queue<T>, LinkedList<T> (and their Owned counterparts), plus Range<T> and
-//   string (already implemented). Set<T>/OwnedSet<T> and Dictionary<K,V> are
+//   string (already implemented). Set<T>/OwningSet<T> and Dictionary<K,V> are
 //   also already implemented (§4.8/#524). This file covers the remaining cases.
 //
 // Before fix: lowerBinary fell through to `return nullptr` ("other `in` forms

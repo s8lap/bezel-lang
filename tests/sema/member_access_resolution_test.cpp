@@ -276,7 +276,7 @@ BEZEL_TEST(sema_member, array_capacity_property_typed_int_4_4) {
 
 // stdlib §4.10/§4.11: Count is typed int on the other built-in collections too
 // (Stack/Queue/Set/LinkedList and Dictionary). Capacity is NOT a member of
-// these (only Array<T>/OwnedArray<T> declare it), so this guards only Count.
+// these (only Array<T>/OwningArray<T> declare it), so this guards only Count.
 BEZEL_TEST(sema_member, stack_count_property_typed_int_4_10) {
     auto r = parseSemaAll(
         "module M; "

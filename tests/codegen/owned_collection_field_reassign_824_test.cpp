@@ -1,5 +1,5 @@
 // fix #824 / §28.5 / §28.9: reassigning an `owned` collection field
-// (OwnedArray<T> etc.) now disposes the prior collection and its owned
+// (OwningArray<T> etc.) now disposes the prior collection and its owned
 // elements before overwriting the pointer. Before the fix the old pointer was
 // silently leaked — `Cell.n` never returned to 0 after a Replace() call.
 //
@@ -20,7 +20,7 @@ int run(const std::string& src) {
 }
 
 // Boilerplate: Cell tracks live-instance count in Cell.n; Box holds an
-// `owned OwnedArray<Cell>` field that starts with one element.
+// `owned OwningArray<Cell>` field that starts with one element.
 static constexpr const char* kPrefix =
     "module M; "
     "class Cell "
@@ -31,18 +31,18 @@ static constexpr const char* kPrefix =
 
 }  // namespace
 
-// §28.5 / §28.9 / #824: single reassignment via a fresh OwnedArray local —
-// the original OwnedArray<Cell> (and its one Cell) must be disposed on Replace().
+// §28.5 / §28.9 / #824: single reassignment via a fresh OwningArray local —
+// the original OwningArray<Cell> (and its one Cell) must be disposed on Replace().
 BEZEL_TEST(owned_collection_field_reassign_824, single_reassign_rc0) {
     BEZEL_EXPECT_EQ(run(std::string(kPrefix) +
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    _arr := new OwnedArray<Cell>(); "
+        "    _arr := new OwningArray<Cell>(); "
         "    _arr.Add(new Cell()); "
         "  end constructor; "
         "  public method Replace() "
-        "    var fresh := new OwnedArray<Cell>(); "
+        "    var fresh := new OwningArray<Cell>(); "
         "    fresh.Add(new Cell()); "
         "    _arr := fresh; "
         "  end Replace; "
@@ -55,24 +55,24 @@ BEZEL_TEST(owned_collection_field_reassign_824, single_reassign_rc0) {
 }
 
 // §28.5 / §28.9 / #824: double reassignment — both the original and the first
-// replacement OwnedArray<Cell> (each with one Cell) must be disposed before the
+// replacement OwningArray<Cell> (each with one Cell) must be disposed before the
 // second replacement is stored; after disposal of Box only the second
 // replacement's Cell is disposed. All three Cells must be disposed: rc=0.
 BEZEL_TEST(owned_collection_field_reassign_824, double_reassign_rc0) {
     BEZEL_EXPECT_EQ(run(std::string(kPrefix) +
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    _arr := new OwnedArray<Cell>(); "
+        "    _arr := new OwningArray<Cell>(); "
         "    _arr.Add(new Cell()); "
         "  end constructor; "
         "  public method Replace1() "
-        "    var f1 := new OwnedArray<Cell>(); "
+        "    var f1 := new OwningArray<Cell>(); "
         "    f1.Add(new Cell()); "
         "    _arr := f1; "
         "  end Replace1; "
         "  public method Replace2() "
-        "    var f2 := new OwnedArray<Cell>(); "
+        "    var f2 := new OwningArray<Cell>(); "
         "    f2.Add(new Cell()); "
         "    _arr := f2; "
         "  end Replace2; "
@@ -90,9 +90,9 @@ BEZEL_TEST(owned_collection_field_reassign_824, double_reassign_rc0) {
 BEZEL_TEST(owned_collection_field_reassign_824, literal_reassign_rc0) {
     BEZEL_EXPECT_EQ(run(std::string(kPrefix) +
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    _arr := new OwnedArray<Cell>(); "
+        "    _arr := new OwningArray<Cell>(); "
         "    _arr.Add(new Cell()); "
         "  end constructor; "
         "  public method ReplaceWithLiteral() "
@@ -107,15 +107,15 @@ BEZEL_TEST(owned_collection_field_reassign_824, literal_reassign_rc0) {
 }
 
 // §28.5 / §28.9 / #824 (control / no-reassign): ctor-only path. The first
-// assignment `_arr := new OwnedArray<Cell>()` in the constructor sets a
+// assignment `_arr := new OwningArray<Cell>()` in the constructor sets a
 // null/uninitialized old slot; the null-safe bz_array_free must not crash.
 // After Box is disposed, Cell.n must be 0.
 BEZEL_TEST(owned_collection_field_reassign_824, ctor_only_no_crash_rc0) {
     BEZEL_EXPECT_EQ(run(std::string(kPrefix) +
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    _arr := new OwnedArray<Cell>(); "
+        "    _arr := new OwningArray<Cell>(); "
         "    _arr.Add(new Cell()); "
         "  end constructor; "
         "  destructor end destructor; "
@@ -142,13 +142,13 @@ BEZEL_TEST(owned_collection_field_reassign_824, survivor_accessible_rc0) {
         "  destructor Cell.n := Cell.n - 1; end destructor; "
         "end Cell; "
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    _arr := new OwnedArray<Cell>(); "
+        "    _arr := new OwningArray<Cell>(); "
         "    _arr.Add(new Cell(10)); "
         "  end constructor; "
         "  public method Replace() "
-        "    var fresh := new OwnedArray<Cell>(); "
+        "    var fresh := new OwningArray<Cell>(); "
         "    fresh.Add(new Cell(42)); "
         "    _arr := fresh; "
         "  end Replace; "
@@ -185,14 +185,14 @@ BEZEL_TEST(owned_collection_field_reassign_824, no_double_free) {
         "  end destructor; "
         "end Cell; "
         "class Box "
-        "  private owned _arr: OwnedArray<Cell>; "
+        "  private owned _arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    _arr := new OwnedArray<Cell>(); "
+        "    _arr := new OwningArray<Cell>(); "
         "    _arr.Add(new Cell()); "
         "    _arr.Add(new Cell()); "
         "  end constructor; "
         "  public method Replace() "
-        "    var fresh := new OwnedArray<Cell>(); "
+        "    var fresh := new OwningArray<Cell>(); "
         "    fresh.Add(new Cell()); "
         "    _arr := fresh; "
         "  end Replace; "

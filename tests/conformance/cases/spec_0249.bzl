@@ -1,4 +1,4 @@
-public async method OpenFilesAsync(paths: IEnumerable<string>): OwnedAsyncEnumerable<FileStream>
+public async method OpenFilesAsync(paths: IEnumerable<string>): IOwningAsyncEnumerable<FileStream>
   for var path in paths do
     yield return await OpenAsync(path);    // each yielded FileStream is owned
   end;

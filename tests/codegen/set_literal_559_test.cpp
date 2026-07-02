@@ -1,7 +1,7 @@
-// Fix #559 — Set<T>/OwnedSet<T> collection literal `[e1, e2, …]` crashes the
+// Fix #559 — Set<T>/OwningSet<T> collection literal `[e1, e2, …]` crashes the
 // compiler with "IR verification failed: Invalid indices for GEP pointer type!".
 //
-// Root cause: `materializeHeapCollectionLiteral` returned nullptr for Set/OwnedSet
+// Root cause: `materializeHeapCollectionLiteral` returned nullptr for Set/OwningSet
 // (intentional deferral), but `lowerLocalDecl` had no guard for that null and fell
 // through to the inline-array GEP path, which treats the Set's `ptr` slot as a
 // struct → malformed IR → verifier abort.
@@ -11,14 +11,14 @@
 //      (same as `new Set<T>()`) and inserts each element via bz_dict_set_gen with
 //      sentinel value 1 (same as Set.Add in tryLowerCollectionInstanceCall). Dedup
 //      is inherent: bz_dict_set_gen on an already-present key is a no-op.
-//   2. `materializeHeapCollectionLiteral` now routes Set/OwnedSet through
+//   2. `materializeHeapCollectionLiteral` now routes Set/OwningSet through
 //      `materializeHeapSetLiteral` instead of returning nullptr.
 //   3. A safety guard in `lowerLocalDecl` (and the field-store path) prevents the
-//      inline-array fallback for Set/OwnedSet even if materialization returns null
+//      inline-array fallback for Set/OwningSet even if materialization returns null
 //      (which it would for an unrecognised element type — a sema error already
 //      diagnosed upstream).
 //
-// Spec authority: stdlib §4.10 (Set<T>/OwnedSet<T>), spec §15.4 (collection
+// Spec authority: stdlib §4.10 (Set<T>/OwningSet<T>), spec §15.4 (collection
 // literals), §4.10 dedup rule: "duplicates (per T's equality contract) are
 // silently collapsed, the first textual occurrence retained".
 

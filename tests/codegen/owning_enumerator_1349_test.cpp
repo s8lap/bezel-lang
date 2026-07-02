@@ -1,20 +1,20 @@
-// #1349 / §29.1 v0.161: OwnedEnumerator<T>.TakeCurrent() replaces the
+// #1349 / §29.1 v0.161: IOwningEnumerator<T>.TakeCurrent() replaces the
 // destructive `Current` property on owning enumerators.  Protocol misuse
 // (double-take without intervening MoveNext, or take before first advance /
 // after exhaustion) raises InvalidOperationException.
 //
 // Tests:
-//   1. Manual owning-protocol loop (source/GetOwnedEnumerator/MoveNext/TakeCurrent)
+//   1. Manual owning-protocol loop (source/GetOwningEnumerator/MoveNext/TakeCurrent)
 //      produces the correct values.
 //   2. Double-take (without MoveNext) raises InvalidOperationException.
 //   3. Take-before-advance (before the first MoveNext) raises IOE.
 //   4. Take-after-exhaustion (after MoveNext returned false) raises IOE.
-//   5. for-loop over OwnedEnumerable<T> still works (the for-desugaring calls
+//   5. for-loop over IOwningEnumerable<T> still works (the for-desugaring calls
 //      TakeCurrent internally — no regression from §29.2 for-loop path).
 //   6. Disposal is exactly-once (ASan; no leak, no double-free).
 //
 // Manual-protocol note: in `using var source := Gen(); using var en :=
-// source.GetOwnedEnumerator()`, the source OwnedEnumerable must be held in a
+// source.GetOwningEnumerator()`, the source IOwningEnumerable must be held in a
 // using var separately so its owned parameters are disposed (§29.8). The tests
 // use this two-var pattern throughout.
 //
@@ -162,7 +162,7 @@ const std::string kBox =
 // §29.1 / #1349: Manual owning-protocol loop value-correct
 // ===========================================================================
 
-// Manual protocol: source / GetOwnedEnumerator / MoveNext / TakeCurrent.
+// Manual protocol: source / GetOwningEnumerator / MoveNext / TakeCurrent.
 // Gen() yields Box(1), Box(2), Box(3).  Manual loop sums v fields.
 // Result: 1+2+3 = 6.
 // Source held in a separate using var (§29.8: source must be disposed so its
@@ -171,14 +171,14 @@ BEZEL_TEST(owning_enumerator_1349, manual_protocol_values_correct_spec_29_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(1); "
         "    yield return new Box(2); "
         "    yield return new Box(3); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    var s := 0; "
         "    while en.MoveNext() do "
         "      using var x := en.TakeCurrent(); "
@@ -193,12 +193,12 @@ BEZEL_TEST(owning_enumerator_1349, manual_protocol_single_element_spec_29_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(42); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    if en.MoveNext() then "
         "      using var x := en.TakeCurrent(); "
         "      return x.v; "  // 42
@@ -217,12 +217,12 @@ BEZEL_TEST(owning_enumerator_1349, double_take_raises_ioe_spec_29_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(1); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    var ok := en.MoveNext(); "
         "    if ok then "
         "      using var first := en.TakeCurrent(); "  // ok: owns element
@@ -237,17 +237,17 @@ BEZEL_TEST(owning_enumerator_1349, double_take_raises_ioe_spec_29_1) {
         "  end Main; end C;"), 1);
 }
 
-// Take-before-first-advance: GetOwnedEnumerator → TakeCurrent (no MoveNext) → IOE.
+// Take-before-first-advance: GetOwningEnumerator → TakeCurrent (no MoveNext) → IOE.
 BEZEL_TEST(owning_enumerator_1349, take_before_advance_raises_ioe_spec_29_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(1); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    var caught := 0; "
         "    try "
         "      using var x := en.TakeCurrent(); "  // no MoveNext yet → IOE
@@ -267,12 +267,12 @@ BEZEL_TEST(owning_enumerator_1349, take_after_exhaustion_raises_ioe_spec_29_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(1); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    var b1 := en.MoveNext(); "
         "    using var x := en.TakeCurrent(); "
         "    var b2 := en.MoveNext(); "
@@ -292,12 +292,12 @@ BEZEL_TEST(owning_enumerator_1349, diag_movenext_returns_false_spec_29_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(1); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    var b1 := en.MoveNext(); "  // → true
         "    using var x := en.TakeCurrent(); "  // consumes Box(1)
         "    var b2 := en.MoveNext(); "  // → false (exhaustion)
@@ -315,12 +315,12 @@ BEZEL_TEST(owning_enumerator_1349, diag_take_after_exhaust_ioe_via_b2_spec_29_1)
     BEZEL_EXPECT_EQ(run(
         "module M; " + kBox +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<Box> "
+        "  public static method Gen(): IOwningEnumerable<Box> "
         "    yield return new Box(1); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    var b1 := en.MoveNext(); "
         "    using var x := en.TakeCurrent(); "
         "    var b2 := en.MoveNext(); "
@@ -338,13 +338,13 @@ BEZEL_TEST(owning_enumerator_1349, diag_take_after_exhaust_ioe_via_b2_spec_29_1)
 // §29.2 / #1349: for-loop desugaring still works (regression guard)
 // ===========================================================================
 
-// for-loop over OwnedEnumerable<T> implicitly calls TakeCurrent; elements
+// for-loop over IOwningEnumerable<T> implicitly calls TakeCurrent; elements
 // are still received correctly and destructors run exactly once.
 BEZEL_TEST(owning_enumerator_1349, for_loop_desugaring_correct_spec_29_2) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; " + kCountR +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); "
         "    yield return new R(); "
         "    yield return new R(); "
@@ -368,14 +368,14 @@ BEZEL_TEST(owning_enumerator_1349, asan_manual_protocol_no_leak_spec_29_1) {
     int rc = runUnderASan(
         "module M; " + kCountR +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); "
         "    yield return new R(); "
         "    yield return new R(); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    while en.MoveNext() do "
         "      using var x := en.TakeCurrent(); "
         "    end; "
@@ -400,13 +400,13 @@ BEZEL_TEST(owning_enumerator_1349, asan_plain_var_explicit_dispose_reclaims) {
     int rc = runUnderASan(
         "module M; " + kCountR +
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); "
         "    yield return new R(); "
         "  end Gen; "
         "  public static method Main(): int "
         "    using var source := Gen(); "
-        "    using var en := source.GetOwnedEnumerator(); "
+        "    using var en := source.GetOwningEnumerator(); "
         "    while en.MoveNext() do "
         "      var x := en.TakeCurrent(); "
         "      x.Dispose(); "
@@ -418,14 +418,14 @@ BEZEL_TEST(owning_enumerator_1349, asan_plain_var_explicit_dispose_reclaims) {
 }
 
 // AOT + ASan: the same gap for the owning-collection transfers — §4.11
-// OwnedStack.Pop() into a plain `var` with explicit Dispose, plus a §28.7
+// OwningStack.Pop() into a plain `var` with explicit Dispose, plus a §28.7
 // reassignment (`x := s.Pop()`) that must dispose the displaced element.
 BEZEL_TEST(owning_enumerator_1349, asan_pop_plain_var_dispose_and_overwrite) {
     int rc = runUnderASan(
         "module M; " + kCountR +
         "class C "
         "  public static method Main(): int "
-        "    using var s := new OwnedStack<R>(); "
+        "    using var s := new OwningStack<R>(); "
         "    s.Push(move (new R())); "
         "    s.Push(move (new R())); "
         "    var x := s.Pop(); "

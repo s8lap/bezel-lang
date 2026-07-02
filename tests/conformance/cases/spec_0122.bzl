@@ -1,4 +1,4 @@
-private owned _cache: OwnedDictionary<string, Connection>;
+private owned _cache: OwningDictionary<string, Connection>;
 
 public method TryGetCached(name: string, out owned conn: Connection?): bool
   if not _cache.ContainsKey(name) then

@@ -115,14 +115,14 @@ BEZEL_TEST(owned_field_sink, new_ctor_bare_owned_field_rejected) {
 }
 
 // stdlib §4.5: a bare owned-field read handed to the BUILT-IN
-// `OwnedArray<T>.Add(owned item)` is the headline #398 case — a borrow into an
+// `OwningArray<T>.Add(owned item)` is the headline #398 case — a borrow into an
 // owned sink. REJECTED. (Built-in collections have no AST declaration, so the
 // owned sink is recognized by receiver-type + method name, as in #395.)
 BEZEL_TEST(owned_field_sink, builtin_array_add_bare_owned_field_rejected) {
     auto r = parseAndCheckOwnership(std::string("module M; class R end R; "
         "class C "
         "  private owned _owned: R := new R(); "
-        "  public method M(a: OwnedArray<R>) "
+        "  public method M(a: OwningArray<R>) "
         "    a.Add(this._owned); "
         "  end M; "
         "end C;"));

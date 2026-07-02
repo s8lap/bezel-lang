@@ -146,8 +146,8 @@ BEZEL_TEST(mutex_sendable_647,
 //
 // These tests confirm that the "not yet implemented" diagnostic is no longer
 // emitted, and that the returned types are correct:
-//   AcquireAsync()        → OwnedTask<Lock>  (await yields Lock)
-//   TryAcquireAsync(ts)   → OwnedTask<Lock?> (await yields Lock?)
+//   AcquireAsync()        → OwningTask<Lock>  (await yields Lock)
+//   TryAcquireAsync(ts)   → OwningTask<Lock?> (await yields Lock?)
 // ---------------------------------------------------------------------------
 
 // §6.2 / #647 / v0.139: AcquireAsync in an async method produces no error.

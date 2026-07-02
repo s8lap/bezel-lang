@@ -10,7 +10,7 @@
 //   - The unit type `()` — valid as a return type only.
 //   - Function types `(...) -> T` whose params and return are FFI-compatible.
 // §32.5 — "Not allowed: Bezel `string` ..., `char` ..., classes, records,
-//   interfaces, generic type parameters, `Array<T>`, `OwnedArray<T>`,
+//   interfaces, generic type parameters, `Array<T>`, `OwningArray<T>`,
 //   inline arrays whose element type is not FFI-compatible."
 //
 // The check runs during type resolution (Resolver::checkExternType). Each

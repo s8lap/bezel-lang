@@ -1,7 +1,7 @@
 // fix #832 / §21.9: a bare expression statement that DISCARDS the owned element
-// returned by an owning-collection DRAIN (OwnedArray.PopFirst/PopLast/PopAt,
-// OwnedStack.Pop, OwnedQueue.Dequeue, OwnedLinkedList.PopFirst/PopLast,
-// OwnedDictionary.PopValue) silently leaked the popped resource. §21.9 makes
+// returned by an owning-collection DRAIN (OwningArray.PopFirst/PopLast/PopAt,
+// OwningStack.Pop, OwningQueue.Dequeue, OwningLinkedList.PopFirst/PopLast,
+// OwningDictionary.PopValue) silently leaked the popped resource. §21.9 makes
 // discarding a non-trivial-dispose owned value a hard error. The discard check
 // previously missed these because the drains are synthetic builtins with no user
 // MethodDecl (so the existing returnOwned gate never fired). Get/Peek BORROW the
@@ -34,41 +34,41 @@ bool has219Error(const bezel::test::OwnershipResult& r) {
 
 }  // namespace
 
-// OwnedArray.PopFirst() as a bare statement leaks → §21.9 error.
+// OwningArray.PopFirst() as a bare statement leaks → §21.9 error.
 BEZEL_TEST(bare_drain_discard_832, owned_array_pop_first_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(move (new R())); "
+        "  using var a := new OwningArray<R>(); a.Add(move (new R())); "
         "  a.PopFirst(); return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(has219Error(r));
 }
 
-// OwnedStack.Pop() as a bare statement leaks → §21.9 error.
+// OwningStack.Pop() as a bare statement leaks → §21.9 error.
 BEZEL_TEST(bare_drain_discard_832, owned_stack_pop_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var s := new OwnedStack<R>(); s.Push(move (new R())); "
+        "  using var s := new OwningStack<R>(); s.Push(move (new R())); "
         "  s.Pop(); return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(has219Error(r));
 }
 
-// OwnedQueue.Dequeue() as a bare statement leaks → §21.9 error.
+// OwningQueue.Dequeue() as a bare statement leaks → §21.9 error.
 BEZEL_TEST(bare_drain_discard_832, owned_queue_dequeue_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var q := new OwnedQueue<R>(); q.Enqueue(move (new R())); "
+        "  using var q := new OwningQueue<R>(); q.Enqueue(move (new R())); "
         "  q.Dequeue(); return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(has219Error(r));
 }
 
-// OwnedLinkedList.PopLast() as a bare statement leaks → §21.9 error.
+// OwningLinkedList.PopLast() as a bare statement leaks → §21.9 error.
 BEZEL_TEST(bare_drain_discard_832, owned_linkedlist_pop_last_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var l := new OwnedLinkedList<R>(); l.AddLast(move (new R())); "
+        "  using var l := new OwningLinkedList<R>(); l.AddLast(move (new R())); "
         "  l.PopLast(); return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(has219Error(r));
@@ -78,7 +78,7 @@ BEZEL_TEST(bare_drain_discard_832, owned_linkedlist_pop_last_rejected) {
 BEZEL_TEST(bare_drain_discard_832, using_var_discard_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(move (new R())); "
+        "  using var a := new OwningArray<R>(); a.Add(move (new R())); "
         "  using var _ := a.PopFirst(); return 0; "
         "end Main;"));
     BEZEL_EXPECT_FALSE(has219Error(r));
@@ -88,7 +88,7 @@ BEZEL_TEST(bare_drain_discard_832, using_var_discard_accepted) {
 BEZEL_TEST(bare_drain_discard_832, bind_named_using_var_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(move (new R())); "
+        "  using var a := new OwningArray<R>(); a.Add(move (new R())); "
         "  using var x := a.PopFirst(); return 0; "
         "end Main;"));
     BEZEL_EXPECT_FALSE(has219Error(r));
@@ -98,7 +98,7 @@ BEZEL_TEST(bare_drain_discard_832, bind_named_using_var_accepted) {
 BEZEL_TEST(bare_drain_discard_832, borrowing_get_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(move (new R())); "
+        "  using var a := new OwningArray<R>(); a.Add(move (new R())); "
         "  a.Get(0); return 0; "
         "end Main;"));
     BEZEL_EXPECT_FALSE(has219Error(r));

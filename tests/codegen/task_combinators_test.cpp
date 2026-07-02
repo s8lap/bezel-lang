@@ -209,7 +209,7 @@ BEZEL_TEST(task_combinators_6_7, when_all_already_complete) {
 // §30.9 / §30.4 (#855): a fault inside a task passed to Task.WhenAll IS caught by
 // a try/catch around `await Task.WhenAll(...)` — the WhenAll await re-raises the
 // aggregate's exception into the awaiting frame's active catch. The tasks are held
-// by an OWNING OwnedArray<Task> (the correct idiom: a borrowing Array<Task> does
+// by an OWNING OwningArray<Task> (the correct idiom: a borrowing Array<Task> does
 // not own the tasks, so storing fresh producers there leaks them and their
 // unobserved fault surfaces as unhandled — the #1020 footgun, NOT an async-routing
 // bug). Verified: the original #855 repro used a borrowing `Array<Task>`; with an
@@ -222,7 +222,7 @@ BEZEL_TEST(task_combinators_6_7, when_all_owned_array_faulted_task_caught_855) {
         "  public static async method Boom(): Task "
         "    throw new InvalidOperationException(\"f\"); end Boom; "
         "  public static async method Main(): Task<int> "
-        "    using var tasks := new OwnedArray<Task>(); "
+        "    using var tasks := new OwningArray<Task>(); "
         "    tasks.Add(Boom()); "
         "    var x := 0; "
         "    try await Task.WhenAll(tasks); catch Exception => x := 55; end; "
@@ -239,7 +239,7 @@ BEZEL_TEST(task_combinators_6_7, await_owned_array_element_faulted_task_caught_8
         "  public static async method Boom(): Task "
         "    throw new InvalidOperationException(\"f\"); end Boom; "
         "  public static async method Main(): Task<int> "
-        "    using var tasks := new OwnedArray<Task>(); "
+        "    using var tasks := new OwningArray<Task>(); "
         "    tasks.Add(Boom()); "
         "    var x := 0; "
         "    try await tasks[0]; catch Exception => x := 55; end; "

@@ -1,10 +1,10 @@
 // Spec-derived tests for the #1007 fix — returning a BORROW through an
 // owning-collection / owning-wrapper return type (§28.3 / §28.6 / §5.11).
 //
-// An owning-collection / owning-wrapper return type (`OwnedArray<T>`,
-// `OwnedDictionary<K,V>`, `OwnedTask<T>`, `Shared<T>`, …) names ELEMENT
+// An owning-collection / owning-wrapper return type (`OwningArray<T>`,
+// `OwningDictionary<K,V>`, `OwningTask<T>`, `Shared<T>`, …) names ELEMENT
 // ownership (rationale §5.11); the CONTAINER-ownership axis is the separate
-// `owned` qualifier. A method declared `: OwnedArray<T>` WITHOUT `owned` hands
+// `owned` qualifier. A method declared `: OwningArray<T>` WITHOUT `owned` hands
 // the caller a value the caller tracks as OWNED (it must discharge it — a
 // `using var` binding disposes it). If the returned value is a BORROW (a
 // non-`owned` parameter, a borrowed local, or a plain field read), that borrow
@@ -32,13 +32,13 @@ std::string mod(const std::string& body) {
 
 // --- REJECT: a borrowed param returned through an owning-collection type. ---
 
-// §28.3 / §5.11 (#1007 repro): the OwnedArray double-free. `a` is a non-owned
-// param (a borrow); returning it through `: OwnedArray<Cell>` (no `owned`)
+// §28.3 / §5.11 (#1007 repro): the OwningArray double-free. `a` is a non-owned
+// param (a borrow); returning it through `: OwningArray<Cell>` (no `owned`)
 // launders it into an owned alias the caller disposes — a double-free.
 BEZEL_TEST(borrow_return_1007, owned_array_param_exprbody_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Identity(a: OwnedArray<Cell>): OwnedArray<Cell> "
+        "  public static method Identity(a: OwningArray<Cell>): OwningArray<Cell> "
         "    => a; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -48,19 +48,19 @@ BEZEL_TEST(borrow_return_1007, owned_array_param_exprbody_rejected) {
 BEZEL_TEST(borrow_return_1007, owned_array_param_blockbody_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Identity(a: OwnedArray<Cell>): OwnedArray<Cell> "
+        "  public static method Identity(a: OwningArray<Cell>): OwningArray<Cell> "
         "    return a; "
         "  end Identity; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §5.11 sibling: OwnedDictionary borrow-return is the same hazard.
+// §5.11 sibling: OwningDictionary borrow-return is the same hazard.
 BEZEL_TEST(borrow_return_1007, owned_dictionary_param_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Id(d: OwnedDictionary<int, Cell>): "
-        "      OwnedDictionary<int, Cell> => d; "
+        "  public static method Id(d: OwningDictionary<int, Cell>): "
+        "      OwningDictionary<int, Cell> => d; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -74,11 +74,11 @@ BEZEL_TEST(borrow_return_1007, shared_param_rejected) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §30.5 sibling: a borrowed OwnedTask<T> param returned through OwnedTask<T>.
+// §30.5 sibling: a borrowed OwningTask<T> param returned through OwningTask<T>.
 BEZEL_TEST(borrow_return_1007, owned_task_param_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Id(t: OwnedTask<Cell>): OwnedTask<Cell> => t; "
+        "  public static method Id(t: OwningTask<Cell>): OwningTask<Cell> => t; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -88,7 +88,7 @@ BEZEL_TEST(borrow_return_1007, owned_task_param_rejected) {
 BEZEL_TEST(borrow_return_1007, owned_array_borrowed_local_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Id(a: OwnedArray<Cell>): OwnedArray<Cell> "
+        "  public static method Id(a: OwningArray<Cell>): OwningArray<Cell> "
         "    var b := a; "
         "    return b; "
         "  end Id; "
@@ -101,9 +101,9 @@ BEZEL_TEST(borrow_return_1007, owned_array_borrowed_local_rejected) {
 BEZEL_TEST(borrow_return_1007, owned_array_field_read_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public _items: OwnedArray<Cell>; "
-        "  public constructor(a: OwnedArray<Cell>) this._items := a; end constructor; "
-        "  public method Get(): OwnedArray<Cell> => this._items; "
+        "  public _items: OwningArray<Cell>; "
+        "  public constructor(a: OwningArray<Cell>) this._items := a; end constructor; "
+        "  public method Get(): OwningArray<Cell> => this._items; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -117,7 +117,7 @@ BEZEL_TEST(borrow_return_1007, owned_array_field_read_rejected) {
 BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_requires_owned) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Make(): OwnedArray<Cell> => new OwnedArray<Cell>(); "
+        "  public static method Make(): OwningArray<Cell> => new OwningArray<Cell>(); "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -127,7 +127,7 @@ BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_requires_owned) {
 BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_owned_clean) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Make(): owned OwnedArray<Cell> => new OwnedArray<Cell>(); "
+        "  public static method Make(): owned OwningArray<Cell> => new OwningArray<Cell>(); "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -139,7 +139,7 @@ BEZEL_TEST(borrow_return_1007, fresh_new_owned_array_owned_clean) {
 BEZEL_TEST(borrow_return_1007, owned_param_through_nonowned_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Pass(owned a: OwnedArray<Cell>): OwnedArray<Cell> "
+        "  public static method Pass(owned a: OwningArray<Cell>): OwningArray<Cell> "
         "    => a; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -151,10 +151,10 @@ BEZEL_TEST(borrow_return_1007, owned_param_through_nonowned_rejected) {
 BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_allowed) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public owned _items: OwnedArray<Cell>; "
-        "  public constructor() this._items := new OwnedArray<Cell>(); end constructor; "
+        "  public owned _items: OwningArray<Cell>; "
+        "  public constructor() this._items := new OwningArray<Cell>(); end constructor; "
         "  destructor end destructor; "
-        "  public method Get(): OwnedArray<Cell> => this._items; "
+        "  public method Get(): OwningArray<Cell> => this._items; "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -165,7 +165,7 @@ BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_allowed) {
 BEZEL_TEST(borrow_return_1007, owned_return_type_exempt_clean) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
-        "  public static method Id(a: OwnedArray<Cell>): owned OwnedArray<Cell> "
+        "  public static method Id(a: OwningArray<Cell>): owned OwningArray<Cell> "
         "    => a; "
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -207,7 +207,7 @@ BEZEL_TEST(borrow_return_1007, move_owning_collection_local_auto_dropped_1264) {
         "module M; class Cell end Cell; "
         "class P public static method Main(): int "
         "  do "
-        "    var a := new OwnedArray<Cell>(); a.Add(new Cell()); "
+        "    var a := new OwningArray<Cell>(); a.Add(new Cell()); "
         "    var b := move a; "
         "  end; "
         "  return 0; "

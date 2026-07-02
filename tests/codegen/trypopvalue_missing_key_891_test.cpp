@@ -1,4 +1,4 @@
-// fix #891 / §28.11: OwnedDictionary.TryPopValue left its out-owned parameter
+// fix #891 / §28.11: OwningDictionary.TryPopValue left its out-owned parameter
 // uninitialized when the key was absent — the runtime's bz_dict_pop_value_*
 // function does not write *out on the not-found path, so the tmpSlot alloca
 // held garbage; subsequent use of the out param (e.g. v?.Dispose()) then
@@ -49,7 +49,7 @@ const char* kCellHdr =
 BEZEL_TEST(trypopvalue_missing_key_891, empty_dict_missing_key_no_crash) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var d := new OwnedDictionary<string, Cell>(); "
+        "  do using var d := new OwningDictionary<string, Cell>(); "
         "    var ok := d.TryPopValue(\"x\", out owned var v); "
         "    v?.Dispose(); "
         "    if ok then return 99; end; "
@@ -62,7 +62,7 @@ BEZEL_TEST(trypopvalue_missing_key_891, empty_dict_missing_key_no_crash) {
 BEZEL_TEST(trypopvalue_missing_key_891, nonempty_dict_missing_key_others_disposed) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var d := new OwnedDictionary<string, Cell>(); "
+        "  do using var d := new OwningDictionary<string, Cell>(); "
         "    d.Add(\"a\", move (new Cell())); "
         "    d.Add(\"b\", move (new Cell())); "
         "    var ok := d.TryPopValue(\"x\", out owned var v); "
@@ -77,7 +77,7 @@ BEZEL_TEST(trypopvalue_missing_key_891, nonempty_dict_missing_key_others_dispose
 BEZEL_TEST(trypopvalue_missing_key_891, present_key_disposed_exactly_once) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var d := new OwnedDictionary<string, Cell>(); "
+        "  do using var d := new OwningDictionary<string, Cell>(); "
         "    d.Add(\"k\", move (new Cell())); "
         "    var ok := d.TryPopValue(\"k\", out owned var v); "
         "    v?.Dispose(); "
@@ -89,7 +89,7 @@ BEZEL_TEST(trypopvalue_missing_key_891, present_key_disposed_exactly_once) {
 BEZEL_TEST(trypopvalue_missing_key_891, out_using_var_missing_no_crash) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var d := new OwnedDictionary<string, Cell>(); "
+        "  do using var d := new OwningDictionary<string, Cell>(); "
         "    var ok := d.TryPopValue(\"missing\", out using var v); "
         "  end; return Cell._n; end Main; end C;"), 0);
 }
@@ -99,7 +99,7 @@ BEZEL_TEST(trypopvalue_missing_key_891, out_using_var_missing_no_crash) {
 BEZEL_TEST(trypopvalue_missing_key_891, out_using_var_present_disposed_once) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var d := new OwnedDictionary<string, Cell>(); "
+        "  do using var d := new OwningDictionary<string, Cell>(); "
         "    d.Add(\"k\", move (new Cell())); "
         "    var ok := d.TryPopValue(\"k\", out using var v); "
         "  end; return Cell._n; end Main; end C;"), 0);

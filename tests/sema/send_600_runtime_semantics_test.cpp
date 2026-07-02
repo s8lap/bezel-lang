@@ -20,7 +20,7 @@
 //   §30.14: "An exception that propagates out of the entry ... raises
 //     DomainFaultedException ... whose Message and FaultStackTrace carry copies
 //     of the original exception's message and stack-trace text."
-//   §30.14: "Awaiting an OwnedTask<R> join follows Pattern B: ownership of
+//   §30.14: "Awaiting an OwningTask<R> join follows Pattern B: ownership of
 //     the result transfers to the awaiter."
 //
 // These are JIT-executed end-to-end tests (like tests/codegen/*) using the
@@ -40,7 +40,7 @@ using bezel::test::runJit;
 // §30.15 spec example (adapted): unbounded channel round-trip.
 // The spawned domain sends one item; the main domain receives it.
 // Per §30.15: Send transfers ownership into the channel; await Receive()
-// (OwnedTask<T> Pattern B) transfers ownership to the receiver.
+// (OwningTask<T> Pattern B) transfers ownership to the receiver.
 BEZEL_TEST(send_600_runtime,
            single_send_receive_round_trip_30_15) {
     auto r = runJit(
@@ -112,10 +112,10 @@ BEZEL_TEST(send_600_runtime,
 }
 
 // ---------------------------------------------------------------------------
-// §30.14: Domain.Spawn join returns result (OwnedTask<R> Pattern B).
+// §30.14: Domain.Spawn join returns result (OwningTask<R> Pattern B).
 // ---------------------------------------------------------------------------
 
-// §30.14: "Awaiting an OwnedTask<R> join follows Pattern B: ownership of the
+// §30.14: "Awaiting an OwningTask<R> join follows Pattern B: ownership of the
 // sendable result transfers to the awaiter."
 BEZEL_TEST(send_600_runtime,
            domain_spawn_join_returns_result_30_14) {

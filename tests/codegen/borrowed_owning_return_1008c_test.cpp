@@ -63,17 +63,17 @@ bool compileFails(const std::string& source) {
     return !r.success;
 }
 
-// A Cell with a disposal counter, and a Holder owning an OwnedArray<Cell> field
+// A Cell with a disposal counter, and a Holder owning an OwningArray<Cell> field
 // with a borrow-returning accessor `GetItems`.
 const char* prelude =
     "module M; "
     "class Cell public static n: int := 0; "
     "  public constructor() Cell.n := Cell.n + 1; end constructor; "
     "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
-    "class Holder public owned _items: OwnedArray<Cell>; "
-    "  public constructor() _items := new OwnedArray<Cell>(); _items.Add(new Cell()); end constructor; "
+    "class Holder public owned _items: OwningArray<Cell>; "
+    "  public constructor() _items := new OwningArray<Cell>(); _items.Add(new Cell()); end constructor; "
     "  destructor end destructor; "
-    "  public method GetItems(): OwnedArray<Cell> => _items; "
+    "  public method GetItems(): OwningArray<Cell> => _items; "
     "  public method DrainSelf(): int "
     "    for var c in _items.Drain() do c.Dispose(); end; return 0; "
     "  end DrainSelf; "
@@ -124,8 +124,8 @@ BEZEL_TEST(borrowed_owning_1008c, caller_drain_borrow_allowed) {
 BEZEL_TEST(borrowed_owning_1008c, fresh_nonowned_return_rejected) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string(prelude) +
-        "class P public static method Make(): OwnedArray<Cell> "
-        "    return new OwnedArray<Cell>(); end Make; "
+        "class P public static method Make(): OwningArray<Cell> "
+        "    return new OwningArray<Cell>(); end Make; "
         "  public static method Main(): int return 0; end Main; end P;"));
 }
 
@@ -134,8 +134,8 @@ BEZEL_TEST(borrowed_owning_1008c, fresh_nonowned_return_rejected) {
 BEZEL_TEST(borrowed_owning_1008c, fresh_owned_return_disposed_once) {
     BEZEL_EXPECT_EQ(compileAndRun(
         std::string(prelude) +
-        "class P public static method Make(): owned OwnedArray<Cell> "
-        "    var a := new OwnedArray<Cell>(); a.Add(new Cell()); return a; end Make; "
+        "class P public static method Make(): owned OwningArray<Cell> "
+        "    var a := new OwningArray<Cell>(); a.Add(new Cell()); return a; end Make; "
         "  public static method Main(): int "
         "    do using var x := P.Make(); end; return Cell.n; "
         "  end Main; end P;"), 0);
@@ -146,7 +146,7 @@ BEZEL_TEST(borrowed_owning_1008c, fresh_owned_return_disposed_once) {
 BEZEL_TEST(borrowed_owning_1008c, dangling_local_field_return_rejected) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string(prelude) +
-        "class P public static method Bad(): OwnedArray<Cell> "
+        "class P public static method Bad(): OwningArray<Cell> "
         "    do using var lh := new Holder(); return lh._items; end; end Bad; "
         "  public static method Main(): int return 0; end Main; end P;"));
 }

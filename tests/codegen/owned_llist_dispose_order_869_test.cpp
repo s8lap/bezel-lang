@@ -1,4 +1,4 @@
-// Codegen/runtime — issue #869: OwnedLinkedList<T>.Dispose() must dispose its
+// Codegen/runtime — issue #869: OwningLinkedList<T>.Dispose() must dispose its
 // elements in REVERSE-INSERTION order (§28.11). The runtime walked the list
 // tail→head, which equals reverse-insertion only when every element was
 // AddLast'd; with AddFirst (or AddBefore) the head/tail position no longer
@@ -42,7 +42,7 @@ BEZEL_TEST(owned_llist_dispose_order_869, add_first_reverse_insertion) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + cell(10) +
         "class C public static method Main(): int "
-        "  do using var ll := new OwnedLinkedList<Cell>(); "
+        "  do using var ll := new OwningLinkedList<Cell>(); "
         "     ll.AddFirst(new Cell(1)); ll.AddFirst(new Cell(2)); end; "
         "  return Cell.order; "  // 21
         "end Main; end C;"), 21);
@@ -53,7 +53,7 @@ BEZEL_TEST(owned_llist_dispose_order_869, add_last_still_reverse_insertion) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + cell(4) +
         "class C public static method Main(): int "
-        "  do using var ll := new OwnedLinkedList<Cell>(); "
+        "  do using var ll := new OwningLinkedList<Cell>(); "
         "     ll.AddLast(new Cell(1)); ll.AddLast(new Cell(2)); ll.AddLast(new Cell(3)); end; "
         "  return Cell.order; "  // 57
         "end Main; end C;"), 57);
@@ -65,7 +65,7 @@ BEZEL_TEST(owned_llist_dispose_order_869, mixed_add_first_last_by_insertion) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + cell(4) +
         "class C public static method Main(): int "
-        "  do using var ll := new OwnedLinkedList<Cell>(); "
+        "  do using var ll := new OwningLinkedList<Cell>(); "
         "     ll.AddLast(new Cell(1)); ll.AddFirst(new Cell(2)); ll.AddLast(new Cell(3)); end; "
         "  return Cell.order; "  // 57
         "end Main; end C;"), 57);

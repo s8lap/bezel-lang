@@ -2,7 +2,7 @@
 // (issue #401, stdlib §4.1 / §4.2 / §4.3).
 //
 // The runtime-backed heap-collection indexer (#388) keyed on the CONCRETE
-// collection type (Array / OwnedArray) via isCollectionTypeName. When the
+// collection type (Array / OwningArray) via isCollectionTypeName. When the
 // receiver is one of the list INTERFACES the indexer was not lowered:
 //   * a read returned garbage (it fell to the inline-array GEP path), and
 //   * a write was silently dropped.
@@ -13,7 +13,7 @@
 //   * IList<T>              (§4.1): `property [i: int]: T;`
 //                            get + set; borrowing; the setter stores a borrow,
 //                            NO disposal of the previous slot (Array borrows).
-//   * IOwnedList<T>         (§4.2): `property [i: int]: T { get; set(owned); }`
+//   * IOwningList<T>         (§4.2): `property [i: int]: T { get; set(owned); }`
 //                            get + owned-taking set; the setter DISPOSES the
 //                            previous slot value before installing the new one.
 // (No collection INTERFACE declares a key-indexer: Dictionary<K,V> implements
@@ -21,7 +21,7 @@
 //  key-indexing through an interface is intentionally not covered, §4.8.)
 //
 // Per §4.3, IReadOnlyList<T> is the shared read-only view of BOTH borrowing
-// (Array<T>: IList<T>) and owning (OwnedArray<T>: IOwnedList<T>) array-backed
+// (Array<T>: IList<T>) and owning (OwningArray<T>: IOwningList<T>) array-backed
 // collections. All three interfaces are array-backed at runtime (bz_array_t*),
 // so the interface receiver holds the same runtime pointer as the concrete
 // collection; the indexer get/set lower against the same bz_array_* runtime.
@@ -148,7 +148,7 @@ BEZEL_TEST(interface_indexer_401, ireadonlylist_int_get_4_1) {
         "end Main; end C;"), 20);
 }
 
-// §4.1 / §4.3: an OwnedArray viewed as IReadOnlyList<T> is the SHARED read-only
+// §4.1 / §4.3: an OwningArray viewed as IReadOnlyList<T> is the SHARED read-only
 // view of an owning collection (§4.3: the two hierarchies share IReadOnlyList).
 // Reading through it borrows the slot — the array keeps ownership; the owner
 // disposes both elements at scope end. Distinct elements read via the interface.
@@ -158,7 +158,7 @@ BEZEL_TEST(interface_indexer_401, ireadonlylist_over_owned_get_4_3) {
         "  public constructor(v: int) V := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R(5))); a.Add(move (new R(9))); "
         "  var xs: IReadOnlyList<R> := a; "
         "  return xs[1].V - xs[0].V; "                   // 9 - 5 = 4
@@ -235,7 +235,7 @@ BEZEL_TEST(interface_indexer_401, ilist_set_no_dispose_4_4) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var holder := new OwnedArray<R>(); "
+        "  using var holder := new OwningArray<R>(); "
         "  holder.Add(move (new R())); holder.Add(move (new R())); "
         "  using var a := new Array<R>(); "
         "  a.Add(holder.Get(0)); "
@@ -246,11 +246,11 @@ BEZEL_TEST(interface_indexer_401, ilist_set_no_dispose_4_4) {
 }
 
 // ---------------------------------------------------------------------------
-// IOwnedList<T> — §4.2 get + owned-taking set over OwnedArray<T>. The setter
+// IOwningList<T> — §4.2 get + owned-taking set over OwningArray<T>. The setter
 // DISPOSES the displaced element exactly once before installing the new one.
 // ---------------------------------------------------------------------------
 
-// §4.2: an OwnedArray viewed as IOwnedList<T> reads element i through the
+// §4.2: an OwningArray viewed as IOwningList<T> reads element i through the
 // interface indexer (borrowing read). Two distinct elements differ.
 BEZEL_TEST(interface_indexer_401, iownedlist_get_4_2) {
     BEZEL_EXPECT_EQ(run(
@@ -258,15 +258,15 @@ BEZEL_TEST(interface_indexer_401, iownedlist_get_4_2) {
         "  public constructor(v: int) V := v; end constructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R(3))); a.Add(move (new R(40))); "
-        "  var xs: IOwnedList<R> := a; "
+        "  var xs: IOwningList<R> := a; "
         "  return xs[0].V + xs[1].V; "                   // 3 + 40 = 43
         "end Main; end C;"), 43);
 }
 
 // §4.2: "the indexer setter takes ownership and disposes the previous slot
-// value." `xs[0] := move (new R())` through an IOwnedList<R> view disposes the
+// value." `xs[0] := move (new R())` through an IOwningList<R> view disposes the
 // element previously at slot 0 EXACTLY once. Encoded: <count right after the set>
 // * 10 + <count after the owning array's scope-end Dispose>. The set disposes 1
 // (displaced); scope-end disposes the other 2 (new slot-0 element + slot-1) → 13.
@@ -281,10 +281,10 @@ BEZEL_TEST(interface_indexer_401, iownedlist_set_disposes_previous_4_2) {
         "class C public static method Main(): int "
         "  var afterSet := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R())); "
         "    a.Add(move (new R())); "
-        "    var xs: IOwnedList<R> := a; "
+        "    var xs: IOwningList<R> := a; "
         "    xs[0] := move (new R()); "
         "    afterSet := R._n; "
         "  end; "
@@ -303,9 +303,9 @@ BEZEL_TEST(interface_indexer_401, iownedlist_set_keeps_count_4_2) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); a.Add(move (new R())); "
-        "  var xs: IOwnedList<R> := a; "
+        "  var xs: IOwningList<R> := a; "
         "  xs[1] := move (new R()); "
         "  return a.Count * 10 + R._n; "                 // count 2, one disposed → 21
         "end Main; end C;"), 21);

@@ -117,10 +117,10 @@ MoveExpr        ::= "move" PrimaryExpr
                                  the named field is `owned`; or (b) an
                                  indexer access `PrimaryExpr "[" Expression "]"`
                                  where the receiver is an owning collection
-                                 admitting slot-level move (`OwnedArray<T>`,
-                                 `OwnedDictionary<K, V>`, `OwnedBuffer<T>`
+                                 admitting slot-level move (`OwningArray<T>`,
+                                 `OwningDictionary<K, V>`, `OwningBuffer<T>`
                                  for class-typed T, `Span<T>` over class-typed
-                                 `OwnedBuffer<T>`, or an owning inline array
+                                 `OwningBuffer<T>`, or an owning inline array
                                  `[N owned]…`). Both rejections are compile
                                  errors. See §28.8.1 and §28.11. */
 

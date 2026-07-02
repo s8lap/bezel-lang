@@ -383,12 +383,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    id->name == "Convert" || id->name == "Environment" ||
                    id->name == "Random" ||
                    // §3 stdlib collection and helper classes:
-                   id->name == "Array" || id->name == "OwnedArray" ||
-                   id->name == "Dictionary" || id->name == "OwnedDictionary" ||
-                   id->name == "Stack" || id->name == "OwnedStack" ||
-                   id->name == "Queue" || id->name == "OwnedQueue" ||
-                   id->name == "Set" || id->name == "OwnedSet" ||
-                   id->name == "LinkedList" || id->name == "OwnedLinkedList" ||
+                   id->name == "Array" || id->name == "OwningArray" ||
+                   id->name == "Dictionary" || id->name == "OwningDictionary" ||
+                   id->name == "Stack" || id->name == "OwningStack" ||
+                   id->name == "Queue" || id->name == "OwningQueue" ||
+                   id->name == "Set" || id->name == "OwningSet" ||
+                   id->name == "LinkedList" || id->name == "OwningLinkedList" ||
                    id->name == "StringBuilder" || id->name == "Encoding" ||
                    id->name == "DateTime" || id->name == "TimeSpan" ||
                    // stdlib §2.5 / #1357: DateOnly and TimeOnly are auto-imported
@@ -803,13 +803,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // collection's element/result type so codegen can lower the
                 // read and the setter against it (mirrors the inline-array path
                 // above):
-                //   * Array<T> / OwnedArray<T> (stdlib §4.4 / §4.5): the
+                //   * Array<T> / OwningArray<T> (stdlib §4.4 / §4.5): the
                 //     indexer `[i: int]: T` result is T = genericArgs[0].
-                //   * Dictionary<K,V> / OwnedDictionary<K,V> (§4.8 / §4.9): the
+                //   * Dictionary<K,V> / OwningDictionary<K,V> (§4.8 / §4.9): the
                 //     indexer `[key: K]: V` result is V = genericArgs[1].
                 //   * issue #401 / §4.1 / §4.2: the int-indexed list INTERFACES
                 //     IReadOnlyList<T> (get-only), IList<T> (get/set borrowing),
-                //     and IOwnedList<T> (get/owned-set) each declare an indexer
+                //     and IOwningList<T> (get/owned-set) each declare an indexer
                 //     `[i: int]: T`; the element type is T = genericArgs[0], the
                 //     same position as Array<T>. (No collection interface
                 //     declares a key-indexer, so dictionaries are concrete-only.)
@@ -823,18 +823,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         ctx_.setExprType(&e, tt->genericArgs[0]);
                     }
                     bool isArrLike =
-                        cn == "Array" || cn == "OwnedArray" ||
-                        // §4.14 (#743/f11): OwnedBuffer<T>[i] is element-indexed
-                        // exactly like OwnedArray<T> — its result type is the
+                        cn == "Array" || cn == "OwningArray" ||
+                        // §4.14 (#743/f11): OwningBuffer<T>[i] is element-indexed
+                        // exactly like OwningArray<T> — its result type is the
                         // element T = genericArgs[0]. Without this it fell to the
                         // untyped path, where the ownership checker assumed a
                         // borrow and falsely rejected `return buf[0]` for a
                         // value-type T (§28.3 borrow-lifetime).
-                        cn == "OwnedBuffer" ||
+                        cn == "OwningBuffer" ||
                         // issue #401: list interfaces are array-backed; their
                         // indexer result type is the element T = genericArgs[0].
                         cn == "IReadOnlyList" || cn == "IList" ||
-                        cn == "IOwnedList";
+                        cn == "IOwningList";
                     // §4.15 (#549) / §4.14 (#779): ArraySpan/ReadOnlyArraySpan
                     // (borrowing) and Span/ReadOnlySpan (owning) indexer returns
                     // T = genericArgs[0].
@@ -842,13 +842,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         cn == "ArraySpan" || cn == "ReadOnlyArraySpan" ||
                         cn == "Span" || cn == "ReadOnlySpan";
                     bool isDict =
-                        cn == "Dictionary" || cn == "OwnedDictionary";
+                        cn == "Dictionary" || cn == "OwningDictionary";
                     if ((isArrLike || isSpan) && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                         // §15.6 / fix #690: `arr[range]` on Array<T> produces
                         // a new Array<T> — the result type is the ARRAY type
                         // (tt), not the element type (T). Only Array<T> supports
-                        // range slicing; OwnedArray<T>, span types, and list
+                        // range slicing; OwningArray<T>, span types, and list
                         // interfaces use the scalar-element path.
                         bool isRangeIdx =
                             !ix->indices.empty() && ix->indices[0].value &&
@@ -871,22 +871,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                         // §15.6 (#746 R41-E): range slicing produces a NEW Array<T>
                         // of copied references; it is admitted only on Array<T>.
-                        // "Slicing is not admitted on OwnedArray<T>" — the
+                        // "Slicing is not admitted on OwningArray<T>" — the
                         // copy-returning semantics would manufacture a second
                         // owner for each owned element. Reject it instead of
                         // silently typing the (miscompiled) result as the element.
-                        if (isRangeIdx && cn == "OwnedArray")
+                        if (isRangeIdx && cn == "OwningArray")
                             ctx_.diagnostics().report(
                                 Severity::Error, e.span.begin,
                                 "range slicing `[a..b]` is not admitted on "
-                                "`OwnedArray<T>` — it would manufacture a second "
+                                "`OwningArray<T>` — it would manufacture a second "
                                 "owner for each owned element (§15.6)");
                         if (isRangeIdx && cn == "Array")
                             ctx_.setExprType(&e, tt);
                         else {
                             TypeRef* elem = tt->genericArgs[0];
                             // §4.14 (#1157): for class-typed T, an
-                            // `OwnedBuffer<T>` stores `T?` in each slot
+                            // `OwningBuffer<T>` stores `T?` in each slot
                             // (nullable references, all null until set). Its
                             // indexer is declared `[i: int]: T?`, so the
                             // indexer-get must be typed `T?` — an empty-slot
@@ -900,13 +900,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             // param (no declaration) is left non-nullable —
                             // its category is unknown until instantiation.
                             // per §7.4 / #1157 (#1208): Span<T> and
-                            // ReadOnlySpan<T> (owning spans over OwnedBuffer<T>)
+                            // ReadOnlySpan<T> (owning spans over OwningBuffer<T>)
                             // store `T?` in each slot for class/interface T —
-                            // identical semantics to OwnedBuffer<T> itself.
+                            // identical semantics to OwningBuffer<T> itself.
                             // ArraySpan / ReadOnlyArraySpan (borrowing views of
                             // Array<T>) store `T` directly (non-nullable) and
                             // are excluded.
-                            if ((cn == "OwnedBuffer" ||
+                            if ((cn == "OwningBuffer" ||
                                  cn == "Span" || cn == "ReadOnlySpan") &&
                                 elem && !elem->nullable &&
                                 elem->kind == TypeRef::Kind::Named &&
@@ -1256,12 +1256,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     !rt->astNode->name->parts.empty()) {
                     std::string_view colName = rt->astNode->name->parts[0];
                     bool isBuiltinColl =
-                        colName == "Array"     || colName == "OwnedArray"  ||
-                        colName == "Stack"     || colName == "OwnedStack"  ||
-                        colName == "Queue"     || colName == "OwnedQueue"  ||
-                        colName == "Set"       || colName == "OwnedSet"    ||
-                        colName == "LinkedList"|| colName == "OwnedLinkedList" ||
-                        colName == "Dictionary"|| colName == "OwnedDictionary" ||
+                        colName == "Array"     || colName == "OwningArray"  ||
+                        colName == "Stack"     || colName == "OwningStack"  ||
+                        colName == "Queue"     || colName == "OwningQueue"  ||
+                        colName == "Set"       || colName == "OwningSet"    ||
+                        colName == "LinkedList"|| colName == "OwningLinkedList" ||
+                        colName == "Dictionary"|| colName == "OwningDictionary" ||
                         colName == "StringBuilder"  ||
                         // §28.13 / stdlib §2.16: Shared<T>/Weak<T> constructors
                         // take an owned value, not a collection literal.
@@ -1366,7 +1366,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // be a proper class type.  Runtime-managed (string, function),
                 // value (int/record/enum), and interface types have no disposal
                 // obligation to share and are rejected at instantiation, mirroring
-                // the §14.4 / OwnedArray<T: class> constraint.
+                // the §14.4 / OwningArray<T: class> constraint.
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty()) {
@@ -1388,7 +1388,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 // §28.13 v0.140 / #689: compiler-known stdlib class types
                                 // (Mutex, Atomic<T>, AtomicInteger<T>, Semaphore, Channel<T>,
                                 // ChannelSender<T>, and other compiler-known classes like Lock,
-                                // OwnedArray<T>, etc.) have no user TypeDecl but are classes.
+                                // OwningArray<T>, etc.) have no user TypeDecl but are classes.
                                 // Accept all builtin named types here; the Shared<T> sendability
                                 // rule in isSendable (ExprTypecheck_Calls.cpp) further restricts
                                 // which of these are sendable across domains.
@@ -1396,8 +1396,8 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 // The full set of compiler-known class types (not value types,
                                 // not records/enums/interfaces): Mutex, Lock, Atomic<T>,
                                 // AtomicInteger<T>, Semaphore, Channel<T>, ChannelSender<T>,
-                                // Task, OwnedTask, OwnedArray, OwnedStack, OwnedQueue,
-                                // OwnedSet, OwnedLinkedList, OwnedDictionary, Array, Stack,
+                                // Task, OwningTask, OwningArray, OwningStack, OwningQueue,
+                                // OwningSet, OwningLinkedList, OwningDictionary, Array, Stack,
                                 // Queue, Set, LinkedList, Dictionary, EventSource,
                                 // AsyncEventSource, Shared, Weak.
                                 // Excluded: string (primitive), Object (primitive), int etc.
@@ -1668,9 +1668,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 }
                 // §2.15 / issue #631: `new BinaryDeserializer(arg)` requires
                 // `arg` to be a `ReadOnlySpan<byte>` (the result of calling
-                // `.AsReadOnlySpan()` on an `OwnedBuffer<byte>`). Passing the
+                // `.AsReadOnlySpan()` on an `OwningBuffer<byte>`). Passing the
                 // owned buffer directly (`new BinaryDeserializer(bytes)` where
-                // `bytes: OwnedBuffer<byte>`) is a type error — the constructor
+                // `bytes: OwningBuffer<byte>`) is a type error — the constructor
                 // signature is `BinaryDeserializer(input: ReadOnlySpan<byte>)`
                 // (stdlib §2.15). Without this check the wrong-arg form compiled
                 // silently and segfaulted at runtime.
@@ -1684,12 +1684,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         !arg0->declaration && arg0->astNode &&
                         arg0->astNode->name &&
                         !arg0->astNode->name->parts.empty() &&
-                        arg0->astNode->name->parts[0] == "OwnedBuffer") {
+                        arg0->astNode->name->parts[0] == "OwningBuffer") {
                         ctx_.diagnostics().report(
                             Severity::Error, ne->args[0].value->span.begin,
                             "`new BinaryDeserializer(...)` expects "
                             "`ReadOnlySpan<byte>` as its first argument "
-                            "(stdlib \xC2\xA7""2.15); got `OwnedBuffer<byte>` — "
+                            "(stdlib \xC2\xA7""2.15); got `OwningBuffer<byte>` — "
                             "call `.AsReadOnlySpan()` first "
                             "(\xC2\xA7""2.15, #631)");
                     }
@@ -2678,7 +2678,7 @@ MethodSymbol* ExprTC::findUnaryOperator(const ast::UnaryExpr& ue) {
 
 // §28.8.1 / §28.11 (issue #423): classify the receiver of a `move coll[i]`.
 // `move coll[i]` is admitted only on the enumerated CONCRETE owning receivers
-// (§28.11: `OwnedArray<T>`, `OwnedDictionary<K, V>`, class-typed `OwnedBuffer<T>`,
+// (§28.11: `OwningArray<T>`, `OwningDictionary<K, V>`, class-typed `OwningBuffer<T>`,
 // class-typed `Span<T>`, and the owning inline arrays). An INTERFACE-typed
 // receiver is not among them — the interface owns no storage, so there is no
 // statically-known slot to leave in moved-from state; codegen's
@@ -2702,13 +2702,13 @@ ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
     // declaration (TypeResolution_Names) carrying the name on the AST node. The
     // only built-in interfaces that declare an int-indexer — the sole shape a
     // `move coll[i]` can take among built-ins — are the list interfaces
-    // `IReadOnlyList<T>`, `IList<T>`, and `IOwnedList<T>` (stdlib §4.1–§4.2);
+    // `IReadOnlyList<T>`, `IList<T>`, and `IOwningList<T>` (stdlib §4.1–§4.2);
     // every other built-in interface has no indexer, so `coll[i]` would not
-    // typecheck on it. (`Array`/`OwnedArray`/`OwnedDictionary`/… are concrete
+    // typecheck on it. (`Array`/`OwningArray`/`OwningDictionary`/… are concrete
     // CLASSES, not interfaces, and are correctly NOT matched here.)
     if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty()) {
         std::string_view cn = tt->astNode->name->parts[0];
-        if (cn == "IReadOnlyList" || cn == "IList" || cn == "IOwnedList")
+        if (cn == "IReadOnlyList" || cn == "IList" || cn == "IOwningList")
             return std::string(cn);
     }
     return {};
@@ -2720,7 +2720,7 @@ ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
 // `Array<T>`, and the read-only spans (`ReadOnlySpan<T>`, `IReadOnlySpan<T>`,
 // `ReadOnlyStringSpan`, `ReadOnlyAsciiByteSpan`) view a borrowed string / buffer
 // — so their slots hold borrows with nothing to move out. (The OWNING `Span<T>`
-// over an `OwnedBuffer` is intentionally NOT matched.) Returns the span type
+// over an `OwningBuffer` is intentionally NOT matched.) Returns the span type
 // name when `operand` is `span[i]` over such a span, else the empty string.
 std::string
 ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
@@ -2788,7 +2788,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     }
     // §28.8.1 / §28.11 (issue #423): `move coll[i]` is admitted only on the
     // enumerated CONCRETE owning receivers (§28.11). A `move` through an
-    // INTERFACE-typed indexer slot (`IOwnedList<T>`, `IList<T>`,
+    // INTERFACE-typed indexer slot (`IOwningList<T>`, `IList<T>`,
     // `IReadOnlyList<T>`, or a user interface exposing an indexer) is rejected:
     // the interface owns no storage, so there is no slot to leave in moved-from
     // state, and codegen would mishandle the moved-out element (a double-free at
@@ -2803,8 +2803,8 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                             "indexer slot: `") + iface +
                 "` is an interface and owns no storage, so there is no slot to "
                 "take ownership of (§28.8.1 / §28.11 — `move coll[i]` is "
-                "admitted only on concrete owning collections: `OwnedArray<T>`, "
-                "`OwnedDictionary<K, V>`, class-typed `OwnedBuffer<T>` / "
+                "admitted only on concrete owning collections: `OwningArray<T>`, "
+                "`OwningDictionary<K, V>`, class-typed `OwningBuffer<T>` / "
                 "`Span<T>`, and owning inline arrays)");
         }
         // §28.11 / §4.15 (#871): `move arrSpan[i]` is rejected for a borrowing
@@ -2912,7 +2912,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         //                                  the borrow/ownership at the await
         //                                  site is the ownership pass's job —
         //                                  3b produces the element type T)
-        //   await OwnedTask<T>  -> T     (Pattern B: ownership transfers; the
+        //   await OwningTask<T>  -> T     (Pattern B: ownership transfers; the
         //                                  result type is the element type T;
         //                                  `owned`-ness is tracked by the
         //                                  ownership pass, not by TypeRef)
@@ -2920,7 +2920,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // is typed elsewhere — see the deferral note below.
         TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
         // §30.2 / Appendix C.7 (#444 / #509): `await` requires a Task /
-        // Task<T> / OwnedTask<T> operand. When the operand's type is known and
+        // Task<T> / OwningTask<T> operand. When the operand's type is known and
         // is NOT one of those three forms, reject it with a clean diagnostic
         // rather than silently miscompiling.
         // NOTE: as of #509, the parser correctly handles `Method<T>(…)` as an
@@ -2937,12 +2937,12 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 ot->astNode && ot->astNode->name &&
                 ot->astNode->name->parts.size() == 1) {
                 std::string_view head = ot->astNode->name->parts.front();
-                isTaskType = (head == "Task" || head == "OwnedTask");
+                isTaskType = (head == "Task" || head == "OwningTask");
             }
             if (!isTaskType) {
                 ctx_.diagnostics().report(
                     Severity::Error, ue.span.begin,
-                    "`await` requires a `Task`, `Task<T>`, or `OwnedTask<T>` "
+                    "`await` requires a `Task`, `Task<T>`, or `OwningTask<T>` "
                     "operand (§30.2 / §30.3).");
                 return;
             }
@@ -2961,18 +2961,18 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                     // `await Task<T>` → T (Pattern A; element type).
                     ctx_.setExprType(&ue, ot->genericArgs.front());
                 }
-            } else if (head == "OwnedTask" && !ot->genericArgs.empty() &&
+            } else if (head == "OwningTask" && !ot->genericArgs.empty() &&
                        ot->genericArgs.front()) {
-                // `await OwnedTask<T>` → T (Pattern B; element type).
+                // `await OwningTask<T>` → T (Pattern B; element type).
                 ctx_.setExprType(&ue, ot->genericArgs.front());
             }
             // NOTE (deferred, §30.7): the result typing specific to async
             // iteration — `await for` desugaring's `MoveNextAsync()` / the
-            // owned-yield `GetOwnedAsyncEnumerator` path — is deeper than this
+            // owned-yield `GetOwningAsyncEnumerator` path — is deeper than this
             // increment (it depends on the for-loop iteration-variable typing
             // and the IAsyncEnumerator<T> interface members) and is left to
             // the async-iterator typing milestone. 3b scopes the await result
-            // rule to the Task / Task<T> / OwnedTask<T> forms above.
+            // rule to the Task / Task<T> / OwningTask<T> forms above.
         }
         return;
     }
@@ -3089,31 +3089,31 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         // Owning-collection Try* methods —
                                         // element type from genericArgs[0] (T),
                                         // or genericArgs[1] (V) for
-                                        // OwnedDictionary.TryPopValue.
+                                        // OwningDictionary.TryPopValue.
                                         const TypeRef* elemT = nullptr;
-                                        if ((cn == "OwnedStack" &&
+                                        if ((cn == "OwningStack" &&
                                              mn == "TryPop" && pos2 == 0) ||
-                                            (cn == "OwnedQueue" &&
+                                            (cn == "OwningQueue" &&
                                              mn == "TryDequeue" && pos2 == 0) ||
-                                            // §4.5 (#831/#1354): OwnedArray
+                                            // §4.5 (#831/#1354): OwningArray
                                             // TryPopFirst/TryPopLast write the
                                             // element type T to the out param.
-                                            (cn == "OwnedArray" &&
+                                            (cn == "OwningArray" &&
                                              (mn == "TryPopFirst" ||
                                               mn == "TryPopLast") &&
                                              pos2 == 0) ||
-                                            (cn == "OwnedLinkedList" &&
+                                            (cn == "OwningLinkedList" &&
                                              (mn == "TryPopFirst" ||
                                               mn == "TryPopLast") &&
                                              pos2 == 0) ||
-                                            (cn == "OwnedSet" &&
+                                            (cn == "OwningSet" &&
                                              mn == "TryTake" && pos2 == 1) ||
                                             (cn == "Channel" &&
                                              mn == "TryReceive" && pos2 == 0)) {
                                             if (!rt->genericArgs.empty() &&
                                                 rt->genericArgs[0])
                                                 elemT = rt->genericArgs[0];
-                                        } else if (cn == "OwnedDictionary" &&
+                                        } else if (cn == "OwningDictionary" &&
                                                    mn == "TryPopValue" &&
                                                    pos2 == 1 &&
                                                    rt->genericArgs.size() >= 2 &&
@@ -3145,12 +3145,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             //
             // Handled cases (all are builtins with no MethodDecl):
             //   Weak<T>.TryUpgrade                           → Shared<T> (arg 0)
-            //   OwnedStack<T>.TryPop                         → T         (arg 0)
-            //   OwnedQueue<T>.TryDequeue                     → T         (arg 0)
-            //   OwnedArray<T>.TryPopFirst/TryPopLast         → T         (arg 0)
-            //   OwnedLinkedList<T>.TryPopFirst/TryPopLast    → T         (arg 0)
-            //   OwnedSet<T>.TryTake                          → T (T?, arg 1)
-            //   OwnedDictionary<K,V>.TryPopValue             → V         (arg 1)
+            //   OwningStack<T>.TryPop                         → T         (arg 0)
+            //   OwningQueue<T>.TryDequeue                     → T         (arg 0)
+            //   OwningArray<T>.TryPopFirst/TryPopLast         → T         (arg 0)
+            //   OwningLinkedList<T>.TryPopFirst/TryPopLast    → T         (arg 0)
+            //   OwningSet<T>.TryTake                          → T (T?, arg 1)
+            //   OwningDictionary<K,V>.TryPopValue             → V         (arg 1)
             //   Channel<T>.TryReceive                        → T (T?, arg 0)
             //
             // For T?-typed out params the spec still delivers the non-nullable
@@ -3207,21 +3207,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         // per §28.11, #890: owning-collection
                                         // Try* methods — element type from
                                         // receiver's generic argument.
-                                        ((cn == "OwnedStack" &&
+                                        ((cn == "OwningStack" &&
                                           mn == "TryPop" && pos2 == 0) ||
-                                         (cn == "OwnedQueue" &&
+                                         (cn == "OwningQueue" &&
                                           mn == "TryDequeue" && pos2 == 0) ||
-                                         // §4.5 (#831/#1354): OwnedArray
+                                         // §4.5 (#831/#1354): OwningArray
                                          // TryPopFirst/TryPopLast (out using var).
-                                         (cn == "OwnedArray" &&
+                                         (cn == "OwningArray" &&
                                           (mn == "TryPopFirst" ||
                                            mn == "TryPopLast") &&
                                           pos2 == 0) ||
-                                         (cn == "OwnedLinkedList" &&
+                                         (cn == "OwningLinkedList" &&
                                           (mn == "TryPopFirst" ||
                                            mn == "TryPopLast") &&
                                           pos2 == 0) ||
-                                         (cn == "OwnedSet" &&
+                                         (cn == "OwningSet" &&
                                           mn == "TryTake" && pos2 == 1) ||
                                          (cn == "Channel" &&
                                           mn == "TryReceive" && pos2 == 0)) &&
@@ -3241,9 +3241,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         }
 
                                     } else if (
-                                        // OwnedDictionary<K,V>.TryPopValue
+                                        // OwningDictionary<K,V>.TryPopValue
                                         // — value type = genericArgs[1] (V).
-                                        cn == "OwnedDictionary" &&
+                                        cn == "OwningDictionary" &&
                                         mn == "TryPopValue" &&
                                         pos2 == 1 &&
                                         rt->genericArgs.size() >= 2 &&
@@ -3383,7 +3383,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                     }
                     // issue #777 / §30.6: when an async lambda is bound to a
-                    // function-typed parameter `(…) -> Task<T>` / `OwnedTask<T>`,
+                    // function-typed parameter `(…) -> Task<T>` / `OwningTask<T>`,
                     // thread the peeled element T so the lambda visitor rejects a
                     // forgotten `await` in its body (same as the typed-local
                     // path). Positional binding via calleeMd2/pos2 mirrors the
@@ -3757,7 +3757,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             ctx_.diagnostics().report(
                 Severity::Error, lam->exprBody->span.begin,
                 "an expression-bodied `async` lambda's body must produce the "
-                "element type of its `Task<T>`/`OwnedTask<T>` return, not a "
+                "element type of its `Task<T>`/`OwningTask<T>` return, not a "
                 "`Task` value; add `await` (e.g. `async () => await Producer()`)"
                 " (§30.6)");
         }
@@ -3822,7 +3822,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     inferredReturn = ctx_.primitiveTypeRef(PrimitiveType::Int);
             }
             // §30.6 (#800, partial): the function type of an ASYNC lambda has a
-            // `Task<T>` (or `OwnedTask<T>` for a class-typed, ownership-
+            // `Task<T>` (or `OwningTask<T>` for a class-typed, ownership-
             // transferring result) return — the body's natural result T is
             // wrapped, exactly as for an async method (§30.1). Without this the
             // INFERRED type of `var f := async () => do return 1; end` was
@@ -3847,7 +3847,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 auto* ann = new ast::Type();
                 ann->kind = ast::TypeKind::Named;
                 auto* nm = new ast::QualifiedName();
-                nm->parts.push_back(ownedResult ? "OwnedTask" : "Task");
+                nm->parts.push_back(ownedResult ? "OwningTask" : "Task");
                 ann->name.reset(nm);
                 taskTy->astNode = ann;
                 taskTy->genericArgs.push_back(inferredReturn);
@@ -4403,7 +4403,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                    dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
         for (const auto& k : cl->keys) if (k) visitExpr(*k);
         for (const auto& v : cl->elements) if (v) visitExpr(*v);
-        // §15.4 (#1297): a Dictionary<K,V> / OwnedDictionary<K,V> literal (the
+        // §15.4 (#1297): a Dictionary<K,V> / OwningDictionary<K,V> literal (the
         // dict form has a non-empty `keys` vector) with DUPLICATE keys is a
         // compile error when all the duplicates are compile-time constants;
         // only when duplicates are not statically detectable does the last

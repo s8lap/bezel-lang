@@ -7,14 +7,14 @@
 //       `await Task<T>`       -> T       (Pattern A; the borrow/ownership at
 //                                          the await site is the ownership
 //                                          pass's job — 3b types the result).
-//       `await OwnedTask<T>`  -> T       (Pattern B; result type is the
+//       `await OwningTask<T>`  -> T       (Pattern B; result type is the
 //                                          element type T; `owned`-ness is
 //                                          tracked by ownership, not TypeRef).
 //   - §30.2 / Appendix C.6: `await` appears only inside an `async` method,
 //       `async` lambda, or the synchronous prefix of `await for`. `await`
 //       outside an async context is a compile error.
 //   - §30.1 / §30.6 / Appendix C.6: an `async` method/lambda's declared
-//       return type must be `Task` / `Task<T>` / `OwnedTask<T>` (or an
+//       return type must be `Task` / `Task<T>` / `OwningTask<T>` (or an
 //       async-iterator interface). A non-async return type is a compile error.
 //   - §17.1 (precedence list): `await await x` is permitted; typing composes.
 
@@ -150,12 +150,12 @@ BEZEL_TEST(sema_await, await_task_int_types_as_int) {
     }
 }
 
-// §30.5 Pattern B: `await OwnedTask<SomeClass>` types as the element type
+// §30.5 Pattern B: `await OwningTask<SomeClass>` types as the element type
 // SomeClass (the `owned`-ness is the ownership pass's concern; 3b types T).
 BEZEL_TEST(sema_await, await_ownedtask_class_types_as_element) {
     auto r = parseSemaAll(
         "module M; class R end R; class C "
-        "  public async method F(t: OwnedTask<R>): Task "
+        "  public async method F(t: OwningTask<R>): Task "
         "    using var x := await t; return; "
         "  end F; "
         "end C;");
@@ -274,14 +274,14 @@ BEZEL_TEST(sema_await, async_method_missing_return_diagnosed) {
     BEZEL_EXPECT_TRUE(hasAsyncReturnTypeError(r));
 }
 
-// §30.1: `Task` / `Task<T>` / `OwnedTask<T>` are all admitted async return
+// §30.1: `Task` / `Task<T>` / `OwningTask<T>` are all admitted async return
 // types (no return-type error).
 BEZEL_TEST(sema_await, async_method_task_returns_ok) {
     auto r = parseSemaAll(
         "module M; class R end R; class C "
         "  public async method A(): Task return; end A; "
         "  public async method B(): Task<int> return 1; end B; "
-        "  public async method D(t: OwnedTask<R>): OwnedTask<R> "
+        "  public async method D(t: OwningTask<R>): OwningTask<R> "
         "    return await t; "
         "  end D; "
         "end C;");
@@ -327,7 +327,7 @@ BEZEL_TEST(sema_await, non_async_int_method_ok) {
 }
 
 // §30.2 / Appendix C.7 (#444): `await` of a non-Task primitive (e.g. `await 5`)
-// is a compile error. The operand type `int` is not Task / Task<T> / OwnedTask<T>.
+// is a compile error. The operand type `int` is not Task / Task<T> / OwningTask<T>.
 // This is the general guard that turns any await-of-non-task into a clean diagnostic.
 BEZEL_TEST(sema_await_444, await_non_task_int_literal_diagnosed) {
     auto r = parseSemaAll(

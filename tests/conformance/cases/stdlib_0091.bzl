@@ -7,11 +7,11 @@ public static class Domain
       where A: notnull;                                    // A sendable value type or string
 
   // Class-typed result: ownership transfers to the awaiter (Pattern B).
-  public static method Spawn<R>(entry: () -> owned R): owned OwnedTask<R>
+  public static method Spawn<R>(entry: () -> owned R): owned OwningTask<R>
       where R: class;                                      // R sendable (compiler-checked)
-  public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwnedTask<R>
+  public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
       where A: class, R: class;
-  public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwnedTask<R>
+  public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwningTask<R>
       where A: notnull, R: class;
 
   // Value-typed or string result (Pattern A).

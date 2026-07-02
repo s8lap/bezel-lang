@@ -1,4 +1,4 @@
-// fix #837 / stdlib §4.10 / §8.3: OwnedSet<T> with a class element type that
+// fix #837 / stdlib §4.10 / §8.3: OwningSet<T> with a class element type that
 // OVERRIDES Equals/GetHashCode must deduplicate by the user's equality contract,
 // not by reference identity. The array-backed class-element set's TryAdd and Add
 // compared element POINTERS, so a content-equal element was treated as distinct
@@ -45,7 +45,7 @@ const char* kPlain =
 BEZEL_TEST(owned_set_equality_837, tryadd_equal_rejected) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<Box>(); "
+        "  do using var s := new OwningSet<Box>(); "
         "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
         "    var r := s.TryAdd(move (new Box(1))); return s.Count; end; "
         "  return 0; end Main; end C;"), 2);
@@ -55,7 +55,7 @@ BEZEL_TEST(owned_set_equality_837, tryadd_equal_rejected) {
 BEZEL_TEST(owned_set_equality_837, add_equal_deduplicates) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<Box>(); "
+        "  do using var s := new OwningSet<Box>(); "
         "    s.Add(move (new Box(1))); s.Add(move (new Box(1))); "
         "    return s.Count; end; "
         "  return 0; end Main; end C;"), 1);
@@ -65,7 +65,7 @@ BEZEL_TEST(owned_set_equality_837, add_equal_deduplicates) {
 BEZEL_TEST(owned_set_equality_837, add_distinct_kept) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<Box>(); "
+        "  do using var s := new OwningSet<Box>(); "
         "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
         "    return s.Count; end; "
         "  return 0; end Main; end C;"), 2);
@@ -75,7 +75,7 @@ BEZEL_TEST(owned_set_equality_837, add_distinct_kept) {
 BEZEL_TEST(owned_set_equality_837, contains_by_value) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<Box>(); s.Add(move (new Box(5))); "
+        "  do using var s := new OwningSet<Box>(); s.Add(move (new Box(5))); "
         "    using var q := new Box(5); "
         "    if s.Contains(q) then return 1; end; return 0; end; "
         "  return 0; end Main; end C;"), 1);
@@ -86,7 +86,7 @@ BEZEL_TEST(owned_set_equality_837, contains_by_value) {
 BEZEL_TEST(owned_set_equality_837, add_duplicate_disposed) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<Box>(); "
+        "  do using var s := new OwningSet<Box>(); "
         "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
         "    s.Add(move (new Box(1))); end; "
         "  return Box._n; end Main; end C;"), 3);
@@ -96,7 +96,7 @@ BEZEL_TEST(owned_set_equality_837, add_duplicate_disposed) {
 BEZEL_TEST(owned_set_equality_837, tryadd_duplicate_disposed) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<Box>(); "
+        "  do using var s := new OwningSet<Box>(); "
         "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
         "    var r := s.TryAdd(move (new Box(1))); end; "
         "  return Box._n; end Main; end C;"), 3);
@@ -107,17 +107,17 @@ BEZEL_TEST(owned_set_equality_837, tryadd_duplicate_disposed) {
 BEZEL_TEST(owned_set_equality_837, no_override_reference_identity) {
     BEZEL_EXPECT_EQ(run(std::string(kPlain) +
         "public static method Main(): int "
-        "  do using var s := new OwnedSet<P>(); "
+        "  do using var s := new OwningSet<P>(); "
         "    s.Add(move (new P(1))); s.Add(move (new P(1))); "
         "    return s.Count; end; "
         "  return 0; end Main; end C;"), 2);
 }
 
-// Regression: OwnedArray.Add still appends (no set dedup).
+// Regression: OwningArray.Add still appends (no set dedup).
 BEZEL_TEST(owned_set_equality_837, owned_array_add_still_appends) {
     BEZEL_EXPECT_EQ(run(std::string(kBox) +
         "public static method Main(): int "
-        "  do using var a := new OwnedArray<Box>(); "
+        "  do using var a := new OwningArray<Box>(); "
         "    a.Add(move (new Box(1))); a.Add(move (new Box(1))); "
         "    return a.Count; end; "
         "  return 0; end Main; end C;"), 2);

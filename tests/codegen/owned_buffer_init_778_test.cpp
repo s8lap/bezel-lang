@@ -1,11 +1,11 @@
-// fix #778 / stdlib §4.14: the two-argument OwnedBuffer<T> constructor
-// `OwnedBuffer<T>(length, init: (int) -> T)` calls init(i) for each i in
+// fix #778 / stdlib §4.14: the two-argument OwningBuffer<T> constructor
+// `OwningBuffer<T>(length, init: (int) -> T)` calls init(i) for each i in
 // 0..<length and stores the result into slot i.
 //
 // §4.14 (value-typed T): "The two-argument constructor calls init(i) for each
 // i in 0..<length, copying the returned value into the slot."
 //
-// The bug: the OwnedBuffer-new codegen used only the length argument
+// The bug: the OwningBuffer-new codegen used only the length argument
 // (bz_array_alloc_count_n) and IGNORED the init lambda, so every slot stayed
 // zero/null. The fix emits a 0..<length loop that calls the init closure and
 // stores each result via bz_array_set.
@@ -26,7 +26,7 @@ int runFull(const std::string& program) {
 BEZEL_TEST(owned_buffer_init_778, two_arg_init_fills_slots) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(3, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(3, (i) => i + 1); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "  // 1+2+3
         "end Main; end C;"), 6);
 }
@@ -35,7 +35,7 @@ BEZEL_TEST(owned_buffer_init_778, two_arg_init_fills_slots) {
 BEZEL_TEST(owned_buffer_init_778, init_receives_the_index) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(3, (i) => i * i); "
+        "  using var buf := new OwningBuffer<int>(3, (i) => i * i); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "  // 0+1+4
         "end Main; end C;"), 5);
 }
@@ -46,7 +46,7 @@ BEZEL_TEST(owned_buffer_init_778, capturing_init_closure) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
         "  var k := 10; "
-        "  using var buf := new OwnedBuffer<int>(3, (i) => i + k); "
+        "  using var buf := new OwningBuffer<int>(3, (i) => i + k); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "  // 10+11+12
         "end Main; end C;"), 33);
 }
@@ -56,7 +56,7 @@ BEZEL_TEST(owned_buffer_init_778, capturing_init_closure) {
 BEZEL_TEST(owned_buffer_init_778, one_arg_still_zero_inits) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(3); "
+        "  using var buf := new OwningBuffer<int>(3); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "
         "end Main; end C;"), 0);
 }

@@ -4,4 +4,4 @@ end ReportEach;
 
 // Accepts both:
 ReportEach(myArray);          // Array<Connection> → IReadOnlyList<Connection> ✓
-ReportEach(myPool);            // OwnedArray<Connection> → IReadOnlyList<Connection> ✓
+ReportEach(myPool);            // OwningArray<Connection> → IReadOnlyList<Connection> ✓

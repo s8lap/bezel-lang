@@ -1,4 +1,4 @@
-public class OwnedBuffer<T>                              // no IEnumerable conformance
+public class OwningBuffer<T>                              // no IEnumerable conformance
                                                           //   (value-typed; see "Iteration" below)
   public constructor(length: int);                       // all slots default(T)
                                                           //   requires T to have a default value
@@ -24,4 +24,4 @@ public class OwnedBuffer<T>                              // no IEnumerable confo
   public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
   public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
-end OwnedBuffer;
+end OwningBuffer;

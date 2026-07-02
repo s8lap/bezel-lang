@@ -1,4 +1,4 @@
-// Codegen for TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+// Codegen for TaskCompletionSource<T> / OwningTaskCompletionSource<T> /
 // TaskCompletionSource (non-generic), stdlib §6.6, issue #974.
 //
 // These types were previously absent from the type registry, producing an
@@ -22,7 +22,7 @@
 //   5. TrySetCancelled — awaiter gets OperationCanceledException
 //   6. TrySetException — awaiter re-raises the original exception
 //   7. using-var disposal — scope-end faults a never-completed TCS (no hang)
-//   8. OwnedTaskCompletionSource<T> — TrySetResult delivers owned result
+//   8. OwningTaskCompletionSource<T> — TrySetResult delivers owned result
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -176,7 +176,7 @@ BEZEL_TEST(tcs_974, tcs_task_property_bound_then_completed) {
 }
 
 // ---------------------------------------------------------------------------
-// §28.3 / issue #1250: OwnedTaskCompletionSource<T:class> disposal soundness.
+// §28.3 / issue #1250: OwningTaskCompletionSource<T:class> disposal soundness.
 // Owned results must be disposed exactly once (§28.3).
 // The Res class uses a static counter: ctor increments, dtor decrements.
 // After all scopes close the counter must be 0 (each Res disposed once).
@@ -204,7 +204,7 @@ BEZEL_TEST(tcs_974, owned_tcs_unconsumed_result_disposed_on_tcs_disposal) {
         "class C "
         "  public static method Main(): int "
         "    do "
-        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      using var tcs := new OwningTaskCompletionSource<Res>(); "
         "      _ := tcs.TrySetResult(new Res(7)); "
         "    end; "
         "    if Res.n = 0 then return 1; end; "
@@ -221,7 +221,7 @@ BEZEL_TEST(tcs_974, owned_tcs_consumed_via_result_not_disposed_again) {
         "class C "
         "  public static method Main(): int "
         "    do "
-        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      using var tcs := new OwningTaskCompletionSource<Res>(); "
         "      _ := tcs.TrySetResult(new Res(7)); "
         "      do "
         "        using var r := tcs.Task.Result; "
@@ -241,7 +241,7 @@ BEZEL_TEST(tcs_974, owned_tcs_never_set_no_spurious_dispose) {
         "class C "
         "  public static method Main(): int "
         "    do "
-        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      using var tcs := new OwningTaskCompletionSource<Res>(); "
         "    end; "
         "    if Res.n = 0 then return 1; end; "
         "    return 0; "
@@ -257,7 +257,7 @@ BEZEL_TEST(tcs_974, owned_tcs_setexception_no_result_dispose) {
         "class C "
         "  public static method Main(): int "
         "    do "
-        "      using var tcs := new OwnedTaskCompletionSource<Res>(); "
+        "      using var tcs := new OwningTaskCompletionSource<Res>(); "
         "      _ := tcs.TrySetException(new InvalidOperationException()); "
         "    end; "
         "    if Res.n = 0 then return 1; end; "

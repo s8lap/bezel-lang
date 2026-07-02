@@ -1,22 +1,22 @@
-// Codegen — issue #1127 (§30.3 / §30.5): `OwnedTask<OwnedArray<T>>.Result`
+// Codegen — issue #1127 (§30.3 / §30.5): `OwningTask<OwningArray<T>>.Result`
 // yielded an empty array instead of the real heap array.
 //
-// Root cause: sema rejected `OwnedTask<T>.Result` entirely with the error
-// "OwnedTask<T> does not expose a Result property (§30.3)"; this left the
+// Root cause: sema rejected `OwningTask<T>.Result` entirely with the error
+// "OwningTask<T> does not expose a Result property (§30.3)"; this left the
 // expression untyped, so codegen materialised a zero-initialised placeholder
 // (an empty array) rather than the actual async result.
 //
 // The fix extends the `Task<T>.Result` sema path (ExprTypecheck_Calls.cpp,
-// §30.3) to also accept `OwnedTask<T>.Result`, typing it as T.  Codegen for
+// §30.3) to also accept `OwningTask<T>.Result`, typing it as T.  Codegen for
 // `.Result` already used `isTaskTypeName` (which fires for both Task and
-// OwnedTask), so no codegen change was needed beyond adding `bz_task_free`
+// OwningTask), so no codegen change was needed beyond adding `bz_task_free`
 // for anonymous producers on the ok and fault paths to avoid a task-struct
 // leak (§30.5).
 //
 // Spec derivation:
 //   §30.3 "Result is the synchronous escape hatch: blocks the calling thread
 //          until the task completes, then materialises and returns T."
-//   §30.5 Pattern B: `OwnedTask<T>` transfers ownership of T to the consumer.
+//   §30.5 Pattern B: `OwningTask<T>` transfers ownership of T to the consumer.
 // v0.154.
 
 #include "support/codegen_support.hpp"
@@ -45,7 +45,7 @@ const char* kCell =
 
 // ---------------------------------------------------------------------------
 // §30.3 / §30.5 #1127 — primary repro:
-// `OwnedTask<OwnedArray<Res>>.Result` in a non-async `Main`.
+// `OwningTask<OwningArray<Res>>.Result` in a non-async `Main`.
 // Pre-fix this compiled to a zero-element array (sema left the expression
 // untyped so codegen emitted a zero-initialised placeholder); post-fix the
 // real array is returned and arr[0].n + arr[1].n == 7.
@@ -54,8 +54,8 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_owned_array_result_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kImports) + kRes +
         "class C "
-        "  public static async method LoadAll(): OwnedTask<OwnedArray<Res>> "
-        "    var arr := new OwnedArray<Res>(); "
+        "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
+        "    var arr := new OwningArray<Res>(); "
         "    arr.Add(new Res(3)); arr.Add(new Res(4)); "
         "    return move arr; "
         "  end LoadAll; "
@@ -67,7 +67,7 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_owned_array_result_value) {
 }
 
 // ---------------------------------------------------------------------------
-// §30.5 Pattern B — await form of the same OwnedTask<OwnedArray<Res>>.
+// §30.5 Pattern B — await form of the same OwningTask<OwningArray<Res>>.
 // `using var arr := await C.LoadAll()` inside an async method must also
 // yield the real array (regression guard for the await path).
 // ---------------------------------------------------------------------------
@@ -75,8 +75,8 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_owned_array_await_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kImports) + kRes +
         "class C "
-        "  public static async method LoadAll(): OwnedTask<OwnedArray<Res>> "
-        "    var arr := new OwnedArray<Res>(); "
+        "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
+        "    var arr := new OwningArray<Res>(); "
         "    arr.Add(new Res(3)); arr.Add(new Res(4)); "
         "    return move arr; "
         "  end LoadAll; "
@@ -91,15 +91,15 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_owned_array_await_value) {
 }
 
 // ---------------------------------------------------------------------------
-// Empty OwnedArray — `OwnedTask<OwnedArray<Res>>.Result` with zero elements
+// Empty OwningArray — `OwningTask<OwningArray<Res>>.Result` with zero elements
 // must succeed without crash and return Count == 0.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(async_owned_task_result_1127, owned_task_empty_owned_array_result) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kImports) + kRes +
         "class C "
-        "  public static async method EmptyArr(): OwnedTask<OwnedArray<Res>> "
-        "    var arr := new OwnedArray<Res>(); "
+        "  public static async method EmptyArr(): OwningTask<OwningArray<Res>> "
+        "    var arr := new OwningArray<Res>(); "
         "    return move arr; "
         "  end EmptyArr; "
         "  public static method Main(): int "
@@ -118,8 +118,8 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_owned_array_result_disposal)
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kImports) + kCell +
         "class C "
-        "  public static async method Make(): OwnedTask<OwnedArray<Cell>> "
-        "    var a := new OwnedArray<Cell>(); "
+        "  public static async method Make(): OwningTask<OwningArray<Cell>> "
+        "    var a := new OwningArray<Cell>(); "
         "    a.Add(new Cell()); a.Add(new Cell()); "  // Cell.n → 2
         "    return move a; "
         "  end Make; "
@@ -148,7 +148,7 @@ BEZEL_TEST(async_owned_task_result_1127, task_int_result_regression) {
 }
 
 // ---------------------------------------------------------------------------
-// §30.5 / #1258: an OwnedTask<T:class> DROPPED at scope end (using var, never
+// §30.5 / #1258: an OwningTask<T:class> DROPPED at scope end (using var, never
 // awaited) must dispose its produced owned class result — bz_task_dispose_owned_result
 // runs the result's destructor before the task is freed. Cell.n must be 0.
 // ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_dropped_disposes_result_1258
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kCell) +
         "class C "
-        "  public static async method ProduceCell(): OwnedTask<Cell> "
+        "  public static async method ProduceCell(): OwningTask<Cell> "
         "    return new Cell(); "
         "  end ProduceCell; "
         "  public static method Main(): int "
@@ -165,7 +165,7 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_dropped_disposes_result_1258
         "end Main; end C;"), 0);
 }
 
-// §30.5 / #1258: when the OwnedTask result IS consumed by an await, the task's
+// §30.5 / #1258: when the OwningTask result IS consumed by an await, the task's
 // scope-end disposal must NOT double-dispose it (bz_task_take_result zeroed the
 // result on consume; the disposer sees null and skips). The awaited `c` disposes
 // the Cell exactly once. Cell.n must be 0 — a double-free would crash/underflow.
@@ -173,7 +173,7 @@ BEZEL_TEST(async_owned_task_result_1127, owned_task_awaited_result_single_dispos
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kCell) +
         "class C "
-        "  public static async method ProduceCell(): OwnedTask<Cell> "
+        "  public static async method ProduceCell(): OwningTask<Cell> "
         "    return new Cell(); "
         "  end ProduceCell; "
         "  public static async method Consume(): Task<int> "

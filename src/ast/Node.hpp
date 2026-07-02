@@ -219,7 +219,7 @@ struct ForStmt : Stmt {
     std::unique_ptr<Expr> withExpr;      // null when no `with EXPR` clause
     std::vector<std::unique_ptr<Stmt>> body;
     // §29.2 / §28.3 v0.157 (#1329): set by the ownership pass when the owned
-    // iteration variable (over OwnedEnumerable<T> / OwnedAsyncEnumerable<T>)
+    // iteration variable (over IOwningEnumerable<T> / IOwningAsyncEnumerable<T>)
     // is undischarged on at least one body-exit path. Codegen reads this flag
     // to register a per-iteration null-guarded disposal at body-end (fall-
     // through / break / continue / return edges) so the variable is auto-

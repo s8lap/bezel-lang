@@ -1,6 +1,6 @@
 // Sema tests — #1245: ReadOnly spans are NOT assignable to writable counterparts.
 //
-// Spec authority: §4.14 (owning Span<T>/ReadOnlySpan<T> over OwnedBuffer<T>),
+// Spec authority: §4.14 (owning Span<T>/ReadOnlySpan<T> over OwningBuffer<T>),
 //                 §4.15 (borrowing ArraySpan<T>/ReadOnlyArraySpan<T> over Array<T>),
 //                 §5.1 (implicit-conversion table — span types are nominal, not
 //                       structural, so cross-kind coercion is a §5.1 error).
@@ -83,7 +83,7 @@ BEZEL_TEST(span_readonly_assignability_1245,
         "    sp[0] := 77; "
         "  end Mutate; "
         "  public static method Main(): int "
-        "    using var buf := new OwnedBuffer<int>(1); "
+        "    using var buf := new OwningBuffer<int>(1); "
         "    var ro := buf.AsReadOnlySpan(); "
         "    C.Mutate(ro); "          // ReadOnlySpan passed as Span → §5.1
         "    return 0; "
@@ -117,7 +117,7 @@ BEZEL_TEST(span_readonly_assignability_1245,
            readonly_span_init_where_writable_expected_rejects_spec_4_14_issue_1245) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; import System.Serialization; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(1); "
+        "  using var buf := new OwningBuffer<int>(1); "
         "  var ro := buf.AsReadOnlySpan(); "
         "  var sp: Span<int> := ro; "        // §5.1: RO→writable
         "  return 0; "
@@ -171,7 +171,7 @@ BEZEL_TEST(span_readonly_assignability_1245,
         "    return sp.Length; "
         "  end LenRO; "
         "  public static method Main(): int "
-        "    using var buf := new OwnedBuffer<int>(7); "
+        "    using var buf := new OwningBuffer<int>(7); "
         "    return LenRO(buf.AsReadOnlySpan()); "  // ReadOnlySpan → ReadOnlySpan OK
         "  end Main; end C;"), 7);
 }

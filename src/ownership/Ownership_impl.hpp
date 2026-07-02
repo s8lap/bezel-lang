@@ -153,9 +153,9 @@ private:
     bool isDestructor_ = false;
     // §28.3 / §28.6 / §5.11 (#1007): the enclosing method's DECLARED return type
     // and whether it was declared `owned`. An owning-collection / owning-wrapper
-    // return type (`OwnedArray<T>`, `OwnedTask<T>`, `Shared<T>`, …) names ELEMENT
+    // return type (`OwningArray<T>`, `OwningTask<T>`, `Shared<T>`, …) names ELEMENT
     // ownership (§5.11); the CONTAINER-ownership axis is the separate `owned`
-    // qualifier. A method declared `: OwnedArray<T>` (no `owned`) that hands back
+    // qualifier. A method declared `: OwningArray<T>` (no `owned`) that hands back
     // a BORROW (a non-owned param, a borrowed local, a plain field read) launders
     // that borrow into a value the caller tracks as owned — a double-free. The
     // return check (handleReturn) consults these to reject that case. Null/false
@@ -319,8 +319,8 @@ private:
     void handleReturn(const ast::Expr& e);
 
     // §28.3 / §28.6 / §5.11 (#1007): reject returning a BORROW through an
-    // owning-collection / owning-wrapper return type (`OwnedArray<T>`,
-    // `OwnedTask<T>`, `Shared<T>`, …) declared WITHOUT `owned`. Such a return
+    // owning-collection / owning-wrapper return type (`OwningArray<T>`,
+    // `OwningTask<T>`, `Shared<T>`, …) declared WITHOUT `owned`. Such a return
     // type names element ownership, not container ownership: a method that hands
     // back a borrowed value (a non-owned param, a borrowed local, a plain field
     // read) launders it into a value the caller tracks as owned — a double-free
@@ -357,10 +357,10 @@ private:
 
     // §28.3 / §5.11 (#1007): the name-head of an owning-collection / owning-
     // wrapper type (the set whose value the caller must discharge). True for
-    // `OwnedArray`/`OwnedDictionary`/…/`Shared`/`Weak`/`OwnedTask`/etc.
+    // `OwningArray`/`OwningDictionary`/…/`Shared`/`Weak`/`OwningTask`/etc.
     static bool isOwningTypeNameHead(std::string_view head);
-    // §28.6 / §5.11 (#1008 Part C): the owning COLLECTIONS only (OwnedArray,
-    // OwnedDictionary, OwnedSet, OwnedStack, OwnedQueue, OwnedLinkedList) — the
+    // §28.6 / §5.11 (#1008 Part C): the owning COLLECTIONS only (OwningArray,
+    // OwningDictionary, OwningSet, OwningStack, OwningQueue, OwningLinkedList) — the
     // Part C borrow-return / capability rules apply to these; the owning
     // wrappers keep their consumer-owns semantics.
     static bool isOwningCollectionNameHead(std::string_view head);
@@ -695,7 +695,7 @@ private:
     void seedOwnedIterVar(const ast::ForStmt& fs);
 
     // §29.2 (#834): true when `fs`'s iterable has static type
-    // `OwnedEnumerable<T>` / `OwnedAsyncEnumerable<T>` (owning iteration).
+    // `IOwningEnumerable<T>` / `IOwningAsyncEnumerable<T>` (owning iteration).
     bool iterableIsOwningEnumerable(const ast::ForStmt& fs);
 
     // §29.2 (#834): the LocalSymbol ExprTypecheck created for `fs`'s iteration
@@ -787,8 +787,8 @@ private:
     // owning collection whose `set(owned)` indexer requires an owned RHS. Per
     // §28.11 "Indexer set `coll[i] := value` requires `value` to be owned."
     // Recognizes a user indexer `PropertyDecl` whose set accessor is declared
-    // `set(owned)`, and the built-in owning collections `OwnedArray<T>` /
-    // `OwnedDictionary<K, V>` (stdlib §4.5 / §4.9), whose indexer setter takes
+    // `set(owned)`, and the built-in owning collections `OwningArray<T>` /
+    // `OwningDictionary<K, V>` (stdlib §4.5 / §4.9), whose indexer setter takes
     // owned by definition. // per §28.11
     bool indexerSetterTakesOwned(const ast::Expr& target);
 
@@ -811,9 +811,9 @@ private:
     // (or a Channel<T>/Weak<T> handle) into the caller's local. The owned-OUT
     // direction is the mirror of `builtinOwnedSinkArg` (which models owned-IN
     // sinks): there the argument local LOSES ownership, here it RECEIVES it.
-    // Recognised: `OwnedStack<T>.TryPop`, `OwnedQueue<T>.TryDequeue`,
-    // `OwnedLinkedList<T>.TryPopFirst/TryPopLast`, `OwnedSet<T>.TryTake`
-    // (argPos 1), `OwnedDictionary<K,V>.TryPopValue` (argPos 1),
+    // Recognised: `OwningStack<T>.TryPop`, `OwningQueue<T>.TryDequeue`,
+    // `OwningLinkedList<T>.TryPopFirst/TryPopLast`, `OwningSet<T>.TryTake`
+    // (argPos 1), `OwningDictionary<K,V>.TryPopValue` (argPos 1),
     // `Channel<T>.TryReceive` (class T only — §6.9 value-T drops the
     // modifiers), and `Weak<T>.TryUpgrade` (stdlib §4.5/§4.7/§4.9/§6.9/§2.16).
     // The borrow forms `TryPop(out item)` / `TryPeek(out item)` carry no
@@ -837,7 +837,7 @@ private:
     // §30.5 "Consumer-side rules". For `await <task>` the obligations are fixed
     // by the task's STATIC return type, which 3b's await typing makes readable:
     // the await UnaryExpr's operand carries the resolved `Task`/`Task<T>`/
-    // `OwnedTask<T>` TypeRef. These checks run as a single syntactic walk over
+    // `OwningTask<T>` TypeRef. These checks run as a single syntactic walk over
     // the async body (driven from `run()`), independent of the CFG dataflow, so
     // each await is examined once and no diagnostic is duplicated. They are
     // gated on `isAsync_`, so a synchronous body never reaches them. // per §30.5
@@ -847,7 +847,7 @@ private:
                     //   or an untyped operand) — no site rule applies here
         UnitTask,   // `await Task` — no result value, no ownership obligation
         PatternA,   // `await Task<T>` for CLASS T — borrow; needs owning location
-        PatternB,   // `await OwnedTask<T>` for class T — ownership transfers;
+        PatternB,   // `await OwningTask<T>` for class T — ownership transfers;
                     //   needs an owned-consuming context
         ValueResult,// `await Task<T>` for non-class T — no obligation crosses
     };
@@ -882,7 +882,7 @@ private:
     // UnaryExpr that appears as the IMMEDIATE value of an owned-consuming
     // position — a LocalDecl `:= await` RHS (using/plain/await-using var), an
     // assignment-to-owned-location `target := await` RHS, an `owned` argument
-    // `M(await)` / `coll.Add(await)`, an `owned`/`OwnedTask` `return await`,
+    // `M(await)` / `coll.Add(await)`, an `owned`/`OwningTask` `return await`,
     // and an owned `yield return await`. A Pattern B await NOT in this set is
     // dropped without discharge and is diagnosed. // per §30.5
     void collectOwnedConsumingAwaits(
@@ -940,7 +940,7 @@ private:
     void recordAwaitOperandConsume(const ast::Expr& awaitOperand,
                                    SourceLocation loc);
 
-    // §30.5 / §30.4 (#834): true when `e`'s static type is `OwnedTask<...>`
+    // §30.5 / §30.4 (#834): true when `e`'s static type is `OwningTask<...>`
     // (the single-consumer owning task an `await` consumes); generic-safe
     // (name-head based), unlike awaitTaskKind's result-class gate.
     bool operandIsOwnedTaskType(const ast::Expr& e);

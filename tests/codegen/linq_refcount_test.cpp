@@ -719,7 +719,7 @@ BEZEL_TEST(linq_refcount, using_var_toarray_not_double_freed_1003) {
 // path never fires), yet the BACKING is owned by nothing — it leaked (96B / 2
 // allocs) before #1015. Reclaimed via the #1004 helper (backing freed, elements
 // borrowed → not disposed; the Cell is disposed once at `cell`'s using-var end).
-// Cell.n == 1 (Cell still alive). Receiver retargeted from OwnedArray<Cell> to a
+// Cell.n == 1 (Cell still alive). Receiver retargeted from OwningArray<Cell> to a
 // borrowing Array<Cell> (the #1015 backing-reclaim is receiver-agnostic) because
 // #1022 now rejects copy-forms on owning collections (§4.5).
 BEZEL_TEST(linq_refcount, discard_toarray_backing_freed_1015) {
@@ -749,7 +749,7 @@ BEZEL_TEST(linq_refcount, discard_toarray_string_leak_free_1015) {
 
 // #1015: discarding a fresh ToDictionary materializer frees the dict backing
 // (bz_dict_free, not bz_array_free — #1013's dict-backed reclaim path). Receiver
-// retargeted from OwnedArray<int> to a borrowing Array<int> (the reclaim is
+// retargeted from OwningArray<int> to a borrowing Array<int> (the reclaim is
 // receiver-agnostic) because #1022 now rejects copy-forms on owning collections.
 BEZEL_TEST(linq_refcount, discard_todictionary_backing_freed_1015) {
     expectValueAndLeakFree(
@@ -944,7 +944,7 @@ BEZEL_TEST(linq_refcount, using_var_chain_sorted_no_double_free_1004) {
 // The fix gates strictly on the receiver being an `owned`-returning CALL whose
 // result is a borrowing `Array<T>` (isUnboundOwnedBorrowingArrayCallExpr), so a
 // BOUND (`using var`/`var`), `move`d, returned, owned-arg, or OWNING-collection
-// (`OwnedArray<T>`) result is never freed here — no UAF, no double-free.
+// (`OwningArray<T>`) result is never freed here — no UAF, no double-free.
 //
 // ASan (detect_leaks=1), before -> after, native repro:
 //   P.Fold(s).Sorted():    64B leaked / 2 allocs (the owned Fold temp) -> 0
@@ -953,7 +953,7 @@ BEZEL_TEST(linq_refcount, using_var_chain_sorted_no_double_free_1004) {
 //   owned Array<Cell> chain: backing freed once, Cell elements BORROWED (net
 //                            Cell.n == 0) -> 0, no double-free of the Cells
 //   using var f := P.Fold(s); f.Sorted():  clean -> clean, NO double-free
-//   P.Build().Count (owned OwnedArray<Cell>): NOT freed here (owning family) ->
+//   P.Build().Count (owned OwningArray<Cell>): NOT freed here (owning family) ->
 //                            no double-free of owned Cell elements
 
 // The confirmed #1006b repro: `P.Fold(s).Sorted()` where `Fold` returns
@@ -1032,7 +1032,7 @@ BEZEL_TEST(linq_refcount, owned_fold_temp_count_method_leak_free_1006b) {
 }
 
 // OWNED ELEMENTS: an `owned Array<Cell>` borrowing snapshot (its elements are
-// borrowed from an OwnedArray<Cell> that uniquely owns them) used as a chained
+// borrowed from an OwningArray<Cell> that uniquely owns them) used as a chained
 // `.Reversed()` receiver. The snapshot backing is freed once; the borrowing
 // element disposer is NULL (stdlib §3/§5: the caller owns the array, not its
 // elements), so the Cells are NOT cascade-disposed here and are freed exactly
@@ -1051,7 +1051,7 @@ const char* kOwnedElemFoldReversed =
     "  public static method Fold(src: Array<Cell>): owned Array<Cell> "
     "    => src.Where((c) => c.V > 0).ToArray(); "
     "  public static method Run(): int "
-    "    using var owners := new OwnedArray<Cell>(); "
+    "    using var owners := new OwningArray<Cell>(); "
     "    owners.Add(new Cell(3)); owners.Add(new Cell(1)); owners.Add(new Cell(2)); "
     "    using var view := new Array<Cell>(); "
     "    view.Add(owners.Get(0)); view.Add(owners.Get(1)); view.Add(owners.Get(2)); "
@@ -1090,9 +1090,9 @@ BEZEL_TEST(linq_refcount, owned_fold_bound_using_var_no_double_free_1006b) {
     expectValueAndLeakFree(kOwnedFoldBoundUsingVar, 3);
 }
 
-// SOUNDNESS: an OWNING-collection owned result (`Build(): owned OwnedArray<Cell>`)
+// SOUNDNESS: an OWNING-collection owned result (`Build(): owned OwningArray<Cell>`)
 // chained as `.Count` UNBOUND. The #1006b free is gated to the BORROWING `Array`
-// name-head, so an `OwnedArray<T>` temp is NEVER freed here — freeing it (with an
+// name-head, so an `OwningArray<T>` temp is NEVER freed here — freeing it (with an
 // element cascade) would double-free the uniquely-owned Cell elements. This
 // proves no double-free / UAF on the owning family (a leak of the owning temp is
 // the safe, deferred direction — leak-not-dangle, §28.7). Count is 3; the Cells
@@ -1106,8 +1106,8 @@ const char* kOwningCollOwnedTempCountUnbound =
     "  destructor Cell.n := Cell.n - 1; end destructor; "
     "end Cell; "
     "class P "
-    "  public static method Build(): owned OwnedArray<Cell> "
-    "    var r := new OwnedArray<Cell>(); "
+    "  public static method Build(): owned OwningArray<Cell> "
+    "    var r := new OwningArray<Cell>(); "
     "    r.Add(new Cell(3)); r.Add(new Cell(1)); r.Add(new Cell(2)); "
     "    return r; "
     "  end Build; "
@@ -1135,7 +1135,7 @@ BEZEL_TEST(linq_refcount, owning_coll_owned_temp_count_unbound_no_double_free_10
 // (2) is read from the dict BEFORE the free; ASan confirms no leak.
 //
 // NOTE: the five ToDictionary tests below source from a borrowing `Array<int>`
-// (was `OwnedArray<int>`). #1022 now rejects copy-form materializers on an owning
+// (was `OwningArray<int>`). #1022 now rejects copy-form materializers on an owning
 // collection (§4.5); the dict-materializer reclaim these test is receiver-agnostic
 // (value elements), so the borrowing source exercises the identical reclaim path.
 const char* kToDictUnboundCount =

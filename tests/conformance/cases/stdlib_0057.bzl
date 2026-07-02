@@ -1,4 +1,4 @@
-public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
   // class T
 
   // Indexer (bounds-checked against span Length as of v0.105).

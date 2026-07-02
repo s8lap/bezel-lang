@@ -47,7 +47,7 @@ const char* kCellHdr =
 BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_null_cond_dispose) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); "
+        "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell())); "
         "    var ok := s.TryPop(out owned var item); "
         "    item?.Dispose(); "
@@ -60,7 +60,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_null_cond_dispose) {
 BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_narrowed_dispose) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); "
+        "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell())); "
         "    var ok := s.TryPop(out owned var item); "
         "    if item <> null then item.Dispose(); end; "
@@ -77,7 +77,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_two_elements_each_disposed_once) {
         "  public constructor(id: int) _id := id; end constructor; "
         "  destructor Cell._log := Cell._log * 10 + _id; end destructor; end Cell; "
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); "
+        "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell(1))); s.Push(move (new Cell(2))); "
         "    var ok := s.TryPop(out owned var item); "  // pops id=2 (top)
         "    item?.Dispose(); "                          // disposes 2 -> log=2
@@ -90,7 +90,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_two_elements_each_disposed_once) {
 BEZEL_TEST(out_owned_writeback_889, trypop_out_using_var_disposed_once) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); "
+        "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell())); "
         "    var ok := s.TryPop(out using var item); "
         "  end; return Cell._n; end Main; end C;"), 0);
@@ -101,7 +101,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_out_using_var_disposed_once) {
 BEZEL_TEST(out_owned_writeback_889, trypop_empty_null_cond_noop) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); "
+        "  do using var s := new OwningStack<Cell>(); "
         "    var ok := s.TryPop(out owned var item); "
         "    item?.Dispose(); "
         "    if ok then return 99; end; "
@@ -117,12 +117,12 @@ BEZEL_TEST(out_owned_writeback_889, trypop_empty_null_cond_noop) {
 // therefore not duplicated here (a JIT-harness run without the ownership pass
 // would not exercise the same lowering).
 
-// OwnedQueue.TryDequeue(out owned var item): the front element is written back
+// OwningQueue.TryDequeue(out owned var item): the front element is written back
 // and disposed exactly once.
 BEZEL_TEST(out_owned_writeback_889, trydequeue_out_owned_disposed_once) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
-        "  do using var q := new OwnedQueue<Cell>(); "
+        "  do using var q := new OwningQueue<Cell>(); "
         "    q.Enqueue(move (new Cell())); "
         "    var ok := q.TryDequeue(out owned var item); "
         "    item?.Dispose(); "
@@ -150,7 +150,7 @@ BEZEL_TEST(out_owned_writeback_889, borrow_stack_class_trypop_no_disposal) {
         "  public constructor(v: int) _v := v; Box._n := Box._n + 1; end constructor; "
         "  destructor Box._n := Box._n - 1; end destructor; end Box; "
         "class C public static method Main(): int "
-        "  do using var owner := new OwnedStack<Box>(); "
+        "  do using var owner := new OwningStack<Box>(); "
         "    owner.Push(move (new Box(7))); "
         "    var b := owner.Peek(); "
         "    using var s := new Stack<Box>(); s.Push(b); "

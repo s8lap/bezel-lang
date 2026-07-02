@@ -1,4 +1,4 @@
-// Codegen — issue #910 (discovery sweep #7): `using var c := await <OwnedTask<T>>`
+// Codegen — issue #910 (discovery sweep #7): `using var c := await <OwningTask<T>>`
 // inside an async method did not dispose the owned T at scope end (a leak).
 // usingVarOwnsClassObjectDynamically only inspected a CallExpr initializer, so
 // the `await` UnaryExpr fell through and no disposal was registered. The
@@ -23,12 +23,12 @@ const char* kCell =
     "  destructor Cell.n:=Cell.n-1; end destructor; end Cell; ";
 }  // namespace
 
-// `using var c := await Make()` (Make returns OwnedTask<Cell>) disposes c.
+// `using var c := await Make()` (Make returns OwningTask<Cell>) disposes c.
 BEZEL_TEST(async_using_var_await_dispose_910, using_var_awaited_owned_task_disposed) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
         "class C "
-        "  public static async method Make(): OwnedTask<Cell> return new Cell(); end Make; "
+        "  public static async method Make(): OwningTask<Cell> return new Cell(); end Make; "
         "  public static async method Run(): Task<int> "
         "    using var c := await C.Make(); "
         "    return 0; "
@@ -45,7 +45,7 @@ BEZEL_TEST(async_using_var_await_dispose_910, await_using_var_still_disposes) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
         "class C "
-        "  public static async method Make(): OwnedTask<Cell> return new Cell(); end Make; "
+        "  public static async method Make(): OwningTask<Cell> return new Cell(); end Make; "
         "  public static async method Run(): Task<int> "
         "    await using var c := await C.Make(); "
         "    return 0; "
@@ -107,21 +107,21 @@ BEZEL_TEST(async_using_var_await_dispose_910, method_level_using_var_across_awai
         "end C;"), 0);
 }
 
-// #1122 / §30.5: awaiting a BOUND-LOCAL OwnedTask whose result is a built-in
-// OWNING collection (`OwnedArray<T>` — the result type of Task.WhenAllOwned)
+// #1122 / §30.5: awaiting a BOUND-LOCAL OwningTask whose result is a built-in
+// OWNING collection (`OwningArray<T>` — the result type of Task.WhenAllOwned)
 // must discharge the bound operand. Before the fix awaitTaskKind's resultIsClass
 // only recognized a result type with a user CLASS declaration, so an
-// OwnedTask<OwnedArray<Res>> (a built-in, declaration-less Named) was classified
+// OwningTask<OwningArray<Res>> (a built-in, declaration-less Named) was classified
 // NotTask and `var ot := …; await ot;` spuriously reported `ot` as "dropped
-// without disposal". OwnedArray<T> is a heap/reference type (stdlib §3.1), so
+// without disposal". OwningArray<T> is a heap/reference type (stdlib §3.1), so
 // this is a valid Pattern B — the await consumes `ot` and the result is bound.
 BEZEL_TEST(async_using_var_await_dispose_910, await_bound_owntask_owning_collection_1122) {
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
         "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
         "class C "
-        "  public static async method MakeArr(): OwnedTask<OwnedArray<Res>> "
-        "    var a := new OwnedArray<Res>(); a.Add(new Res(7)); return a; "
+        "  public static async method MakeArr(): OwningTask<OwningArray<Res>> "
+        "    var a := new OwningArray<Res>(); a.Add(new Res(7)); return a; "
         "  end MakeArr; "
         "  public static async method Run(): Task<int> "
         "    var ot := MakeArr(); "

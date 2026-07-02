@@ -12,7 +12,7 @@ namespace bezel::codegen {
 // path mirrors the iterator (`Yield`) path with smKind_ == Await:
 //
 //   - The original method (declared `async`, returning Task / Task<T> /
-//     OwnedTask<T>) becomes the ENTRY function. It allocates the outer Task,
+//     OwningTask<T>) becomes the ENTRY function. It allocates the outer Task,
 //     calloc's the heap frame, spills the captures (`this` + params) and the
 //     outer-task pointer into the frame, then invokes the Resume function once.
 //     Because the runtime's bz_task_then has an already-done fast path and the
@@ -533,7 +533,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // Determine the result element type T from the return type's generic arg.
     //   Task           → no result value (asyncResultTy_ = null)
     //   Task<T>        → T
-    //   OwnedTask<T>   → T (Pattern B; ownership transfer is the awaiter's job)
+    //   OwningTask<T>   → T (Pattern B; ownership transfer is the awaiter's job)
     llvm::Type* resultTy = nullptr;
     const sema::TypeRef* resultSemaTy = nullptr;
     if (ci.returnType) {
@@ -921,7 +921,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
     (void)fn;
     smKind_ = SuspendKind::Await;
 
-    // §30.6 result element type T (from the lambda's Task<T>/OwnedTask<T> return
+    // §30.6 result element type T (from the lambda's Task<T>/OwningTask<T> return
     // type; null for a no-value `Task`). Mirrors emitAsyncMethod's resultTy/
     // resultSemaTy setup (which reads it from the method's declared return type).
     llvm::Type* resultTy =
@@ -1334,7 +1334,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // (IAsyncEnumerable<T> / IAsyncEnumerator<T>).
     llvm::Type* elemTy = i32();
     const sema::TypeRef* elemSemaTy = nullptr;  // #1102B
-    // #1349: detect OwnedAsyncEnumerable<T> so TakeCurrent gets the IOE guard.
+    // #1349: detect IOwningAsyncEnumerable<T> so TakeCurrent gets the IOE guard.
     bool isOwningIter = false;
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
@@ -1349,7 +1349,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 rn = retRef->astNode->name->parts[0];
             else if (!retRef->importedName.empty())
                 rn = retRef->importedName;
-            isOwningIter = (rn == "OwnedAsyncEnumerable");
+            isOwningIter = (rn == "IOwningAsyncEnumerable");
         }
     }
     // The per-advance MoveNextAsync result is Task<bool>; the await-result type
@@ -1445,7 +1445,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     }
 
     // --- Current: load current_val from the frame ---
-    // For OwnedAsyncEnumerable<T> this implements TakeCurrent() (vtable slot 3):
+    // For IOwningAsyncEnumerable<T> this implements TakeCurrent() (vtable slot 3):
     // check for null → IOE; on success null slot and return value. §29.1/#1349.
     {
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", currentFn);
@@ -1821,7 +1821,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     llvm::Value* task = lowerExpr(*un.operand);
     if (!task) return nullptr;
 
-    // The await result type (§30.3 / §30.5): T for Task<T>/OwnedTask<T>, or
+    // The await result type (§30.3 / §30.5): T for Task<T>/OwningTask<T>, or
     // unit for `await Task`. sema set this on the UnaryExpr.
     llvm::Type* resultTy = nullptr;
     if (auto* rt = ctx_.exprType(un)) {
@@ -1839,14 +1839,14 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     bool freeTaskAfter =
         dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr &&
         !asyncChainedReturn_;
-    // §28.3 / #1250: for a BOUND OwnedTask<T:class> await, null the result buffer
+    // §28.3 / #1250: for a BOUND OwningTask<T:class> await, null the result buffer
     // after loading so bz_tcs_dispose_owned_result (called at TCS disposal) sees no
     // result and skips the dispose — preventing a double-free of the caller-owned obj.
-    // Only fires for OwnedTask (not plain Task) with a ClassOwned element type.
+    // Only fires for OwningTask (not plain Task) with a ClassOwned element type.
     bool takeResultAfter = false;
-    // §30.5 (v0.162 / #1352): OwnedTask single-consumer tracking. After the first
+    // §30.5 (v0.162 / #1352): OwningTask single-consumer tracking. After the first
     // await (success or fault), mark the task as spent so a second await raises
-    // InvalidOperationException. Only fires for BOUND OwnedTask (!freeTaskAfter):
+    // InvalidOperationException. Only fires for BOUND OwningTask (!freeTaskAfter):
     // an anonymous inline `await Producer()` (freeTaskAfter=true) is freed
     // immediately after the first await, so no second await is possible and
     // calling mark_spent after free would be UAF. Plain Task<T> is re-awaitable
@@ -1857,7 +1857,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
         bool isOwnedTask = (taskTy && taskTy->kind == sema::TypeRef::Kind::Named &&
             !taskTy->declaration && taskTy->astNode && taskTy->astNode->name &&
             !taskTy->astNode->name->parts.empty() &&
-            taskTy->astNode->name->parts[0] == "OwnedTask");
+            taskTy->astNode->name->parts[0] == "OwningTask");
         if (isOwnedTask && !freeTaskAfter) {
             markSpentAfter = true;
             if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {
@@ -1949,10 +1949,10 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                          smStateStruct_, smSelf_,
                                          asyncPendingTaskField_));
 
-    // §30.5 (v0.162 / #1352): OwnedTask single-consumer guard — if a SECOND await
-    // is attempted on a spent OwnedTask (one already consumed on any path, including
+    // §30.5 (v0.162 / #1352): OwningTask single-consumer guard — if a SECOND await
+    // is attempted on a spent OwningTask (one already consumed on any path, including
     // a faulted/cancelled first await), raise InvalidOperationException instead of
-    // reading freed or stale memory. markSpentAfter is true only for OwnedTask.
+    // reading freed or stale memory. markSpentAfter is true only for OwningTask.
     if (markSpentAfter) {
         auto* isSpentFn = declareC("bz_task_is_spent", i1(), {ptrTy()});
         llvm::Value* spent =
@@ -2014,7 +2014,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeTaskFn, {awaitedTask});
         }
-        // §30.5 (v0.162 / #1352): mark OwnedTask spent BEFORE the unwind so any
+        // §30.5 (v0.162 / #1352): mark OwningTask spent BEFORE the unwind so any
         // catch arm that re-awaits the same variable gets IOE, not the re-raised
         // original exception. Applies on fault path regardless of freeTaskAfter.
         if (markSpentAfter) {
@@ -2048,7 +2048,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // The result is loaded BY VALUE into the await site before the task is
         // freed below, so the value (and the task's freed result buffer) do not
         // alias afterwards.
-        // §28.3 / #1250: for a BOUND OwnedTask<T:class> await, null the result
+        // §28.3 / #1250: for a BOUND OwningTask<T:class> await, null the result
         // buffer after loading (consumed-tracking). bz_tcs_dispose_owned_result
         // checks task->result; a null here tells it the result was already taken.
         if (takeResultAfter) {
@@ -2057,7 +2057,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
             builder_.CreateCall(takeResultFn, {awaitedTask});
         }
     }
-    // §30.5 (v0.162 / #1352): mark OwnedTask spent after successful result
+    // §30.5 (v0.162 / #1352): mark OwningTask spent after successful result
     // consumption so a second await gets IOE (spend-on-all-edges, not just fault).
     if (markSpentAfter) {
         auto* markSpentFn = declareC("bz_task_mark_spent",

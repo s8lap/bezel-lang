@@ -8,9 +8,9 @@ var token := await semaphore.AcquireAsync();
 TransferToHelper(token);    // owned local consumed by owned parameter
 
 // Direct ownership transfer to a method call accepting owned
-results.Add(await loadTask);     // results: OwnedArray<T>; Add takes owned
+results.Add(await loadTask);     // results: OwningArray<T>; Add takes owned
 
 // Direct return
-public async method Acquire(): OwnedTask<Connection>
+public async method Acquire(): OwningTask<Connection>
   return await ConnectAsync(url);     // owned T flows to owned T return
 end Acquire;

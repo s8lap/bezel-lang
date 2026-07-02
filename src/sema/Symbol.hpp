@@ -331,7 +331,7 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
 
 // §3.6 / §8.3 (v0.158, #1338): the **equality-bearing** derived type property —
 // the classification a hash-container key/element must satisfy (`Dictionary<K,V>`
-// / `OwnedDictionary<K,V>` keys, `Set<T>` / `OwnedSet<T>` elements). Per §3.6's
+// / `OwningDictionary<K,V>` keys, `Set<T>` / `OwningSet<T>` elements). Per §3.6's
 // table: "every type except a record that is neither auto-equality-bearing nor
 // declares user equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per
 // the §25.2 co-declaration rule)". So every primitive, string, enum, class,

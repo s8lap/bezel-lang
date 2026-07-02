@@ -1,11 +1,11 @@
-// Codegen tests for LinkedList<T> / OwnedLinkedList<T> node-based API.
+// Codegen tests for LinkedList<T> / OwningLinkedList<T> node-based API.
 // Derives from stdlib §4.6 / §4.7 (Bezel_Standard_Library_0_130.md §4.6–§4.7).
 //
 // Covers:
 //   §4.6: AddFirst, AddLast, AddBefore, AddAfter, RemoveFirst, RemoveLast,
 //         RemoveNode, Find, Count, FirstNode, LastNode, First, Last,
 //         node.Value, node.Next, node.Previous
-//   §4.7: OwnedLinkedList<T> disposal (RemoveFirst/RemoveLast/RemoveNode/
+//   §4.7: OwningLinkedList<T> disposal (RemoveFirst/RemoveLast/RemoveNode/
 //         Clear disposes the value exactly once; scope-end disposes all).
 
 #include "support/codegen_support.hpp"
@@ -245,17 +245,17 @@ BEZEL_TEST(linked_list_4_6, first_node_last_node) {
 }
 
 // ---------------------------------------------------------------------------
-// §4.7: OwnedLinkedList<T> — disposal semantics
+// §4.7: OwningLinkedList<T> — disposal semantics
 // ---------------------------------------------------------------------------
 
-// per §4.7: OwnedLinkedList.RemoveFirst disposes the removed element exactly once;
+// per §4.7: OwningLinkedList.RemoveFirst disposes the removed element exactly once;
 // scope-end disposes the remaining elements.
 // Encoded: afterRemove*10 + afterScopeEnd (counts of disposals).
 BEZEL_TEST(owned_linked_list_4_7, remove_first_disposes_element) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterRemove := -1; "
         "do "
-        "  using var l := new OwnedLinkedList<R>(); "
+        "  using var l := new OwningLinkedList<R>(); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
@@ -266,12 +266,12 @@ BEZEL_TEST(owned_linked_list_4_7, remove_first_disposes_element) {
         13);
 }
 
-// per §4.7: OwnedLinkedList.RemoveLast disposes the removed element exactly once.
+// per §4.7: OwningLinkedList.RemoveLast disposes the removed element exactly once.
 BEZEL_TEST(owned_linked_list_4_7, remove_last_disposes_element) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterRemove := -1; "
         "do "
-        "  using var l := new OwnedLinkedList<R>(); "
+        "  using var l := new OwningLinkedList<R>(); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
         "  l.RemoveLast(); "
@@ -281,12 +281,12 @@ BEZEL_TEST(owned_linked_list_4_7, remove_last_disposes_element) {
         12);
 }
 
-// per §4.7: OwnedLinkedList.RemoveNode disposes the targeted element exactly once.
+// per §4.7: OwningLinkedList.RemoveNode disposes the targeted element exactly once.
 BEZEL_TEST(owned_linked_list_4_7, remove_node_disposes_element) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterRemove := -1; "
         "do "
-        "  using var l := new OwnedLinkedList<R>(); "
+        "  using var l := new OwningLinkedList<R>(); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
@@ -301,11 +301,11 @@ BEZEL_TEST(owned_linked_list_4_7, remove_node_disposes_element) {
         13);
 }
 
-// per §4.7: scope-end of OwnedLinkedList<T> disposes ALL remaining elements.
+// per §4.7: scope-end of OwningLinkedList<T> disposes ALL remaining elements.
 BEZEL_TEST(owned_linked_list_4_7, scope_end_disposes_all) {
     BEZEL_EXPECT_EQ(runResource(
         "do "
-        "  using var l := new OwnedLinkedList<R>(); "
+        "  using var l := new OwningLinkedList<R>(); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
@@ -330,12 +330,12 @@ BEZEL_TEST(linked_list_4_6, borrowing_list_does_not_dispose_elements) {
         0);
 }
 
-// per §4.7: OwnedLinkedList.Clear disposes every element exactly once.
+// per §4.7: OwningLinkedList.Clear disposes every element exactly once.
 BEZEL_TEST(owned_linked_list_4_7, clear_disposes_all_elements) {
     BEZEL_EXPECT_EQ(runResource(
         "var afterClear := -1; "
         "do "
-        "  using var l := new OwnedLinkedList<R>(); "
+        "  using var l := new OwningLinkedList<R>(); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
         "  l.AddLast(move (new R())); "
@@ -494,7 +494,7 @@ BEZEL_TEST(codegen_linked_list, literal_iterates_in_order_738) {
         "  return s + ll.Count; "  // 60 + 3 = 63
         "end Main; end C;"), 63);
 }
-// Migrated from OwnedLinkedList<int> → LinkedList<int> per stdlib §4.2/#1327:
+// Migrated from OwningLinkedList<int> → LinkedList<int> per stdlib §4.2/#1327:
 // owned collections require class element types; for value-type iteration
 // use the non-owning LinkedList<T>.
 BEZEL_TEST(codegen_linked_list, owned_literal_738) {

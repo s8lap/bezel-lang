@@ -77,13 +77,13 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_field_rejected_28_3) {
     auto r = parseAndCheckOwnership(std::string("module M; class R end R; "
         "class Holder "
         "  public owned _held: R; "
-        "  public constructor(arr: OwnedArray<R>) "
+        "  public constructor(arr: OwningArray<R>) "
         "    this._held := arr[0]; "
         "  end constructor; "
         "end Holder; "
         "class C "
         "  public static method Main(): int "
-        "    using var arr := new OwnedArray<R>(); "
+        "    using var arr := new OwningArray<R>(); "
         "    arr.Add(new R()); "
         "    using var h := new Holder(arr); "
         "    return 0; "
@@ -94,15 +94,15 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_field_rejected_28_3) {
 
 // ---- Finding [19]: indexer borrow `coll[i]` into an OWNED ARGUMENT --------
 // §28.3 / §28.8 / §28.11: `b.Add(a[0])` passes a slot-borrow of `a` to the
-// owned sink `OwnedArray<R>.Add(owned item)`. A borrow handed to an owned sink
+// owned sink `OwningArray<R>.Add(owned item)`. A borrow handed to an owned sink
 // is double-disposed (the sink AND `a`'s `Dispose` both dispose it). REJECTED.
 BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_arg_builtin_rejected_28_8) {
     auto r = parseAndCheckOwnership(std::string("module M; class R end R; "
         "class C "
         "  public static method Main(): int "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(new R()); "
-        "    using var b := new OwnedArray<R>(); "
+        "    using var b := new OwningArray<R>(); "
         "    b.Add(a[0]); "
         "    return 0; "
         "  end Main; "
@@ -115,7 +115,7 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_arg_builtin_rejected_28
 BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_arg_user_method_rejected_28_8) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
-        "  public method Use(s: Sink, a: OwnedArray<T>) "
+        "  public method Use(s: Sink, a: OwningArray<T>) "
         "    s.Add(a[0]); "
         "  end Use; "
         "end C;"));
@@ -128,7 +128,7 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_arg_user_method_rejecte
 BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_setter_rejected_28_11) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
-        "  public method Use(s: Sink, a: OwnedArray<T>) "
+        "  public method Use(s: Sink, a: OwningArray<T>) "
         "    s[0] := a[0]; "
         "  end Use; "
         "end C;"));
@@ -144,7 +144,7 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_ctor_arg_rejected_28_8)
         "  end constructor; "
         "end Box; "
         "class C "
-        "  public method Use(a: OwnedArray<R>) "
+        "  public method Use(a: OwningArray<R>) "
         "    using var box := new Box(a[0]); "
         "  end Use; "
         "end C;"));
@@ -191,7 +191,7 @@ BEZEL_TEST(owned_sink_sources, nonowned_field_read_into_owned_arg_rejected_28_8)
 BEZEL_TEST(owned_sink_sources, this_into_owned_arg_rejected_28_3) {
     auto r = parseAndCheckOwnership(std::string("module M; "
         "class R "
-        "  public method Leak(s: OwnedArray<R>) "
+        "  public method Leak(s: OwningArray<R>) "
         "    s.Add(this); "
         "  end Leak; "
         "end R; "
@@ -227,9 +227,9 @@ BEZEL_TEST(owned_sink_sources, move_indexer_into_owned_arg_accepted_28_8_1) {
     auto r = parseAndCheckOwnership(std::string("module M; class R end R; "
         "class C "
         "  public static method Main(): int "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(new R()); "
-        "    using var b := new OwnedArray<R>(); "
+        "    using var b := new OwningArray<R>(); "
         "    b.Add(move a[0]); "
         "    return 0; "
         "  end Main; "
@@ -244,7 +244,7 @@ BEZEL_TEST(owned_sink_sources, move_owned_field_into_owned_arg_accepted_28_8_1) 
     auto r = parseAndCheckOwnership(std::string("module M; class R end R; "
         "class Holder "
         "  public owned _r: R := new R(); "
-        "  public method Give(a: OwnedArray<R>) "
+        "  public method Give(a: OwningArray<R>) "
         "    a.Add(move this._r); "
         "    this._r := new R(); "
         "  end Give; "
@@ -277,7 +277,7 @@ BEZEL_TEST(owned_sink_sources, new_into_owned_field_accepted_28_8) {
 BEZEL_TEST(owned_sink_sources, indexer_borrow_into_borrow_param_accepted_28_3) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
-        "  public method Use(rd: Reader, a: OwnedArray<T>) "
+        "  public method Use(rd: Reader, a: OwningArray<T>) "
         "    rd.Look(a[0]); "
         "  end Use; "
         "end C;"));

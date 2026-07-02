@@ -6,7 +6,7 @@ public class Channel<T>: IDisposable                       // the receiving end;
 
   public method NewSender(): owned ChannelSender<T>;       // mint a sender endpoint
 
-  public method Receive(): OwnedTask<T>;                   // await transfers ownership of one item
+  public method Receive(): OwningTask<T>;                   // await transfers ownership of one item
   public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
 end Channel;
 

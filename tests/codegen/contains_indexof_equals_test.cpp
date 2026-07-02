@@ -1,4 +1,4 @@
-// Codegen — Array<T>/OwnedArray<T>.Contains(item) and .IndexOf(item) match via
+// Codegen — Array<T>/OwningArray<T>.Contains(item) and .IndexOf(item) match via
 // the element type's EQUALITY, not just pointer identity (issue #424).
 //
 // stdlib §4.4/§4.5: `Contains(item): bool` / `IndexOf(item): int` find the
@@ -9,7 +9,7 @@
 // `=` always invokes `Equals`.
 //
 // The query argument is a PURE BORROW (§4.4/§4.5): Contains/IndexOf only
-// compare — they do not remove or dispose any element. An OwnedArray element
+// compare — they do not remove or dispose any element. An OwningArray element
 // that matches is NOT disposed (unlike Remove). The query itself is never
 // consumed by the call.
 //
@@ -216,10 +216,10 @@ BEZEL_TEST(contains_indexof_equals_4_6, string_indexof_by_content) {
 }
 
 // -----------------------------------------------------------------------
-// OwnedArray — record element (issue #424 sibling: OwnedArray variant)
+// OwningArray — record element (issue #424 sibling: OwningArray variant)
 // -----------------------------------------------------------------------
 
-// §4.5/§14.4/#1327 v0.165: OwnedArray<P> with a record element type is NOW
+// §4.5/§14.4/#1327 v0.165: OwningArray<P> with a record element type is NOW
 // rejected at sema (stdlib §4.2: owned collections require class/interface
 // elements; records are value types with no disposal obligation). These tests
 // were converted from behavioral to rejection tests when #1327 landed.
@@ -230,7 +230,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
-        "  using var a := new OwnedArray<P>(); "
+        "  using var a := new OwningArray<P>(); "
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
         "  if a.Contains(new P(3, 4)) then return 1; end; "
         "  return 0; "
@@ -239,13 +239,13 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// §4.5/§14.4/#1327 v0.165: OwnedArray<P> with record element rejected at sema.
+// §4.5/§14.4/#1327 v0.165: OwningArray<P> with record element rejected at sema.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_indexof_present) {
     auto r = runJit(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
-        "  using var a := new OwnedArray<P>(); "
+        "  using var a := new OwningArray<P>(); "
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
         "  return a.IndexOf(new P(3, 4)); "
         "end Main; end Program;");
@@ -253,7 +253,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_indexof_present) {
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// §4.5: OwnedArray<R> with class element: Contains query is a PURE BORROW —
+// §4.5: OwningArray<R> with class element: Contains query is a PURE BORROW —
 // the destructor counter must NOT be incremented by Contains itself. After the
 // scope-end the three stored elements and the query are disposed exactly once.
 // Encoded: <counter after Contains>*10 + <final counter>. Contains disposes
@@ -275,7 +275,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_contains_query_is_pure_borro
         "class C public static method Main(): int "
         "  var afterContains := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R(1))); "
         "    a.Add(move (new R(2))); "
         "    a.Add(move (new R(3))); "
@@ -287,7 +287,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_contains_query_is_pure_borro
         "end Main; end C;"), 4);
 }
 
-// §4.5: OwnedArray<R> with class element: IndexOf query is a PURE BORROW —
+// §4.5: OwningArray<R> with class element: IndexOf query is a PURE BORROW —
 // same disposal accounting as Contains above. Expect 04.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_indexof_query_is_pure_borrow) {
     BEZEL_EXPECT_EQ(run(
@@ -306,7 +306,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_indexof_query_is_pure_borrow
         "class C public static method Main(): int "
         "  var afterIndexOf := -1; "
         "  do "
-        "    using var a := new OwnedArray<R>(); "
+        "    using var a := new OwningArray<R>(); "
         "    a.Add(move (new R(1))); "
         "    a.Add(move (new R(2))); "
         "    a.Add(move (new R(3))); "

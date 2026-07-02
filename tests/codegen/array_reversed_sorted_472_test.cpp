@@ -10,7 +10,7 @@
 //                                   (int / string in this milestone).
 //
 // In-place Reverse() / Sort() stay UNCHANGED (mutate, return ()).
-// OwnedArray<T> gets NO value-forms (unique ownership — copy semantics unsound).
+// OwningArray<T> gets NO value-forms (unique ownership — copy semantics unsound).
 //
 // Spec reference: stdlib §3 (Array<T> instance methods), §26.5 (instance
 // members win over LINQ extensions).  All examples trace the copy-then-op path.
@@ -384,31 +384,31 @@ BEZEL_TEST(array_reversed_sorted_472, inplace_sort_comparer_still_mutates_spec_3
 }
 
 // ===========================================================================
-// OwnedArray<T> does NOT get value-forms — must still be accepted for the
+// OwningArray<T> does NOT get value-forms — must still be accepted for the
 // in-place forms and rejected for the copy-forms (via undefined-method path).
-// Note: OwnedArray<T> in-place Reverse()/Sort() work (they're the same runtime
+// Note: OwningArray<T> in-place Reverse()/Sort() work (they're the same runtime
 // ops); only the copy-forms Reversed()/Sorted() must be absent.
 // ===========================================================================
 
-// §3 / #472: OwnedArray<int>.Reversed() must be rejected — OwnedArray has no
+// §3 / #472: OwningArray<int>.Reversed() must be rejected — OwningArray has no
 // value-form copy-method (ownership semantics prevent a shallow copy).
 BEZEL_TEST(array_reversed_sorted_472, ownedarray_reversed_rejected_spec_3) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); "
+        "  using var a := new OwningArray<int>(); "
         "  a.Add(1); a.Add(2); "
-        "  using var rev := a.Reversed(); "  // OwnedArray has no Reversed()
+        "  using var rev := a.Reversed(); "  // OwningArray has no Reversed()
         "  return rev.Length; "
         "end Main; end C;"));
 }
 
-// §3 / #472: OwnedArray<int>.Sorted() must be rejected.
+// §3 / #472: OwningArray<int>.Sorted() must be rejected.
 BEZEL_TEST(array_reversed_sorted_472, ownedarray_sorted_rejected_spec_3) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); "
+        "  using var a := new OwningArray<int>(); "
         "  a.Add(3); a.Add(1); "
-        "  using var s := a.Sorted(); "  // OwnedArray has no Sorted()
+        "  using var s := a.Sorted(); "  // OwningArray has no Sorted()
         "  return s.Length; "
         "end Main; end C;"));
 }

@@ -685,13 +685,13 @@ bool ExprTC::returnsValue(const ast::Type* rt) {
 // async-readiness 3b (§30.1): map an `async` method's declared return type to
 // the return-FORM context and the result-assignability type used inside its
 // body. The task wrapper is peeled: `Task` is a void-method context (no
-// result), `Task<T>` / `OwnedTask<T>` are value-method contexts whose result
+// result), `Task<T>` / `OwningTask<T>` are value-method contexts whose result
 // type is the element T. Anything else (no return type, a non-async type, or
 // an async-iterator interface) is left as a void context — the dedicated async
 // return-type diagnostic (§30.1, in TypeResolution) already names a non-async
 // return type, and an async-iterator method is exempt from the value-return
 // check via the `isIteratorMethod` path.
-// issue #777 / §30.6: a Named `Task<…>` / `OwnedTask<…>` shape — the async task
+// issue #777 / §30.6: a Named `Task<…>` / `OwningTask<…>` shape — the async task
 // wrapper. An async lambda/method body must produce the unwrapped element T, not
 // a Task value; a Task-shaped body where T is NOT itself Task-shaped is a
 // forgotten `await`.
@@ -700,7 +700,7 @@ bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
            t->astNode && t->astNode->name &&
            t->astNode->name->parts.size() == 1 &&
            (t->astNode->name->parts.front() == "Task" ||
-            t->astNode->name->parts.front() == "OwnedTask");
+            t->astNode->name->parts.front() == "OwningTask");
 }
 
 // stdlib §5 (#755): a BARE lazy GroupBy result — `IEnumerable<IGrouping<TKey,T>>`
@@ -737,8 +737,8 @@ void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
         // `Task` — no result value; void-method form rules.
         return;
     }
-    if ((head == "Task" || head == "OwnedTask") && !r->genericArgs.empty()) {
-        // `Task<T>` / `OwnedTask<T>` — value-method form rules; the body
+    if ((head == "Task" || head == "OwningTask") && !r->genericArgs.empty()) {
+        // `Task<T>` / `OwningTask<T>` — value-method form rules; the body
         // returns the element type T.
         outCtx = ReturnCtx::ValueMethod;
         outType = r->genericArgs.front();
@@ -1612,20 +1612,20 @@ static bool extensionTargetMatchesReceiver(
 }
 
 // §26.5 (#714): for a null-declaration builtin receiver type (e.g. `Array<int>`
-// or `OwnedArray<int>`), return its transitive interface ancestors as synthesised
+// or `OwningArray<int>`), return its transitive interface ancestors as synthesised
 // null-declaration TypeRefs that carry the same generic args as the receiver.
 // This lets extensionTargetMatchesReceiverOrBase BFS the conceptual interface
 // hierarchy without requiring real TypeDecl nodes.
 //
 // The hierarchy (per stdlib §4.4/§4.5):
 //   Array<T>      : IList<T>
-//   OwnedArray<T> : IOwnedList<T>
+//   OwningArray<T> : IOwningList<T>
 //   Stack<T>      : IReadOnlyCollection<T> (conservative; full chain when needed)
 //   IList<T>      : IReadOnlyList<T>, ICollection<T>
-//   IOwnedList<T> : IReadOnlyList<T>, IOwnedCollection<T>
+//   IOwningList<T> : IReadOnlyList<T>, IOwningCollection<T>
 //   IReadOnlyList<T>       : IReadOnlyCollection<T>
 //   ICollection<T>         : IReadOnlyCollection<T>
-//   IOwnedCollection<T>    : IReadOnlyCollection<T>
+//   IOwningCollection<T>    : IReadOnlyCollection<T>
 //   IReadOnlyCollection<T> : IEnumerable<T>
 //   IEnumerable<T>         : (root)
 //
@@ -1659,22 +1659,22 @@ static std::vector<const TypeRef*> builtinInterfaceAncestors(
     // Tier 1 parents of the concrete collection types.
     if (name == "Array")
         ancestors.push_back(makeBuiltin("IList", {T}));
-    else if (name == "OwnedArray")
-        ancestors.push_back(makeBuiltin("IOwnedList", {T}));
-    else if (name == "Stack" || name == "OwnedStack" ||
-             name == "Queue" || name == "OwnedQueue" ||
-             name == "Set"   || name == "OwnedSet" ||
-             name == "LinkedList" || name == "OwnedLinkedList")
+    else if (name == "OwningArray")
+        ancestors.push_back(makeBuiltin("IOwningList", {T}));
+    else if (name == "Stack" || name == "OwningStack" ||
+             name == "Queue" || name == "OwningQueue" ||
+             name == "Set"   || name == "OwningSet" ||
+             name == "LinkedList" || name == "OwningLinkedList")
         ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
     else if (name == "IList")
         ancestors.push_back(makeBuiltin("IReadOnlyList", {T})),
         ancestors.push_back(makeBuiltin("ICollection", {T}));
-    else if (name == "IOwnedList")
+    else if (name == "IOwningList")
         ancestors.push_back(makeBuiltin("IReadOnlyList", {T})),
-        ancestors.push_back(makeBuiltin("IOwnedCollection", {T}));
+        ancestors.push_back(makeBuiltin("IOwningCollection", {T}));
     else if (name == "ICollection")
         ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
-    else if (name == "IOwnedCollection")
+    else if (name == "IOwningCollection")
         ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
     else if (name == "IReadOnlyList")
         ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
@@ -1726,8 +1726,8 @@ static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
 // Per §12.9 and the language-primitives table in §2.1:
 //   covariant (out T): IEnumerable, IEnumerator, IAsync*, IReadOnlyCollection,
 //                      IReadOnlyList, IEvent, IAsyncEvent.
-//   invariant: IList, ICollection, IOwnedList, IOwnedCollection, Array,
-//              OwnedArray, Stack, Queue, Set, LinkedList, etc.
+//   invariant: IList, ICollection, IOwningList, IOwningCollection, Array,
+//              OwningArray, Stack, Queue, Set, LinkedList, etc.
 static std::string_view builtinParamVariance(std::string_view name,
                                               std::size_t /*i*/) {
     if (name == "IEnumerable" || name == "IEnumerator" ||
@@ -2915,7 +2915,7 @@ void ExprTC::visitMember(const ast::Member& m) {
         //                               the end is `return;`; `return EXPR;`
         //                               is rejected (the task has no result).
         //   async ...: Task<T> /
-        //              OwnedTask<T>  -> behaves like a value method — must
+        //              OwningTask<T>  -> behaves like a value method — must
         //                               `return EXPR;` on every path, with
         //                               EXPR assignable to the element type T.
         //   async ...: IAsyncEnumerable<T> / ... (async iterator) -> an
@@ -3258,7 +3258,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         // issue #777 / §30.6: when a typed local's declared type is a function
-        // type `(…) -> Task<T>` / `(…) -> OwnedTask<T>` and the initializer is an
+        // type `(…) -> Task<T>` / `(…) -> OwningTask<T>` and the initializer is an
         // `async` lambda, thread the peeled element T to the lambda visitor so it
         // can reject a forgotten `await` in the body. Restored after the visit.
         TypeRef* savedLamRet = pendingLambdaReturnType_;
@@ -3562,7 +3562,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             ctx_.diagnostics().report(
                 Severity::Error, rs->value->span.begin,
                 "an `async` method's `return` must produce the element type of "
-                "its `Task<T>`/`OwnedTask<T>` return, not a `Task` value; add "
+                "its `Task<T>`/`OwningTask<T>` return, not a `Task` value; add "
                 "`await` (e.g. `return await Producer();`) (§30.6)");
         }
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -3616,11 +3616,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     std::string_view head =
                                         rt->astNode->name->parts.front();
                                     ownedProduced =
-                                        head == "OwnedArray" ||
-                                        head == "OwnedStack" ||
-                                        head == "OwnedQueue" ||
-                                        head == "OwnedLinkedList" ||
-                                        head == "OwnedDictionary";
+                                        head == "OwningArray" ||
+                                        head == "OwningStack" ||
+                                        head == "OwningQueue" ||
+                                        head == "OwningLinkedList" ||
+                                        head == "OwningDictionary";
                                 }
                         }
                     }
@@ -4156,7 +4156,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         //     #949); the result is untyped, so it is recognized structurally.
         if (ds->value) {
             const TypeRef* t = ctx_.exprType(*ds->value);
-            // §17.13 / §30.10 (#1014): discarding a `Task`/`Task<T>`/`OwnedTask<T>`
+            // §17.13 / §30.10 (#1014): discarding a `Task`/`Task<T>`/`OwningTask<T>`
             // is a compile error — disposing a task abandons a running operation
             // (a semantic, not a leak, concern), so the discard must direct the
             // caller to `Task.FireAndForget` (the error names it specifically).
@@ -4328,7 +4328,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             ctx_.primitiveTypeRef(PrimitiveType::Char);
                     // §3 / §29.2: runtime Array<T> or other IEnumerable<T>
                     // with a Named TypeRef — element type from first generic arg.
-                    // Guard: Dictionary<K,V> and OwnedDictionary<K,V> are NOT
+                    // Guard: Dictionary<K,V> and OwningDictionary<K,V> are NOT
                     // directly iterable (stdlib §4.8 / §4.9 — no default
                     // `for var e in d` iteration is provided). Blindly taking
                     // genericArgs[0] (K) mis-types the element and causes a
@@ -4337,12 +4337,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                !tt->genericArgs.empty() &&
                                tt->genericArgs[0]) {
                         // Check whether the Named type is Dictionary or
-                        // OwnedDictionary.
+                        // OwningDictionary.
                         // §4.8 v0.135 (#548): Dictionary<K,V> is directly
                         // iterable — `for var e in d` yields DictionaryEntry<K,V>
                         // (the ICollection element type), one per live entry in
                         // insertion order.
-                        // §4.9 v0.135: OwnedDictionary<K,V> is NOT directly
+                        // §4.9 v0.135: OwningDictionary<K,V> is NOT directly
                         // iterable — the #530 diagnostic is narrowed to it only.
                         std::string_view colTypeName;
                         if (tt->astNode && tt->astNode->name &&
@@ -4370,13 +4370,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             entryTy->genericArgs.push_back(tt->genericArgs[0]); // K
                             entryTy->genericArgs.push_back(tt->genericArgs[1]); // V
                             lsym->declType = entryTy;
-                        } else if (colTypeName == "OwnedDictionary") {
-                            // per §4.9 (v0.135): OwnedDictionary direct iteration
+                        } else if (colTypeName == "OwningDictionary") {
+                            // per §4.9 (v0.135): OwningDictionary direct iteration
                             // is not provided (#530 diagnostic, narrowed from
                             // both dict kinds to owning kind only).
                             ctx_.diagnostics().report(
                                 Severity::Error, fs->span.begin,
-                                "OwnedDictionary<K,V> is not directly iterable "
+                                "OwningDictionary<K,V> is not directly iterable "
                                 "(stdlib \xC2\xA7""4.9); use `d.Drain()` "
                                 "(ownership-transfer) instead of "
                                 "`for var e in d`");

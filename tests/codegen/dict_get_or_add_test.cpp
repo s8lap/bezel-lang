@@ -1,5 +1,5 @@
 // Codegen — Dictionary<K,V>.GetOrAdd(key, factory) and
-// OwnedDictionary<K,V>.GetOrAdd(key, factory) (stdlib §4.8 / §4.9).
+// OwningDictionary<K,V>.GetOrAdd(key, factory) (stdlib §4.8 / §4.9).
 //
 // stdlib §4.8 (`Dictionary<K, V>`):
 //   public method GetOrAdd(key: K, factory: (K) -> V): V;
@@ -9,7 +9,7 @@
 // and returns the now-stored value. The borrowing dictionary owns nothing; the
 // returned V is a borrow/value the caller already manages.
 //
-// stdlib §4.9 (`OwnedDictionary<K, V> where V: class`):
+// stdlib §4.9 (`OwningDictionary<K, V> where V: class`):
 //   public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 // "the factory produces an `owned V`; the dictionary stores the value (taking
 // ownership) and the call returns a borrow of the now-stored value." (§4.9).
@@ -256,7 +256,7 @@ BEZEL_TEST(dict_get_or_add_4_8, record_value_miss_boxes_and_reads_back) {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedDictionary<K,V>.GetOrAdd (§4.9) — owned→borrow handoff.
+// OwningDictionary<K,V>.GetOrAdd (§4.9) — owned→borrow handoff.
 // ---------------------------------------------------------------------------
 
 // §4.9 MISS: empty dict → the factory produces an owned R, the dict STORES it
@@ -269,7 +269,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_miss_stores_owned_and_returns_borr
     expectValueAndLeakFree(prog(
         "var tag := -1; var inside := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  var got := d.GetOrAdd(\"a\", (k: string) => move (new R(7))); "
         "  tag := got.Tag(); "
         "  inside := R._n; "
@@ -286,7 +286,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_hit_no_factory_returns_existing_bo
     expectValueAndLeakFree(prog(
         "var tag := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R(3))); "
         "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
         "  tag := got.Tag(); "
@@ -301,7 +301,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, generic_key_miss_stores_owned_and_returns_
     expectValueAndLeakFree(prog(
         "var tag := -1; var inside := -1; "
         "do "
-        "  using var d := new OwnedDictionary<int, R>(); "
+        "  using var d := new OwningDictionary<int, R>(); "
         "  var got := d.GetOrAdd(2, (k: int) => move (new R(5))); "
         "  tag := got.Tag(); "
         "  inside := R._n; "
@@ -318,7 +318,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, second_call_same_key_is_hit_no_second_valu
     expectValueAndLeakFree(prog(
         "var tag1 := -1; var tag2 := -1; "
         "do "
-        "  using var d := new OwnedDictionary<string, R>(); "
+        "  using var d := new OwningDictionary<string, R>(); "
         "  var g1 := d.GetOrAdd(\"a\", (k: string) => move (new R(4))); "
         "  tag1 := g1.Tag(); "
         "  var g2 := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return move (new R(9)); end); "

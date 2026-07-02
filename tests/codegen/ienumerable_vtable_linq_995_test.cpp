@@ -216,13 +216,13 @@ BEZEL_TEST(ienumerable_vtable_linq_995, reenumeration_replays) {
         "  end Main; end P;"), 33);
 }
 
-// #1067: an OwnedArray<T> passed as an IEnumerable<T> PARAMETER and iterated
+// #1067: an OwningArray<T> passed as an IEnumerable<T> PARAMETER and iterated
 // through the interface (`for var a in xs`) must work. Pre-fix it SIGSEGV'd: the
 // call-site argument coercion (LlvmBackend_Assign.cpp) wrapped only `Array<T>`,
-// so the OwnedArray's bz_array_t layout was passed raw and the callee's vtable
-// dispatch called a null GetEnumerator slot. OwnedArray shares the bz_array_t
+// so the OwningArray's bz_array_t layout was passed raw and the callee's vtable
+// dispatch called a null GetEnumerator slot. OwningArray shares the bz_array_t
 // layout, so wrapArrayAsIEnumerable applies the same way; `Array<T>` (already
-// covered) and direct OwnedArray iteration are unaffected.
+// covered) and direct OwningArray iteration are unaffected.
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_array_as_ienumerable_param_1067) {
     BEZEL_EXPECT_EQ(run(
         "module M; class Item public V: int := 0; "
@@ -232,13 +232,13 @@ BEZEL_TEST(ienumerable_vtable_linq_995, owned_array_as_ienumerable_param_1067) {
         "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
         "  end Sum; "
         "  public static method Main(): int "
-        "    using var items: OwnedArray<Item> := [new Item(3), new Item(4)]; "
+        "    using var items: OwningArray<Item> := [new Item(3), new Item(4)]; "
         "    return Sum(items); "
         "  end Main; end C;"), 7);
 }
 
 // #1067 disposal: the IEnumerable wrapper SHARES the array (does not own it), so
-// after iterating-as-IEnumerable (twice) and disposing the OwnedArray, its owned
+// after iterating-as-IEnumerable (twice) and disposing the OwningArray, its owned
 // elements are disposed EXACTLY once (Cell.n net 0 — no leak, no double-free).
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_array_as_ienumerable_param_disposed_once_1067) {
@@ -251,16 +251,16 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
         "  end Sum; "
         "  public static method Main(): int "
-        "    do using var items: OwnedArray<Cell> := [new Cell(3), new Cell(4)]; "
+        "    do using var items: OwningArray<Cell> := [new Cell(3), new Cell(4)]; "
         "       var t: int := Sum(items); var u: int := Sum(items); end; "
         "    return Cell.n; "
         "  end Main; end C;"), 0);
 }
 
 // #1068: the #1067 fix extends to every DENSE bz_array_t-backed collection —
-// Stack/OwnedStack, Queue/OwnedQueue, OwnedBuffer (the set lowerArrayFor iterates
+// Stack/OwningStack, Queue/OwningQueue, OwningBuffer (the set lowerArrayFor iterates
 // directly). Each, passed as an IEnumerable<T> parameter and iterated, must work
-// (each previously SIGSEGV'd). Set/OwnedSet and LinkedList are NOT array-dense
+// (each previously SIGSEGV'd). Set/OwningSet and LinkedList are NOT array-dense
 // and stay out (#1069).
 namespace {
 std::string ifaceParamSum(const std::string& collDecl) {
@@ -279,19 +279,19 @@ std::string ifaceParamSum(const std::string& collDecl) {
 }  // namespace
 
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_param_1068) {
-    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedStack<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwningStack<Item>")), 7);
 }
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_queue_as_ienumerable_param_1068) {
-    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedQueue<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwningQueue<Item>")), 7);
 }
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_buffer_as_ienumerable_param_1068) {
-    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedBuffer<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwningBuffer<Item>")), 7);
 }
 BEZEL_TEST(ienumerable_vtable_linq_995, borrowing_stack_as_ienumerable_param_1068) {
     BEZEL_EXPECT_EQ(run(ifaceParamSum("Stack<Item>")), 7);
 }
 
-// #1068 disposal: an OwnedStack iterated through IEnumerable (twice) still
+// #1068 disposal: an OwningStack iterated through IEnumerable (twice) still
 // disposes its owned elements exactly once (the wrapper shares the collection).
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_disposed_once_1068) {
     BEZEL_EXPECT_EQ(run(
@@ -303,7 +303,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_disposed_once
         "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
         "  end Sum; "
         "  public static method Main(): int "
-        "    do using var c: OwnedStack<Cell> := [new Cell(3), new Cell(4)]; "
+        "    do using var c: OwningStack<Cell> := [new Cell(3), new Cell(4)]; "
         "       var t: int := Sum(c); var u: int := Sum(c); end; "
         "    return Cell.n; "
         "  end Main; end C;"), 0);
@@ -313,7 +313,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_disposed_once
 // iterated must work — via the node-walking wrapper (wrapLinkedListAsIEnumerable),
 // since a LinkedList is bz_llist-backed, not array-backed (it was SIGSEGV before).
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_linkedlist_as_ienumerable_param_1069) {
-    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwnedLinkedList<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwningLinkedList<Item>")), 7);
 }
 BEZEL_TEST(ienumerable_vtable_linq_995, borrowing_linkedlist_as_ienumerable_param_1069) {
     BEZEL_EXPECT_EQ(run(ifaceParamSum("LinkedList<Item>")), 7);
@@ -330,12 +330,12 @@ BEZEL_TEST(ienumerable_vtable_linq_995, linkedlist_as_ienumerable_reenumerates_1
         "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
         "  end Sum; "
         "  public static method Main(): int "
-        "    using var c: OwnedLinkedList<Item> := [new Item(3), new Item(4)]; "
+        "    using var c: OwningLinkedList<Item> := [new Item(3), new Item(4)]; "
         "    var a: int := Sum(c); var b: int := Sum(c); return a * 10 + b; "
         "  end Main; end C;"), 77);
 }
 
-// #1069 disposal: an OwnedLinkedList iterated through IEnumerable (twice) disposes
+// #1069 disposal: an OwningLinkedList iterated through IEnumerable (twice) disposes
 // its owned elements exactly once (the wrapper shares the list — no double-free).
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_linkedlist_as_ienumerable_disposed_once_1069) {
     BEZEL_EXPECT_EQ(run(
@@ -347,7 +347,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, owned_linkedlist_as_ienumerable_disposed
         "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
         "  end Sum; "
         "  public static method Main(): int "
-        "    do using var c: OwnedLinkedList<Cell> := [new Cell(3), new Cell(4)]; "
+        "    do using var c: OwningLinkedList<Cell> := [new Cell(3), new Cell(4)]; "
         "       var t: int := Sum(c); var u: int := Sum(c); end; "
         "    return Cell.n; "
         "  end Main; end C;"), 0);
@@ -364,14 +364,14 @@ BEZEL_TEST(ienumerable_vtable_linq_995, empty_linkedlist_as_ienumerable_param_10
         "    var s: int := 0; for var a in xs do s := s + a.V; end; return s + 99; "
         "  end Sum; "
         "  public static method Main(): int "
-        "    using var c: OwnedLinkedList<Item> := []; return Sum(c); "
+        "    using var c: OwningLinkedList<Item> := []; return Sum(c); "
         "  end Main; end C;"), 99);
 }
 
 // #1177 / §4.5 / §12.1: a LOCAL variable declared as IEnumerable<T> and bound
-// to an owning collection (OwnedArray, OwnedStack, OwnedQueue, OwnedLinkedList)
+// to an owning collection (OwningArray, OwningStack, OwningQueue, OwningLinkedList)
 // must iterate correctly. Pre-fix: the local initializer wrapped only Array<T>,
-// so OwnedArray etc. stored the raw bz_array_t* or bz_llist* in the
+// so OwningArray etc. stored the raw bz_array_t* or bz_llist* in the
 // IEnumerable<T> slot; lowerIEnumerableBuiltinFor then read vtable slot 4 off
 // the raw pointer (non-existent for owning collections) → SIGSEGV even on an
 // empty collection. Fix in LlvmBackend_Setup.cpp: extend the local-initializer
@@ -391,7 +391,7 @@ std::string ifaceLocalSum(const std::string& collDecl) {
 }
 }  // anonymous namespace
 
-// §4.5 / §12.1 / #1177: empty OwnedArray via IEnumerable local — no crash (was
+// §4.5 / §12.1 / #1177: empty OwningArray via IEnumerable local — no crash (was
 // SIGSEGV on HEAD before fix; the vtable-slot-4 read fired even on 0 elements).
 BEZEL_TEST(ienumerable_vtable_linq_995,
            empty_owned_array_as_ienumerable_local_no_crash_1177) {
@@ -400,39 +400,39 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "  public constructor(v: int) this.V := v; end constructor; end Item; "
         "class C "
         "  public static method Main(): int "
-        "    using var c := new OwnedArray<Item>(); "
+        "    using var c := new OwningArray<Item>(); "
         "    var e: IEnumerable<Item> := c; "
         "    var s: int := 0; for var a in e do s := s + a.V; end; return s + 99; "
         "  end Main; end C;"), 99);
 }
 
-// §4.5 / §12.1 / #1177: OwnedArray<Item> bound to IEnumerable<Item> local —
+// §4.5 / §12.1 / #1177: OwningArray<Item> bound to IEnumerable<Item> local —
 // for-in sees all elements and sums correctly (was SIGSEGV).
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_array_as_ienumerable_local_sum_1177) {
-    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedArray<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwningArray<Item>")), 7);
 }
 
 // §4.5 / §12.1 / #1177: other bz_array_t-backed owning collections via
 // IEnumerable<T> local — same fix, same wrapper (wrapArrayAsIEnumerable).
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_stack_as_ienumerable_local_sum_1177) {
-    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedStack<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwningStack<Item>")), 7);
 }
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_queue_as_ienumerable_local_sum_1177) {
-    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedQueue<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwningQueue<Item>")), 7);
 }
 
 // §4.5 / §12.1 / #1177: (Owned)LinkedList<T> via IEnumerable<T> local —
 // uses wrapLinkedListAsIEnumerable (node-walking), mirroring buildOrderedArgs.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_linkedlist_as_ienumerable_local_sum_1177) {
-    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwnedLinkedList<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(ifaceLocalSum("OwningLinkedList<Item>")), 7);
 }
 
 // §4.5 / §12.1 / #1177 disposal: the IEnumerable wrapper SHARES the collection
-// (does not own it), so after iterating via the local the OwnedArray still
+// (does not own it), so after iterating via the local the OwningArray still
 // disposes its elements exactly once at scope close (Cell.n net 0 — no leak,
 // no double-free). Covers the ownership-safety invariant of the #1177 fix.
 BEZEL_TEST(ienumerable_vtable_linq_995,
@@ -443,14 +443,14 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; "
         "class C "
         "  public static method Main(): int "
-        "    do using var items: OwnedArray<Cell> := [new Cell(3), new Cell(4)]; "
+        "    do using var items: OwningArray<Cell> := [new Cell(3), new Cell(4)]; "
         "       var e: IEnumerable<Cell> := items; "
         "       var s: int := 0; for var a in e do s := s + a.V; end; end; "
         "    return Cell.n; "
         "  end Main; end C;"), 0);
 }
 
-// §29.2 / §4.3 / #1310: a method RETURNING an owned OwnedArray<T> field coerced
+// §29.2 / §4.3 / #1310: a method RETURNING an owned OwningArray<T> field coerced
 // to its `IEnumerable<T>` view — binding the result then letting it leave scope
 // SIGSEGV'd (no iteration required): the raw bz_array_t* was returned unwrapped,
 // and the caller's scope-end disposal dispatched through the array's first word
@@ -462,8 +462,8 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
     BEZEL_EXPECT_EQ(run(
         "module M; class Dog end Dog; "
         "class Holder "
-        "  private owned arr: OwnedArray<Dog>; "
-        "  public constructor() arr := new OwnedArray<Dog>(); end constructor; "
+        "  private owned arr: OwningArray<Dog>; "
+        "  public constructor() arr := new OwningArray<Dog>(); end constructor; "
         "  public method Items(): IEnumerable<Dog> => arr; "
         "end Holder; "
         "class C "
@@ -476,7 +476,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
 
 // §29.2 / #1310: iterating the IEnumerable<T>-typed return (`=> expr` body)
 // walks the shared array through the wrapper's vtable protocol.
-// Migrated from OwnedArray<int> → OwnedArray<Cell> per stdlib §4.2/#1327.
+// Migrated from OwningArray<int> → OwningArray<Cell> per stdlib §4.2/#1327.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_iterated_1310) {
     BEZEL_EXPECT_EQ(run(
@@ -484,9 +484,9 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "class Cell public V: int := 0; "
         "  public constructor(v: int) V := v; end constructor; end Cell; "
         "class Holder "
-        "  private owned arr: OwnedArray<Cell>; "
+        "  private owned arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    arr := new OwnedArray<Cell>(); "
+        "    arr := new OwningArray<Cell>(); "
         "    arr.Add(new Cell(3)); arr.Add(new Cell(4)); "
         "  end constructor; "
         "  public method Items(): IEnumerable<Cell> => arr; "
@@ -502,7 +502,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
 // §29.2 / #1310: the explicit-ReturnStmt path (LlvmBackend_Stmts.cpp) wraps the
 // same way as the `=> expr` path; two independent coerced returns (one iterated,
 // one bind-only) from the same owned field are both safe.
-// Migrated from OwnedArray<int> → OwnedArray<Cell> per stdlib §4.2/#1327.
+// Migrated from OwningArray<int> → OwningArray<Cell> per stdlib §4.2/#1327.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_return_stmt_1310) {
     BEZEL_EXPECT_EQ(run(
@@ -510,9 +510,9 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "class Cell public V: int := 0; "
         "  public constructor(v: int) V := v; end constructor; end Cell; "
         "class Holder "
-        "  private owned arr: OwnedArray<Cell>; "
+        "  private owned arr: OwningArray<Cell>; "
         "  public constructor() "
-        "    arr := new OwnedArray<Cell>(); arr.Add(new Cell(5)); "
+        "    arr := new OwningArray<Cell>(); arr.Add(new Cell(5)); "
         "  end constructor; "
         "  public method Items(): IEnumerable<Cell> "
         "    return arr; "
@@ -537,9 +537,9 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "module M; class Dog public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end Dog; "
         "class Holder "
-        "  private owned arr: OwnedArray<Dog>; "
+        "  private owned arr: OwningArray<Dog>; "
         "  public constructor() "
-        "    arr := new OwnedArray<Dog>(); arr.Add(new Dog()); arr.Add(new Dog()); "
+        "    arr := new OwningArray<Dog>(); arr.Add(new Dog()); arr.Add(new Dog()); "
         "  end constructor; "
         "  public method Items(): IEnumerable<Dog> => arr; "
         "end Holder; "

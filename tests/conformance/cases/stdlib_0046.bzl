@@ -1,4 +1,4 @@
-public class OwnedDictionary<K, V>: IDisposable where V: class
+public class OwningDictionary<K, V>: IDisposable where V: class
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<K>);
@@ -23,12 +23,12 @@ public class OwnedDictionary<K, V>: IDisposable where V: class
   // Drain
   public method PopValue(key: K): owned V;     // raises if not present
   public method TryPopValue(key: K, out owned value: V): bool;
-  public method Drain(): OwnedEnumerable<DrainedEntry<K, V>>;
+  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
                                                // iteration drains the dictionary;
                                                //   each yielded entry owns its Value
 
   public method Clear();                        // disposes every value
-end OwnedDictionary;
+end OwningDictionary;
 
 public class DrainedEntry<K, V>: IDisposable where V: class
   public constructor(key: K, owned value: V);  // ownership of value transfers in
@@ -37,7 +37,7 @@ public class DrainedEntry<K, V>: IDisposable where V: class
                                                 //   so it may own its Value field
 end DrainedEntry;
 
-using var pool: OwnedDictionary<string, Connection> := [
+using var pool: OwningDictionary<string, Connection> := [
   "primary": Connect("p"),
   "backup":  Connect("b")
 ];

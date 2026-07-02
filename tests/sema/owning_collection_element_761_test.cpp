@@ -10,12 +10,12 @@
 // §3.6: such a property-dependent requirement "is rejected *at the
 // instantiation site*" — so the check fires for every spelling of the type, not
 // only `new`. §14.4 also states interfaces and nullable class types remain
-// admitted, and for `OwnedDictionary<K, V>` the owned slot is the VALUE V (keys
+// admitted, and for `OwningDictionary<K, V>` the owned slot is the VALUE V (keys
 // are value-like, §28.11).
 //
 // The under-enforcement this file pins down (and #761 fixes): the owning
-// collection family (`OwnedArray`, `OwnedSet`, `OwnedStack`, `OwnedQueue`,
-// `OwnedLinkedList`, `OwnedDictionary`) accepted a `string` / function element
+// collection family (`OwningArray`, `OwningSet`, `OwningStack`, `OwningQueue`,
+// `OwningLinkedList`, `OwningDictionary`) accepted a `string` / function element
 // with no diagnostic, in every spelling.
 
 #include "support/sema_support.hpp"
@@ -64,32 +64,32 @@ std::string wrap(const std::string& body) {
 // §3.6 / §14.4: the repro — a TYPED LOCAL (no `new`) must be rejected at the
 // instantiation site.
 BEZEL_TEST(owning_collection_element_761, typed_var_owned_array_string_rejected) {
-    auto r = parseSemaAll(wrap("using var arr: OwnedArray<string> := [];"));
+    auto r = parseSemaAll(wrap("using var arr: OwningArray<string> := [];"));
     BEZEL_EXPECT_TRUE(hasOwningElementError(r));
 }
 
 // §14.4: the `new` spelling is equally rejected.
 BEZEL_TEST(owning_collection_element_761, new_owned_array_string_rejected) {
-    auto r = parseSemaAll(wrap("using var arr := new OwnedArray<string>();"));
+    auto r = parseSemaAll(wrap("using var arr := new OwningArray<string>();"));
     BEZEL_EXPECT_TRUE(hasOwningElementError(r));
 }
 
-// §14.4 / §28.11: `OwnedDictionary<K, V>` owns its VALUES — a `string` VALUE is
+// §14.4 / §28.11: `OwningDictionary<K, V>` owns its VALUES — a `string` VALUE is
 // rejected (the key slot is value-like and unrestricted).
 BEZEL_TEST(owning_collection_element_761, owned_dictionary_string_value_rejected) {
-    auto r = parseSemaAll(wrap("using var d := new OwnedDictionary<int, string>();"));
+    auto r = parseSemaAll(wrap("using var d := new OwningDictionary<int, string>();"));
     BEZEL_EXPECT_TRUE(hasOwningElementError(r));
 }
 
 // §14.4: the restriction covers the whole owning family — Stack here.
 BEZEL_TEST(owning_collection_element_761, owned_stack_string_rejected) {
-    auto r = parseSemaAll(wrap("using var s := new OwnedStack<string>();"));
+    auto r = parseSemaAll(wrap("using var s := new OwningStack<string>();"));
     BEZEL_EXPECT_TRUE(hasOwningElementError(r));
 }
 
 // §14.4: a function value is the other runtime-managed reference type rejected.
 BEZEL_TEST(owning_collection_element_761, owned_array_function_rejected) {
-    auto r = parseSemaAll(wrap("using var a := new OwnedArray<() -> int>();"));
+    auto r = parseSemaAll(wrap("using var a := new OwningArray<() -> int>();"));
     BEZEL_EXPECT_TRUE(hasOwningElementError(r));
 }
 
@@ -100,27 +100,27 @@ BEZEL_TEST(owning_collection_element_761, owned_array_function_rejected) {
 
 // §14.4: a proper class element is the canonical admitted case.
 BEZEL_TEST(owning_collection_element_761, owned_array_class_admitted) {
-    auto r = parseSemaAll(wrap("using var a := new OwnedArray<Foo>();"));
+    auto r = parseSemaAll(wrap("using var a := new OwningArray<Foo>();"));
     BEZEL_EXPECT_FALSE(hasOwningElementError(r));
 }
 
-// §14.4: "interface types … OwnedArray<IConnection> is admitted."
+// §14.4: "interface types … OwningArray<IConnection> is admitted."
 BEZEL_TEST(owning_collection_element_761, owned_array_interface_admitted) {
-    auto r = parseSemaAll(wrap("using var a := new OwnedArray<IFoo>();"));
+    auto r = parseSemaAll(wrap("using var a := new OwningArray<IFoo>();"));
     BEZEL_EXPECT_FALSE(hasOwningElementError(r));
 }
 
 // §14.4: "the instantiation rule checks the underlying type, not the nullable
 // wrapper" — a nullable class element is admitted.
 BEZEL_TEST(owning_collection_element_761, owned_array_nullable_class_admitted) {
-    auto r = parseSemaAll(wrap("using var a := new OwnedArray<Foo?>();"));
+    auto r = parseSemaAll(wrap("using var a := new OwningArray<Foo?>();"));
     BEZEL_EXPECT_FALSE(hasOwningElementError(r));
 }
 
 // §28.11: an owning dictionary's KEY is value-like and unrestricted — a
 // `string` KEY with a class VALUE is admitted.
 BEZEL_TEST(owning_collection_element_761, owned_dictionary_string_key_class_value_admitted) {
-    auto r = parseSemaAll(wrap("using var d := new OwnedDictionary<string, Foo>();"));
+    auto r = parseSemaAll(wrap("using var d := new OwningDictionary<string, Foo>();"));
     BEZEL_EXPECT_FALSE(hasOwningElementError(r));
 }
 

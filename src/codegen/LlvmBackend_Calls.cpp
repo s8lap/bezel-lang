@@ -394,25 +394,25 @@ bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
         return false;
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
-    // per §4.6/§4.7: LinkedList/OwnedLinkedList are NOT array-backed — they
+    // per §4.6/§4.7: LinkedList/OwningLinkedList are NOT array-backed — they
     // use bz_llist_t. Exclude them here so they route through their own
     // tryLowerLinkedListInstanceCall handler rather than the bz_array_* paths.
-    return n == "Array" || n == "OwnedArray" ||
-           // §4.14: OwnedBuffer<T> is backed by bz_array_t* (same as Array<T>);
+    return n == "Array" || n == "OwningArray" ||
+           // §4.14: OwningBuffer<T> is backed by bz_array_t* (same as Array<T>);
            // indexer get/set and .Count go through the same bz_array_* runtime.
-           n == "OwnedBuffer" ||
-           n == "Stack" || n == "OwnedStack" ||
-           n == "Queue" || n == "OwnedQueue" ||
-           n == "Set" || n == "OwnedSet";
+           n == "OwningBuffer" ||
+           n == "Stack" || n == "OwningStack" ||
+           n == "Queue" || n == "OwningQueue" ||
+           n == "Set" || n == "OwningSet";
 }
 
-// per §4.6 / §4.7: true for LinkedList<T> and OwnedLinkedList<T> (bz_llist_t-backed).
+// per §4.6 / §4.7: true for LinkedList<T> and OwningLinkedList<T> (bz_llist_t-backed).
 bool Emitter::isLinkedListTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
-    return n == "LinkedList" || n == "OwnedLinkedList";
+    return n == "LinkedList" || n == "OwningLinkedList";
 }
 
 
@@ -423,16 +423,16 @@ bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
     if (n.empty()) return false;
     // stdlib §4.17 (#1354): SortedDictionary also has a K-indexed get/set
     // property and shares the bz_dict_t* runtime representation.
-    return n == "Dictionary" || n == "OwnedDictionary" || n == "SortedDictionary";
+    return n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary";
 }
 
 
 // issue #401 / stdlib §4.1 / §4.2 / §4.3: the int-indexed list interfaces.
 // IReadOnlyList<T> (get-only, §4.1) is the shared read-only view of BOTH the
-// borrowing array (Array<T>: IList<T>, §4.4) and the owning array (OwnedArray<T>:
-// IOwnedList<T>, §4.5). All three are array-backed at runtime, so an interface-
+// borrowing array (Array<T>: IList<T>, §4.4) and the owning array (OwningArray<T>:
+// IOwningList<T>, §4.5). All three are array-backed at runtime, so an interface-
 // typed receiver carries the same bz_array_t* as the concrete collection and the
-// indexer get/set lower through the identical bz_array_* runtime. IOwnedList<T>
+// indexer get/set lower through the identical bz_array_* runtime. IOwningList<T>
 // is the only owning-set (disposing) one; IReadOnlyList<T> / IList<T> are
 // borrowing — IReadOnlyList<T> is read-only so its setter branch never runs.
 bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
@@ -442,14 +442,14 @@ bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
     auto n = rt->astNode->name->parts[0];
-    if (n == "IOwnedList") { if (outOwning) *outOwning = true; return true; }
+    if (n == "IOwningList") { if (outOwning) *outOwning = true; return true; }
     return n == "IReadOnlyList" || n == "IList";
 }
 
 
 // fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces
-// (IReadOnlyCollection<T>, ICollection<T>, IOwnedCollection<T>).  Unlike the
-// list interfaces above — which only Array<T>/OwnedArray<T> implement, so an
+// (IReadOnlyCollection<T>, ICollection<T>, IOwningCollection<T>).  Unlike the
+// list interfaces above — which only Array<T>/OwningArray<T> implement, so an
 // interface-typed receiver is unambiguously the array-backed bz_array_t* — these
 // collection interfaces are implemented by collections with INCOMPATIBLE runtime
 // representations: Array/Stack/Queue (bz_array_t*, count at offset 8),
@@ -467,7 +467,7 @@ bool Emitter::isCollectionInterfaceName(const sema::TypeRef* rt) {
         return false;
     std::string_view n = builtinTypeName(rt);
     return n == "IReadOnlyCollection" || n == "ICollection" ||
-           n == "IOwnedCollection";
+           n == "IOwningCollection";
 }
 
 
@@ -575,7 +575,7 @@ sema::MethodSymbol* Emitter::classEqualsOverride(const sema::TypeSymbol* cls) {
 }
 
 
-// issue #400 / §25.2: the per-element comparison `Array<T>`/`OwnedArray<T>`'s
+// issue #400 / §25.2: the per-element comparison `Array<T>`/`OwningArray<T>`'s
 // `.Remove(item)` uses to match `el` (a stored element, borrowed) against
 // `target` (the query, a pure borrow — neither operand is consumed). The spec
 // requires collections to use the element type's `Equals` (§25.2: "which use
@@ -693,7 +693,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // / IndexOf / Insert) lower through the identical bz_array_* runtime — the
     // same bridge the indexer get/set already uses (#401). Without this they fell
     // through to a stub: Add was a silent no-op (#853). The OWNING list interface
-    // IOwnedList<T> is excluded here (outOwning) — mutation through it disposes
+    // IOwningList<T> is excluded here (outOwning) — mutation through it disposes
     // owned elements, which is deferred (diagnosed below). Read-only `.Count` is
     // a property handled in LlvmBackend_Exprs.cpp, not here.
     bool listIfaceOwning = false;
@@ -762,7 +762,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
     // fix #853 / stdlib §4.1–§4.3: a built-in collection member invoked through a
     // POLYMORPHIC collection interface (IReadOnlyCollection<T> / ICollection<T> /
-    // IOwnedCollection<T>) OR through the OWNING list interface (IOwnedList<T>).
+    // IOwningCollection<T>) OR through the OWNING list interface (IOwningList<T>).
     // These erase the concrete backing, which spans incompatible runtime
     // representations (bz_array_t* / bz_llist_t* / bz_dict_t*) with no shared kind
     // tag and no collection itable — so no single bz_* call is sound. Previously
@@ -777,7 +777,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         bool ownerOnly = false;
         bool isPolyCollIface =
             isCollectionInterfaceName(recvTy) ||
-            (isListInterfaceName(recvTy, &ownerOnly) && ownerOnly);  // IOwnedList
+            (isListInterfaceName(recvTy, &ownerOnly) && ownerOnly);  // IOwningList
         bool isBuiltinCollMember =
             m == "Add" || m == "Clear" || m == "Contains" || m == "Remove" ||
             m == "Insert" || m == "IndexOf" || m == "DisposeElements";
@@ -786,8 +786,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 Severity::Error, call.span.begin,
                 "`." + std::string(m) +
                 "` through a polymorphic collection interface "
-                "(IReadOnlyCollection<T> / ICollection<T> / IOwnedCollection<T> "
-                "/ IOwnedList<T>) is not yet supported in codegen "
+                "(IReadOnlyCollection<T> / ICollection<T> / IOwningCollection<T> "
+                "/ IOwningList<T>) is not yet supported in codegen "
                 "(stdlib \xC2\xA7""4.1\xE2\x80\x93\xC2\xA7""4.3, #853): these "
                 "interfaces are implemented by collections with incompatible "
                 "runtime representations (array / linked-list / hash-table) and "
@@ -931,7 +931,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(disposed, "DisposedAccessException");
         }
 
-        // issues #343 / D8 / §4.10: a Set<T>/OwnedSet<T> is backed by the
+        // issues #343 / D8 / §4.10: a Set<T>/OwningSet<T> is backed by the
         // generic-key hash table (allocated in the `new` path). Route its core
         // membership operations to the generic dict entry points so set
         // semantics follow the element's hash/equality (§8.3). This covers
@@ -942,7 +942,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
                          !recvTy->astNode->name->parts.empty() &&
                          (recvTy->astNode->name->parts[0] == "Set" ||
-                          recvTy->astNode->name->parts[0] == "OwnedSet");
+                          recvTy->astNode->name->parts[0] == "OwningSet");
         if (isSetName) {
             if (const sema::TypeRef* elemTy =
                     genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
@@ -2984,15 +2984,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // arrElemRef: the sema TypeRef for the element type (genericArgs[0]);
         // null for unparameterized collections (handled safely by elementPolicyFor).
         //
-        // owning family flag: the collection name starts with "Owned" (§28.11 table).
-        // NOTE: the Set/OwnedSet branch above already handled dict-backed sets and
+        // owning family flag: the collection name starts with "Owning" (§28.11 table).
+        // NOTE: the Set/OwningSet branch above already handled dict-backed sets and
         // returned; everything from here down is array-backed.
         const sema::TypeRef* arrElemRef =
             (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                      : nullptr;
         bool arrIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                            !recvTy->astNode->name->parts.empty() &&
-                           (recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0);
+                           (recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0);
         const ElementPolicy arrElemPol =
             elementPolicyFor(arrElemRef, arrIsOwning);
         // Convenience predicates derived from the policy (replacing the old
@@ -3000,7 +3000,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //
         //   arrIsStringElem: RuntimeManaged + non-nullable string primitive
         //     (same guard as emitArrayRetainStringsIfStringArray; the collection-
-        //     name guard is already enforced above: the Set/OwnedSet branch
+        //     name guard is already enforced above: the Set/OwningSet branch
         //     returned, so we are in an array-backed collection; Owned* is
         //     excluded at instantiation, §15.2).
         //     #602 batch 4: isStringElementArray was deleted; the RuntimeManaged
@@ -3122,16 +3122,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         };
 
         // .Add(v) / .Push(v) / .Enqueue(v)
-        // stdlib §4.10 / §8.3 (#837): OwnedSet<T>.Add(owned item) for class-typed
+        // stdlib §4.10 / §8.3 (#837): OwningSet<T>.Add(owned item) for class-typed
         // T DEDUPLICATES — on a duplicate (per T's equality contract, honouring a
         // user `Equals` override) it silently disposes the passed item rather than
         // appending. The generic array Add below just appends, which on a set is a
         // wrong-Count / duplicate-membership bug. Mirrors the TryAdd scan but
-        // returns unit. Gated to OwnedSet (OwnedArray.Add must still append).
+        // returns unit. Gated to OwningSet (OwningArray.Add must still append).
         {
             bool isOwnedSetRecv = recvTy && recvTy->astNode &&
                 recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0] == "OwnedSet";
+                recvTy->astNode->name->parts[0] == "OwningSet";
             if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
                 isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -3220,7 +3220,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
             return llvm::ConstantInt::get(i32(), 0);  // unit/void result
         }
-        // fix #654-tail B / stdlib §4.10: OwnedSet<T>.TryAdd(owned item): bool
+        // fix #654-tail B / stdlib §4.10: OwningSet<T>.TryAdd(owned item): bool
         // for class-typed T (array-backed path — class elements are ineligible
         // for the dict-backed set path since genericBackingType returns null for
         // class types). Equality for class T follows §8.3: a user `Equals`
@@ -3292,7 +3292,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return phi;
         }
         // per §4.5: .Insert(index, item) — insert at index, shifting up. For an
-        // OwnedArray<T> the item is `owned` (already moved in by the caller);
+        // OwningArray<T> the item is `owned` (already moved in by the caller);
         // there is no element to dispose (a fresh slot is created, not a
         // replacement), so insertion is the same op for owning and borrowing
         // arrays — the runtime just shifts and stores the element bytes.
@@ -3343,13 +3343,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     len, builder_.getInt64(0), "peek.empty");
                 emitGuardThrow(isEmpty, "InvalidOperationException");
                 // fix #654-tail A / stdlib §4.11: Peek() FIFO semantics for
-                // Queue/OwnedQueue — front element (index 0); Stack/OwnedStack
+                // Queue/OwningQueue — front element (index 0); Stack/OwningStack
                 // peek the top element (last inserted, index len-1).
                 bool isQueuePeek = recvTy && recvTy->astNode &&
                     recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
                     (recvTy->astNode->name->parts[0] == "Queue" ||
-                     recvTy->astNode->name->parts[0] == "OwnedQueue");
+                     recvTy->astNode->name->parts[0] == "OwningQueue");
                 if (isQueuePeek)
                     idx = builder_.getInt64(0);
                 else
@@ -3384,7 +3384,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // arrIsStringElem and arrElemPol.retainRelease derived from arrElemPol.
             // #919: pick the displaced-element disposer — the string-release
             // thunk for a borrowing Array<string>, OR the element disposer thunk
-            // for an OWNING collection of class elements (OwnedArray<Cell>).
+            // for an OWNING collection of class elements (OwningArray<Cell>).
             // Without the latter, .Set leaked the replaced owned element; the
             // array owns it, so disposing it (exactly as the indexer setter
             // `arr[i] := v` does) is sound — no double-free.
@@ -3438,7 +3438,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                "IndexOutOfRangeException");
             }
             // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.135 fix #619:
-            // OwnedArray<T>.RemoveAt disposes the removed element (ClassOwned row —
+            // OwningArray<T>.RemoveAt disposes the removed element (ClassOwned row —
             // class or interface); a borrowing Array<string> releases the removed
             // element's co-owned +1 (RuntimeManaged row). The two disposers are
             // mutually exclusive; arrElemPol.disposerThunk is non-null for ClassOwned.
@@ -3458,7 +3458,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return llvm::ConstantInt::get(i32(), 0);
         }
         // per §4.4/§4.5: .Remove(item): bool — find the first matching element
-        // and remove it; returns whether one was found. For an OwnedArray<T> the
+        // and remove it; returns whether one was found. For an OwningArray<T> the
         // matched (class) element is DISPOSED (and freed) via the element
         // disposer, mirroring RemoveAt; for a borrowing Array<T> the slot is
         // just removed. Match semantics (issue #400 / §25.2 — "collections use
@@ -3607,7 +3607,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // fix #642 / stdlib §4.5: .PopAt(index): owned T / .PopLast(): owned T /
         // .PopFirst(): owned T  — remove and return the element at the given slot,
         // transferring ownership to the caller.  Unlike Pop/Dequeue (Stack/Queue),
-        // these are defined on OwnedArray<T> and its alias forms.
+        // these are defined on OwningArray<T> and its alias forms.
         // Ownership rule (§4.5 / §28.11 v0.135): the slot is removed WITHOUT
         // disposal — bz_array_pop_at copies the element bytes BEFORE shifting so
         // the pointer is captured before the shift, then the slot is removed.
@@ -3629,7 +3629,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // per stdlib §4.5 (#1199): PopAt(index) calls BoundsCheck(index)
                 // first, raising IndexOutOfRangeException when index < 0 or
                 // index >= Count (this also covers the empty-array case, where
-                // Count == 0). Mirrors the OwnedArray indexer / ElementAt
+                // Count == 0). Mirrors the OwningArray indexer / ElementAt
                 // bounds-check. Without this guard bz_array_pop_at leaves *out
                 // unwritten on an out-of-bounds index, so the caller reads an
                 // uninitialized owned T and faults (SIGSEGV) instead of throwing.
@@ -3661,7 +3661,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // fix #831 / stdlib §4.5: .TryPopFirst(out owned item): bool /
         // .TryPopLast(out owned item): bool — the TRY analogue of PopFirst /
-        // PopLast on OwnedArray<T>. On a non-empty array write the first/last
+        // PopLast on OwningArray<T>. On a non-empty array write the first/last
         // element to the out param and remove it WITHOUT disposal (ownership
         // transfers to the out param), returning true; on empty return false and
         // leave the out param unchanged. Before this fix it fell through to no
@@ -3702,7 +3702,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // .Clear()
         if (m == "Clear" && call.args.empty()) {
             // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.134:
-            // OwnedArray<T>.Clear disposes every element (ClassOwned row via
+            // OwningArray<T>.Clear disposes every element (ClassOwned row via
             // arrElemPol.disposerThunk). A borrowing Array<string> releases each
             // element's co-owned +1 (RuntimeManaged row via arrIsStringElem).
             // The two paths are mutually exclusive; all derived from arrElemPol.
@@ -3886,10 +3886,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // #602 / §28.11 v0.134: hoist one element-slot policy lookup for the
         // dictionary VALUE slot.  Per §28.11 the "value" slot of a Dictionary
         // follows the same borrowing/owning column as the collection family.
-        // OwnedDictionary owns its values; borrowing Dictionary borrows/
+        // OwningDictionary owns its values; borrowing Dictionary borrows/
         // runtime-manages them (string values in the RuntimeManaged row).
         //
-        // dictValIsOwning: a dictionary name starting with "Owned" (OwnedDictionary).
+        // dictValIsOwning: a dictionary name starting with "Owning" (OwningDictionary).
         // Note: dictValueBoxFreer (record-value boxing path) is not a policy-table
         // concern — record values are value types and land in the Value row of the
         // §28.11 table.  Their heap-boxing is a STORAGE encoding detail (inttoptr
@@ -3897,12 +3897,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // keep dictValueBoxFreer calls unchanged (batch 3 / #602 follow-on).
         bool dictValIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                                !recvTy->astNode->name->parts.empty() &&
-                               (recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0);
+                               (recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0);
         const ElementPolicy dictValPol =
             elementPolicyFor(valTy, dictValIsOwning);
         // Convenience predicate: is this a borrowing Dictionary<K, string>?
         //   RuntimeManaged + non-nullable string primitive + NOT owning.
-        // Mirrors isStringValueDict (same exclusions: OwnedDictionary excluded,
+        // Mirrors isStringValueDict (same exclusions: OwningDictionary excluded,
         // nullable string? excluded, function types share RuntimeManaged but
         // use a different release path — same string-vs-function distinction).
         bool dictIsStringValue =
@@ -3912,7 +3912,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             valTy->kind == sema::TypeRef::Kind::Primitive &&
             valTy->primitive == sema::PrimitiveType::String &&
             !valTy->nullable;
-        // dictValClassDisposer: non-null for OwnedDictionary<K, class-or-interface V>.
+        // dictValClassDisposer: non-null for OwningDictionary<K, class-or-interface V>.
         // Derived from dictValPol (elementPolicyFor) which now handles both Class
         // and Interface correctly per §28.11 v0.135 fix #619.
         llvm::Function* dictValClassDisposer = dictValPol.disposerThunk;
@@ -4024,7 +4024,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // §4.8 / §4.9: .Clear() — empty the table in place (it stays allocated;
         // Count is 0 afterward). The value-disposal obligation mirrors the
         // scope-end Dispose exactly (bz_dict_free in LlvmBackend_Setup.cpp):
-        //   * OwnedDictionary<K, class>  → dispose+free every surviving value via
+        //   * OwningDictionary<K, class>  → dispose+free every surviving value via
         //     its own vtable (owningDictValueDisposer): "Clear(); // disposes
         //     every value" (§4.9). Each value is disposed EXACTLY ONCE — a value
         //     displaced earlier by the indexer setter (#388) was already removed
@@ -4044,12 +4044,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // generic mode — for every live entry).
         if (m == "Clear" && call.args.empty()) {
             // #602 / §28.11 v0.134: derive disposer from dictValPol (hoisted above).
-            // dictValClassDisposer: non-null for OwnedDictionary<K,class> (ClassOwned).
+            // dictValClassDisposer: non-null for OwningDictionary<K,class> (ClassOwned).
             // dictValueBoxFreer: kept unchanged (value-type record box; not a policy
             //   table decision — batch 3 / #602 follow-on).
             // dictIsStringValue: borrowing Dictionary<K,string> → release each +1.
             // per §28.11 v0.135 fix #619: dictValClassDisposer is now non-null for
-            // interface-valued OwnedDictionary (class-or-interface element).
+            // interface-valued OwningDictionary (class-or-interface element).
             llvm::Function* disp = dictValClassDisposer;
             if (!disp) disp = dictValueBoxFreer(recvTy);
             if (!disp && dictIsStringValue)
@@ -4091,7 +4091,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             llvm::Value* v = lowerExpr(*call.args[1].value);
             if (!k || !v) return nullptr;
-            // §4.8 / #1201 / #1214: Dictionary.Add and OwnedDictionary.Add must
+            // §4.8 / #1201 / #1214: Dictionary.Add and OwningDictionary.Add must
             // throw ArgumentException when the key is already present (the indexer
             // setter `d[k] := v` is the add-or-update / overwrite path and must
             // not throw).  .Set is sema-rejected per §4.8 v0.148; the m=="Set"
@@ -4115,7 +4115,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         "ArgumentException");
                 }
             }
-            // fix #1214 / §4.8 / §28.3: OwnedDictionary.Add on a duplicate key
+            // fix #1214 / §4.8 / §28.3: OwningDictionary.Add on a duplicate key
             // must throw ArgumentException AND dispose the transferred owned value
             // (§28.3 discharge rule) before throwing — the value won't be inserted
             // so ownership must be consumed here or it leaks.  Cannot use
@@ -4166,23 +4166,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, kd, kl, vPtr});
             return llvm::ConstantInt::get(i32(), 0);
         }
-        // .Remove(k): bool — per §4.9: OwnedDictionary.Remove disposes the
+        // .Remove(k): bool — per §4.9: OwningDictionary.Remove disposes the
         // removed value (exactly once) before unlinking; a non-owning
         // Dictionary.Remove unlinks without disposal (§4.8, borrows).
         // #429 / §28.9: a borrowing Dictionary<K, string> co-owns a +1 per
         // stored value — Remove must release the removed value's +1 (else it
         // leaks). Use the disposing-remove variant with stringElementReleaseThunk
-        // as the value-disposer, exactly mirroring the OwnedDictionary path.
+        // as the value-disposer, exactly mirroring the OwningDictionary path.
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
-            // For an OwnedDictionary<K, class> get the value disposer thunk
+            // For an OwningDictionary<K, class> get the value disposer thunk
             // (same helper Clear uses, so the dispose logic is exactly-once
             // and consistent). For borrowing Dictionary<K, string>, get the
             // string-release thunk. For borrowing Dict or non-class/non-string
             // values, valDisp is null → fall through to plain non-disposing remove.
             // #602 / §28.11 v0.135 fix #619: derive disposer from dictValPol (hoisted
-            // above).  dictValClassDisposer: OwnedDictionary<K,class-or-interface>
+            // above).  dictValClassDisposer: OwningDictionary<K,class-or-interface>
             // (ClassOwned row per §28.11 v0.135).
             // dictIsStringValue: borrowing Dictionary<K,string> (RuntimeManaged row).
             llvm::Function* valDisp = dictValClassDisposer;
@@ -4190,7 +4190,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 valDisp = stringElementReleaseThunk();
             if (keyTy) {
                 if (valDisp) {
-                    // OwnedDictionary (or Dict<K,string>) with generic key.
+                    // OwningDictionary (or Dict<K,string>) with generic key.
                     auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
                                         {ptrTy(), ptrTy(), ptrTy()});
                     return builder_.CreateCall(
@@ -4202,7 +4202,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             auto [kd, kl] = strDataLen(k);
             if (valDisp) {
-                // OwnedDictionary (or Dict<string,string>) with string key.
+                // OwningDictionary (or Dict<string,string>) with string key.
                 auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 return builder_.CreateCall(
@@ -4216,7 +4216,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // value for key k, remove the entry WITHOUT disposing the value
         // (ownership transfers to the caller), raise if absent.
         // Unlike Remove(k) which disposes, PopValue transfers the owned V out.
-        // Only meaningful on OwnedDictionary<K,V>; the borrowing Dictionary does
+        // Only meaningful on OwningDictionary<K,V>; the borrowing Dictionary does
         // not expose a PopValue method.
         if (m == "PopValue" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
@@ -4261,7 +4261,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             return valPtr;  // pointer value (class/string)
         }
-        // .TryPopValue(k, out owned v): bool — stdlib §4.9 OwnedDictionary.
+        // .TryPopValue(k, out owned v): bool — stdlib §4.9 OwningDictionary.
         // The TRY analogue of PopValue: get-then-remove WITHOUT disposing the
         // value (ownership transfers to the out param), but return false and
         // leave the out param unchanged when the key is absent (instead of
@@ -4416,7 +4416,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // .GetOrAdd(k, factory): V  (stdlib §4.8 borrowing / §4.9 owning)
         //   Dictionary<K,V>:       factory is (K) -> V
-        //   OwnedDictionary<K,V>:  factory is (K) -> owned V, result is a BORROW
+        //   OwningDictionary<K,V>:  factory is (K) -> owned V, result is a BORROW
         //
         // Semantics (§4.8 / §4.9): if `k` is present, return the existing value
         // and DO NOT invoke the factory; otherwise invoke factory(k) to produce a
@@ -4424,7 +4424,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // heap-boxed, class pointers stored directly), and return that value.
         //
         // Ownership (the cardinal risk, §28.3 / §28.8):
-        //   * OwnedDictionary MISS: the factory yields an `owned V` (+1 class
+        //   * OwningDictionary MISS: the factory yields an `owned V` (+1 class
         //     pointer); we STORE it (the dict takes ownership, exactly as
         //     `Add(owned)` / the indexer set does — encodeValue stores the pointer
         //     directly, bz_dict_set_* records it) and RETURN A BORROW = the stored
@@ -4433,7 +4433,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //     in the ownership checker classifies the GetOrAdd result as Borrowed
         //     (no resolved `owned` return), so the caller gets no disposal
         //     obligation — no double-free.
-        //   * OwnedDictionary HIT: the factory is NOT invoked (the call is in the
+        //   * OwningDictionary HIT: the factory is NOT invoked (the call is in the
         //     miss branch only), so no owned V is produced — nothing leaks. The
         //     existing slot's value is returned as a borrow.
         //   * Borrowing Dictionary: V is a value/record/string; the factory yields
@@ -6408,7 +6408,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // to bz_task_from_result. ptr-result types (class objects, task pointers)
         // are stored as i64 sizeof(void*); integer types are stored at their
         // natural width. Per the doc, this handles non-class T (value types, int,
-        // bool, etc.) only — OwnedTask<T> for class T is FromOwnedResult (deferred).
+        // bool, etc.) only — OwningTask<T> for class T is FromOwnedResult (deferred).
         if (m == "FromResult" && !call.args.empty() && call.args[0].value) {
             llvm::Value* val = lowerExpr(*call.args[0].value);
             if (!val) return nullptr;
@@ -6427,17 +6427,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 "task.from_result");
         }
         // stdlib §6.7 (line 2993) / §30.5 Pattern B:
-        // Task.FromOwnedResult<T>(owned value: T): OwnedTask<T> where T: class.
+        // Task.FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class.
         // Build an already-completed OWNED task carrying the owned class-pointer
         // result. The value is a ptr (a class object handle); store it into a
         // stack slot and complete the task with sizeof(void*) bytes — the same
         // already-done task primitive FromResult uses, but the stored result is
         // the heap-object pointer the awaiter takes ownership of (Pattern B).
-        // The ownership pass treats `await OwnedTask<T>` as the consume point that
+        // The ownership pass treats `await OwningTask<T>` as the consume point that
         // disposes the awaited task and transfers the owned T to the awaiter, so
         // the value here is NOT released at the call site (it flows into the task
         // and out through the await). Without this arm the call produced no value
-        // and the OwnedTask<T> local was codegen'd with i32 storage → the await's
+        // and the OwningTask<T> local was codegen'd with i32 storage → the await's
         // bz_task_is_done(i32 …) IR mismatch (#939) / runtime crash (#940).
         if (m == "FromOwnedResult" && !call.args.empty() &&
             call.args[0].value) {
@@ -6519,7 +6519,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* elemTaskTy = arrTy->genericArgs[0];
                 // elemTaskTy should be Task<T>.
                 auto elemName = builtinTypeName(elemTaskTy);
-                if ((elemName == "Task" || elemName == "OwnedTask") &&
+                if ((elemName == "Task" || elemName == "OwningTask") &&
                     !elemTaskTy->genericArgs.empty() &&
                     elemTaskTy->genericArgs[0]) {
                     // T is elemTaskTy->genericArgs[0].
@@ -6557,14 +6557,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateCall(whenAnyFn, {arr}, "task.when_any");
         }
         // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
-        //   owned tasks: OwnedArray<OwnedTask<T>>): OwnedTask<OwnedArray<T>>
+        //   owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>>
         //   where T: class.
         //
         // Pattern B aggregator for class T. The caller transfers ownership of
-        // the OwnedArray<OwnedTask<T>>; bz_task_when_all_owned collects each
-        // OwnedTask<T> result (a pointer) into a new OwnedArray<T> and frees
-        // each input task and the input array. Returns OwnedTask<OwnedArray<T>>
-        // (a bz_task_t* whose result is an OwnedArray<T> pointer).
+        // the OwningArray<OwningTask<T>>; bz_task_when_all_owned collects each
+        // OwningTask<T> result (a pointer) into a new OwningArray<T> and frees
+        // each input task and the input array. Returns OwningTask<OwningArray<T>>
+        // (a bz_task_t* whose result is an OwningArray<T> pointer).
         if (m == "WhenAllOwned" && !call.args.empty() && call.args[0].value) {
             llvm::Value* arr = lowerExpr(*call.args[0].value);
             if (!arr) return nullptr;
@@ -9895,7 +9895,7 @@ void Emitter::unifyMethodReturnTypeArg(
             added = true;
         }
         // §12 / §14.2 / #1246: when `nm` is a BUILTIN GENERIC TYPE name (e.g.
-        // "OwnedArray", "Array", "LinkedList") and NOT a type-parameter name,
+        // "OwningArray", "Array", "LinkedList") and NOT a type-parameter name,
         // the user-type branch below (both declaration=non-null) never fires for
         // builtin collections (declaration=null). Without this block the function
         // returns here and the generic args are discarded unseen, leaving T
@@ -9907,7 +9907,7 @@ void Emitter::unifyMethodReturnTypeArg(
         //
         // Fix: if the declared type is a builtin (no declaration) with generic
         // args and the actual type has the SAME builtin name, recurse pairwise
-        // so that `OwnedArray<T>` vs `OwnedArray<B>` produces T=B. The binding
+        // so that `OwningArray<T>` vs `OwningArray<B>` produces T=B. The binding
         // then triggers the force-specialisation check at the call site (see
         // ~line 12343) which inlines the method body under the concrete subst.
         if (!isParam && !declRet->genericArgs.empty() &&
@@ -9990,7 +9990,7 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                         return lvalueAddr(receiver, slotTy);
                 }
                 // #963 / §28.11 / §29.2: a for-loop variable of an
-                // `OwnedEnumerable<T>` loop (`for var x in Gen()`) is a
+                // `IOwningEnumerable<T>` loop (`for var x in Gen()`) is a
                 // LocalSymbol whose decl is the ForStmt (sema sets `lsym->decl =
                 // fs`), not a LocalDecl. Each yielded element is OWNED by the
                 // loop variable — the iterator transfers ownership on yield and
@@ -10000,7 +10000,7 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                 // reclaimed the element block (a normal-path leak). Reclaiming +
                 // nulling here frees it exactly once. A BORROW loop (over an
                 // Array<T> / IEnumerable<T> the collection still owns) is NOT an
-                // OwnedEnumerable, so its loop variable is correctly excluded.
+                // IOwningEnumerable, so its loop variable is correctly excluded.
                 if (auto* fs = dynamic_cast<const ast::ForStmt*>(loc->decl)) {
                     const sema::TypeRef* itTy =
                         fs->iterable ? ctx_.exprType(*fs->iterable) : nullptr;
@@ -10012,7 +10012,7 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                         else if (!itTy->importedName.empty())
                             inm = itTy->importedName;
                     }
-                    if (inm == "OwnedEnumerable")
+                    if (inm == "IOwningEnumerable")
                         return lvalueAddr(receiver, slotTy);
                 }
                 return nullptr;
@@ -10131,7 +10131,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // collection path so they intercept LINQ calls on both Array<T> receivers
     // and lazy IEnumerable<T> receivers (chaining).
     if (auto* v = tryLowerLazyLinqCall(call)) return v;
-    // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-based API.
+    // per §4.6/§4.7: LinkedList<T>/OwningLinkedList<T> node-based API.
     if (auto* v = tryLowerLinkedListInstanceCall(call)) return v;
     // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> instance methods and
     // Array<T>.AsSpan()/AsReadOnlySpan() construction.
@@ -10148,7 +10148,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerMutexLockCall(call)) return v;
     // §6.3 / issue #647: Semaphore.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.
     if (auto* v = tryLowerSemaphoreTokenCall(call)) return v;
-    // §6.6 / issue #974: TaskCompletionSource / OwnedTaskCompletionSource methods.
+    // §6.6 / issue #974: TaskCompletionSource / OwningTaskCompletionSource methods.
     if (auto* v = tryLowerTcsCall(call)) return v;
     // §6.4 / issue #647: Atomic<T> / AtomicInteger<T> instance methods.
     if (auto* v = tryLowerAtomicCall(call)) return v;
@@ -11188,7 +11188,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         // §30.3 (#941): `t.Wait()` — the synchronous escape hatch on a Task /
-        // Task<T> / OwnedTask<T> receiver (a builtin class with no MethodSymbol,
+        // Task<T> / OwningTask<T> receiver (a builtin class with no MethodSymbol,
         // so this call would otherwise fall through and be silently dropped,
         // leaving statements after `await Task.Delay(N)` un-run). Wait() blocks
         // the calling thread until the task completes (its continuation, run on
@@ -11236,7 +11236,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         // issue #1002 / §29.3 / §29.11 / stdlib §4.4/§4.12: explicit
-        // `arr.GetEnumerator()` on a builtin Array<T>/OwnedArray<T> receiver.
+        // `arr.GetEnumerator()` on a builtin Array<T>/OwningArray<T> receiver.
         // The stdlib types this `owned IEnumerator<T>`, and sema now types the
         // result as the builtin IEnumerator<T> sentinel (so #494 MoveNext/Current
         // typing fires). Lower it to a concrete iterator-vtable enumerator by
@@ -11264,12 +11264,12 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // GetAsyncEnumerator path returns for the async iterator — so a
                 // `using var it := C.Gen().GetEnumerator()` disposes exactly that
                 // one struct (slot 1) with no separate leaked source temp and no
-                // double-free. (The Array/OwnedArray case below instead wraps +
+                // double-free. (The Array/OwningArray case below instead wraps +
                 // clones because the array is a distinct long-lived object.)
                 if (isVtableBackedIEnumerableType(recvTy)) {
                     return lowerExpr(*ma->target);
                 }
-                if ((rbn == "Array" || rbn == "OwnedArray") && recvTy &&
+                if ((rbn == "Array" || rbn == "OwningArray") && recvTy &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                     llvm::Value* arr = lowerExpr(*ma->target);
                     if (arr && arr->getType()->isPointerTy()) {
@@ -11308,7 +11308,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         // issue #494 / §29.2 / §29.3: explicit `e.MoveNext()` call where `e` is
-        // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
+        // typed as the builtin IEnumerator<T> or IOwningEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol for MoveNext). The iterator state
         // struct's vtable layout is [0]=td, [1]=Dispose, [2]=MoveNext(→i1),
         // [3]=Current(→T) — the same layout emitted by emitIteratorMethod.
@@ -11326,7 +11326,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
                     (recvTy->astNode->name->parts[0] == "IEnumerator" ||
-                     recvTy->astNode->name->parts[0] == "OwnedEnumerator");
+                     recvTy->astNode->name->parts[0] == "IOwningEnumerator");
                 if (isBuiltinEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -11346,7 +11346,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         // #1349 / §29.1 v0.161: explicit `e.TakeCurrent()` on builtin
-        // OwnedEnumerator<T> / OwnedAsyncEnumerator<T> (no sema TypeDecl).
+        // IOwningEnumerator<T> / IOwningAsyncEnumerator<T> (no sema TypeDecl).
         // Dispatches vtable slot 3 (same slot as IEnumerator Current).
         // emitPendingCheck() follows because TakeCurrent may raise
         // InvalidOperationException (double-take / before-first / after-exhaust).
@@ -11361,8 +11361,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->astNode->name->parts[0] == "OwnedEnumerator" ||
-                     recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerator");
+                    (recvTy->astNode->name->parts[0] == "IOwningEnumerator" ||
+                     recvTy->astNode->name->parts[0] == "IOwningAsyncEnumerator");
                 if (isOwningEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -11387,14 +11387,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
-        // #1349 / §29.1 v0.161: explicit `src.GetOwnedEnumerator()` on builtin
-        // OwnedEnumerable<T>. Dispatches vtable slot 4 (same as GetEnumerator in
+        // #1349 / §29.1 v0.161: explicit `src.GetOwningEnumerator()` on builtin
+        // IOwningEnumerable<T>. Dispatches vtable slot 4 (same as GetEnumerator in
         // lowerIEnumerableBuiltinFor) to produce a fresh, independent
-        // OwnedEnumerator<T> clone. The result is typed OwnedEnumerator<T> (by
+        // IOwningEnumerator<T> clone. The result is typed IOwningEnumerator<T> (by
         // sema), so using-var disposal wires up via isSyncIterEnum in Setup.cpp.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
-            if (ma->member == "GetOwnedEnumerator" && ma->target &&
+            if (ma->member == "GetOwningEnumerator" && ma->target &&
                     call.args.empty()) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 bool isOwnedEnumerable =
@@ -11403,7 +11403,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    recvTy->astNode->name->parts[0] == "OwnedEnumerable";
+                    recvTy->astNode->name->parts[0] == "IOwningEnumerable";
                 if (isOwnedEnumerable) {
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (src && src->getType()->isPointerTy()) {
@@ -11421,7 +11421,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         // issue #759 / §29.3 / §30.7: explicit `e.MoveNextAsync()` where `e` is
-        // the builtin IAsyncEnumerator<T> / OwnedAsyncEnumerator<T> (no sema
+        // the builtin IAsyncEnumerator<T> / IOwningAsyncEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol). Same async-iterator vtable layout
         // [0]=td,[1]=Dispose,[2]=MoveNextAsync(→Task<bool> ptr),[3]=Current —
         // the layout emitAsyncIteratorMethod emits and `await for` dispatches.
@@ -11440,7 +11440,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
                     (recvTy->astNode->name->parts[0] == "IAsyncEnumerator" ||
-                     recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerator");
+                     recvTy->astNode->name->parts[0] == "IOwningAsyncEnumerator");
                 if (isAsyncEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -11477,7 +11477,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
                     (recvTy->astNode->name->parts[0] == "IAsyncEnumerable" ||
-                     recvTy->astNode->name->parts[0] == "OwnedAsyncEnumerable");
+                     recvTy->astNode->name->parts[0] == "IOwningAsyncEnumerable");
                 if (isAsyncEnumerable) {
                     if (!call.args.empty() && call.args[0].value)
                         (void)lowerExpr(*call.args[0].value);
@@ -11492,7 +11492,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 call.callee.get())) {
             if (ma->member == "Dispose" && ma->target) {
                 // issue #1002 / §29.3 / §29.7: explicit `e.Dispose()` where `e`
-                // is the builtin IEnumerator<T> / OwnedEnumerator<T> sentinel (a
+                // is the builtin IEnumerator<T> / IOwningEnumerator<T> sentinel (a
                 // GetEnumerator result, or a yield-method enumerator). It has no
                 // sema TypeDecl, so the generic Dispose dispatch below would not
                 // recognise it and the enumerator struct/frame would leak. Its
@@ -11506,7 +11506,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 {
                     auto* recvTy = ctx_.exprType(*ma->target);
                     std::string_view ebn = builtinTypeName(recvTy);
-                    if (ebn == "IEnumerator" || ebn == "OwnedEnumerator") {
+                    if (ebn == "IEnumerator" || ebn == "IOwningEnumerator") {
                         llvm::Value* obj = lowerExpr(*ma->target);
                         if (obj && obj->getType()->isPointerTy()) {
                             llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
@@ -11858,7 +11858,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         recvTy->astNode->name &&
                         !recvTy->astNode->name->parts.empty() &&
                         (recvTy->astNode->name->parts[0] == "Set" ||
-                         recvTy->astNode->name->parts[0] == "OwnedSet");
+                         recvTy->astNode->name->parts[0] == "OwningSet");
                     bool dictBackedSet = isSetName &&
                         genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
                             != nullptr;
@@ -11869,7 +11869,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             llvm::ConstantPointerNull::get(ptrTy())});
                     } else if (isLinkedListTypeName(recvTy)) {
                         // per §4.6/§4.7: LinkedList<T>.Dispose() → bz_llist_free.
-                        // OwnedLinkedList<T> cascades disposal into class elements.
+                        // OwningLinkedList<T> cascades disposal into class elements.
                         // #602 / §28.11 v0.135: route directly through elementPolicyFor.
                         {
                             const sema::TypeRef* llElem =
@@ -11878,7 +11878,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool llIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0].rfind("Owned",0) == 0;
+                                recvTy->astNode->name->parts[0].rfind("Owning",0) == 0;
                             llvm::Function* elemDisp =
                                 elementPolicyFor(llElem, llIsOwning).disposerThunk;
                             llvm::Value* disp = elemDisp
@@ -11904,7 +11904,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool arrIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0].rfind("Owned",0) == 0;
+                                recvTy->astNode->name->parts[0].rfind("Owning",0) == 0;
                             llvm::Function* elemDisp =
                                 elementPolicyFor(arrElem, arrIsOwning).disposerThunk;
                             llvm::Value* disp = elemDisp
@@ -11922,7 +11922,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         // Dispose() on a hash-backed dictionary frees the backing
                         // table (and key bytes) and runs the per-value callback,
                         // the same one the #394/#401 scope-end path uses:
-                        //   * OwnedDictionary<K, class/interface> → dispose+free
+                        //   * OwningDictionary<K, class/interface> → dispose+free
                         //     each surviving value (#396/#394).
                         //   * borrowing Dictionary<K, record> → free each
                         //     surviving record value BOX (#401; a record is a
@@ -11947,7 +11947,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool dictIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0] == "OwnedDictionary";
+                                recvTy->astNode->name->parts[0] == "OwningDictionary";
                             llvm::Function* valDisp =
                                 elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
                             if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
@@ -14289,7 +14289,7 @@ bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
 // cases (those carry a declaration or take a dedicated wrap path) and the
 // richer list interfaces (IReadOnlyList/IList — array-backed, indexer-bearing,
 // NOT vtable objects) and the polymorphic collection interfaces
-// (IReadOnlyCollection/ICollection/IOwnedCollection — diagnosed, #853).
+// (IReadOnlyCollection/ICollection/IOwningCollection — diagnosed, #853).
 bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
@@ -14301,7 +14301,7 @@ bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
     // the iterator vtable (slot-1 Dispose, slot-4 GetEnumerator). These are
     // implemented uniformly by the yield-iterator / array-wrapper / user-class
     // -wrapper producers (§29.11), so the vtable read is always in-bounds.
-    return n == "IEnumerable" || n == "OwnedEnumerable";
+    return n == "IEnumerable" || n == "IOwningEnumerable";
 }
 
 // issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
@@ -14387,7 +14387,7 @@ llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
                       !otherTy->astNode->name->parts.empty() &&
                       !otherTy->declaration &&
                       (otherTy->astNode->name->parts[0] == "Set" ||
-                       otherTy->astNode->name->parts[0] == "OwnedSet") &&
+                       otherTy->astNode->name->parts[0] == "OwningSet") &&
                       genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
 
     const sema::TypeRef* otherElem =
@@ -15322,13 +15322,13 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // bz_dict_t*, not a bz_array_t* — wrap it via the Set lazy source, which
     // snapshots the element keys. Only the generic dict-backed Sets (record /
     // primitive / enum / string elements) need this; a plain class-element
-    // OwnedSet is array-backed and takes the ARRAY path below.
+    // OwningSet is array-backed and takes the ARRAY path below.
     elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                        : nullptr;
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
         (recvTy->astNode->name->parts[0] == "Set" ||
-         recvTy->astNode->name->parts[0] == "OwnedSet")) {
+         recvTy->astNode->name->parts[0] == "OwningSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
@@ -15336,7 +15336,7 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set");
         }
     }
-    // per §4.6/§4.7 + §5 fix #450: LinkedList<T>/OwnedLinkedList<T> is
+    // per §4.6/§4.7 + §5 fix #450: LinkedList<T>/OwningLinkedList<T> is
     // IEnumerable<T> but backed by bz_llist_t*, not bz_array_t*.  Wrap via
     // bz_lazy_from_llist so LINQ operators can enumerate it correctly.
     if (isLinkedListTypeName(recvTy)) {
@@ -15903,7 +15903,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
 
 
 // ---------------------------------------------------------------------------
-// per §4.6/§4.7: LinkedList<T> / OwnedLinkedList<T> node-based API codegen.
+// per §4.6/§4.7: LinkedList<T> / OwningLinkedList<T> node-based API codegen.
 // The runtime is bz_llist_t (doubly-linked list of inline-value nodes).
 // A LinkedListNode<T> Bezel value is a raw ptr to bz_llist_node_t; `.Value`
 // loads the inline bytes; `.Next`/`.Previous` follow the pointer chain.
@@ -15926,7 +15926,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // handling below.  tryLowerLinkedListInstanceCall handles CALL forms.)
 
     // -----------------------------------------------------------------------
-    // LinkedList<T> / OwnedLinkedList<T> method lowerings.
+    // LinkedList<T> / OwningLinkedList<T> method lowerings.
     // -----------------------------------------------------------------------
     if (!isLinkedListTypeName(recvTy)) return nullptr;
 
@@ -15934,7 +15934,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     int64_t esz = collectionElemSize(recvTy);
     bool isOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    recvTy->astNode->name->parts[0] == "OwnedLinkedList";
+                    recvTy->astNode->name->parts[0] == "OwningLinkedList";
 
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv) return nullptr;
@@ -15946,9 +15946,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
 
     // #602 / §28.11 v0.134: hoist one element-slot policy lookup for LinkedList
     // operations that need per-element equality (Find/Remove/Contains) or disposal
-    // (OwnedLinkedList RemoveFirst/RemoveLast/Clear/Remove).
+    // (OwningLinkedList RemoveFirst/RemoveLast/Clear/Remove).
     // LinkedList is always in the borrowing family (no Owned* string elements);
-    // OwnedLinkedList is in the owning family (isOwning flag above).
+    // OwningLinkedList is in the owning family (isOwning flag above).
     const sema::TypeRef* llElemRef =
         (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
     const ElementPolicy llElemPol = elementPolicyFor(llElemRef, isOwning);
@@ -16006,9 +16006,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         return builder_.CreateCall(fn,
             {recv, node, slot, builder_.getInt64(esz)}, "ll.addAfter");
     }
-    // --- PopFirst(): owned T / PopLast(): owned T (OwnedLinkedList only) ---
+    // --- PopFirst(): owned T / PopLast(): owned T (OwningLinkedList only) ---
     // fix #642 / stdlib §4.7: transfer ownership of the first/last element to the
-    // caller; remove WITHOUT disposal.  Only valid on OwnedLinkedList<T> (the
+    // caller; remove WITHOUT disposal.  Only valid on OwningLinkedList<T> (the
     // borrowing LinkedList<T> has no owned-return variants).
     if ((m == "PopFirst" || m == "PopLast") && call.args.empty()) {
         // Guard: raise InvalidOperationException when empty.
@@ -16032,7 +16032,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     }
     // --- TryPopFirst(out owned item): bool / TryPopLast(out owned item): bool ---
     // fix #831 / stdlib §4.7: the TRY analogue of PopFirst / PopLast on
-    // OwnedLinkedList<T>. On a non-empty list write the first/last element to the
+    // OwningLinkedList<T>. On a non-empty list write the first/last element to the
     // out param and remove it WITHOUT disposal (ownership transfers to the out
     // param), returning true; on empty return false and leave the out param
     // unchanged. Before this fix it fell through → malformed IR (bug16).
@@ -16173,7 +16173,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* cnt = builder_.CreateCall(fn, {recv}, "ll.cnt");
         return builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
     }
-    // --- Clear() --- disposes all elements (OwnedLinkedList) and frees all
+    // --- Clear() --- disposes all elements (OwningLinkedList) and frees all
     // nodes, then re-allocates an empty list. Simplest: remove all from front.
     // We implement by calling bz_llist_free then re-alloc would break existing
     // pointer. Instead: walk and free each node via remove_first repeatedly.
@@ -16204,14 +16204,14 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.SetInsertPoint(endBB);
         return llvm::ConstantInt::get(i32(), 0);
     }
-    // --- Remove(item): bool — per §4.6/§4.3 IOwnedCollection ---
+    // --- Remove(item): bool — per §4.6/§4.3 IOwningCollection ---
     // fix #565 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
     // raw element bytes, comparing bz_string* pointer values (not content) for
     // string elements and raw pointer bytes for records with string fields.
     // Mirror the #562 fix for LinkedList<T>.Contains: walk node-by-node applying
     // emitRemoveElementEquality for per-element comparison, then call
     // bz_llist_remove_node on the matching node (unlinks + optionally disposes).
-    // Ownership semantics are preserved: OwnedLinkedList passes its disposer;
+    // Ownership semantics are preserved: OwningLinkedList passes its disposer;
     // non-owning LinkedList passes null (§4.6, borrows — no element disposal).
     if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
@@ -16267,7 +16267,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
                                                      "llr.fnd");
         llvm::Value* found = builder_.CreateICmpNE(foundNode, nullP, "llr.found");
         // If found, call RemoveNode (which unlinks + optionally disposes).
-        // OwnedLinkedList disposes the element; LinkedList borrows, no disposal.
+        // OwningLinkedList disposes the element; LinkedList borrows, no disposal.
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk from policy
         // hoist.  Interface elements now produce a non-null disposerThunk.
         llvm::Function* elemDisp =
@@ -16457,15 +16457,15 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 
     // -----------------------------------------------------------------------
     // Array<T>.AsSpan() / AsReadOnlySpan() — construct a span from an array.
-    // §4.14 / #636: OwnedBuffer<T> uses the same bz_array_t* backing as
-    // Array<T>, so OwnedBuffer<T>.AsSpan() / AsReadOnlySpan() lower identically.
+    // §4.14 / #636: OwningBuffer<T> uses the same bz_array_t* backing as
+    // Array<T>, so OwningBuffer<T>.AsSpan() / AsReadOnlySpan() lower identically.
     // The resulting span struct is { ptr source, i32 start, i32 length } —
     // the same bz.arrayspan used for ArraySpan<T> / ReadOnlyArraySpan<T>.
     // Previously a duplicate path in tryLowerSerializationCall handled only
     // the byte-element case and lacked bounds checks; delegating here closes
     // that gap and gives a single, element-width–correct lowering for all T.
     // -----------------------------------------------------------------------
-    if ((rcn == "Array" || rcn == "OwnedBuffer") &&
+    if ((rcn == "Array" || rcn == "OwningBuffer") &&
         (m == "AsSpan" || m == "AsReadOnlySpan")) {
         // The span element type and size are those of the array (genericArgs[0]).
         llvm::Value* arr = lowerExpr(*ma->target);
@@ -16552,7 +16552,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 
     // -----------------------------------------------------------------------
     // ArraySpan<T> / ReadOnlyArraySpan<T> (§4.15, borrowing) and
-    // Span<T> / ReadOnlySpan<T> (§4.14, owning over OwnedBuffer) instance method
+    // Span<T> / ReadOnlySpan<T> (§4.14, owning over OwningBuffer) instance method
     // calls. All four share the bz.arrayspan layout, so the read-only / value
     // surface (Length, IsEmpty, Slice, IndexOf, Contains, SequenceEqual,
     // AsReadOnly, CopyTo, CopyFrom, Fill, Reverse) lowers identically. The owning
@@ -16958,7 +16958,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 
     // -- Clear() — owning Span<classT> only (§4.14) ---------------------------
     // Dispose every owned element and leave each slot NULL (moved-from), so the
-    // underlying OwnedBuffer's scope-end disposal skips them (no double-free).
+    // underlying OwningBuffer's scope-end disposal skips them (no double-free).
     if (m == "Clear" && isOwningSpan && call.args.empty()) {
         llvm::Function* disp =
             elementPolicyFor(spanElemRef, /*owningFamily=*/true).disposerThunk;
@@ -17291,7 +17291,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 //   Channel<T>:
 //     NewSender()               → bz_channel_new_sender(ch)        → ptr (ChannelSender<T>)
 //     Send(owned item)          → bz_channel_send(ch, item)        → void
-//     Receive()                 → bz_channel_receive(ch, cce_vtable) → Task/OwnedTask<T>
+//     Receive()                 → bz_channel_receive(ch, cce_vtable) → Task/OwningTask<T>
 //     TryReceive(out item)      → bz_channel_try_receive(ch, &slot)  → bool
 //     Count                     → bz_channel_count(ch)             → int
 //     IsClosed                  → bz_channel_is_closed(ch)         → bool
@@ -17299,7 +17299,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 //   ChannelSender<T>:
 //     Send(owned item)          → bz_channel_sender_send(tx, item) → void
 //     Dispose()                 → bz_channel_sender_release(tx, cce_vtable) → void
-//   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable) → OwnedTask<R>
+//   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable) → OwningTask<R>
 // ---------------------------------------------------------------------------
 llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
@@ -17370,7 +17370,7 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 return nullptr;  // void — handled; fallthrough is benign (no symbol match)
             }
 
-            // Receive(): returns a Task<T> or OwnedTask<T>.
+            // Receive(): returns a Task<T> or OwningTask<T>.
             if (mname == "Receive" && call.args.empty()) {
                 auto* fn = declareC("bz_channel_receive", ptrTy(),
                                     {ptrTy(), ptrTy()});
@@ -17885,8 +17885,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
 //
 //   Acquire()                 → bz_mutex_acquire(mx)             → ptr (owned Lock)
 //   TryAcquire(timeout: ts)   → bz_mutex_try_acquire(mx, ms)     → ptr? (owned Lock?)
-//   AcquireAsync(token?)      → bz_mutex_acquire_async(mx,t,oce) → ptr (OwnedTask<Lock>)
-//   TryAcquireAsync(ts,tok?)  → bz_mutex_try_acquire_async(...)  → ptr (OwnedTask<Lock?>)
+//   AcquireAsync(token?)      → bz_mutex_acquire_async(mx,t,oce) → ptr (OwningTask<Lock>)
+//   TryAcquireAsync(ts,tok?)  → bz_mutex_try_acquire_async(...)  → ptr (OwningTask<Lock?>)
 //   Dispose()                 → handled in the explicit-Dispose block above.
 //
 // TryAcquire lowers the TimeSpan argument to milliseconds (i64) using
@@ -17937,10 +17937,10 @@ llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
 
     // §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync.
     //
-    // AcquireAsync(token := CancellationToken.None): OwnedTask<Lock>
+    // AcquireAsync(token := CancellationToken.None): OwningTask<Lock>
     //   → bz_mutex_acquire_async(mx, token, oce_vtable)
     // TryAcquireAsync(timeout: TimeSpan,
-    //                  token := CancellationToken.None): OwnedTask<Lock?>
+    //                  token := CancellationToken.None): OwningTask<Lock?>
     //   → bz_mutex_try_acquire_async(mx, timeout_ms, token, oce_vtable)
     //
     // token is the last argument (optional with default CancellationToken.None).
@@ -18010,8 +18010,8 @@ llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
 //
 //   Acquire()                 → bz_semaphore_acquire(sem)             → ptr (SemaphoreToken)
 //   TryAcquire(timeout: ts)   → bz_semaphore_try_acquire(sem, ms)     → ptr? (SemaphoreToken?)
-//   AcquireAsync(token?)      → bz_semaphore_acquire_async(sem,t,oce) → ptr (OwnedTask<SemaphoreToken>)
-//   TryAcquireAsync(ts,tok?)  → bz_semaphore_try_acquire_async(...)   → ptr (OwnedTask<SemaphoreToken?>)
+//   AcquireAsync(token?)      → bz_semaphore_acquire_async(sem,t,oce) → ptr (OwningTask<SemaphoreToken>)
+//   TryAcquireAsync(ts,tok?)  → bz_semaphore_try_acquire_async(...)   → ptr (OwningTask<SemaphoreToken?>)
 //   Dispose()                 → handled in the explicit-Dispose block above.
 //
 // Mirrors tryLowerMutexLockCall exactly, substituting Semaphore/SemaphoreToken
@@ -18259,7 +18259,7 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
 }
 
 
-// §6.6 / issue #974: TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+// §6.6 / issue #974: TaskCompletionSource<T> / OwningTaskCompletionSource<T> /
 // TaskCompletionSource (non-generic) instance method lowering.
 //
 // Handled methods:
@@ -18272,7 +18272,7 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
 //   Dispose()                      → no-op here; real work done by emitDisposals
 //
 // Detection: receiver builtin type name "TaskCompletionSource" or
-// "OwnedTaskCompletionSource" (both map to a bz_tcs_t* opaque pointer).
+// "OwningTaskCompletionSource" (both map to a bz_tcs_t* opaque pointer).
 llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -18281,7 +18281,7 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
     const std::string_view mname = ma->member;
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
     std::string_view rcn = builtinTypeName(recvTy);
-    if (rcn != "TaskCompletionSource" && rcn != "OwnedTaskCompletionSource")
+    if (rcn != "TaskCompletionSource" && rcn != "OwningTaskCompletionSource")
         return nullptr;
 
     llvm::Value* tcs = lowerExpr(*ma->target);
@@ -18306,7 +18306,7 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
 
     // TrySetResult / SetResult — pass the value through a stack slot.
     // Pattern mirrors Task.FromResult (LlvmBackend_Calls.cpp §6.7 arm above).
-    // For OwnedTaskCompletionSource<T>, T is a class pointer — same layout as
+    // For OwningTaskCompletionSource<T>, T is a class pointer — same layout as
     // any other pointer-width value; ownership transfer is the caller's concern.
     if ((mname == "TrySetResult" || mname == "SetResult") &&
         !call.args.empty() && call.args[0].value) {

@@ -21,7 +21,7 @@
 //   • Clear() + re-add → fresh order.
 //   • Growth across rehash (50 keys): insertion order preserved.
 //   • `in` operator and indexer: unaffected (still work correctly).
-//   • OwnedDictionary basic ops: regression guard.
+//   • OwningDictionary basic ops: regression guard.
 //
 // Order verification method: assign value 'i+1' to the (i+0)-th inserted key,
 // then compute result = v[0]*10000 + v[1]*1000 + v[2]*100 + v[3]*10 + v[4]*1.
@@ -404,10 +404,10 @@ BEZEL_TEST(dict_insertion_order_622, indexer_read_write_unaffected) {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedDictionary: basic ops regression guard (§4.9 — order not promised)
+// OwningDictionary: basic ops regression guard (§4.9 — order not promised)
 // ---------------------------------------------------------------------------
 
-// #622 regression guard / stdlib §4.9: OwnedDictionary<string, V> basic ops
+// #622 regression guard / stdlib §4.9: OwningDictionary<string, V> basic ops
 // (Set/Remove/Count) still work after the runtime changes. The order tracking
 // array is maintained but §4.9 makes no iteration-order promise. Insert 3 keys,
 // remove 1, Count == 2. (The VALUE is a class — per §14.4 an owning dictionary
@@ -417,7 +417,7 @@ BEZEL_TEST(dict_insertion_order_622, owned_dict_basic_ops_regression) {
     BEZEL_EXPECT_EQ(run(
         "module M; class V public n: int := 0; end V; "
         "class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, V>(); "
+        "  using var od := new OwningDictionary<string, V>(); "
         "  od[\"k1\"] := new V(); "
         "  od[\"k2\"] := new V(); "
         "  od[\"k3\"] := new V(); "
@@ -426,7 +426,7 @@ BEZEL_TEST(dict_insertion_order_622, owned_dict_basic_ops_regression) {
         "end Main; end C;"), 2);
 }
 
-// #622 regression guard / stdlib §4.9: OwnedDictionary.Clear() disposes values
+// #622 regression guard / stdlib §4.9: OwningDictionary.Clear() disposes values
 // and does not leak. After Clear(), Count == 0; a new value can be added. (The
 // VALUE is a class with a real disposal obligation — §14.4 requires a class
 // value for an owning dictionary, which also makes the "disposes values"
@@ -435,7 +435,7 @@ BEZEL_TEST(dict_insertion_order_622, owned_dict_clear_then_reuse) {
     BEZEL_EXPECT_EQ(run(
         "module M; class V public n: int := 0; end V; "
         "class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, V>(); "
+        "  using var od := new OwningDictionary<string, V>(); "
         "  od[\"a\"] := new V(); "
         "  od[\"b\"] := new V(); "
         "  od.Clear(); "

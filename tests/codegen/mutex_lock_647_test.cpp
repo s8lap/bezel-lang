@@ -463,13 +463,13 @@ static int compileAndRunAsyncRetrying(const std::string& source) {
 
 // ---------------------------------------------------------------------------
 // §6.2 / #647 / v0.139 — IR-level: AcquireAsync / TryAcquireAsync no longer
-// produce a "not yet implemented" diagnostic; the returned OwnedTask<Lock> /
-// OwnedTask<Lock?> types are correctly set so the IR emits without errors.
+// produce a "not yet implemented" diagnostic; the returned OwningTask<Lock> /
+// OwningTask<Lock?> types are correctly set so the IR emits without errors.
 // ---------------------------------------------------------------------------
 
 // §6.2 / #647 / v0.139: AcquireAsync compiles to valid IR without errors.
-// The call appears in an async method; the returned OwnedTask<Lock> is awaited.
-// Verifies: sema assigns OwnedTask<Lock> type → codegen emits bz_mutex_acquire_async
+// The call appears in an async method; the returned OwningTask<Lock> is awaited.
+// Verifies: sema assigns OwningTask<Lock> type → codegen emits bz_mutex_acquire_async
 // call → await machinery lowers correctly → module is valid.
 BEZEL_TEST(codegen_mutex_acquire_async_6_2_v0139, acquire_async_compiles_valid_ir) {
     const std::string source =
@@ -627,7 +627,7 @@ BEZEL_TEST(codegen_mutex_acquire_async_aot_6_2_v0139, try_acquire_async_zero_tim
 // Two-domain shapes require an async Worker entry for Domain.Spawn. Async
 // entry functions have return type `Task<T>` (the state-machine wrapper), so
 // `Domain.Spawn(Worker.Run, move mch)` where Run returns Task<int> yields
-// `OwnedTask<Task<int>>` — a doubly-nested task that requires two awaits to
+// `OwningTask<Task<int>>` — a doubly-nested task that requires two awaits to
 // unwrap.  This is valid IR but sets an unusual precedent as the first such
 // test in the suite.
 //

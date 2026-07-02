@@ -115,13 +115,13 @@ constexpr const char* kCell =
     "  public constructor(x: int) this.v := x; end constructor; "
     "end Cell; ";
 
-// §7.4 (#1161): direct `.member` on an `OwnedBuffer<classT>` index result
+// §7.4 (#1161): direct `.member` on an `OwningBuffer<classT>` index result
 // (typed `Cell?` per #1157) is rejected — narrow to non-null first.
 BEZEL_TEST(nullable_field_narrowing_862, ownedbuffer_index_member_rejected_1161) {
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  return buf[0].v; "  // §7.4: index result is Cell? — not narrowable
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -151,7 +151,7 @@ BEZEL_TEST(nullable_field_narrowing_862, ownedbuffer_index_bang_member_accepted_
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  buf[0] := new Cell(7); "
         "  return buf[0]!.v; "  // §7.4: `!` narrows — accepted
         "end Main; end C;");
@@ -166,7 +166,7 @@ BEZEL_TEST(nullable_field_narrowing_862, nonnullable_record_index_member_accepte
         "module M; "
         "record Pt(x: int, y: int); "
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Pt>(2); "
+        "  using var buf := new OwningBuffer<Pt>(2); "
         "  buf[0] := new Pt(3, 4); "
         "  return buf[0].x; "  // §7.4: record elem is non-nullable — accepted
         "end Main; end C;");

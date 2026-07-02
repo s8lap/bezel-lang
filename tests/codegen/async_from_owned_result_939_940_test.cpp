@@ -1,17 +1,17 @@
 // Codegen — issues #939 / #940 (discovery sweep #10): `Task.FromOwnedResult<T>`
 // (§30.5 Pattern B / stdlib §6.7) had no sema result type and no codegen, so an
-// `OwnedTask<T>` value produced by it (a `using var task := Task.FromOwnedResult
+// `OwningTask<T>` value produced by it (a `using var task := Task.FromOwnedResult
 // <Cell>(...)` local, or the inline `await Task.FromOwnedResult<...>()`) fell to
 // the i32 placeholder storage. The await lowering then called the task runtime
 // helpers with the wrong argument type:
 //   #939 (IR_FAIL): `call i1 @bz_task_is_done(i32 ...)` — the verifier rejected
 //                   the malformed IR.
 //   #940 (SIGSEGV): the same mismatch surfacing at runtime (compiles, crashes).
-// The fix types `Task.FromOwnedResult<T>(...)` as `OwnedTask<T>` (so the local /
+// The fix types `Task.FromOwnedResult<T>(...)` as `OwningTask<T>` (so the local /
 // await-result lowers to a ptr task handle) AND lowers it to an already-completed
 // task carrying the owned class-pointer result (bz_task_from_result, ptr-width).
 //
-// SOUNDNESS (§30.5 Pattern B / §28.3): awaiting an `OwnedTask<Cell>` yields an
+// SOUNDNESS (§30.5 Pattern B / §28.3): awaiting an `OwningTask<Cell>` yields an
 // OWNED Cell; `using var result := await ...` must dispose that Cell EXACTLY ONCE
 // at scope end (net Cell.n == 0). The awaited task itself is disposed exactly once
 // too. The Cell static counter (ctor n++ / dtor n--) is the leak / double-free
@@ -71,13 +71,13 @@ BEZEL_TEST(async_from_owned_result_939_940, from_owned_result_bound_local_dispos
 }
 
 // #940: canonical Pattern B `using var result := await Producer()`, where the
-// producer is an async method returning OwnedTask<Cell>. Must compile and run
+// producer is an async method returning OwningTask<Cell>. Must compile and run
 // WITHOUT crashing; the owned result is alive while in scope (Cell.n == 1).
 BEZEL_TEST(async_from_owned_result_939_940, await_producer_inline_alive_in_scope) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
         "class C "
-        "  public static async method ProduceAsync(): OwnedTask<Cell> "
+        "  public static async method ProduceAsync(): OwningTask<Cell> "
         "    return new Cell(); "
         "  end ProduceAsync; "
         "  public static async method ConsumeAsync(): Task<int> "
@@ -97,7 +97,7 @@ BEZEL_TEST(async_from_owned_result_939_940, await_producer_inline_disposed_once)
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
         "class C "
-        "  public static async method ProduceAsync(): OwnedTask<Cell> "
+        "  public static async method ProduceAsync(): OwningTask<Cell> "
         "    return new Cell(); "
         "  end ProduceAsync; "
         "  public static async method ConsumeAsync(): Task<int> "

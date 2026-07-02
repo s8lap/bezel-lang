@@ -7,6 +7,6 @@ using var snapshot: Array<int> := [1, 2, 3];
 // snapshot.Count == 3 throughout its lifetime; no Add calls
 
 // Owning heap array
-using var pool: OwnedArray<Connection> := [
+using var pool: OwningArray<Connection> := [
   Connect("a"), Connect("b"), Connect("c")
 ];

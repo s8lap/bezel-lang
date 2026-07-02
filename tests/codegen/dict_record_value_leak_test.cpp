@@ -14,7 +14,7 @@
 //
 // The bug (#401, contained half): the scope-end `using var` disposal of a
 // borrowing Dictionary<K, record> called bz_dict_free with a NULL value-disposer
-// (only owning OwnedDictionary<K, class> passed one, via #394). bz_dict_free thus
+// (only owning OwningDictionary<K, class> passed one, via #394). bz_dict_free thus
 // freed the backing table and its key bytes but NOT the record-value boxes →
 // each surviving box leaked. The fix passes a value-box-FREE callback (a plain
 // `free`, NO destructor — records are value types) for a borrowing
@@ -22,7 +22,7 @@
 //
 // No-double-free scoping (the critical invariant, mirroring #394):
 //   * The box-free callback is for the value-BOX case (record/value-type values
-//     in a plain Dictionary) ONLY. An OwnedDictionary<K, class> still routes
+//     in a plain Dictionary) ONLY. An OwningDictionary<K, class> still routes
 //     through #394's owning-class value-disposer (dispose + free via the
 //     object's vtable), NOT the box-free — its values are class objects, not
 //     boxes, and must be disposed exactly once. The #394 regression guard below
@@ -229,9 +229,9 @@ const char* kStrExplicitDispose =
     "end; "                             // scope-end disposal is a no-op
     "return v;";
 
-// --- #394 regression guard: OwnedDictionary<K, class> values disposed once. --
+// --- #394 regression guard: OwningDictionary<K, class> values disposed once. --
 
-// An OwnedDictionary<K, R> (R a class) must STILL dispose its class values
+// An OwningDictionary<K, R> (R a class) must STILL dispose its class values
 // exactly once at scope end via #394's owning-class value-disposer — NOT via
 // the new value-box-free path (a class value is an object, not a record box).
 // R's destructor bumps a static counter; two survivors are disposed once each
@@ -245,7 +245,7 @@ const char* kOwnedDictClassValuesGuard =
     "end R; "
     "class C public static method Main(): int "
     "  do "
-    "    using var d := new OwnedDictionary<string, R>(); "
+    "    using var d := new OwningDictionary<string, R>(); "
     "    d.Add(\"a\", move (new R())); "
     "    d.Add(\"b\", move (new R())); "
     "  end; "
@@ -289,10 +289,10 @@ BEZEL_TEST(codegen_dict_record_value_leak_401, str_key_explicit_dispose_no_doubl
     expectValueAndLeakFree(prog(kStrExplicitDispose), 9);
 }
 
-// ---- #394 regression guard: OwnedDictionary class values still once (§4.9) -
+// ---- #394 regression guard: OwningDictionary class values still once (§4.9) -
 
 BEZEL_TEST(codegen_owned_dict_class_value_guard_401, class_values_disposed_once_not_box_freed_4_9) {
-    // OwnedDictionary<string, R> (R a class): the #401 box-free MUST NOT touch
+    // OwningDictionary<string, R> (R a class): the #401 box-free MUST NOT touch
     // these class values — they are disposed exactly once via #394's owning-
     // class value-disposer → R._n == 2. LSan leg: no double-free / no leak.
     expectValueAndLeakFree(kOwnedDictClassValuesGuard, 2);

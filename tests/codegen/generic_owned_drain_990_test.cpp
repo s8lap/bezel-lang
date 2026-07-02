@@ -1,7 +1,7 @@
 // Codegen — GENERIC owning-collection .Drain() (#990).
 //
 // stdlib §4.5/§4.7/§4.11 / §14.2: `for var item in coll.Drain()` over an owning
-// sequence collection (OwnedArray/Stack/Queue/LinkedList) inside a GENERIC class
+// sequence collection (OwningArray/Stack/Queue/LinkedList) inside a GENERIC class
 // `Wrapper<T> where T: class`, where the element type is the unresolved type
 // parameter `T`.
 //
@@ -145,28 +145,28 @@ std::string makeGenericProgram(const std::string& collType,
 }  // namespace
 
 // ===========================================================================
-// §4.5 / §14.2 / #990: generic OwnedArray<T>.Drain() — compile + dispose-once
+// §4.5 / §14.2 / #990: generic OwningArray<T>.Drain() — compile + dispose-once
 // ===========================================================================
 
 // The element type T is an unresolved class type parameter; the drain compiles
 // (no IR_FAIL) and disposes each drained element exactly once (R._n == 0).
 BEZEL_TEST(generic_owned_drain_990, ownedarray_generic_drain_disposes_once_spec_4_5) {
-    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedArray", "Add")), 0);
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwningArray", "Add")), 0);
 }
 
-// §4.11 / §14.2: generic OwnedStack<T>.Drain().
+// §4.11 / §14.2: generic OwningStack<T>.Drain().
 BEZEL_TEST(generic_owned_drain_990, ownedstack_generic_drain_disposes_once_spec_4_11) {
-    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedStack", "Push")), 0);
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwningStack", "Push")), 0);
 }
 
-// §4.11 / §14.2: generic OwnedQueue<T>.Drain().
+// §4.11 / §14.2: generic OwningQueue<T>.Drain().
 BEZEL_TEST(generic_owned_drain_990, ownedqueue_generic_drain_disposes_once_spec_4_11) {
-    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedQueue", "Enqueue")), 0);
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwningQueue", "Enqueue")), 0);
 }
 
-// §4.7 / §14.2: generic OwnedLinkedList<T>.Drain() (AddLast inserts).
+// §4.7 / §14.2: generic OwningLinkedList<T>.Drain() (AddLast inserts).
 BEZEL_TEST(generic_owned_drain_990, ownedlinkedlist_generic_drain_disposes_once_spec_4_7) {
-    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwnedLinkedList", "AddLast")), 0);
+    BEZEL_EXPECT_EQ(run(makeGenericProgram("OwningLinkedList", "AddLast")), 0);
 }
 
 // ===========================================================================
@@ -184,8 +184,8 @@ BEZEL_TEST(generic_owned_drain_990, generic_drain_element_value_usable_spec_4_5)
         "  public constructor(n: int) N := n; end constructor; "
         "end Val; "
         "class Bag<T> where T: class "
-        "  public owned _items: OwnedArray<T>; "
-        "  public constructor() _items := new OwnedArray<T>(); end constructor; "
+        "  public owned _items: OwningArray<T>; "
+        "  public constructor() _items := new OwningArray<T>(); end constructor; "
         "  destructor end destructor; "
         "  public method Add(owned c: T) _items.Add(c); end Add; "
         "end Bag; "
@@ -219,8 +219,8 @@ BEZEL_TEST(generic_owned_drain_990, nongeneric_ownedarray_drain_disposes_once_sp
         "  destructor _n := _n - 1; end destructor; "
         "end R; "
         "class Wrapper "
-        "  public owned _items: OwnedArray<R>; "
-        "  public constructor() _items := new OwnedArray<R>(); end constructor; "
+        "  public owned _items: OwningArray<R>; "
+        "  public constructor() _items := new OwningArray<R>(); end constructor; "
         "  destructor end destructor; "
         "  public method Add(owned c: R) _items.Add(c); end Add; "
         "  public method DrainAll() "
@@ -242,25 +242,25 @@ BEZEL_TEST(generic_owned_drain_990, nongeneric_ownedarray_drain_disposes_once_sp
 // ===========================================================================
 
 BEZEL_TEST(generic_owned_drain_990, asan_ownedarray_generic_drain_no_leak) {
-    int asan = runUnderASan(makeGenericProgram("OwnedArray", "Add"));
+    int asan = runUnderASan(makeGenericProgram("OwningArray", "Add"));
     if (asan == -1) return;
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
 BEZEL_TEST(generic_owned_drain_990, asan_ownedstack_generic_drain_no_leak) {
-    int asan = runUnderASan(makeGenericProgram("OwnedStack", "Push"));
+    int asan = runUnderASan(makeGenericProgram("OwningStack", "Push"));
     if (asan == -1) return;
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
 BEZEL_TEST(generic_owned_drain_990, asan_ownedqueue_generic_drain_no_leak) {
-    int asan = runUnderASan(makeGenericProgram("OwnedQueue", "Enqueue"));
+    int asan = runUnderASan(makeGenericProgram("OwningQueue", "Enqueue"));
     if (asan == -1) return;
     BEZEL_EXPECT_EQ(asan, 0);
 }
 
 BEZEL_TEST(generic_owned_drain_990, asan_ownedlinkedlist_generic_drain_no_leak) {
-    int asan = runUnderASan(makeGenericProgram("OwnedLinkedList", "AddLast"));
+    int asan = runUnderASan(makeGenericProgram("OwningLinkedList", "AddLast"));
     if (asan == -1) return;
     BEZEL_EXPECT_EQ(asan, 0);
 }

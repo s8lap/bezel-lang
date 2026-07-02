@@ -1,7 +1,7 @@
 public class TaskCompletionSource<T>
   // Intrinsic restriction: T must be a value type, string, or other
   // runtime-managed reference type. Instantiating with a class T is a
-  // compile error pointing to OwnedTaskCompletionSource<T>.
+  // compile error pointing to OwningTaskCompletionSource<T>.
   public constructor();
   public readonly property Task: Task<T>;
 

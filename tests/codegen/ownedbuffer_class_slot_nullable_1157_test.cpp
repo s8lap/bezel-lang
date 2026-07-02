@@ -1,8 +1,8 @@
-// fix #1157 / stdlib §4.14: for a CLASS-typed T, `OwnedBuffer<T>` stores `T?`
+// fix #1157 / stdlib §4.14: for a CLASS-typed T, `OwningBuffer<T>` stores `T?`
 // in each slot (nullable references, all null until set), and its indexer is
 // declared `[i: int]: T?`. The sema indexer-get must therefore be typed `T?`
 // (nullable) — NOT the bare non-nullable `T` it was folded to via the
-// `isArrLike` path alongside `OwnedArray<T>`.
+// `isArrLike` path alongside `OwningArray<T>`.
 //
 // §4.14 (class-typed T): "fixed-at-construction storage of N slots, each
 // holding `T?` (a nullable reference) … all slots initialized to null. The
@@ -63,14 +63,14 @@ const char* kCell =
 
 }  // namespace
 
-// §4.14 (the #1157 repro): an empty-slot read of a class-typed OwnedBuffer is
+// §4.14 (the #1157 repro): an empty-slot read of a class-typed OwningBuffer is
 // `Cell?` — a member access `.v` without a null guard is a clean sema error
 // (previously it compiled clean and SIGSEGVed).
 BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, class_empty_slot_read_rejected) {
     auto r = parseSemaAll(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  var x := buf[0]; "
         "  return x.v; "  // null deref on the empty (null) slot — now rejected
         "end Main; end C;");
@@ -84,7 +84,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, class_assign_null_accepted) {
     auto r = runJit(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  buf[0] := new Cell(5); "
         "  buf[0] := null; "  // restore the slot to null — accepted
         "  return 0; "
@@ -100,20 +100,20 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, class_guarded_read_works) {
     BEZEL_EXPECT_EQ(runFull(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  buf[0] := new Cell(7); "
         "  if buf[0] <> null then return buf[0]!.v; end; "
         "  return -1; "
         "end Main; end C;"), 7);
 }
 
-// §4.14 (value-typed T, regression guard): an `OwnedBuffer<int>` slot holds
+// §4.14 (value-typed T, regression guard): an `OwningBuffer<int>` slot holds
 // `int` directly (value default 0) — the indexer stays NON-nullable `int`, so a
 // bare read needs no guard. `buf[1] := 42` then `buf[1]` reads 42.
 BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, value_int_indexer_non_nullable) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(3); "
+        "  using var buf := new OwningBuffer<int>(3); "
         "  buf[1] := 42; "
         "  var x := buf[1]; "  // non-nullable int — no guard required
         "  return x; "
@@ -127,14 +127,14 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, value_record_indexer_non_nullab
     BEZEL_EXPECT_EQ(runFull(
         "module M; record Pt(x: int, y: int); "
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Pt>(2); "
+        "  using var buf := new OwningBuffer<Pt>(2); "
         "  buf[0] := new Pt(3, 4); "
         "  var p := buf[0]; "
         "  return p.x + p.y; "  // 7 — value-typed, no guard
         "end Main; end C;"), 7);
 }
 
-// §28.11 / §4.14 (#1209): OwnedBuffer<int> (value-typed element) indexer-set
+// §28.11 / §4.14 (#1209): OwningBuffer<int> (value-typed element) indexer-set
 // from a bare local variable must COMPILE (the slot receives a value COPY, not
 // an owned transfer) and the local must remain usable after the assignment.
 // Previously rejected as a BAD_REJECT because indexerSetterTakesOwned returned
@@ -143,7 +143,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, value_record_indexer_non_nullab
 BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, owned_value_element_indexer_set_ok_1209) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(2); "
+        "  using var buf := new OwningBuffer<int>(2); "
         "  var x := 4; "
         "  buf[0] := x; "         // value copy — x must not be consumed
         "  var y := x; "          // x still usable after the assignment
@@ -151,7 +151,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, owned_value_element_indexer_set
         "end Main; end C;"), 8);
 }
 
-// §28.11 / §4.14 (#1209 regression guard): OwnedBuffer<T> with a CLASS element
+// §28.11 / §4.14 (#1209 regression guard): OwningBuffer<T> with a CLASS element
 // type must still treat the indexer-set as an owned-sink — a bare owned local
 // passed as the RHS is consumed (moved into the slot). A subsequent use of that
 // local is rejected at compile time, preventing a double-dispose.
@@ -164,7 +164,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  var cell := new Cell(42); "
         "  buf[0] := cell; "         // owned-sink: cell is consumed here
         "  var v := cell.v; "        // must be rejected — cell was moved out
@@ -175,8 +175,8 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
 }
 
 // ===========================================================================
-// §7.4 / #1208: Span<T> and ReadOnlySpan<T> over an OwnedBuffer<T> store T?
-// in each slot for class/interface T (same semantics as OwnedBuffer<T> itself).
+// §7.4 / #1208: Span<T> and ReadOnlySpan<T> over an OwningBuffer<T> store T?
+// in each slot for class/interface T (same semantics as OwningBuffer<T> itself).
 // ACCEPT-TRAP: bare member access `s[i].member` must be rejected (requires
 // nullable narrowing).  BAD-REJECT: `s[i] := null` must be accepted.
 // ===========================================================================
@@ -190,7 +190,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
     auto r = parseSemaAll(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  var s := buf.AsSpan(); "
         "  var x := s[0]; "  // x is Cell? (slot is null until set)
         "  return x.v; "     // member access on nullable — must be rejected
@@ -207,7 +207,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
     auto r = parseSemaAll(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  var s := buf.AsSpan(); "
         "  s[0] := null; "  // restore slot to null — must be accepted
         "  return 0; "
@@ -223,7 +223,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
     auto r = parseSemaAll(
         std::string(kCell) +
         "class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<Cell>(2); "
+        "  using var buf := new OwningBuffer<Cell>(2); "
         "  var s := buf.AsReadOnlySpan(); "
         "  var x := s[0]; "  // x is Cell?
         "  return x.v; "     // must be rejected — nullable narrowing required
@@ -238,7 +238,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157,
            span_value_int_indexer_non_nullable_1208) {
     auto r = parseSemaAll(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(2); "
+        "  using var buf := new OwningBuffer<int>(2); "
         "  var s := buf.AsSpan(); "
         "  s[0] := 99; "
         "  var x := s[0]; "  // non-nullable int — no guard required

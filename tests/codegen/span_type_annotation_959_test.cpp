@@ -76,7 +76,7 @@ BEZEL_TEST(span_type_annotation_959, owning_span_class_parameter) {
         "    return span[0]!.V; "  // span[i] is R? (#1208), narrow with `!`
         "  end First; "
         "  public static method Main(): int "
-        "    using var buf := new OwnedBuffer<R>(2); "
+        "    using var buf := new OwningBuffer<R>(2); "
         "    buf[0] := new R(10); buf[1] := new R(20); "
         "    return First(buf.AsSpan()); "  // 10
         "  end Main; end C;"), 10);
@@ -90,7 +90,7 @@ BEZEL_TEST(span_type_annotation_959, readonly_span_parameter) {
         "    return span.Length; "
         "  end Len; "
         "  public static method Main(): int "
-        "    using var buf := new OwnedBuffer<int>(7); "
+        "    using var buf := new OwningBuffer<int>(7); "
         "    return Len(buf.AsReadOnlySpan()); "  // 7
         "  end Main; end C;"), 7);
 }
@@ -120,7 +120,7 @@ BEZEL_TEST(span_type_annotation_959, clear_through_owning_span_parameter_no_doub
         "  end Wipe; "
         "  public static method Main(): int "
         "    do "
-        "      using var buf := new OwnedBuffer<R>(2); "
+        "      using var buf := new OwningBuffer<R>(2); "
         "      buf[0] := new R(1); buf[1] := new R(2); "
         "      Wipe(buf.AsSpan()); "
         "    end; "

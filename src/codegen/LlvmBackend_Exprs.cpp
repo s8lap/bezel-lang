@@ -2674,7 +2674,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
     }
     // §30.3 / §30.5 (#941 / #1127): `t.Result` — the synchronous escape hatch
-    // on a Task<T> or OwnedTask<T> receiver (a builtin class, no MethodSymbol).
+    // on a Task<T> or OwningTask<T> receiver (a builtin class, no MethodSymbol).
     // This is the SYNCHRONOUS read used from non-async code (e.g. inside a
     // plain `method Main()`): it blocks the calling thread until the task
     // completes (bz_task_await_sync — the same blocking primitive Wait() uses),
@@ -2682,7 +2682,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // route through emitAwaitSuspend, which builds state-machine suspend/resume
     // blocks valid only inside an async resume function.
     // For Task<T>: T is a value/reference type; the buffer holds T directly.
-    // For OwnedTask<T>: T is an owned heap pointer (class/collection);
+    // For OwningTask<T>: T is an owned heap pointer (class/collection);
     // the buffer holds the T* pointer (8 bytes); loading it transfers ownership
     // to the caller. The task's result buffer (the malloc'd 8-byte slot) is
     // freed by bz_task_free when the task is disposed — it frees only the slot,
@@ -2691,7 +2691,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // we re-raise the ORIGINAL exception object (bz_task_error_obj) through the
     // ordinary synchronous-throw machinery (emitThrowValue), so an enclosing
     // try/catch sees the real exception type and the function's unwind boundary
-    // propagates it otherwise. Both Task<T> and OwnedTask<T> are handled here;
+    // propagates it otherwise. Both Task<T> and OwningTask<T> are handled here;
     // isTaskTypeName fires for both names.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Result") {
@@ -2797,17 +2797,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                      {ptrTy()});
                         builder_.CreateCall(freeTaskFn, {task});
                     }
-                    // §28.3 / #1250: for a BOUND OwnedTask<T:class> .Result read,
+                    // §28.3 / #1250: for a BOUND OwningTask<T:class> .Result read,
                     // null the task's result buffer after loading so the TCS
                     // disposal (bz_tcs_dispose_owned_result) sees no result and
                     // skips dispose — preventing a double-free of the caller-owned
-                    // class object.  Check: OwnedTask (not plain Task) + ClassOwned.
+                    // class object.  Check: OwningTask (not plain Task) + ClassOwned.
                     if (isBoundTask) {
                         bool isOwnedClass = false;
                         if (tt && tt->kind == sema::TypeRef::Kind::Named &&
                             !tt->declaration && tt->astNode && tt->astNode->name &&
                             !tt->astNode->name->parts.empty() &&
-                            tt->astNode->name->parts[0] == "OwnedTask" &&
+                            tt->astNode->name->parts[0] == "OwningTask" &&
                             !tt->genericArgs.empty() && tt->genericArgs[0]) {
                             isOwnedClass =
                                 (elementPolicyFor(tt->genericArgs[0],
@@ -2827,7 +2827,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
     }
     // §6.6 / issue #974: tcs.Task — readonly property on
-    // TaskCompletionSource<T> / OwnedTaskCompletionSource<T> /
+    // TaskCompletionSource<T> / OwningTaskCompletionSource<T> /
     // TaskCompletionSource. Returns the inner task pointer (borrowed).
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Task") {
@@ -2837,7 +2837,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                           tt->astNode->name &&
                           !tt->astNode->name->parts.empty() &&
                           (tt->astNode->name->parts[0] == "TaskCompletionSource" ||
-                           tt->astNode->name->parts[0] == "OwnedTaskCompletionSource"));
+                           tt->astNode->name->parts[0] == "OwningTaskCompletionSource"));
             if (isTcs) {
                 llvm::Value* tcsPtr = lowerExpr(*ma->target);
                 if (tcsPtr) {
@@ -2888,7 +2888,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateTrunc(builder_.CreateLoad(i64(), sumSlot), i32());
                 }
             }
-            // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T>.Count via bz_llist_count.
+            // per §4.6/§4.7: LinkedList<T>/OwningLinkedList<T>.Count via bz_llist_count.
             if (isLinkedListTypeName(tt)) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
@@ -2919,14 +2919,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                 }
             }
-            // §4.14 / §9.8 / issue #550: OwnedBuffer<T>.Count → bz_array_len.
-            // OwnedBuffer is array-backed (bz_array_t*) but is not in
+            // §4.14 / §9.8 / issue #550: OwningBuffer<T>.Count → bz_array_len.
+            // OwningBuffer is array-backed (bz_array_t*) but is not in
             // isCollectionTypeName (which lists element-owning collections).
             {
                 bool isOB = tt && tt->kind == sema::TypeRef::Kind::Named &&
                             !tt->declaration && tt->astNode && tt->astNode->name &&
                             !tt->astNode->name->parts.empty() &&
-                            tt->astNode->name->parts[0] == "OwnedBuffer";
+                            tt->astNode->name->parts[0] == "OwningBuffer";
                 if (isOB) {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {
@@ -2943,7 +2943,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 bool isSetName = tt->astNode && tt->astNode->name &&
                                  !tt->astNode->name->parts.empty() &&
                                  (tt->astNode->name->parts[0] == "Set" ||
-                                  tt->astNode->name->parts[0] == "OwnedSet");
+                                  tt->astNode->name->parts[0] == "OwningSet");
                 bool dictBacked = isSetName &&
                     genericBackingType(tt, 0, /*isSet=*/true, nullptr) != nullptr;
                 llvm::Value* obj = lowerExpr(*ma->target);
@@ -2978,8 +2978,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 }
             }
             // fix #853 / stdlib §4.1–§4.3: `.Count` on a LIST-INTERFACE receiver
-            // (IReadOnlyList<T> / IList<T> / IOwnedList<T>). These interfaces are
-            // implemented ONLY by Array<T> / OwnedArray<T> (both bz_array_t*-
+            // (IReadOnlyList<T> / IList<T> / IOwningList<T>). These interfaces are
+            // implemented ONLY by Array<T> / OwningArray<T> (both bz_array_t*-
             // backed), so an interface-typed receiver carries the same array
             // pointer as the concrete collection and `.Count` is bz_array_len —
             // the same bridge the indexer get/set already uses (#401). Previously
@@ -2997,7 +2997,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             // fix #853 / stdlib §4.1–§4.3: `.Count` on a polymorphic COLLECTION-
             // INTERFACE receiver (IReadOnlyCollection<T> / ICollection<T> /
-            // IOwnedCollection<T>). Unlike the list interfaces, these are
+            // IOwningCollection<T>). Unlike the list interfaces, these are
             // implemented by collections with incompatible runtime
             // representations (Array → bz_array_t* count@8; LinkedList →
             // bz_llist_t* count@16; Dictionary/Set → bz_dict_t*) and the
@@ -3011,7 +3011,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     Severity::Error, e.span.begin,
                     "`.Count` through a polymorphic collection interface "
                     "(IReadOnlyCollection<T> / ICollection<T> / "
-                    "IOwnedCollection<T>) is not yet supported in codegen "
+                    "IOwningCollection<T>) is not yet supported in codegen "
                     "(stdlib \xC2\xA7""4.1\xE2\x80\x93\xC2\xA7""4.3, #853): these "
                     "interfaces are implemented by collections with incompatible "
                     "runtime representations (array / linked-list / hash-table) "
@@ -3056,8 +3056,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
     }
     // stdlib §4.4/§4.5/§4.14 (#741): `.Capacity` on a `bz_array_t`-backed type
-    // → bz_array_capacity. The spec declares `Capacity` only on Array/OwnedArray
-    // (and OwnedBuffer exposes it as `Length`), but every bz_array_t-backed
+    // → bz_array_capacity. The spec declares `Capacity` only on Array/OwningArray
+    // (and OwningBuffer exposes it as `Length`), but every bz_array_t-backed
     // collection has a valid backing capacity; the allowlist mirrors the
     // construction branch (LlvmBackend_Exprs.cpp ~L6004). LinkedList (bz_llist)
     // and Dictionary (bz_dict) use different backings and are NOT included. No
@@ -3072,10 +3072,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             };
             std::string_view cn = headName(tt);
             bool isArrayBacked =
-                cn == "Array" || cn == "OwnedArray" || cn == "OwnedBuffer" ||
-                cn == "Stack" || cn == "OwnedStack" ||
-                cn == "Queue" || cn == "OwnedQueue" ||
-                cn == "Set"   || cn == "OwnedSet";
+                cn == "Array" || cn == "OwningArray" || cn == "OwningBuffer" ||
+                cn == "Stack" || cn == "OwningStack" ||
+                cn == "Queue" || cn == "OwningQueue" ||
+                cn == "Set"   || cn == "OwningSet";
             if (isArrayBacked) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
@@ -3086,7 +3086,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
-    // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-returning properties
+    // per §4.6/§4.7: LinkedList<T>/OwningLinkedList<T> node-returning properties
     // (FirstNode, LastNode, First, Last) and LinkedListNode<T> accessor
     // properties (Value, Next, Previous).
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -3658,7 +3658,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // struct's vtable layout is [0]=td, [1]=Dispose, [2]=MoveNext(→i1),
     // [3]=Current(→T). Dispatch through slot 3 returning T.
     // This complements the MoveNext fix in lowerCall (issue #494).
-    // #1349 / §29.1 v0.161: OwnedEnumerator<T>/OwnedAsyncEnumerator<T> no longer
+    // #1349 / §29.1 v0.161: IOwningEnumerator<T>/IOwningAsyncEnumerator<T> no longer
     // have Current — they use TakeCurrent() dispatched in lowerCall below.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->member == "Current" && ma->target) {
@@ -3670,7 +3670,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
                 // issue #759: async enumerators share the slot-3 layout.
-                // #1349: OwnedEnumerator/OwnedAsyncEnumerator excluded (TakeCurrent).
+                // #1349: IOwningEnumerator/IOwningAsyncEnumerator excluded (TakeCurrent).
                 (recvTy->astNode->name->parts[0] == "IEnumerator" ||
                  recvTy->astNode->name->parts[0] == "IAsyncEnumerator");
             if (isBuiltinEnumerator) {
@@ -4763,7 +4763,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                             rTy->astNode->name &&
                             !rTy->astNode->name->parts.empty() &&
                             (rTy->astNode->name->parts[0] == "Set" ||
-                             rTy->astNode->name->parts[0] == "OwnedSet");
+                             rTy->astNode->name->parts[0] == "OwningSet");
             if (isSetRHS) {
                 const sema::TypeRef* elemTy =
                     genericBackingType(rTy, 0, /*isSet=*/true, nullptr);
@@ -4823,18 +4823,18 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         }
         // §17.5: `x in coll` where `coll` is an Array<T>-, Stack<T>-, or
         // Queue<T>-typed expression (all bz_array_t-backed collections except
-        // Set/OwnedSet, which are dict-backed and handled above).
+        // Set/OwningSet, which are dict-backed and handled above).
         // Lowers to the same linear scan as Array<T>.Contains(x): iterate via
         // bz_array_len / bz_array_ptr_at and compare each element using
         // emitRemoveElementEquality (record/string/value-type equality per §8.3).
         if (bin.right) {
             auto* rTy = ctx_.exprType(*bin.right);
-            // isCollectionTypeName covers Array, OwnedArray, Stack, OwnedStack,
-            // Queue, OwnedQueue, Set, OwnedSet — but Set/OwnedSet are already
+            // isCollectionTypeName covers Array, OwningArray, Stack, OwningStack,
+            // Queue, OwningQueue, Set, OwningSet — but Set/OwningSet are already
             // handled above by the dict-backed path; they only reach here when
             // genericBackingType returned null (no generic arg), which is a
             // degenerate case not reached in practice.  isLinkedListTypeName
-            // covers LinkedList and OwnedLinkedList (bz_llist_t-backed).
+            // covers LinkedList and OwningLinkedList (bz_llist_t-backed).
             bool isArr = isCollectionTypeName(rTy);
             bool isLL  = isLinkedListTypeName(rTy);
             if (isArr || isLL) {
@@ -7421,7 +7421,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (haveAnnotation) {
             // The annotation IS authoritative for the void-vs-value distinction
             // (§30.6): a bare `Task` (no generic arg) is a no-value task — leave
-            // T null; `Task<T>` / `OwnedTask<T>` carries the element type T.
+            // T null; `Task<T>` / `OwningTask<T>` carries the element type T.
             const sema::TypeRef* taskTy = expectedFunctionType_->funcReturn;
             if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0])
                 asyncResultElemSemaTy = taskTy->genericArgs[0];
@@ -8636,13 +8636,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                "IndexOutOfRangeException");
                 return buildArraySpan(src, start, len);
             }
-            // issues #343 / D8 / §4.10: a Set<T> (or OwnedSet<T>) is backed by
+            // issues #343 / D8 / §4.10: a Set<T> (or OwningSet<T>) is backed by
             // the generic-key hash table so equality and hashing follow T's
             // contract (§8.3) — real set semantics (dedup by content). This
             // covers records (#343), primitives/enums, AND strings (D8: the
             // array backing cannot deduplicate). Stored value is a non-null
             // sentinel (membership only).
-            if ((colName == "Set" || colName == "OwnedSet")) {
+            if ((colName == "Set" || colName == "OwningSet")) {
                 uint64_t ksz = 0;
                 if (const sema::TypeRef* elemTy =
                         genericBackingType(rt, 0, /*isSet=*/true, &ksz)) {
@@ -8654,25 +8654,25 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         {builder_.getInt64((int64_t)ksz), hashT, eqT});
                 }
             }
-            // per §4.6/§4.7: LinkedList/OwnedLinkedList use the real doubly-linked-
+            // per §4.6/§4.7: LinkedList/OwningLinkedList use the real doubly-linked-
             // list runtime (bz_llist_alloc), not the bz_array_t backing. The
             // elem_size argument tells the runtime how many bytes to store inline
             // in each node — same sizing as bz_array_t (4 for int/float, 8 otherwise).
-            if (colName == "LinkedList" || colName == "OwnedLinkedList") {
+            if (colName == "LinkedList" || colName == "OwningLinkedList") {
                 auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
                 return builder_.CreateCall(allocFn, {builder_.getInt64(elemSize)});
             }
-            if (colName == "Array" || colName == "OwnedArray" ||
-                // §4.14: OwnedBuffer<T> uses the same bz_array_t* backing.
-                // new OwnedBuffer<T>(capacity) pre-allocates `capacity` slots
+            if (colName == "Array" || colName == "OwningArray" ||
+                // §4.14: OwningBuffer<T> uses the same bz_array_t* backing.
+                // new OwningBuffer<T>(capacity) pre-allocates `capacity` slots
                 // (all zero-initialized), mirroring the Array no-arg ctor.
-                colName == "OwnedBuffer" ||
-                colName == "Stack" || colName == "OwnedStack" ||
-                colName == "Queue" || colName == "OwnedQueue" ||
-                colName == "Set" || colName == "OwnedSet") {
-                // For OwnedBuffer<T>(n): the arg is the capacity / initial count.
+                colName == "OwningBuffer" ||
+                colName == "Stack" || colName == "OwningStack" ||
+                colName == "Queue" || colName == "OwningQueue" ||
+                colName == "Set" || colName == "OwningSet") {
+                // For OwningBuffer<T>(n): the arg is the capacity / initial count.
                 // Pre-allocate n slots AND set count=n so index-assignment is valid.
-                if (colName == "OwnedBuffer" && !ne.args.empty() && ne.args[0].value) {
+                if (colName == "OwningBuffer" && !ne.args.empty() && ne.args[0].value) {
                     llvm::Value* nArg = lowerExpr(*ne.args[0].value);
                     if (!nArg) return nullptr;
                     if (!nArg->getType()->isIntegerTy(64))
@@ -8684,7 +8684,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     llvm::Value* buf = builder_.CreateCall(fn,
                         {builder_.getInt64(elemSize), nArg}, "ob.arr");
                     // §4.14 (#778): the two-argument constructor
-                    // `OwnedBuffer<T>(length, init: (int) -> T)` calls `init(i)`
+                    // `OwningBuffer<T>(length, init: (int) -> T)` calls `init(i)`
                     // for each i in 0..<length and stores the result into slot i
                     // (copying for value-typed T, taking ownership for class-typed
                     // T — the buffer's destructor then disposes the owned slots).
@@ -8797,7 +8797,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     llvm::Value* fillVal = lowerExpr(*ne.args[1].value);
                     if (fillVal) {
                         // Spill fill value into an alloca so bz_array_set
-                        // can read it via a pointer (matching OwnedBuffer init
+                        // can read it via a pointer (matching OwningBuffer init
                         // loop pattern at §4.14 / #778).
                         llvm::AllocaInst* fillSlot = entryAlloca(elemLlvmTy);
                         builder_.CreateStore(fillVal, fillSlot);
@@ -8831,7 +8831,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 // stdlib §4.4/§4.5 (#741): the `constructor(capacity: int)` arg
                 // reserves backing slots WITHOUT setting count (an empty array
-                // with room to grow), distinct from OwnedBuffer above which also
+                // with room to grow), distinct from OwningBuffer above which also
                 // sets count=n. Previously the arg was ignored and a constant 16
                 // was always allocated, so `.Capacity` could not reflect the
                 // requested reservation. A non-positive request falls back to 16.
@@ -8842,7 +8842,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         if (!capArg->getType()->isIntegerTy(64))
                             capArg = builder_.CreateSExt(capArg, i64());
                         // max(capArg, 1) so a 0/negative request still yields a
-                        // usable buffer; matches the OwnedArray reference impl
+                        // usable buffer; matches the OwningArray reference impl
                         // (`if capacity > 0 then capacity else 1`, stdlib §4.5).
                         llvm::Value* one = builder_.getInt64(1);
                         llvm::Value* useArg = builder_.CreateICmpSGT(capArg, one);
@@ -8854,7 +8854,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.CreateCall(allocFn,
                     {builder_.getInt64(elemSize), builder_.getInt64(16)});
             }
-            if (colName == "Dictionary" || colName == "OwnedDictionary") {
+            if (colName == "Dictionary" || colName == "OwningDictionary") {
                 // issues #343 / D3 / §4.8: a non-string key uses the generic-key
                 // runtime variant, parameterized by the key's hash/eq via
                 // trampolines (§8.3). This covers records (#343) AND primitive/
@@ -9028,16 +9028,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     {initCount, maxCount}, "sem.new");
             }
             // §6.6 / issue #974: new TaskCompletionSource<T>() /
-            // new OwnedTaskCompletionSource<T>() / new TaskCompletionSource().
+            // new OwningTaskCompletionSource<T>() / new TaskCompletionSource().
             // Allocate via bz_tcs_new() — zero arguments (constructor takes none).
-            // §28.3 / #1250: for OwnedTaskCompletionSource<T:class>, wire the element
+            // §28.3 / #1250: for OwningTaskCompletionSource<T:class>, wire the element
             // disposer via bz_tcs_set_owned_disposer so TCS disposal can run the
             // destructor of a set-but-unconsumed owned result (exactly-once, §28.3).
             if (colName == "TaskCompletionSource" ||
-                colName == "OwnedTaskCompletionSource") {
+                colName == "OwningTaskCompletionSource") {
                 auto* allocFn = declareC("bz_tcs_new", ptrTy(), {});
                 llvm::Value* tcs = builder_.CreateCall(allocFn, {}, "tcs.new");
-                if (colName == "OwnedTaskCompletionSource" && rt &&
+                if (colName == "OwningTaskCompletionSource" && rt &&
                     !rt->genericArgs.empty() && rt->genericArgs[0]) {
                     llvm::Function* dispThunk =
                         elementPolicyFor(rt->genericArgs[0],

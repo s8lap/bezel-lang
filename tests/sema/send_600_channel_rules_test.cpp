@@ -86,7 +86,7 @@ BEZEL_TEST(send_600_channel_rules,
 // ---------------------------------------------------------------------------
 
 // §30.15 stdlib §6.9: for class-typed T, Send takes `owned item: T` and
-// Receive() returns OwnedTask<T>. The pattern below must type-check.
+// Receive() returns OwningTask<T>. The pattern below must type-check.
 // Channel-in-receive-domain pattern from the spec example.
 BEZEL_TEST(send_600_channel_rules,
            send_receive_class_ownership_shapes_accepted_30_15) {
@@ -102,7 +102,7 @@ BEZEL_TEST(send_600_channel_rules,
         "    using var item := await inbox.Receive(); "
         "  end RunReceiver; "
         "end Receiver;");
-    // Accepted: OwnedTask<T> receive, `using var` discharges the owned result.
+    // Accepted: OwningTask<T> receive, `using var` discharges the owned result.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -195,7 +195,7 @@ BEZEL_TEST(send_600_channel_rules,
 
 // ---------------------------------------------------------------------------
 // §30.14 stdlib table: stdlib types not sendable as channel elements.
-// Task<T>, OwnedTask<T>, Shared<T> are domain-local (§30.14 / §28.13).
+// Task<T>, OwningTask<T>, Shared<T> are domain-local (§30.14 / §28.13).
 // ---------------------------------------------------------------------------
 
 // §30.14 stdlib table: Task<int> is domain-local → not sendable.
@@ -214,7 +214,7 @@ BEZEL_TEST(send_600_channel_rules,
     BEZEL_EXPECT_TRUE(hasNotSendableDiag(r));
 }
 
-// §30.14 stdlib table: OwnedTask<T> is domain-local → not sendable.
+// §30.14 stdlib table: OwningTask<T> is domain-local → not sendable.
 BEZEL_TEST(send_600_channel_rules,
            owned_task_as_channel_element_rejected_30_14_stdlib) {
     auto r = parseSemaAll(
@@ -225,10 +225,10 @@ BEZEL_TEST(send_600_channel_rules,
         "end Result; "
         "class C "
         "  public static method Test() "
-        "    using var ch := new Channel<OwnedTask<Result>>(); "
+        "    using var ch := new Channel<OwningTask<Result>>(); "
         "  end Test; "
         "end C;");
-    // Rejected: OwnedTask<T> is domain-local → not sendable.
+    // Rejected: OwningTask<T> is domain-local → not sendable.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasNotSendableDiag(r));
 }
@@ -254,10 +254,10 @@ BEZEL_TEST(send_600_channel_rules,
 }
 
 // ---------------------------------------------------------------------------
-// §30.14 stdlib table: OwnedArray<T> is sendable iff element type is sendable.
+// §30.14 stdlib table: OwningArray<T> is sendable iff element type is sendable.
 // ---------------------------------------------------------------------------
 
-// §30.14 stdlib table: OwnedArray<SealedSendable> → sendable (all state owned).
+// §30.14 stdlib table: OwningArray<SealedSendable> → sendable (all state owned).
 BEZEL_TEST(send_600_channel_rules,
            owned_array_sendable_element_as_channel_element_accepted_30_14) {
     auto r = parseSemaAll(
@@ -268,10 +268,10 @@ BEZEL_TEST(send_600_channel_rules,
         "end Item; "
         "class C "
         "  public static method Test() "
-        "    using var ch := new Channel<OwnedArray<Item>>(); "
+        "    using var ch := new Channel<OwningArray<Item>>(); "
         "  end Test; "
         "end C;");
-    // Accepted: OwnedArray<Item> where Item is sendable sealed class.
+    // Accepted: OwningArray<Item> where Item is sendable sealed class.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

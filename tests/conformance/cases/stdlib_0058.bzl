@@ -1,4 +1,4 @@
-public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
   // class T
 
   // Indexer (bounds-checked against span Length as of v0.105).
@@ -52,7 +52,7 @@ public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnl
   public method Reverse();                         // reverse slot ordering in place
 end Span;
 
-public record Span<T>(Buffer: OwnedBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
   // value T (primitive, record, enum, non-move-only inline array)
 
   // Indexer (bounds-checked against span Length as of v0.105).

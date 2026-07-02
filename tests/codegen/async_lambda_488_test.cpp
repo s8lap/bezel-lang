@@ -3,7 +3,7 @@
 // `{fn_ptr, env_ptr, rc}` cell whose body may capture outer variables) whose
 // invocation drives an ASYNC STATE MACHINE (§30.1/§30.2 — the suspend/resume
 // scaffolding of §29/§30 Phase 2a, parameterized for `await`). The lambda's
-// function type carries a `Task` / `Task<T>` / `OwnedTask<T>` return type
+// function type carries a `Task` / `Task<T>` / `OwningTask<T>` return type
 // (§30.6); calling it returns the outer Task, which the caller `await`s.
 //
 // These tests cannot use the plain JIT harness (the async emitter accumulates

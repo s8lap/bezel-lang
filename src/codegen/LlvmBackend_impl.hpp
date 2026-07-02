@@ -518,20 +518,20 @@ private:
         const sema::TypeSymbol* cls;
         bool subscription = false;
         // #362 / stdlib §4.5: a `using var` bound to a heap collection
-        // (Array<T>/OwnedArray<T>/…). At scope end it is freed via
+        // (Array<T>/OwningArray<T>/…). At scope end it is freed via
         // bz_array_free. `collectionElemDisposer` is the per-element dispose
         // callback for an OWNING collection of class elements (null for a
         // borrowing collection or value elements — only the backing is freed).
         bool collection = false;
         llvm::Value* collectionElemDisposer = nullptr;
         // #394 / stdlib §4.9 + #401 / stdlib §4.8: a `using var` bound to a
-        // hash-backed dictionary (Dictionary<K,V>/OwnedDictionary<K,V>). At scope
+        // hash-backed dictionary (Dictionary<K,V>/OwningDictionary<K,V>). At scope
         // end it is freed via bz_dict_free. `dictValueDisposer` is the per-VALUE
         // callback passed to bz_dict_free; it is one of exactly two mutually
         // exclusive things (or null):
-        //   * #394: an OwnedDictionary<K,V> with a CLASS value type → the
+        //   * #394: an OwningDictionary<K,V> with a CLASS value type → the
         //     owning-class value-disposer (dispose + free the object via its
-        //     vtable). OwnedDictionary owns its VALUES only.
+        //     vtable). OwningDictionary owns its VALUES only.
         //   * #401: a BORROWING Dictionary<K,V> with a RECORD value type → the
         //     value-box-free thunk (plain `free` of the heap box; a record is a
         //     value type, §3.2 / §9, so there is nothing to dispose — only the
@@ -556,9 +556,9 @@ private:
         // disposal emits bz_set_string_keys_release(tbl) before bz_dict_free.
         bool dictStringKeys = false;
         // per §4.6/§4.7: a `using var` bound to a LinkedList<T> or
-        // OwnedLinkedList<T>. At scope end it is freed via bz_llist_free.
+        // OwningLinkedList<T>. At scope end it is freed via bz_llist_free.
         // `collectionElemDisposer` (reused) is the per-element dispose callback
-        // for an OwnedLinkedList<T> of class elements (null for LinkedList<T>
+        // for an OwningLinkedList<T> of class elements (null for LinkedList<T>
         // or value elements — only the node chain is freed, not the values).
         bool linkedList = false;
         // #383 / §28: a `using var` that owns a class/interface object but
@@ -674,7 +674,7 @@ private:
         // frees anonymous CallExpr operands), so the sole free is via the faf
         // continuation — exactly once.
         bool task = false;
-        // §30.5 / #1258: for a `using var` bound to an OwnedTask<T:class>, the
+        // §30.5 / #1258: for a `using var` bound to an OwningTask<T:class>, the
         // per-T disposer that disposes the produced-but-unconsumed owned class
         // result at scope end (passed to bz_task_dispose_owned_result before the
         // task is freed). Null for a Task<T> / value-result / no-value task.
@@ -730,7 +730,7 @@ private:
         // by the builtin type name "ChannelSender".
         bool channelSender = false;
         // §6.6 / issue #974: a `using var` bound to a TaskCompletionSource<T>,
-        // OwnedTaskCompletionSource<T>, or TaskCompletionSource (non-generic).
+        // OwningTaskCompletionSource<T>, or TaskCompletionSource (non-generic).
         // At scope end:
         //   1. bz_tcs_fault_if_pending(tcs, ioe_vtable) — faults the inner
         //      task with InvalidOperationException if not already completed.
@@ -873,16 +873,16 @@ private:
     llvm::Function* elementDisposerThunk_ = nullptr;
     // §28.13 / stdlib §2.16 (#603): void(void*) thunks that call
     // bz_shared_release / bz_weak_release, used as per-element disposal
-    // callbacks for OwnedArray<Shared<T>> / OwnedArray<Weak<T>>.
+    // callbacks for OwningArray<Shared<T>> / OwningArray<Weak<T>>.
     llvm::Function* sharedReleaseThunk_ = nullptr;
     llvm::Function* weakReleaseThunk_ = nullptr;
     // stdlib §5 (#651): bz_grouping_free thunk for Array<IGrouping> disposal.
     llvm::Function* groupingFreeThunk_ = nullptr;
-    // §2.11 (#838): bz_subscription_dispose thunk for OwnedArray<Subscription>
+    // §2.11 (#838): bz_subscription_dispose thunk for OwningArray<Subscription>
     // (and other owning collections) element disposal.
     llvm::Function* subscriptionDisposeThunk_ = nullptr;
     // §28.11 (#868): per-element-collection-type thunks for nested owning
-    // collections (e.g. OwnedArray<OwnedArray<R>>). Keyed by the TypeRef* of
+    // collections (e.g. OwningArray<OwningArray<R>>). Keyed by the TypeRef* of
     // the inner collection element type (unique per sema type).
     std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
@@ -1645,7 +1645,7 @@ private:
     // §4.14 / §4.15: test whether a TypeRef is one of the span-like value types
     // that share the bz.arrayspan layout { ptr source, i32 start, i32 length }.
     // Covers the borrowing spans over Array<T> (ArraySpan/ReadOnlyArraySpan,
-    // §4.15) AND the owning spans over OwnedBuffer<T> (Span/ReadOnlySpan, §4.14).
+    // §4.15) AND the owning spans over OwningBuffer<T> (Span/ReadOnlySpan, §4.14).
     // All four reuse the same shared-surface lowering (indexer get/set, Slice,
     // IndexOf, Contains, SequenceEqual, Length/IsEmpty, for-in); the owning
     // class-T behaviour (disposing set, `move`, Clear/MoveFrom/MoveTo) is gated
@@ -1676,7 +1676,7 @@ private:
     }
 
     // §4.14 (#779): test whether a TypeRef is the OWNING `Span<T>` over an
-    // OwnedBuffer<T> (its slots own their class-typed elements). `ReadOnlySpan<T>`
+    // OwningBuffer<T> (its slots own their class-typed elements). `ReadOnlySpan<T>`
     // is a read-only view (no set/move/clear), so it is NOT matched here.
     static bool isOwningSpanTypeName(const sema::TypeRef* rt) {
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
@@ -2472,7 +2472,7 @@ private:
     bool lowerIndexerCompound(const ast::AssignmentStmt& as);
 
     // fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
-    // on a HEAP-collection Array<T>/OwnedArray<T>/Dictionary<K,V> indexer.
+    // on a HEAP-collection Array<T>/OwningArray<T>/Dictionary<K,V> indexer.
     // Evaluates receiver and index ONCE (array path), reads via bz_array_get /
     // lowerCollectionIndexerGet, applies OP, writes back via bz_array_set /
     // lowerCollectionIndexerSet. Returns true if handled; false if the target is
@@ -2493,7 +2493,7 @@ private:
     llvm::Value* lowerCollectionIndexerGet(const ast::IndexExpr& ix);
 
     // issue #409 / language spec §28.8.1 / §28.11: lower `move coll[i]` (the
-    // slot-take) on an OWNING heap collection (OwnedArray / OwnedDictionary).
+    // slot-take) on an OWNING heap collection (OwningArray / OwningDictionary).
     // Reads the element out as owned AND leaves the slot moved-from (null) so the
     // collection's later element-disposer skips it — no #409 double-free. Returns
     // null if `ix` is not an owning-collection slot (caller falls through to the
@@ -2501,8 +2501,8 @@ private:
     llvm::Value* lowerMoveFromCollectionSlot(const ast::IndexExpr& ix);
 
     // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
-    // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
-    // OwnedDictionary) the displaced slot/value is disposed exactly once before
+    // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwningArray /
+    // OwningDictionary) the displaced slot/value is disposed exactly once before
     // the new (owned) one is stored (§4.5 / §4.9); a borrowing collection just
     // overwrites. `val` is the already-lowered RHS. Returns true if handled.
     bool lowerCollectionIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
@@ -3671,7 +3671,7 @@ private:
     };
 
     // #602 / §28.11 v0.134: classify `elemTy` against the slot-policy table.
-    // `owningFamily` is true when the containing collection is in the "Owned"
+    // `owningFamily` is true when the containing collection is in the "Owning"
     // family.  The factory's rows mirror the spec table with per-row citations.
     ElementPolicy elementPolicyFor(const sema::TypeRef* elemTy,
                                    bool owningFamily);
@@ -3701,8 +3701,8 @@ private:
     llvm::Function* groupingFreeThunk(); // stdlib §5 (#651): IGrouping disposal
     llvm::Function* subscriptionDisposeThunk(); // §2.11 (#838): Subscription elem
     // §28.11 (#868): void(void*) thunk that calls the right free fn on a nested
-    // builtin owning collection element (e.g. the OwnedArray<R> inside an
-    // OwnedArray<OwnedArray<R>>). Recursively resolves the inner element's
+    // builtin owning collection element (e.g. the OwningArray<R> inside an
+    // OwningArray<OwningArray<R>>). Recursively resolves the inner element's
     // disposer via elementPolicyFor. Cached per element-collection TypeRef*.
     llvm::Function* nestedCollectionDisposerThunk(const sema::TypeRef* elemCollTy);
 
@@ -3758,7 +3758,7 @@ private:
     // type V is a record (and therefore heap-boxed, see the encode in
     // LlvmBackend_{Calls,Assign}.cpp), return the value-box-free thunk so the
     // dict's disposal reclaims each surviving value box; otherwise null. This is
-    // strictly the value-BOX-free case: an OwnedDictionary<K, class> instead
+    // strictly the value-BOX-free case: an OwningDictionary<K, class> instead
     // routes through owningDictValueDisposer (#394, dispose+free a class object
     // via its vtable), and a scalar/string-valued borrowing Dictionary stores no
     // box (nothing extra to free). The two are mutually exclusive, so the
@@ -3778,7 +3778,7 @@ private:
     // declare (§8.4: classes customize equality by overriding `Equals`).
     sema::MethodSymbol* classEqualsOverride(const sema::TypeSymbol* cls);
 
-    // issue #400 / §25.2: compute the equality `Array<T>`/`OwnedArray<T>`'s
+    // issue #400 / §25.2: compute the equality `Array<T>`/`OwningArray<T>`'s
     // .Remove(item) uses to match `el` against `target`, dispatched
     // by the element's static Bezel type `elemTy`. A class with a user `Equals`
     // override → a (null-guarded) virtual `el.Equals(target)` call (§8.4); a
@@ -3948,8 +3948,8 @@ private:
     }
 
     // #816 / §28.5/§28.11: is `fs` an `owned` generic OWNING-collection field
-    // (OwnedArray<T> / OwnedStack<T> / OwnedQueue<T> / OwnedLinkedList<T> /
-    // OwnedSet<T> / OwnedBuffer<T> / OwnedDictionary<K,T>) whose disposed element
+    // (OwningArray<T> / OwningStack<T> / OwningQueue<T> / OwningLinkedList<T> /
+    // OwningSet<T> / OwningBuffer<T> / OwningDictionary<K,T>) whose disposed element
     // type is a generic type PARAMETER of the enclosing class? Such a field needs
     // a PER-INSTANTIATION disposer: only an owning collection disposes its
     // elements, and the element's concrete type (and so whether each element must
@@ -3962,9 +3962,9 @@ private:
         if (!collTy || !collTy->astNode || !collTy->astNode->name ||
             collTy->astNode->name->parts.empty())
             return false;
-        // Owning families (name prefixed "Owned") dispose their elements.
-        if (collTy->astNode->name->parts[0].rfind("Owned", 0) != 0) return false;
-        // OwnedDictionary owns its V value (genericArgs[1]); the ordered/set
+        // Owning families (name prefixed "Owning") dispose their elements.
+        if (collTy->astNode->name->parts[0].rfind("Owning", 0) != 0) return false;
+        // OwningDictionary owns its V value (genericArgs[1]); the ordered/set
         // families own their single element (genericArgs[0]).
         bool isDict = isDictTypeName(collTy);
         const sema::TypeRef* elem =
@@ -4100,7 +4100,7 @@ private:
     }
 
     // #362 / stdlib §4.5: if `fs` is an `owned` field whose type is a heap
-    // collection (Array<T>/OwnedArray<T>/…, builtins with no TypeSymbol so
+    // collection (Array<T>/OwningArray<T>/…, builtins with no TypeSymbol so
     // isOwnedReferenceField does not match them), return its resolved TypeRef;
     // otherwise null. The owner's Dispose frees such a field's backing and
     // cascades disposal into its class elements for an owning collection.
@@ -4124,7 +4124,7 @@ private:
             rt = ctx_.resolvedType(*fd->type);
         }
         // §28.5 (#937): an owned type-PARAMETER field (`owned _v: T`) whose
-        // concrete instantiation is a heap collection (`T = OwnedArray<Cell>`)
+        // concrete instantiation is a heap collection (`T = OwningArray<Cell>`)
         // is a collection field — it must free its backing AND cascade disposal
         // into its class elements. Resolve the bare type param to its concrete
         // substituted type (only when a per-instantiation substitution is
@@ -4137,13 +4137,13 @@ private:
                 rt = concr;
         }
         if (isCollectionTypeName(rt)) return rt;
-        // per §4.6/§4.7: owned LinkedList<T>/OwnedLinkedList<T> fields are also
+        // per §4.6/§4.7: owned LinkedList<T>/OwningLinkedList<T> fields are also
         // heap collections — freed via bz_llist_free, not bz_array_free; but
         // they are identified here so emitOwnedFieldDisposals handles them.
         if (isLinkedListTypeName(rt)) return rt;
-        // §28.5/§28.11, #893 #894: owned Dictionary<K,V>/OwnedDictionary<K,V>
+        // §28.5/§28.11, #893 #894: owned Dictionary<K,V>/OwningDictionary<K,V>
         // fields are heap-backed (bz_dict_t*) and must be freed via bz_dict_free.
-        // They own their V values for the OwnedDictionary case; emitOwnedFieldDisposals
+        // They own their V values for the OwningDictionary case; emitOwnedFieldDisposals
         // and lowerOwnedCollectionFieldStore detect isDict and use genericArgs[1].
         if (isDictTypeName(rt)) return rt;
         return nullptr;
@@ -4447,7 +4447,7 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
     // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
-    // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).
+    // OwningTask<T>; the async-iterator forms — async + yield — are deferred).
     // Mirrors emitIteratorMethod with smKind_ == Await. Layers the task-driver
     // shape on the kind-agnostic suspend/resume scaffolding:
     //   - State frame: { ptr vtable, i32 state, captures..., locals...,
@@ -4473,7 +4473,7 @@ private:
     // Task pointer); a sibling Resume(ptr completedTask, ptr frame) holds the
     // suspend/resume body — reusing the kind-agnostic scaffolding (await
     // suspend, ReturnStmt completion, fault boundary) exactly as emitAsyncMethod
-    // does. `resultElemSemaTy` is T in the lambda's `Task<T>`/`OwnedTask<T>`
+    // does. `resultElemSemaTy` is T in the lambda's `Task<T>`/`OwningTask<T>`
     // return type (null for a no-value `Task`), taken from the call-site
     // expected function type. `paramSyms` are the lambda's user parameter
     // symbols (already bound from the entry fn's args 1..N). On return `fn` is
@@ -4507,7 +4507,7 @@ private:
     // already-done fast path inline and, on the slow path, spills suspend-locals,
     // registers the Resume continuation on the awaited task, returns from the
     // resume fn, and resumes at the next state block. Returns the awaited
-    // result value (an int/value/string for Task<T>/OwnedTask<T>; a null
+    // result value (an int/value/string for Task<T>/OwningTask<T>; a null
     // placeholder for `await Task` which yields unit). Returns nullptr if the
     // enclosing function is not an async state machine (so the await falls
     // through to the normal nullptr — a defensive guard, not a normal path).
@@ -4666,7 +4666,7 @@ private:
     // The async resume function (the bz_task_then continuation). The await
     // suspend point registers this on the awaited task.
     llvm::Function* asyncResumeFn_ = nullptr;
-    // The async method's result element type T (Task<T>/OwnedTask<T>), or null
+    // The async method's result element type T (Task<T>/OwningTask<T>), or null
     // for a `Task` (no value). Used to size bz_task_complete's result buffer and
     // to type the value read back at the await site.
     llvm::Type* asyncResultTy_ = nullptr;
@@ -4981,7 +4981,7 @@ private:
     bool registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld);
 
     // §29.11 (#943): if `ld` is a plain (non-`using`) `var` whose value is a
-    // vtable-backed re-iterable IEnumerable<T>/OwnedEnumerable<T> (the result of
+    // vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T> (the result of
     // a yield iterator method, or an array/user-class wrapped into one), register
     // a scope-end disposal of that source via the iterator-format slot-1 Dispose
     // (iterEnumDispose) and return true. The for-in loop over such a source clones
@@ -5368,8 +5368,8 @@ private:
                             llvm::Value* newVal, const ast::Expr* valueExpr);
 
     // #824 / §28.5 / §28.9: is `target` an `owned` heap-collection CLASS
-    // instance field lvalue (OwnedArray<T>/OwnedStack<T>/OwnedQueue<T>/
-    // OwnedSet<T>/OwnedLinkedList<T>/OwnedBuffer<T>/OwnedDictionary<T> etc.)?
+    // instance field lvalue (OwningArray<T>/OwningStack<T>/OwningQueue<T>/
+    // OwningSet<T>/OwningLinkedList<T>/OwningBuffer<T>/OwningDictionary<T> etc.)?
     // Only such a location is auto-disposed by the enclosing class's destructor
     // (emitOwnedFieldDisposals) and needs dispose-old/store-new on reassignment.
     // Excludes locals, ref params, static fields, record fields, and
@@ -5501,7 +5501,7 @@ private:
 
     // #990 / §4.5 / §14.2: `using var _ := item` where `item` is the loop
     // variable of a `for var item in coll.Drain()` loop over an owning sequence
-    // collection (OwnedArray/Stack/Queue/LinkedList).  A drained owning-collection
+    // collection (OwningArray/Stack/Queue/LinkedList).  A drained owning-collection
     // element is, by the stdlib type definitions, a class object with a vtable —
     // even when its static type is an unresolved generic class type parameter `T`
     // in the generic TEMPLATE body (classOfLocal cannot recover a concrete class
@@ -5517,7 +5517,7 @@ private:
 
     // #465 / §15.4 / stdlib §4.4–§4.5: materialize a sequence collection literal
     // `[e1, e2, …]` into a freshly-allocated heap collection (Array<T> /
-    // OwnedArray<T> / Stack / Queue and their owning variants), reusing the exact
+    // OwningArray<T> / Stack / Queue and their owning variants), reusing the exact
     // `new Array<T>()` allocation (bz_array_alloc) + `.Add(...)` element-store
     // (bz_array_add) codegen. `collTy` is the resolved heap-collection target
     // TypeRef (carrying the element type in genericArgs[0]). Returns a `ptr` to
@@ -5535,8 +5535,8 @@ private:
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy);
 
     // #999 / §15.4: materialize a collection literal `[…]` against ANY heap
-    // collection target type (Array/OwnedArray/Set/OwnedSet/Stack/Queue and their
-    // owned forms, LinkedList/OwnedLinkedList, Dictionary/OwnedDictionary). This
+    // collection target type (Array/OwningArray/Set/OwningSet/Stack/Queue and their
+    // owned forms, LinkedList/OwningLinkedList, Dictionary/OwningDictionary). This
     // is the single entry the call-argument path uses: it dispatches the dict
     // literal form to materializeHeapDictLiteral and every sequence form to
     // materializeHeapCollectionLiteral (which itself routes Set/LinkedList).
@@ -5576,22 +5576,22 @@ private:
     Disposal buildCollectionTempDisposal(llvm::Value* slot,
                                          const sema::TypeRef* collTy);
 
-    // #559 / stdlib §4.10: materialize a Set<T>/OwnedSet<T> sequence literal
+    // #559 / stdlib §4.10: materialize a Set<T>/OwningSet<T> sequence literal
     // `[e1, e2, …]` into a freshly-allocated Set backed by bz_dict_alloc_generic,
     // reusing the SAME allocation and per-element insertion as the
     // `new Set<T>()` + `.Add(e)` paths (bz_dict_set_gen + sentinel value 1).
     // Duplicates are silently collapsed (dict stores the first; second call is
     // a no-op on an already-present key). Returns a `ptr` to the bz_dict_t
-    // (or null if `setTy` is not a Set/OwnedSet TypeRef with a recognised
+    // (or null if `setTy` is not a Set/OwningSet TypeRef with a recognised
     // element type).
     llvm::Value* materializeHeapSetLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy);
 
-    // per §4.6/§4.7: the resolved LinkedList<T>/OwnedLinkedList<T> TypeRef of
+    // per §4.6/§4.7: the resolved LinkedList<T>/OwningLinkedList<T> TypeRef of
     // a local, or null if the local is not a linked list.
     const sema::TypeRef* linkedListTypeOfLocal(const ast::LocalDecl* ld);
 
-    // #394 / stdlib §4.9: the resolved Dictionary/OwnedDictionary TypeRef of a
+    // #394 / stdlib §4.9: the resolved Dictionary/OwningDictionary TypeRef of a
     // local (declared type, then `new` initializer type, then inferred
     // initializer type), or null if the local is not a hash-backed dictionary.
     const sema::TypeRef* dictTypeOfLocal(const ast::LocalDecl* ld);
@@ -5688,15 +5688,15 @@ private:
     //     var x := __enum.Current;   // borrowing
     //     body
     //   end;
-    // Desugar per spec (OwnedEnumerable, §29.2/v0.161/#1349):
-    //   using var __enum := obj.GetOwnedEnumerator();
+    // Desugar per spec (IOwningEnumerable, §29.2/v0.161/#1349):
+    //   using var __enum := obj.GetOwningEnumerator();
     //   while __enum.MoveNext() do
     //     var x := __enum.TakeCurrent();  // ownership transfer
     //     body
     //   end;
     //   __enum.Dispose();   ← via disposeStack_ at scope exit
     // §29.2 (B1): `for var x in items` where items is typed as IEnumerable<T> /
-    // OwnedEnumerable<T> / IReadOnlyCollection<T> etc. with null declaration (builtin interface).
+    // IOwningEnumerable<T> / IReadOnlyCollection<T> etc. with null declaration (builtin interface).
     // Uses the vtable protocol (MoveNext at slot 2, Current/TakeCurrent at slot 3)
     // which works for BOTH iterator state machines AND Array<T> (via its vtable).
     // If the actual runtime object is a bz_array_t, falls back to direct loop.
@@ -5738,12 +5738,12 @@ private:
     bool lowerDictEntryFor(const ast::ForStmt& fs);
 
     // #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()`
-    // ownership-transferring drain over OwnedArray<T>, OwnedLinkedList<T>,
-    // OwnedStack<T>, OwnedQueue<T>.
+    // ownership-transferring drain over OwningArray<T>, OwningLinkedList<T>,
+    // OwningStack<T>, OwningQueue<T>.
     bool lowerOwnedSeqDrainFor(const ast::ForStmt& fs);
 
     // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()`
-    // ownership-transferring drain iteration over OwnedDictionary<K,V>.
+    // ownership-transferring drain iteration over OwningDictionary<K,V>.
     bool lowerDictDrainFor(const ast::ForStmt& fs);
 
     // issue #370: emit a counted loop over a snapshot of generic-table keys
@@ -6127,7 +6127,7 @@ private:
 
     // Check if the named type (TypeRef with null declaration) is a collection.
     static bool isCollectionTypeName(const sema::TypeRef* rt);
-    // per §4.6/§4.7: true for LinkedList<T> / OwnedLinkedList<T> (bz_llist_t-backed).
+    // per §4.6/§4.7: true for LinkedList<T> / OwningLinkedList<T> (bz_llist_t-backed).
     static bool isLinkedListTypeName(const sema::TypeRef* rt);
     // §6.1 / §30.8: extract the builtin type name from a Named TypeRef that has
     // no user TypeDecl.  Two shapes exist:
@@ -6150,15 +6150,15 @@ private:
             "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
             "DateTime", "TimeSpan", "Range", "Guid",
             "ArraySpan", "ReadOnlyArraySpan",
-            "Array", "OwnedArray", "Dictionary", "OwnedDictionary",
-            "Stack", "OwnedStack", "Queue", "OwnedQueue",
-            "Set", "OwnedSet", "LinkedList", "OwnedLinkedList",
+            "Array", "OwningArray", "Dictionary", "OwningDictionary",
+            "Stack", "OwningStack", "Queue", "OwningQueue",
+            "Set", "OwningSet", "LinkedList", "OwningLinkedList",
             "LinkedListNode", "StringBuilder", "Random",
-            "IEnumerable", "IEnumerator", "OwnedEnumerable", "OwnedEnumerator",
+            "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
             "IAsyncEnumerable", "IAsyncEnumerator",
-            "OwnedAsyncEnumerable", "OwnedAsyncEnumerator",
+            "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
             "IReadOnlyCollection", "IReadOnlyList", "ICollection", "IList",
-            "IOwnedCollection", "IOwnedList", "Task", "OwnedTask",
+            "IOwningCollection", "IOwningList", "Task", "OwningTask",
             "Subscription", "CancellationToken", "CancellationTokenSource",
             // §28.13 / stdlib §2.16 (#620): Shared<T> and Weak<T> are
             // compiler-known heap-pointer types.  Without them a bare
@@ -6187,9 +6187,9 @@ private:
             // type-parameter and the nullable-type-param branch lowered it to
             // {i8,i32} instead of ptr → emitStructEquality crash on `tok <> null`.
             "Semaphore", "SemaphoreToken",
-            // §6.6 / issue #974: TaskCompletionSource<T>/OwnedTaskCompletionSource<T>/
+            // §6.6 / issue #974: TaskCompletionSource<T>/OwningTaskCompletionSource<T>/
             // TaskCompletionSource — compiler-known heap-pointer builtins (bz_tcs_t*).
-            "TaskCompletionSource", "OwnedTaskCompletionSource",
+            "TaskCompletionSource", "OwningTaskCompletionSource",
             // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
             // heap-pointer builtins (bz_atomic_t*).  Without these entries a
             // nullable `Atomic<T>?` was mis-classified as a bare generic
@@ -6209,8 +6209,8 @@ private:
 
     static bool isDictTypeName(const sema::TypeRef* rt);
 
-    // stdlib §6.7 / §30.5: true when `rt` is a Task / Task<T> or OwnedTask<T>
-    // (bare name "Task" or "OwnedTask", with or without generic args, no user
+    // stdlib §6.7 / §30.5: true when `rt` is a Task / Task<T> or OwningTask<T>
+    // (bare name "Task" or "OwningTask", with or without generic args, no user
     // TypeDecl — these are builtin runtime types, not user-defined classes).
     static bool isTaskTypeName(const sema::TypeRef* rt);
     // stdlib §6.7 / §30.5: return a local's resolved Task / Task<T> TypeRef if
@@ -6218,18 +6218,18 @@ private:
     const sema::TypeRef* taskTypeOfLocal(const ast::LocalDecl* ld);
 
     // issue #401 / stdlib §4.1 / §4.2: is `rt` one of the int-indexed list
-    // INTERFACES (IReadOnlyList<T>, IList<T>, IOwnedList<T>)? These are the only
+    // INTERFACES (IReadOnlyList<T>, IList<T>, IOwningList<T>)? These are the only
     // collection interfaces that declare an indexer, and the only implementers
-    // are the array-backed Array<T> (IList) / OwnedArray<T> (IOwnedList) — so an
+    // are the array-backed Array<T> (IList) / OwningArray<T> (IOwningList) — so an
     // interface-typed receiver holds the same bz_array_t* and lowers through the
     // same runtime as the concrete array path. `outOwning` (optional) is set to
-    // true for IOwnedList<T> (the owning-set, disposing variant) and false for
+    // true for IOwningList<T> (the owning-set, disposing variant) and false for
     // the borrowing/read-only interfaces.
     static bool isListInterfaceName(const sema::TypeRef* rt,
                                     bool* outOwning = nullptr);
 
     // fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces
-    // (IReadOnlyCollection<T>, ICollection<T>, IOwnedCollection<T>). These are
+    // (IReadOnlyCollection<T>, ICollection<T>, IOwningCollection<T>). These are
     // genuinely polymorphic — implemented by collections with incompatible
     // runtime representations (bz_array_t*/bz_llist_t*/bz_dict_t*) with no shared
     // kind tag — so an interface-typed receiver cannot be soundly routed to a
@@ -6327,7 +6327,7 @@ private:
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
-    // per §4.6/§4.7: lower LinkedList<T>/OwnedLinkedList<T> instance calls
+    // per §4.6/§4.7: lower LinkedList<T>/OwningLinkedList<T> instance calls
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
     llvm::Value* tryLowerLinkedListInstanceCall(const ast::CallExpr& call);
@@ -6364,7 +6364,7 @@ private:
     static bool isLazyEnumerableType(const sema::TypeRef* rt);
 
     // issue #995 / stdlib §5 / §29.11: is `rt` a VTABLE-BACKED IEnumerable<T> /
-    // OwnedEnumerable<T> — an interface-typed local/param/field or a yield-method
+    // IOwningEnumerable<T> — an interface-typed local/param/field or a yield-method
     // result whose runtime value is the iterator-vtable object (not a bz_lazy_t*
     // / bz_array_t*)? Unlike the lazy sentinel (isLazyEnumerableType) it carries
     // the interface name in an astNode or importedName. Such a receiver is
@@ -6456,7 +6456,7 @@ private:
     llvm::Value* tryLowerMutexLockCall(const ast::CallExpr& call);
     // §6.3 / issue #647: Semaphore.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
     llvm::Value* tryLowerSemaphoreTokenCall(const ast::CallExpr& call);
-    // §6.6 / issue #974: TaskCompletionSource<T>/OwnedTaskCompletionSource<T>/
+    // §6.6 / issue #974: TaskCompletionSource<T>/OwningTaskCompletionSource<T>/
     //   TaskCompletionSource instance methods: TrySetResult, SetResult,
     //   TrySetException, SetException, TrySetCancelled, SetCancelled, Dispose.
     llvm::Value* tryLowerTcsCall(const ast::CallExpr& call);

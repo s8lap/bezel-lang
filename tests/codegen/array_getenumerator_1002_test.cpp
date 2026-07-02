@@ -1,5 +1,5 @@
 // Codegen — #1002 / §29.3 / §29.11 / stdlib §4.4/§4.12: the manual enumerator
-// protocol on an `Array<T>.GetEnumerator()` (and `OwnedArray<T>.GetEnumerator()`)
+// protocol on an `Array<T>.GetEnumerator()` (and `OwningArray<T>.GetEnumerator()`)
 // result.
 //
 // Root cause (pre-fix): `Array<T>.GetEnumerator()` returns `owned
@@ -14,7 +14,7 @@
 //      so the program silently returned the wrong value — WRONG_VALUE.
 //
 // Fix:
-//   - sema (ExprTypecheck_Calls): type Array<T>/OwnedArray<T> GetEnumerator() as
+//   - sema (ExprTypecheck_Calls): type Array<T>/OwningArray<T> GetEnumerator() as
 //     the builtin IEnumerator<T> sentinel, so the #494 MoveNext-bool / Current-T
 //     typing fires.
 //   - codegen (LlvmBackend_Calls): lower the call by reusing the #943
@@ -25,7 +25,7 @@
 //     the #494 path; Dispose (slot 1) frees only the wrapper struct, BORROWING the
 //     array, so a separate `using var arr` is disposed exactly once (§28.2).
 //   - codegen (LlvmBackend_Setup, registerUsingDisposal): recognise an
-//     IEnumerator<T>/OwnedEnumerator<T>-typed `using var` and dispose it via the
+//     IEnumerator<T>/IOwningEnumerator<T>-typed `using var` and dispose it via the
 //     iterator slot-1 path (§29.7/§29.11), so the enumerator struct does not leak.
 //
 // These tests run the FULL pipeline (including the ownership pass) so the
@@ -181,9 +181,9 @@ BEZEL_TEST(array_getenumerator_1002, for_in_then_manual_no_regression_spec_29_2)
         "end Main; end P;"), 120);
 }
 
-// ---- F: owned-element dispose-once (OwnedArray<Cell>) --------------------------
-// §28.2 / §4.3: the enumerator BORROWS the OwnedArray — its slot-1 Dispose frees
-// only the wrapper struct, NOT the cells. The OwnedArray disposes each owned Cell
+// ---- F: owned-element dispose-once (OwningArray<Cell>) --------------------------
+// §28.2 / §4.3: the enumerator BORROWS the OwningArray — its slot-1 Dispose frees
+// only the wrapper struct, NOT the cells. The OwningArray disposes each owned Cell
 // exactly once at its own scope end. Net Cell.n == 0 (no double-free, no leak).
 // The drain reads each Cell.V (= 7) through the borrowing IEnumerable<T> view
 // (Current is non-destructive here, §4.3), so the sum is 21 while alive; the test
@@ -193,7 +193,7 @@ BEZEL_TEST(array_getenumerator_1002, owned_array_enum_dispose_once_spec_28_2) {
         std::string(kImport) + kCell +
         "class P public static method Main(): int "
         "  do "
-        "    using var arr := new OwnedArray<Cell>(); "
+        "    using var arr := new OwningArray<Cell>(); "
         "    arr.Add(new Cell()); arr.Add(new Cell()); arr.Add(new Cell()); "
         "    using var e := arr.GetEnumerator(); "
         "    var sum := 0; "
@@ -204,13 +204,13 @@ BEZEL_TEST(array_getenumerator_1002, owned_array_enum_dispose_once_spec_28_2) {
 }
 
 // ---- G: owned-element drain value while alive ---------------------------------
-// §4.3: borrowing iteration over OwnedArray<Cell> yields borrows of each Cell;
+// §4.3: borrowing iteration over OwningArray<Cell> yields borrows of each Cell;
 // reading Current.V three times sums 21 (3 × 7) before disposal.
 BEZEL_TEST(array_getenumerator_1002, owned_array_drain_value_spec_4_3) {
     BEZEL_EXPECT_EQ(run(
         std::string(kImport) + kCell +
         "class P public static method Main(): int "
-        "  using var arr := new OwnedArray<Cell>(); "
+        "  using var arr := new OwningArray<Cell>(); "
         "  arr.Add(new Cell()); arr.Add(new Cell()); arr.Add(new Cell()); "
         "  using var e := arr.GetEnumerator(); "
         "  var sum := 0; "
@@ -239,14 +239,14 @@ BEZEL_TEST(array_getenumerator_1002, non_using_explicit_dispose_spec_29_7) {
 
 // ---- I: using-var + explicit Dispose — exactly-once (no double-free) -----------
 // §28.2: an explicit `e.Dispose()` nulls the receiver slot; the using-var
-// scope-exit reloads null and skips, so the OwnedArray's cells are disposed
+// scope-exit reloads null and skips, so the OwningArray's cells are disposed
 // exactly once. Net Cell.n == 0 (a double-free would have crashed/under-counted).
 BEZEL_TEST(array_getenumerator_1002, using_var_plus_explicit_dispose_once_spec_28_2) {
     BEZEL_EXPECT_EQ(run(
         std::string(kImport) + kCell +
         "class P public static method Main(): int "
         "  do "
-        "    using var arr := new OwnedArray<Cell>(); "
+        "    using var arr := new OwningArray<Cell>(); "
         "    arr.Add(new Cell()); arr.Add(new Cell()); "
         "    using var e := arr.GetEnumerator(); "
         "    var s := 0; "

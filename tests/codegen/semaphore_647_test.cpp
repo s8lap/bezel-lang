@@ -440,8 +440,8 @@ BEZEL_TEST(codegen_semaphore_6_3_30_14, semaphore_spawn_arg_compiles_to_valid_ir
 
 // ---------------------------------------------------------------------------
 // §6.3 / #647 / v0.140: AcquireAsync / TryAcquireAsync IR-level tests.
-// AcquireAsync → OwnedTask<SemaphoreToken>
-// TryAcquireAsync → OwnedTask<SemaphoreToken?>
+// AcquireAsync → OwningTask<SemaphoreToken>
+// TryAcquireAsync → OwningTask<SemaphoreToken?>
 // ---------------------------------------------------------------------------
 
 // §6.3 / #647 / v0.140: AcquireAsync compiles to valid IR without errors.

@@ -15,7 +15,7 @@
 //   no longer emits the #530 diagnostic; instead it sets the loop variable's
 //   element type to a synthetic DictionaryEntry<K,V> TypeRef
 //   (importedName="DictionaryEntry", genericArgs=[K,V]).
-//   OwnedDictionary<K,V> still gets the narrowed §4.9 diagnostic.
+//   OwningDictionary<K,V> still gets the narrowed §4.9 diagnostic.
 //
 // Sema (ExprTypecheck_Calls.cpp / resolveMemberAccess): `entry.Key` is typed
 //   as K (genericArgs[0]) and `entry.Value` as V (genericArgs[1]) when the
@@ -214,7 +214,7 @@ BEZEL_TEST(dict_entry_iter_548, spec_21_verbatim_entry_accessible) {
 }
 
 // ---------------------------------------------------------------------------
-// NEGATIVE: OwnedDictionary<K,V> still rejected (§4.9 v0.135, narrowed #530)
+// NEGATIVE: OwningDictionary<K,V> still rejected (§4.9 v0.135, narrowed #530)
 // ---------------------------------------------------------------------------
 
 // #548 / §4.9 v0.135: `for var e in ownedDict` must still be rejected with
@@ -226,7 +226,7 @@ BEZEL_TEST(dict_entry_iter_548, owned_dict_still_rejected) {
     auto r = runJit(
         "module M; class V public n: int := 0; end V; "
         "class C public static method Main(): int "
-        "  using var od := new OwnedDictionary<string, V>(); "
+        "  using var od := new OwningDictionary<string, V>(); "
         "  var n := 0; "
         "  for var e in od do n := n + 1; end; "
         "  return n; "

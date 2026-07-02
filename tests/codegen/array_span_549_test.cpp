@@ -152,7 +152,7 @@ BEZEL_TEST(array_span_549, asspan_0arg_empty_length_spec_4_15) {
         "end Main; end C;", 0);
 }
 
-// §4.5 (#1022): OwnedArray<T> does NOT expose AsSpan — its elements are uniquely
+// §4.5 (#1022): OwningArray<T> does NOT expose AsSpan — its elements are uniquely
 // owned, so a span view (writable, can overwrite owned slots) is not provided.
 // Before #1022 this was accepted and codegen SILENTLY miscompiled it to a zeroed
 // span (sp[i] == 0 for every i); now it is a clean compile error.
@@ -161,19 +161,19 @@ BEZEL_TEST(array_span_549, ownedarray_asspan_rejected_1022) {
         "module M; "
         "class R end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  using var a := new OwningArray<R>(); a.Add(new R()); "
         "  var sp := a.AsSpan(); "
         "  return 0; "
         "end Main; end C;"));
 }
 
-// §4.5 (#1022): OwnedArray<T>.AsReadOnlySpan() is likewise rejected.
+// §4.5 (#1022): OwningArray<T>.AsReadOnlySpan() is likewise rejected.
 BEZEL_TEST(array_span_549, ownedarray_asreadonlyspan_rejected_1022) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; "
         "class R end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  using var a := new OwningArray<R>(); a.Add(new R()); "
         "  var sp := a.AsReadOnlySpan(); "
         "  return 0; "
         "end Main; end C;"));
@@ -186,7 +186,7 @@ BEZEL_TEST(array_span_549, array_asspan_index_unaffected_1022) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(7); a.Add(8); a.Add(9); "
         "  var sp := a.AsSpan(); "
-        "  return sp[1]; "  // 8 (was the silent-0 bug only on OwnedArray)
+        "  return sp[1]; "  // 8 (was the silent-0 bug only on OwningArray)
         "end Main; end C;", 8);
 }
 
@@ -194,12 +194,12 @@ BEZEL_TEST(array_span_549, array_asspan_index_unaffected_1022) {
 // are rejected on an OWNING collection — copying would double-own its uniquely
 // owned elements. (Before the fix they were silently accepted and codegen
 // mis-reclaimed the materializer backing.) §4.5 L1202: "There is no ToArray() on
-// OwnedArray<T> that produces a non-owning copy."
+// OwningArray<T> that produces a non-owning copy."
 BEZEL_TEST(array_span_549, ownedarray_toarray_rejected_1022) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; class R end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  using var a := new OwningArray<R>(); a.Add(new R()); "
         "  _ := a.ToArray(); "
         "  return 0; "
         "end Main; end C;"));
@@ -209,7 +209,7 @@ BEZEL_TEST(array_span_549, ownedarray_toset_rejected_1022) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; class R end R; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<R>(); a.Add(new R()); "
+        "  using var a := new OwningArray<R>(); a.Add(new R()); "
         "  _ := a.ToSet(); "
         "  return 0; "
         "end Main; end C;"));
@@ -220,7 +220,7 @@ BEZEL_TEST(array_span_549, ownedarray_todictionary_rejected_1022) {
         "module M; "
         "import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); a.Add(1); a.Add(2); "
+        "  using var a := new OwningArray<int>(); a.Add(1); a.Add(2); "
         "  _ := a.ToDictionary((x) => x); "
         "  return 0; "
         "end Main; end C;"));
@@ -229,7 +229,7 @@ BEZEL_TEST(array_span_549, ownedarray_todictionary_rejected_1022) {
 // §4.5 (#1022) regression: a LINQ query result over an owning collection has an
 // IEnumerable receiver, so its ToArray() materializer is the borrowing copy-form
 // and stays VALID (only a DIRECT owning-collection receiver is rejected).
-// Migrated from OwnedArray<int> to OwnedArray<Cell> per stdlib §4.2/#1327.
+// Migrated from OwningArray<int> to OwningArray<Cell> per stdlib §4.2/#1327.
 BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
     expectValueAndAsanClean(
         "module M; "
@@ -237,7 +237,7 @@ BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
         "class Cell public V: int := 0; "
         "  public constructor(v: int) V := v; end constructor; end Cell; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(7)); a.Add(new Cell(8)); a.Add(new Cell(9)); "
         "  using var e: Array<Cell> := a.Where((x) => x.V > 7).ToArray(); "
         "  return e.Length; "  // 2 (8 and 9)
@@ -253,7 +253,7 @@ BEZEL_TEST(array_span_549, ownedarray_unknown_method_takeat_rejected_1103b) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); a.Add(7); "
+        "  using var a := new OwningArray<int>(); a.Add(7); "
         "  return a.TakeAt(0); "
         "end Main; end C;"));
 }
@@ -262,7 +262,7 @@ BEZEL_TEST(array_span_549, ownedarray_unknown_method_arbitrary_rejected_1103b) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); a.Add(7); "
+        "  using var a := new OwningArray<int>(); a.Add(7); "
         "  a.Frobnicate(); "
         "  return 0; "
         "end Main; end C;"));
@@ -276,7 +276,7 @@ BEZEL_TEST(array_span_549, ownedarray_real_surface_accepted_1103b) {
         "class Cell public _v: int := 0; "
         "  public constructor(v: int) _v := v; end constructor; end Cell; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(7)); a.Add(new Cell(9)); "
         "  var hi := a.Where((c) => c._v > 8).Count(); "  // 1
         "  return a.Get(1)._v + a.Count + hi; "           // 9 + 2 + 1 = 12
@@ -894,12 +894,12 @@ BEZEL_TEST(array_span_549, readonly_span_setter_rejected_spec_4_15) {
 // (not SIGSEGV). The write surface is the indexer `coll[i] := v`.
 // ===========================================================================
 
-// §4.5 / #920 / #1112: OwnedArray.Set(i,v) is rejected with an indexer hint.
+// §4.5 / #920 / #1112: OwningArray.Set(i,v) is rejected with an indexer hint.
 BEZEL_TEST(array_span_549, ownedarray_set_rejected_with_indexer_hint_920) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<int>(); a.Add(7); "
+        "  using var a := new OwningArray<int>(); a.Add(7); "
         "  a.Set(0, 99); "  // §4.5/§4.8 v0.155: .Set is not a method — use a[0] := 99
         "  return 0; "
         "end Main; end C;"));
@@ -960,7 +960,7 @@ BEZEL_TEST(array_span_549, array_and_dict_real_surface_still_accepted_920) {
         "end Main; end C;", 46);
 }
 
-// Anti-over-reject guard: real methods on OwnedArray still accepted.
+// Anti-over-reject guard: real methods on OwningArray still accepted.
 // §4.5 / #920 / #1112.
 BEZEL_TEST(array_span_549, ownedarray_real_surface_still_accepted_920) {
     expectValueAndAsanClean(
@@ -968,7 +968,7 @@ BEZEL_TEST(array_span_549, ownedarray_real_surface_still_accepted_920) {
         "class Cell public _v: int := 0; "
         "  public constructor(v: int) _v := v; end constructor; end Cell; "
         "class C public static method Main(): int "
-        "  using var a := new OwnedArray<Cell>(); "
+        "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(5)); a.Add(new Cell(7)); "
         "  a[0] := new Cell(9); "  // indexer-set disposes old Cell(5)
         "  return a.Count + a.Get(0)._v + a.Get(1)._v; "  // 2 + 9 + 7 = 18
@@ -984,7 +984,7 @@ BEZEL_TEST(codegen_span549, span_start_field_read_1277) {
     // AsSpan(2, 4) → Start=2, Length=4; Start+Length = 6.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(8, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(8, (i) => i + 1); "
         "  var sp := buf.AsSpan(2, 4); "
         "  return sp.Start + sp.Length; "  // 2 + 4 = 6
         "end Main; end C;"), 6);
@@ -994,7 +994,7 @@ BEZEL_TEST(codegen_span549, span_start_field_read_1277) {
 BEZEL_TEST(codegen_span549, span_start_alone_1277) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(8, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(8, (i) => i + 1); "
         "  var sp := buf.AsSpan(3, 2); "
         "  return sp.Start; "  // 3
         "end Main; end C;"), 3);
@@ -1004,7 +1004,7 @@ BEZEL_TEST(codegen_span549, span_start_alone_1277) {
 BEZEL_TEST(codegen_span549, readonly_span_start_field_read_1277) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(8, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(8, (i) => i + 1); "
         "  var sp := buf.AsReadOnlySpan(2, 3); "
         "  return sp.Start + sp.Length; "  // 2 + 3 = 5
         "end Main; end C;"), 5);
@@ -1029,7 +1029,7 @@ BEZEL_TEST(codegen_span549, readonly_span_start_field_read_1277) {
 BEZEL_TEST(codegen_span549, span_ctor_direct_valid_read_1275) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(4); "
+        "  using var buf := new OwningBuffer<int>(4); "
         "  var sp := new Span<int>(buf, 0, 4); "
         "  sp[3] := 4; "
         "  return sp[3]; "  // 4
@@ -1041,7 +1041,7 @@ BEZEL_TEST(codegen_span549, span_ctor_direct_valid_read_1275) {
 BEZEL_TEST(codegen_span549, readonly_span_ctor_direct_1275) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(5); "
+        "  using var buf := new OwningBuffer<int>(5); "
         "  var w := new Span<int>(buf, 0, 5); w[2] := 3; "
         "  var sp := new ReadOnlySpan<int>(buf, 1, 3); "
         "  return sp[1]; "  // buf[2] = 3
@@ -1064,7 +1064,7 @@ BEZEL_TEST(codegen_span549, arrayspan_ctor_direct_1275) {
 BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(4, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(4, (i) => i + 1); "
         "  try var sp := new Span<int>(buf, 0, 100); return sp[50]; "
         "  catch IndexOutOfRangeException => return 88; end; "
         "end Main; end C;"), 88);
@@ -1074,20 +1074,20 @@ BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
 BEZEL_TEST(codegen_span549, span_ctor_start_oob_throws_1275) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(4, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(4, (i) => i + 1); "
         "  try var sp := new Span<int>(buf, 9, 1); return sp[0]; "
         "  catch IndexOutOfRangeException => return 77; end; "
         "end Main; end C;"), 77);
 }
 
-// §4.14 (#1286): the init lambda of `new OwnedBuffer<T>(n, (i) => …)` is
+// §4.14 (#1286): the init lambda of `new OwningBuffer<T>(n, (i) => …)` is
 // call-scoped — it fills the buffer and does not escape. Codegen now releases
 // its closure cell after the fill loop; previously the closure leaked (LSan
 // reported 32 bytes for a non-capturing `(i) => …`). Value: buf[3] = 4.
 BEZEL_TEST(codegen_span549, ownedbuffer_init_closure_not_leaked_1286) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwnedBuffer<int>(4, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(4, (i) => i + 1); "
         "  return buf[3]; "  // 4 — and the init closure is freed (ASan-clean)
         "end Main; end C;", 4);
 }

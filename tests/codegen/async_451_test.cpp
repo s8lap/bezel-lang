@@ -241,11 +241,11 @@ BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
 
 // ===========================================================================
 // (A2) Task.WhenAllOwned<T> — stdlib §6.7 lines 2942-2944
-//      OwnedTask<T> combinator variant (T: class)
+//      OwningTask<T> combinator variant (T: class)
 // ===========================================================================
 
-// §6.7 line 2942 / §30.10: WhenAllOwned with an empty OwnedArray produces an
-// immediately-complete OwnedTask<OwnedArray<T>>. Await result's Count == 0.
+// §6.7 line 2942 / §30.10: WhenAllOwned with an empty OwningArray produces an
+// immediately-complete OwningTask<OwningArray<T>>. Await result's Count == 0.
 BEZEL_TEST(when_all_owned_451, empty_array_produces_empty_result) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; "
@@ -257,7 +257,7 @@ BEZEL_TEST(when_all_owned_451, empty_array_produces_empty_result) {
         "end Box; "
         "class C "
         "  public static async method Main(): Task<int> "
-        "    var tasks := new OwnedArray<OwnedTask<Box>>(); "
+        "    var tasks := new OwningArray<OwningTask<Box>>(); "
         "    using var wa := Task.WhenAllOwned(move tasks); "
         "    using var arr := await wa; "
         "    return arr.Count; "
@@ -265,11 +265,11 @@ BEZEL_TEST(when_all_owned_451, empty_array_produces_empty_result) {
         0);
 }
 
-// §6.7 line 2942 / §30.10: WhenAllOwned with two already-completed OwnedTask<Box>
+// §6.7 line 2942 / §30.10: WhenAllOwned with two already-completed OwningTask<Box>
 // (from Task.FromOwnedResult). Results collected; Value fields are 10 and 20.
 // Returns arr[0].Value + arr[1].Value = 30.
-// Derived from: stdlib §6.7 WhenAllOwned<T>(tasks: OwnedArray<OwnedTask<T>>):
-// OwnedTask<OwnedArray<T>>.
+// Derived from: stdlib §6.7 WhenAllOwned<T>(tasks: OwningArray<OwningTask<T>>):
+// OwningTask<OwningArray<T>>.
 BEZEL_TEST(when_all_owned_451, two_tasks_results_collected) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; "
@@ -280,11 +280,11 @@ BEZEL_TEST(when_all_owned_451, two_tasks_results_collected) {
         "  end; "
         "end Box; "
         "class C "
-        "  public static async method MakeBox(n: int): OwnedTask<Box> "
+        "  public static async method MakeBox(n: int): OwningTask<Box> "
         "    return new Box(n); "
         "  end MakeBox; "
         "  public static async method Main(): Task<int> "
-        "    var tasks := new OwnedArray<OwnedTask<Box>>(); "
+        "    var tasks := new OwningArray<OwningTask<Box>>(); "
         "    tasks.Add(MakeBox(10)); "
         "    tasks.Add(MakeBox(20)); "
         "    using var wa := Task.WhenAllOwned(move tasks); "
@@ -294,7 +294,7 @@ BEZEL_TEST(when_all_owned_451, two_tasks_results_collected) {
         30);
 }
 
-// §6.7 line 2942 / §30.10: WhenAllOwned cross-thread: each OwnedTask<Box>
+// §6.7 line 2942 / §30.10: WhenAllOwned cross-thread: each OwningTask<Box>
 // awaits Task.Delay before returning a new Box. Tasks run concurrently (they
 // are started before WhenAllOwned is called). Collect 3 boxes; sum = 1+2+3=6.
 BEZEL_TEST(when_all_owned_451, async_producers_cross_thread) {
@@ -307,12 +307,12 @@ BEZEL_TEST(when_all_owned_451, async_producers_cross_thread) {
         "  end; "
         "end Box; "
         "class C "
-        "  public static async method MakeBox(n: int): OwnedTask<Box> "
+        "  public static async method MakeBox(n: int): OwningTask<Box> "
         "    await Task.Delay(5); "
         "    return new Box(n); "
         "  end MakeBox; "
         "  public static async method Main(): Task<int> "
-        "    var tasks := new OwnedArray<OwnedTask<Box>>(); "
+        "    var tasks := new OwningArray<OwningTask<Box>>(); "
         "    tasks.Add(MakeBox(1)); "
         "    tasks.Add(MakeBox(2)); "
         "    tasks.Add(MakeBox(3)); "

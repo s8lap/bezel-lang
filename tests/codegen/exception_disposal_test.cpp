@@ -1173,7 +1173,7 @@ BEZEL_TEST(codegen_excdisp_821, async_iterator_using_var_early_break_disposed) {
 // all; this verifies the transfer is ownership-correct, not just that it runs.)
 // --------------------------------------------------------------------------
 
-// OwnedArray<R>: 2 elements; TryPopFirst transfers one out (disposed via
+// OwningArray<R>: 2 elements; TryPopFirst transfers one out (disposed via
 // `using var _`); the other disposed at scope-end. Each disposed once → 2.
 const char* kArrTryPopFirstTransfer =
     "module M; "
@@ -1181,7 +1181,7 @@ const char* kArrTryPopFirstTransfer =
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C public static method Main(): int "
     "  do "
-    "    using var a := new OwnedArray<R>(); "
+    "    using var a := new OwningArray<R>(); "
     "    a.Add(move (new R())); a.Add(move (new R())); "
     "    var got: R? := null; var ok := a.TryPopFirst(out got); "
     "    if ok then if got <> null then "
@@ -1195,14 +1195,14 @@ BEZEL_TEST(codegen_excdisp_831, owned_array_try_pop_first_transfer_disposed_once
     expectExitAndLeakFree(kArrTryPopFirstTransfer, 2);
 }
 
-// OwnedLinkedList<R>: same transfer + dispose-once invariant.
+// OwningLinkedList<R>: same transfer + dispose-once invariant.
 const char* kLListTryPopFirstTransfer =
     "module M; "
     "class R public static count: int := 0; "
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C public static method Main(): int "
     "  do "
-    "    using var l := new OwnedLinkedList<R>(); "
+    "    using var l := new OwningLinkedList<R>(); "
     "    l.AddLast(move (new R())); l.AddLast(move (new R())); "
     "    var got: R? := null; var ok := l.TryPopFirst(out got); "
     "    if ok then if got <> null then "
@@ -1216,7 +1216,7 @@ BEZEL_TEST(codegen_excdisp_831, owned_linkedlist_try_pop_first_transfer_disposed
     expectExitAndLeakFree(kLListTryPopFirstTransfer, 2);
 }
 
-// OwnedDictionary<string,R>: TryPopValue transfers one value out (disposed via
+// OwningDictionary<string,R>: TryPopValue transfers one value out (disposed via
 // `using var _`); the other entry disposed at scope-end. Each disposed once → 2.
 const char* kDictTryPopValueTransfer =
     "module M; "
@@ -1224,7 +1224,7 @@ const char* kDictTryPopValueTransfer =
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C public static method Main(): int "
     "  do "
-    "    using var d := new OwnedDictionary<string, R>(); "
+    "    using var d := new OwningDictionary<string, R>(); "
     "    d.Add(\"a\", move (new R())); d.Add(\"b\", move (new R())); "
     "    var v: R? := null; var hit := d.TryPopValue(\"a\", out v); "
     "    if hit then if v <> null then "
@@ -1238,7 +1238,7 @@ BEZEL_TEST(codegen_excdisp_831, owned_dict_try_pop_value_transfer_disposed_once)
     expectExitAndLeakFree(kDictTryPopValueTransfer, 2);
 }
 
-// TryPopFirst on an EMPTY OwnedArray<R> returns false and disposes nothing
+// TryPopFirst on an EMPTY OwningArray<R> returns false and disposes nothing
 // extra; the one element added afterwards (never popped) is disposed at
 // scope-end exactly once → 1 (the false path must not corrupt ownership).
 const char* kArrTryPopEmptyThenScopeEnd =
@@ -1247,7 +1247,7 @@ const char* kArrTryPopEmptyThenScopeEnd =
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C public static method Main(): int "
     "  do "
-    "    using var a := new OwnedArray<R>(); "
+    "    using var a := new OwningArray<R>(); "
     "    var got: R? := null; var ok := a.TryPopFirst(out got); "
     "    a.Add(move (new R())); "
     "  end; "
@@ -1260,7 +1260,7 @@ BEZEL_TEST(codegen_excdisp_831, owned_array_try_pop_empty_false_no_corruption) {
 }
 
 // --------------------------------------------------------------------------
-// [837] §4.10 / §8.3 — OwnedSet<T> deduplicates a class element by the user's
+// [837] §4.10 / §8.3 — OwningSet<T> deduplicates a class element by the user's
 // Equals; the rejected duplicate is disposed exactly once and the retained
 // elements are disposed at scope-end. Verifies the dedup-dispose path is
 // ownership-correct (no leak, no double-free), not merely that the count is
@@ -1280,7 +1280,7 @@ const char* kSetAddDupDisposed =
     "  public override method GetHashCode(): int => X; end Box; "
     "class C public static method Main(): int "
     "  do "
-    "    using var s := new OwnedSet<Box>(); "
+    "    using var s := new OwningSet<Box>(); "
     "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
     "    s.Add(move (new Box(1))); "
     "  end; "
@@ -1304,7 +1304,7 @@ const char* kSetTryAddDupDisposed =
     "  public override method GetHashCode(): int => X; end Box; "
     "class C public static method Main(): int "
     "  do "
-    "    using var s := new OwnedSet<Box>(); "
+    "    using var s := new OwningSet<Box>(); "
     "    s.Add(move (new Box(1))); s.Add(move (new Box(2))); "
     "    var r := s.TryAdd(move (new Box(1))); "
     "  end; "
@@ -1316,7 +1316,7 @@ BEZEL_TEST(codegen_excdisp_837, owned_set_tryadd_duplicate_disposed_once) {
     expectExitAndLeakFree(kSetTryAddDupDisposed, 3);
 }
 
-// NOTE [838]: an OwnedArray<Subscription>'s scope-end unsubscribe is verified by
+// NOTE [838]: an OwningArray<Subscription>'s scope-end unsubscribe is verified by
 // the value tests in owned_array_subscription_838_test.cpp (the handler stops
 // firing). An LSan assertion is intentionally NOT added here: a capturing
 // subscription handler's closure ENVIRONMENT is not freed when the subscription
@@ -1324,7 +1324,7 @@ BEZEL_TEST(codegen_excdisp_837, owned_set_tryadd_duplicate_disposed_once) {
 // `using var sub := <event>.Subscribe(closure)` (no array), tracked separately
 // (orthogonal to the #838 element-disposal fix, which only ensures the array
 // disposes its elements at all). The array's own bz_array_t backing IS freed
-// (covered by the LSan-clean OwnedArray<Cell> tests #819/#820).
+// (covered by the LSan-clean OwningArray<Cell> tests #819/#820).
 
 // --------------------------------------------------------------------------
 // [865] §28.3 — an owned local with an UNREACHABLE or CONDITIONAL Dispose() is
@@ -1403,7 +1403,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_recipient_unwind_disposed) {
     expectExitAndLeakFree(
         std::string("module M; ") + kCellCtorDtor +
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
+        "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
         "    try do var ok := s.TryPop(out owned var item); "
         "           throw new Exception(\"x\"); item?.Dispose(); end; "
         "    catch Exception => return Cell._n; end; "  // 0
@@ -1418,7 +1418,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_dispose_then_throw_no_double_free) 
     expectExitAndLeakFree(
         std::string("module M; ") + kCellCtorDtor + "class E end E; "
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
+        "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
         "    try do var ok := s.TryPop(out owned var item); "
         "           item?.Dispose(); throw new E(); end; "
         "    catch E => return Cell._n; end; "  // 0 — disposed once
@@ -1432,7 +1432,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_normal_exit_disposed_once) {
     expectExitAndLeakFree(
         std::string("module M; ") + kCellCtorDtor +
         "class C public static method Main(): int "
-        "  do using var s := new OwnedStack<Cell>(); s.Push(new Cell()); "
+        "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
         "    do var ok := s.TryPop(out owned var item); "
         "       item?.Dispose(); end; "
         "    return Cell._n; end; "  // 0
@@ -1440,7 +1440,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_normal_exit_disposed_once) {
 }
 
 // --------------------------------------------------------------------------
-// [895] §28.3/§29.2 — the loop variable of a `for var x in <OwnedEnumerable<T>>`
+// [895] §28.3/§29.2 — the loop variable of a `for var x in <IOwningEnumerable<T>>`
 // loop OWNS each yielded element; on the exception path the current element is
 // auto-disposed. It was registered for neither normal nor unwind disposal (the
 // enumerator's Dispose frees the iterator's remaining state, not the already-
@@ -1454,7 +1454,7 @@ BEZEL_TEST(exception_disposal_895, owned_iteration_var_unwind_disposed) {
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); end Gen; "
         "  public static method Main(): int "
         "    var disposed := 0; "
@@ -1472,7 +1472,7 @@ BEZEL_TEST(exception_disposal_895, owned_iteration_var_dispose_then_throw_once) 
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); end Gen; "
         "  public static method Main(): int "
         "    var disposed := 0; "
@@ -1485,7 +1485,7 @@ BEZEL_TEST(exception_disposal_895, owned_iteration_var_dispose_then_throw_once) 
 // Control: normal exhaustion with an explicit discharge per element disposes
 // each exactly once (the unwindOnly disposal correctly skips the normal path —
 // _n == 2 for two elements, not 4). Value-only (compileAndRun, not
-// expectExitAndLeakFree): `x.Dispose()` on an OwnedEnumerable loop variable runs
+// expectExitAndLeakFree): `x.Dispose()` on an IOwningEnumerable loop variable runs
 // the destructor but does not RECLAIM the element block on the normal path — a
 // pre-existing leak tracked as #963, independent of #895's exception-path fix.
 BEZEL_TEST(exception_disposal_895, owned_iteration_var_normal_discharge_once) {
@@ -1494,7 +1494,7 @@ BEZEL_TEST(exception_disposal_895, owned_iteration_var_normal_discharge_once) {
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C "
-        "  public static method Gen(): OwnedEnumerable<R> "
+        "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(); yield return new R(); end Gen; "
         "  public static method Main(): int "
         "    for var x in Gen() do x.Dispose(); end; "
@@ -1590,7 +1590,7 @@ BEZEL_TEST(codegen_excdisp_1292, owning_literal_element_throw_disposes_earlier) 
         "    throw new InvalidOperationException(\"boom\"); end Boom; "
         "end Helpers; "
         "class C public static method Main(): int "
-        "  try using var arr: OwnedArray<Res> := [Helpers.Mk(), Helpers.Boom()]; "
+        "  try using var arr: OwningArray<Res> := [Helpers.Mk(), Helpers.Boom()]; "
         "  catch InvalidOperationException => Console.WriteLine(\"caught\") end; "
         "  return Res.created - Res.disposed; "  // 1 - 1 = 0
         "end Main; end C;", 0);
@@ -1613,7 +1613,7 @@ BEZEL_TEST(codegen_excdisp_1292, owning_literal_two_before_throw_both_disposed) 
         "    throw new InvalidOperationException(\"boom\"); end Boom; "
         "end Helpers; "
         "class C public static method Main(): int "
-        "  try using var arr: OwnedArray<Res> := "
+        "  try using var arr: OwningArray<Res> := "
         "    [Helpers.Mk(), Helpers.Mk(), Helpers.Boom()]; "
         "  catch InvalidOperationException => Console.WriteLine(\"caught\") end; "
         "  return Res.created - Res.disposed; "  // 2 - 2 = 0

@@ -3,7 +3,7 @@
 // it.MoveNext()` — was broken in two layers:
 //   (1) SEMA: `GetEnumerator()` on a vtable-backed IEnumerable<T> (a yield-
 //       method result) was not typed as the builtin IEnumerator<T> sentinel
-//       (only Array/OwnedArray GetEnumerator was), so `var b := it.MoveNext()`
+//       (only Array/OwningArray GetEnumerator was), so `var b := it.MoveNext()`
 //       inferred `b` as the i32 default and `if b then …` emitted a malformed
 //       `br i32` (IR-verification crash: "Branch condition is not 'i1' type!").
 //   (2) CODEGEN: `GetEnumerator()` on a vtable IEnumerable was not lowered, so

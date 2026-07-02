@@ -227,8 +227,8 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     }
 
     // issue #401 / §4.1-§4.3: a list-INTERFACE receiver (IReadOnlyList<T> /
-    // IList<T> / IOwnedList<T>) is array-backed; its runtime pointer is the same
-    // bz_array_t* as the concrete Array<T>/OwnedArray<T>, and its element type is
+    // IList<T> / IOwningList<T>) is array-backed; its runtime pointer is the same
+    // bz_array_t* as the concrete Array<T>/OwningArray<T>, and its element type is
     // genericArgs[0] (same as the array path), so it takes the `isArr` get path.
     bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
     bool isDict = isDictTypeName(recvTy);
@@ -249,7 +249,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         emitGuardThrow(disposed, "DisposedAccessException");
     }
 
-    // --- Array<T> / OwnedArray<T> indexer get (§4.4 / §4.5; #401 §4.1-§4.3) --
+    // --- Array<T> / OwningArray<T> indexer get (§4.4 / §4.5; #401 §4.1-§4.3) --
     // `a[i]` reads the slot at i (the getter borrows for class T, copies for
     // value T). The element type is genericArgs[0]; bounds-check against Count.
     if (isArr) {
@@ -343,7 +343,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         return builder_.CreateLoad(retTy, out, "ix.elem");
     }
 
-    // --- Dictionary<K,V> / OwnedDictionary<K,V> indexer get (§4.8 / §4.9) --
+    // --- Dictionary<K,V> / OwningDictionary<K,V> indexer get (§4.8 / §4.9) --
     // `dict[key]` returns the stored value; an absent key raises
     // KeyNotFoundException (§4.8). Mirrors the TryGetValue decode path.
     const sema::TypeRef* keyTy =
@@ -422,7 +422,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
 
 
 // issue #409 / language spec §28.8.1 / §28.11: lower `move coll[i]` (the
-// slot-take form) on an OWNING heap collection (OwnedArray / OwnedDictionary).
+// slot-take form) on an OWNING heap collection (OwningArray / OwningDictionary).
 // The element is read out as an owned value AND the slot is left in moved-from
 // state — for these runtime-backed collections a moved-from slot is a NULL slot.
 // The collection's element-disposer (bz_array_free / bz_dict_free) already skips
@@ -458,7 +458,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         return moved;
     }
     // §4.14 / §28.11 (#907): `move sp[i]` on an OWNING `Span<classT>` (the span
-    // returned by `OwnedBuffer<classT>.AsSpan()`). The span's slots own their
+    // returned by `OwningBuffer<classT>.AsSpan()`). The span's slots own their
     // elements, so a move transfers ownership OUT of the underlying buffer slot
     // at absolute index Start+i and leaves it NULL (moved-from) — the buffer's
     // scope-end disposal then skips it (no double-free). The borrowing spans
@@ -515,7 +515,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return nullptr;
 
-    // --- OwnedArray<T> slot-move (§28.11; admitted only on owning arrays) ----
+    // --- OwningArray<T> slot-move (§28.11; admitted only on owning arrays) ----
     if (isArr) {
         // Only an OWNING array's slot carries ownership to transfer; a borrowing
         // Array<T> slot is a borrow and `move arr[i]` is rejected by sema. Guard
@@ -527,7 +527,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
             bool arrIsOwning =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+                recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
             if (!elementPolicyFor(arrEl, arrIsOwning).disposerThunk) return nullptr;
         }
         llvm::Value* recv = lowerExpr(*ix.target);
@@ -563,7 +563,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         return moved;
     }
 
-    // --- OwnedDictionary<K,V> slot-move (§28.11 / §4.9) ---------------------
+    // --- OwningDictionary<K,V> slot-move (§28.11 / §4.9) ---------------------
     // Only an owning dictionary's value carries ownership; a borrowing
     // Dictionary<K,V> value is a borrow and `move dict[key]` is rejected by
     // sema. The owned thing is the VALUE (genericArgs[1]).
@@ -577,7 +577,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     bool owningDict =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        recvTy->astNode->name->parts[0] == "OwnedDictionary" &&
+        recvTy->astNode->name->parts[0] == "OwningDictionary" &&
         elementPolicyFor(dictMoveValTy, /*owningFamily=*/true).cat ==
             ElementPolicy::Category::ClassOwned;
     if (!owningDict) return nullptr;
@@ -636,8 +636,8 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 
 
 // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
-// `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
-// OwnedDictionary) the displaced slot/value is disposed exactly once before the
+// `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwningArray /
+// OwningDictionary) the displaced slot/value is disposed exactly once before the
 // new owner is stored (§4.5 / §4.9). Mirrors `.Set(i, v)` (§4.5) and the dict
 // `.Add(k, v)` lowering. `val` is the already-lowered RHS; `valueExpr` is the
 // RHS AST (when available) used to decide transfer-vs-retain for a #429
@@ -650,9 +650,9 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     auto* recvTy = ctx_.exprType(*ix.target);
 
     // §4.15 (#549): ArraySpan<T>[i] := value — borrowing-set; no disposal.
-    // §4.14 (#779): the OWNING Span<T>[i] := value over an OwnedBuffer DISPOSES
+    // §4.14 (#779): the OWNING Span<T>[i] := value over an OwningBuffer DISPOSES
     // the displaced class-typed element (the slot owns it), mirroring the direct
-    // OwnedBuffer<T>[i] disposing-set. ReadOnly spans have no setter.
+    // OwningBuffer<T>[i] disposing-set. ReadOnly spans have no setter.
     if (isSpanLikeTypeName(recvTy)) {
         std::string_view rcn = (recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty())
@@ -760,7 +760,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
     // issue #401 / §4.1-§4.3: a list-INTERFACE receiver is array-backed (same
     // bz_array_t* as the concrete array), so it takes the `isArr` set path. The
-    // OWNING interface IOwnedList<T> (§4.2) carries the disposing-setter
+    // OWNING interface IOwningList<T> (§4.2) carries the disposing-setter
     // semantics; IList<T> (§4.1, borrowing) and IReadOnlyList<T> (get-only) do
     // not. IReadOnlyList<T> declares no setter, so it never reaches this set.
     bool listIfaceOwning = false;
@@ -781,7 +781,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         emitGuardThrow(disposed, "DisposedAccessException");
     }
 
-    // --- Array<T> / OwnedArray<T> indexer set (§4.4 / §4.5; #401 §4.1-§4.3) --
+    // --- Array<T> / OwningArray<T> indexer set (§4.4 / §4.5; #401 §4.1-§4.3) --
     if (isArr) {
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return false;
@@ -828,7 +828,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool arrIsOwning =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+                recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
             ElementPolicy arrPol = elementPolicyFor(arrEl, arrIsOwning);
             bool isStrElemArr =
                 !arrIsOwning &&
@@ -857,11 +857,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         llvm::AllocaInst* slot = entryAlloca(val->getType());
         builder_.CreateStore(val, slot);
         // §4.5 / §4.2: an OWNING array's set(owned) — whether reached through the
-        // concrete OwnedArray<T> or through an IOwnedList<T> view (#401) —
+        // concrete OwningArray<T> or through an IOwningList<T> view (#401) —
         // disposes the displaced class element before storing the new owner; a
         // borrowing Array<T> / IList<T> set just overwrites (no slot ownership).
         // #602 / §28.11 v0.135: element disposer from elementPolicyFor (covers
-        // class, interface, Shared<T>, and Weak<T> elements; IOwnedList<T> case
+        // class, interface, Shared<T>, and Weak<T> elements; IOwningList<T> case
         // falls back to elementDisposerThunk() since the interface receiver's
         // concrete element type is not in its TypeRef — T: class is guaranteed
         // by §4.2's constraint, so the shared vtable thunk is correct).
@@ -871,7 +871,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool arrIsOwning2 =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+                recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
             llvm::Function* elemDisp =
                 elementPolicyFor(arrEl, arrIsOwning2).disposerThunk;
             if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
@@ -890,7 +890,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         return true;
     }
 
-    // --- Dictionary<K,V> / OwnedDictionary<K,V> indexer set (§4.8 / §4.9) --
+    // --- Dictionary<K,V> / OwningDictionary<K,V> indexer set (§4.8 / §4.9) --
     // `dict[key] := v` is insert-or-replace. For an OWNING dictionary the
     // previous value under an existing key is disposed before the new owner is
     // stored (§4.9); a borrowing Dictionary<K,V> just overwrites (§4.8).
@@ -965,7 +965,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return false;
-    // §4.9: an OWNING dictionary (OwnedDictionary<K,V> where V: class/interface)
+    // §4.9: an OWNING dictionary (OwningDictionary<K,V> where V: class/interface)
     // disposes the displaced value before storing the new owner. Unlike owning
     // ARRAYS (whose owned element is genericArgs[0]), an owning dictionary's
     // owned thing is its VALUE = genericArgs[1].
@@ -976,7 +976,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     bool dictIsOwning2 =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        recvTy->astNode->name->parts[0] == "OwnedDictionary";
+        recvTy->astNode->name->parts[0] == "OwningDictionary";
     const sema::TypeRef* dictValTy2 =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                     : nullptr;
@@ -1678,7 +1678,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
 
 
 // fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
-// on a HEAP-collection Array<T> / OwnedArray<T> indexer. The plain-assignment
+// on a HEAP-collection Array<T> / OwningArray<T> indexer. The plain-assignment
 // path (`arr[i] := v`) was already correct via lowerCollectionIndexerSet, and
 // the explicit read-modify-write (`arr[i] := arr[i] OP v`) worked because the
 // get and the set each drove their own receiver+index evaluation. The COMPOUND
@@ -1712,8 +1712,8 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
         return false;
     auto* recvTy = ctx_.exprType(*ix->target);
-    // Handle Array<T>/OwnedArray<T> and list-interface receivers (§4.1-§4.3)
-    // as before, and also Dictionary<K,V>/OwnedDictionary<K,V> (fix #613 / §4.8).
+    // Handle Array<T>/OwningArray<T> and list-interface receivers (§4.1-§4.3)
+    // as before, and also Dictionary<K,V>/OwningDictionary<K,V> (fix #613 / §4.8).
     bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return false;
@@ -1901,7 +1901,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         }
     }
 
-    // --- Write back (bz_array_set / bz_array_set_disposing for OwnedArray). ---
+    // --- Write back (bz_array_set / bz_array_set_disposing for OwningArray). ---
     llvm::AllocaInst* setSlot = entryAlloca(newVal->getType());
     builder_.CreateStore(newVal, setSlot);
 
@@ -1914,7 +1914,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         bool ixIsOwning =
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
         llvm::Function* elemDisp =
             elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
         if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
@@ -2017,7 +2017,7 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
         bool ixIsOwning =
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
         llvm::Function* elemDisp = elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
         if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
         if (elemDisp) {
@@ -2934,9 +2934,9 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         !actualTy->astNode->name->parts.empty())
         an = actualTy->astNode->name->parts[0];
     bool actualIsArray =
-        (an == "Array" || an == "OwnedArray" || an == "OwnedBuffer" ||
-         an == "Stack" || an == "OwnedStack" ||
-         an == "Queue" || an == "OwnedQueue");
+        (an == "Array" || an == "OwningArray" || an == "OwningBuffer" ||
+         an == "Stack" || an == "OwningStack" ||
+         an == "Queue" || an == "OwningQueue");
     if (actualIsArray)
         return wrapArrayAsIEnumerable(v, targetTy);
     if (actualTy && isLinkedListTypeName(actualTy))

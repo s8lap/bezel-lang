@@ -323,7 +323,7 @@ BEZEL_TEST(builtin_674_uniform_unknown_member,
 // (b) BinarySerializer.ToBytes() still compiles without error.
 BEZEL_TEST(builtin_674_uniform_unknown_member,
            binaryserializer_tobytes_allowed_2_15) {
-    // stdlib §2.15: ToBytes() → owned OwnedBuffer<byte>.
+    // stdlib §2.15: ToBytes() → owned OwningBuffer<byte>.
     auto r = parseSemaAll(
         "module M; "
         "import System.Serialization; "

@@ -1,7 +1,7 @@
 // Codegen — scope-end disposal of a dict-backed Set<T> (issue #1012).
 // stdlib §4.10 `Set<T>` / language spec §28.9.
 //
-// A Set<T> (and OwnedSet<T>) is DICT-BACKED whenever its element is generic-dict-
+// A Set<T> (and OwningSet<T>) is DICT-BACKED whenever its element is generic-dict-
 // eligible — a record, a non-nullable primitive/enum, or (for sets) a string;
 // see genericBackingType / lowerNew. The runtime representation is a bz_dict_t*
 // (the same hash table Dictionary uses), NOT a bz_array_t*.
@@ -11,7 +11,7 @@
 // key-release interception, added for #429). So a dict-backed Set<int> /
 // Set<enum> / Set<record> was freed with bz_array_free — which reads the wrong
 // header and leaks the bz_dict struct (ASan: a 64-byte struct + its entry
-// allocations). Dictionary<K,V>, OwnedDictionary<K,V>, and OwnedArray<T> were
+// allocations). Dictionary<K,V>, OwningDictionary<K,V>, and OwningArray<T> were
 // all clean under the same pattern; the defect was specific to the dict-backed
 // Set disposal.
 //
@@ -170,7 +170,7 @@ BEZEL_TEST(set_dispose_leak_1012, set_string_using_var_no_leak) {
                  "s.Add(\"b\"); s.Add(\"a\"); end; return 0;"), 0);
 }
 
-// Regression: an OwnedSet<class> has a class element — NOT dict-eligible
+// Regression: an OwningSet<class> has a class element — NOT dict-eligible
 // (genericBackingType returns null), so it is ARRAY-backed and keeps the
 // bz_array_free path with its #888 per-element class disposer. Each element is
 // disposed EXACTLY once (no leak, no double-free). The counter returns to 0.
@@ -179,7 +179,7 @@ BEZEL_TEST(set_dispose_leak_1012, owned_set_class_disposed_once) {
         prog("class Cell public static n: int := 0; "
              "  public constructor() Cell.n := Cell.n + 1; end constructor; "
              "  destructor Cell.n := Cell.n - 1; end destructor; end Cell; ",
-             "do using var s := new OwnedSet<Cell>(); s.Add(new Cell()); "
+             "do using var s := new OwningSet<Cell>(); s.Add(new Cell()); "
              "s.Add(new Cell()); end; return Cell.n;"), 0);
 }
 

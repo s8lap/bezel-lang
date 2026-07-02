@@ -64,7 +64,7 @@ bool hasDropError(const bezel::test::OwnershipResult& r,
 // register scope-end disposal. Before #1387 this was a hard error.
 BEZEL_TEST(out_owned_condition_892, if_cond_drop_rejected) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "if s.TryPop(out owned var item) then end; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -75,7 +75,7 @@ BEZEL_TEST(out_owned_condition_892, if_cond_drop_rejected) {
 // success path (non-null) and the false path (null → Dispose no-ops). ACCEPT.
 BEZEL_TEST(out_owned_condition_892, if_cond_dispose_after_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "if s.TryPop(out owned var item) then end; "
         "item?.Dispose(); "));
@@ -88,7 +88,7 @@ BEZEL_TEST(out_owned_condition_892, if_cond_dispose_after_accepted) {
 // loop (false exit → TryPop returned false, item not written). Must ACCEPT.
 BEZEL_TEST(out_owned_condition_892, while_drain_dispose_body_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "s.Push(move (new Cell())); "
         "while s.TryPop(out owned var item) do "
@@ -101,7 +101,7 @@ BEZEL_TEST(out_owned_condition_892, while_drain_dispose_body_accepted) {
 // while body → REJECT (obligation incurred by the condition, not discharged).
 BEZEL_TEST(out_owned_condition_892, while_drain_drop_rejected) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "while s.TryPop(out owned var item) do "
         "  // item dropped without disposal "
@@ -137,7 +137,7 @@ BEZEL_TEST(out_owned_condition_892, if_borrow_form_accepted) {
 // item is still correctly marked Owned (the #860 mark-owned fix is intact).
 BEZEL_TEST(out_owned_condition_892, stmt_form_860_regression_rejected) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "s.TryPop(out owned var item); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -148,7 +148,7 @@ BEZEL_TEST(out_owned_condition_892, stmt_form_860_regression_rejected) {
 // a statement-level TryPop still ACCEPTS. Guards the #860 positive case.
 BEZEL_TEST(out_owned_condition_892, stmt_form_860_regression_dispose_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell())); "
         "s.TryPop(out owned var item); "
         "item?.Dispose(); "));

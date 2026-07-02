@@ -1,6 +1,6 @@
 // Codegen — owning-collection element disposal (issue #362, stdlib §4.5).
 //
-// stdlib §4.5: "`OwnedArray<T>` owns each element. `Add`, `Insert`, and the
+// stdlib §4.5: "`OwningArray<T>` owns each element. `Add`, `Insert`, and the
 // indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's
 // own `Dispose()` dispose the affected elements." And: "`Array<T>` stores
 // borrows … The array's `Dispose()` … does not dispose the elements. To dispose
@@ -40,12 +40,12 @@ int runResource(const std::string& mainBody) {
 
 }  // namespace
 
-// stdlib §4.5: OwnedArray<T>.Dispose() (here the `using var` scope-end) disposes
+// stdlib §4.5: OwningArray<T>.Dispose() (here the `using var` scope-end) disposes
 // every owned class element exactly once. This is the issue #362 reproducer.
 BEZEL_TEST(owned_coll_dispose_4_5, owned_array_dispose_runs_each_destructor) {
     BEZEL_EXPECT_EQ(runResource(
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "end; "
@@ -58,7 +58,7 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_dispose_each_exactly_once) {
     BEZEL_EXPECT_EQ(runResource(
         "var after := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
@@ -67,7 +67,7 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_dispose_each_exactly_once) {
         "return after;"), 3);
 }
 
-// stdlib §4.5: OwnedArray<T>.Clear() disposes every element. Encoded:
+// stdlib §4.5: OwningArray<T>.Clear() disposes every element. Encoded:
 // <count right after Clear>*10 + <count after the array's own Dispose>. Clear
 // disposes both (2); the subsequent scope-end Dispose finds an empty array and
 // disposes nothing more (still 2) — proving no double-dispose. Expect 22.
@@ -75,7 +75,7 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_clear_disposes_then_no_redispose)
     BEZEL_EXPECT_EQ(runResource(
         "var afterClear := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  a.Clear(); "
@@ -84,7 +84,7 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_clear_disposes_then_no_redispose)
         "return afterClear * 10 + R._n;"), 22);
 }
 
-// stdlib §4.5: OwnedArray<T>.RemoveAt(i) disposes the removed element only.
+// stdlib §4.5: OwningArray<T>.RemoveAt(i) disposes the removed element only.
 // Encoded: <count right after RemoveAt>*10 + <count after scope-end Dispose>.
 // RemoveAt(1) disposes 1 of 3; scope-end disposes the other 2 → total 3.
 // Expect 13 (and notably the not-removed elements are NOT double-disposed).
@@ -92,7 +92,7 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_remove_at_disposes_only_removed) 
     BEZEL_EXPECT_EQ(runResource(
         "var afterRemove := -1; "
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
         "  a.Add(move (new R())); "
@@ -143,12 +143,12 @@ BEZEL_TEST(owned_coll_dispose_4_5, null_element_is_skipped_safely) {
 BEZEL_TEST(owned_coll_dispose_4_5, empty_owned_array_dispose_is_noop) {
     BEZEL_EXPECT_EQ(runResource(
         "do "
-        "  using var a := new OwnedArray<R>(); "
+        "  using var a := new OwningArray<R>(); "
         "end; "
         "return R._n;"), 0);
 }
 
-// stdlib §4.5: an `owned` OwnedArray<T> FIELD's elements are disposed when the
+// stdlib §4.5: an `owned` OwningArray<T> FIELD's elements are disposed when the
 // owner is disposed (its compiler-generated Dispose cascades through the field's
 // backing into each class element). Disposing the owner (a using var) here must
 // run both element destructors → 2.
@@ -160,9 +160,9 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_field_disposed_with_owner) {
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
         "class Pool "
-        "  private owned _items: OwnedArray<R>; "
+        "  private owned _items: OwningArray<R>; "
         "  public constructor() "
-        "    _items := new OwnedArray<R>(); "
+        "    _items := new OwningArray<R>(); "
         "    _items.Add(move (new R())); "
         "    _items.Add(move (new R())); "
         "  end constructor; "

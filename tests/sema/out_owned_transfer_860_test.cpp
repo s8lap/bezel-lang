@@ -1,7 +1,7 @@
 // fix #860 / §28.3 / §28.11: model the caller-side `out owned` ownership
 // transfer. Moving an element out of an owning collection via a
-// `Try*(out owned item: T)` call (OwnedStack.TryPop, OwnedQueue.TryDequeue,
-// OwnedLinkedList.TryPopFirst/Last, OwnedSet.TryTake, OwnedDictionary.
+// `Try*(out owned item: T)` call (OwningStack.TryPop, OwningQueue.TryDequeue,
+// OwningLinkedList.TryPopFirst/Last, OwningSet.TryTake, OwningDictionary.
 // TryPopValue, Channel.TryReceive, Weak.TryUpgrade) — or through a USER
 // method's `out owned` parameter — transfers ownership of the moved-out value
 // to the caller's local. The ownership checker did NOT model this owned-OUT
@@ -54,14 +54,14 @@ std::string withMain(const std::string& body) {
 }  // namespace
 
 // §28.3 / §28.11 / #860 / #1387: an `out owned var item` inline local moved out
-// of an OwnedStack via TryPop and then dropped without disposal. Under #1387 the
+// of an OwningStack via TryPop and then dropped without disposal. Under #1387 the
 // §28.3 v0.150 affine auto-drop rule applies to ALL `out owned var` inline fresh
 // locals (statement-level and if-condition alike): emit a must-use WARNING and
 // register scope-end disposal rather than a hard error.  Before #1387 this was a
 // hard error; before #860 it was silently accepted (a leak).
 BEZEL_TEST(out_owned_transfer_860, trypop_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
         "var ok := s.TryPop(out owned var item); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -73,7 +73,7 @@ BEZEL_TEST(out_owned_transfer_860, trypop_dropped_rejected) {
 // the (null) false-return path. Must be ACCEPTED.
 BEZEL_TEST(out_owned_transfer_860, trypop_null_safe_dispose_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
         "var ok := s.TryPop(out owned var item); "
         "item?.Dispose(); "));
@@ -85,8 +85,8 @@ BEZEL_TEST(out_owned_transfer_860, trypop_null_safe_dispose_accepted) {
 // be ACCEPTED.
 BEZEL_TEST(out_owned_transfer_860, trypop_moved_out_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
-        "using var s2 := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
+        "using var s2 := new OwningStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
         "var ok := s.TryPop(out owned var item); "
         "s2.Push(move item); "));
@@ -105,7 +105,7 @@ BEZEL_TEST(out_owned_transfer_860, trypop_returned_accepted) {
         "end Cell; "
         "class C "
         "  public static method Take(): owned Cell? "
-        "    using var s := new OwnedStack<Cell>(); "
+        "    using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell(1))); "
         "    var ok := s.TryPop(out owned var item); "
         "    return move item; "
@@ -117,28 +117,28 @@ BEZEL_TEST(out_owned_transfer_860, trypop_returned_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 / #860 / #1387: OwnedQueue.TryDequeue — out-owned at arg 0 —
+// §28.3 / §28.11 / #860 / #1387: OwningQueue.TryDequeue — out-owned at arg 0 —
 // dropped without disposal. As with TryPop (#1387 affine auto-drop), this is now
 // a must-use WARNING with scope-end disposal, not a hard error.  Confirms the
 // `item` is still marked Owned (the #860 mark-owned fix intact) so the must-use
 // path fires, not silent acceptance (the pre-#860 bug).
 BEZEL_TEST(out_owned_transfer_860, trydequeue_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var q := new OwnedQueue<Cell>(); "
+        "using var q := new OwningQueue<Cell>(); "
         "q.Enqueue(move (new Cell(1))); "
         "var ok := q.TryDequeue(out owned var item); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "item"));
 }
 
-// §28.3 / §28.11 / #860 / #1387: OwnedDictionary.TryPopValue(key, out owned
+// §28.3 / §28.11 / #860 / #1387: OwningDictionary.TryPopValue(key, out owned
 // value) — out-owned at arg POSITION 1 (not 0) — dropped without disposal.
 // Under #1387 affine auto-drop: must-use WARNING, not a hard error. Guards the
 // per-method argument-index table AND confirms `v` is still marked Owned (the
 // #860 mark-owned fix, not the pre-#860 silent-acceptance bug).
 BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dropped_rejected) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var d := new OwnedDictionary<string, Cell>(); "
+        "using var d := new OwningDictionary<string, Cell>(); "
         "d.Add(\"a\", move (new Cell(1))); "
         "var ok := d.TryPopValue(\"a\", out owned var v); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -149,7 +149,7 @@ BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dropped_rejected) {
 // key (arg 0) is a borrow and only arg 1 is the out-owned transfer. ACCEPT.
 BEZEL_TEST(out_owned_transfer_860, trypopvalue_pos1_dispose_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var d := new OwnedDictionary<string, Cell>(); "
+        "using var d := new OwningDictionary<string, Cell>(); "
         "d.Add(\"a\", move (new Cell(1))); "
         "var ok := d.TryPopValue(\"a\", out owned var v); "
         "v?.Dispose(); "));
@@ -235,12 +235,12 @@ BEZEL_TEST(out_owned_transfer_860, borrow_trypop_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.3 / §28.11 / #860 (BORROW-FORM GUARDRAIL): `OwnedStack.TryPeek(out item)`
+// §28.3 / §28.11 / #860 (BORROW-FORM GUARDRAIL): `OwningStack.TryPeek(out item)`
 // produces a BORROW of the top element (stdlib §4.11), not an owned transfer —
 // dropping `item` must be ACCEPTED.
 BEZEL_TEST(out_owned_transfer_860, borrow_trypeek_accepted) {
     auto r = parseAndCheckOwnership(withMain(
-        "using var s := new OwnedStack<Cell>(); "
+        "using var s := new OwningStack<Cell>(); "
         "s.Push(move (new Cell(1))); "
         "var item: Cell? := null; "
         "var ok := s.TryPeek(out item); "));
