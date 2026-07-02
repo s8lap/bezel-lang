@@ -953,7 +953,14 @@ set(BEZEL_TEST_SOURCES
     # --- fix #1328: §28.7 drop-on-overwrite for owned class/interface FIELDS ---
     codegen/field_drop_on_overwrite_1328_test.cpp
     # --- fix #1342: §15.1.2 / §17.5 inline-array ToArray() + Contains() intrinsics ---
-    codegen/inline_array_intrinsics_1342_test.cpp)
+    codegen/inline_array_intrinsics_1342_test.cpp
+    # --- fix #1375: Array<T>(size, fill) constructor (stdlib §4.4 v0.165) ---
+    codegen/array_sized_fill_1375_stdlib_4_4_test.cpp
+    # --- fix #1355: Encoding.GetByteCount + GetBytes(s, Span<byte>) (stdlib §3.2 v0.165) ---
+    codegen/encoding_getbytecount_span_1355_stdlib_3_2_test.cpp
+    # --- fix #1358: byte-buffer accessors on ArraySpan<byte>/ReadOnlyArraySpan<byte> (stdlib §4.15 v0.165) ---
+    codegen/arrayspan_byte_accessors_1358_stdlib_4_15_test.cpp
+    codegen/deserializer_arrayspan_1358_stdlib_2_15_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

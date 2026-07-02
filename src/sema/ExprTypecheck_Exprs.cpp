@@ -1256,6 +1256,83 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                     }
                 }
+                // stdlib §4.4 v0.165 (#1375): the sized-fill constructor
+                // `Array<T>(size: int, fill: T)` requires `fill` to be
+                // assignable to the element type T (and `size` to be int-like).
+                // Codegen fills each slot with `fill` via a raw element-width
+                // store, so a type-mismatched fill (`new Array<int>(4, "x")`)
+                // would silently write a wrong-width value into every slot —
+                // reject it here, matching every other typed constructor arg.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "Array" &&
+                    ne->args.size() == 2 &&
+                    ne->args[0].value && ne->args[1].value &&
+                    !rt->genericArgs.empty() && rt->genericArgs[0]) {
+                    // size (arg 0): must be int-like.
+                    checkAssignable(
+                        ctx_.exprType(*ne->args[0].value),
+                        ctx_.primitiveTypeRef(PrimitiveType::Int),
+                        ne->args[0].value->span.begin,
+                        "size argument of the sized `Array<T>` constructor",
+                        ne->args[0].value.get());
+                    // fill (arg 1): must be assignable to the element type T.
+                    // §4.2 typed-context narrowing: a bare in-range int literal
+                    // fill bound to a narrower integer element type is admitted at
+                    // that type (the doc's canonical read-loop is
+                    // `new Array<byte>(64 * 1024, 0)`, §7.1) — retype the literal
+                    // before the assignability check, mirroring the record-arg and
+                    // local-decl narrowing paths.
+                    {
+                        TypeRef* fillTy = ctx_.exprType(*ne->args[1].value);
+                        TypeRef* elemTy = rt->genericArgs[0];
+                        if (fillTy && elemTy &&
+                            fillTy->kind == TypeRef::Kind::Primitive &&
+                            fillTy->primitive == PrimitiveType::Int &&
+                            elemTy->kind == TypeRef::Kind::Primitive) {
+                            PrimitiveType tgt = elemTy->primitive;
+                            bool narrower =
+                                tgt == PrimitiveType::Byte ||
+                                tgt == PrimitiveType::SByte ||
+                                tgt == PrimitiveType::Short ||
+                                tgt == PrimitiveType::UShort ||
+                                tgt == PrimitiveType::UInt ||
+                                tgt == PrimitiveType::Long ||
+                                tgt == PrimitiveType::ULong;
+                            if (narrower) {
+                                auto cv = foldIntConstExprTC(*ne->args[1].value);
+                                auto fits = [](long long v, PrimitiveType pt) {
+                                    switch (pt) {
+                                        case PrimitiveType::SByte:
+                                            return v >= -128 && v <= 127;
+                                        case PrimitiveType::Byte:
+                                            return v >= 0 && v <= 255;
+                                        case PrimitiveType::Short:
+                                            return v >= -32768 && v <= 32767;
+                                        case PrimitiveType::UShort:
+                                            return v >= 0 && v <= 65535;
+                                        case PrimitiveType::UInt:
+                                            return v >= 0 && v <= 4294967295LL;
+                                        case PrimitiveType::ULong:
+                                            return v >= 0;
+                                        default:
+                                            return true;  // Long fits any int
+                                    }
+                                };
+                                if (cv && fits(*cv, tgt))
+                                    ctx_.setExprType(ne->args[1].value.get(),
+                                                     elemTy);
+                            }
+                        }
+                    }
+                    checkAssignable(
+                        ctx_.exprType(*ne->args[1].value),
+                        rt->genericArgs[0],
+                        ne->args[1].value->span.begin,
+                        "fill value of the sized `Array<T>` constructor",
+                        ne->args[1].value.get());
+                }
                 // §28.13 / stdlib §2.16 (#603): Shared<T> / Weak<T> require T to
                 // be a proper class type.  Runtime-managed (string, function),
                 // value (int/record/enum), and interface types have no disposal

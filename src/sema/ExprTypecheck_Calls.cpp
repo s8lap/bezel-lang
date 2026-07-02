@@ -2434,10 +2434,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration &&
                     recvTy->declaration->name == "Encoding") {
-                    if (m == "GetBytes") {
-                        // fix #526 / stdlib §3.2: GetBytes returns owned
-                        // Array<byte>. Use makeConcreteCollectionResult (which
-                        // carries a synthetic "Array" astNode) rather than
+                    if (m == "GetBytes" && ce.args.size() <= 1) {
+                        // fix #526 / stdlib §3.2: 1-arg GetBytes(s: string)
+                        // returns owned Array<byte>. Use makeConcreteCollectionResult
+                        // (which carries a synthetic "Array" astNode) rather than
                         // makeLazyEnumerable (which has no astNode). Without the
                         // astNode, isCollectionTypeName returns false and the
                         // .Count / .Length codegen path does not recognise the
@@ -2449,6 +2449,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(
                             &ce, makeConcreteCollectionResult(
                                 "Array", ctx_.primitiveTypeRef(P::Byte)));
+                    } else if (m == "GetBytes" && ce.args.size() == 2) {
+                        // v0.165 (#1355): 2-arg GetBytes(s, destination: Span<byte>)
+                        // writes into an existing span and returns bytes written.
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    } else if (m == "GetByteCount") {
+                        // v0.165 (#1355): GetByteCount(s: string): int
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                     } else if (m == "GetString" || m == "Name") {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
@@ -4433,6 +4440,69 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             // else unit; no return type.
                         } else {
+                            // §4.15 (#1358): byte-buffer accessors on byte spans.
+                            // Read*/TryRead*/Write*/TryWrite* methods are available
+                            // when the element type is `byte`; they provide
+                            // endianness-aware multi-byte reads and writes.
+                            bool handledAsByteAccessor = false;
+                            if (spEl && spEl->kind == TypeRef::Kind::Primitive &&
+                                spEl->primitive == P::Byte) {
+                                std::string_view mv(m);
+                                bool isTry   = mv.starts_with("Try");
+                                std::string_view op = isTry ? mv.substr(3) : mv;
+                                bool isRead  = op.starts_with("Read");
+                                bool isWrite = op.starts_with("Write");
+                                if ((isRead || isWrite) &&
+                                    (op.ends_with("LittleEndian") ||
+                                     op.ends_with("BigEndian"))) {
+                                    // Extract the type portion between Read/Write and
+                                    // LittleEndian/BigEndian.
+                                    std::string_view inner = isWrite
+                                        ? op.substr(5) : op.substr(4);
+                                    P pt = P::None;
+                                    if      (inner.starts_with("Int16"))  pt = P::Short;
+                                    else if (inner.starts_with("UInt16")) pt = P::UShort;
+                                    else if (inner.starts_with("Int32"))  pt = P::Int;
+                                    else if (inner.starts_with("UInt32")) pt = P::UInt;
+                                    else if (inner.starts_with("Int64"))  pt = P::Long;
+                                    else if (inner.starts_with("UInt64")) pt = P::ULong;
+                                    else if (inner.starts_with("Float"))  pt = P::Float;
+                                    else if (inner.starts_with("Double")) pt = P::Double;
+                                    if (pt != P::None) {
+                                        handledAsByteAccessor = true;
+                                        if (isWrite) {
+                                            // Write*/TryWrite* require a writable span.
+                                            if (!isWritable) {
+                                                ctx_.diagnostics().report(
+                                                    Severity::Error, ce.span.begin,
+                                                    std::string("`") + std::string(m) +
+                                                    "` requires a writable span "
+                                                    "(ArraySpan<byte> or Span<byte>); `" +
+                                                    std::string(rcn) + "<byte>` is "
+                                                    "read-only (stdlib \xC2\xA7""4.15)");
+                                            }
+                                            if (isTry) {
+                                                // TryWrite* → bool
+                                                ctx_.setExprType(
+                                                    &ce, ctx_.primitiveTypeRef(P::Bool));
+                                            }
+                                            // Write* → void/unit (no return type set)
+                                        } else {
+                                            // Read/TryRead are valid on any byte span.
+                                            if (isTry) {
+                                                // TryRead*(out value: T): bool
+                                                ctx_.setExprType(
+                                                    &ce, ctx_.primitiveTypeRef(P::Bool));
+                                            } else {
+                                                // Read*(): T
+                                                ctx_.setExprType(
+                                                    &ce, ctx_.primitiveTypeRef(pt));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (!handledAsByteAccessor) {
                             // Documented surface exhausted — any other member errs.
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
@@ -4442,7 +4512,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "Contains(), SequenceEqual(), Slice(), "
                                 "AsReadOnly()/Reverse()/Fill()/CopyFrom()/CopyTo() "
                                 "[writable spans], Clear()/MoveFrom()/MoveTo() "
-                                "[owning class Span<T>] (stdlib \xC2\xA7""4.14/\xC2\xA7""4.15)");
+                                "[owning class Span<T>]; when T=byte: "
+                                "Read*/TryRead*/Write*/TryWrite*{Int16,UInt16,Int32,"
+                                "UInt32,Int64,UInt64,Float,Double}{LittleEndian,"
+                                "BigEndian} (stdlib \xC2\xA7""4.14/\xC2\xA7""4.15)");
+                            }
                         }
                     }
                     // §28.13 / stdlib §2.16 (#603): Shared<T> instance method

@@ -1109,6 +1109,24 @@ void* bz_encoding_utf8_get_bytes(const void* str);
 // passes index=0, count=Array.Length. The byte array is borrowed (not freed).
 void* bz_encoding_utf8_get_string(void* bytes, int64_t index, int64_t count);
 
+// §3.2 v0.165 (#1355): GetByteCount(s: string): int
+// Returns the number of bytes needed to encode `s` in the given encoding.
+// bz_encoding_ascii_get_byte_count returns -1 when any code point is > U+007F
+// (the codegen caller turns this into FormatException, matching the strict error
+// model of §3.2 v0.136).
+int64_t bz_encoding_utf8_get_byte_count(const void* str);
+int64_t bz_encoding_utf16_get_byte_count(const void* str);
+int64_t bz_encoding_utf32_get_byte_count(const void* str);
+int64_t bz_encoding_ascii_get_byte_count(const void* str);
+
+// §3.2 v0.165 (#1355): GetBytes(s, destination: Span<byte>): int
+// Write the encoding of `s` into the pre-allocated byte buffer `dest`.
+// The caller must ensure dest points to at least GetByteCount(s) bytes.
+void bz_encoding_utf8_write_bytes(const void* str, void* dest);
+void bz_encoding_utf16_write_bytes(const void* str, void* dest);
+void bz_encoding_utf32_write_bytes(const void* str, void* dest);
+void bz_encoding_ascii_write_bytes(const void* str, void* dest);
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Per-interface itable lookup (CG35-itable, §13 / §12 interface dispatch).

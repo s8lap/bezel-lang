@@ -8769,6 +8769,66 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                     return buf;
                 }
+                // per stdlib §4.4 v0.165 (#1375): Array<T>(size: int, fill: T)
+                // — allocate `size` slots (count set to size) and fill each one
+                // with the `fill` value. Models the two-argument Array constructor
+                // that initialises every element to a known value (e.g.
+                // `new Array<byte>(16, 0b)` or `new Array<int>(4, 42)`).
+                // Value types (byte, int, …) are stored by copy; class/interface
+                // elements are stored as borrowed references (Array<T> is always
+                // a borrowing collection — §4.4 — so aliasing is fine).
+                if (colName == "Array" && ne.args.size() == 2 &&
+                    ne.args[0].value && ne.args[1].value) {
+                    llvm::Value* sizeArg = lowerExpr(*ne.args[0].value);
+                    if (!sizeArg) return nullptr;
+                    if (!sizeArg->getType()->isIntegerTy(64))
+                        sizeArg = builder_.CreateSExt(sizeArg, i64());
+                    // bz_array_alloc_count_n: alloc with capacity=n, count=n,
+                    // all slots zero-initialised (calloc inside the runtime).
+                    auto* fn = declareC("bz_array_alloc_count_n", ptrTy(),
+                                       {i64(), i64()});
+                    llvm::Value* buf = builder_.CreateCall(
+                        fn, {builder_.getInt64(elemSize), sizeArg}, "arr.fill.buf");
+                    // Compute the LLVM element type for the fill value.
+                    llvm::Type* elemLlvmTy = i32();
+                    if (!rt->genericArgs.empty() && rt->genericArgs[0])
+                        if (auto* et = lowerTypeRef(rt->genericArgs[0]))
+                            elemLlvmTy = et;
+                    llvm::Value* fillVal = lowerExpr(*ne.args[1].value);
+                    if (fillVal) {
+                        // Spill fill value into an alloca so bz_array_set
+                        // can read it via a pointer (matching OwnedBuffer init
+                        // loop pattern at §4.14 / #778).
+                        llvm::AllocaInst* fillSlot = entryAlloca(elemLlvmTy);
+                        builder_.CreateStore(fillVal, fillSlot);
+                        // for i = 0 ..<  sizeArg: bz_array_set(buf, i, fillSlot, esz)
+                        llvm::AllocaInst* iSlot = entryAlloca(i64());
+                        builder_.CreateStore(builder_.getInt64(0), iSlot);
+                        auto* hdrBB  = llvm::BasicBlock::Create(
+                            llvm_, "arr.fill.hdr",  currentFn_);
+                        auto* bodyBB = llvm::BasicBlock::Create(
+                            llvm_, "arr.fill.body", currentFn_);
+                        auto* doneBB = llvm::BasicBlock::Create(
+                            llvm_, "arr.fill.done", currentFn_);
+                        builder_.CreateBr(hdrBB);
+                        builder_.SetInsertPoint(hdrBB);
+                        llvm::Value* iv =
+                            builder_.CreateLoad(i64(), iSlot, "arr.fill.i");
+                        builder_.CreateCondBr(
+                            builder_.CreateICmpSLT(iv, sizeArg), bodyBB, doneBB);
+                        builder_.SetInsertPoint(bodyBB);
+                        auto* setFn = declareC("bz_array_set",
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), i64(), ptrTy(), i64()});
+                        builder_.CreateCall(setFn,
+                            {buf, iv, fillSlot, builder_.getInt64(elemSize)});
+                        builder_.CreateStore(
+                            builder_.CreateAdd(iv, builder_.getInt64(1)), iSlot);
+                        builder_.CreateBr(hdrBB);
+                        builder_.SetInsertPoint(doneBB);
+                    }
+                    return buf;
+                }
                 // stdlib §4.4/§4.5 (#741): the `constructor(capacity: int)` arg
                 // reserves backing slots WITHOUT setting count (an empty array
                 // with room to grow), distinct from OwnedBuffer above which also

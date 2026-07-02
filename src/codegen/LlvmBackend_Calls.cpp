@@ -8023,6 +8023,82 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         return result;
     }
 
+    // GetByteCount(s): int — count bytes needed without allocating.
+    // v0.165 (#1355): new 1-arg overload on all four encodings.
+    if (m == "GetByteCount" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* strPtr = lowerExpr(*call.args[0].value);
+        if (!strPtr) return nullptr;
+        std::string cntFnName = "bz_encoding_" +
+            (sg == "UTF8"  ? std::string("utf8")  :
+             sg == "UTF16" ? std::string("utf16") :
+             sg == "UTF32" ? std::string("utf32") :
+                             std::string("ascii")) + "_get_byte_count";
+        auto* cntFn = declareC(cntFnName.c_str(), i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(cntFn, {strPtr}, "enc.cnt");
+        // ASCII: -1 means a code point > U+007F → FormatException (§3.2 v0.136).
+        if (sg == "ASCII") {
+            llvm::Value* isFail =
+                builder_.CreateICmpSLT(cnt, builder_.getInt64(0), "enc.asc.fail");
+            emitGuardThrow(isFail, "FormatException");
+        }
+        // Spec says int; the runtime returns i64; truncate to i32.
+        return builder_.CreateTrunc(cnt, i32(), "enc.cnt32");
+    }
+
+    // GetBytes(s, destination: Span<byte>): int — v0.165 (#1355) 2-arg overload.
+    // Encodes `s` into an existing writable byte span; returns bytes written.
+    // IndexOutOfRangeException if the span is shorter than the encoded length.
+    if (m == "GetBytes" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* strPtr  = lowerExpr(*call.args[0].value);
+        llvm::Value* spanVal = lowerExpr(*call.args[1].value);
+        if (!strPtr || !spanVal) return nullptr;
+        // Count bytes needed.
+        std::string cntFnName = "bz_encoding_" +
+            (sg == "UTF8"  ? std::string("utf8")  :
+             sg == "UTF16" ? std::string("utf16") :
+             sg == "UTF32" ? std::string("utf32") :
+                             std::string("ascii")) + "_get_byte_count";
+        auto* cntFn = declareC(cntFnName.c_str(), i64(), {ptrTy()});
+        llvm::Value* needed = builder_.CreateCall(cntFn, {strPtr}, "enc.sp.needed");
+        // ASCII: -1 means non-ASCII code point → FormatException.
+        if (sg == "ASCII") {
+            llvm::Value* isFail =
+                builder_.CreateICmpSLT(needed, builder_.getInt64(0), "enc.sp.afail");
+            emitGuardThrow(isFail, "FormatException");
+        }
+        // Unpack span struct { ptr source, i32 start, i32 length }.
+        auto* spanSt = arraySpanStructType();
+        auto* spanSlot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, spanSlot);
+        llvm::Value* spanSrc = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 0), "enc.sp.src");
+        llvm::Value* spanStart = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 1), "enc.sp.st");
+        llvm::Value* spanLen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 2), "enc.sp.len");
+        // Bounds: span length (as i64) must be >= needed.
+        llvm::Value* spanLen64 = builder_.CreateSExt(spanLen, i64(), "enc.sp.len64");
+        emitGuardThrow(
+            builder_.CreateICmpSLT(spanLen64, needed), "IndexOutOfRangeException");
+        // Get raw byte pointer into the backing array at spanStart.
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* spanStart64 = builder_.CreateSExt(spanStart, i64());
+        llvm::Value* rawPtr = builder_.CreateCall(
+            ptrAtFn, {spanSrc, spanStart64, builder_.getInt64(1)}, "enc.sp.raw");
+        // Write bytes into the destination buffer.
+        std::string wrtFnName = "bz_encoding_" +
+            (sg == "UTF8"  ? std::string("utf8")  :
+             sg == "UTF16" ? std::string("utf16") :
+             sg == "UTF32" ? std::string("utf32") :
+                             std::string("ascii")) + "_write_bytes";
+        auto* wrtFn = declareC(wrtFnName.c_str(),
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(wrtFn, {strPtr, rawPtr});
+        // Return bytes written as int (truncated from i64).
+        return builder_.CreateTrunc(needed, i32(), "enc.sp.written");
+    }
+
     // GetString(bytes): string — decode the whole array (index 0, count Length).
     // GetString(bytes, index, count): string — decode the requested sub-range.
     if (m == "GetString" &&
@@ -8047,6 +8123,25 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
                         ? iv : builder_.CreateSExt(iv, i64(), "enc.idx");
             count = cv->getType()->isIntegerTy(64)
                         ? cv : builder_.CreateSExt(cv, i64(), "enc.cnt");
+            // stdlib §3.2 v0.165 (#1355): the (bytes, index, count) window ranges
+            // over the array's Count; an out-of-range window raises
+            // IndexOutOfRangeException (like every other bounds rule in the
+            // library). Guard `index < 0 || count < 0 || index + count > Count`
+            // before the decode so an out-of-range request faults rather than
+            // reading past the backing storage.
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* alen =
+                builder_.CreateCall(lenFn, {arr}, "enc.gs.len");
+            llvm::Value* idxNeg =
+                builder_.CreateICmpSLT(index, builder_.getInt64(0));
+            llvm::Value* cntNeg =
+                builder_.CreateICmpSLT(count, builder_.getInt64(0));
+            llvm::Value* endPos =
+                builder_.CreateAdd(index, count, "enc.gs.end");
+            llvm::Value* over = builder_.CreateICmpSGT(endPos, alen);
+            llvm::Value* bad = builder_.CreateOr(
+                builder_.CreateOr(idxNeg, cntNeg), over, "enc.gs.oor");
+            emitGuardThrow(bad, "IndexOutOfRangeException");
         }
         auto* fn = declareC(getStringName.c_str(), ptrTy(),
                             {ptrTy(), i64(), i64()});
@@ -16982,6 +17077,208 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
         return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // §4.15 (#1358): byte-buffer accessors — Read*/TryRead*/Write*/TryWrite*
+    // for all four span types (ArraySpan/ReadOnlyArraySpan/Span/ReadOnlySpan)
+    // when the element type is `byte`.  Methods operate from the start of the
+    // span (no offset parameter — callers use .Slice() to position; stdlib §4.15).
+    //
+    // Names: {Try}{Read|Write}{Int16|UInt16|Int32|UInt32|Int64|UInt64|
+    //                          Float|Double}{LittleEndian|BigEndian}
+    if (spanElemRef &&
+        spanElemRef->kind == sema::TypeRef::Kind::Primitive &&
+        spanElemRef->primitive == sema::PrimitiveType::Byte) {
+        std::string_view mv(m);
+        bool isTry  = mv.starts_with("Try");
+        std::string_view op = isTry ? mv.substr(3) : mv;
+        bool isRead  = op.starts_with("Read");
+        bool isWrite = op.starts_with("Write");
+        if ((isRead || isWrite) &&
+            (op.ends_with("LittleEndian") || op.ends_with("BigEndian"))) {
+            bool isBE    = op.ends_with("BigEndian");
+            std::string_view inner = isWrite ? op.substr(5) : op.substr(4);
+            // Map method name → LLVM integer type + byte width.
+            int byteWidth = 0;
+            llvm::Type* intTy   = nullptr;
+            bool        isFloat = false;
+            if      (inner.starts_with("Int16")  || inner.starts_with("UInt16"))
+                { byteWidth = 2; intTy = llvm::Type::getInt16Ty(llvm_); }
+            else if (inner.starts_with("Int32")  || inner.starts_with("UInt32"))
+                { byteWidth = 4; intTy = i32(); }
+            else if (inner.starts_with("Float"))
+                { byteWidth = 4; intTy = i32();  isFloat = true; }
+            else if (inner.starts_with("Int64")  || inner.starts_with("UInt64"))
+                { byteWidth = 8; intTy = i64(); }
+            else if (inner.starts_with("Double"))
+                { byteWidth = 8; intTy = i64();  isFloat = true; }
+            if (byteWidth > 0) {
+                // isWritable was already set from rcn above.
+                // Write*/TryWrite* require a writable span (sema enforces this;
+                // we bail silently here if somehow wrong at codegen).
+                if (isWrite && !isWritable) return nullptr;
+
+                llvm::Value* src  = loadSource();
+                llvm::Value* base = loadStart();
+                llvm::Value* slen = loadLen();
+                // Raw byte pointer: bz_array_ptr_at(src, i64(base), 1).
+                auto* ptrAtFn = declareC(
+                    "bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* base64 = builder_.CreateSExt(base, i64());
+                llvm::Value* rawPtr = builder_.CreateCall(
+                    ptrAtFn, {src, base64, builder_.getInt64(1)}, "bba.ptr");
+                llvm::Value* slen64 = builder_.CreateSExt(slen, i64());
+                llvm::Value* wid64  = builder_.getInt64(byteWidth);
+
+                if (!isTry) {
+                    // Non-try variants: throw IndexOutOfRangeException if too short.
+                    emitGuardThrow(
+                        builder_.CreateICmpSLT(slen64, wid64),
+                        "IndexOutOfRangeException");
+                    if (isRead) {
+                        // Load integer value, bswap if BE, bitcast to float/double.
+                        llvm::Value* raw = builder_.CreateLoad(intTy, rawPtr, "bba.raw");
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            raw = builder_.CreateCall(bswapFn, {raw}, "bba.bswap");
+                        }
+                        if (isFloat) {
+                            llvm::Type* fpTy = byteWidth == 4
+                                ? llvm::Type::getFloatTy(llvm_)
+                                : llvm::Type::getDoubleTy(llvm_);
+                            return builder_.CreateBitCast(raw, fpTy, "bba.fp");
+                        }
+                        return raw;
+                    } else {
+                        // Write: for float/double, bitcast the argument to int first.
+                        if (call.args.empty() || !call.args[0].value) return nullptr;
+                        llvm::Value* val = lowerExpr(*call.args[0].value);
+                        if (!val) return nullptr;
+                        if (isFloat) {
+                            val = builder_.CreateBitCast(val, intTy, "bba.fi");
+                        } else {
+                            // Ensure correct bit-width for integer types.
+                            if (val->getType() != intTy) {
+                                if (intTy->getIntegerBitWidth() <
+                                    val->getType()->getIntegerBitWidth())
+                                    val = builder_.CreateTrunc(val, intTy, "bba.trunc");
+                                else
+                                    val = builder_.CreateZExt(val, intTy, "bba.zext");
+                            }
+                        }
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            val = builder_.CreateCall(bswapFn, {val}, "bba.bswap");
+                        }
+                        builder_.CreateStore(val, rawPtr);
+                        return llvm::ConstantInt::get(i32(), 0);  // unit
+                    }
+                } else {
+                    // Try variants: return false (no throw) if span too short.
+                    auto* okBB   = llvm::BasicBlock::Create(llvm_, "bba.ok", currentFn_);
+                    auto* failBB = llvm::BasicBlock::Create(llvm_, "bba.fail", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "bba.end", currentFn_);
+                    llvm::Value* hasRoom =
+                        builder_.CreateICmpSGE(slen64, wid64, "bba.room");
+                    builder_.CreateCondBr(hasRoom, okBB, failBB);
+                    if (isRead) {
+                        // TryRead*(out value: T): bool
+                        // out parameter is call.args[0]
+                        if (call.args.empty() || !call.args[0].value) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
+                        }
+                        llvm::Type* outTy = nullptr;
+                        llvm::Value* outAddr =
+                            lvalueAddr(*call.args[0].value, outTy);
+                        // okBB: load, bswap if BE, bitcast, store to out, jump end
+                        builder_.SetInsertPoint(okBB);
+                        llvm::Value* raw =
+                            builder_.CreateLoad(intTy, rawPtr, "bba.tryraw");
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            raw = builder_.CreateCall(bswapFn, {raw}, "bba.tbswap");
+                        }
+                        llvm::Value* result = raw;
+                        if (isFloat) {
+                            llvm::Type* fpTy = byteWidth == 4
+                                ? llvm::Type::getFloatTy(llvm_)
+                                : llvm::Type::getDoubleTy(llvm_);
+                            result = builder_.CreateBitCast(raw, fpTy, "bba.tfp");
+                        }
+                        if (outAddr) builder_.CreateStore(result, outAddr);
+                        builder_.CreateBr(endBB);
+                        // failBB: store default (0/0.0) to out, jump end
+                        builder_.SetInsertPoint(failBB);
+                        if (outAddr) {
+                            llvm::Type* storeTy = result->getType();
+                            builder_.CreateStore(
+                                llvm::Constant::getNullValue(storeTy), outAddr);
+                        }
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2, "bba.tryres");
+                        phi->addIncoming(builder_.getTrue(),  okBB);
+                        phi->addIncoming(builder_.getFalse(), failBB);
+                        return phi;
+                    } else {
+                        // TryWrite*(value: T): bool
+                        if (call.args.empty() || !call.args[0].value) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
+                        }
+                        llvm::Value* val = lowerExpr(*call.args[0].value);
+                        if (!val) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
+                        }
+                        // okBB: bitcast/bswap, store, return true
+                        builder_.SetInsertPoint(okBB);
+                        llvm::Value* toStore = val;
+                        if (isFloat) {
+                            toStore = builder_.CreateBitCast(val, intTy, "bba.twfi");
+                        } else if (toStore->getType() != intTy) {
+                            if (intTy->getIntegerBitWidth() <
+                                toStore->getType()->getIntegerBitWidth())
+                                toStore = builder_.CreateTrunc(toStore, intTy);
+                            else
+                                toStore = builder_.CreateZExt(toStore, intTy);
+                        }
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            toStore = builder_.CreateCall(
+                                bswapFn, {toStore}, "bba.twbswap");
+                        }
+                        builder_.CreateStore(toStore, rawPtr);
+                        builder_.CreateBr(endBB);
+                        // failBB: no-op, jump end
+                        builder_.SetInsertPoint(failBB);
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2, "bba.twres");
+                        phi->addIncoming(builder_.getTrue(),  okBB);
+                        phi->addIncoming(builder_.getFalse(), failBB);
+                        return phi;
+                    }
+                }
+            }
+        }
     }
 
     return nullptr;

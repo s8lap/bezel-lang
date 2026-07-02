@@ -7556,6 +7556,151 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
 }
 
 // ---------------------------------------------------------------------------
+// §3.2 v0.165 (#1355): GetByteCount and write_bytes helpers.
+//
+// GetByteCount: count bytes needed without allocating an array.
+// write_bytes: encode string into a pre-allocated destination buffer.
+// The caller (tryLowerEncodingCall codegen) ensures dest is large enough
+// by first calling GetByteCount and bounds-checking the destination span.
+
+extern "C" int64_t bz_encoding_utf8_get_byte_count(const void* strp) {
+    if (!strp) return 0;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        if      (cp <= 0x7F)   count += 1;
+        else if (cp <= 0x7FF)  count += 2;
+        else if (cp <= 0xFFFF) count += 3;
+        else                   count += 4;
+    }
+    return count;
+}
+
+extern "C" int64_t bz_encoding_utf16_get_byte_count(const void* strp) {
+    if (!strp) return 0;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        count += (cp > 0xFFFF) ? 4 : 2;  // surrogate pair vs BMP
+    }
+    return count;
+}
+
+extern "C" int64_t bz_encoding_utf32_get_byte_count(const void* strp) {
+    if (!strp) return 0;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    return n * 4;  // UTF-32LE: 4 bytes per code point
+}
+
+extern "C" int64_t bz_encoding_ascii_get_byte_count(const void* strp) {
+    // Returns -1 on any non-ASCII code point (codegen turns this into
+    // FormatException per the strict error model of §3.2 v0.136).
+    if (!strp) return 0;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        if (cp > 0x7F) return -1;  // non-ASCII → defined fault
+    }
+    return n;  // ASCII: 1 byte per code point
+}
+
+extern "C" void bz_encoding_utf8_write_bytes(const void* strp, void* destp) {
+    if (!strp || !destp) return;
+    const auto* s = (const bz_string_struct*)strp;
+    uint8_t* d = (uint8_t*)destp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        if (cp <= 0x7F) {
+            *d++ = (uint8_t)cp;
+        } else if (cp <= 0x7FF) {
+            *d++ = (uint8_t)(0xC0 | (cp >> 6));
+            *d++ = (uint8_t)(0x80 | (cp & 0x3F));
+        } else if (cp <= 0xFFFF) {
+            *d++ = (uint8_t)(0xE0 | (cp >> 12));
+            *d++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+            *d++ = (uint8_t)(0x80 | (cp & 0x3F));
+        } else {
+            *d++ = (uint8_t)(0xF0 | (cp >> 18));
+            *d++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+            *d++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+            *d++ = (uint8_t)(0x80 | (cp & 0x3F));
+        }
+    }
+}
+
+extern "C" void bz_encoding_utf16_write_bytes(const void* strp, void* destp) {
+    if (!strp || !destp) return;
+    const auto* s = (const bz_string_struct*)strp;
+    uint8_t* d = (uint8_t*)destp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        if (cp <= 0xFFFF) {
+            // BMP: little-endian 16-bit
+            d[0] = (uint8_t)(cp & 0xFF);
+            d[1] = (uint8_t)((cp >> 8) & 0xFF);
+            d += 2;
+        } else {
+            // Supplementary: UTF-16LE surrogate pair
+            cp -= 0x10000u;
+            uint16_t hi = (uint16_t)(0xD800u + (cp >> 10));
+            uint16_t lo = (uint16_t)(0xDC00u + (cp & 0x3FFu));
+            d[0] = (uint8_t)(hi & 0xFF); d[1] = (uint8_t)((hi >> 8) & 0xFF); d += 2;
+            d[0] = (uint8_t)(lo & 0xFF); d[1] = (uint8_t)((lo >> 8) & 0xFF); d += 2;
+        }
+    }
+}
+
+extern "C" void bz_encoding_utf32_write_bytes(const void* strp, void* destp) {
+    if (!strp || !destp) return;
+    const auto* s = (const bz_string_struct*)strp;
+    uint8_t* d = (uint8_t*)destp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        // Little-endian 32-bit code point
+        d[0] = (uint8_t)(cp & 0xFF);
+        d[1] = (uint8_t)((cp >> 8) & 0xFF);
+        d[2] = (uint8_t)((cp >> 16) & 0xFF);
+        d[3] = (uint8_t)((cp >> 24) & 0xFF);
+        d += 4;
+    }
+}
+
+extern "C" void bz_encoding_ascii_write_bytes(const void* strp, void* destp) {
+    // Caller has already verified GetByteCount != -1 (all code points ≤ U+007F).
+    if (!strp || !destp) return;
+    const auto* s = (const bz_string_struct*)strp;
+    uint8_t* d = (uint8_t*)destp;
+    int64_t n = s->len; if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp = (s->width == 1) ? ((const uint8_t*)s->data)[i]
+                    : (s->width == 2) ? ((const uint16_t*)s->data)[i]
+                                      : ((const uint32_t*)s->data)[i];
+        *d++ = (uint8_t)(cp & 0x7Fu);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Encoding: Utf16 / Utf32 / Ascii (stdlib §3.2, v0.136).
 //
 // All three follow the strict error model: malformed or unrepresentable input
