@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.174 — July 2026**
+**Version 0.175 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1623,7 +1623,7 @@ end IComparer;
 
 `out` requires T to appear only in output positions (return types, read-only property types, `out` parameters). `in` requires T to appear only in input positions. The compiler enforces position constraints.
 
-Position is composed across nested type constructors. A type parameter inside another generic type inherits position from that wrapper's variance: T inside `IEnumerator<T>` (where `IEnumerator` is `out T'`) has the same position the wrapper itself sits in. Function types are themselves variant (covariant in return, contravariant in parameter, see below), and the same composition rule applies. The practical consequence — relevant for event interfaces — is that T appearing inside the *parameter* of a function type that is itself the *parameter* of a method ends up in covariant position, because contravariant-of-contravariant is covariant. A concrete worked example: in `IEvent<out T>`, the method `Subscribe(handler: (T) -> ())` places T inside `(T) -> ()` (contravariant in T) which is itself a parameter of `Subscribe` (an input, contravariant), giving T a covariant position overall — `out T` is sound.
+Position is composed across nested type constructors. A type parameter inside another generic type inherits position from that wrapper's variance: T inside `IEnumerator<T>` (where `IEnumerator` is `out T'`) has the same position the wrapper itself sits in. Function types are themselves variant (covariant in return, contravariant in parameter, see below), and the same composition rule applies. The practical consequence — relevant for event interfaces — is that T appearing inside the *parameter* of a function type that is itself the *parameter* of a method ends up in covariant position, because contravariant-of-contravariant is covariant. A concrete worked example: in `IEvent<out T>`, the method `Subscribe(scoped handler: (T) -> ())` places T inside `(T) -> ()` (contravariant in T) which is itself a parameter of `Subscribe` (an input, contravariant), giving T a covariant position overall — `out T` is sound.
 
 Type parameters without `out` or `in` are invariant. Classes, records, and concrete generic types are always invariant.
 
@@ -3439,6 +3439,7 @@ public method Max(a: int, b: int): int => a if a > b else b;
 - `out` — output parameter. The caller writes `out`. The variable need not be initialized before the call. The callee must assign every `out` parameter on every exit path; failing to do so is a compile error.
 - `owned` — ownership transfer. See [§28.8](#sec-ownership-transfer). **Call-site marker (v0.169, #1348):** when the argument is a **named owned binding** — an owned local or an `owned` parameter, which the call leaves moved-from — the caller writes `owned` at the call site: `M(owned x)`. A **fresh producer** — a `new` expression, a call returning `owned T`, an operator result, or a `move obj._field` — stays unmarked: no live binding is invalidated, so there is nothing to announce. Omitting the marker on a named owned binding is a compile error naming the fix ("this call consumes `x`; write `M(owned x)`"); writing it on a borrow, a fresh producer, or a non-`owned` parameter position is likewise an error. This restores the visibility rule the other destructive modes already follow (`ref`/`out` at call sites, `move` at field-read sites, rationale §5.10): the most destructive passing mode is no longer the only unmarked one.
 - `out owned` — output parameter that produces an owned value. The callee assigns an owned value through the parameter; the caller receives ownership and must discharge it (typically with `out using var` at the call site, [§22.4](#sec-inline-out-declarations)). The combination `out owned` is the only modifier compound; the others are mutually exclusive.
+- `scoped` — on a *function-typed* parameter only: the callee may store the callback, bounded by the storing object's lifetime; the caller's captures are checked against that bound. Normative rules in [§28.14](#sec-scoped-callback-parameters) (v0.175).
 
 <a id="sec-inline-out-declarations"></a>
 ### 22.4 Inline `out` declarations
@@ -4180,11 +4181,11 @@ For a synchronous event `event E: T`, the handler type is `(T) -> ()`. For an as
 
 ```bezel
 public interface IEvent<out T>
-  method Subscribe(handler: (T) -> ()): owned Subscription;
+  method Subscribe(scoped handler: (T) -> ()): owned Subscription;
 end IEvent;
 
 public interface IAsyncEvent<out T>
-  method Subscribe(handler: (T) -> Task): owned Subscription;
+  method Subscribe(scoped handler: (T) -> Task): owned Subscription;
 end IAsyncEvent;
 ```
 
@@ -4195,14 +4196,14 @@ end IAsyncEvent;
 ```bezel
 public class EventSource<T>: IEvent<T>
   // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> ()): owned Subscription;
+  public method Subscribe(scoped handler: (T) -> ()): owned Subscription;
   public method Raise(payload: T);
   public method Add(handler: (T) -> ());
   public method Remove(handler: (T) -> ());
 end EventSource;
 
 public class AsyncEventSource<T>: IAsyncEvent<T>
-  public method Subscribe(handler: (T) -> Task): owned Subscription;
+  public method Subscribe(scoped handler: (T) -> Task): owned Subscription;
   public async method RaiseAsync(payload: T): Task;
   public method Add(handler: (T) -> Task);
   public method Remove(handler: (T) -> Task);
@@ -4662,6 +4663,8 @@ var nullableReturn: (int) -> bool?;   // non-null function returning a nullable 
 The parentheses around the function type are required before `?`. Without them, the `?` would attach to the return type.
 
 <a id="sec-lambda-expressions"></a>
+**`scoped` in function types (v0.175).** A `scoped` parameter position is part of a function signature's identity, like `ref`/`out` ([§28.14](#sec-scoped-callback-parameters)): `(scoped () -> Task) -> ()` and `(() -> Task) -> ()` are distinct types with no conversion between them.
+
 ### 27.3 Lambda expressions
 
 Expression body:
@@ -4941,6 +4944,8 @@ User code does not implement `Dispose()` directly. The customization points are:
 - `owned` fields for fields that should be disposed with the containing object.
 
 <a id="sec-local-variables-ownership-and-borrows"></a>
+**Scoped-callback backstop (v0.175).** In checked disposal mode, invoking a callback stored under a `scoped` parameter ([§28.14](#sec-scoped-callback-parameters)) after its bounding object's disposal has completed — a violation of the callee's quiescence obligation — faults deterministically as `DisposedAccessException`, exactly like any other member access through a logically-disposed instance.
+
 ### 28.3 Local variables, ownership, and borrows
 
 Bezel tracks two kinds of class-typed reference at compile time:
@@ -5067,7 +5072,7 @@ A borrowed value's lifetime is the lifetime of its *source*. The compiler enforc
 - A borrowed local may not be returned from a method at all unless the return type is the same kind of borrow with a clearly-defined source (in this version, that means: receiver-borrows from extension methods, value-typed returns, and runtime-managed returns).
 - A method's return type that names an **owning-collection or owning-wrapper type** (`OwningArray<T>`, `OwningDictionary<K, V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningLinkedList<T>`, `OwningTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) follows the *same* owned-vs-borrow rule as any other reference return (the *Producers* table above): declared `owned`, the caller takes ownership; declared **without** `owned`, the result is a **borrow** with a documented source (the `Owned*` type name denotes *element* ownership, orthogonal to the container ownership the `owned` qualifier governs — [§5.11](Bezel_Design_Rationale.md#sec-owning-collections)). The borrow-return restrictions then apply unchanged: a bare owning-collection *field* read may be returned (its source is the receiver, [§28.6](#sec-leak-prevention)); a borrowed *local* or *parameter* with no source that outlives the call may **not** be returned; a `move`d field or a freshly-produced owning value must be returned through an `owned` return type. A borrow returned this way carries the capability restriction of [§28.6](#sec-borrowed-owning-collections) — the caller may not `Dispose` it (the owner does); it may otherwise be read and mutated like any borrowed collection.
 - A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference. **The assignment-site check is structural and decidable** — parameter-sourced and receiver-sourced borrows are admissible; scope-bound locals and temporaries are rejected. **The residual is trust:** whether the caller-side source actually outlives the object is the programmer's obligation, not a compile-time guarantee; a violation is caught as `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior in unchecked mode.
-- A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted.
+- A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted. The general storage-bounded form — a callback stored by an object whose own lifetime bounds it — is [§28.14](#sec-scoped-callback-parameters)'s `scoped` parameters (v0.175).
 - The same capture-and-escape rule applies to **method references** ([§27.6](#sec-method-references)) that bind an instance receiver: `obj.Method` produces a function value whose captured environment includes `obj`. If `obj` is a borrow, the resulting function value is subject to the closure-escape rules above as if `obj` had been captured by an explicit lambda. The function value's runtime-managed status ([§28.9](#sec-runtime-managed-types)) governs the *function value's own* lifetime; it does not relax the lifetime constraints on borrows captured by the function value.
 
 A borrowed value may be passed as a non-`owned` argument to another call: the callee further borrows for the duration of the call.
@@ -5904,6 +5909,27 @@ The semantics, stated against the existing model:
 ---
 
 <a id="sec-iteration-2"></a>
+<a id="sec-scoped-callback-parameters"></a>
+### 28.14 Scoped callback parameters: storage-bounded capture (v0.175, #808)
+
+The closure-capture rules ([§28.3](#sec-local-variables-ownership-and-borrows)) admit three escape forms — immediate invocation, a `using var` local of function type, an extension-method parameter — all bounded by the borrow's source. This section adds the fourth and general form, subsuming the others' reasoning: **a stored callback whose lifetime is bounded by the object that stores it.**
+
+**The `scoped` modifier.** A function-typed parameter may be declared `scoped`: `method Spawn(scoped body: () -> Task)`. The declaration is a two-sided contract:
+
+- **The callee may store the callback**, but only in `scoped` fields **of the bounding object itself** (below), or forward it to another `scoped` parameter whose bounding object is the same object; it may invoke it. It may not return it, move it into non-`scoped` storage, or store it in any other object. A `scoped` **field** holds such a callback: it may be invoked, overwritten, or cleared, but never read out as an escaping value. These obligations are compiler-verified for user-authored callees. *(v1 deliberately excludes storage reached through owned fields of the bounding object: an owned child holding the callback could be moved out (§28.8.1), extending the callback past its bound. Direct fields only.)*
+- **The caller's captures are storage-bounded.** At the call site the compiler resolves the **bounding object**:
+  1. a constructor call → the constructed object;
+  2. a call whose return is `owned` **and** is the initializer of a `using var`/`await using var` local → the returned object;
+  3. otherwise → the receiver.
+  A closure argument capturing locals or parameters is admitted **iff** the bounding object resolves to a `using var`/`await using var` local `L` (directly, or is `L`'s initializer per form 2) and every captured source is declared **before** `L` in the same or an enclosing scope — so the sources provably outlive `L`, and therefore outlive every invocation of the stored callback. Until `L`'s scope exits, the captured sources are **frozen**: they may not be moved from or reassigned (the same freeze the `catch` borrow rules apply). A bounding object that is none of these — a plain expression, a field, a returned value that does not initialize a `using var` — admits **no** capture-bearing arguments (capture-free callbacks are always admitted).
+
+**Quiescence.** Disposal of the bounding object must guarantee that no stored callback is invoked after disposal completes (by draining in-flight work or severing registrations before teardown). For compiler-known types the guarantee is stated normatively in the standard library (`TaskScope`, the event types, the task-completion sources). For user-authored types the obligation is the same **residual-trust shape** as this chapter's borrowed-field rule: the storage-site checks are structural and decidable; the temporal guarantee is the author's, and **checked disposal mode** ([§28.2](#sec-the-idisposable-contract)) converts a violation into a deterministic `DisposedAccessException` rather than undefined behavior. A callback that runs *during* the drain may touch the bounding object soundly: logical disposal precedes physical reclamation ([§28.12](#sec-asynchronous-disposal)).
+
+**Interaction with the type system.** `scoped` participates in function-signature identity like `ref`/`out` ([§27.2](#sec-nullable-function-types)): a `scoped` parameter and a plain function-typed parameter are distinct signatures, and a function value does not convert between them. `scoped` is **illegal on `extern` declarations** ([§32](#sec-ffi)): neither the storage obligations nor quiescence can be verified across the FFI boundary.
+
+**Relation to §30.11.** The task-completion-source callback admission previously stood as a hard-coded structural exception. Under this section it is a **derived instance**: the source is the bounding object, settlement is its quiescence point. §30.11's four-condition text remains as the legacy statement until the standard library's signatures migrate to `scoped`; no new hard-coded patterns will be added.
+
+
 ## 29. Iteration
 
 `for` operates on any value whose type implements `IEnumerable<T>`. The protocol is interface-based; there is no duck-typing fallback.
@@ -6799,6 +6825,8 @@ This reasoning is **specific to the TCS callback-registration pattern** and not 
 A capture meeting all four conditions is admitted; anything else falls to the standard closure-escape rules. **The registration API's callback must be one-shot** — never invoked after its first invocation or after the operation settles. A *repeating* registration (an event subscription, a polling hook) is **outside** this exception: its callback can fire again after the `using var` scope ends, a use-after-dispose the structural proof cannot discharge; wrap repeating sources with an owned subscription object and an explicit lifetime instead. A future revision is expected to introduce an explicit non-escaping-callback annotation capturing this contract in the type system (recorded in the rationale); until then, the four-condition shape is the documented escape hatch.
 
 <a id="sec-thread-synchronization"></a>
+**Re-derivation (v0.175).** The callback-capture admission below is now a derived instance of [§28.14](#sec-scoped-callback-parameters)'s storage-bounded capture (the source is the bounding object; settlement is its quiescence point). The four-condition text remains normative for the current signatures and is retired when the standard library migrates them to `scoped`; no further hard-coded capture patterns will be added.
+
 ### 30.12 Thread synchronization
 
 Bezel has no language-level synchronization primitives (no `synchronized` keyword, no `lock` statement). The standard library provides:
@@ -7191,6 +7219,8 @@ A Bezel program may call functions defined in native libraries (`.so`, `.dylib`,
 The boundary between Bezel and native code is **trusted but unverified**. The compiler accepts the programmer's declaration of a native function's signature; if the declaration is wrong, the call is undefined behavior. This is unlike calls within Bezel, which are end-to-end checked.
 
 <a id="sec-the-extern-block"></a>
+`scoped` function-typed parameters ([§28.14](#sec-scoped-callback-parameters)) are **illegal on `extern` declarations**: neither the storage obligations nor the quiescence guarantee can be verified across the FFI boundary (v0.175).
+
 ### 32.1 The `extern` block
 
 `extern` declarations always appear inside a block:
@@ -7850,6 +7880,11 @@ Param           ::= ParamModifiers? Identifier ":" Type (":=" Expression)?
 ParamModifiers  ::= "ref"
                   | "out" "owned"?
                   | "owned"
+                  | "scoped"
+                              /* "scoped" is valid only on function-typed
+                                 parameters (§28.14, v0.175): storage-bounded
+                                 callback capture. Illegal on extern
+                                 declarations (§32). */
 ArgList         ::= Argument ("," Argument)*
 Argument        ::= ArgModifiers ArgExpression
                   | (Identifier ":=")? ArgExpression
@@ -7937,7 +7972,7 @@ FunctionType    ::= "(" (FuncParamType ("," FuncParamType)*)? ")" "->" "owned"? 
                                  identity: `() -> Connection` and
                                  `() -> owned Connection` are distinct types. */
 FuncParamType   ::= FuncParamMods? (Identifier ":")? Type
-FuncParamMods   ::= "ref"
+FuncParamMods   ::= "ref" | "scoped"
                   | "out" "owned"?
                   | "owned"
                               /* Same set as the method-declaration ParamModifiers

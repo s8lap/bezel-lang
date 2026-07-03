@@ -7596,6 +7596,19 @@ v0.174 is the **back-pressure revision** — adopting RFC #809's bounded half.
 
 None — purely additive.
 
+<a id="sec-v0-174-to-v0-175-changelog"></a>
+### v0.175 changelog (v0.174 → v0.175)
+
+v0.175 is the **structured-concurrency revision** — adopting RFC #808 on the researched general capture mechanism (owner-ruled 2026-07-03: no further per-API carve-outs; full comparison in docs/proposals/capture-mechanism-808.md).
+
+- **`scoped` parameters + storage-bounded capture** (new spec §28.14; §28.3/§28.2/§27.2/§22.3/§32/A.4/A.6 amendments): a function-typed parameter marked `scoped` lets the callee store the callback bounded by a **bounding object** (constructed / owned-return-into-`using var` / receiver) whose lifetime the caller's checker proves ends before every captured source's scope. Callee storage obligations compiler-verified (v1: direct `scoped` fields of the bounding object only — the owned-field-extraction hole both candidate designs shared is closed by construction); quiescence is the author's obligation in the §28.3 borrowed-field trust shape, backstopped by `DisposedAccessException` in checked mode; `scoped` illegal on extern. **§30.11's TCS exception re-derives as an instance** (legacy text retained until stdlib migration — no new hard-coded patterns, ever). §24 events unify as-is: `Subscribe(scoped handler)` is the owned-return form.
+- **`TaskScope`** (stdlib §6.10): the nursery — `await using` only; mandatory `await Join()` as the sole re-raise site (first-fault-wins + cancel-siblings via the scope's token, the §13.5 no-aggregation posture); `DisposeAsync` drains-and-swallows; `Spawn` after close is `InvalidOperationException`; unbounded close-edge drain per the approved §28.12 note, bounded by `CancelAfter`. Intra-domain; consumes #810's primitives.
+- Declined/deferred in this revision: typed-result `Spawn<T>` handles (results flow via captured sinks), block-form sugar, cross-domain nurseries (§30.14 capture-free entry), plain-owned-local bounding anchors (ordering-guarantee wording too thin — revisit with a §28.3 clarification).
+
+#### Migration
+
+Additive except: `Subscribe` handler parameters become `scoped` (existing handler lambdas at call sites are unaffected — the modifier is on the declaration; function-VALUES of the old type held in locals would need the new type, none exist in the corpus).
+
 ## 20. Closing
 
 If the opening framed Bezel by what it borrows, the body has shown what it actually contributes: not the features — those have ancestors — but the discipline applied to combining them. The recurring move in this document is the same one every time a hard question arrived. Ship the part that fits the foundations cleanly. Decline the part that fights them, with the reason written down so the question stays settled rather than perennially reopened. Scope whatever genuinely remains open by naming its precise blocker, not by deferring it vaguely. Member-access reflection is declined, not pending. The cyclic-serialization soundness obligation was discharged in prose before any syntax was written. Tuples and post-condition loops are conveniences with recorded costs, not gaps. The deferred list is a list of decisions deliberately not yet made — each with its reasoning — never a list of unsolved problems.

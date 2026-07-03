@@ -3016,16 +3016,16 @@ For a synchronous event `event E: T`, the handler type is `(T) -> ()`. For an as
 
 ```bezel
 public interface IEvent<out T>
-  method Subscribe(handler: (T) -> ()): owned Subscription;
+  method Subscribe(scoped handler: (T) -> ()): owned Subscription;
 end IEvent;
 
 public interface IAsyncEvent<out T>
-  method Subscribe(handler: (T) -> Task): owned Subscription;
+  method Subscribe(scoped handler: (T) -> Task): owned Subscription;
 end IAsyncEvent;
 
 public class EventSource<T>: IEvent<T>
   // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> ()): owned Subscription;
+  public method Subscribe(scoped handler: (T) -> ()): owned Subscription;
   public method Raise(payload: T);
 
   public method Add(handler: (T) -> ());
@@ -3034,7 +3034,7 @@ end EventSource;
 
 public class AsyncEventSource<T>: IAsyncEvent<T>
   // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> Task): owned Subscription;
+  public method Subscribe(scoped handler: (T) -> Task): owned Subscription;
   public async method RaiseAsync(payload: T): Task;
 
   public method Add(handler: (T) -> Task);
@@ -3046,7 +3046,7 @@ Outside the declaring class, the static type of an event member is `IEvent<T>` (
 
 The `Add`, `Remove`, and `Raise` methods are declared `public` rather than `internal` because the visibility restriction is enforced by the **type fence**: an `EventSource<T>` reference is obtainable only inside the declaring class (the field type from outside is the interface, not the class). User code that smuggles an `EventSource<T>` reference out of the declaring class — for example, by exposing it through a public method or by reflection — gains the ability to call `Raise` directly, but doing so is a deliberate breach of the event-pattern contract that the language does not attempt to defend against. The conventional design is to never expose the `EventSource<T>` itself; the public surface is always the interface.
 
-`IEvent<T>` and `IAsyncEvent<T>` are covariant in T (`out T`): `IEvent<Dog>` is a subtype of `IEvent<Animal>`, the same direction as `IEnumerable<out T>`. An event source that fires `Dog` payloads can be exposed as an `IEvent<Animal>` to consumers; subscribers register `(Animal) -> ()` handlers, which accept any `Animal` (including `Dog`), and each fired `Dog` is passed in as an `Animal`. The variance check is sound because T appears once in `Subscribe(handler: (T) -> ())`, in the parameter position of `(T) -> ()` (contravariant) which is itself a method parameter (contravariant) — composing to a covariant position overall.
+`IEvent<T>` and `IAsyncEvent<T>` are covariant in T (`out T`): `IEvent<Dog>` is a subtype of `IEvent<Animal>`, the same direction as `IEnumerable<out T>`. An event source that fires `Dog` payloads can be exposed as an `IEvent<Animal>` to consumers; subscribers register `(Animal) -> ()` handlers, which accept any `Animal` (including `Dog`), and each fired `Dog` is passed in as an `Animal`. The variance check is sound because T appears once in `Subscribe(scoped handler: (T) -> ())`, in the parameter position of `(T) -> ()` (contravariant) which is itself a method parameter (contravariant) — composing to a covariant position overall.
 
 `EventSource<T>` and `AsyncEventSource<T>` (the producer-side classes) remain invariant because their `Raise(payload: T)` method places T in input position, which is incompatible with `out`. Since `EventSource<T>` is visible only inside the declaring class, the user-facing variance comes from `IEvent<out T>` exclusively.
 
@@ -3341,6 +3341,33 @@ end ChannelFullException;
 Deferred, each with its reason recorded in the v0.174 rationale entry: **capacity-zero rendezvous** (couples producer/consumer scheduling; addable later as `capacity: 0` without breaking), **`TrySend`** (the failure path would need to hand the owned item *back* — an ownership-protocol design of its own), **cancellation of a pending send** (same give-back protocol, plus it rides #1413's foundations), and **multi-consumer receiver cloning** (drags `Shared<T>`'s §28.13 domain-locality questions; worker pools compose today from N single-consumer channels).
 
 ---
+
+<a id="sec-taskscope"></a>
+### 6.10 `TaskScope` (v0.175, #808)
+
+The structured-concurrency nursery: a lexically-scoped owner of concurrently-running tasks. At scope exit every child has completed or been cancelled-and-joined; a child fault cancels its siblings; the first fault re-raises at the (mandatory) `await Join()`.
+
+```bezel
+public class TaskScope: IAsyncDisposable
+  public constructor();                                    // fresh internal CancellationTokenSource
+  public readonly property Token: CancellationToken;       // the scope's token — pass to children
+  public method CancelAfter(delay: TimeSpan);              // deadline for the whole scope
+  public method Cancel();                                  // cancel all children now
+
+  public method Spawn(scoped body: () -> Task);            // start a child (§28.14 storage-bounded);
+                                                           //   InvalidOperationException once closed
+  public async method Join(): Task;                        // await all children; re-raise the FIRST
+                                                           //   fault (first-fault-wins, no aggregation)
+  // await using only (see below); DisposeAsync drains and never raises
+end TaskScope;
+```
+
+- **Consumption is `await using` only** — a plain `using var`, or dropping the scope undisposed, is a compile error naming this rule: a synchronous destructor cannot await the drain, and live children hold scope-bounded borrows (§28.14), so no synchronous escape is sound.
+- **`await Join()` is mandatory on the normal path** (compile error where provable, `InvalidOperationException` from `DisposeAsync` otherwise): the join-and-re-raise happens at a source-visible `await`, never at an unmarked `end`. `DisposeAsync` (the exception/early-exit edge) cancels the scope's token, drains remaining children, and **always swallows** their faults — `Join` is the sole re-raise site. The drain may suspend unboundedly (the §28.12 close-edge note); bound it with `CancelAfter`.
+- **Fault policy**: first fault wins and cancels siblings via the scope's token (cooperative, §30.8); later faults are swallowed (the recorded §13.5 no-aggregation posture).
+- **`Spawn` after close** (after `Join` returned or disposal began) raises `InvalidOperationException` — deterministic, never a silent extension of the drain.
+- **Quiescence (normative, §28.14)**: `DisposeAsync` completes only after every child task has completed and been reclaimed; no `scoped` callback runs after it returns.
+- Intra-domain: `TaskScope` is not sendable; cross-domain fan-out remains channels + `Domain.Spawn`.
 
 <a id="sec-system-io"></a>
 ## 7. `System.IO`
