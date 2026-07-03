@@ -3880,14 +3880,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
 
                     // §6.1 / §30.8: CancellationToken instance method return types.
-                    // ThrowIfCancellationRequested() → unit (void); Register(cb) →
-                    // owned Subscription (leave untyped — Register is deferred).
+                    // ThrowIfCancellationRequested() → unit (void).
+                    // Register(cb) → owned Subscription is typed in the builtinInstName
+                    // ("rcn") block below — the CancellationToken receiver's TypeRef has
+                    // a non-null builtin declaration, so `colName` here resolves to the
+                    // receiver *variable* name, not "CancellationToken".
                     // IsCancellationRequested is a property (not a call), handled
                     // in resolveMemberAccess.
-                    if (colName == "CancellationToken") {
-                        // ThrowIfCancellationRequested() returns unit (void/untyped).
-                        // Register — deferred (needs closure-list infra).
-                    }
                     // §6.1: CancellationTokenSource instance and static method
                     // return types. Token is a property; Cancel() and CancelAfter()
                     // → unit; IsCancellationRequested → handled in resolveMemberAccess.
@@ -4254,6 +4253,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // per §2.5 / #1357: ToUnixTimeSeconds(): long.
                         else if (m == "ToUnixTimeSeconds")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                    }
+                    // §6.1 (#1413): CancellationToken.Register(callback: () -> ()) →
+                    // owned Subscription.  The receiver's TypeRef carries a non-null
+                    // builtin declaration, so `rcn` (builtinInstName) is the way to
+                    // recognise it — `colName` would resolve to the receiver variable
+                    // name.  Type the result as Subscription the way codegen expects
+                    // (a NULL-declaration Named TypeRef whose astNode name is
+                    // "Subscription" — isSubscriptionType), so §2.11 leak-prevention
+                    // applies and a `using var` auto-disposes it via
+                    // bz_subscription_dispose (the cancel-callback branch).
+                    if (rcn == "CancellationToken" && m == "Register") {
+                        static const ast::Type* kSubNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("Subscription");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* subTy = ctx_.makeTypeRef();
+                        subTy->kind = TypeRef::Kind::Named;
+                        subTy->declaration = nullptr;
+                        subTy->astNode = kSubNode;
+                        ctx_.setExprType(&ce, subTy);
                     }
                     // TimeSpan arithmetic methods return TimeSpan (fallback if
                     // the operator desugaring lands here rather than BinaryExpr).
@@ -8342,7 +8365,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 // ThrowIfCancellationRequested(): void — leave untyped (unit).
-                // Register(cb): owned Subscription — deferred (see codegen note).
+                // Register(cb): owned Subscription — a method-like member; the
+                // MemberAccess is left untyped here and the enclosing CallExpr sets
+                // the Subscription result type (#1413, see the typeCall handler).
             }
             if (cn == "CancellationTokenSource") {
                 // Token: CancellationToken (§6.1).  Use builtinClassSym so the

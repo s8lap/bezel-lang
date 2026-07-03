@@ -5079,7 +5079,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.CreateCall(fn, {cts});
                         return nullptr;  // unit
                     }
-                    // §6.1: CancelAfter / WithCancelAfter — deferred (needs timer).
+                    // §6.1 (#1413 / #1378): CancelAfter(delay: TimeSpan) — schedule
+                    // this source to cancel after `delay` on the dedicated BzTimer.
+                    // TimeSpan lowers to an i64 tick count (100-ns units) → ms =
+                    // ticks / 10000 (same conversion as Task.Delay(TimeSpan)).
+                    if (mname == "CancelAfter" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* span = lowerExpr(*call.args[0].value);
+                        if (!span) return nullptr;
+                        if (!span->getType()->isIntegerTy(64))
+                            span = builder_.CreateSExtOrTrunc(span, i64());
+                        llvm::Value* ms = builder_.CreateSDiv(
+                            span, builder_.getInt64(10000), "cancelafter.ms");
+                        auto* fn = declareC("bz_cts_cancel_after",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64()});
+                        builder_.CreateCall(fn, {cts, ms});
+                        return nullptr;  // unit
+                    }
+                    // §6.1: WithCancelAfter is a STATIC factory — handled in
+                    // tryLowerStaticCall, not here.
                 }
             }
         }
@@ -5150,9 +5168,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.SetInsertPoint(resumeBB);
                         return nullptr;  // unit
                     }
-                    // §6.1: Register(cb) — deferred.  Needs closure-list infra
-                    // (a per-source list of registered lambdas fired on Cancel()).
-                    // Report: not implemented.
+                    // §6.1 (#1413): Register(callback: () -> ()): owned Subscription.
+                    // Lower the callback exactly like an event handler — a `() -> ()`
+                    // closure (payload null) handed over with a transferred +1 — then
+                    // install it on the token's cancel state (bz_ctoken_register) and
+                    // return the Subscription handle.  Disposal routes through
+                    // bz_subscription_dispose's cancel-callback branch.  On an already-
+                    // cancelled token the runtime fires the callback synchronously and
+                    // returns a no-op Subscription (§6.1); on None the callback never
+                    // fires and its +1 is dropped, also yielding a no-op Subscription.
+                    if (mname == "Register" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* closure = lowerEventHandlerClosure(
+                            call.args[0].value.get(), /*payload=*/nullptr);
+                        if (!closure) return nullptr;
+                        llvm::Value* tokArg =
+                            tok ? tok : llvm::ConstantPointerNull::get(ptrTy());
+                        auto* fn = declareC("bz_ctoken_register",
+                                            ptrTy(), {ptrTy(), ptrTy()});
+                        return builder_.CreateCall(fn, {tokArg, closure},
+                                                   "ctoken.register");
+                    }
                 }
             }
         }
@@ -6306,21 +6342,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (cls == "CancellationTokenSource") {
         // WithCancelAfter(delay: TimeSpan): owned CancellationTokenSource.
         // Allocates a new CancellationTokenSource via bz_cts_alloc (the same
-        // allocation as `new CancellationTokenSource()`).  The timer that
-        // triggers cancellation after `delay` is DEFERRED pending scheduler
-        // infra (bz_task_delay already schedules work on the thread pool;
-        // CancelAfter needs an analogous bz_cts_cancel_after helper).  Until
-        // that helper exists, the source is allocated normally and no
-        // cancellation is scheduled — programs compile and run cleanly with
-        // well-formed IR; the timer simply does not fire.  (#463: the bug was
-        // that the source was never even allocated because sema gave the call
-        // expression no type, which caused IR verification failure downstream.)
+        // allocation as `new CancellationTokenSource()`) and immediately schedules
+        // it to cancel after `delay` via bz_cts_cancel_after (#1413 / #1378 timer).
+        // TimeSpan lowers to an i64 tick count (100-ns units) → ms = ticks / 10000
+        // (same conversion as Task.Delay(TimeSpan) and CancelAfter above).
         if (m == "WithCancelAfter" && !call.args.empty()) {
-            // Evaluate the delay argument for any side-effects (TimeSpan.FromMilliseconds
-            // etc.) even though we do not yet pass it to a timer.
-            if (call.args[0].value) lowerExpr(*call.args[0].value);
             auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
-            return builder_.CreateCall(allocFn, {}, "cts.wca");
+            llvm::Value* src = builder_.CreateCall(allocFn, {}, "cts.wca");
+            if (call.args[0].value) {
+                llvm::Value* span = lowerExpr(*call.args[0].value);
+                if (span) {
+                    if (!span->getType()->isIntegerTy(64))
+                        span = builder_.CreateSExtOrTrunc(span, i64());
+                    llvm::Value* ms = builder_.CreateSDiv(
+                        span, builder_.getInt64(10000), "wca.ms");
+                    auto* fn = declareC("bz_cts_cancel_after",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), i64()});
+                    builder_.CreateCall(fn, {src, ms});
+                }
+            }
+            return src;
         }
         // §30.8 / stdlib §6.1 (v0.173, #810): CreateLinked(a, b) — a linked child
         // source cancelled when either parent token cancels (or via its own

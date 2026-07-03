@@ -153,21 +153,21 @@ BEZEL_TEST(codegen_cancellation_6_1, explicit_dispose_source) {
 // (the same TypeRef shape used by `new CancellationTokenSource()`), so
 // `cts.Token` types correctly as CancellationToken (a ptr-wide value, §6.1).
 //
-// Timer note: WithCancelAfter schedules cancellation after a delay.  The
-// timer is currently DEFERRED (the runtime does not yet schedule the cancel
-// callback).  The source is allocated normally; no cancellation fires during
-// the test.  Programs compile cleanly (no malformed IR) and run to a defined
-// exit — they do NOT see the cancellation (timer not implemented), so they
-// take the "not cancelled" path and return 0, not 8.  Tests assert 0 for
-// now; when the timer is implemented they will need updating to assert 8.
+// Timer note: WithCancelAfter schedules cancellation after a delay.  As of #1413
+// the timer IS implemented (bz_cts_cancel_after on the #1378 BzTimer; the firing
+// behaviour is covered in cts_register_timer_1413_test.cpp).  These SYNCHRONOUS
+// #463 layout tests still take the "not cancelled" path and return 0: the token is
+// checked immediately (well before the 10 ms deadline), and the `using var` source
+// is disposed at scope end, which cancels the still-pending timer entry — so no
+// cancellation is observed within the test.
 //
 // Spec reference: stdlib §6.1 (WithCancelAfter signature and return type),
 //                 §6.1 (CancellationToken — a single pointer word).
 // ===========================================================================
 
 // #463 / §6.1: WithCancelAfter() compiles cleanly and the source's token
-// has the right layout (ptr-wide).  IsCancellationRequested is false before
-// the deferred timer fires (timer is currently deferred → not cancelled).
+// has the right layout (ptr-wide).  IsCancellationRequested is false when checked
+// immediately (well before the 10 ms deadline — see the timer note above).
 // Regression for `new CancellationTokenSource()` path also verified.
 BEZEL_TEST(cts_withcancelafter_token_typed_463,
            withcancelafter_token_is_ptr_not_erased) {
@@ -176,10 +176,10 @@ BEZEL_TEST(cts_withcancelafter_token_typed_463,
         "using var cts := CancellationTokenSource.WithCancelAfter("
         "    TimeSpan.FromMilliseconds(10)); "
         "var token := cts.Token; "
-        // Timer is deferred: token is not yet cancelled (IsCancellationRequested false).
+        // Checked immediately — before the 10 ms deadline — so not yet cancelled.
         "if token.IsCancellationRequested then return 1; end; "
         "return 0; ")),
-        0);  // timer deferred — cancellation not observed yet
+        0);  // synchronous check precedes the deadline — cancellation not observed
 }
 
 // #463 / §6.1: Cancel() on a WithCancelAfter-created source works (the source

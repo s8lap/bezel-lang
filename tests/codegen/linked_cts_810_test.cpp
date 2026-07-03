@@ -21,13 +21,13 @@
 // Implementation note (deviation recorded in the #810 lane report): the runtime
 // composes cancellation by a PUSH cascade — the child registers its state cell on
 // each parent's downward `children` list; the parent's Cancel()/Dispose()
-// cascades the latch into the child.  This is NOT built on CancellationToken.
-// Register(callback) (which remains DEFERRED — no callback-firing infra exists),
-// so "a user callback registered on the child fires when a parent cancels" is not
-// yet observable; the observable equivalent — the child token's
-// IsCancellationRequested flips true when a parent cancels — is tested here.
-// The CancelAfter/WithCancelAfter TIMER is likewise deferred project-wide, so the
-// "or via its own CancelAfter" branch is covered through the child's own Cancel().
+// cascades the latch into the child.  This is the substrate on which #1413 later
+// built CancellationToken.Register(callback) — a callback registered on the child's
+// token now DOES fire when a parent cancels (the cascade reaches the child's
+// callback drain); that behaviour, and the CancelAfter/WithCancelAfter timer, are
+// covered in cts_register_timer_1413_test.cpp.  Here the observable equivalent —
+// the child token's IsCancellationRequested flips true when a parent cancels — is
+// what is tested.
 //
 // Each test cites the stdlib section and the spec-stated behaviour it verifies.
 

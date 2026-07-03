@@ -6141,10 +6141,27 @@ struct bz_event_source_t {
     int64_t             next_token;
 };
 
+// #1413 (stdlib §6.1): CancellationToken.Register installs a `() -> ()` callback
+// on the token's cancel-state cell (bz_cancel_state_t, defined in the cancellation
+// section far below).  The Subscription that Register returns REUSES the event
+// machinery's bz_subscription_t + bz_subscription_dispose (and the live-set
+// idempotency), routing its unregistration to the cancel-callback list instead of
+// an event source.  Forward-declare the state type and the one static helper that
+// bz_subscription_dispose needs; both live in the cancellation section below.
+struct bz_cancel_state_t;
+static void bz_ctoken_unregister(bz_cancel_state_t* s, int64_t tok);
+static void bz_cancel_state_release(bz_cancel_state_t* s);
+
 struct bz_subscription_t {
-    bz_event_source_t* src;
+    bz_event_source_t* src;          // event source (null for a Register callback sub)
     int64_t            token;
     bool               disposed;
+    // #1413: non-null → a CancellationToken.Register subscription.  Dispose routes
+    // to bz_ctoken_unregister(cancel_state, token) instead of the event path.  The
+    // subscription RETAINS this cell (bz_cancel_state_retain) so Dispose can find
+    // and remove the callback even after the source itself is gone; it is released
+    // here at Dispose.  calloc/zero-init leaves it null for every event Subscribe.
+    bz_cancel_state_t* cancel_state;
 };
 
 extern "C" void* bz_event_source_new(void) {
@@ -6331,6 +6348,22 @@ extern "C" void bz_subscription_dispose(void* subp) {
     }
     auto* sub = (bz_subscription_t*)subp;
     sub->disposed = true;
+    if (sub->cancel_state) {
+        // #1413 (stdlib §6.1): a CancellationToken.Register subscription.  Remove
+        // the callback from the cancel-state's callback list (bz_ctoken_unregister
+        // releases the transferred +1 IF the callback is still installed — if a
+        // concurrent Cancel already snapshot-and-drained it, unregister finds
+        // nothing and Cancel owns the release, so the +1 is dropped exactly once).
+        // Then drop the subscription's retained reference on the state cell.  This
+        // is the callback-list analogue of the event path below, and it is the ONLY
+        // dispose entry point codegen emits for a Subscription (§2.11 idempotent).
+        bz_cancel_state_t* cs = sub->cancel_state;
+        sub->cancel_state = nullptr;
+        bz_ctoken_unregister(cs, sub->token);
+        bz_cancel_state_release(cs);
+        free(sub);
+        return;
+    }
     if (sub->src) {
         // §24 / §27.5 / #841: the handler closure is a transferred +1 — codegen
         // (lowerEventHandlerClosure → bz_event_subscribe) hands the event source
@@ -8572,6 +8605,25 @@ struct bz_cancel_state_t {
     // parent's cascade never writes into a freed child.
     std::vector<bz_cancel_state_t*> children;
     std::vector<bz_cancel_state_t*> parents;
+    // #1413 (stdlib §6.1): CancellationToken.Register callback list.  A callback is
+    // a Bezel `() -> ()` closure cell (runtime-managed, §28.9 refcounted): Register
+    // stores it with the transferred +1, a cancel FIRES it (calls fn(env)) exactly
+    // once and RELEASES the +1, and Subscription.Dispose unregisters it (releasing
+    // the +1) if it has not yet fired.  This is the closure-list analogue of the
+    // event machinery's bz_event_source_t handler list, but guarded by the same
+    // g_cancel_link_mu as the cascade lists so the list is mutated under the lock
+    // and FIRED via snapshot-and-drain OUTSIDE the lock (the cascade's discipline).
+    struct callback_t { void* closure; int64_t token; };
+    std::vector<callback_t> callbacks;
+    int64_t next_cb_token{0};        // monotonic Subscription token (>0)
+    // #1413: CancelAfter / WithCancelAfter reschedule + cancel-on-dispose generation.
+    // Each CancelAfter bumps this and captures the new value in its BzTimer entry; at
+    // fire time only the entry whose captured generation still matches actually
+    // signals — a rescheduled (CancelAfter-twice → later-call-wins) or disposed
+    // source's stale timer entry no-ops.  It lives on the STATE cell (not the source)
+    // because the timer entry retains the state cell, so it stays readable after the
+    // source is freed — no separate shared owner needed.
+    std::atomic<uint64_t> timer_gen{0};
 };
 
 struct bz_cancel_source_t {
@@ -8591,7 +8643,15 @@ static void bz_cancel_state_retain(bz_cancel_state_t* s) {
 static void bz_cancel_state_release(bz_cancel_state_t* s) {
     if (!s) return;
     // #716: use `delete` to match the `new` in bz_cts_alloc.
-    if (s->rc.fetch_sub(1, std::memory_order_acq_rel) == 1) delete s;
+    if (s->rc.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // #1413: at last-drop no other thread references `s`, so drain any callback
+        // closure still installed (never fired, never unregistered — e.g. a leaked
+        // Subscription on a token that was never cancelled).  Normal paths (Cancel /
+        // Dispose signal, Subscription.Dispose) already emptied the list; this is a
+        // defensive leak guard so a closure's +1 is never orphaned.
+        for (auto& cb : s->callbacks) bz_closure_release(cb.closure);
+        delete s;
+    }
 }
 
 // v0.173 / #810 (stdlib §6.1 / spec §30.8): linked cancellation composition.
@@ -8606,24 +8666,56 @@ static std::mutex g_cancel_link_mu;
 
 static void bz_cancel_state_signal(bz_cancel_state_t* s);
 
-// Set the one-way cancelled latch on `s` and cascade to every child linked to it
-// (spec §30.8: a child cancels when its parent cancels).  UAF-safe firing: under
-// the lock we SNAPSHOT-and-CLEAR `s->children` (transferring the parent's
-// retained refs into `kids`), then recurse OUTSIDE the lock.  The snapshot keeps
-// each child alive across the cascade even if a concurrent dispose is
-// unregistering it; clearing the list drops the parent→child edge so a child
-// disposed after the cascade finds nothing to remove and no ref to double-drop.
-// The idempotent latch bounds recursion even for a (degenerate) link cycle: a
-// re-signalled node has an already-empty children list after its first drain.
+// #1413 (stdlib §6.1): invoke a Bezel `() -> ()` callback closure from the runtime.
+// A closure cell is { fn (off 0), env (off BZ_CLOSURE_ENV_OFFSET), rc, envdtor };
+// the trampoline ABI passes env as the first (hidden) argument, so a unit action is
+// `void fn(void* env)` (confirmed against codegen's closure-call lowering, which
+// always pushes env_ptr first).  This is what lets cancellation callbacks fire on
+// the timer thread and the cascade thread — where codegen is NOT the driver — the
+// same way the event machinery has codegen drive the (typed) raise loop.
+static void bz_cancel_invoke_closure(void* closure) {
+    if (!closure) return;
+    void* fn = nullptr;
+    memcpy(&fn, closure, sizeof(void*));                       // fn at offset 0
+    if (!fn) return;
+    void* env = nullptr;
+    memcpy(&env, (uint8_t*)closure + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
+    typedef void (*action_fn_t)(void*);
+    ((action_fn_t)fn)(env);
+}
+
+// Set the one-way cancelled latch on `s`, FIRE every registered Register callback,
+// and cascade to every child linked to it (spec §30.8: a child cancels when its
+// parent cancels).  UAF-safe firing: under the lock we SNAPSHOT-and-CLEAR both
+// `s->children` (transferring the parent's retained refs into `kids`) and
+// `s->callbacks` (transferring the callback closures' +1 into `cbs`), then fire /
+// recurse OUTSIDE the lock.  Snapshotting keeps each child alive across the cascade
+// even if a concurrent dispose is unregistering it, and takes exclusive ownership of
+// each callback's +1 so a concurrent Subscription.Dispose (which finds the token
+// already gone) cannot double-release — whoever wins the lock owns the release,
+// exactly the event machinery's "release the transferred +1 exactly once" rule.
+// The idempotent latch bounds recursion even for a (degenerate) link cycle, and a
+// re-signalled node has already-empty lists after its first drain (so Cancel-then-
+// timer, or double-Cancel, fires each callback at most once — no double effects).
 static void bz_cancel_state_signal(bz_cancel_state_t* s) {
     if (!s) return;
     // #716: release-store so acquire-loaders (workers, bz_ctoken_is_cancelled)
     // observe the flag.  Idempotent — storing 1 when already 1 is harmless.
     s->cancelled.store(1, std::memory_order_release);
     std::vector<bz_cancel_state_t*> kids;
+    std::vector<void*> cbs;              // #1413: snapshot of callback closures to fire
     {
         std::lock_guard<std::mutex> g(g_cancel_link_mu);
         kids.swap(s->children);          // take the parent's retained child refs
+        cbs.reserve(s->callbacks.size());
+        for (auto& cb : s->callbacks) cbs.push_back(cb.closure);
+        s->callbacks.clear();            // take exclusive ownership of each closure's +1
+    }
+    // Fire callbacks first (on THIS thread — the cancelling thread per §6.1), then
+    // cascade to linked children (whose own callbacks fire the same way — piece 3).
+    for (void* cl : cbs) {
+        bz_cancel_invoke_closure(cl);    // call fn(env) exactly once
+        bz_closure_release(cl);          // drop the list's transferred +1
     }
     for (auto* k : kids) {
         bz_cancel_state_signal(k);       // cascade (idempotent)
@@ -8681,6 +8773,82 @@ static void bz_cancel_unlink_all(bz_cancel_state_t* child) {
     for (auto* p : ps) bz_cancel_state_release(p);
 }
 
+// #1413 (stdlib §6.1): remove the Register callback identified by `tok` from `s`'s
+// callback list and release its transferred +1.  Called by Subscription.Dispose
+// (bz_subscription_dispose's cancel-callback branch).  If the callback has already
+// fired (Cancel snapshot-and-drained the list under the same lock), the token is
+// gone → this is a no-op and the fire path owns the release: the +1 is dropped
+// exactly once either way.  The release runs OUTSIDE the lock so a last-drop of the
+// closure (which frees its env / captured refs) never re-enters g_cancel_link_mu.
+static void bz_ctoken_unregister(bz_cancel_state_t* s, int64_t tok) {
+    if (!s) return;
+    void* cl = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        for (auto it = s->callbacks.begin(); it != s->callbacks.end(); ++it) {
+            if (it->token == tok) { cl = it->closure; s->callbacks.erase(it); break; }
+        }
+    }
+    if (cl) bz_closure_release(cl);   // drop the transferred +1 (outside the lock)
+}
+
+// #1413 (stdlib §6.1): build the Subscription that Register hands back.  REUSES the
+// event machinery's bz_subscription_t + live-set (bz_subscription_dispose routes the
+// cancel_state != null case to bz_ctoken_unregister).  For a real registration the
+// subscription retains the state cell so Dispose can unregister even after the source
+// is gone; for the already-cancelled / None case it is a no-op handle (§6.1: "a
+// Subscription whose Dispose() is a no-op").
+static void* bz_make_cancel_subscription(bz_cancel_state_t* s, int64_t tok) {
+    auto* sub = (bz_subscription_t*)calloc(1, sizeof(bz_subscription_t));
+    sub->src = nullptr;
+    sub->token = tok;
+    sub->disposed = false;
+    sub->cancel_state = s;
+    if (s) bz_cancel_state_retain(s);   // the subscription keeps the cell alive
+    { std::lock_guard<std::mutex> lk(bz_sub_live_mutex()); bz_sub_live_set().insert(sub); }
+    return sub;
+}
+
+// §6.1: CancellationToken.Register(callback: () -> ()): owned Subscription.
+// `token` is a bz_cancel_state_t* (null == CancellationToken.None).  `closure` is a
+// `() -> ()` cell handed over with a transferred +1 (codegen lowers it exactly like
+// an event handler, via lowerEventHandlerClosure).  Semantics (stdlib §6.1 verbatim):
+//   - not-yet-cancelled token: store the callback; it fires when cancellation is
+//     requested (on the cancelling thread — Cancel(), the CancelAfter timer thread,
+//     or a linked parent's cascade thread).  Return a real Subscription.
+//   - ALREADY-cancelled token (or None, which never cancels and so, C#-style,
+//     returns a default no-op registration): invoke the callback SYNCHRONOUSLY on the
+//     calling thread before returning, release the +1, and return a no-op Subscription.
+// The already-cancelled check and the list insert happen UNDER g_cancel_link_mu, and
+// bz_cancel_state_signal snapshots the list under the SAME lock AFTER setting the
+// latch, so there is no lost-callback / double-fire window (see the signal comment).
+extern "C" void* bz_ctoken_register(void* token, void* closure) {
+    auto* s = (bz_cancel_state_t*)token;
+    if (!s) {
+        // CancellationToken.None: never cancels, so the callback can never fire —
+        // drop its +1 now and return a no-op Subscription (matches C#'s default reg).
+        bz_closure_release(closure);
+        return bz_make_cancel_subscription(nullptr, 0);
+    }
+    bool alreadyCancelled;
+    int64_t tok = 0;
+    {
+        std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        alreadyCancelled = s->cancelled.load(std::memory_order_acquire) != 0;
+        if (!alreadyCancelled) {
+            tok = ++s->next_cb_token;
+            s->callbacks.push_back({closure, tok});   // store the transferred +1
+        }
+    }
+    if (alreadyCancelled) {
+        // §6.1: synchronous fire on the calling thread, then a no-op Subscription.
+        bz_cancel_invoke_closure(closure);
+        bz_closure_release(closure);   // drop the transferred +1 (fired once)
+        return bz_make_cancel_subscription(nullptr, 0);
+    }
+    return bz_make_cancel_subscription(s, tok);
+}
+
 extern "C" void* bz_cts_alloc(void) {
     // Use `new` (not calloc) so that std::atomic constructors run.
     auto* src = new bz_cancel_source_t();
@@ -8732,6 +8900,43 @@ extern "C" void bz_cts_cancel(void* srcp) {
     bz_cancel_state_signal(src->state);
 }
 
+// §6.1 (#1413 / #1378): CancellationTokenSource.CancelAfter(delay) — schedule the
+// source to cancel after `ms` milliseconds via the dedicated BzTimer thread (g_timer,
+// the #1378 substrate).  Wires to the same cancel path as Cancel() (bz_cancel_state_
+// signal → latch + fire callbacks + cascade), fired on the timer thread.
+//
+// Reschedule (later-call-wins, matching C#'s CancelAfter which RESETS the timer): each
+// call bumps the state's timer generation and captures the new value; the timer entry
+// only signals if its captured generation still matches at fire time, so an earlier
+// pending entry (from a prior CancelAfter) no-ops.  The docs say "set or extend the
+// delay" — reschedule is the literal reading.  (Note: even without this the one-way
+// latch makes a double-fire harmless; the generation is what makes a LONGER second
+// delay actually supersede a shorter first one, which is the observable difference.)
+//
+// UAF safety: the timer entry RETAINS the state cell, so it stays readable even if the
+// source is disposed before the deadline; the callback releases that ref when it fires
+// (or is drained at scheduler shutdown).  Dispose bumps the generation first (below),
+// so the pending entry no-ops rather than signalling a state we are tearing down.
+extern "C" void bz_cts_cancel_after(void* srcp, int64_t ms) {
+    auto* src = (bz_cancel_source_t*)srcp;
+    if (!src || !src->state) return;
+    if (src->disposed) return;                 // no scheduling on a disposed source
+    bz_cancel_state_t* s = src->state;
+    // Bump the generation and capture the new value (reschedule / later-call-wins).
+    uint64_t myGen = s->timer_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (!g_scheduler) bz_scheduler_init(4);
+    bz_timer_ensure();
+    int64_t d = ms < 0 ? 0 : ms;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(d);
+    bz_cancel_state_retain(s);                 // the timer entry holds a ref on the cell
+    g_timer->schedule(deadline, [s, myGen]() {
+        // Fire only if still the latest scheduled entry (not rescheduled, not disposed).
+        if (s->timer_gen.load(std::memory_order_acquire) == myGen)
+            bz_cancel_state_signal(s);         // latch + fire callbacks + cascade
+        bz_cancel_state_release(s);            // drop the timer entry's ref
+    });
+}
+
 extern "C" void bz_cts_dispose(void* srcp) {
     auto* src = (bz_cancel_source_t*)srcp;
     if (!src) return;
@@ -8741,10 +8946,17 @@ extern "C" void bz_cts_dispose(void* srcp) {
     // still observing.  Outstanding token handles retain the state cell via
     // the rc, so reads after dispose stay safe.
     if (src->state) {
+        // #1413 (§6.1 / #1378): cancel any pending CancelAfter timer entry BEFORE
+        // teardown — bump the generation so a not-yet-fired timer callback no-ops
+        // (it will not signal a state we are about to release).  The retained state
+        // ref inside that callback keeps the cell alive until it runs, so its own
+        // release stays UAF-safe.
+        src->state->timer_gen.fetch_add(1, std::memory_order_acq_rel);
         // v0.173 / #810 (§6.1 dispose order): FIRST unregister from every parent,
         // so no parent's cascade can fire into this child once disposal proceeds
         // (the UAF pin), THEN signal our own tokens and cascade to any children
-        // we ourselves parent.
+        // we ourselves parent.  The signal also fires + releases any registered
+        // Register callbacks (§6.1: the destructor releases the callback list).
         bz_cancel_unlink_all(src->state);
         bz_cancel_state_signal(src->state);
         bz_cancel_state_release(src->state);  // drop the source's reference
