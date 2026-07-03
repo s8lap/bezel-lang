@@ -50,6 +50,10 @@ target_link_libraries(bezel_tests PRIVATE bezel_core bezel_warnings)
 target_link_options(bezel_tests PRIVATE
     -Wl,--whole-archive $<TARGET_FILE:bezel_runtime> -Wl,--no-whole-archive
     -Wl,--export-dynamic)
+# $<TARGET_FILE:...> in link OPTIONS creates no dependency edge (unlike
+# target_link_libraries), so a fresh tree building --target bezel_tests alone
+# never builds the archive; make the edge explicit.
+add_dependencies(bezel_tests bezel_runtime)
 
 add_test(NAME bezel_tests COMMAND bezel_tests)
 
