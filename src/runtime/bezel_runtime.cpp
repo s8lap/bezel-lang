@@ -8549,13 +8549,29 @@ extern "C" void* bz_current_domain_ptr() { return (void*)g_current_domain; }
 // data-race undefined behaviour under C++20.
 //
 // Layout: std::atomic<int32_t> is guaranteed to have the SAME size and
-// alignment as int32_t (4 bytes each, total struct = 8 bytes) per [atomics.types.generic]
-// p1. Codegen only touches bz_cancel_state_t through opaque function calls
+// alignment as int32_t (4 bytes each) per [atomics.types.generic] p1.  Codegen
+// only touches bz_cancel_state_t through opaque function calls
 // (bz_ctoken_is_cancelled, bz_cts_is_cancelled, bz_cts_cancel, etc.) — no
-// direct GEP offsets — so the layout change is transparent to codegen.
+// direct GEP offsets — so the layout is transparent to codegen and MAY carry
+// extra runtime-only fields.  v0.173 / #810 adds the two linked-source adjacency
+// lists below; because codegen never GEPs into the cell, growing it is safe.
 struct bz_cancel_state_t {
     std::atomic<int32_t> cancelled;  // 0 = live, 1 = cancelled; one-way latch
     std::atomic<int32_t> rc;         // reference count (source + outstanding tokens)
+    // v0.173 / #810 (stdlib §6.1 / spec §30.8): linked cancellation composition.
+    // A source created by CreateLinked / CreateLinkedAll registers its state as a
+    // CHILD on each parent token's state.  `children` lists the child states this
+    // state must cancel when IT cancels (downward cascade); `parents` lists the
+    // parent states this state is registered on (kept so the child can UNREGISTER
+    // itself at dispose, before it signals its own tokens — the UAF-safe order).
+    // Every pointer in either list is a RETAINED reference (bz_cancel_link): a
+    // parent keeps each child alive while it may still cascade into it, and a
+    // child keeps each parent alive so it can find-and-remove itself at dispose.
+    // Both lists are guarded by the file-global g_cancel_link_mu (below), which
+    // serialises registration and unregistration against cascade firing so a
+    // parent's cascade never writes into a freed child.
+    std::vector<bz_cancel_state_t*> children;
+    std::vector<bz_cancel_state_t*> parents;
 };
 
 struct bz_cancel_source_t {
@@ -8576,6 +8592,93 @@ static void bz_cancel_state_release(bz_cancel_state_t* s) {
     if (!s) return;
     // #716: use `delete` to match the `new` in bz_cts_alloc.
     if (s->rc.fetch_sub(1, std::memory_order_acq_rel) == 1) delete s;
+}
+
+// v0.173 / #810 (stdlib §6.1 / spec §30.8): linked cancellation composition.
+// A single file-global lock guards the children/parents adjacency lists on every
+// bz_cancel_state_t.  Choosing ONE global lock (over a per-cell lock) makes
+// register / unregister / cascade trivially deadlock-free — there is no per-cell
+// lock ordering to invert — and the cascade releases the lock before recursing
+// (snapshot-and-drain).  Cancellation linking is rare, so global-lock contention
+// is irrelevant.  This matches the runtime's #716 stance: cross-thread safety
+// with the simplest structure that is provably correct.
+static std::mutex g_cancel_link_mu;
+
+static void bz_cancel_state_signal(bz_cancel_state_t* s);
+
+// Set the one-way cancelled latch on `s` and cascade to every child linked to it
+// (spec §30.8: a child cancels when its parent cancels).  UAF-safe firing: under
+// the lock we SNAPSHOT-and-CLEAR `s->children` (transferring the parent's
+// retained refs into `kids`), then recurse OUTSIDE the lock.  The snapshot keeps
+// each child alive across the cascade even if a concurrent dispose is
+// unregistering it; clearing the list drops the parent→child edge so a child
+// disposed after the cascade finds nothing to remove and no ref to double-drop.
+// The idempotent latch bounds recursion even for a (degenerate) link cycle: a
+// re-signalled node has an already-empty children list after its first drain.
+static void bz_cancel_state_signal(bz_cancel_state_t* s) {
+    if (!s) return;
+    // #716: release-store so acquire-loaders (workers, bz_ctoken_is_cancelled)
+    // observe the flag.  Idempotent — storing 1 when already 1 is harmless.
+    s->cancelled.store(1, std::memory_order_release);
+    std::vector<bz_cancel_state_t*> kids;
+    {
+        std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        kids.swap(s->children);          // take the parent's retained child refs
+    }
+    for (auto* k : kids) {
+        bz_cancel_state_signal(k);       // cascade (idempotent)
+        bz_cancel_state_release(k);      // drop the parent's ref to this child
+    }
+}
+
+// Register `child` to be cancelled when `parent` cancels (spec §30.8: the child
+// cancels when ANY parent cancels).  `parent` null == CancellationToken.None:
+// never cancels, so no edge.  If `parent` is ALREADY cancelled, `child` fires
+// SYNCHRONOUSLY (same policy as Register-on-cancelled) and no edge is recorded.
+// Otherwise both directions are recorded, each RETAINED: parent→child (so the
+// cascade can safely reach the child) and child→parent (so the child can
+// unregister at dispose).
+static void bz_cancel_link(bz_cancel_state_t* child, bz_cancel_state_t* parent) {
+    if (!child || !parent) return;       // None never cancels — no edge
+    bool fireNow = false;
+    {
+        std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        if (parent->cancelled.load(std::memory_order_acquire)) {
+            fireNow = true;              // already cancelled — fire below, no edge
+        } else {
+            bz_cancel_state_retain(child);
+            parent->children.push_back(child);
+            bz_cancel_state_retain(parent);
+            child->parents.push_back(parent);
+        }
+    }
+    if (fireNow) bz_cancel_state_signal(child);  // synchronous already-cancelled fire
+}
+
+// Remove `child` from every parent it is registered on and drop the paired
+// references — done at dispose BEFORE the child signals its own tokens (the §6.1
+// dispose order: unregister first, so no parent cascade can fire into the child
+// once disposal proceeds).  Removing the child from a parent's children list
+// drops that parent's retained ref to the child; swapping out `child->parents`
+// drops the child's retained refs to the parents.  All releases run OUTSIDE the
+// lock so a last-ref `delete` never re-enters g_cancel_link_mu.
+static void bz_cancel_unlink_all(bz_cancel_state_t* child) {
+    if (!child) return;
+    std::vector<bz_cancel_state_t*> ps;
+    int child_refs_to_drop = 0;
+    {
+        std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        ps.swap(child->parents);
+        for (auto* p : ps) {
+            auto& kids = p->children;
+            for (auto it = kids.begin(); it != kids.end(); ) {
+                if (*it == child) { ++child_refs_to_drop; it = kids.erase(it); }
+                else               ++it;
+            }
+        }
+    }
+    for (int i = 0; i < child_refs_to_drop; ++i) bz_cancel_state_release(child);
+    for (auto* p : ps) bz_cancel_state_release(p);
 }
 
 extern "C" void* bz_cts_alloc(void) {
@@ -8623,9 +8726,10 @@ extern "C" int32_t bz_cts_is_cancelled(void* srcp) {
 extern "C" void bz_cts_cancel(void* srcp) {
     auto* src = (bz_cancel_source_t*)srcp;
     if (!src || !src->state) return;
-    // #716: release store so workers that load with acquire see the flag.
-    // Idempotent: storing 1 when already 1 is harmless.
-    src->state->cancelled.store(1, std::memory_order_release);
+    // v0.173 / #810: set the latch AND cascade to any linked child sources.
+    // Idempotent (the latch is one-way; a re-signal drains an already-empty list).
+    // No upward propagation: signalling this source touches only ITS children.
+    bz_cancel_state_signal(src->state);
 }
 
 extern "C" void bz_cts_dispose(void* srcp) {
@@ -8637,13 +8741,48 @@ extern "C" void bz_cts_dispose(void* srcp) {
     // still observing.  Outstanding token handles retain the state cell via
     // the rc, so reads after dispose stay safe.
     if (src->state) {
-        // #716: release store so workers observing with acquire-load see cancelled=1.
-        src->state->cancelled.store(1, std::memory_order_release);
+        // v0.173 / #810 (§6.1 dispose order): FIRST unregister from every parent,
+        // so no parent's cascade can fire into this child once disposal proceeds
+        // (the UAF pin), THEN signal our own tokens and cascade to any children
+        // we ourselves parent.
+        bz_cancel_unlink_all(src->state);
+        bz_cancel_state_signal(src->state);
         bz_cancel_state_release(src->state);  // drop the source's reference
         src->state = nullptr;
     }
     // Use `delete` to match the `new` in bz_cts_alloc (#716).
     delete src;
+}
+
+// v0.173 / #810 (stdlib §6.1 / spec §30.8): CancellationTokenSource.CreateLinked
+// / CreateLinkedAll — a linked cancellation source.  The returned child source
+// cancels when ANY parent token cancels, or via its own Cancel()/CancelAfter —
+// whichever first.  A parent already cancelled at creation cancels the child
+// synchronously before the call returns (bz_cancel_link's already-cancelled
+// fire).  CancellationToken.None parents (null handles) are ignored.
+//
+// Parents are CancellationToken HANDLES (== bz_cancel_state_t*), i.e. the parent
+// SOURCE's state cell; linking onto the token links onto that cell, so when the
+// parent source's Cancel()/Dispose() calls bz_cancel_state_signal it cascades
+// into this child.  The child retains each parent's state cell (bz_cancel_link),
+// so a parent source disposed while the child lives keeps its cell readable
+// (matching the existing token-outlives-source defensive stance).
+extern "C" void* bz_cts_create_linked(void* tokA, void* tokB) {
+    auto* src = (bz_cancel_source_t*)bz_cts_alloc();
+    bz_cancel_link(src->state, (bz_cancel_state_t*)tokA);
+    bz_cancel_link(src->state, (bz_cancel_state_t*)tokB);
+    return src;
+}
+
+extern "C" void* bz_cts_create_linked_all(void* arrp) {
+    auto* src = (bz_cancel_source_t*)bz_cts_alloc();
+    if (arrp) {
+        auto* arr = (bz_array_t*)arrp;
+        auto** elems = (bz_cancel_state_t**)arr->data;   // ptr-element array
+        for (int64_t i = 0; i < arr->count; ++i)
+            bz_cancel_link(src->state, elems ? elems[i] : nullptr);
+    }
+    return src;
 }
 
 extern "C" int32_t bz_ctoken_is_cancelled(void* token) {

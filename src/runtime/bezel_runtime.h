@@ -1199,6 +1199,23 @@ void bz_cts_cancel(void* src);
 // long as they need the token.
 void bz_cts_dispose(void* src);
 
+// v0.173 / #810 (stdlib §6.1 / spec §30.8): linked cancellation sources.
+// CreateLinked(a, b) returns a new CancellationTokenSource whose token cancels
+// when EITHER parent token (a or b) cancels, or via the child's own
+// Cancel/CancelAfter — whichever happens first (cancellation is idempotent).  A
+// parent already cancelled at creation cancels the child SYNCHRONOUSLY before the
+// call returns (the same policy as registering on an already-cancelled token).
+// CancellationToken.None parents (null handles) are ignored.  CreateLinkedAll
+// does the same over an Array<CancellationToken> (a bz_array_t* of ptr elements,
+// each a CancellationToken handle; null elements are ignored).  Both return the
+// child source (owned by the caller; disposed via bz_cts_dispose, which
+// unregisters from every parent BEFORE signalling — no parent cascade fires into
+// a disposed child).  Parents are token handles (== the parent source's state
+// cell), so linking onto a token links onto that source's cell.  Intra-domain
+// only (§30.8): no cross-domain machinery.
+void* bz_cts_create_linked(void* tokA, void* tokB);
+void* bz_cts_create_linked_all(void* parents);
+
 // #716: token-level retain / release.  A token handle (void* == bz_cancel_state_t*)
 // can be retained by async slow-paths (bz_task_delay_cancelable, mutex/semaphore
 // acquire_async) to extend the state cell's lifetime across the pool-worker

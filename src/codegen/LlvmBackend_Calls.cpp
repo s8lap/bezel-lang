@@ -6322,6 +6322,34 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
             return builder_.CreateCall(allocFn, {}, "cts.wca");
         }
+        // §30.8 / stdlib §6.1 (v0.173, #810): CreateLinked(a, b) — a linked child
+        // source cancelled when either parent token cancels (or via its own
+        // Cancel/CancelAfter, whichever first).  Each argument lowers to a
+        // CancellationToken handle (a ptr — the parent source's state cell, or a
+        // null ptr for CancellationToken.None).  The runtime links the child onto
+        // each non-null parent and fires synchronously for any already-cancelled
+        // parent.  The result is an owned CancellationTokenSource (disposed via
+        // bz_cts_dispose, which unregisters from all parents first).
+        if (m == "CreateLinked" && call.args.size() == 2) {
+            llvm::Value* a = call.args[0].value ? lowerExpr(*call.args[0].value)
+                                                : nullptr;
+            llvm::Value* b = call.args[1].value ? lowerExpr(*call.args[1].value)
+                                                : nullptr;
+            if (!a) a = llvm::ConstantPointerNull::get(ptrTy());
+            if (!b) b = llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_cts_create_linked", ptrTy(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(fn, {a, b}, "cts.linked");
+        }
+        // §30.8 / stdlib §6.1 (v0.173, #810): CreateLinkedAll(parents) — the same
+        // over an Array<CancellationToken>.  The argument lowers to a bz_array_t*
+        // whose ptr-sized elements are CancellationToken handles; the runtime
+        // links the child onto every non-null element.
+        if (m == "CreateLinkedAll" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* fn = declareC("bz_cts_create_linked_all", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {arr}, "cts.linkedall");
+        }
     }
 
     // §8.1 / issue #646: Stopwatch static factory.

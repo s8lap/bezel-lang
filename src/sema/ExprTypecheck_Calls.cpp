@@ -3919,6 +3919,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctsTy->declaration = builtinClassSym("CancellationTokenSource");
                             ctx_.setExprType(&ce, ctsTy);
                         }
+                        // §30.8 / stdlib §6.1 (v0.173, #810): CreateLinked(a, b) and
+                        // CreateLinkedAll(parents) are STATIC factories returning
+                        // owned CancellationTokenSource — the linked child source
+                        // (cancels when any parent token cancels, or via its own
+                        // Cancel/CancelAfter, whichever first).  Same TypeRef shape
+                        // as WithCancelAfter / `new CancellationTokenSource()` so all
+                        // downstream checks (owned classification, using-var
+                        // disposal via bz_cts_dispose, lowerTypeRef) agree.  The
+                        // CancellationToken / Array<CancellationToken> arguments are
+                        // already typed here (post-order); the result-type
+                        // assignment is all sema needs.
+                        if (m == "CreateLinked" || m == "CreateLinkedAll") {
+                            auto* ctsTy = ctx_.makeTypeRef();
+                            ctsTy->kind = TypeRef::Kind::Named;
+                            ctsTy->declaration = builtinClassSym("CancellationTokenSource");
+                            ctx_.setExprType(&ce, ctsTy);
+                        }
                     }
                     // §30.10 / stdlib §6.7: Task static helpers.
                     // Helper: build a bare `Task` TypeRef (astNode name="Task",
