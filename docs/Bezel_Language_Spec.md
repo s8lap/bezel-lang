@@ -7773,8 +7773,12 @@ IfaceIndexer    ::= "readonly"? "property" "[" ParamList "]" ":" Type
                                  implementation), enforced semantically. See §23.3. */
 IfaceEvent      ::= "async"? "event" Identifier (":" Type)? ";"
 
-FieldDecl       ::= Visibility "static"? "owned"? "readonly"?
+FieldDecl       ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
                     Identifier ":" Type (":=" Expression)? ";"
+                              /* "scoped" fields (§28.14, v0.175) hold storage-
+                                 bounded callbacks: function-typed only,
+                                 invocable/overwritable/clearable, never read
+                                 out as an escaping value. */
 ConstDecl       ::= Visibility "static"? "const" Identifier (":" Type)?
                     ":=" ConstExpr ";"
 
