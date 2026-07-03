@@ -9031,6 +9031,44 @@ struct StringEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // Call arguments (#1430): a bare read of the target passed in a PLAIN
+    // (no-modifier) parameter position of a resolved user/imported method is a
+    // CALL-BOUNDED read, not an escape (§28.3 borrow-for-the-call / §28.9).
+    // The callee is compiled under the same string refcount discipline, so
+    // every path by which it could extend the argument's lifetime mints its
+    // own +1: a field store retains (the #429 argpass cardinal canary), a
+    // return of the param mints (#429/#694 return logic), a closure capture
+    // retains (capture_retain_429), and an onward pass repeats this rule one
+    // level down. The caller's scope-end release therefore never strands the
+    // callee. Everything else — ref/out/owned positions, named args
+    // (positional mapping unknown), operators, extension methods
+    // (receiver-shifted param mapping), generic methods, unresolved/builtin
+    // callees (no compiled body to hold the discipline), non-identifier args —
+    // stays ESCAPED, leak-over-UAF as before. String-walker only: closure envs
+    // and boxed Objects have no equivalent callee-side retain discipline.
+    void walkCallArgs(const ast::Expr* callee,
+                      const std::vector<ast::CallArgument>& args) {
+        const sema::MethodSymbol* ms = nullptr;
+        if (callee) {
+            ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee));
+            if (ms && (ms->isOperator || ms->extensionDecl ||
+                       !ms->genericParams.empty() ||
+                       (ms->decl == nullptr && !ctx.isImported(ms))))
+                ms = nullptr;  // not a plain compiled method — no relaxation
+        }
+        for (size_t i = 0; i < args.size(); ++i) {
+            const ast::CallArgument& a = args[i];
+            bool safeArg = false;
+            if (ms && a.modifier.empty() && a.name.empty() &&
+                i < ms->params.size() && isTargetIdent(a.value.get())) {
+                auto* ps =
+                    dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+                if (ps && ps->modifier.empty()) safeArg = true;
+            }
+            expr(a.value.get(), safeArg);
+        }
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -9057,12 +9095,12 @@ struct StringEscapeWalker {
         // Call: the receiver (callee) is a read; every ARGUMENT escapes.
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             expr(c->callee.get(), /*safeRead=*/true);
-            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            walkCallArgs(c->callee.get(), c->args);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             expr(c->callee.get(), /*safeRead=*/true);
-            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            walkCallArgs(c->callee.get(), c->args);
             return;
         }
         // Indexing `s[i]`: receiver is a read; indices escape (defensive).

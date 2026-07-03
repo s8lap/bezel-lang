@@ -421,19 +421,76 @@ const char* kSliceDirectArgReleased =
 
 // ---- Programs: local string arg (NOT a +1 producer at call site) -----------
 //
-// §28.9 (CONTROL — no change): a LOCAL string `var s := "ab"+"cd"` owns +1.
-// When passed as an argument, `s` is an IDENTIFIER (not a +1 producer at the
-// call site). The fix must NOT release it (the local's own scope-end release
-// handles it — but since the escape walk marks s as escaped when passed to a
-// call, s's +1 is conservatively leaked; this is the pre-existing #422 behavior
-// unchanged by this increment). The test verifies CORRECTNESS (the value
-// round-trips) and NO DOUBLE-FREE (no UAF/DF under ASan with detect_leaks=0).
+// §28.9 / #1430: a LOCAL string `var s := "ab"+"cd"` owns +1. When passed as
+// an argument, `s` is an IDENTIFIER (not a +1 producer at the call site) — no
+// post-call release fires; the local's own scope-end release handles it. Until
+// #1430 the escape walk marked s as escaped when passed to ANY call and its +1
+// was conservatively leaked; the walk now treats a bare identifier in a plain
+// borrow position of a compiled user method as a call-bounded read, so the
+// scope-end release fires and the shape is LSan-CLEAN. Correctness (value
+// round-trips) and no-double-free are asserted by the same run.
 const char* kLocalStringArgNotAProducerControl =
     "module M; class C "
     "  public static method Consume(s: string): int return s.Length; end Consume; "
     "  public static method Main(): int "
     "    var s: string := \"ab\" + \"cd\"; "  // producer local — NOT a producer at call site
     "    return C.Consume(s); "               // passes the identifier, not the expression
+    "  end Main; "
+    "end C;";
+
+// ---- Programs (#1430): local passed to borrow-only callee, looped ----------
+//
+// The s4/xmod shape mono-module, looped: the +1 producer local is passed to a
+// borrow-only user method each iteration; post-#1430 each iteration's local is
+// released at its scope end → bounded memory, LSan-clean.
+const char* kLocalArgBorrowOnlyLooped =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      do var s := \"ab\" + \"cd\"; total := total + C.Consume(s); end; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 400000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs (#1430 CARDINAL): local arg to FIELD-STORE callee -------------
+//
+// The double-free guard for the walker relaxation: the callee STORES the
+// borrowed local into a field (field-store retains, rc→2); the caller's
+// scope-end release (new under #1430) drops rc→1 — the field's +1 survives and
+// the value is READ BACK AFTER the caller's release point would have run for
+// an inner scope. No UAF, no double-free; the holder's disposal releases the
+// field's +1.
+const char* kLocalArgFieldStoreNoDoubleFree1430 =
+    "module M; class Holder "
+    "  public Name: string; "
+    "  public constructor() this.Name := \"init\"; end constructor; "
+    "  public method Set(s: string) this.Name := s; end Set; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  using var h := new Holder(); "
+    "  do var s := \"ab\" + \"cd\"; h.Set(s); end; "  // s released at inner scope end
+    "  if h.Name.Length = 4 then return 0; end; "     // field's +1 still live
+    "  return 1; "
+    "end Main; end C;";
+
+// ---- Programs (#1430 guard): local used in a call INSIDE a lambda ----------
+//
+// The relaxation must NOT apply through a lambda: the env captures s and
+// outlives the scope, so s stays ESCAPED (retained conservatively, tolerated
+// leak) — asserting correctness and no UAF/DF when the closure runs after the
+// producing statement.
+const char* kLocalArgInsideLambdaStaysEscaped =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var s := \"ab\" + \"cd\"; "
+    "    var f := () => C.Consume(s); "   // env captures s
+    "    var n := f(); "
+    "    if n = 4 then return 0; end; return 1; "
     "  end Main; "
     "end C;";
 
@@ -523,8 +580,30 @@ BEZEL_TEST(codegen_argpass_string_429, slice_direct_arg_released_28_9) {
 // string (not an inline producer) is NOT a +1 producer at the call site, so
 // no post-call release is emitted. Correctness check + no double-free.
 BEZEL_TEST(codegen_argpass_string_429, local_string_arg_not_a_producer_control_28_9) {
-    // The local `s` is escaped (passed as arg), so the escape walk suppresses
-    // scope-end release — a pre-existing #422 safe leak, not this increment's
-    // concern. Verify correctness (Length=4) and no double-free under ASan.
-    expectValueAndNoCorruption(kLocalStringArgNotAProducerControl, 4);
+    // #1430: the walk now treats the bare-identifier borrow-pass as a
+    // call-bounded read, so s keeps its scope-end release → LSan-clean
+    // (upgraded from the pre-#1430 tolerated-leak assertion).
+    expectValueAndLeakFree(kLocalStringArgNotAProducerControl, 4);
+}
+
+// #1430: the s4/xmod shape mono-module, looped — the producer local passed to
+// a borrow-only user method is released at its scope end each iteration.
+BEZEL_TEST(codegen_argpass_string_429, local_arg_borrow_only_looped_leak_free_1430) {
+    expectValueAndLeakFree(kLocalArgBorrowOnlyLooped, 0);
+}
+
+// #1430 (CARDINAL double-free guard for the walker relaxation): the callee
+// field-stores the borrowed local (retain, rc→2); the caller's scope-end
+// release drops rc→1; the field read-back proves the +1 survives. detect_leaks
+// off — the holder's field release at disposal is object-bookkeeping the
+// harness tolerates, the assertion here is NO UAF/DF + correct value.
+BEZEL_TEST(codegen_argpass_string_429, local_arg_field_store_no_double_free_1430) {
+    expectValueAndNoCorruption(kLocalArgFieldStoreNoDoubleFree1430, 0);
+}
+
+// #1430 (negative guard): a call-argument use INSIDE a lambda body must stay
+// ESCAPED (the env outlives the scope); correctness + no UAF when the closure
+// runs later. The conservative retained +1 may leak — tolerated by design.
+BEZEL_TEST(codegen_argpass_string_429, local_arg_inside_lambda_stays_escaped_1430) {
+    expectValueAndNoCorruption(kLocalArgInsideLambdaStaysEscaped, 0);
 }
