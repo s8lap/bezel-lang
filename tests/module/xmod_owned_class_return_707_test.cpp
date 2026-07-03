@@ -68,16 +68,6 @@ void writeSource707(const std::string& path, const std::string& src) {
     out << src;
 }
 
-// Returns the path to src/runtime/bezel_runtime.cpp.
-static std::string runtimeSrcPath707() {
-    namespace fs = std::filesystem;
-    fs::path here(__FILE__);          // tests/module/xmod_owned_class_return_707_test.cpp
-    fs::path root = here.parent_path() // tests/module/
-                        .parent_path() // tests/
-                        .parent_path(); // repo root
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 // Compile lane-local ASan runtime once, cache path.  Per HARD RULES, NEVER the
 // shared memoised .o; always /tmp/wt-707/rt_asan.o.
 static const std::string& laneLocalAsanRt707() {

@@ -55,13 +55,6 @@ void writeSource783(const std::string& path, const std::string& src) {
     out << src;
 }
 
-static std::string runtimeSrcPath783() {
-    namespace fs = std::filesystem;
-    fs::path here(__FILE__);
-    fs::path root = here.parent_path().parent_path().parent_path();
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 static const std::string& laneLocalAsanRt783() {
     static std::string cached;
     static bool attempted = false;
