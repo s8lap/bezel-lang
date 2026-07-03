@@ -2499,6 +2499,44 @@ void ExprTC::checkCasePatternConstantRanges(
             for (const auto& c : cp->constants)
                 rejectNonConstantPatternExpr(c.get());
     }
+    // §19.3 (#1399): a Range<T> scrutinee is a struct value, not a scalar. A
+    // RangePattern, RelOpPattern, or non-null ConstantPattern matched against a
+    // Range scrutinee would reach codegen's ICmp/FCmp with mismatched operand
+    // types and abort the backend (SIGABRT in ICmpInst::AssertOK). Reject here
+    // with a clean type-mismatch diagnostic. `_`, `var x`, and type-test
+    // patterns remain valid and unaffected. per §19.3 (#1399)
+    if (scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+            scrutTy->declaration == builtinClassSym("Range")) {
+        for (const auto& arm : arms) {
+            const ast::Pattern* p = arm.pattern.get();
+            if (!p) continue;
+            if (dynamic_cast<const ast::RangePattern*>(p) ||
+                    dynamic_cast<const ast::RelOpPattern*>(p)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, p->span.begin,
+                    "range or relational pattern is not compatible with a "
+                    "Range-typed scrutinee \xe2\x80\x94 a Range value is a "
+                    "struct, not a scalar; use `_` or `var x` to match "
+                    "(\xc2\xa7""19.3)");
+            } else if (auto* cp =
+                           dynamic_cast<const ast::ConstantPattern*>(p)) {
+                for (const auto& c : cp->constants) {
+                    if (!c) continue;
+                    // null is the nullable-scrutinee arm and is handled by
+                    // the nullable-unwrap path; only non-null constants would
+                    // reach ICmp and crash the backend.
+                    if (!dynamic_cast<const ast::NullLiteralExpr*>(c.get()))
+                        ctx_.diagnostics().report(
+                            Severity::Error, c->span.begin,
+                            "constant pattern is not compatible with a "
+                            "Range-typed scrutinee \xe2\x80\x94 a Range value "
+                            "is a struct, not a scalar; use `_` or `var x` "
+                            "to match (\xc2\xa7""19.3)");
+                }
+            }
+        }
+        return;
+    }
     if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive) return;
     long long lo = 0, hi = 0;
     if (!caseIntScrutineeRange(scrutTy->primitive, lo, hi)) return;

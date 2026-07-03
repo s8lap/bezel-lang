@@ -612,3 +612,153 @@ BEZEL_TEST(sema_case_pattern_range, case_const_float_over_decimal_ok_1213) {
     BEZEL_EXPECT_FALSE(hasCasePatternOperandError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// --- §19.3 (#1399): Range-typed scrutinee vs scalar patterns -----------------
+//
+// A `case` over a Range<T> scrutinee that uses a RangePattern, RelOpPattern,
+// or numeric ConstantPattern crashes the LLVM backend (ICmpInst::AssertOK
+// assertion) because codegen emits ICmp between the Range struct and an
+// integer bound with mismatched LLVM operand types. Sema must reject these
+// combinations before codegen is reached. `_`, `var x`, and type-test patterns
+// remain valid for a Range scrutinee.
+
+namespace {
+// True iff some error diagnostic mentions the §19.3 Range-scrutinee
+// incompatibility introduced by #1399.
+bool hasCaseRangeScrutineeError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("Range-typed scrutinee") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+} // namespace
+
+// §19.3 (#1399): the issue's exact repro — `case (lo..hi) of 1..3 => ...`.
+// The scrutinee `(lo..hi)` has type Range; the pattern `1..3` is an integer
+// range pattern. Was a compiler SIGABRT; must now produce a clean sema error.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_range_pattern_rejected_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var lo := 1; "
+        "    var hi := 3; "
+        "    var r := case (lo..hi) of "
+        "      1..3 => \"x\", "
+        "      _ => \"other\", "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): relational pattern `> 1` against a Range scrutinee — also a
+// struct-vs-scalar ICmp mismatch; must be rejected with the same diagnostic.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_relop_pattern_rejected_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := 1..10; "
+        "    return case r of > 1 => 0, _ => 1 end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): integer constant pattern `42` against a Range scrutinee —
+// a Range struct cannot be compared to a scalar constant; must reject.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_int_const_pattern_rejected_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := 1..10; "
+        "    return case r of 42 => 0, _ => 1 end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): char constant pattern against a Range scrutinee is also
+// rejected — char is a scalar and Range is a struct.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_char_const_pattern_rejected_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := 1..10; "
+        "    return case r of 'a' => 0, _ => 1 end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): float constant pattern against a Range scrutinee is also
+// rejected — double is a scalar, Range is a struct.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_double_const_pattern_rejected_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := 1..10; "
+        "    return case r of 3.14 => 0, _ => 1 end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): a `_` (wildcard) pattern over a Range scrutinee is valid —
+// wildcard matches any value without comparing. Pin that it is NOT rejected.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_wildcard_ok_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var lo := 1; "
+        "    var hi := 3; "
+        "    return case (lo..hi) of _ => 0 end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): `var x` (unconstrained binding) over a Range scrutinee is
+// valid — binds the whole Range value; must not be rejected. Pin it.
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_var_binding_ok_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := 1..10; "
+        "    return case r of var x => 0 end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.3 (#1399): statement-position `case` over a Range scrutinee with a
+// range pattern is also rejected — CaseStmt and CaseExpr share the same sema
+// gate (checkCasePatternConstantRanges).
+BEZEL_TEST(sema_case_pattern_range,
+           range_scrutinee_range_pattern_stmt_rejected_spec_19_3_1399) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main() "
+        "    var r := 1..10; "
+        "    case r of 1..5 => do return; end, _ => do return; end end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasCaseRangeScrutineeError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
