@@ -395,15 +395,9 @@ bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
     // per §4.6/§4.7: LinkedList/OwningLinkedList are NOT array-backed — they
-    // use bz_llist_t. Exclude them here so they route through their own
-    // tryLowerLinkedListInstanceCall handler rather than the bz_array_* paths.
-    return n == "Array" || n == "OwningArray" ||
-           // §4.14: OwningBuffer<T> is backed by bz_array_t* (same as Array<T>);
-           // indexer get/set and .Count go through the same bz_array_* runtime.
-           n == "OwningBuffer" ||
-           n == "Stack" || n == "OwningStack" ||
-           n == "Queue" || n == "OwningQueue" ||
-           n == "Set" || n == "OwningSet";
+    // use bz_llist_t; §4.14 OwningBuffer<T> IS bz_array_t-backed. The name set
+    // lives in the #1414 stage-3 registry (one home, snapshot-pinned).
+    return common::isArrayBackedCollectionName(n);
 }
 
 // per §4.6 / §4.7: true for LinkedList<T> and OwningLinkedList<T> (bz_llist_t-backed).
@@ -412,7 +406,7 @@ bool Emitter::isLinkedListTypeName(const sema::TypeRef* rt) {
         return false;
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
-    return n == "LinkedList" || n == "OwningLinkedList";
+    return common::isLinkedListName(n);  // #1414 stage 3 registry
 }
 
 
@@ -421,9 +415,9 @@ bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
         return false;
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
-    // stdlib §4.17 (#1354): SortedDictionary also has a K-indexed get/set
-    // property and shares the bz_dict_t* runtime representation.
-    return n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary";
+    // stdlib §4.17 (#1354): SortedDictionary shares the bz_dict_t* rep. The name
+    // set lives in the #1414 stage-3 registry (one home, snapshot-pinned).
+    return common::isDictionaryName(n);
 }
 
 
@@ -2992,7 +2986,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                                      : nullptr;
         bool arrIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                            !recvTy->astNode->name->parts.empty() &&
-                           (recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0);
+                           (common::isOwningPrefixedName(recvTy->astNode->name->parts[0]));
         const ElementPolicy arrElemPol =
             elementPolicyFor(arrElemRef, arrIsOwning);
         // Convenience predicates derived from the policy (replacing the old
@@ -3929,7 +3923,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // keep dictValueBoxFreer calls unchanged (batch 3 / #602 follow-on).
         bool dictValIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                                !recvTy->astNode->name->parts.empty() &&
-                               (recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0);
+                               (common::isOwningPrefixedName(recvTy->astNode->name->parts[0]));
         const ElementPolicy dictValPol =
             elementPolicyFor(valTy, dictValIsOwning);
         // Convenience predicate: is this a borrowing Dictionary<K, string>?
@@ -12247,7 +12241,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool llIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0].rfind("Owning",0) == 0;
+                                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
                             llvm::Function* elemDisp =
                                 elementPolicyFor(llElem, llIsOwning).disposerThunk;
                             llvm::Value* disp = elemDisp
@@ -12273,7 +12267,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool arrIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0].rfind("Owning",0) == 0;
+                                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
                             llvm::Function* elemDisp =
                                 elementPolicyFor(arrElem, arrIsOwning).disposerThunk;
                             llvm::Value* disp = elemDisp

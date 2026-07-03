@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "sema/SemaContext.hpp"
@@ -2307,13 +2308,8 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
 // §5.11). The set mirrors the `producerState` owned-returning-call fallback so
 // the two stay aligned. // per §28.3, §5.11
 bool MethodOwnership::isOwningTypeNameHead(std::string_view head) {
-    return head == "Shared"          || head == "Weak"            ||
-           head == "ChannelSender"    || head == "OwningTask"       ||
-           head == "OwningArray"       || head == "OwningDictionary" ||
-           head == "OwningSet"         || head == "OwningStack"      ||
-           head == "OwningQueue"       || head == "OwningLinkedList" ||
-           head == "IOwningEnumerable"  ||
-           head == "CancellationTokenSource";
+    // #1414 stage 3: the head set lives in the builtin registry (one home).
+    return common::isOwningTypeHead(head);
 }
 
 // §28.6 / §5.11 (#1008 Part C): the owning *collections* — the borrow-return and
@@ -2323,9 +2319,8 @@ bool MethodOwnership::isOwningTypeNameHead(std::string_view head) {
 // stays an owned producer (a borrow through it is the #1007 double-free hazard,
 // still rejected), and the read-only capability restriction does not apply.
 bool MethodOwnership::isOwningCollectionNameHead(std::string_view head) {
-    return head == "OwningArray"  || head == "OwningDictionary" ||
-           head == "OwningSet"    || head == "OwningStack"      ||
-           head == "OwningQueue"  || head == "OwningLinkedList";
+    // #1414 stage 3: the head set lives in the builtin registry (one home).
+    return common::isOwningCollectionHead(head);
 }
 
 // §28.3 / §28.6 / §5.11 (#1007): a method declared `: OwningArray<T>` (or any

@@ -527,7 +527,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
             bool arrIsOwning =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
             if (!elementPolicyFor(arrEl, arrIsOwning).disposerThunk) return nullptr;
         }
         llvm::Value* recv = lowerExpr(*ix.target);
@@ -828,7 +828,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool arrIsOwning =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
             ElementPolicy arrPol = elementPolicyFor(arrEl, arrIsOwning);
             bool isStrElemArr =
                 !arrIsOwning &&
@@ -871,7 +871,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool arrIsOwning2 =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
             llvm::Function* elemDisp =
                 elementPolicyFor(arrEl, arrIsOwning2).disposerThunk;
             if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
@@ -1914,7 +1914,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         bool ixIsOwning =
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+            common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
         llvm::Function* elemDisp =
             elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
         if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
@@ -2017,7 +2017,7 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
         bool ixIsOwning =
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+            common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
         llvm::Function* elemDisp = elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
         if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
         if (elemDisp) {

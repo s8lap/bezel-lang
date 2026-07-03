@@ -514,115 +514,16 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
                 auto n = rt->astNode->name->parts[0];
-                if (n == "Array" || n == "OwningArray" ||
-                    // §4.14: OwningBuffer<T> is heap-allocated (bz_array_t*);
-                    // without this it fell through to i32 default → IR mismatch.
-                    n == "OwningBuffer" ||
-                    n == "Dictionary" || n == "OwningDictionary" ||
-                    // stdlib §4.17 (#1354, #1406): SortedDictionary<K,V> shares
-                    // the bz_dict_t* runtime representation. Without this entry
-                    // lowerTypeRef fell through to i32, so a SortedDictionary
-                    // variable slot was alloca i32 and bz_dict_try_get_* received
-                    // a truncated receiver — malformed IR.
-                    n == "SortedDictionary" ||
-                    n == "Stack" || n == "OwningStack" ||
-                    n == "Queue" || n == "OwningQueue" ||
-                    n == "Set" || n == "OwningSet" ||
-                    n == "LinkedList" || n == "OwningLinkedList" ||
-                    // §4.6: a LinkedListNode<T> variable holds a pointer to the
-                    // bz_llist_node_t; it is the node handle / borrow from the list.
-                    n == "LinkedListNode" ||
-                    n == "StringBuilder" || n == "Random" ||
-                    // §29: iteration interfaces are heap-allocated objects.
-                    n == "IEnumerable" || n == "IEnumerator" ||
-                    n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
-                    n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
-                    n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
-                    n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
-                    n == "ICollection" || n == "IList" ||
-                    n == "IOwningCollection" || n == "IOwningList" ||
-                    // §30: Task types are also heap-allocated.
-                    n == "Task" || n == "OwningTask" ||
-                    // per §2.11 / §24.4: a Subscription is a runtime-managed
-                    // opaque handle (bz_subscription_t*), returned by
-                    // `<event>.Subscribe(...)` / CancellationToken.Register and
-                    // disposed via bz_subscription_dispose. Without this it fell
-                    // through to the i32 default, truncating the pointer when a
-                    // Subscription was a method return / parameter / field — so
-                    // its later `.Dispose()` saw a non-pointer and was skipped.
-                    n == "Subscription" ||
-                    // §6.1 / §30.8: CancellationToken is a builtin record whose
-                    // value representation is a single borrow-pointer to the
-                    // cancellation state cell (bz_cancel_state_t*).  It lowers
-                    // to a pointer word (ptr) rather than an i32 so the borrowed
-                    // state pointer is stored at full width.
-                    // CancellationTokenSource is an owned class type — also a ptr.
-                    n == "CancellationToken" ||
-                    n == "CancellationTokenSource" ||
-                    // stdlib §6.10 (v0.175, #808): TaskScope is a compiler-known
-                    // heap-pointer builtin (bz_task_scope_t*).
-                    n == "TaskScope" ||
-                    // §28.13 / stdlib §2.16 (#620): Shared<T> and Weak<T> are
-                    // compiler-known heap-pointer types (no user TypeDecl).
-                    // Without these entries lowerTypeRef fell through to the i32
-                    // default → bz_shared_get/bz_weak_release called with i32
-                    // instead of ptr (IR verification failure); Shared<T>? fell
-                    // into the bare type-param nullable branch (returns {i8,i32}
-                    // instead of ptr) → checkGEPType LLVM-assert crash.
-                    n == "Shared" || n == "Weak" ||
-                    // §30.14/§30.15 (#600 phase c): Channel<T> and ChannelSender<T>
-                    // are compiler-known heap-pointer builtins (bz_channel_t* and
-                    // bz_channel_sender_t* respectively). Both lower to ptrTy().
-                    n == "Channel" || n == "ChannelSender" ||
-                    // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known
-                    // pointer (bz_grouping_t*) produced by GroupBy(...).ToArray().
-                    n == "IGrouping" ||
-                    // §24.3 (#747): IEvent<T>/IAsyncEvent<T> value = the bare
-                    // bz_event_source_t* (a borrow of the declaring instance).
-                    n == "IEvent" || n == "IAsyncEvent" ||
-                    // §6.2 / #647: Mutex (bz_mutex_t*) and Lock (bz_lock_t*) are
-                    // compiler-known heap-pointer builtins. Without these entries
-                    // lowerTypeRef fell through to the i32 default →
-                    // `await mutex.AcquireAsync()` returned type Lock was lowered
-                    // to i32, making CreateLoad(i32, resPtr) load 4 bytes from an
-                    // 8-byte result buffer; the loaded i32 was then used as a
-                    // pointer by using-var disposal → segfault / IR mismatch.
-                    n == "Mutex" || n == "Lock" ||
-                    // §6.3 / #647: Semaphore (bz_semaphore_t*) and SemaphoreToken
-                    // (bz_semaphore_token_t*) — same fix applied proactively.
-                    n == "Semaphore" || n == "SemaphoreToken" ||
-                    // §6.6 / issue #974: TaskCompletionSource<T> /
-                    // OwningTaskCompletionSource<T> / TaskCompletionSource are
-                    // opaque heap-pointer builtins (bz_tcs_t*). Without this
-                    // entry lowerTypeRef would fall through to the i32 default.
-                    n == "TaskCompletionSource" || n == "OwningTaskCompletionSource" ||
-                    // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
-                    // heap-pointer builtins (bz_atomic_t*).  Same ptrTy treatment as
-                    // Mutex/Semaphore so lowerTypeRef returns ptrTy() not i32.
-                    n == "Atomic" || n == "AtomicInteger" ||
-                    // issue #545: Buffer<T> is a compiler-known heap-pointer builtin
-                    // (bz_buffer_hdr_t* with inline payload).  Without this entry
-                    // lowerTypeRef would fall through to the i32 default → GEP /
-                    // load type mismatches at every Buffer<T> use site.
-                    n == "Buffer" ||
-                    // fix #1390 / §2.14–2.15 (#550): the serialization vocabulary
-                    // interfaces and the concrete opaque serializer/deserializer
-                    // classes are heap-pointer reference types (an ISerializer is
-                    // a bz_binser_t*; an IDeserializer a bz_binder_t*).  They have
-                    // no user TypeDecl (null declaration), so without these entries
-                    // an `s: ISerializer` parameter / `BinarySerializer` local /
-                    // field / return fell through to the i32 default: the opaque
-                    // serializer pointer was ABI-coerced to the low 32 bits at the
-                    // call boundary and zero-extended back to a pointer inside the
-                    // callee, yielding a 0x00000000_xxxxxxxx receiver.  At low heap
-                    // addresses the truncation is lossless (the regular suite
-                    // passes); under ASan's high address space the high 32 bits are
-                    // lost, so bz_binser_begin_object dereferenced a wild pointer
-                    // and SEGV'd (the #1390 crash).  Lower them to ptr.
-                    n == "ISerializer"      || n == "IDeserializer"     ||
-                    n == "ISerializable"    || n == "IDeserializable"   ||
-                    n == "BinarySerializer" || n == "BinaryDeserializer" ||
-                    n == "JsonSerializer"   || n == "JsonDeserializer") {
+                // #1414 stage 3: the shared heap-pointer reference-builtin name
+                // set now lives in the registry (one home, snapshot-pinned).
+                // This is the miss-a-list class behind #1390 (serializer pointer
+                // truncation) and #1406 (SortedDictionary i32). §4.14
+                // OwningBuffer<T> (bz_array_t*) is an astNode-path-only addition
+                // — the FFI class names on the imported path have no local
+                // astNode counterpart (they are handled by the i64/ptr branch
+                // above) — so it stays an explicit delta here.
+                if (common::isHeapPointerReferenceBuiltin(n) ||
+                    n == "OwningBuffer") {
                     return ptrTy();
                 }
             }
@@ -664,61 +565,16 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "ReadOnlyStringSpan")
                     return arraySpanStructType();
                 // Heap-pointer types — all stdlib collection/interface/task names.
-                if (n == "Array"       || n == "OwningArray"     ||
-                    n == "Dictionary"  || n == "OwningDictionary" ||
-                    // stdlib §4.17 (#1354, #1406): imported SortedDictionary.
-                    n == "SortedDictionary" ||
-                    n == "Stack"       || n == "OwningStack"      ||
-                    n == "Queue"       || n == "OwningQueue"      ||
-                    n == "Set"         || n == "OwningSet"        ||
-                    n == "LinkedList"  || n == "OwningLinkedList" ||
-                    n == "LinkedListNode"                        ||
-                    n == "StringBuilder" || n == "Random"       ||
-                    n == "IEnumerable"   || n == "IEnumerator"  ||
-                    n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
-                    n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
-                    n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator" ||
-                    n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
-                    n == "ICollection" || n == "IList"           ||
-                    n == "IOwningCollection" || n == "IOwningList" ||
-                    n == "Task"        || n == "OwningTask"       ||
-                    n == "Subscription"|| n == "IntPtr"          ||
-                    n == "UIntPtr"     || n == "CString"         ||
-                    n == "WString"     || n == "RawBytes"        ||
-                    n == "CancellationToken" ||
-                    n == "CancellationTokenSource" ||
-                    // stdlib §6.10 (v0.175, #808): imported TaskScope.
-                    n == "TaskScope" ||
-                    // §28.13 / stdlib §2.16 (#620): imported Shared<T>/Weak<T>
-                    // (type name carried in importedName — same fix as the
-                    // astNode path above).
-                    n == "Shared" || n == "Weak" ||
-                    // §30.14/§30.15 (#600 phase c): imported Channel<T>/ChannelSender<T>.
-                    n == "Channel" || n == "ChannelSender" ||
-                    // stdlib §5 (#651): imported IGrouping<TKey, T>.
-                    n == "IGrouping" ||
-                    // §24.3 (#747): an IEvent<T>/IAsyncEvent<T> value is the
-                    // bare bz_event_source_t* (a borrow of the declaring
-                    // instance's backing source).
-                    n == "IEvent" || n == "IAsyncEvent" ||
-                    // §6.2 / #647: imported Mutex (bz_mutex_t*) and Lock (bz_lock_t*).
-                    n == "Mutex" || n == "Lock" ||
-                    // §6.3 / #647: imported Semaphore / SemaphoreToken.
-                    n == "Semaphore" || n == "SemaphoreToken" ||
-                    // §6.6 / issue #974: imported TCS types.
-                    n == "TaskCompletionSource" || n == "OwningTaskCompletionSource" ||
-                    // §6.4 / #647: imported Atomic<T> and AtomicInteger<T>.
-                    n == "Atomic" || n == "AtomicInteger" ||
-                    // issue #545: imported Buffer<T> (bz_buffer_hdr_t*).
-                    n == "Buffer" ||
-                    // fix #1390 / §2.14–2.15 (#550): imported serialization
-                    // vocabulary interfaces and concrete serializer/deserializer
-                    // classes — heap-pointer reference types (see the astNode path
-                    // above for why the i32 fallback truncated the opaque pointer).
-                    n == "ISerializer"      || n == "IDeserializer"     ||
-                    n == "ISerializable"    || n == "IDeserializable"   ||
-                    n == "BinarySerializer" || n == "BinaryDeserializer" ||
-                    n == "JsonSerializer"   || n == "JsonDeserializer") {
+                // #1414 stage 3: the shared set lives in the registry (one home,
+                // snapshot-pinned). The FFI class names are an imported-path-only
+                // delta (their astNode counterparts lower to i64/ptr in the
+                // FFI branch above, which imported types never reach), so they
+                // stay explicit here. (This path has no OwningBuffer entry —
+                // preserved: it was never in the imported list.)
+                if (common::isHeapPointerReferenceBuiltin(n) ||
+                    // §32.5 / stdlib §10: imported FFI-boundary reference types.
+                    n == "IntPtr"  || n == "UIntPtr" || n == "CString" ||
+                    n == "WString" || n == "RawBytes") {
                     return ptrTy();
                 }
             }

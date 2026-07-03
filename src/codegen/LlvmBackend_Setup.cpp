@@ -2569,7 +2569,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             bool collIsOwning =
                 it->collTy->astNode && it->collTy->astNode->name &&
                 !it->collTy->astNode->name->parts.empty() &&
-                it->collTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+                common::isOwningPrefixedName(it->collTy->astNode->name->parts[0]);
             ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
             llvm::Function* elemDisp = fieldCollPol.disposerThunk;
             if (!elemDisp && !isDict &&
@@ -7479,7 +7479,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             bool llIsOwning =
                 llTy->astNode && llTy->astNode->name &&
                 !llTy->astNode->name->parts.empty() &&
-                llTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+                common::isOwningPrefixedName(llTy->astNode->name->parts[0]);
             d.collectionElemDisposer =
                 elementPolicyFor(llEl, llIsOwning).disposerThunk;
         }
@@ -7509,7 +7509,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             bool collIsOwning =
                 collTy->astNode && collTy->astNode->name &&
                 !collTy->astNode->name->parts.empty() &&
-                collTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+                common::isOwningPrefixedName(collTy->astNode->name->parts[0]);
             bool isSetName =
                 collTy->astNode && collTy->astNode->name &&
                 !collTy->astNode->name->parts.empty() &&
@@ -9660,7 +9660,7 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     bool collIsOwning =
         collTy && collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        collTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+        common::isOwningPrefixedName(collTy->astNode->name->parts[0]);
 
     ElementPolicy pol = elementPolicyFor(collElem, collIsOwning);
     llvm::Function* elemDisp = pol.disposerThunk;
@@ -12127,7 +12127,7 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     {
         auto* clitSavedInsert = builder_.GetInsertBlock();
         llvm::BasicBlock* clitEnclosing = unwindBB();
-        bool clitOwnsElems = name.rfind("Owning", 0) == 0;
+        bool clitOwnsElems = common::isOwningPrefixedName(name);
         auto* clitCleanup =
             llvm::BasicBlock::Create(llvm_, "clit.elem.cleanup", currentFn_);
         builder_.SetInsertPoint(clitCleanup);
@@ -12360,7 +12360,7 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     bool isOwning =
         collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        collTy->astNode->name->parts[0].rfind("Owning", 0) == 0;
+        common::isOwningPrefixedName(collTy->astNode->name->parts[0]);
     auto isStrElem = [&](const sema::TypeRef* el, bool owning) {
         if (!el || el->nullable) return false;
         ElementPolicy p = elementPolicyFor(el, owning);

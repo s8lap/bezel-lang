@@ -26,6 +26,7 @@
 
 #include "ast/Node.hpp"
 #include "codegen/LlvmBackend.hpp"
+#include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
@@ -4051,7 +4052,7 @@ private:
             collTy->astNode->name->parts.empty())
             return false;
         // Owning families (name prefixed "Owning") dispose their elements.
-        if (collTy->astNode->name->parts[0].rfind("Owning", 0) != 0) return false;
+        if (!common::isOwningPrefixedName(collTy->astNode->name->parts[0])) return false;
         // OwningDictionary owns its V value (genericArgs[1]); the ordered/set
         // families own their single element (genericArgs[0]).
         bool isDict = isDictTypeName(collTy);
