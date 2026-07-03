@@ -2848,7 +2848,7 @@ public record CancellationToken
   public static readonly property None: CancellationToken;
   public readonly property IsCancellationRequested: bool;
   public method ThrowIfCancellationRequested();
-  public method Register(callback: () -> ()): owned Subscription;
+  public method Register(scoped callback: () -> ()): owned Subscription;
 end CancellationToken;
 
 public class CancellationTokenSource
@@ -2878,7 +2878,7 @@ end CancellationTokenSource;
 
 **Timeout-as-a-scope needs no new type.** The RFC's `CancellationScope` sketch is already expressible: the source's destructor *cancels on dispose*, so `using var cts := CancellationTokenSource.WithCancelAfter(delay);` **is** a cancellation scope — auto-cancelled at scope exit or on timeout, whichever first. Recorded as the idiom rather than a wrapper type (see the v0.173 rationale entry).
 
-`Register` invokes the callback when cancellation is requested; the returned `Subscription` removes the registration when disposed.
+`Register` invokes the callback when cancellation is requested; the returned `Subscription` removes the registration when disposed. The `callback` parameter is `scoped` (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)): the registration stores the callback bounded by the returned `Subscription` (the owned-return bounding form — `using var reg := token.Register(...)`), and disposal severs the registration, which is the quiescence guarantee. (Erratum within v0.177, #1431: the marker was implemented with the #1420 enforcement but this signature had been left unmarked; the event `Subscribe` signatures in [§6.5](#sec-events-ievent-eventsource) carried it since v0.175.)
 
 If the token is **already in the cancelled state** at the moment `Register` is called, the callback is invoked synchronously on the calling thread before `Register` returns, and the returned `Subscription` is one whose `Dispose()` is a no-op (the registration was never installed because there was nothing to install — cancellation has already happened). Code receiving the `Subscription` should not assume the callback has not yet run.
 
