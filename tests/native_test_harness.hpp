@@ -20,10 +20,14 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <string>
+#include <sys/file.h>
 #include <system_error>
+#include <unistd.h>
 #include <vector>
 
 namespace bezel::native_test {
@@ -59,11 +63,19 @@ inline std::vector<std::string> runtimeSourceFiles() {
 // runtimeSourceFiles() / asanRuntimeObject() / buildRuntimeSanitizerObject().
 inline std::string runtimeSourcePath() { return runtimeSourceDir().string(); }
 
-// Build (once per sanitizer) a single relocatable object that contains every
-// runtime TU compiled under -fsanitize=<san>, `ld -r`-combined. Returns the
-// cached master object path, or "" if the toolchain is unavailable or any step
-// fails (callers then SKIP). Memoized in a function-local static map so the
-// heavy N-source compile happens at most once per sanitizer per process.
+// Build (once per sanitizer per SOURCE TREE, shared across processes) a single
+// relocatable object that contains every runtime TU compiled under
+// -fsanitize=<san>, `ld -r`-combined. Returns the cached master object path,
+// or "" if the toolchain is unavailable or any step fails (callers then SKIP).
+//
+// The master lives under /var/tmp/bezel-scratch (DISK-backed — never
+// fs::temp_directory_path(): per-shard TMPDIRs are tmpfs, and 16 shards each
+// rebuilding ~100MB of ASan objects into RAM both thrashes the box and costs
+// minutes per shard), keyed by a hash of the source dir so parallel worktrees
+// get distinct masters. Cross-process safety + dedup via flock on a sibling
+// lock file: the first process builds, the rest wait then reuse. Freshness is
+// mtime-based against every file in src/runtime (sources AND headers), so an
+// edited runtime invalidates the shared master without a manual clean.
 inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
     static std::map<std::string, std::string> cache;
     auto it = cache.find(san);
@@ -75,22 +87,59 @@ inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
     std::vector<std::string> srcs = runtimeSourceFiles();
     if (srcs.empty()) return out;
 
-    fs::path dir = fs::temp_directory_path();
-    const std::string inc = "-I" + runtimeSourceDir().string();
+    std::error_code ec;
+    const fs::path srcDir = runtimeSourceDir();
+    fs::path dir = fs::path("/var/tmp/bezel-scratch/rt-objs") /
+                   std::to_string(std::hash<std::string>{}(srcDir.string()));
+    fs::create_directories(dir, ec);
+    if (ec) return out;
+
+    const std::string combined =
+        (dir / ("bezel_rt_" + san + "_combined.o")).string();
+
+    // Newest mtime across src/runtime (TUs + bezel_runtime*.h/.hpp).
+    fs::file_time_type newestSrc = fs::file_time_type::min();
+    for (const auto& e : fs::directory_iterator(srcDir, ec)) {
+        auto t = fs::last_write_time(e.path(), ec);
+        if (!ec && t > newestSrc) newestSrc = t;
+    }
+    auto isFresh = [&]() {
+        std::error_code fec;
+        auto t = fs::last_write_time(combined, fec);
+        return !fec && t >= newestSrc;
+    };
+
+    int lockFd = ::open((dir / ("build_" + san + ".lock")).c_str(),
+                        O_CREAT | O_RDWR, 0666);
+    if (lockFd < 0) return out;
+    ::flock(lockFd, LOCK_EX);  // serialize check+build across processes
+    if (isFresh()) {
+        ::flock(lockFd, LOCK_UN); ::close(lockFd);
+        out = combined;
+        return out;
+    }
+    const std::string inc = "-I" + srcDir.string();
     std::string objs;
+    bool ok = true;
     for (const std::string& s : srcs) {
         std::string stem = fs::path(s).stem().string();
         std::string obj = (dir / ("bezel_rt_" + san + "_" + stem + ".o")).string();
         std::string cmd = "clang++ -std=c++20 -g -fsanitize=" + san +
                           " -pthread " + inc + " -c " + s + " -o " + obj +
                           " > /dev/null 2>&1";
-        if (std::system(cmd.c_str()) != 0) return out;  // out stays "" → SKIP
+        if (std::system(cmd.c_str()) != 0) { ok = false; break; }
         objs += " " + obj;
     }
-    std::string combined = (dir / ("bezel_rt_" + san + "_combined.o")).string();
-    std::string ld = "ld -r -o " + combined + objs + " > /dev/null 2>&1";
-    if (std::system(ld.c_str()) != 0) return out;
-    out = combined;
+    if (ok) {
+        // ld -r to a temp name + rename: a waiter that sees `combined` sees a
+        // complete object, never a partial write.
+        std::string tmp = combined + ".tmp";
+        std::string ld = "ld -r -o " + tmp + objs + " > /dev/null 2>&1";
+        ok = std::system(ld.c_str()) == 0;
+        if (ok) { fs::rename(tmp, combined, ec); ok = !ec; }
+    }
+    ::flock(lockFd, LOCK_UN); ::close(lockFd);
+    if (ok) out = combined;
     return out;
 }
 
