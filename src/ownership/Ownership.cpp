@@ -85,6 +85,25 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // the transfer functions enforce it. // per §28.14, stdlib §6.10
     if (paramSyms)
         for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
+    // §28.14 v0.177 (#1419): classify this method's PLAIN function-typed
+    // parameters as call-bounded, then run the callee-side sink pre-pass.
+    // It runs BEFORE scopedPreScan so the carrier-alias map is complete when
+    // the §28.14 admission consults it for the forward-to-scoped shapes.
+    if (paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || !ps->modifier.empty()) continue;
+            const sema::TypeRef* rt =
+                ps->declType ? ctx_.resolvedType(*ps->declType)
+                             : ps->resolvedDeclType;
+            const bool fnTyped =
+                (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+                (ps->declType &&
+                 ps->declType->kind == ast::TypeKind::Function);
+            if (fnTyped) callBoundedParams_.insert(sym);
+        }
+    }
+    callBoundedScan(body);
     scopedPreScan(body);
     scopedCalleeScan(body);
     checkTaskScopeConsumption(body);
@@ -471,6 +490,25 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
     // legal). // per §28.6
     checkOwnedFieldReturn(exprBody);
+    // §28.14 v0.177 (#1419): the expression body IS the return value — a
+    // call-bounded parameter (or a closure capturing one) returned through
+    // `=> f` escapes exactly as `return f;` does. // per §28.14
+    if (paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || !ps->modifier.empty()) continue;
+            const sema::TypeRef* rt =
+                ps->declType ? ctx_.resolvedType(*ps->declType)
+                             : ps->resolvedDeclType;
+            const bool fnTyped =
+                (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+                (ps->declType &&
+                 ps->declType->kind == ast::TypeKind::Function);
+            if (fnTyped) callBoundedParams_.insert(sym);
+        }
+        if (sema::ParameterSymbol* src = callBoundedSourceOf(exprBody))
+            reportCallBounded(exprBody.span.begin, src->name, "returned");
+    }
 }
 
 namespace {

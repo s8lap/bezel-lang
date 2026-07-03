@@ -1128,6 +1128,74 @@ private:
     // this-qualified). Returns 0 otherwise.
     int scopedUseKind(const ast::Expr& e, std::string_view* nameOut = nullptr);
 
+    // -- §28.14 v0.177 (#1419): the call-bounded default ----------------------
+    //
+    // A PLAIN (no-modifier) function-typed parameter is CALL-BOUNDED in this
+    // callee: it may be invoked, bound to locals, and passed to another plain
+    // function-typed parameter; it may NOT be stored in a field of any object,
+    // stored into a collection reachable beyond the call (parameter-, field-,
+    // or borrow-reachable — a purely local collection is a local binding),
+    // returned (including a `yield return` or a write through an out/ref
+    // parameter, both of which hand the value beyond the call), captured by a
+    // closure that itself escapes by these same rules (transitively, followed
+    // through local bindings), or forwarded into a `scoped` parameter position
+    // (the callee cannot vouch for captures it cannot see). Compiler-verified
+    // for user-authored callees — structural sink checks, no interprocedural
+    // analysis; builtin callees state their retention in their signatures
+    // (`scoped` where they store; §30.11 and the lazy query operators stay on
+    // the stdlib-certified legacy path). Runs as a syntactic pre-pass beside
+    // scopedCalleeScan, BEFORE scopedPreScan so the alias map is complete when
+    // the §28.14 admission consults it for the forward-to-scoped shapes.
+    // // per §28.14, §28.3, §22.3 (v0.177)
+
+    // The enclosing method's plain function-typed parameters.
+    std::unordered_set<sema::Symbol*> callBoundedParams_;
+    // Locals that transitively CARRY a call-bounded parameter: bound from the
+    // parameter directly, from a closure capturing one (or capturing another
+    // carrier), from a conditional over carriers, or from a collection literal
+    // containing one. Maps the carrier to the parameter it carries. Recorded
+    // in source order; flow-insensitive (an alias is never un-recorded —
+    // conservative, may over-reject a rebound name, never under-rejects).
+    std::unordered_map<sema::Symbol*, sema::ParameterSymbol*> callBoundedAlias_;
+    // Locals whose initializer is ROOTED at a parameter / field / `this` /
+    // call result — a collection reached through one is reachable beyond the
+    // call. (Only consulted for collection receivers.)
+    std::unordered_set<sema::Symbol*> beyondCallRooted_;
+
+    // The pre-pass driver + walkers (statement coverage mirrors
+    // scopedCalleeWalkStmt).
+    void callBoundedScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void callBoundedWalkStmt(const ast::Stmt& s);
+    void callBoundedWalkExpr(const ast::Expr& e);
+    // The call-bounded parameter `e` denotes or transitively carries (bare
+    // identifier, carrier local, capturing lambda, conditional, collection
+    // literal, postfix-bang), or null.
+    sema::ParameterSymbol* callBoundedSourceOf(const ast::Expr& e);
+    // True when `recv` (a collection receiver / index-store target) is
+    // reachable beyond the call: rooted at a parameter, field, `this`, a call
+    // result, or a beyond-call-rooted local. Conservative for unresolved
+    // roots.
+    bool exprReachableBeyondCall(const ast::Expr& recv);
+    // True when `callee` is a builtin-collection STORING mutator
+    // (Add / Insert / Push / Enqueue / …) — the §28.14 collection-store sink.
+    // User methods never match (their formals carry their own obligations).
+    bool builtinCollectionStoreCallee(const ast::Expr* callee);
+    // Report the §28.14 v0.177 sink violation, naming the parameter and the
+    // spec-stated fix.
+    void reportCallBounded(SourceLocation loc, std::string_view paramName,
+                           std::string_view sink);
+    // True when the call's formal at `argPos` resolves to a USER-authored
+    // PLAIN function-typed parameter — a position v0.177 verifies callee-side
+    // as call-bounded, so the CALLER may pass any capture-bearing closure
+    // there (checkClosureEscapesOnReturn skips its legacy rejection for such
+    // arguments). Builtin callees (the lazy query operators' storing
+    // signatures), function-value callees, and unresolved callees stay on the
+    // legacy caller-side rejection — the stdlib-certified path §28.14 v0.177
+    // records. // per §28.14, §28.3 (v0.177)
+    bool verifiedCallBoundedFormalAt(const ast::Expr* callee,
+                                     const ast::NewExpr* ne,
+                                     std::size_t argPos);
+
     // -- stdlib §6.10 (v0.175, #808): TaskScope consumption rules ------------
     // TaskScope may only be consumed by `await using`; a plain `using var`, an
     // undisposed drop, or an explicit .Dispose() is a compile error naming the

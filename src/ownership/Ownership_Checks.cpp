@@ -1227,14 +1227,35 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
                 if (cd->elseValue) findLambdas(*cd->elseValue);
                 return;
             }
+            // §28.14 v0.177 (#1419): a closure argument bound to a VERIFIED
+            // call-bounded formal (a user-authored plain function-typed
+            // parameter) cannot outlive the call — the callee-side pre-pass
+            // rejects every retention. `return Apply(() => res.Val());`
+            // therefore escapes nothing, and the caller side is unrestricted.
+            // Arguments to BUILTIN callees keep the legacy rejection: the
+            // lazy query operators' returned query objects retain the
+            // callback until enumeration (stdlib-certified storing
+            // signatures, the §30.11 legacy path), so a capture-bearing
+            // closure there still escapes with the returned value.
+            // // per §28.14, §28.3 (v0.177)
             if (auto* ce = dynamic_cast<const ast::CallExpr*>(&x)) {
-                for (const auto& a : ce->args)
-                    if (a.value) findLambdas(*a.value);
+                for (std::size_t i = 0; i < ce->args.size(); ++i) {
+                    const auto& a = ce->args[i];
+                    if (!a.value) continue;
+                    if (verifiedCallBoundedFormalAt(ce->callee.get(), nullptr,
+                                                    i))
+                        continue;
+                    findLambdas(*a.value);
+                }
                 return;
             }
             if (auto* ne = dynamic_cast<const ast::NewExpr*>(&x)) {
-                for (const auto& a : ne->args)
-                    if (a.value) findLambdas(*a.value);
+                for (std::size_t i = 0; i < ne->args.size(); ++i) {
+                    const auto& a = ne->args[i];
+                    if (!a.value) continue;
+                    if (verifiedCallBoundedFormalAt(nullptr, ne, i)) continue;
+                    findLambdas(*a.value);
+                }
                 return;
             }
         };
@@ -4626,6 +4647,29 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             (void)ms;
             return;
         }
+        // §28.14 v0.177 (#1419): a CALL-BOUNDED parameter (or a local
+        // carrying one) may not be forwarded into a `scoped` position — the
+        // callee cannot vouch for captures it cannot see. The diagnostic
+        // names the spec-stated fix.
+        {
+            sema::ParameterSymbol* cb = nullptr;
+            if (sym && callBoundedParams_.count(sym))
+                cb = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!cb && sym) {
+                auto ait = callBoundedAlias_.find(sym);
+                if (ait != callBoundedAlias_.end()) cb = ait->second;
+            }
+            if (cb) {
+                report(Severity::Error, arg.span.begin,
+                       std::string("parameter `") + std::string(cb->name) +
+                           "` is call-bounded and may not be forwarded into "
+                           "a `scoped` parameter position — the callee "
+                           "cannot vouch for captures it cannot see; declare "
+                           "`" + std::string(cb->name) +
+                           "` itself `scoped` to store it (§28.14, v0.177)");
+                return;
+            }
+        }
         // Verifiable-subset widening (#1420 triage): a local bound to a
         // LAMBDA LITERAL and never reassigned is verifiable — its captures
         // are the literal's captures, enumerated exactly as if the literal
@@ -4701,6 +4745,22 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
         }
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (!methodParamSet_.count(sym)) continue;  // lambda-internal param
+            // §28.14 v0.177 (#1419): a closure CAPTURING a call-bounded
+            // function-typed parameter cannot enter storage-bounded
+            // admission — the stored closure would extend the callback past
+            // its call (the transitive escape judgment).
+            if (callBoundedParams_.count(sym)) {
+                report(Severity::Error, id->span.begin,
+                       std::string("closure bound to a `scoped` parameter "
+                                   "captures `") +
+                           std::string(sym->name) +
+                           "`, a call-bounded function-typed parameter — "
+                           "storing the closure would extend the callback "
+                           "past its call; declare `" +
+                           std::string(sym->name) +
+                           "` itself `scoped` to store it (§28.14, v0.177)");
+                return;
+            }
             anyCapture = true;
             // Parameters precede every local — declaration order holds. An
             // `owned` parameter is still a freezable source (it can be moved).
@@ -4709,6 +4769,24 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             continue;
         }
         if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // §28.14 v0.177 (#1419): a local CARRYING a call-bounded
+            // parameter (bound from it, or from a closure capturing it) is
+            // the callback under another name — same rejection as the direct
+            // capture above.
+            auto ait = callBoundedAlias_.find(sym);
+            if (ait != callBoundedAlias_.end()) {
+                report(Severity::Error, id->span.begin,
+                       std::string("closure bound to a `scoped` parameter "
+                                   "captures `") +
+                           std::string(sym->name) +
+                           "`, which carries the call-bounded parameter `" +
+                           std::string(ait->second->name) +
+                           "` — storing the closure would extend the "
+                           "callback past its call; declare `" +
+                           std::string(ait->second->name) +
+                           "` itself `scoped` to store it (§28.14, v0.177)");
+                return;
+            }
             // Value-typed captures live in their (heap) capture box, which the
             // closure keeps alive — no lifetime constraint. Only a capture of
             // a class/interface reference can dangle. Null declType stays
@@ -5224,6 +5302,489 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
         }
         return;
     }
+}
+
+// -- §28.14 v0.177 (#1419): the call-bounded default -------------------------
+//
+// Callee-side verification for PLAIN function-typed parameters. See the
+// declaration block in Ownership_impl.hpp for the rule statement. The walk is
+// syntactic (like scopedCalleeScan) so each diagnostic fires exactly once,
+// and it maintains its own source-order carrier-alias map so the escape
+// judgment follows local bindings transitively. // per §28.14, v0.177
+
+sema::ParameterSymbol* MethodOwnership::callBoundedSourceOf(
+    const ast::Expr& e) {
+    if (callBoundedParams_.empty() && callBoundedAlias_.empty())
+        return nullptr;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return nullptr;
+        if (callBoundedParams_.count(sym))
+            return dynamic_cast<sema::ParameterSymbol*>(sym);
+        auto it = callBoundedAlias_.find(sym);
+        return it != callBoundedAlias_.end() ? it->second : nullptr;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // A closure CARRIES the callback when it captures the parameter or a
+        // carrier local — the §28.14 "judged by these same rules, applied
+        // transitively" clause.
+        std::vector<const ast::IdentifierExpr*> ids;
+        scopedCollectCaptures(*lam, ids);
+        for (const ast::IdentifierExpr* cid : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*cid);
+            if (!sym) continue;
+            if (callBoundedParams_.count(sym))
+                return dynamic_cast<sema::ParameterSymbol*>(sym);
+            auto it = callBoundedAlias_.find(sym);
+            if (it != callBoundedAlias_.end()) return it->second;
+        }
+        return nullptr;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->thenValue)
+            if (sema::ParameterSymbol* s = callBoundedSourceOf(*cd->thenValue))
+                return s;
+        return cd->elseValue ? callBoundedSourceOf(*cd->elseValue) : nullptr;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        // A local collection literal holding the callback is a local binding;
+        // the CARRIER classification makes its later escape the sink.
+        for (const auto& k : cl->keys)
+            if (k)
+                if (sema::ParameterSymbol* s = callBoundedSourceOf(*k))
+                    return s;
+        for (const auto& el : cl->elements)
+            if (el)
+                if (sema::ParameterSymbol* s = callBoundedSourceOf(*el))
+                    return s;
+        return nullptr;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+        return pb->operand ? callBoundedSourceOf(*pb->operand) : nullptr;
+    return nullptr;
+}
+
+bool MethodOwnership::exprReachableBeyondCall(const ast::Expr& recv) {
+    const ast::IdentifierExpr* root = identifierRoot(recv);
+    if (!root) return true;  // unrooted (temporary/complex) — conservative
+    if (root->name == "this" || root->name == "base") return true;
+    sema::Symbol* sym = ctx_.exprSymbol(*root);
+    if (!sym) return true;  // unresolved — conservative
+    if (dynamic_cast<sema::LocalSymbol*>(sym))
+        return beyondCallRooted_.count(sym) != 0;  // purely local unless
+                                                   // rooted beyond the call
+    // Parameter / field / method-result / static-member roots all reach
+    // storage that outlives the call.
+    return true;
+}
+
+bool MethodOwnership::builtinCollectionStoreCallee(const ast::Expr* callee) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    const std::string_view m = ma->member;
+    const bool storing =
+        m == "Add" || m == "Insert" || m == "AddRange" || m == "TryAdd" ||
+        m == "AddFirst" || m == "AddLast" || m == "AddBefore" ||
+        m == "AddAfter" || m == "Push" || m == "Enqueue";
+    if (!storing) return false;
+    // Built-in collections resolve to a Named TypeRef with a NULL declaration
+    // carrying the class name on the AST node (cf. builtinOwnedSinkArg). A
+    // user type (non-null declaration) never matches — its own formals carry
+    // their own §28.14 obligations.
+    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return false;
+    std::string_view cn;
+    if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
+        cn = tt->astNode->name->parts[0];
+    else
+        cn = tt->importedName;
+    return cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
+           cn == "Set" || cn == "Stack" || cn == "Queue" ||
+           cn == "LinkedList" || cn == "OwningArray" ||
+           cn == "OwningDictionary" || cn == "OwningSet" ||
+           cn == "OwningStack" || cn == "OwningQueue" ||
+           cn == "OwningLinkedList";
+}
+
+bool MethodOwnership::verifiedCallBoundedFormalAt(const ast::Expr* callee,
+                                                  const ast::NewExpr* ne,
+                                                  std::size_t argPos) {
+    // A formal is a VERIFIED call-bounded position when it belongs to a
+    // user-authored method/constructor (its body runs this same pre-pass),
+    // its modifier is empty, and its declared type is a function type.
+    // // per §28.14, v0.177
+    auto paramIsPlainFunction = [&](const ast::Param& p) {
+        if (!p.modifier.empty() || !p.type) return false;
+        if (p.type->kind == ast::TypeKind::Function) return true;
+        const sema::TypeRef* rt = ctx_.resolvedType(*p.type);
+        return rt && rt->kind == sema::TypeRef::Kind::Function;
+    };
+    if (ne) {
+        if (!ne->type) return false;
+        const sema::TypeRef* rt = ctx_.resolvedType(*ne->type);
+        if (!rt || !rt->declaration) return false;
+        for (sema::Symbol* m : rt->declaration->members) {
+            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (d && d->params.size() == ne->args.size())
+                    return argPos < d->params.size() &&
+                           paramIsPlainFunction(d->params[argPos]);
+            }
+        }
+        return false;
+    }
+    if (!callee) return false;
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee))) {
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            return argPos < md->params.size() &&
+                   paramIsPlainFunction(md->params[argPos]);
+    }
+    return false;
+}
+
+void MethodOwnership::reportCallBounded(SourceLocation loc,
+                                        std::string_view paramName,
+                                        std::string_view sink) {
+    report(Severity::Error, loc,
+           std::string("parameter `") + std::string(paramName) +
+               "` is call-bounded; declare it `scoped` to store it (§28.14, "
+               "v0.177) — a plain function-typed parameter may be invoked, "
+               "bound to locals, and passed to another plain function-typed "
+               "parameter, but may not be " +
+               std::string(sink));
+}
+
+void MethodOwnership::callBoundedScan(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (callBoundedParams_.empty()) return;
+    for (const auto& s : body)
+        if (s) callBoundedWalkStmt(*s);
+}
+
+void MethodOwnership::callBoundedWalkStmt(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) {
+            // Binding to a local is allowed — record the carrier so a later
+            // escape of the alias is judged transitively. // per §28.14
+            if (sema::ParameterSymbol* src =
+                    callBoundedSourceOf(*ld->initializer)) {
+                if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
+                    callBoundedAlias_[ls] = src;
+            }
+            // A local rooted at a parameter / field / call result reaches
+            // beyond-call storage — a collection reached through it is not a
+            // "purely local collection".
+            if (dynamic_cast<const ast::IdentifierExpr*>(
+                    ld->initializer.get()) ||
+                dynamic_cast<const ast::MemberAccessExpr*>(
+                    ld->initializer.get()) ||
+                dynamic_cast<const ast::IndexExpr*>(ld->initializer.get())) {
+                if (exprReachableBeyondCall(*ld->initializer))
+                    if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
+                        beyondCallRooted_.insert(ls);
+            }
+            callBoundedWalkExpr(*ld->initializer);
+        }
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) callBoundedWalkExpr(*lc->value);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        sema::ParameterSymbol* src =
+            (as->op == ":=" && as->value) ? callBoundedSourceOf(*as->value)
+                                          : nullptr;
+        // (`+=`/`-=` never move a function value into storage; the event
+        // `+=` form is the stdlib-certified Add path — §24.3, v0.177.)
+        if (src && as->target) {
+            // Sink: store into a FIELD of any object (qualified, bare, or
+            // another object's). A `scoped`-field target is reported by the
+            // scoped machinery with the assignment-specific message — skip
+            // the duplicate here.
+            const bool fieldTarget =
+                dynamic_cast<const ast::MemberAccessExpr*>(as->target.get()) !=
+                    nullptr ||
+                (dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
+                 dynamic_cast<sema::FieldSymbol*>(
+                     ctx_.exprSymbol(*as->target)));
+            if (fieldTarget) {
+                if (scopedUseKind(*as->target) != 2)
+                    reportCallBounded(as->span.begin, src->name,
+                                      "stored in a field of any object");
+                return;
+            }
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        ctx_.exprSymbol(*tid))) {
+                    if (ps->modifier == "out" || ps->modifier == "ref" ||
+                        ps->modifier == "out owned") {
+                        // Sink: an out/ref write hands the callback beyond
+                        // the call (the caller's frame) — the return sink in
+                        // another syntax.
+                        reportCallBounded(
+                            as->span.begin, src->name,
+                            "written through an out/ref parameter (it "
+                            "escapes to the caller's frame)");
+                        return;
+                    }
+                }
+                // Reassigning a plain local: the target becomes a carrier.
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(
+                        ctx_.exprSymbol(*tid)))
+                    callBoundedAlias_[ls] = src;
+            }
+            if (auto* ix =
+                    dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
+                // Sink: indexer store into a collection reachable beyond the
+                // call (`xs[i] := f` where xs is a param / field / borrow).
+                if (ix->target && exprReachableBeyondCall(*ix->target)) {
+                    reportCallBounded(
+                        as->span.begin, src->name,
+                        "stored into a collection reachable beyond the call");
+                    return;
+                }
+            }
+        }
+        if (as->target) callBoundedWalkExpr(*as->target);
+        if (as->value) callBoundedWalkExpr(*as->value);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) {
+            if (sema::ParameterSymbol* src = callBoundedSourceOf(*rs->value)) {
+                reportCallBounded(rs->value->span.begin, src->name,
+                                  "returned");
+                return;
+            }
+            callBoundedWalkExpr(*rs->value);
+        }
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) {
+            if (sema::ParameterSymbol* src = callBoundedSourceOf(*ys->value)) {
+                reportCallBounded(ys->value->span.begin, src->name,
+                                  "yielded (the iterator's consumer outlives "
+                                  "the call)");
+                return;
+            }
+            callBoundedWalkExpr(*ys->value);
+        }
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) callBoundedWalkExpr(*es->expr);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) callBoundedWalkExpr(*ts->value);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) callBoundedWalkExpr(*ds->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            callBoundedWalkExpr(*ifs->ifBranch.condition);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) callBoundedWalkStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) callBoundedWalkExpr(*el.condition);
+            for (const auto& bs : el.body)
+                if (bs) callBoundedWalkStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) callBoundedWalkStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) callBoundedWalkExpr(*ws->condition);
+        for (const auto& bs : ws->body)
+            if (bs) callBoundedWalkStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) callBoundedWalkExpr(*fs->iterable);
+        if (fs->withExpr) callBoundedWalkExpr(*fs->withExpr);
+        for (const auto& bs : fs->body)
+            if (bs) callBoundedWalkStmt(*bs);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) callBoundedWalkStmt(*bs);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) callBoundedWalkExpr(*is->target);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) callBoundedWalkStmt(*bs);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) callBoundedWalkExpr(*arm.guard);
+            if (arm.body) callBoundedWalkStmt(*arm.body);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) callBoundedWalkStmt(*bs);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) callBoundedWalkExpr(*cs->scrutinee);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) callBoundedWalkExpr(*arm.guard);
+            if (arm.exprBody) callBoundedWalkExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) callBoundedWalkStmt(*bs);
+        }
+        return;
+    }
+    // Break / Continue: nothing to check.
+}
+
+void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
+    const ast::Expr* callee = nullptr;
+    const std::vector<ast::CallArgument>* args = nullptr;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        callee = ce->callee.get();
+        args = &ce->args;
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        callee = nc->callee.get();
+        args = &nc->args;
+    } else if (ne) {
+        args = &ne->args;
+    }
+    if (args) {
+        const bool collStore =
+            !ne && builtinCollectionStoreCallee(callee) &&
+            [&] {
+                auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(callee);
+                return ma && ma->target &&
+                       exprReachableBeyondCall(*ma->target);
+            }();
+        for (std::size_t i = 0; i < args->size(); ++i) {
+            const auto& a = (*args)[i];
+            if (!a.value) continue;
+            if (sema::ParameterSymbol* src = callBoundedSourceOf(*a.value)) {
+                // Forward into a `scoped` position: reported by the §28.14
+                // admission (checkScopedAdmission), which sees the same call
+                // — skip the duplicate here.
+                if (scopedFormalAt(callee, ne, i)) {
+                    // (admission owns the diagnostic)
+                } else if (collStore) {
+                    // Sink: builtin-collection mutator on a receiver
+                    // reachable beyond the call.
+                    reportCallBounded(
+                        a.value->span.begin, src->name,
+                        "stored into a collection reachable beyond the call");
+                    continue;
+                }
+                // Any other argument position: plain→plain forwarding, or a
+                // builtin callee whose retention is signature-certified —
+                // allowed.
+            }
+            callBoundedWalkExpr(*a.value);
+        }
+        // Walk a non-bare callee (receiver chains may contain calls);
+        // invoking the callback itself (`f()`) is the admitted use.
+        if (callee && !dynamic_cast<const ast::IdentifierExpr*>(callee))
+            callBoundedWalkExpr(*callee);
+        return;
+    }
+    // Structural recursion (no sinks below — sinks are positional above).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) callBoundedWalkExpr(*ma->target);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) callBoundedWalkExpr(*nm->target);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) callBoundedWalkExpr(*ix->target);
+        for (const auto& a : ix->indices)
+            if (a.value) callBoundedWalkExpr(*a.value);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) callBoundedWalkExpr(*be->left);
+        if (be->right) callBoundedWalkExpr(*be->right);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) callBoundedWalkExpr(*un->operand);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) callBoundedWalkExpr(*pb->operand);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) callBoundedWalkExpr(*tt->operand);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) callBoundedWalkExpr(*cd->condition);
+        if (cd->thenValue) callBoundedWalkExpr(*cd->thenValue);
+        if (cd->elseValue) callBoundedWalkExpr(*cd->elseValue);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) callBoundedWalkExpr(*th->operand);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo) callBoundedWalkExpr(*rg->lo);
+        if (rg->hi) callBoundedWalkExpr(*rg->hi);
+        if (rg->step) callBoundedWalkExpr(*rg->step);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) callBoundedWalkExpr(*we->source);
+        for (const auto& ia : we->assigns)
+            if (ia.value) callBoundedWalkExpr(*ia.value);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) callBoundedWalkExpr(*k);
+        for (const auto& el : cl->elements)
+            if (el) callBoundedWalkExpr(*el);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) callBoundedWalkExpr(*part.expr);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // Walk the lambda BODY: a store that executes when the closure runs
+        // (`() => do _f := f; end`) is still a store of the call-bounded
+        // value. The lambda VALUE's own escape is judged at its use sites
+        // via callBoundedSourceOf.
+        if (lam->exprBody) callBoundedWalkExpr(*lam->exprBody);
+        for (const auto& bs : lam->stmts)
+            if (bs) callBoundedWalkStmt(*bs);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) callBoundedWalkExpr(*cx->scrutinee);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) callBoundedWalkExpr(*arm.guard);
+            if (arm.exprBody) callBoundedWalkExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) callBoundedWalkStmt(*bs);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit: no sinks.
 }
 
 // -- stdlib §6.10: TaskScope consumption ------------------------------------
