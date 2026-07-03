@@ -2396,6 +2396,46 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         // string is identity (§9.6); the value is the bz_string itself.
         return emitPrimitiveToString(val, fieldTy->primitive);
     }
+    // §2.18 / §18.5 (#1411): named builtin value types with their own no-format
+    // renderers. TimeSpan → "c" (§2.5), DateOnly → "yyyy-MM-dd" ISO 8601,
+    // TimeOnly → bz_timeonly_to_string, Guid → "D" (§2.6 / §2.18). Without
+    // this, they fell through the Class dispatch below (integer LLVM types
+    // don't match the isPointerTy guard; a Guid struct has no members) and
+    // rendered raw tick/day counts or the literal type name.
+    if (fieldTy && fieldTy->kind == K::Named) {
+        std::string_view bn = builtinTypeName(fieldTy);
+        if (bn == "TimeSpan" && val->getType()->isIntegerTy(64)) {
+            auto* fn = declareC("bz_timespan_to_string_c", ptrTy(), {i64()});
+            return builder_.CreateCall(fn, {val}, "ts.str");
+        }
+        if (bn == "DateOnly" && val->getType()->isIntegerTy()) {
+            llvm::Value* dn = val->getType()->isIntegerTy(32)
+                ? val : builder_.CreateTrunc(val, i32());
+            llvm::Value* ticks = builder_.CreateMul(
+                builder_.CreateSExt(dn, i64()),
+                builder_.getInt64(864000000000LL));  // TICKS_PER_DAY
+            llvm::Value* fmtStr = lowerStringLiteral("\"yyyy-MM-dd\"", false);
+            auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                {i64(), ptrTy()});
+            return builder_.CreateCall(fn, {ticks, fmtStr}, "do.str");
+        }
+        if (bn == "TimeOnly" && val->getType()->isIntegerTy()) {
+            llvm::Value* ms = val->getType()->isIntegerTy(32)
+                ? val : builder_.CreateTrunc(val, i32());
+            auto* fn = declareC("bz_timeonly_to_string", ptrTy(), {i32()});
+            return builder_.CreateCall(fn, {ms}, "to.str");
+        }
+        if (bn == "Guid") {
+            llvm::StructType* gst = guidStructType();
+            llvm::AllocaInst* slot = entryAlloca(gst);
+            llvm::Value* gv = val;
+            if (gv->getType()->isPointerTy())
+                gv = builder_.CreateLoad(gst, gv, "guid.str.load");
+            builder_.CreateStore(gv, slot);
+            auto* fn = declareC("bz_guid_to_string", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {slot}, "guid.strD");
+        }
+    }
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration) {
         const sema::TypeSymbol* ts = fieldTy->declaration;
         if (ts->kind == ast::TypeDeclKind::Record && val->getType()->isStructTy())

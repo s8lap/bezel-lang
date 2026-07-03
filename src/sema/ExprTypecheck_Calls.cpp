@@ -7410,8 +7410,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             if (pt != PrimitiveType::None) {
                 const auto& mbr = ma.member;
                 // Numeric properties: MaxValue/MinValue → same type.
-                if (mbr == "MaxValue" || mbr == "MinValue" ||
-                    mbr == "Zero" || mbr == "One") {
+                if (mbr == "MaxValue" || mbr == "MinValue") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                    return;
+                }
+                // §9.3 (#1424): Zero and One are declared only on decimal
+                // (stdlib §9.3). The prior accept on EVERY numeric primitive
+                // was an invented API (CLAUDE.md rule 2). ints/doubles reach
+                // Zero()/One() legitimately ONLY via the §11.8 constraint
+                // path (GenericParamSymbol, handled above), which is separate
+                // from this primitive-keyword static branch.
+                if ((mbr == "Zero" || mbr == "One") &&
+                    pt == PrimitiveType::Decimal) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                     return;
                 }

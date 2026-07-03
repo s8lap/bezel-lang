@@ -297,6 +297,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     // Type not set or not primitive — infer from LLVM type.
                     using P = sema::PrimitiveType;
                     auto* llvmTy = ev->getType();
+                    // §2.18 / §18.5 (#1411): named builtin value types with
+                    // their own no-format renderers (TimeSpan → "c", DateOnly/
+                    // TimeOnly → ISO 8601, Guid → "D"). Route through
+                    // emitValueToString before the LLVM-type integer fallback,
+                    // which would render raw tick/day counts (§2.5/§2.18).
+                    if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+                        std::string_view bn = builtinTypeName(rt);
+                        if (bn == "TimeSpan" || bn == "DateOnly" ||
+                            bn == "TimeOnly" || bn == "Guid")
+                            pv = emitValueToString(ev, rt);
+                    }
+                    if (!pv) {
                     if (llvmTy->isIntegerTy(1))
                         pv = emitPrimitiveToString(ev, P::Bool);
                     else if (llvmTy->isIntegerTy(8) || llvmTy->isIntegerTy(16) ||
@@ -356,6 +368,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             pv = ev;  // string or unknown ptr — use as-is
                         }
                     }
+                    }  // end if (!pv) — LLVM-type integer/pointer fallback
                     // For struct (record value): spill to alloca, call ToString.
                     if (!pv && ev->getType()->isStructTy() && rt &&
                         rt->kind == sema::TypeRef::Kind::Named &&
