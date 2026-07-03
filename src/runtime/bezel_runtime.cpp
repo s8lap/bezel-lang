@@ -2809,6 +2809,75 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
 }
 
 // ---------------------------------------------------------------------------
+// v0.172 (#812/#1339, stdlib §2.18): the floating round-trip guarantee.
+// `double`/`float` no-format ToString() and the "R" specifier both produce the
+// SHORTEST decimal string that reparses to the identical bit pattern. Search
+// precisions 1..N with "%.*g", reparse with strtod/strtof, and take the first
+// that is bit-identical to the input (memcmp of the raw bits — distinguishes
+// -0.0 from 0.0 and never mistakes a NaN payload for an exact match). Correctness
+// over speed per CLAUDE.md; no caching.
+// ---------------------------------------------------------------------------
+
+// Build a fresh heap bz_string* (rc := 1) wrapping a copy of buf[0..len).
+static void* bz_make_string(const char* buf, int64_t len) {
+    char* data = (char*)malloc((size_t)len + 1);
+    memcpy(data, buf, (size_t)len);
+    data[len] = '\0';
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data = data; sh->len = len; sh->width = 1; sh->rc = 1;
+    return sh;
+}
+
+extern "C" void* bz_double_to_string_r(double v) {
+    char buf[64];
+    int n = 0;
+    for (int prec = 1; prec <= 17; ++prec) {
+        n = snprintf(buf, sizeof(buf), "%.*g", prec, v);
+        double rt = strtod(buf, nullptr);
+        if (memcmp(&rt, &v, sizeof(double)) == 0) break;  // exact round-trip
+    }
+    return bz_make_string(buf, n);
+}
+
+extern "C" void* bz_float_to_string_r(float v) {
+    char buf[64];
+    int n = 0;
+    for (int prec = 1; prec <= 9; ++prec) {
+        n = snprintf(buf, sizeof(buf), "%.*g", prec, (double)v);
+        float rt = strtof(buf, nullptr);
+        if (memcmp(&rt, &v, sizeof(float)) == 0) break;   // exact round-trip
+    }
+    return bz_make_string(buf, n);
+}
+
+// v0.172 (stdlib §2.18): integer "B"/"Bn" — binary, no leading zeros beyond the
+// natural width, left-zero-padded to `min_digits`. `value` is the operand's
+// natural-width bit pattern zero-extended to 64 bits (so a signed operand's
+// two's-complement bits print correctly, e.g. int -1 → 32 ones).
+extern "C" void* bz_ulong_to_binary(uint64_t value, int32_t min_digits) {
+    char tmp[64];
+    int n = 0;
+    if (value == 0) tmp[n++] = '0';
+    else while (value) { tmp[n++] = (char)('0' + (int)(value & 1)); value >>= 1; }
+    int total = (n < min_digits) ? min_digits : n;
+    char out[80];
+    int pad = total - n;
+    for (int i = 0; i < pad; ++i) out[i] = '0';
+    for (int i = 0; i < n; ++i) out[pad + i] = tmp[n - 1 - i];  // reverse
+    return bz_make_string(out, total);
+}
+
+// v0.172 (stdlib §2.18): Guid "N" — 32 hex digits, lowercase, no hyphens.
+// ("D" is the canonical bz_guid_to_string form.)
+extern "C" void* bz_guid_to_string_n(const bz_guid_t* g) {
+    const uint8_t* b = (const uint8_t*)g;
+    char buf[33];
+    for (int i = 0; i < 16; ++i)
+        snprintf(buf + i * 2, 3, "%02x", b[i]);
+    return bz_make_string(buf, 32);
+}
+
+// ---------------------------------------------------------------------------
 // Per §2.5: TimeSpan component extractors.
 // Ticks are signed 100-ns units.
 // ---------------------------------------------------------------------------
@@ -2816,6 +2885,29 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
 static const int64_t TICKS_PER_MINUTE = 600000000LL;     // 60 * 10_000_000
 static const int64_t TICKS_PER_HOUR   = 36000000000LL;   // 3600 * 10_000_000
 static const int64_t TICKS_PER_DAY    = 864000000000LL;  // 86400 * 10_000_000
+
+// v0.172 (stdlib §2.18): TimeSpan "c" (constant) format —
+// `[-][d.]hh:mm:ss[.fffffff]`. The day part appears only when non-zero; the
+// fractional part is 7 zero-padded digits (100-ns units) and appears only when
+// non-zero. Used for the "c" specifier and the no-format rendering.
+extern "C" void* bz_timespan_to_string_c(int64_t ticks) {
+    char buf[48];
+    int pos = 0;
+    int64_t t = ticks;
+    if (t < 0) { buf[pos++] = '-'; t = -t; }
+    int64_t days = t / TICKS_PER_DAY; t %= TICKS_PER_DAY;
+    int64_t hh   = t / TICKS_PER_HOUR; t %= TICKS_PER_HOUR;
+    int64_t mm   = t / TICKS_PER_MINUTE; t %= TICKS_PER_MINUTE;
+    int64_t ss   = t / TICKS_PER_SECOND; t %= TICKS_PER_SECOND;
+    int64_t frac = t;  // 0..9,999,999 (100-ns units)
+    if (days > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld.", (long long)days);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "%02lld:%02lld:%02lld",
+                    (long long)hh, (long long)mm, (long long)ss);
+    if (frac > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, ".%07lld", (long long)frac);
+    return bz_make_string(buf, pos);
+}
 
 void bz_timespan_components(int64_t ticks,
                              int32_t* days, int32_t* hours,

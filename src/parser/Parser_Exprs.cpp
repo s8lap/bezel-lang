@@ -378,6 +378,10 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         e->isVerbatim =
             (current_.kind == TokenKind::InterpolatedVerbatimString);
         e->text = current_.text;
+        // Record the token location before splitting so diagnostics reported by
+        // splitInterpolation (empty hole, brace-in-spec) point at the string.
+        e->span.begin = current_.location;
+        e->span.end = current_.location;
         // §18.5 / §18.7: split the `$"..."` token into alternating literal
         // and expression parts. The lexer already validated balanced braces.
         splitInterpolation(*e);

@@ -633,6 +633,7 @@ set(BEZEL_TEST_SOURCES
     codegen/static_inline_array_init_1098_test.cpp
     codegen/throw_in_catch_guard_1097_test.cpp
     codegen/datetime_interp_format_1099_test.cpp
+    codegen/format_revision_812_1339_test.cpp
     codegen/yield_after_break_1102_test.cpp
     codegen/coalesce_value_nullable_rhs_1104_test.cpp
     codegen/inline_array_linq_reject_1100_test.cpp

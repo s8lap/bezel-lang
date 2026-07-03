@@ -88,72 +88,77 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                 e.parts.push_back(std::move(lp));
                 literal.clear();
             }
-            // Sub-parse the expression. Check for a format specifier
-            // `{expr:FORMAT}` (§18.5): a `:` not inside balanced
-            // delimiters splits expression from the format spec.
-            // The format spec is stored in InterpPart::formatSpec and
-            // applied at codegen time (avoids dangling-string_view bug
-            // that would result from modifying the expression text).
+            // Sub-parse the expression, delimiting the alignment `,` and the
+            // format-spec `:` per the normative §18.5 hole-delimitation rule
+            // (v0.172, #1339): both are recognized ONLY at the hole's top
+            // nesting level. The scan tracks `()` `[]` `{}` depth and skips
+            // nested string/char literals (their `,`/`:`/braces do not
+            // delimit). The FIRST top-level `,` begins the alignment; the
+            // FIRST top-level `:` begins the format spec (Bezel has no other
+            // top-level colon meaning inside a hole expression, so no
+            // heuristic is needed — the earlier "looks like a format" guard is
+            // gone). The format spec runs to the hole's closing `}` and is
+            // brace-free (a `{` in it is a compile error). The spec is stored in
+            // InterpPart::formatSpec (encoded as [","WIDTH][":"FORMAT]) and
+            // applied at codegen time (avoids a dangling-string_view bug from
+            // rewriting the expression text).
             std::string_view actualExpr = exprText;
             std::string fmtSpec;
             {
-                int d = 0; // paren/bracket depth
+                int d = 0; // paren/bracket/brace depth
                 for (size_t k = 0; k < exprText.size(); ++k) {
                     char ek = exprText[k];
-                    if (ek == '(' || ek == '[') ++d;
-                    else if (ek == ')' || ek == ']') --d;
-                    else if (d == 0 && k + 1 < exprText.size()) {
-                        // `:FORMAT` — standard format specifier.
-                        if (ek == ':') {
-                            // §18.5 (#1099A): the format spec is everything after
-                            // this first depth-0 `:` (Bezel has no ternary `:`, so
-                            // a `:` outside brackets is always the format
-                            // separator). Besides alphanumerics and sign, a custom
-                            // date/time format carries separators — `:` (HH:mm:ss),
-                            // `/` (yyyy/MM/dd), `.` (fff), and spaces (a combined
-                            // `yyyy-MM-dd HH:mm:ss`). Rejecting those left the colon
-                            // form mis-parsed as the expression (the spec was
-                            // discarded → no-arg ToString).
-                            bool looksLikeFmt = true;
-                            for (size_t f = k + 1; f < exprText.size(); ++f) {
-                                char fc = exprText[f];
-                                if (!std::isalnum(static_cast<unsigned char>(fc)) &&
-                                    fc != '-' && fc != '+' && fc != ':' &&
-                                    fc != '/' && fc != '.' && fc != ' ')
-                                    { looksLikeFmt = false; break; }
-                            }
-                            if (looksLikeFmt) {
-                                actualExpr = exprText.substr(0, k);
-                                fmtSpec = std::string(exprText.substr(k + 1));
-                            }
-                            break;
+                    // Skip a nested string literal as a unit.
+                    if (ek == '"') {
+                        ++k;
+                        while (k < exprText.size() && exprText[k] != '"') {
+                            if (!e.isVerbatim && exprText[k] == '\\' &&
+                                k + 1 < exprText.size())
+                                ++k;
+                            ++k;
                         }
-                        // `,WIDTH` or `,WIDTH:FORMAT` — alignment specifier.
-                        // Negative WIDTH = left-align.
-                        // e.g. `{x,-15}`, `{x,10}`, `{x,10:F2}`.
-                        if (ek == ',') {
-                            auto tail = exprText.substr(k + 1);
-                            bool looksLikeWidth = !tail.empty();
-                            size_t start = 0;
-                            if (!tail.empty() && (tail[0] == '-' || tail[0] == '+'))
-                                start = 1;
-                            size_t digitEnd = start;
-                            while (digitEnd < tail.size() && std::isdigit(tail[digitEnd]))
-                                ++digitEnd;
-                            if (digitEnd == start) looksLikeWidth = false; // no digits
-                            // After the digits, only `}` (end) or `:FORMAT` is valid.
-                            if (looksLikeWidth && digitEnd < tail.size() &&
-                                tail[digitEnd] != ':')
-                                looksLikeWidth = false;
-                            if (looksLikeWidth) {
-                                actualExpr = exprText.substr(0, k);
-                                // Encode as "," + WIDTH (+ optional ":FORMAT").
-                                fmtSpec = "," + std::string(tail);
-                            }
-                            break;
+                        continue;
+                    }
+                    // Skip a nested char literal as a unit.
+                    if (ek == '\'') {
+                        ++k;
+                        while (k < exprText.size() && exprText[k] != '\'') {
+                            if (exprText[k] == '\\' && k + 1 < exprText.size()) ++k;
+                            ++k;
                         }
+                        continue;
+                    }
+                    if (ek == '(' || ek == '[' || ek == '{') { ++d; continue; }
+                    if (ek == ')' || ek == ']' || ek == '}') { --d; continue; }
+                    if (d != 0) continue;
+                    // Top-level `:` begins the format spec (everything after it).
+                    if (ek == ':') {
+                        actualExpr = exprText.substr(0, k);
+                        fmtSpec = std::string(exprText.substr(k + 1));
+                        break;
+                    }
+                    // Top-level `,` begins the alignment; `,WIDTH[:FORMAT]`.
+                    if (ek == ',') {
+                        actualExpr = exprText.substr(0, k);
+                        fmtSpec = "," + std::string(exprText.substr(k + 1));
+                        break;
                     }
                 }
+                // §18.5 (v0.172, #1339): the format spec is brace-free — a `{`
+                // in it is a compile error. Check the FORMAT portion (after any
+                // `,`WIDTH alignment prefix).
+                std::string_view fmtPortion = fmtSpec;
+                if (!fmtPortion.empty() && fmtPortion.front() == ',') {
+                    size_t colon = fmtPortion.find(':');
+                    fmtPortion = (colon == std::string_view::npos)
+                        ? std::string_view()
+                        : fmtPortion.substr(colon + 1);
+                }
+                if (fmtPortion.find('{') != std::string_view::npos)
+                    diagnostics_.report(
+                        Severity::Error, e.span.begin,
+                        "a `{` may not appear in an interpolation format spec — "
+                        "the spec runs to the hole's closing `}` (\xC2\xA7""18.5)");
             }
             // §18.5 (#746 R41-G): `{expression}` requires an expression; an
             // empty hole `{}` (or whitespace-only / `{:FORMAT}` with no

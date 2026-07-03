@@ -2027,6 +2027,19 @@ private:
                                     const std::string& spec,
                                     const sema::TypeRef* rt);
 
+    // §18.5 (v0.172, #812/#1339): dispatch a hole's format spec to a user type's
+    // IFormattable.ToString(format): string. Returns null if `ts` has no such
+    // method (caller falls back). Handles class (ptr) and record (value)
+    // receivers via emitMethodCall.
+    llvm::Value* emitIFormattableDispatch(llvm::Value* val,
+                                          const sema::TypeSymbol* ts,
+                                          const std::string& spec);
+    // §18.5 (v0.172): raise a catchable FormatException for an unrecognized
+    // specifier on an intrinsically-formattable operand (the specifier is a
+    // compile-time constant in interpolation, so the throw is unconditional).
+    // Returns a sentinel empty string keeping the CFG well-formed.
+    llvm::Value* emitAlwaysFormatException();
+
     // Helper: emit snprintf(buf, 64, fmt, val) → bz_string.
     llvm::Value* emitSnprintfToString(const std::string& fmt,
                                       llvm::Value* val);

@@ -606,19 +606,75 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
     // instead of falling through to the no-arg ToString (which rendered the full
     // "…T00:00:00" form). The alignment path (`,WIDTH:FORMAT`) recurses here with
     // the inner format, so this single branch covers both.
-    if (spec[0] != ',' && rt && rt->kind == sema::TypeRef::Kind::Named &&
-        val->getType()->isIntegerTy(64)) {
-        bool isDateTime =
-            (rt->declaration && rt->declaration->name == "DateTime") ||
-            (rt->astNode && rt->astNode->name &&
-             !rt->astNode->name->parts.empty() &&
-             rt->astNode->name->parts.back() == "DateTime");
-        if (isDateTime) {
-            llvm::Value* fmtStr =
-                lowerStringLiteral("\"" + spec + "\"", false);
-            auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
-                                {i64(), ptrTy()});
-            return builder_.CreateCall(fn, {val, fmtStr}, "dt.fmt");
+    if (spec[0] != ',' && rt && rt->kind == sema::TypeRef::Kind::Named) {
+        std::string_view bn = builtinTypeName(rt);
+        // §18.5 / §2.5 / §2.18 (v0.172, #812/#1339): temporal + Guid dispatch.
+        // DateTime / DateOnly / TimeOnly format via bz_datetime_to_string_fmt
+        // (DateOnly's day-number and TimeOnly's ms-of-day are first widened to
+        // DateTime ticks). Any pattern is valid (non-pattern chars are literal
+        // separators), so no FormatException on those. TimeSpan takes only "c";
+        // Guid only "D"/"N"; an unrecognized specifier on those raises
+        // FormatException (§2.18 strict-fault).
+        if (!bn.empty()) {
+            llvm::Value* fmtStr = lowerStringLiteral("\"" + spec + "\"", false);
+            if (bn == "DateTime" && val->getType()->isIntegerTy(64)) {
+                auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                    {i64(), ptrTy()});
+                return builder_.CreateCall(fn, {val, fmtStr}, "dt.fmt");
+            }
+            if (bn == "DateOnly" && val->getType()->isIntegerTy()) {
+                llvm::Value* dn = val->getType()->isIntegerTy(32)
+                    ? val : builder_.CreateTrunc(val, i32());
+                llvm::Value* ticks = builder_.CreateMul(
+                    builder_.CreateSExt(dn, i64()),
+                    builder_.getInt64(864000000000LL));  // TICKS_PER_DAY
+                auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                    {i64(), ptrTy()});
+                return builder_.CreateCall(fn, {ticks, fmtStr}, "do.fmt");
+            }
+            if (bn == "TimeOnly" && val->getType()->isIntegerTy()) {
+                llvm::Value* ms = val->getType()->isIntegerTy(32)
+                    ? val : builder_.CreateTrunc(val, i32());
+                llvm::Value* ticks = builder_.CreateMul(
+                    builder_.CreateSExt(ms, i64()),
+                    builder_.getInt64(10000LL));          // TICKS_PER_MS
+                auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                    {i64(), ptrTy()});
+                return builder_.CreateCall(fn, {ticks, fmtStr}, "to.fmt");
+            }
+            if (bn == "TimeSpan" && val->getType()->isIntegerTy(64)) {
+                if (spec == "c") {
+                    auto* fn = declareC("bz_timespan_to_string_c", ptrTy(),
+                                        {i64()});
+                    return builder_.CreateCall(fn, {val}, "ts.fmt");
+                }
+                return emitAlwaysFormatException();
+            }
+            if (bn == "Guid") {
+                llvm::StructType* gst = guidStructType();
+                llvm::AllocaInst* slot = entryAlloca(gst);
+                llvm::Value* gv = val;
+                if (gv->getType()->isPointerTy())
+                    gv = builder_.CreateLoad(gst, gv, "guid.fmt.load");
+                builder_.CreateStore(gv, slot);
+                if (spec == "D") {
+                    auto* fn = declareC("bz_guid_to_string", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {slot}, "guid.fmtD");
+                }
+                if (spec == "N") {
+                    auto* fn = declareC("bz_guid_to_string_n", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {slot}, "guid.fmtN");
+                }
+                return emitAlwaysFormatException();
+            }
+        }
+        // §18.5 (v0.172): a user type implementing IFormattable — dispatch to
+        // its ToString(format). (bn is empty for a user type, so this is
+        // reached only for a non-temporal Named operand.)
+        if (rt->declaration) {
+            if (llvm::Value* r =
+                    emitIFormattableDispatch(val, rt->declaration, spec))
+                return r;
         }
     }
     // §18.5 / §9.3 (#1099B in interpolation): a decimal value with a fixed-point
@@ -697,6 +753,15 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
     char specCh = spec[0];
     char kind = std::toupper(static_cast<unsigned char>(specCh));
     int width = (spec.size() > 1) ? std::atoi(spec.c_str() + 1) : -1;
+    // §2.18 (v0.172): the count-bearing numeric specifiers are `<letter>` or
+    // `<letter><digits>` — the tail after the letter must be all digits. A
+    // non-digit tail (e.g. "BOGUS", "Xy") is NOT the letter with a 0 count; it
+    // is an unrecognized specifier → FormatException (checked at the else below).
+    bool countTailOk = true;
+    for (std::size_t ti = 1; ti < spec.size(); ++ti)
+        if (!std::isdigit(static_cast<unsigned char>(spec[ti]))) {
+            countTailOk = false; break;
+        }
     std::string snprintfFmt;
     bool isFloat = val->getType()->isDoubleTy() ||
                    val->getType()->isFloatTy() ||
@@ -707,6 +772,31 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                  (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                   !isFloat);
     bool numeric = isFloat || isInt;
+    // §2.18 (v0.172, #812/#1339): "R" (round-trip) — floating only. Route to the
+    // shortest-round-trip renderer, the SAME value no-format ToString() uses.
+    if (kind == 'R' && spec.size() == 1 && isFloat) {
+        if (val->getType()->isFloatTy()) {
+            auto* fn = declareC("bz_float_to_string_r", ptrTy(),
+                                {llvm::Type::getFloatTy(llvm_)});
+            return builder_.CreateCall(fn, {val}, "flt.r");
+        }
+        llvm::Value* dv = val->getType()->isDoubleTy()
+            ? val : builder_.CreateSIToFP(val, llvm::Type::getDoubleTy(llvm_));
+        auto* fn = declareC("bz_double_to_string_r", ptrTy(),
+                            {llvm::Type::getDoubleTy(llvm_)});
+        return builder_.CreateCall(fn, {dv}, "dbl.r");
+    }
+    // §2.18 (v0.172): "B"/"Bn" — binary, integers only. Pass the operand's
+    // natural-width bit pattern zero-extended to i64 (a signed operand's two's-
+    // complement bits print correctly, e.g. int -1 → 32 ones), left-zero-padded
+    // to n digits.
+    if (kind == 'B' && isInt && countTailOk) {
+        llvm::Value* iv = val->getType()->isIntegerTy(64)
+            ? val : builder_.CreateZExt(val, i64());
+        llvm::Value* md = builder_.getInt32(width >= 0 ? width : 0);
+        auto* fn = declareC("bz_ulong_to_binary", ptrTy(), {i64(), i32()});
+        return builder_.CreateCall(fn, {iv, md}, "int.bin");
+    }
     // F/E/G/P (§18.5) format a numeric value as a real number, so they apply to
     // both floating and integer operands (an int operand is widened to double
     // first — `{42:F2}` → "42.00", issue #739/WR11). X/D apply to integers
@@ -715,25 +805,26 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
     // the existing X/x handling).
     bool useFloatEmit = false;
     double scale = 1.0;  // P (percent) multiplies the value by 100
-    if (kind == 'F' && numeric) {
-        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "f";
+    if (kind == 'F' && numeric && countTailOk) {
+        // §2.18 (v0.172): "F"/"Fn" fixed-point, n decimals, DEFAULT 2.
+        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "2") + "f";
         useFloatEmit = true;
-    } else if (kind == 'E' && numeric) {
+    } else if (kind == 'E' && numeric && countTailOk) {
         char ech = (specCh == 'e') ? 'e' : 'E';
         snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + ech;
         useFloatEmit = true;
-    } else if (kind == 'G' && numeric) {
+    } else if (kind == 'G' && numeric && countTailOk) {
         char gch = (specCh == 'g') ? 'g' : 'G';
         snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + gch;
         useFloatEmit = true;
-    } else if (kind == 'P' && numeric) {
+    } else if (kind == 'P' && numeric && countTailOk) {
         // §18.5 normative example: `{ratio:P1}` → "85.0%". Scale by 100, format
         // fixed-point to the requested digit count (default 2), append a
         // literal '%' (snprintf renders "%%" as one '%'). Issue #739/WR9.
         snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "2") + "f%%";
         useFloatEmit = true;
         scale = 100.0;
-    } else if (kind == 'X' && isInt) {
+    } else if (kind == 'X' && isInt && countTailOk) {
         // §18.5 X[n]: zero-padded hex to n digits minimum. The value is widened
         // to i64 below, so the conversion MUST carry the `ll` length modifier —
         // a bare `%X`/`%x` reads only the low 32 bits of the i64 argument
@@ -742,7 +833,7 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         snprintfFmt = width >= 0
             ? ("%0" + std::to_string(width) + "ll" + xch)
             : (std::string("%ll") + xch);
-    } else if (kind == 'D' && isInt) {
+    } else if (kind == 'D' && isInt && countTailOk) {
         // §18.5 D[n]: zero-padded decimal to n digits minimum. Carry the `ll`
         // length modifier (#1123) so the full 64-bit value is read, and select
         // the unsigned conversion `llu` for unsigned operands so a large
@@ -753,8 +844,14 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         snprintfFmt = width >= 0
             ? ("%0" + std::to_string(width) + dconv)
             : (std::string("%") + dconv);
+    } else if (numeric) {
+        // §18.5 / §2.18 (v0.172): the operand is intrinsically formattable
+        // (an int/float/decimal — sema admitted the spec) but the specifier is
+        // not in this type's vocabulary → the defined FormatException fault,
+        // catchable (the specifier is a compile-time constant here).
+        return emitAlwaysFormatException();
     } else {
-        return nullptr;  // unknown format spec
+        return nullptr;  // non-numeric operand — caller falls back
     }
     // Emit snprintf call.
     if (useFloatEmit) {
@@ -792,6 +889,56 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                        : builder_.CreateSExt(val, i64()));
         return emitSnprintfToString(snprintfFmt, iv);
     }
+}
+
+
+// §18.5 (v0.172, #812/#1339): dispatch a hole's format spec to a user type's
+// IFormattable.ToString(format): string. Walks the class chain for a
+// `ToString` taking one parameter (the format string). Returns null if no such
+// method exists (the caller then falls back). emitMethodCall handles both a
+// class (pointer) and a record (value) receiver.
+llvm::Value* Emitter::emitIFormattableDispatch(llvm::Value* val,
+                                               const sema::TypeSymbol* ts,
+                                               const std::string& spec) {
+    if (!ts || !val) return nullptr;
+    sema::MethodSymbol* toStr = nullptr;
+    for (const sema::TypeSymbol* cur = ts; cur && !toStr;) {
+        for (auto* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && ms->name == "ToString" && ms->params.size() == 1) {
+                toStr = ms; break;
+            }
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (auto* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+    if (!toStr) return nullptr;
+    // emitMethodCall requires a POINTER receiver when the callee's `this` is a
+    // pointer (class, and a record's `this` too, §CG29). Spill a record's struct
+    // value to a stack slot and pass its address; a class receiver is already a
+    // pointer.
+    llvm::Value* recv = val;
+    if (recv->getType()->isStructTy()) {
+        llvm::AllocaInst* slot = entryAlloca(recv->getType());
+        builder_.CreateStore(recv, slot);
+        recv = slot;
+    }
+    llvm::Value* fmtStr = lowerStringLiteral("\"" + spec + "\"", false);
+    std::vector<llvm::Value*> a{recv, fmtStr};
+    return emitMethodCall(toStr, a, false);
+}
+
+
+// §18.5 (v0.172): raise a catchable FormatException for an unrecognized
+// specifier on an intrinsically-formattable operand. The specifier is a
+// compile-time constant in interpolation, so the throw is unconditional; a
+// true-guarded throw keeps the CFG well-formed (the continuation is dead but
+// valid) and a surrounding try/catch catches it via the unwind edge.
+llvm::Value* Emitter::emitAlwaysFormatException() {
+    emitGuardThrow(builder_.getTrue(), "FormatException");
+    return lowerStringLiteral("\"\"", false);
 }
 
 
@@ -888,6 +1035,22 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
     if (prim == P::Char) {
         auto* fn = declareC("bz_char_to_string", ptrTy(), {i32()});
         return builder_.CreateCall(fn, {val}, "char.tostr");
+    }
+
+    // §2.18 (v0.172, #812/#1339): the floating no-format ToString() round-trip
+    // guarantee — produce the shortest string that reparses to the identical
+    // bit pattern (the SAME value the "R" specifier uses). Route double/float
+    // to the runtime shortest-round-trip renderer instead of a fixed-precision
+    // "%g" (which lost a digit: 1.0/3.0 → "0.333333333333333", not round-trip).
+    if (prim == P::Double) {
+        auto* fn = declareC("bz_double_to_string_r", ptrTy(),
+                            {llvm::Type::getDoubleTy(llvm_)});
+        return builder_.CreateCall(fn, {val}, "dbl.r0");
+    }
+    if (prim == P::Float) {
+        auto* fn = declareC("bz_float_to_string_r", ptrTy(),
+                            {llvm::Type::getFloatTy(llvm_)});
+        return builder_.CreateCall(fn, {val}, "flt.r0");
     }
 
     // Numeric types: snprintf into a stack buffer, then heap-copy.

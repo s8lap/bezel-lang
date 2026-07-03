@@ -514,6 +514,19 @@ void bz_guid_new(bz_guid_t* g);
 // lowercase dashed form "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
 void* bz_guid_to_string(const bz_guid_t* g);
 
+// v0.172 (stdlib §2.18): Guid "N" — 32 lowercase hex digits, no hyphens.
+void* bz_guid_to_string_n(const bz_guid_t* g);
+
+// v0.172 (#812/#1339, stdlib §2.18): floating shortest-round-trip renderers —
+// the value used by no-format ToString() and the "R" specifier.
+void* bz_double_to_string_r(double v);
+void* bz_float_to_string_r(float v);
+// v0.172 (stdlib §2.18): integer "B"/"Bn" binary rendering; `value` is the
+// operand's natural-width bit pattern zero-extended to 64 bits.
+void* bz_ulong_to_binary(uint64_t value, int32_t min_digits);
+// v0.172 (stdlib §2.18): TimeSpan "c" constant format [-][d.]hh:mm:ss[.fffffff].
+void* bz_timespan_to_string_c(int64_t ticks);
+
 // Parse the canonical 36-char dashed form from a bz_string*. Returns 1 on
 // success (writes *out), 0 on failure (leaves *out unchanged).
 int32_t bz_guid_try_parse(const void* str, bz_guid_t* out);

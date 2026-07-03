@@ -51,6 +51,90 @@ bool isPromotablePrimitive(PrimitiveType p) {
     }
 }
 
+// §18.5 / stdlib §2.18 (v0.172, #812/#1339): the FORMAT portion of an encoded
+// InterpPart::formatSpec (the codegen encoding is `[","WIDTH][":"FORMAT]`). A
+// bare alignment (`,WIDTH` with no `:FORMAT`) carries no format and applies to
+// any operand. Returns the format text (empty when there is none).
+std::string_view interpFormatPortion(const std::string& spec) {
+    std::string_view s = spec;
+    if (s.empty()) return {};
+    if (s.front() == ',') {
+        auto colon = s.find(':');
+        return (colon == std::string_view::npos) ? std::string_view()
+                                                  : s.substr(colon + 1);
+    }
+    return s;
+}
+
+// §2.18: the intrinsically-formattable primitives (integers, floating, decimal).
+// bool/char/string/Object are NOT formattable — a format spec on them is a
+// compile error.
+bool isIntrinsicallyFormattablePrim(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:  case P::SByte: case P::Short: case P::UShort:
+        case P::Int:   case P::UInt:  case P::Long:  case P::ULong:
+        case P::Float: case P::Double: case P::Decimal:
+            return true;
+        default:
+            return false;  // Bool, Char, String, Object, None
+    }
+}
+
+// The last name component of a Named TypeRef (declaration name, else the
+// AST/imported spelling). Empty when unavailable.
+std::string_view namedTypeName(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
+    if (t->declaration && !t->declaration->name.empty())
+        return t->declaration->name;
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        return t->astNode->name->parts.back();
+    if (!t->importedName.empty()) return t->importedName;
+    return {};
+}
+
+// §2.18: the intrinsically-formattable temporal + Guid builtins.
+bool isIntrinsicTemporalOrGuid(std::string_view n) {
+    return n == "DateTime" || n == "DateOnly" || n == "TimeOnly" ||
+           n == "TimeSpan" || n == "Guid";
+}
+
+// §18.5 (v0.172): does `ts` (transitively) declare `: IFormattable`? IFormattable
+// is a null-declaration builtin interface, so it never lands in `baseTypes`;
+// walk each level's AST base-type list by name, recursing through resolved base
+// classes / user interfaces for the `interface IMyFmt: IFormattable` case.
+bool declaresIFormattable(const TypeSymbol* ts) {
+    if (!ts) return false;
+    if (const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+        for (const auto& bt : td->baseTypes)
+            if (bt && bt->name && !bt->name->parts.empty() &&
+                bt->name->parts.back() == "IFormattable")
+                return true;
+    for (const TypeSymbol* b : ts->baseTypes)
+        if (declaresIFormattable(b)) return true;
+    return false;
+}
+
+// §18.5 / §2.18 (v0.172): may a hole with a real format spec apply to an operand
+// of type `t`? Nullable is transparent (null renders "null"; the spec applies to
+// the payload). An unresolved generic type parameter is admitted conservatively
+// (its concrete formattability is a bound-analysis question left to codegen).
+bool isFormattableOperandType(const TypeRef* t) {
+    if (!t) return true;  // already errored elsewhere; don't cascade
+    if (t->kind == TypeRef::Kind::Primitive)
+        return isIntrinsicallyFormattablePrim(t->primitive);
+    if (t->kind == TypeRef::Kind::Named) {
+        std::string_view n = namedTypeName(t);
+        if (isIntrinsicTemporalOrGuid(n)) return true;
+        if (t->declaration && declaresIFormattable(t->declaration)) return true;
+        // Unresolved generic type parameter (no declaration): admit.
+        if (!t->declaration) return true;
+        return false;  // plain class/record/enum/interface, Object
+    }
+    return true;  // non-Named/non-Primitive (unit/function/array): not reached
+                  // with a spec in practice; don't spuriously error.
+}
+
 // The source spelling of a primitive type, for diagnostics.
 const char* primitiveSpelling(PrimitiveType p) {
     using P = PrimitiveType;
@@ -641,6 +725,32 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // their identifiers resolve and their types are set for codegen.
         for (const auto& part : is->parts)
             if (part.expr) visitExpr(*part.expr);
+        // §18.5 dispatch rule (v0.172, #812/#1339): a hole WITH a real format
+        // spec (not a bare `,`alignment) requires an operand that is either
+        // intrinsically formattable (a numeric/temporal/Guid) or implements the
+        // auto-imported `IFormattable` interface (stdlib §2.18). A format spec on
+        // any other operand — bool/char/string/Object or a plain user type — is a
+        // compile error naming this rule. Alignment-only holes are unrestricted.
+        for (const auto& part : is->parts) {
+            if (!part.expr) continue;
+            if (interpFormatPortion(part.formatSpec).empty()) continue;
+            const TypeRef* t = ctx_.exprType(*part.expr);
+            if (t && t->kind != TypeRef::Kind::Error &&
+                !isFormattableOperandType(t)) {
+                std::string what;
+                if (t->kind == TypeRef::Kind::Primitive)
+                    what = std::string("`") + primitiveSpelling(t->primitive) + "`";
+                else if (!namedTypeName(t).empty())
+                    what = std::string("`") + std::string(namedTypeName(t)) + "`";
+                else
+                    what = "this operand";
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "a format spec requires an intrinsically-formattable operand "
+                    "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
+                    + what + " is neither (\xC2\xA7""18.5)");
+            }
+        }
         ctx_.setExprType(
             &e, ctx_.primitiveTypeRef(PrimitiveType::String));
         return;

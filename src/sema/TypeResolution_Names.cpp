@@ -57,7 +57,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §2.14 / issue #550: ISerializer / IDeserializer — parameter types in
         // the synthesised / hand-written Serialize(s: ISerializer) /
         // Deserialize(d: IDeserializer) signatures (stdlib §2.14).
-        n == "ISerializer" || n == "IDeserializer") {
+        n == "ISerializer" || n == "IDeserializer" ||
+        // §18.5 / stdlib §2.18 (v0.172, #812/#1339): IFormattable — the opt-in
+        // interface a user type implements to accept a string-interpolation
+        // format spec (`ToString(format: string): string`). Zero-arity,
+        // auto-imported; resolved here so `: IFormattable` compiles.
+        n == "IFormattable") {
         return 0;
     }
     // Slice S25 (§31.4): language-built-in exception types, all
