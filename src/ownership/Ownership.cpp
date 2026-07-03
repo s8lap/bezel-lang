@@ -1103,6 +1103,29 @@ FlowState MethodOwnership::runDataflow(
                         lo.state = OwnershipState::Disposed;
                 pePtr = &peGuard;
             }
+            // §28.3 / #1407: on the FALSE edge (succs[1]) of a non-loop
+            // if/elif Branch that declared `out owned var` locals, those
+            // locals were NOT written (TryPop returned false) and must be
+            // demoted to PolyNull so that a discharge inside the then-branch
+            // alone (item?.Dispose()) is not reported as spurious. PolyNull
+            // absorbs into Disposed at the merge: Disposed ⊓ PolyNull =
+            // Disposed, satisfying the obligation without a false warning.
+            {
+                auto ifIt = ifCondOutOwnedSyms_.find(p);
+                if (ifIt != ifCondOutOwnedSyms_.end() &&
+                    !p->isLoopHeader &&
+                    p->succs.size() >= 2 &&
+                    p->succs[1] == b) {
+                    if (pePtr == &peBase) {
+                        peGuard = peBase;
+                        pePtr = &peGuard;
+                    }
+                    for (auto& [sym, lo] : peGuard)
+                        if (sym && ifIt->second.count(sym) &&
+                            lo.state == OwnershipState::Owned)
+                            lo.state = OwnershipState::PolyNull;
+                }
+            }
             const BlockState& pe = *pePtr;
             if (!haveIn) {
                 in = pe;
@@ -1316,8 +1339,6 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // state for loop headers in loopSkipExitState_ so computeEntry can use
     // it when folding the header→after skip edge, giving the false edge the
     // correct pre-condition state instead of the Owned post-condition state.
-    // For if/elif conditions (isLoopHeader=false) the false edge IS the else
-    // branch and sema already models `item?.Dispose()` covering both paths.
     if (block.kind == flow::CFGBlock::Kind::Branch && block.condition) {
         if (block.isLoopHeader) {
             // Capture the pre-condition state for the skip edge.  Both the
@@ -1331,6 +1352,19 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
             // values would leak. Track these symbols so the auto-drop check in
             // run() can exclude them (they keep the hard §28.3 discharge error).
             collectOutOwnedVarSyms(*block.condition, ctx_, loopCondOutOwnedSyms_);
+        } else {
+            // §28.3 / #1407: for an if/elif condition (non-loop) that declares
+            // `out owned var` locals, record the symbols so foldPred can demote
+            // them to PolyNull on the FALSE edge (TryPop returned false → did
+            // NOT write the local). handleDischarge marks them Owned
+            // unconditionally (conservative for the false path), but the join
+            // must use PolyNull on the false edge so `item?.Dispose()` inside
+            // the then-branch alone correctly satisfies the obligation.
+            // // per §28.3, #1407
+            std::unordered_set<sema::Symbol*> condSyms;
+            collectOutOwnedVarSyms(*block.condition, ctx_, condSyms);
+            if (!condSyms.empty())
+                ifCondOutOwnedSyms_[&block] = std::move(condSyms);
         }
         handleDischarge(*block.condition);
     }

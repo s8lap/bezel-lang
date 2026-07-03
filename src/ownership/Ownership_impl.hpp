@@ -260,6 +260,20 @@ private:
     // by computeEntry's foldPred lambda. // per §28.3, #892
     std::unordered_map<const flow::CFGBlock*, FlowState> loopSkipExitState_;
 
+    // §28.3 / #1407: for each non-loop if/elif Branch block whose condition
+    // declares `out owned var` inline locals, the set of those symbols. On the
+    // FALSE edge (TryPop returned false → the local was NOT written), those
+    // symbols retain their pre-condition state — null/absent, NOT the Owned
+    // state handleDischarge marks unconditionally. foldPred in computeEntry
+    // demotes them to PolyNull on the false edge so a discharge inside the
+    // then-branch alone correctly satisfies the obligation:
+    //   then-branch exit: Disposed ⊓ false-edge: PolyNull = Disposed (OK)
+    // vs. the pre-fix wrong meet:
+    //   then-branch exit: Disposed ⊓ false-edge: Owned = Owned (spurious).
+    // Monotone (grows only), fixpoint-safe. // per §28.3, #1407
+    std::unordered_map<const flow::CFGBlock*,
+                       std::unordered_set<sema::Symbol*>> ifCondOutOwnedSyms_;
+
     // Slice O3b: the loop fixpoint re-processes loop bodies until the
     // per-block states stabilize. The transfer functions emit diagnostics
     // as a side effect; running them while iterating to the fixpoint would
