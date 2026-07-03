@@ -43,9 +43,14 @@ Multiple calls to `Subscribe(kind)` each return a distinct, independently-owned 
 
 ### D4 — Delivery mechanism from signal handler to channel
 
-The OS signal handler is a **non-capturing static function** registered via FFI (§32). This satisfies the §32 rule for long-lived registrations: "a static-method/non-capturing-lambda callback has no environment and its code address is process-lifetime — such a pointer may be retained by native code and remains valid until process exit."
+*(Corrected in review, 2026-07-04: the original draft had the raw signal handler acquire the subscriber-list lock and call `Send` directly. That is **async-signal-unsafe** — POSIX permits only the async-signal-safe function set inside a handler; a lock acquisition can deadlock against the very thread the signal interrupted, and a channel send may allocate. §30.12 synchronization makes a call safe from a foreign **thread**, not from a signal handler, which is a more restrictive context than any thread.)*
 
-Inside the signal handler, the only operations performed are a lock acquisition (to walk the subscriber list) and `ChannelSender<SignalKind>.Send(kind)` on each registered sender. `ChannelSender<SignalKind>` is internally synchronized (§30.12), making this call safe from a foreign thread. This is exactly the §32 discipline: "a callback invoked from a foreign thread must confine itself to §30.12-synchronized state."
+Delivery is two-stage, the standard self-pipe pattern:
+
+1. **The raw handler does one async-signal-safe operation and nothing else**: a `write(2)` of the signal number to a runtime-owned pre-created pipe (on Linux the runtime may instead use `signalfd(2)` and install no handler at all — an implementation choice behind the same surface). `write` is on the POSIX async-signal-safe list; no locks, no allocation, no runtime calls.
+2. **A runtime drain thread** reads the pipe in ordinary thread context, and *there* takes the subscriber-list lock and calls `ChannelSender<SignalKind>.Send(kind)` on each registered sender — `ChannelSender` is internally synchronized (§30.12), making that call safe from a foreign *thread*, which the drain thread is. This is the §32 discipline applied where it actually holds.
+
+The pipe is the coalescing point as well: if it is full (signals arriving faster than the drain thread runs), the `write` fails with `EAGAIN` and the delivery coalesces — consistent with D5's lossy contract and with the kernel's own pending-signal merging.
 
 ### D5 — Bounded channel capacity; coalescing on full
 
