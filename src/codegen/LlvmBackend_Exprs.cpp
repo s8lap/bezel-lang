@@ -2972,7 +2972,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 bool isSetName = tt->astNode && tt->astNode->name &&
                                  !tt->astNode->name->parts.empty() &&
                                  (tt->astNode->name->parts[0] == "Set" ||
-                                  tt->astNode->name->parts[0] == "OwningSet");
+                                  tt->astNode->name->parts[0] == "OwningSet" ||
+                                  // stdlib §4.18 (#1426): SortedSet<T> shares
+                                  // the generic-key hash table (bz_dict_t*).
+                                  tt->astNode->name->parts[0] == "SortedSet");
                 bool dictBacked = isSetName &&
                     genericBackingType(tt, 0, /*isSet=*/true, nullptr) != nullptr;
                 llvm::Value* obj = lowerExpr(*ma->target);
@@ -3080,6 +3083,117 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     // UAF / double-free).
                     freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), obj, tt);
                     return cnt;
+                }
+            }
+        }
+    }
+    // fix #1426 / stdlib §4.18: SortedSet<T>.First (least) and SortedSet<T>.Last
+    // (greatest) as MemberAccessExpr (no parens — stdlib properties, not methods).
+    // The parser generates a MemberAccessExpr for zero-arg property-style access
+    // that bypasses tryLowerCollectionInstanceCall (which handles CallExpr only).
+    // fix #1426 / stdlib §4.17: SortedDictionary<K,V>.FirstKey / LastKey — same.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) {
+            bool isSortedSetMember  = (ma->member == "First"    || ma->member == "Last");
+            bool isSortedDictMember = (ma->member == "FirstKey" || ma->member == "LastKey");
+            if (isSortedSetMember || isSortedDictMember) {
+                auto* tt = ctx_.exprType(*ma->target);
+                if (tt && !tt->declaration && tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    auto tyn = tt->astNode->name->parts[0];
+                    bool isSortedSet  = isSortedSetMember  && tyn == "SortedSet";
+                    bool isSortedDict = isSortedDictMember && tyn == "SortedDictionary";
+                    if (isSortedSet || isSortedDict) {
+                        // Determine the key TypeRef.
+                        const sema::TypeRef* keyTy = nullptr;
+                        bool isStringKey = false;
+                        if (isSortedSet) {
+                            // Element type (arg 0) — use the generic-backing path.
+                            keyTy = genericBackingType(tt, 0, /*isSet=*/true, nullptr);
+                        } else {
+                            // SortedDictionary<K,V>: K is arg 0.
+                            if (!tt->genericArgs.empty() && tt->genericArgs[0]) {
+                                keyTy = tt->genericArgs[0];
+                                isStringKey =
+                                    keyTy->kind == sema::TypeRef::Kind::Primitive &&
+                                    keyTy->primitive == sema::PrimitiveType::String &&
+                                    !keyTy->nullable;
+                            }
+                        }
+                        if (keyTy) {
+                            llvm::Value* obj = lowerExpr(*ma->target);
+                            if (obj) {
+                                bool isMax = (ma->member == "Last" ||
+                                             ma->member == "LastKey");
+                                // Guard: empty → InvalidOperationException.
+                                auto* cntFn = declareC("bz_dict_count", i64(),
+                                                       {ptrTy()});
+                                llvm::Value* cnt = builder_.CreateCall(
+                                    cntFn, {obj}, "sp.cnt");
+                                emitGuardThrow(
+                                    builder_.CreateICmpEQ(cnt, builder_.getInt64(0)),
+                                    "InvalidOperationException");
+                                if (isStringKey) {
+                                    // bz_dict_min/max_key_str fills data+len slots.
+                                    // Build a heap bz_string from returned bytes
+                                    // (same pattern as FirstKey/LastKey in
+                                    // tryLowerCollectionInstanceCall / #1426).
+                                    const char* rn = isMax ? "bz_dict_max_key_str"
+                                                           : "bz_dict_min_key_str";
+                                    auto* skFn = declareC(rn, i1(),
+                                        {ptrTy(), ptrTy(), ptrTy()});
+                                    llvm::AllocaInst* dSlot = entryAlloca(ptrTy());
+                                    llvm::AllocaInst* lSlot = entryAlloca(i64());
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()), dSlot);
+                                    builder_.CreateStore(builder_.getInt64(0), lSlot);
+                                    builder_.CreateCall(skFn, {obj, dSlot, lSlot});
+                                    llvm::Value* kdata =
+                                        builder_.CreateLoad(ptrTy(), dSlot, "sp.kd");
+                                    llvm::Value* klen =
+                                        builder_.CreateLoad(i64(), lSlot, "sp.kl");
+                                    auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                                    uint64_t strSz2 = module_->getDataLayout()
+                                        .getTypeAllocSize(stringType());
+                                    auto* callocFn2 = declareC("calloc", ptrTy(),
+                                        {i64(), i64()});
+                                    llvm::Value* sObj = builder_.CreateCall(
+                                        callocFn2, {builder_.getInt64(1),
+                                                    builder_.getInt64((int64_t)strSz2)});
+                                    builder_.CreateStore(kdata,
+                                        builder_.CreateStructGEP(stringType(),sObj,0));
+                                    builder_.CreateStore(klen,
+                                        builder_.CreateStructGEP(stringType(),sObj,1));
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty2, 1),
+                                        builder_.CreateStructGEP(stringType(),sObj,2));
+                                    initStringRc(sObj);
+                                    return sObj;
+                                }
+                                // Generic key path.
+                                llvm::Function* cmpFn =
+                                    buildSortedKeyComparator(keyTy);
+                                if (cmpFn) {
+                                    const char* rn2 = isMax ? "bz_dict_max_key_gen"
+                                                            : "bz_dict_min_key_gen";
+                                    auto* mmFn = declareC(rn2, ptrTy(),
+                                                          {ptrTy(), ptrTy()});
+                                    llvm::Value* kPtr = builder_.CreateCall(
+                                        mmFn, {obj, cmpFn}, "sp.mm");
+                                    llvm::Type* kLlvm = lowerTypeRef(keyTy);
+                                    if (kLlvm) {
+                                        llvm::Value* kVal = builder_.CreateLoad(
+                                            kLlvm, kPtr, "sp.kv");
+                                        auto* ffn = declareC("free",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy()});
+                                        builder_.CreateCall(ffn, {kPtr});
+                                        return kVal;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8725,7 +8839,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // covers records (#343), primitives/enums, AND strings (D8: the
             // array backing cannot deduplicate). Stored value is a non-null
             // sentinel (membership only).
-            if ((colName == "Set" || colName == "OwningSet")) {
+            if ((colName == "Set" || colName == "OwningSet" ||
+                 // stdlib §4.18 (#1426): SortedSet<T> shares the generic-key
+                 // hash table backing of Set<T> (bz_dict_alloc_generic with a
+                 // sentinel value for membership-only entries).  Without this
+                 // branch lowerNew returned nullptr, leaving the slot uninitialized
+                 // — same root cause as #1406 for SortedDictionary.
+                 colName == "SortedSet")) {
                 uint64_t ksz = 0;
                 if (const sema::TypeRef* elemTy =
                         genericBackingType(rt, 0, /*isSet=*/true, &ksz)) {

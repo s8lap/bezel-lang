@@ -70,12 +70,16 @@ BEZEL_TEST(builtin_registry_snapshot, array_backed_collection_set) {
         "Array",  "OwningArray", "OwningBuffer",
         "Stack",  "OwningStack", "Queue",
         "OwningQueue", "Set",    "OwningSet",
+        // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet joined the
+        // collection-dispatch gate — it was MISSING pre-#1426 (i32-typed,
+        // lowerNew no-op), the 4th missed-name-list instance.
+        "SortedSet",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n));
     // LinkedList (bz_llist_t) and Dictionary (bz_dict_t) are NOT array-backed.
     for (std::string_view n : {"LinkedList", "OwningLinkedList", "Dictionary",
                                "OwningDictionary", "SortedDictionary",
-                               "SortedSet", "Buffer", ""})
+                               "Buffer", ""})
         BEZEL_EXPECT_FALSE(isArrayBackedCollectionName(n));
 }
 
@@ -106,9 +110,11 @@ BEZEL_TEST(builtin_registry_snapshot, linked_list_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 60> kSnapshot = {
+    static constexpr std::array<std::string_view, 61> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
-        "SortedDictionary", "Stack", "OwningStack", "Queue", "OwningQueue",
+        // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
+        // rep on both the astNode and imported paths.
+        "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
         "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
         "StringBuilder", "Random",
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
@@ -135,6 +141,6 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
     // Value-type / span / temporal builtins are NOT heap-pointer references.
     for (std::string_view n : {"DateTime", "TimeSpan", "Guid", "Range", "Span",
                                "ReadOnlySpan", "ArraySpan", "ReadOnlyStringSpan",
-                               "JsonOptions", "SortedSet", "Boolean", ""})
+                               "JsonOptions", "Boolean", ""})
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
 }

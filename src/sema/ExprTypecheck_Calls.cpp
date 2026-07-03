@@ -3685,8 +3685,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else if (m == "Contains" || m == "Remove" || m == "TryAdd")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // Add returns unit (no explicit type set → defaults to unit).
-                        // Min / Max — return the element type T.
-                        else if ((m == "Min" || m == "Max") && recvTy &&
+                        // fix #1426 / stdlib §4.18: First (least) and Last (greatest)
+                        // return the element type T. The old sema used "Min"/"Max"
+                        // erroneously — the stdlib spec says First/Last.
+                        else if ((m == "First" || m == "Last") && recvTy &&
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0])
                             ctx_.setExprType(&ce, recvTy->genericArgs[0]);

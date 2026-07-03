@@ -899,6 +899,181 @@ void bz_dict_values_gen(void* dp, void*** vals_out, int64_t* n_out) {
     if (n_out)    *n_out    = j;
 }
 
+// fix #1426 / stdlib §4.17–§4.18: SortedDictionary<K,V> and SortedSet<T>
+// ordered-key accessors and sorted-snapshot helpers.
+//
+// bz_dict_min_key_gen / bz_dict_max_key_gen — O(n) scan of a generic-key dict
+// (key_size > 0) for the least or greatest key.  Returns a malloc'd copy of the
+// winning key's bytes (key_size bytes), or NULL if the dict is empty or null.
+// Caller must free the returned pointer.
+// cmp(a, b): a, b are pointers to key_size bytes (the raw key bytes directly —
+// NOT void** pointers to pointers) — matching buildSortedKeyComparator() in codegen.
+// Empty-dict check is performed by codegen before calling (InvalidOperationException
+// path), but these guard NULL/empty defensively anyway.
+
+void* bz_dict_min_key_gen(void* dp,
+                           int (*cmp)(const void* a, const void* b)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0 || d->key_size <= 0) return nullptr;
+    const void* best = nullptr;
+    for (int64_t oi = 0; oi < d->order_count; oi++) {
+        int64_t slot = d->order[oi];
+        if (slot < 0) continue;
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;
+        if (!best || cmp(e.key, best) < 0) best = e.key;
+    }
+    if (!best) return nullptr;
+    void* out = malloc((size_t)d->key_size);
+    memcpy(out, best, (size_t)d->key_size);
+    return out;
+}
+
+void* bz_dict_max_key_gen(void* dp,
+                           int (*cmp)(const void* a, const void* b)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0 || d->key_size <= 0) return nullptr;
+    const void* best = nullptr;
+    for (int64_t oi = 0; oi < d->order_count; oi++) {
+        int64_t slot = d->order[oi];
+        if (slot < 0) continue;
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;
+        if (!best || cmp(e.key, best) > 0) best = e.key;
+    }
+    if (!best) return nullptr;
+    void* out = malloc((size_t)d->key_size);
+    memcpy(out, best, (size_t)d->key_size);
+    return out;
+}
+
+// bz_dict_min_key_str / bz_dict_max_key_str — O(n) scan of a string-key dict
+// (key_size == 0) for the least or greatest key.
+// Fills *out_data (strndup'd copy) and *out_len.  Returns false if empty.
+// Caller must free(*out_data) after use.
+// Ordinal (strcmp) comparison per §9.6.
+
+bool bz_dict_min_key_str(void* dp, char** out_data, int64_t* out_len) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0) return false;
+    const char* best = nullptr;
+    int64_t best_len = 0;
+    for (int64_t oi = 0; oi < d->order_count; oi++) {
+        int64_t slot = d->order[oi];
+        if (slot < 0) continue;
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;
+        if (!best || strcmp(e.key, best) < 0) { best = e.key; best_len = e.key_len; }
+    }
+    if (!best) return false;
+    if (out_data) *out_data = strndup(best, (size_t)best_len);
+    if (out_len)  *out_len  = best_len;
+    return true;
+}
+
+bool bz_dict_max_key_str(void* dp, char** out_data, int64_t* out_len) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0) return false;
+    const char* best = nullptr;
+    int64_t best_len = 0;
+    for (int64_t oi = 0; oi < d->order_count; oi++) {
+        int64_t slot = d->order[oi];
+        if (slot < 0) continue;
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;
+        if (!best || strcmp(e.key, best) > 0) { best = e.key; best_len = e.key_len; }
+    }
+    if (!best) return false;
+    if (out_data) *out_data = strndup(best, (size_t)best_len);
+    if (out_len)  *out_len  = best_len;
+    return true;
+}
+
+// Sorted-snapshot helpers for SortedDictionary/SortedSet ordered iteration.
+// O(n log n) per enumeration (hash-backing limitation).
+// A real ordered rep (tree/skiplist) rides #545 (self-hosted collections).
+// Each helper takes snapshot arrays produced by bz_dict_keys_gen /
+// bz_dict_values_gen and reorders them IN PLACE.
+
+struct BzKVSortCtxGen {
+    void** keys;
+    int (*cmp)(const void* a, const void* b);
+};
+static int bz_kv_idx_cmp_gen(const void* ia, const void* ib, void* c) {
+    auto* ctx = (BzKVSortCtxGen*)c;
+    int64_t i = *(const int64_t*)ia, j = *(const int64_t*)ib;
+    // keys[i]/keys[j] are void* pointing to key bytes; pass them directly.
+    return ctx->cmp(ctx->keys[i], ctx->keys[j]);
+}
+struct BzKVSortCtxStr { char** keys; };
+static int bz_kv_idx_cmp_str(const void* ia, const void* ib, void* c) {
+    auto* ctx = (BzKVSortCtxStr*)c;
+    int64_t i = *(const int64_t*)ia, j = *(const int64_t*)ib;
+    return strcmp(ctx->keys[i], ctx->keys[j]);
+}
+
+// bz_sort_kv_gen: reorder keys[] and values[] together in ascending key order.
+// keys[i] = void* (pointer to raw key bytes); values[i] = void* (stored value).
+// cmp(a, b): a, b = direct pointers to key bytes (NOT void** of void*).
+void bz_sort_kv_gen(void** keys, void** values, int64_t n,
+                    int (*cmp)(const void* a, const void* b)) {
+    if (n <= 1 || !keys || !cmp) return;
+    int64_t* idx = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!idx) return;
+    for (int64_t i = 0; i < n; i++) idx[i] = i;
+    BzKVSortCtxGen ctx = {keys, cmp};
+    qsort_r(idx, (size_t)n, sizeof(int64_t), bz_kv_idx_cmp_gen, &ctx);
+    void** ks = (void**)malloc((size_t)n * sizeof(void*));
+    void** vs = values ? (void**)malloc((size_t)n * sizeof(void*)) : nullptr;
+    if (!ks) { free(idx); return; }
+    for (int64_t i = 0; i < n; i++) {
+        ks[i] = keys[idx[i]];
+        if (vs) vs[i] = values[idx[i]];
+    }
+    memcpy(keys, ks, (size_t)n * sizeof(void*));
+    if (vs) { memcpy(values, vs, (size_t)n * sizeof(void*)); free(vs); }
+    free(ks); free(idx);
+}
+
+// bz_sort_kv_str: reorder char** keys + int64_t* lens + void** values together
+// in ascending lexicographic string order (§9.6).
+void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n) {
+    if (n <= 1 || !keys) return;
+    int64_t* idx = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!idx) return;
+    for (int64_t i = 0; i < n; i++) idx[i] = i;
+    BzKVSortCtxStr ctx = {keys};
+    qsort_r(idx, (size_t)n, sizeof(int64_t), bz_kv_idx_cmp_str, &ctx);
+    char**   ks = (char**)malloc((size_t)n * sizeof(char*));
+    int64_t* ls = lens   ? (int64_t*)malloc((size_t)n * sizeof(int64_t)) : nullptr;
+    void**   vs = values ? (void**)malloc((size_t)n * sizeof(void*)) : nullptr;
+    if (!ks) { free(idx); return; }
+    for (int64_t i = 0; i < n; i++) {
+        ks[i] = keys[idx[i]];
+        if (ls) ls[i] = lens[idx[i]];
+        if (vs) vs[i] = values[idx[i]];
+    }
+    memcpy(keys, ks, (size_t)n * sizeof(char*));
+    if (ls) { memcpy(lens, ls, (size_t)n * sizeof(int64_t)); free(ls); }
+    if (vs) { memcpy(values, vs, (size_t)n * sizeof(void*)); free(vs); }
+    free(ks); free(idx);
+}
+
+// bz_sort_keys_gen: sort a void** key-bytes-pointer array in ascending order.
+// Thin wrapper over bz_sort_kv_gen (values=null).
+// Used for SortedSet<T> element iteration (§4.18).
+void bz_sort_keys_gen(void** keys, int64_t n,
+                      int (*cmp)(const void* a, const void* b)) {
+    bz_sort_kv_gen(keys, nullptr, n, cmp);
+}
+
+// bz_sort_keys_str: sort char** key-data + int64_t* lens in ascending order.
+// Thin wrapper over bz_sort_kv_str (values=null).
+// Used for SortedDictionary<string,V>.Keys sorted iteration (§4.17).
+void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n) {
+    bz_sort_kv_str(keys, lens, nullptr, n);
+}
+
 // issue #628 / stdlib §4.9 v0.135: OwningDictionary<K,V>.Drain() per-entry pop.
 //
 // bz_dict_drain_next_str — string-keyed dict (key_size == 0).

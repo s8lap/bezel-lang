@@ -321,6 +321,40 @@ void bz_dict_values_str(void* d, void*** vals_out, int64_t* n_out);
 // bz_dict_values_gen — for generic-key dictionaries (key_size > 0). Returns
 // the same shape: a malloc'd void** array of `n` slot values.
 void bz_dict_values_gen(void* d, void*** vals_out, int64_t* n_out);
+
+// fix #1426 / stdlib §4.17–§4.18: SortedDictionary/SortedSet ordered-key
+// accessors.  O(n) scans over the hash-table representation.
+//
+// bz_dict_min_key_gen / bz_dict_max_key_gen — return a malloc'd copy of the
+// least/greatest key bytes from a generic-key dict.  NULL if empty.
+// cmp(a, b): a, b are direct pointers to key bytes (NOT void** of void*).
+void* bz_dict_min_key_gen(void* d, int (*cmp)(const void* a, const void* b));
+void* bz_dict_max_key_gen(void* d, int (*cmp)(const void* a, const void* b));
+//
+// bz_dict_min_key_str / bz_dict_max_key_str — least/greatest key in a string-key
+// dict.  Fills *out_data (strndup'd) and *out_len.  Returns false if empty.
+bool bz_dict_min_key_str(void* d, char** out_data, int64_t* out_len);
+bool bz_dict_max_key_str(void* d, char** out_data, int64_t* out_len);
+//
+// Sorted-snapshot helpers: reorder snapshot arrays in ascending key order.
+// O(n log n); used for SortedDictionary/SortedSet iteration (§4.17/§4.18).
+//
+// bz_sort_kv_gen: sort keys[] and values[] together.
+// cmp(a, b): a, b = direct pointers to key bytes.
+void bz_sort_kv_gen(void** keys, void** values, int64_t n,
+                    int (*cmp)(const void* a, const void* b));
+//
+// bz_sort_kv_str: sort char** keys + int64_t* lens + void** values together
+// by lexicographic string comparison (§9.6).
+void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n);
+//
+// bz_sort_keys_gen: sort a void** key-bytes-pointer array in ascending order.
+void bz_sort_keys_gen(void** keys, int64_t n,
+                      int (*cmp)(const void* a, const void* b));
+//
+// bz_sort_keys_str: sort char** + int64_t* arrays in ascending string order.
+void bz_sort_keys_str(char** keys, int64_t* lens, int64_t n);
+
 //
 // #628 / stdlib §4.9 v0.135: ownership-transferring drain iteration.
 //

@@ -7514,7 +7514,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 collTy->astNode && collTy->astNode->name &&
                 !collTy->astNode->name->parts.empty() &&
                 (collTy->astNode->name->parts[0] == "Set" ||
-                 collTy->astNode->name->parts[0] == "OwningSet");
+                 collTy->astNode->name->parts[0] == "OwningSet" ||
+                 // stdlib §4.18 (#1426): SortedSet shares the bz_dict_t* rep.
+                 collTy->astNode->name->parts[0] == "SortedSet");
             // #1012 / §4.10: a Set/OwningSet is DICT-BACKED whenever its element is
             // generic-dict-eligible (records, non-nullable primitives/enums, and —
             // for sets — strings; see genericBackingType / lowerNew). Such a Set

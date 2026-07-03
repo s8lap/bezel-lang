@@ -3192,7 +3192,8 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
 // existing bz_dict_keys_str-based behavior for string keys.
 bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
                                      llvm::Value* tableObj,
-                                     const sema::TypeRef* elemTyRef) {
+                                     const sema::TypeRef* elemTyRef,
+                                     bool sorted) {
     if (!tableObj || !elemTyRef) return false;
     llvm::Type* elemTy = lowerTypeRef(elemTyRef);
     if (!elemTy) return false;
@@ -3210,6 +3211,22 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
     builder_.CreateCall(keysFn, {tableObj, keysOutSlot, cntSlot});
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);  // void**
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+    // fix #1426 / stdlib §4.18: for SortedSet, sort the snapshot in ascending
+    // key order before iterating. O(n log n) — hash-backing limitation; real
+    // ordered rep rides #545.  buildSortedKeyComparator is null for unsupported
+    // key types (record/decimal) — leave unsorted in that case (correctness note
+    // in the commit message; follow-up needed for those types).
+    if (sorted) {
+        llvm::Function* cmpFn = buildSortedKeyComparator(elemTyRef);
+        if (cmpFn) {
+            auto* sortFn = declareC("bz_sort_keys_gen", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(sortFn, {keysArr, cnt, cmpFn});
+        }
+        // If cmpFn is null, fall through unsorted (unsupported elem type).
+    }
+
     auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
     auto* idxSlot = entryAlloca(i64());
@@ -3273,13 +3290,18 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
         iterTy->astNode->name->parts.empty() || iterTy->declaration)
         return false;
     auto n = iterTy->astNode->name->parts[0];
-    if (n != "Set" && n != "OwningSet") return false;
+    if (n != "Set" && n != "OwningSet" &&
+        // stdlib §4.18 (#1426): SortedSet<T> uses the same generic-key hash table.
+        // Route through emitGenericKeyTableFor with sorted=true so elements are
+        // visited in ascending order per §4.18's ordered-iteration contract.
+        n != "SortedSet") return false;
     const sema::TypeRef* elemTy =
         genericBackingType(iterTy, 0, /*isSet=*/true, nullptr);
     if (!elemTy) return false;  // not dict-backed → let lowerArrayFor handle it
     llvm::Value* setObj = lowerExpr(*fs.iterable);
     if (!setObj) return false;
-    return emitGenericKeyTableFor(fs, setObj, elemTy);
+    bool sorted = (n == "SortedSet");
+    return emitGenericKeyTableFor(fs, setObj, elemTy, sorted);
 }
 
 
@@ -3674,6 +3696,35 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
                                : nullptr;
     llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+    // fix #1426 / stdlib §4.17: for SortedDictionary, sort keys and values
+    // together in ascending key order before the loop.  O(n log n) per
+    // enumeration (hash-backing limitation; ordered rep rides #545).
+    if (dictTy && dictTy->astNode && dictTy->astNode->name &&
+        !dictTy->astNode->name->parts.empty() &&
+        dictTy->astNode->name->parts[0] == "SortedDictionary") {
+        if (useGen) {
+            const sema::TypeRef* kTy =
+                genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);
+            llvm::Function* cmpFn = kTy ? buildSortedKeyComparator(kTy) : nullptr;
+            if (cmpFn) {
+                auto* sortKvFn = declareC("bz_sort_kv_gen",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(sortKvFn, {keysArr, valsArr, cnt, cmpFn});
+            }
+        } else {
+            // String-key: sort keys (char**), lens (i64*), and values together.
+            auto* sortKvStrFn = declareC("bz_sort_kv_str",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), ptrTy(), ptrTy(), i64()});
+            llvm::Value* lensForSort = lensArr
+                ? lensArr
+                : llvm::ConstantPointerNull::get(ptrTy());
+            builder_.CreateCall(sortKvStrFn,
+                {keysArr, lensForSort, valsArr, cnt});
+        }
+    }
 
     auto* idxSlot = entryAlloca(i64());
     builder_.CreateStore(builder_.getInt64(0), idxSlot);

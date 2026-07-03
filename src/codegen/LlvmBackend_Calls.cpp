@@ -936,7 +936,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
                          !recvTy->astNode->name->parts.empty() &&
                          (recvTy->astNode->name->parts[0] == "Set" ||
-                          recvTy->astNode->name->parts[0] == "OwningSet");
+                          recvTy->astNode->name->parts[0] == "OwningSet" ||
+                          // stdlib §4.18 (#1426): SortedSet<T> shares the generic-key
+                          // hash table backing of Set/OwningSet.
+                          recvTy->astNode->name->parts[0] == "SortedSet");
         if (isSetName) {
             if (const sema::TypeRef* elemTy =
                     genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
@@ -1097,6 +1100,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             m, recv, *call.args[0].value, elemTy, elemIsRecord))
                         return res;
                     // other element type mismatched self → defer (fall out).
+                }
+                // fix #1426 / stdlib §4.18: SortedSet<T>.First (least) and
+                // SortedSet<T>.Last (greatest) — O(n) scan returning the
+                // min/max element by K's CompareTo order.  Throws
+                // InvalidOperationException on empty set (§4.18).
+                // Only available on SortedSet; not on Set/OwningSet.
+                bool isSortedSetRecv =
+                    recvTy->astNode->name->parts[0] == "SortedSet";
+                if (isSortedSetRecv &&
+                    (m == "First" || m == "Last") && call.args.empty()) {
+                    bool isMax = (m == "Last");
+                    // Guard: empty set throws InvalidOperationException.
+                    auto* cntFn = declareC("bz_dict_count", i64(), {ptrTy()});
+                    llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "ss.cnt");
+                    emitGuardThrow(
+                        builder_.CreateICmpEQ(cnt, builder_.getInt64(0)),
+                        "InvalidOperationException");
+                    // Build comparator for the element type.
+                    llvm::Function* cmpFn = buildSortedKeyComparator(elemTy);
+                    if (!cmpFn) return nullptr;  // unsupported elem type
+                    // Call runtime: returns malloc'd copy of min/max key bytes.
+                    const char* rtName = isMax ? "bz_dict_max_key_gen"
+                                               : "bz_dict_min_key_gen";
+                    auto* minmaxFn = declareC(rtName, ptrTy(), {ptrTy(), ptrTy()});
+                    llvm::Value* keyPtr = builder_.CreateCall(
+                        minmaxFn, {recv, cmpFn}, "ss.mm");
+                    // Load the element value from the returned bytes, then free.
+                    llvm::Type* elemLlvm = lowerTypeRef(elemTy);
+                    if (!elemLlvm) return nullptr;
+                    llvm::Value* elemVal = builder_.CreateLoad(
+                        elemLlvm, keyPtr, "ss.elem");
+                    auto* freeFn = declareC("free",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                    builder_.CreateCall(freeFn, {keyPtr});
+                    return elemVal;
                 }
                 return nullptr;  // remaining ops scoped out for dict-backed sets
             }
@@ -4618,6 +4656,70 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // allocated and must be reclaimed. Null-safe.
             if (factoryIsInlineLambda) emitClosureRelease(closure);
             return phi;
+        }
+
+        // fix #1426 / stdlib §4.17: SortedDictionary<K,V>.FirstKey (least key)
+        // and .LastKey (greatest key) — O(n) scan over the hash-table rep.
+        // Throws InvalidOperationException if the dict is empty (§4.17).
+        // Only meaningful on SortedDictionary; regular Dictionary has no such
+        // property and sema rejects it there.
+        bool isSortedDictRecv = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                                !recvTy->astNode->name->parts.empty() &&
+                                recvTy->astNode->name->parts[0] == "SortedDictionary";
+        if (isSortedDictRecv && (m == "FirstKey" || m == "LastKey") &&
+            call.args.empty()) {
+            bool isMax = (m == "LastKey");
+            // Guard: empty dict throws InvalidOperationException.
+            auto* cntFn = declareC("bz_dict_count", i64(), {ptrTy()});
+            llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "sd.cnt");
+            emitGuardThrow(builder_.CreateICmpEQ(cnt, builder_.getInt64(0)),
+                           "InvalidOperationException");
+
+            if (keyTy) {
+                // Generic-key path: build comparator, call bz_dict_min/max_key_gen.
+                llvm::Function* cmpFn = buildSortedKeyComparator(keyTy);
+                if (!cmpFn) return nullptr;  // unsupported key type
+                const char* rtName = isMax ? "bz_dict_max_key_gen"
+                                           : "bz_dict_min_key_gen";
+                auto* mmFn = declareC(rtName, ptrTy(), {ptrTy(), ptrTy()});
+                llvm::Value* keyBytesPtr = builder_.CreateCall(
+                    mmFn, {recv, cmpFn}, "sd.mm");
+                // Load the key value, then free the malloc'd copy.
+                llvm::Type* keyLlvmTy = lowerTypeRef(keyTy);
+                if (!keyLlvmTy) return nullptr;
+                llvm::Value* keyVal = builder_.CreateLoad(
+                    keyLlvmTy, keyBytesPtr, "sd.key");
+                auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()});
+                builder_.CreateCall(freeFn2, {keyBytesPtr});
+                return keyVal;
+            } else {
+                // String-key path: bz_dict_min/max_key_str returns char* data + len.
+                // Build a bz_string heap object from those, same as lowerDictKeysFor.
+                const char* rtNameStr = isMax ? "bz_dict_max_key_str"
+                                              : "bz_dict_min_key_str";
+                auto* dataSlot = entryAlloca(ptrTy());
+                auto* lenSlot  = entryAlloca(i64());
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), dataSlot);
+                builder_.CreateStore(builder_.getInt64(0), lenSlot);
+                auto* mmStrFn = declareC(rtNameStr, i1(),
+                                         {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(mmStrFn, {recv, dataSlot, lenSlot});
+                // data and len are now filled; build a heap bz_string object.
+                llvm::Value* kdata = builder_.CreateLoad(ptrTy(), dataSlot, "sd.kd");
+                llvm::Value* klen  = builder_.CreateLoad(i64(), lenSlot, "sd.kl");
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+                auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
+                llvm::Value* strObj = builder_.CreateCall(callocFn,
+                    {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+                builder_.CreateStore(kdata, builder_.CreateStructGEP(stringType(), strObj, 0));
+                builder_.CreateStore(klen,  builder_.CreateStructGEP(stringType(), strObj, 1));
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                    builder_.CreateStructGEP(stringType(), strObj, 2));
+                initStringRc(strObj);
+                return strObj;
+            }
         }
     }
 
@@ -15018,6 +15120,61 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
     else
         eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/enum
     builder_.CreateRet(eq);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// fix #1426 / stdlib §4.17–§4.18: Build a comparison thunk for SortedDictionary
+// FirstKey/LastKey, SortedSet First/Last, and sorted-snapshot iteration.
+// Signature: int cmp(const void* a, const void* b)
+//   a, b = direct pointers to key bytes (NOT void** of void*).
+// Returns null for unsupported key types (record, decimal, unresolved param).
+// Supported: integer types (i32, i64, i8, i16, i1), float/double.
+// String-key SortedDictionary uses a dedicated bz_sort_kv_str/bz_dict_min_key_str
+// path and does NOT use this comparator.
+llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
+    if (!keyTy) return nullptr;
+    llvm::Type* kllvm = lowerTypeRef(keyTy);
+    if (!kllvm) return nullptr;
+
+    // Build a unique name per key LLVM type to cache it per module.
+    std::string name = "bz$sdcmp$";
+    if (kllvm->isIntegerTy(32))       name += "i32";
+    else if (kllvm->isIntegerTy(64))  name += "i64";
+    else if (kllvm->isIntegerTy(8))   name += "i8";
+    else if (kllvm->isIntegerTy(16))  name += "i16";
+    else if (kllvm->isIntegerTy(1))   name += "i1";
+    else if (kllvm->isFloatTy())      name += "f32";
+    else if (kllvm->isDoubleTy())     name += "f64";
+    else return nullptr;  // unsupported (record, decimal, etc.)
+
+    if (auto* existing = module_->getFunction(name)) return existing;
+
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    auto* fn   = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                        name, module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(bb);
+    llvm::Value* aPtr = fn->getArg(0);
+    llvm::Value* bPtr = fn->getArg(1);
+    llvm::Value* av   = builder_.CreateLoad(kllvm, aPtr, "ka");
+    llvm::Value* bv   = builder_.CreateLoad(kllvm, bPtr, "kb");
+    llvm::Value* isLess, *isGreater;
+    if (kllvm->isFloatingPointTy()) {
+        isLess    = builder_.CreateFCmpOLT(av, bv, "flt");
+        isGreater = builder_.CreateFCmpOGT(av, bv, "fgt");
+    } else {
+        isLess    = builder_.CreateICmpSLT(av, bv, "ilt");
+        isGreater = builder_.CreateICmpSGT(av, bv, "igt");
+    }
+    llvm::Value* res = builder_.CreateSelect(
+        isLess,    builder_.getInt32(-1),
+        builder_.CreateSelect(isGreater, builder_.getInt32(1), builder_.getInt32(0)));
+    builder_.CreateRet(res);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
     return fn;

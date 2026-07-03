@@ -37,10 +37,14 @@ constexpr std::array<std::string_view, 12> kOwningTypeHeads = {
 
 // §4.4–§4.7 / §4.14: the bz_array_t*-backed collections (isCollectionTypeName).
 // LinkedList/OwningLinkedList are bz_llist_t-backed and excluded here.
-constexpr std::array<std::string_view, 9> kArrayBackedCollections = {
+constexpr std::array<std::string_view, 10> kArrayBackedCollections = {
     "Array",  "OwningArray", "OwningBuffer",
     "Stack",  "OwningStack", "Queue",
     "OwningQueue", "Set",    "OwningSet",
+    // stdlib §4.18 (#1426): SortedSet<T> shares the generic-key hash table
+    // (bz_dict_alloc_generic) but routes through the collection-dispatch gate
+    // (isArr → isSetName), like Set/OwningSet.
+    "SortedSet",
 };
 
 // §4.8 / §4.17: the bz_dict_t*-backed collections (isDictTypeName).
@@ -57,10 +61,10 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 60> kHeapPointerReferenceBuiltins = {
-    // §4 collections
+constexpr std::array<std::string_view, 61> kHeapPointerReferenceBuiltins = {
+    // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
-    "SortedDictionary", "Stack", "OwningStack", "Queue", "OwningQueue",
+    "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
     "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
     // §3 nullary heap classes with pointer rep
     "StringBuilder", "Random",

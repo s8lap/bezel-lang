@@ -5848,8 +5848,11 @@ private:
     // key/element TypeRef (its LLVM type is how each key is loaded and bound to
     // the loop variable). Used by both lowerDictBackedSetFor and the
     // non-string branch of lowerDictKeysFor.
+    // fix #1426: `sorted` param (default false) triggers bz_sort_keys_gen before
+    // iteration — used for SortedSet to satisfy §4.18's ascending-order contract.
     bool emitGenericKeyTableFor(const ast::ForStmt& fs, llvm::Value* tableObj,
-                                const sema::TypeRef* elemTyRef);
+                                const sema::TypeRef* elemTyRef,
+                                bool sorted = false);
 
     // If `e` names a local or parameter, return its storage slot; else null.
     // CG50: if `e` names a ref/out parameter, return its storage address
@@ -6434,6 +6437,12 @@ private:
     // compare (primitives/enums).
     llvm::Function* buildValueHashTrampoline(const sema::TypeRef* ty);
     llvm::Function* buildValueEqTrampoline(const sema::TypeRef* ty);
+    // fix #1426 / stdlib §4.17–§4.18: Build a cmp(const void* a, const void* b)
+    // thunk for SortedDictionary/SortedSet ordered-key operations.
+    // a and b are direct pointers to key bytes (NOT void** of void*).
+    // Supports integer (i32/i64/i8/i16/i1) and float (f32/f64) keys.
+    // Unsupported types (record, decimal, enum, unresolved T): returns null.
+    llvm::Function* buildSortedKeyComparator(const sema::TypeRef* keyTy);
 
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
