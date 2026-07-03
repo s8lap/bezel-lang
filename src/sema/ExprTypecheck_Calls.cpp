@@ -5241,6 +5241,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (rcn == "JsonSerializer" && m == "ToString") {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
                     }
+                    // fix #1397 / §2.14: type the IDeserializer read surface on
+                    // the concrete BinaryDeserializer / JsonDeserializer builtin
+                    // classes (they have a null `decl`, so the interface's method
+                    // decls are not visible for normal member resolution — the
+                    // return type must be set here so `using var x := d.ReadInt()`
+                    // and `return d.ReadBool()` infer/coerce correctly).  Codegen
+                    // wires the calls to the bz_binder_* runtime.
+                    if (rcn == "BinaryDeserializer" || rcn == "JsonDeserializer") {
+                        using P = PrimitiveType;
+                        if (m == "ReadInt")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                        else if (m == "ReadUInt")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::ULong));
+                        else if (m == "ReadFloat")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                        else if (m == "ReadDecimal")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Decimal));
+                        else if (m == "ReadBool" || m == "TryReadNull" ||
+                                 m == "HasMoreElements")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        else if (m == "ReadString" || m == "ReadFieldName")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        else if (m == "ReadChar")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Char));
+                        else if (m == "BeginObject" || m == "BeginArray")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // EndObject / EndArray / SkipValue / Dispose → unit.
+                    }
                 }
 
                 // §30.14 (#600): Domain.Spawn — static class, colName == "Domain".

@@ -2761,6 +2761,256 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
 }
 
 // ---------------------------------------------------------------------------
+// Emitter::lowerSerializerWriteMethod  fix #1397 / §2.14
+//
+// Forward an ISerializer write/structure method to the bz_binser_* runtime.
+// Shared by the concrete BinarySerializer / JsonSerializer receivers and the
+// ISerializer interface receiver: the write functions branch on the buffer's
+// kind tag internally (binary vs JSON), so the same lowering serves both.
+// Returns true iff `methodName` named a write/structure method (all void).
+// ---------------------------------------------------------------------------
+bool Emitter::lowerSerializerWriteMethod(llvm::Value* ser,
+                                         std::string_view methodName,
+                                         const ast::CallExpr& call) {
+    auto voidTy = llvm::Type::getVoidTy(llvm_);
+
+    if (methodName == "BeginObject" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* cnt = lowerExpr(*call.args[0].value);
+        if (!cnt) return true;
+        cnt = builder_.CreateSExtOrTrunc(cnt, i32(), "begin.cnt");
+        auto* fn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
+        builder_.CreateCall(fn, {ser, cnt});
+        return true;
+    }
+    if (methodName == "EndObject" && call.args.empty()) {
+        auto* fn = declareC("bz_binser_end_object", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {ser});
+        return true;
+    }
+    if (methodName == "WriteFieldName" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* nm = lowerExpr(*call.args[0].value);
+        if (!nm) return true;
+        auto* fn = declareC("bz_binser_write_field_name", voidTy, {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {ser, nm});
+        return true;
+    }
+    if (methodName == "WriteInt" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        v = builder_.CreateSExtOrTrunc(v, i64(), "wrint.v");
+        auto* fn = declareC("bz_binser_write_int", voidTy, {ptrTy(), i64()});
+        builder_.CreateCall(fn, {ser, v});
+        return true;
+    }
+    if (methodName == "WriteUInt" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        v = builder_.CreateZExtOrTrunc(v, i64(), "wruint.v");
+        auto* fn = declareC("bz_binser_write_uint", voidTy, {ptrTy(), i64()});
+        builder_.CreateCall(fn, {ser, v});
+        return true;
+    }
+    if (methodName == "WriteFloat" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        if (!v->getType()->isDoubleTy())
+            v = builder_.CreateFPExt(v, llvm::Type::getDoubleTy(llvm_), "wrflt.v");
+        auto* fn = declareC("bz_binser_write_float", voidTy,
+            {ptrTy(), llvm::Type::getDoubleTy(llvm_)});
+        builder_.CreateCall(fn, {ser, v});
+        // §2.15 / fix #1229: bz_binser_write_float sets bz_exc for NaN/±Infinity
+        // on a JsonSerializer; propagate so the caller's try/catch can handle it.
+        emitPendingCheck();
+        return true;
+    }
+    if (methodName == "WriteBool" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        v = builder_.CreateZExtOrTrunc(v, i8(), "wrbool.v");
+        auto* fn = declareC("bz_binser_write_bool", voidTy, {ptrTy(), i8()});
+        builder_.CreateCall(fn, {ser, v});
+        return true;
+    }
+    if (methodName == "WriteString" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        auto* fn = declareC("bz_binser_write_string", voidTy, {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {ser, v});
+        return true;
+    }
+    if (methodName == "WriteChar" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        v = builder_.CreateSExtOrTrunc(v, i32(), "wrchar.v");
+        auto* fn = declareC("bz_binser_write_char", voidTy, {ptrTy(), i32()});
+        builder_.CreateCall(fn, {ser, v});
+        return true;
+    }
+    if (methodName == "WriteDecimal" && call.args.size() == 1 && call.args[0].value) {
+        // §2.14 / #665: ISerializer.WriteDecimal — pass the 16-byte decimal
+        // struct by pointer (4×u32 LE wire format).
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return true;
+        llvm::AllocaInst* decSlot = entryAlloca(decimalStructType());
+        if (v->getType() == decimalStructType())
+            builder_.CreateStore(v, decSlot);
+        auto* fn = declareC("bz_binser_write_decimal", voidTy,
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {ser, decSlot});
+        return true;
+    }
+    if (methodName == "WriteNull" && call.args.empty()) {
+        auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {ser});
+        return true;
+    }
+    if (methodName == "BeginArray" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* cnt = lowerExpr(*call.args[0].value);
+        if (!cnt) return true;
+        cnt = builder_.CreateSExtOrTrunc(cnt, i32(), "bgarr.cnt");
+        auto* fn = declareC("bz_binser_begin_array", voidTy, {ptrTy(), i32()});
+        builder_.CreateCall(fn, {ser, cnt});
+        return true;
+    }
+    if (methodName == "EndArray" && call.args.empty()) {
+        auto* fn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {ser});
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Emitter::lowerDeserializerReadMethod  fix #1397 / §2.14
+//
+// Forward an IDeserializer read/structure method to the bz_binder_* runtime.
+// Shared by the concrete BinaryDeserializer / JsonDeserializer receivers and
+// the IDeserializer interface receiver (the read functions branch on the
+// buffer's kind tag internally).  Sets `handled` iff `methodName` named a
+// read/structure method; returns the lowered value (nullptr for the void
+// methods EndObject/EndArray/SkipValue).  A read on a JSON deserializer may
+// raise SerializationException (type mismatch / truncation) — emitPendingCheck
+// propagates it to the caller's try/catch.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::lowerDeserializerReadMethod(llvm::Value* der,
+                                                  std::string_view methodName,
+                                                  const ast::CallExpr& call,
+                                                  bool& handled) {
+    handled = true;
+    auto voidTy = llvm::Type::getVoidTy(llvm_);
+    auto* dblTy = llvm::Type::getDoubleTy(llvm_);
+
+    // Value reads (§2.14 IDeserializer): return the stdlib-declared width.
+    if (methodName == "ReadInt" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.int");
+        emitPendingCheck();
+        return v;  // long
+    }
+    if (methodName == "ReadUInt" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.uint");
+        emitPendingCheck();
+        return v;  // ulong
+    }
+    if (methodName == "ReadFloat" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_read_float", dblTy, {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.float");
+        emitPendingCheck();
+        return v;  // double
+    }
+    if (methodName == "ReadDecimal" && call.args.empty()) {
+        // #665: bz_binder_read_decimal returns a ptr to a 16-byte {i32×4} struct
+        // on the runtime side; load it to a value (null → default(decimal)=0).
+        auto* fn = declareC("bz_binder_read_decimal", ptrTy(), {ptrTy()});
+        llvm::Value* decPtr = builder_.CreateCall(fn, {der}, "der.decptr");
+        emitPendingCheck();
+        llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+        builder_.CreateStore(
+            llvm::Constant::getNullValue(decimalStructType()), slot);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            decPtr, llvm::ConstantPointerNull::get(ptrTy()), "der.dec.null");
+        auto* loadBB = llvm::BasicBlock::Create(llvm_, "der.dec.load", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "der.dec.end",  currentFn_);
+        builder_.CreateCondBr(isNull, endBB, loadBB);
+        builder_.SetInsertPoint(loadBB);
+        builder_.CreateStore(
+            builder_.CreateLoad(decimalStructType(), decPtr, "der.decv"), slot);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return builder_.CreateLoad(decimalStructType(), slot, "der.dec");
+    }
+    if (methodName == "ReadBool" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_read_bool", i8(), {ptrTy()});
+        llvm::Value* b8 = builder_.CreateCall(fn, {der}, "der.bool8");
+        emitPendingCheck();
+        return builder_.CreateTrunc(b8, i1(), "der.bool");
+    }
+    if (methodName == "ReadString" && call.args.empty()) {
+        // Returns a newly-allocated string (rc=1); the caller owns it.
+        auto* fn = declareC("bz_binder_read_string", ptrTy(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.str");
+        emitPendingCheck();
+        return v;
+    }
+    if (methodName == "ReadChar" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_read_char", i32(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.char");
+        emitPendingCheck();
+        return v;
+    }
+    if (methodName == "TryReadNull" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_try_read_null", i8(), {ptrTy()});
+        llvm::Value* b8 = builder_.CreateCall(fn, {der}, "der.trynull8");
+        return builder_.CreateTrunc(b8, i1(), "der.trynull");
+    }
+    if (methodName == "BeginObject" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.beginobj");
+        emitPendingCheck();
+        return v;  // int field count (or -1 for JSON)
+    }
+    if (methodName == "ReadFieldName" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.fieldname");
+        emitPendingCheck();
+        return v;
+    }
+    if (methodName == "SkipValue" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_skip_value", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {der});
+        emitPendingCheck();
+        return nullptr;  // void
+    }
+    if (methodName == "EndObject" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_end_object", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {der});
+        emitPendingCheck();
+        return nullptr;  // void
+    }
+    if (methodName == "BeginArray" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_begin_array", i32(), {ptrTy()});
+        llvm::Value* v = builder_.CreateCall(fn, {der}, "der.beginarr");
+        emitPendingCheck();
+        return v;  // int element count (or -1 for JSON)
+    }
+    if (methodName == "HasMoreElements" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_has_more_elements", i8(), {ptrTy()});
+        llvm::Value* b8 = builder_.CreateCall(fn, {der}, "der.hasmore8");
+        return builder_.CreateTrunc(b8, i1(), "der.hasmore");
+    }
+    if (methodName == "EndArray" && call.args.empty()) {
+        auto* fn = declareC("bz_binder_end_array", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {der});
+        emitPendingCheck();
+        return nullptr;  // void
+    }
+
+    handled = false;
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // Emitter::tryLowerSerializationCall  §9.8 / §2.15
 //
 // Intercept call expressions related to BinarySerializer/BinaryDeserializer
@@ -2802,6 +3052,10 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 builder_.CreateCall(fn, {ser});
                 return nullptr;  // void
             }
+            // fix #1397: the ISerializer write surface on the concrete class —
+            // previously unwired, so `ser.WriteInt(x)` was a silent no-op and
+            // ToBytes() then returned an empty buffer.
+            if (lowerSerializerWriteMethod(ser, methodName, call)) return nullptr;
             return nullptr;
         }
 
@@ -2816,6 +3070,10 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 builder_.CreateCall(fn, {der});
                 return nullptr;
             }
+            // fix #1397: the IDeserializer read surface on the concrete class.
+            bool handled = false;
+            llvm::Value* v = lowerDeserializerReadMethod(der, methodName, call, handled);
+            if (handled) return v;
             return nullptr;
         }
 
@@ -2843,6 +3101,9 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 builder_.CreateCall(fn, {ser});
                 return nullptr;
             }
+            // fix #1397: the ISerializer write surface on the concrete class
+            // (write functions branch on kind → JSON here).
+            if (lowerSerializerWriteMethod(ser, methodName, call)) return nullptr;
             return nullptr;
         }
 
@@ -2858,130 +3119,32 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 builder_.CreateCall(fn, {der});
                 return nullptr;
             }
+            // fix #1397: the IDeserializer read surface on the concrete class.
+            bool handled = false;
+            llvm::Value* v = lowerDeserializerReadMethod(der, methodName, call, handled);
+            if (handled) return v;
             return nullptr;
         }
 
         // §2.14: ISerializer — forwarded to bz_binser_* functions.
-        // The concrete object is always a BinarySerializer* at runtime.
+        // The concrete object is always a BinarySerializer* / JsonSerializer*
+        // at runtime; the shared helper handles the full write surface.
         if (rcn == "ISerializer") {
             llvm::Value* ser = lowerExpr(*ma->target);
             if (!ser) return nullptr;
-            auto voidTy = llvm::Type::getVoidTy(llvm_);
-
-            if (methodName == "BeginObject" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* cnt = lowerExpr(*call.args[0].value);
-                if (!cnt) return nullptr;
-                cnt = builder_.CreateSExtOrTrunc(cnt, i32(), "begin.cnt");
-                auto* fn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
-                builder_.CreateCall(fn, {ser, cnt});
-                return nullptr;
-            }
-            if (methodName == "EndObject" && call.args.empty()) {
-                auto* fn = declareC("bz_binser_end_object", voidTy, {ptrTy()});
-                builder_.CreateCall(fn, {ser});
-                return nullptr;
-            }
-            if (methodName == "WriteFieldName" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* nm = lowerExpr(*call.args[0].value);
-                if (!nm) return nullptr;
-                auto* fn = declareC("bz_binser_write_field_name", voidTy, {ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {ser, nm});
-                return nullptr;
-            }
-            if (methodName == "WriteInt" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                v = builder_.CreateSExtOrTrunc(v, i64(), "wrint.v");
-                auto* fn = declareC("bz_binser_write_int", voidTy, {ptrTy(), i64()});
-                builder_.CreateCall(fn, {ser, v});
-                return nullptr;
-            }
-            if (methodName == "WriteUInt" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                v = builder_.CreateZExtOrTrunc(v, i64(), "wruint.v");
-                auto* fn = declareC("bz_binser_write_uint", voidTy, {ptrTy(), i64()});
-                builder_.CreateCall(fn, {ser, v});
-                return nullptr;
-            }
-            if (methodName == "WriteFloat" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                if (!v->getType()->isDoubleTy())
-                    v = builder_.CreateFPExt(v, llvm::Type::getDoubleTy(llvm_), "wrflt.v");
-                auto* fn = declareC("bz_binser_write_float", voidTy,
-                    {ptrTy(), llvm::Type::getDoubleTy(llvm_)});
-                builder_.CreateCall(fn, {ser, v});
-                // §2.15 / fix #1229: bz_binser_write_float sets bz_exc for NaN/±Infinity
-                // on a JsonSerializer; propagate so the caller's try/catch can handle it.
-                emitPendingCheck();
-                return nullptr;
-            }
-            if (methodName == "WriteBool" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                v = builder_.CreateZExtOrTrunc(v, i8(), "wrbool.v");
-                auto* fn = declareC("bz_binser_write_bool", voidTy, {ptrTy(), i8()});
-                builder_.CreateCall(fn, {ser, v});
-                return nullptr;
-            }
-            if (methodName == "WriteString" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                auto* fn = declareC("bz_binser_write_string", voidTy, {ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {ser, v});
-                return nullptr;
-            }
-            if (methodName == "WriteChar" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                v = builder_.CreateSExtOrTrunc(v, i32(), "wrchar.v");
-                auto* fn = declareC("bz_binser_write_char", voidTy, {ptrTy(), i32()});
-                builder_.CreateCall(fn, {ser, v});
-                return nullptr;
-            }
-            if (methodName == "WriteDecimal" && call.args.size() == 1 && call.args[0].value) {
-                // §2.14 / #665: ISerializer.WriteDecimal — pass the 16-byte decimal
-                // struct by pointer (4×u32 LE wire format).
-                llvm::Value* v = lowerExpr(*call.args[0].value);
-                if (!v) return nullptr;
-                llvm::AllocaInst* decSlot = entryAlloca(decimalStructType());
-                if (v->getType() == decimalStructType())
-                    builder_.CreateStore(v, decSlot);
-                auto* fn = declareC("bz_binser_write_decimal", voidTy,
-                                    {ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {ser, decSlot});
-                return nullptr;
-            }
-            if (methodName == "WriteNull" && call.args.empty()) {
-                auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
-                builder_.CreateCall(fn, {ser});
-                return nullptr;
-            }
-            if (methodName == "BeginArray" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* cnt = lowerExpr(*call.args[0].value);
-                if (!cnt) return nullptr;
-                cnt = builder_.CreateSExtOrTrunc(cnt, i32(), "bgarr.cnt");
-                auto* fn = declareC("bz_binser_begin_array", voidTy, {ptrTy(), i32()});
-                builder_.CreateCall(fn, {ser, cnt});
-                return nullptr;
-            }
-            if (methodName == "EndArray" && call.args.empty()) {
-                auto* fn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
-                builder_.CreateCall(fn, {ser});
-                return nullptr;
-            }
+            lowerSerializerWriteMethod(ser, methodName, call);
             return nullptr;
         }
 
-        // §2.14: IDeserializer — forwarded to bz_binder_* functions.
+        // §2.14: IDeserializer — forwarded to bz_binder_* functions.  fix #1397:
+        // wire the read surface so hand-written Deserialize bodies that call
+        // `d.ReadInt()`/`d.BeginObject()`/… (stdlib §2.14 example) move data.
         if (rcn == "IDeserializer") {
             llvm::Value* der = lowerExpr(*ma->target);
             if (!der) return nullptr;
-            // IDeserializer methods not yet needed in hand-written Deserialize
-            // bodies (no test exercises this path in tier 2). Return nullptr to
-            // fall through gracefully.
-            (void)der;
+            bool handled = false;
+            llvm::Value* v = lowerDeserializerReadMethod(der, methodName, call, handled);
+            if (handled) return v;
             return nullptr;
         }
 

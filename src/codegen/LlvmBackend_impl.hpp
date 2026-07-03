@@ -2123,6 +2123,27 @@ private:
     bool isSerializationCall(const ast::CallExpr& call,
                              const ast::MemberAccessExpr& ma);
 
+    // fix #1397 / §2.14: the ISerializer write/structure surface, forwarded to
+    // the bz_binser_* runtime.  Shared by the concrete BinarySerializer /
+    // JsonSerializer receivers and the ISerializer interface receiver so a
+    // direct `ser.WriteInt(x)` on a concrete serializer moves data (previously
+    // only the ISerializer-receiver path was wired).  `ser` is the (opaque)
+    // serializer pointer.  Returns true iff `methodName` named a write/structure
+    // method and a call was emitted (all such methods are void).
+    bool lowerSerializerWriteMethod(llvm::Value* ser,
+                                    std::string_view methodName,
+                                    const ast::CallExpr& call);
+    // fix #1397 / §2.14: the IDeserializer read/structure surface, forwarded to
+    // the bz_binder_* runtime.  Shared by the concrete BinaryDeserializer /
+    // JsonDeserializer receivers and the IDeserializer interface receiver.
+    // `der` is the (opaque) deserializer pointer.  Sets `handled` iff
+    // `methodName` named a read/structure method; returns the lowered value
+    // (nullptr for the void methods EndObject/EndArray/SkipValue).
+    llvm::Value* lowerDeserializerReadMethod(llvm::Value* der,
+                                             std::string_view methodName,
+                                             const ast::CallExpr& call,
+                                             bool& handled);
+
     // Helpers for synthesized Serialize / Deserialize bodies.
     // Emit the Serialize body for a positional record value and a serializer ptr.
     void emitRecordSerialize(const sema::TypeSymbol* ts,

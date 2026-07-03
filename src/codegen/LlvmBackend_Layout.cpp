@@ -604,7 +604,25 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // (bz_buffer_hdr_t* with inline payload).  Without this entry
                     // lowerTypeRef would fall through to the i32 default → GEP /
                     // load type mismatches at every Buffer<T> use site.
-                    n == "Buffer") {
+                    n == "Buffer" ||
+                    // fix #1390 / §2.14–2.15 (#550): the serialization vocabulary
+                    // interfaces and the concrete opaque serializer/deserializer
+                    // classes are heap-pointer reference types (an ISerializer is
+                    // a bz_binser_t*; an IDeserializer a bz_binder_t*).  They have
+                    // no user TypeDecl (null declaration), so without these entries
+                    // an `s: ISerializer` parameter / `BinarySerializer` local /
+                    // field / return fell through to the i32 default: the opaque
+                    // serializer pointer was ABI-coerced to the low 32 bits at the
+                    // call boundary and zero-extended back to a pointer inside the
+                    // callee, yielding a 0x00000000_xxxxxxxx receiver.  At low heap
+                    // addresses the truncation is lossless (the regular suite
+                    // passes); under ASan's high address space the high 32 bits are
+                    // lost, so bz_binser_begin_object dereferenced a wild pointer
+                    // and SEGV'd (the #1390 crash).  Lower them to ptr.
+                    n == "ISerializer"      || n == "IDeserializer"     ||
+                    n == "ISerializable"    || n == "IDeserializable"   ||
+                    n == "BinarySerializer" || n == "BinaryDeserializer" ||
+                    n == "JsonSerializer"   || n == "JsonDeserializer") {
                     return ptrTy();
                 }
             }
@@ -692,7 +710,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §6.4 / #647: imported Atomic<T> and AtomicInteger<T>.
                     n == "Atomic" || n == "AtomicInteger" ||
                     // issue #545: imported Buffer<T> (bz_buffer_hdr_t*).
-                    n == "Buffer") {
+                    n == "Buffer" ||
+                    // fix #1390 / §2.14–2.15 (#550): imported serialization
+                    // vocabulary interfaces and concrete serializer/deserializer
+                    // classes — heap-pointer reference types (see the astNode path
+                    // above for why the i32 fallback truncated the opaque pointer).
+                    n == "ISerializer"      || n == "IDeserializer"     ||
+                    n == "ISerializable"    || n == "IDeserializable"   ||
+                    n == "BinarySerializer" || n == "BinaryDeserializer" ||
+                    n == "JsonSerializer"   || n == "JsonDeserializer") {
                     return ptrTy();
                 }
             }
