@@ -10,11 +10,21 @@ set -u
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 shards="${1:-8}"
 scratch=/var/tmp/bezel-scratch/build-asan
+# A cached tree configured against a different source dir (e.g. an agent
+# worktree from a prior run) makes the reconfigure fail and the build silently
+# rebuild the STALE tree — the sweep then "passes" on the wrong sources. Wipe
+# on mismatch.
+if [ -f "$scratch/CMakeCache.txt" ] && \
+   ! grep -q "CMAKE_HOME_DIRECTORY:INTERNAL=$repo\$" "$scratch/CMakeCache.txt"; then
+  echo "asan_sweep: stale build tree (different source dir) — wiping $scratch"
+  rm -rf "$scratch"
+fi
 mkdir -p "$scratch"
 cmake -B "$scratch" -S "$repo" -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" > /dev/null
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" > /dev/null || {
+    echo "asan_sweep: cmake configure FAILED"; exit 2; }
 "$repo/scripts/dev_heavy.sh" build cmake --build "$scratch" -j14 --target bezel_tests || exit 2
 fail=0
 pids=()
