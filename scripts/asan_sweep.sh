@@ -9,7 +9,10 @@
 set -u
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 shards="${1:-8}"
-scratch=/var/tmp/bezel-scratch/build-asan
+# Per-source-tree scratch (#1429): concurrent sweeps from different worktrees
+# previously fought over one tree (and pre-d680e6c could silently gate another
+# worktree's sources); the path hash gives each tree its own scratch.
+scratch=/var/tmp/bezel-scratch/build-asan-$(echo -n "$repo" | cksum | cut -d' ' -f1)
 # A cached tree configured against a different source dir (e.g. an agent
 # worktree from a prior run) makes the reconfigure fail and the build silently
 # rebuild the STALE tree — the sweep then "passes" on the wrong sources. Wipe
