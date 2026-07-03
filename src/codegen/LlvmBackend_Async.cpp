@@ -751,11 +751,30 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // async body here and key it to the resume fn (where the body lowers); the
         // release registers in the resume's disposeStack_ and emitAllDisposals
         // (run on every async `return` / fall-off before emitAsyncComplete) frees
-        // it. (Scoped to closures — the allocation async lambdas introduce. Boxes
-        // / strings in async-method locals are a distinct pre-existing leak left
-        // to a separate fix to keep this change bounded.)
+        // it.
         collectClosureReleaseEligible(*ci.stmts);
         closureReleaseEligibleFn_ = resumeFn;
+        // #1416 / #1418 / §27.5 / §28.9: the CAPTURE CELL of a frame-local that a
+        // lambda captures (the `calloc` from boxLocalSlot) is freed at scope end by
+        // the same boxedCellFree / deferred-cell-free machinery as in a synchronous
+        // method — but ONLY if its cell-free-eligibility pre-scans run and are keyed
+        // to the resume fn (where the body lowers). emitFunctionBody's async routing
+        // returned before Setup's collectBoxCaptureLocals / collectCellFreeEligible
+        // ran, so previously an async method leaked every captured local's cell (a
+        // plain capture cell for a value local — #1418 — or the 8-byte cell holding
+        // a captured `using var`/event-subscription closure's target — #1416).
+        // Mirror the synchronous setup here so lowerLambda records the cells in
+        // lastLambdaCapturedCells_ and lowerLocalDecl registers their frees.
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = resumeFn;
+        cellFreeEligible_.clear();
+        cellFreeEligibleFn_ = resumeFn;
+        collectBoxCaptureLocals(*ci.stmts);
+        collectDefinitelyEscapingLambdas(*ci.stmts);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(*ci.stmts);
         // §30.9 / §31.2 (#438): start with no pending handler-context spill slots;
         // lowerTry registers them as it lowers any in-handler await.
         asyncHandlerSpillSlots_.clear();
@@ -1105,10 +1124,24 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // own block body must be released at scope end. Compute eligibility for
         // the lambda body and key it to the lambda resume fn (where the body
         // lowers). An expression-bodied lambda has no stmts (and no such local).
-        if (!lam.exprBody)
+        // #1416 / #1418: likewise compute the CAPTURE-CELL free eligibility so a
+        // frame-local captured by a nested lambda inside this async lambda's body
+        // has its cell freed at scope end (mirrors emitAsyncMethod above).
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = resumeFn;
+        cellFreeEligible_.clear();
+        cellFreeEligibleFn_ = resumeFn;
+        if (!lam.exprBody) {
             collectClosureReleaseEligible(lam.stmts);
-        else
+            collectBoxCaptureLocals(lam.stmts);
+            collectDefinitelyEscapingLambdas(lam.stmts);
+            // Must run AFTER collectClosureReleaseEligible (uses its result).
+            collectCellFreeEligible(lam.stmts);
+        } else {
             closureReleaseEligible_.clear();
+        }
         closureReleaseEligibleFn_ = resumeFn;
         // CRITICAL (nested lambda): the await spill/restore loop iterates
         // smAllocaToField_, mapping a suspend-local's alloca → its frame field.

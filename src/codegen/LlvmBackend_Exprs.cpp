@@ -7631,18 +7631,34 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
         llvm::Type* savedAsyncResultTy = asyncResultTy_;
         const sema::TypeRef* savedAsyncResultSemaType = asyncResultSemaType_;
-        // emitAsyncLambda recomputes closure-release eligibility for the LAMBDA's
-        // own body and keys it to the lambda resume fn. The ENCLOSING function's
-        // eligibility (which governs whether THIS `var f := <lambda>` local gets
-        // its scope-end closure release — registered AFTER lowerLambda returns)
-        // must be preserved; save and restore it across the call.
+        // emitAsyncLambda recomputes closure-release AND capture-cell-free
+        // eligibility for the LAMBDA's own body and keys them to the lambda resume
+        // fn. The ENCLOSING function's eligibility (which governs whether THIS
+        // `var f := <lambda>` local gets its scope-end closure release / capture-
+        // cell free — registered AFTER lowerLambda returns, and consulted again by
+        // any SUBSEQUENT lambda in the enclosing body) must be preserved; save and
+        // restore all of it across the call. (#1416/#1418: the capture-cell sets
+        // are now recomputed inside emitAsyncLambda too, so they need the same
+        // save/restore the closure-release sets already had.)
         auto savedClosureRelElig = closureReleaseEligible_;
         llvm::Function* savedClosureRelEligFn = closureReleaseEligibleFn_;
+        auto savedCellFreeElig = cellFreeEligible_;
+        llvm::Function* savedCellFreeEligFn = cellFreeEligibleFn_;
+        auto savedBoxCaptureLocals = boxCaptureLocals_;
+        auto savedSingleCaptureLocals = singleCaptureLocals_;
+        llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
+        auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
 
         emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy);
 
         closureReleaseEligible_ = std::move(savedClosureRelElig);
         closureReleaseEligibleFn_ = savedClosureRelEligFn;
+        cellFreeEligible_ = std::move(savedCellFreeElig);
+        cellFreeEligibleFn_ = savedCellFreeEligFn;
+        boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
+        singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
+        boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;
+        definitelyEscapingLambdas_ = std::move(savedDefinitelyEscaping);
         smKind_ = savedSmKind;
         smStateStruct_ = savedSmStateStruct;
         smSelf_ = savedSmSelf;

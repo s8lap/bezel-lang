@@ -1301,7 +1301,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             for (auto& scope : disposeStack_) {
                 scope.erase(
                     std::remove_if(scope.begin(), scope.end(),
-                        [retSlot](const auto& e) { return e.slot == retSlot; }),
+                        [retSlot](const auto& e) {
+                            // #1418 / §27.5 / §28.9: if the returned local is a
+                            // lambda-CAPTURED value local, its slot is the shared
+                            // capture-cell holder. Returning it yields a COPY of the
+                            // cell's contents (a value type), NOT ownership of the
+                            // cell — so the cell's boxedCellFree must still fire.
+                            // Only the ownership-transfer disposals of a returned
+                            // `using var` (class dispose etc.) are excluded here; the
+                            // runtime-managed cell free is preserved, or the cell
+                            // leaks (the #1418 4-byte leak on `return count`).
+                            return e.slot == retSlot &&
+                                   !e.boxedCellFree && !e.boxedCellFreeDeferred;
+                        }),
                     scope.end());
             }
         }
