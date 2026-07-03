@@ -7571,6 +7571,19 @@ v0.172 is the **formatting revision** — discharging RFC #812's standout item t
 
 Additive except: a format spec on a non-formattable operand — previously silently accepted and ignored or misrouted — is now a compile error; `{{`/`}}` in existing interpolated strings (none in the corpus — the sequence was previously meaningless) would change meaning.
 
+<a id="sec-v0-172-to-v0-173-changelog"></a>
+### v0.173 changelog (v0.172 → v0.173)
+
+v0.173 is the **cancellation-composition revision** — adopting RFC #810's first half and recording the second half as already-existing.
+
+- **Linked token sources** (stdlib §6.1, spec §30.8): `CreateLinked(a, b)` + `CreateLinkedAll(parents: Array<CancellationToken>)` — cancelled when any parent cancels or by the source's own `Cancel`/`CancelAfter`; already-cancelled parents cancel the child synchronously at creation (the `Register` race-free policy); disposal unregisters from parents before signalling. Intra-domain only; the parent sources must outlive the linked source (the existing source-outlives-token posture). Array form instead of variadics (§22.14's variadic decline stands).
+- **`CancellationScope` declined-with-reasons**: the RFC's scope sketch duplicates existing semantics — the source destructor already cancels on dispose, so `using var cts := CancellationTokenSource.WithCancelAfter(delay);` *is* timeout-as-a-scope and every `using var` source is cancel-on-scope-exit. A wrapper type would add a name, not a capability; the idiom is now documented in §6.1 where the RFC's readers will look.
+- Sequencing note: #808 (task nursery) consumes these primitives (cancel-siblings-on-fault is a linked source per child); #809 (bounded channels) is independent.
+
+#### Migration
+
+None — purely additive.
+
 ## 20. Closing
 
 If the opening framed Bezel by what it borrows, the body has shown what it actually contributes: not the features — those have ancestors — but the discipline applied to combining them. The recurring move in this document is the same one every time a hard question arrived. Ship the part that fits the foundations cleanly. Decline the part that fights them, with the reason written down so the question stays settled rather than perennially reopened. Scope whatever genuinely remains open by naming its precise blocker, not by deferring it vaguely. Member-access reflection is declined, not pending. The cyclic-serialization soundness obligation was discharged in prose before any syntax was written. Tuples and post-condition loops are conveniences with recorded costs, not gaps. The deferred list is a list of decisions deliberately not yet made — each with its reasoning — never a list of unsolved problems.

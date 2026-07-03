@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.172 — July 2026**
+**Version 0.173 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -6601,7 +6601,7 @@ The `with token` clause works the same way for owning async iterators — `await
 **`await` inside `finally` (clarified in v0.137).** Inside an async iterator, `await` may not appear in a `finally` block — a compile error. The `yield` placement restrictions of [§29.6](#sec-restrictions-inside-try-catch-finally) apply unchanged; this rule additionally restricts `await`, and only inside async *iterators* (an ordinary `async` method may await in its `finally`, [§30.9](#sec-exception-handling-in-async-methods)). The reason is disposal: when a consumer abandons iteration early, the iterator's pending `finally` blocks run synchronously inside `Dispose` ([§29.7](#sec-disposal-of-partially-consumed-iterators)) — there is no async driver at that point, so a suspension inside the `finally` would have nowhere to resume; the continuation would be silently discarded, which is precisely the defined-fault philosophy's forbidden outcome. A `finally` that needs asynchronous cleanup awaits *before* yielding (hoisting the resource acquisition), or the type implements the cleanup in its `Dispose` path. This mirrors the catch-guard rule of [§30.9](#sec-exception-handling-in-async-methods): positions evaluated during synchronous unwinding or dispatch are synchronous.
 ### 30.8 Cancellation
 
-Cancellation is cooperative via `CancellationToken`. The standard library defines the surface (the full declaration is in std lib [§6.1](Bezel_Standard_Library.md#sec-cancellationtoken-and-cancellationtokensource); the members referenced by the language rules are shown here):
+Cancellation is cooperative via `CancellationToken`. The standard library defines the surface (the full declaration is in std lib [§6.1](Bezel_Standard_Library.md#sec-cancellationtoken-and-cancellationtokensource); the members referenced by the language rules are shown here). Sources compose (v0.173, #810): a **linked** source — `CancellationTokenSource.CreateLinked(a, b)` / `CreateLinkedAll(parents)` — cancels when any parent token cancels, with the parent sources outliving the linked source per the ordinary source-outlives-token rule; linking is intra-domain (cross-domain cancellation remains a channel message, rationale §12.6). Cancel-on-dispose makes `using var` scopes double as cancellation scopes (stdlib §6.1).
 
 ```bezel
 public record CancellationToken

@@ -2827,6 +2827,12 @@ public class CancellationTokenSource
 
   public static method WithCancelAfter(delay: TimeSpan): owned CancellationTokenSource;
 
+  // v0.173 (#810): a source cancelled when ANY parent token cancels (or by its
+  // own Cancel/CancelAfter). Two-token form for the everyday case (caller +
+  // deadline); array form for N parents.
+  public static method CreateLinked(a: CancellationToken, b: CancellationToken): owned CancellationTokenSource;
+  public static method CreateLinkedAll(parents: Array<CancellationToken>): owned CancellationTokenSource;
+
   public readonly property Token: CancellationToken;
   public readonly property IsCancellationRequested: bool;
 
@@ -2834,9 +2840,14 @@ public class CancellationTokenSource
   public method CancelAfter(delay: TimeSpan);
 
   destructor;       // signals cancellation to any tokens still observing,
-                           // then releases the registered-callback list
+                           // unregisters from linked parents (v0.173), then
+                           // releases the registered-callback list
 end CancellationTokenSource;
 ```
+
+**Linked sources (v0.173, #810).** `CreateLinked`/`CreateLinkedAll` complete the composition story: *"cancel if the caller cancels OR my local timeout fires"* is `using var cts := CancellationTokenSource.CreateLinked(callerToken, CancellationTokenSource.WithCancelAfter(timeout).Token);` — no hand-wired `Register` plumbing. Semantics: the linked source enters the cancelled state when **any** parent token cancels or its own `Cancel()`/`CancelAfter()` fires, whichever happens first; a parent already cancelled at creation cancels the linked source before `CreateLinked` returns (the same race-free synchronous policy as `Register` on a cancelled token, below). Disposing the linked source **unregisters from its parents first** — no callback can fire into a disposed source. Lifetime follows the existing source-outlives-token rule ([§28.13](Bezel_Language_Spec.md#sec-shared-ownership) posture, spec §30.8): the parent *sources* must outlive the linked source, exactly as they must outlive any other holder of their tokens. Linking is **intra-domain** — cross-domain cancellation remains a message on a channel (rationale §12.6).
+
+**Timeout-as-a-scope needs no new type.** The RFC's `CancellationScope` sketch is already expressible: the source's destructor *cancels on dispose*, so `using var cts := CancellationTokenSource.WithCancelAfter(delay);` **is** a cancellation scope — auto-cancelled at scope exit or on timeout, whichever first. Recorded as the idiom rather than a wrapper type (see the v0.173 rationale entry).
 
 `Register` invokes the callback when cancellation is requested; the returned `Subscription` removes the registration when disposed.
 
