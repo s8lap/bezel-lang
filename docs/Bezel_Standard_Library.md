@@ -864,6 +864,35 @@ Raised on access to a static member of a type whose static initialization failed
 ---
 
 <a id="sec-system-text-auto-imported"></a>
+<a id="sec-static-abstractions"></a>
+### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>` (v0.176, #807)
+
+The static-interface abstractions (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)). The primitive numeric tower and `char` conform via compiler-provided conformances; user types conform by declaring and supplying the statics.
+
+```bezel
+public interface INumber<T> where T: INumber<T>
+  static method Zero(): T;
+  static method One(): T;
+  static operator +(a: T, b: T): T;
+  static operator -(a: T, b: T): T;
+  static operator *(a: T, b: T): T;
+  static operator /(a: T, b: T): T;      // raises per the operand type's division rules
+  static operator <(a: T, b: T): bool;
+end INumber;
+
+public interface ISteppable<T> where T: ISteppable<T>
+  static method Step(value: T, by: long): T;   // advance in T's space
+  static operator <(a: T, b: T): bool;
+end ISteppable;
+
+public interface IParsable<T> where T: IParsable<T>
+  static method Parse(s: string): T;                       // FormatException on bad input
+  static method TryParse(s: string, out value: T?): bool;  // the §1 Try convention
+end IParsable;
+```
+
+Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). The existing per-type `Parse`/`TryParse` members are the conformance witnesses — no signatures changed (`TryParse` follows the v0.171 nullable-out shape).
+
 <a id="sec-iformattable"></a>
 ### 2.18 `IFormattable` and format specifiers (v0.172, #812/#1339)
 

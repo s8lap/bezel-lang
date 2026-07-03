@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.175 — July 2026**
+**Version 0.176 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1470,6 +1470,35 @@ end Triangle;
 
 Because `Shape` is `sealed abstract`, no class outside the declaring module may extend it. The compiler can therefore prove exhaustiveness of `case` matches over `Shape` without requiring a `_` arm, even across module boundaries.
 
+<a id="sec-static-interface-members"></a>
+### 11.8 Static interface members (v0.176, #807)
+
+An interface member may be declared `static`: a contract the conforming **type** — not an instance — must satisfy. Static interface members are **abstract-only** (no default bodies; the same diamond-avoidance posture as the declined default interface methods, rationale §17.4) and may be **methods** or **operators**; static constants and properties are deferred (spell a constant as a nullary method: `Zero()`).
+
+```bezel
+interface INumber<T> where T: INumber<T>
+  static method Zero(): T;
+  static operator +(a: T, b: T): T;
+  static operator *(a: T, b: T): T;
+end INumber;
+```
+
+**The recurrence constraint.** The self-referential form `where T: INumber<T>` is the ordinary generic-constraint machinery — no new syntax, no `Self` keyword (deliberately declined for v1: the recurrence is explicit and already expressible). A conforming type declares `class Meters: INumber<Meters>` and supplies the static members with exact signatures (the §11.2 matching rule, applied to statics).
+
+**Dispatch through the type parameter.** In a generic body whose parameter `T` carries a static-interface constraint, `T.Member(...)` calls the conforming type's static member, and an operator applied to `T`-typed operands resolves through the constraint's static operators. Resolution happens **at instantiation** (the compiler already specializes generics per concrete instantiation; static dispatch requires exactly the information that specialization has):
+
+```bezel
+public static method Sum<T>(items: Array<T>): T where T: INumber<T>
+  var total := T.Zero();
+  for var x in items do total := total + x; end;
+  return total;
+end Sum;
+```
+
+**Primitive conformances (compiler-provided).** The primitive numeric tower (`byte`…`ulong`, `float`, `double`, `decimal`) and `char` conform to the standard-library `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces (stdlib §2.19) **without declaring them**: primitive operators are compiler intrinsics (§3.5), so the compiler bridges the intrinsic/declared split by treating each primitive as conforming with its intrinsic operations as the member bodies. User code observes no difference from a declared conformance.
+
+**What this unblocks (recorded follow-ups, not part of v0.176):** promoting the name-recognized `FromCollectionLiteral` (§15.4.1) to a real `ICollectionLiteralTarget<T>` and `IDeserializable`'s `Deserialize` (§2.14) to a true static interface method — both signatures were chosen for zero-source-change promotion; and replacing §16's compiler-intrinsic `Range<T>` element restriction with an `ISteppable<T>` constraint.
+
 ---
 
 <a id="sec-inheritance-and-dispatch"></a>
@@ -2307,7 +2336,7 @@ In a pattern, `..<0` matches "any value less than 0" and `31..` matches "any val
 <a id="sec-the-ranget-type"></a>
 ### 16.3 The `Range<T>` type
 
-A range over `T` has type `Range<T>`. `T` is restricted by the compiler to the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`) and `char`. Other substitutions are rejected. This restriction cannot be expressed through a `where` clause in the current type system; it is enforced as a compiler-intrinsic rule. A future revision is expected to replace this restriction with a generic constraint once static interface members enable an `ISteppable<T>` or equivalent interface.
+A range over `T` has type `Range<T>`. `T` is restricted by the compiler to the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`) and `char`. Other substitutions are rejected. This restriction is enforced as a compiler-intrinsic rule. Static interface members now exist ([§11.8](#sec-static-interface-members), v0.176) and the standard library defines `ISteppable<T>` (stdlib §2.19); replacing the intrinsic restriction with the constraint is a recorded follow-up (the change is compiler surgery with no user-visible effect, so it is sequenced separately).
 
 `Range<T>` is a compiler-intrinsic record that implements `IEnumerable<T>`:
 

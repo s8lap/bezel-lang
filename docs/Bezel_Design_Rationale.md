@@ -1393,7 +1393,7 @@ The brackets at the call site are syntactic friction but they make the allocatio
 Not in this version; the design is open to them in future revisions.
 
 - **Sum types / discriminated unions.** The current version narrows the gap with `sealed abstract` class hierarchies for `case` exhaustiveness. Full sum types are bigger; the design space (Swift, Rust, Scala 3) is large and unsettled.
-- **Static interface members.** Required for a generic numeric constraint, factory-pattern interfaces, and parsing-method abstractions.
+- **Static interface members.** *Shipped in v0.176 (#807, spec §11.8)* — abstract-only, recurrence-constrained, with compiler-provided primitive conformances. The follow-ups it unblocks (FromCollectionLiteral/IDeserializable promotion, Range<T> de-intrinsicking) are tracked issues.
 - **Trait/typeclass-style polymorphism.** Interfaces handle most of what traits do; the gap is associated types.
 - **Const generics.** Generic parameters that are values, not types.
 - **Reflection beyond `typeof`/`GetType`.** This splits into three pieces with different dispositions. (1) *Type-lattice metadata* — kind predicates, `BaseType`, `Implements`/`IsAssignableFrom`, enum introspection — **delivered in v0.113** on the `Type` token (stdlib [§2.13](Bezel_Standard_Library.md#sec-the-type-class)). (2) *Member-access reflection* — field/method enumeration, by-name member access, dynamic instantiation — is **declined, not deferred**: it contradicts the ownership model (a reflective `owned`-member access has no static site to carry its contract) and is the maximal violation of the no-hidden-magic principle; see rationale [§5.18](#sec-type-identity-not-reflection). It is recorded as declined so the question is settled rather than perennially reopened. (3) *Generic-instantiation decomposition* (`GenericArguments`/`GenericDefinition`) remains genuinely **deferred** — it is useful but cannot be expressed without also adding an unbound-generic `typeof` (`typeof(Array<>)`), which is a language change; it is to be decided together with that syntax, not bundled into a metadata revision. Attribute-only reflection, if reflection pressure ever materializes, is the realistic future direction and is itself a separately-scoped question (the attribute-system entry below).
@@ -7608,6 +7608,20 @@ v0.175 is the **structured-concurrency revision** — adopting RFC #808 on the r
 #### Migration
 
 Additive except: `Subscribe` handler parameters become `scoped` (existing handler lambdas at call sites are unaffected — the modifier is on the declaration; function-VALUES of the old type held in locals would need the new type, none exist in the corpus).
+
+<a id="sec-v0-175-to-v0-176-changelog"></a>
+### v0.176 changelog (v0.175 → v0.176)
+
+v0.176 is the **static-interface-members revision** (#807) — the keystone the spec deferred to by name in four places, closing the design pass's RFC set.
+
+- **Spec §11.8 (new)**: `static` interface members — abstract-only (the §17.4 diamond posture), methods + operators (constants/properties deferred: spell as nullary methods), the C#-style recurrence constraint `where T: I<T>` (no `Self` keyword — deliberately declined: zero new syntax, the recurrence is explicit), `T.Member(...)` and constraint-operator dispatch resolved at instantiation (the compiler already monomorphizes generics; static dispatch uses exactly what specialization has).
+- **Compiler-provided primitive conformances** bridging the intrinsic/declared operator split: the numeric tower + `char` conform to the new stdlib §2.19 `INumber<T>`/`ISteppable<T>`/`IParsable<T>` without declaring them; existing `Parse`/`TryParse` members are the witnesses (v0.171 shapes, unchanged).
+- **§16 Range note updated**: the intrinsic element restriction now has its replacement constraint ON RECORD (`ISteppable<T>`), sequenced as a follow-up (no user-visible change).
+- **Recorded follow-ups, deliberately not in v0.176**: FromCollectionLiteral → `ICollectionLiteralTarget<T>` and `IDeserializable.Deserialize` promotion (both zero-source-change by design), Range de-intrinsicking, static constants/properties in interfaces, `Self` sugar.
+
+#### Migration
+
+None — purely additive. The §18 deferred-list entry is marked shipped.
 
 ## 20. Closing
 
