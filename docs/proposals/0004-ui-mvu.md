@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Early draft — architecture + code shape only; deliberately *not* a full API surface |
+| **Status** | Early draft — **proposal-only by owner decision (2026-07-03): no implementation until a future explicit go**; architecture + code shape only, deliberately *not* a full API surface |
 | **Origin** | exploration-ui.md's "fits like a glove" finding; owner asked for construction/control examples (2026-07-03) |
 | **Design influences** | Elm (the architecture), iced/Rust (MVU without a VM), **not** SwiftUI's property wrappers, **not** React hooks (exploration-ui.md records why) |
 | **The one-line pitch** | The Elm runtime's defining constraint — updates are strictly serial — *is* Bezel's domain model; every piece of MVU maps to an existing language feature, and messages-as-data is exactly what sendability wants |
