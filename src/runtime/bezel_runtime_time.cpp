@@ -324,71 +324,228 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     return sh;
 }
 
-// §9.3 (#1099B): Decimal.ToString(format) — honor the "F"/"f" fixed-point
-// specifier ("F2" → exactly 2 fraction digits; bare "F" → 2 by .NET default).
-// The mantissa is rounded half-up to the requested precision (bz_decimal_round)
-// then formatted with EXACTLY that many fraction digits (trailing zeros padded;
-// prec == 0 drops the point). Any other / malformed format falls back to the
-// plain ToString — no worse than before, when the format argument was discarded
-// entirely. `fmt_p` is a bz_string {data,len,width,rc}.
+// §2.18 / #1412 (v0.172+): Decimal.ToString(format) — handles the full §2.18
+// decimal specifier vocabulary: F/Fn, E/En, G, P/Pn.  Returns nullptr for any
+// unrecognized or malformed specifier; callers check for nullptr and raise
+// FormatException (§2.18 strict-fault rule).
+//
+// Specifiers (per stdlib §2.18):
+//   F/Fn — fixed-point, n decimal places, default 2
+//   E/En — scientific notation, n places in significand, default 6;
+//           3-digit exponent; sign always printed ("exact decimal semantics")
+//   G    — general: exact natural representation (= plain ToString())
+//   P/Pn — percent: ×100, fixed-point with n places, default 2, "%" suffix
+//   anything else → nullptr (→ FormatException via caller)
+//
+// `fmt_p` is a bz_string {data,len,width,rc}.
 extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
                                           const void* fmt_p) {
     const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
     const char* fmt = (fh && fh->data && fh->width == 1) ? fh->data : "";
     int64_t flen = fh ? fh->len : (int64_t)strlen(fmt);
-    if (flen >= 1 && (fmt[0] == 'F' || fmt[0] == 'f')) {
-        int prec = 2;            // .NET default for "F" with no digit count
-        bool ok = true;
-        if (flen > 1) {
-            prec = 0;
+    if (flen < 1) return nullptr;  // empty format → unrecognized
+
+    char letter = fmt[0];
+    char upper = (letter >= 'a' && letter <= 'z') ? (char)(letter - 32) : letter;
+
+    // Validate optional count tail (digits only after the letter).
+    // G accepts no count per §2.18 (decimal has G, not Gn).
+    bool hasCount = (flen > 1);
+    int count = 0;
+    if (upper == 'G') {
+        if (hasCount) return nullptr;  // "Gn" not in §2.18 decimal vocabulary
+    } else {
+        if (hasCount) {
             for (int64_t i = 1; i < flen; ++i) {
-                if (fmt[i] < '0' || fmt[i] > '9') { ok = false; break; }
-                prec = prec * 10 + (fmt[i] - '0');
-                if (prec > 28) { ok = false; break; }  // decimal max scale
+                if (fmt[i] < '0' || fmt[i] > '9') return nullptr;  // bad tail
+                count = count * 10 + (fmt[i] - '0');
+                if (count > 29) return nullptr;  // out of range
             }
-        }
-        if (ok) {
-            bz_decimal_t r;
-            bz_decimal_round(a, prec, &r);
-            __uint128_t m = dec_mantissa(&r);
-            uint32_t s = dec_scale(&r);          // s <= prec after rounding
-            int neg = dec_sign(&r);
-            bool valueIsZero = (m == 0);
-            // mantissa digits, most-significant first.
-            char digits[40]; int nd = 0;
-            if (m == 0) { digits[0] = '0'; nd = 1; }
-            else { while (m > 0) { digits[nd++] = (char)('0' + (int)(m % 10)); m /= 10; } }
-            for (int i = 0; i < nd / 2; ++i) {
-                char t = digits[i]; digits[i] = digits[nd-1-i]; digits[nd-1-i] = t;
-            }
-            char buf[80]; int pos = 0;
-            if (neg && !valueIsZero) buf[pos++] = '-';   // never "-0.00"
-            int int_digits = nd - (int)s;
-            if (int_digits <= 0) buf[pos++] = '0';
-            else for (int i = 0; i < int_digits; ++i) buf[pos++] = digits[i];
-            if (prec > 0) {
-                buf[pos++] = '.';
-                int written = 0;
-                // leading zeros when |value| < 1 (int_digits < 0).
-                for (int i = 0; i < -int_digits && written < prec; ++i) {
-                    buf[pos++] = '0'; ++written;
-                }
-                int fracStart = int_digits > 0 ? int_digits : 0;
-                for (int i = fracStart; i < nd && written < prec; ++i) {
-                    buf[pos++] = digits[i]; ++written;
-                }
-                while (written < prec) { buf[pos++] = '0'; ++written; }  // pad
-            }
-            buf[pos] = '\0';
-            int64_t len = (int64_t)pos;
-            char* data = (char*)malloc((size_t)len + 1);
-            memcpy(data, buf, (size_t)len + 1);
-            bz_string_hdr* hdr = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
-            hdr->data = data; hdr->len = len; hdr->width = 1; hdr->rc = 1;
-            return hdr;
         }
     }
-    return bz_decimal_to_string(a);   // unsupported / malformed format
+
+    // ── F/Fn: fixed-point (n decimal places, default 2) — per §2.18 ──────────
+    if (upper == 'F') {
+        int prec = hasCount ? count : 2;  // §2.18: bare "F" defaults to 2
+        bz_decimal_t r;
+        bz_decimal_round(a, prec, &r);
+        __uint128_t m = dec_mantissa(&r);
+        uint32_t s = dec_scale(&r);   // s <= prec after rounding
+        int neg = dec_sign(&r);
+        bool isZero = (m == 0);
+        char digits[40]; int nd = 0;
+        if (isZero) { digits[0] = '0'; nd = 1; }
+        else { while (m > 0) { digits[nd++] = (char)('0' + (int)(m % 10)); m /= 10; } }
+        for (int i = 0; i < nd / 2; ++i) {
+            char t = digits[i]; digits[i] = digits[nd-1-i]; digits[nd-1-i] = t;
+        }
+        char buf[80]; int pos = 0;
+        if (neg && !isZero) buf[pos++] = '-';   // never "-0.00"
+        int int_d = nd - (int)s;
+        if (int_d <= 0) buf[pos++] = '0';
+        else for (int i = 0; i < int_d; ++i) buf[pos++] = digits[i];
+        if (prec > 0) {
+            buf[pos++] = '.';
+            int written = 0;
+            for (int i = 0; i < -int_d && written < prec; ++i) {
+                buf[pos++] = '0'; ++written;
+            }
+            int fs = int_d > 0 ? int_d : 0;
+            for (int i = fs; i < nd && written < prec; ++i) {
+                buf[pos++] = digits[i]; ++written;
+            }
+            while (written < prec) { buf[pos++] = '0'; ++written; }
+        }
+        buf[pos] = '\0';
+        return bz_make_string(buf, pos);
+    }
+
+    // ── G: general — exact natural representation — per §2.18 #1412 ──────────
+    // "Exact decimal semantics": the decimal's exact value, rendered as the
+    // natural shortest decimal string (identical to plain ToString()).
+    if (upper == 'G') {
+        return bz_decimal_to_string(a);
+    }
+
+    // ── Shared digit extraction for P and E (digit-string domain) ─────────────
+    // Working in digit-string space avoids 96-bit overflow for P (×100) and
+    // lets E round the significand without re-boxing into bz_decimal_t.
+    __uint128_t m0 = dec_mantissa(a);
+    uint32_t s0 = dec_scale(a);
+    int neg = dec_sign(a);
+    bool isZero = (m0 == 0);
+
+    // Capacity 44: up to 29 mantissa digits + 2 appended zeros (P) + guard.
+    char raw[44]; int nd = 0;
+    if (isZero) { raw[0] = '0'; nd = 1; }
+    else {
+        __uint128_t t = m0;
+        while (t > 0) { raw[nd++] = (char)('0' + (int)(t % 10)); t /= 10; }
+        for (int i = 0; i < nd / 2; ++i) {
+            char c = raw[i]; raw[i] = raw[nd-1-i]; raw[nd-1-i] = c;
+        }
+    }
+
+    // ── P/Pn: percent (×100, F-format, "%" suffix) — per §2.18 #1412 ─────────
+    if (upper == 'P') {
+        int prec = hasCount ? count : 2;  // §2.18 default = 2 (same as floating P)
+        // Special-case zero: 0 × 100 = 0; produce "0[.00...]%".
+        // Without this, appending trailing zeros to simulate ×100 would turn "0"
+        // (nd=1, new_s=0) into "000" (nd=3, new_s=0), printing "000.00%".
+        if (isZero) {
+            char zbuf[20]; int zpos = 0;
+            zbuf[zpos++] = '0';
+            if (prec > 0) {
+                zbuf[zpos++] = '.';
+                for (int i = 0; i < prec; ++i) zbuf[zpos++] = '0';
+            }
+            zbuf[zpos++] = '%';
+            zbuf[zpos] = '\0';
+            return bz_make_string(zbuf, zpos);
+        }
+        // ×100 in digit-string domain: shift decimal point right by 2.
+        // raw[0..nd-1] with s0 fractional digits; after ×100: new_s = s0 - 2.
+        // If s0 < 2: append (2 - s0) trailing '0' chars and set new_s = 0.
+        int new_s = (int)s0;
+        if (new_s >= 2) {
+            new_s -= 2;
+        } else {
+            int pad = 2 - new_s;
+            for (int i = 0; i < pad && nd < 42; ++i) raw[nd++] = '0';
+            new_s = 0;
+        }
+        // Round to prec fractional digits in digit-string domain (half-up).
+        // keep_unc = total retained digits (int part + prec fractional).
+        // If keep_unc < 0: all significant digits are past the prec-th fractional
+        // position; the first dropped digit is a leading '0' → no carry → result is 0.
+        if (new_s > prec) {
+            int keep_unc = nd - new_s + prec;  // may be negative
+            if (keep_unc < 0) {
+                nd = 0;  // all digits past cutoff; first dropped = leading '0' → no carry
+            } else if (keep_unc < nd) {
+                int carry = (raw[keep_unc] - '0') >= 5 ? 1 : 0;
+                nd = keep_unc;
+                for (int i = nd - 1; i >= 0 && carry; --i) {
+                    int dv = (raw[i] - '0') + carry;
+                    raw[i] = (char)('0' + dv % 10);
+                    carry = dv / 10;
+                }
+                if (carry) {
+                    for (int i = nd; i > 0; --i) raw[i] = raw[i-1];
+                    raw[0] = '1'; nd++;
+                }
+            }
+            new_s = prec;
+        }
+        char buf[100]; int pos = 0;
+        int int_d = nd - new_s;
+        if (neg && !isZero) buf[pos++] = '-';
+        if (int_d <= 0) buf[pos++] = '0';
+        else for (int i = 0; i < int_d; ++i) buf[pos++] = raw[i];
+        if (prec > 0) {
+            buf[pos++] = '.';
+            int written = 0;
+            for (int i = 0; i < -int_d && written < prec; ++i) {
+                buf[pos++] = '0'; ++written;
+            }
+            int fs = int_d > 0 ? int_d : 0;
+            for (int i = fs; i < nd && written < prec; ++i) {
+                buf[pos++] = raw[i]; ++written;
+            }
+            while (written < prec) { buf[pos++] = '0'; ++written; }
+        }
+        buf[pos++] = '%';
+        buf[pos] = '\0';
+        return bz_make_string(buf, pos);
+    }
+
+    // ── E/En: scientific notation — per §2.18 #1412 ──────────────────────────
+    // "Exact decimal semantics": 3-digit exponent, sign always printed.
+    // Default precision (significand digits after decimal) = 6 (§2.18; same as
+    // floating E default, consistent with the single-table vocabulary).
+    if (upper == 'E') {
+        int prec = hasCount ? count : 6;
+        // Exponent = (integer part digit count) - 1 = (nd - s0) - 1.
+        int exp = isZero ? 0 : nd - (int)s0 - 1;
+        // Round significand to prec+1 significant digits (half-up).
+        if (!isZero && nd > prec + 1) {
+            int keep = prec + 1;
+            int carry = (raw[keep] - '0') >= 5 ? 1 : 0;
+            nd = keep;
+            for (int i = nd - 1; i >= 0 && carry; --i) {
+                int dv = (raw[i] - '0') + carry;
+                raw[i] = (char)('0' + dv % 10);
+                carry = dv / 10;
+            }
+            if (carry) {
+                // Carry propagated past all digits: prepend '1', bump exponent.
+                for (int i = nd; i > 0; --i) raw[i] = raw[i-1];
+                raw[0] = '1'; nd++;
+                exp++;
+                nd = prec + 1;  // re-truncate: the carry digit is now in raw[0]
+            }
+        }
+        // Format: [-]d[0]['.'d[1]...d[prec]]E[+/-]EEE
+        // 3-digit exponent per §2.18 "exact decimal semantics".
+        char buf[100]; int pos = 0;
+        if (neg && !isZero) buf[pos++] = '-';
+        buf[pos++] = (nd >= 1) ? raw[0] : '0';
+        if (prec > 0) {
+            buf[pos++] = '.';
+            for (int i = 1; i <= prec; ++i)
+                buf[pos++] = (i < nd) ? raw[i] : '0';
+        }
+        buf[pos++] = letter;  // preserve E/e case (§2.18: case of specifier)
+        buf[pos++] = (exp >= 0) ? '+' : '-';
+        int aexp = exp < 0 ? -exp : exp;
+        buf[pos++] = (char)('0' + aexp / 100);
+        buf[pos++] = (char)('0' + (aexp / 10) % 10);
+        buf[pos++] = (char)('0' + aexp % 10);
+        buf[pos] = '\0';
+        return bz_make_string(buf, pos);
+    }
+
+    return nullptr;  // unrecognized specifier → FormatException via caller
 }
 
 // ---------------------------------------------------------------------------

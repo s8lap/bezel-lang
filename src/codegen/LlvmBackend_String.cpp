@@ -677,12 +677,27 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                 return r;
         }
     }
-    // §18.5 / §9.3 (#1099B in interpolation): a decimal value with a fixed-point
-    // format — `$"{d:F2}"` — dispatches to the runtime decimal formatter, matching
-    // the explicit `d.ToString("F2")` path, instead of falling through to the
-    // no-format ToString (which dropped the precision: "1.5" not "1.50").
+    // §18.5 / §9.3 / §2.18 #1412: a decimal value with a format specifier.
+    // Dispatches to bz_decimal_to_string_fmt for the full §2.18 decimal vocabulary:
+    // F/Fn, E/En, G, P/Pn.  An unrecognized specifier raises FormatException
+    // (§2.18 strict-fault); since the specifier is a compile-time constant here,
+    // we validate it at codegen time and emit emitAlwaysFormatException() for
+    // anything outside the vocabulary — identical to the float/int approach.
     if (spec[0] != ',' && rt && rt->kind == sema::TypeRef::Kind::Primitive &&
         rt->primitive == sema::PrimitiveType::Decimal) {
+        char specCh = spec[0];
+        char specUp = (specCh >= 'a' && specCh <= 'z') ? (char)(specCh - 32) : specCh;
+        // Validate tail: must be all digits (or empty).
+        bool tailOk = true;
+        for (std::size_t ti = 1; ti < spec.size(); ++ti)
+            if (!std::isdigit(static_cast<unsigned char>(spec[ti])))
+                { tailOk = false; break; }
+        // G takes no count (§2.18: "G" not "Gn" for decimal).
+        bool specOk = tailOk &&
+                      (specUp == 'F' || specUp == 'E' || specUp == 'P' ||
+                       (specUp == 'G' && spec.size() == 1));
+        if (!specOk)
+            return emitAlwaysFormatException();  // §2.18 strict-fault
         llvm::Value* fmtStr = lowerStringLiteral("\"" + spec + "\"", false);
         llvm::AllocaInst* dslot = entryAlloca(decimalStructType());
         builder_.CreateStore(val, dslot);

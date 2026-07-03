@@ -977,8 +977,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 builder_.CreateStore(recv, dslot);
                                 auto* fn = declareC("bz_decimal_to_string_fmt",
                                                     ptrTy(), {ptrTy(), ptrTy()});
-                                return builder_.CreateCall(fn, {dslot, fmtVal},
-                                                           "dec.tostrf");
+                                llvm::Value* res = builder_.CreateCall(
+                                    fn, {dslot, fmtVal}, "dec.tostrf");
+                                // nullptr → unrecognized specifier → FormatException
+                                // (§2.18 strict-fault, #1412).
+                                llvm::Value* isNull = builder_.CreateICmpEQ(
+                                    res,
+                                    llvm::Constant::getNullValue(ptrTy()),
+                                    "dec.fmt.null");
+                                emitGuardThrow(isNull, "FormatException");
+                                return res;
                             }
                             // Try to extract the format specifier from a literal arg.
                             std::string bezelFmt;

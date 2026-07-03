@@ -4808,18 +4808,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* fn = declareC("bz_decimal_to_string", ptrTy(), {ptrTy()});
                 return builder_.CreateCall(fn, {slot}, "dec.tostr");
             }
-            // Decimal.ToString(format: string) — §9.3 (#1099B). Honor the
-            // format (the "F"/"f" fixed-point specifier; other formats fall back
-            // to the plain ToString in the runtime). Was: the format arg was
-            // discarded and plain ToString called — `1.5m.ToString("F2")` gave
-            // "1.5" instead of "1.50".
+            // Decimal.ToString(format: string) — §9.3 / §2.18 #1412. Routes to
+            // bz_decimal_to_string_fmt which handles the full §2.18 decimal
+            // vocabulary (F/Fn, E/En, G, P/Pn) and returns nullptr for anything
+            // else; the null check here raises FormatException (strict-fault, §2.18).
             if (mname == "ToString" && call.args.size() == 1 &&
                 call.args[0].value) {
                 llvm::Value* fmtVal = lowerExpr(*call.args[0].value);
                 if (!fmtVal) return nullptr;
                 auto* fn = declareC("bz_decimal_to_string_fmt", ptrTy(),
                                     {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {slot, fmtVal}, "dec.tostrf");
+                llvm::Value* res = builder_.CreateCall(fn, {slot, fmtVal},
+                                                       "dec.tostrf");
+                // nullptr → unrecognized/malformed specifier → FormatException
+                // (§2.18 strict-fault, #1412).
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    res,
+                    llvm::Constant::getNullValue(ptrTy()),
+                    "dec.fmt.null");
+                emitGuardThrow(isNull, "FormatException");
+                return res;
             }
             // Decimal.CompareTo(other: decimal): int — §9.3.
             if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
