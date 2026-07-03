@@ -455,6 +455,38 @@ private:
     // base/interface set, or equal it? BFS over baseTypes, cycle-guarded.
     bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound);
 
+    // §11.8 / §14.2 (v0.176, #807): a type-bound constraint failure recorded
+    // DURING base-list resolution, re-checked after every type's baseTypes are
+    // populated. The recurrence form `class Meters: INumber<Meters>` checks the
+    // `where T: INumber<T>` bound on the INumber<Meters> instantiation while
+    // Meters' own base list is still being resolved — Meters.baseTypes does not
+    // yet contain INumber, so an eager check false-rejects the self-referential
+    // conformance. Deferring the *report* (not the check) closes the ordering
+    // hole for every mutually/self-referential conformance without weakening
+    // the constraint: the re-check runs with complete base sets and reports
+    // any persistent violation.
+    struct DeferredTypeBoundFailure {
+        SourceLocation loc;
+        std::string param;      // constraint's type-parameter name
+        std::string boundName;  // bound's declaration name (diagnostic)
+        std::string argName;    // argument spelling (diagnostic)
+        TypeRef* arg = nullptr;
+        TypeRef* bound = nullptr;
+    };
+    std::vector<DeferredTypeBoundFailure> deferredTypeBoundFailures_;
+    // Flush deferredTypeBoundFailures_: re-run argSatisfiesTypeBound with all
+    // base sets populated; report the entries that still fail. per §14.2.
+    void recheckDeferredTypeBounds();
+
+    // §11.8 (v0.176, #807): a class/record declaring conformance to an
+    // interface with STATIC members (static methods / static operators) must
+    // supply matching statics with exact signatures (the §11.2 rule applied
+    // to statics: same name/arity/param types/param modifiers/return type
+    // including `owned`; operators match by token + signature). Runs after
+    // base types resolve. Covers both user static interfaces and the
+    // stdlib §2.19 builtins (INumber/ISteppable/IParsable).
+    void checkStaticInterfaceConformance();
+
     // §14.2 `where T: new()`: does the resolved argument type admit a
     // parameterless construction? Sets `decided=false` when the argument
     // can't be classified (built-ins, unresolved, generic param) so the

@@ -460,6 +460,181 @@ inline TypeSymbol* SemaContext::builtinClassSym(std::string_view name) {
 // agent (stdlib §5); the Dictionary/Set comparer-constructor overloads that
 // would *consume* one are a separate, still-deferred feature.
 inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
+    // stdlib §2.19 / spec §11.8 (v0.176, #807): the static-abstraction
+    // interfaces INumber<T> / ISteppable<T> / IParsable<T>. All members are
+    // STATIC (abstract-only static methods + static operators, §11.8), so —
+    // unlike the instance-member builtin interfaces below — they contribute
+    // NO itable slots (declareVtables Pass 0 excludes statics/operators).
+    // They exist as real Interface TypeSymbols so that:
+    //   • `class Meters: INumber<Meters>` resolves and lands in baseTypes,
+    //   • `where T: INumber<T>` resolves as a constraint bound,
+    //   • the §11.8 conformance check and T.Member dispatch read the member
+    //     signatures (each backed by a real abstract ast node).
+    // The member sets are the §2.19 declarations verbatim.
+    if (name == "INumber" || name == "ISteppable" || name == "IParsable") {
+        auto key = std::string(name);
+        auto it = builtinInterfaceCache_.find(key);
+        if (it != builtinInterfaceCache_.end()) return it->second;
+
+        // One member spec: a static method (isOp=false, name) or a static
+        // operator (isOp=true, token). Type spellings admitted: "T", "T?",
+        // "bool", "long", "string" — the §2.19 surface.
+        struct SParam { const char* pname; const char* type; const char* mod; };
+        struct SMember {
+            bool isOp;
+            const char* nameOrToken;
+            std::vector<SParam> params;
+            const char* ret;
+        };
+        std::vector<SMember> smembers;
+        if (name == "INumber") {
+            smembers = {
+                {false, "Zero", {}, "T"},
+                {false, "One",  {}, "T"},
+                {true,  "+", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
+                {true,  "-", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
+                {true,  "*", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
+                {true,  "/", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
+                {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool"},
+            };
+        } else if (name == "ISteppable") {
+            smembers = {
+                {false, "Step", {{"value", "T", ""}, {"by", "long", ""}}, "T"},
+                {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool"},
+            };
+        } else {  // IParsable
+            smembers = {
+                {false, "Parse", {{"s", "string", ""}}, "T"},
+                {false, "TryParse",
+                 {{"s", "string", ""}, {"value", "T?", "out"}}, "bool"},
+            };
+        }
+
+        // Build one ast::Type node for a spelling, returning the raw node.
+        auto typeDecl = std::make_unique<ast::TypeDecl>();
+        typeDecl->kind = ast::TypeDeclKind::Interface;
+        typeDecl->visibility = ast::Visibility::Public;
+        typeDecl->name = name == "INumber" ? "INumber"
+                        : name == "ISteppable" ? "ISteppable" : "IParsable";
+        typeDecl->genericParams.push_back(ast::GenericParam{"", "T"});
+        auto makeTypeNode = [&](const char* spelling) -> std::unique_ptr<ast::Type> {
+            auto t = std::make_unique<ast::Type>();
+            t->kind = ast::TypeKind::Named;
+            t->name = std::make_unique<ast::QualifiedName>();
+            std::string_view sp(spelling);
+            if (sp == "T?") {
+                t->name->parts.push_back("T");
+                t->nullable = true;
+            } else {
+                t->name->parts.push_back(sp);
+            }
+            return t;
+        };
+        // Pre-resolve a node: primitives → the cached primitive TypeRef;
+        // `T`/`T?` → a declaration-less Named TypeRef carrying the node (so
+        // the §11.8 substitution machinery keys off astNode->name).
+        auto preResolve = [&](ast::Type* node) {
+            std::string_view n = node->name->parts[0];
+            PrimitiveType p = PrimitiveType::None;
+            if (n == "bool") p = PrimitiveType::Bool;
+            else if (n == "long") p = PrimitiveType::Long;
+            else if (n == "string") p = PrimitiveType::String;
+            if (p != PrimitiveType::None) {
+                setResolvedType(node, primitiveTypeRef(p, false));
+            } else {
+                TypeRef* tr = makeTypeRef();
+                tr->kind = TypeRef::Kind::Named;
+                tr->astNode = node;
+                tr->nullable = node->nullable;
+                setResolvedType(node, tr);
+            }
+        };
+        // Raw AST pointers, parallel to smembers, to back the symbols.
+        struct RawM {
+            ast::Member* m;
+            std::vector<ast::Type*> paramTypes;
+        };
+        std::vector<RawM> raws;
+        for (const auto& sm : smembers) {
+            RawM rm;
+            if (sm.isOp) {
+                auto od = std::make_unique<ast::OperatorDecl>();
+                od->visibility = ast::Visibility::None;  // implicit public
+                od->opToken = sm.nameOrToken;
+                od->bodyKind = ast::MethodBodyKind::Abstract;
+                for (const auto& sp : sm.params) {
+                    ast::Param p;
+                    p.name = sp.pname;
+                    p.modifier = sp.mod;
+                    p.type = makeTypeNode(sp.type);
+                    preResolve(p.type.get());
+                    rm.paramTypes.push_back(p.type.get());
+                    od->params.push_back(std::move(p));
+                }
+                od->returnType = makeTypeNode(sm.ret);
+                preResolve(od->returnType.get());
+                rm.m = od.get();
+                typeDecl->members.push_back(std::move(od));
+            } else {
+                auto md = std::make_unique<ast::MethodDecl>();
+                md->visibility = ast::Visibility::None;  // implicit public
+                md->modifiers.push_back("static");       // per §11.8
+                md->name = sm.nameOrToken;
+                md->bodyKind = ast::MethodBodyKind::Abstract;
+                for (const auto& sp : sm.params) {
+                    ast::Param p;
+                    p.name = sp.pname;
+                    p.modifier = sp.mod;
+                    p.type = makeTypeNode(sp.type);
+                    preResolve(p.type.get());
+                    rm.paramTypes.push_back(p.type.get());
+                    md->params.push_back(std::move(p));
+                }
+                md->returnType = makeTypeNode(sm.ret);
+                preResolve(md->returnType.get());
+                rm.m = md.get();
+                typeDecl->members.push_back(std::move(md));
+            }
+            raws.push_back(std::move(rm));
+        }
+        ast::TypeDecl* tdRaw = typeDecl.get();
+        builtinInterfaceAst_.push_back(std::move(typeDecl));
+
+        auto* ts = makeSymbol<TypeSymbol>();
+        ts->kind = ast::TypeDeclKind::Interface;
+        ts->name = tdRaw->name;
+        ts->visibility = ast::Visibility::Public;
+        ts->decl = tdRaw;
+        auto* tparam = makeSymbol<GenericParamSymbol>();
+        tparam->name = "T";
+        ts->genericParams.push_back(tparam);
+        for (std::size_t i = 0; i < smembers.size(); ++i) {
+            const SMember& sm = smembers[i];
+            const RawM& rm = raws[i];
+            auto* ms = makeSymbol<MethodSymbol>();
+            ms->name = sm.nameOrToken;
+            ms->visibility = ast::Visibility::Public;
+            ms->parent = ts;
+            ms->decl = rm.m;
+            if (sm.isOp) {
+                ms->isOperator = true;
+                ms->operatorToken = sm.nameOrToken;
+            } else {
+                ms->modifiers.push_back("static");
+            }
+            for (std::size_t p = 0; p < sm.params.size(); ++p) {
+                auto* ps = makeSymbol<ParameterSymbol>();
+                ps->name = sm.params[p].pname;
+                ps->modifier = sm.params[p].mod;
+                ps->declType = rm.paramTypes[p];
+                ms->params.push_back(ps);
+            }
+            ts->members.push_back(ms);
+        }
+        builtinInterfaceCache_[key] = ts;
+        return ts;
+    }
+
     // Per-method contract spec. Every parameter is the generic `T` (the only
     // shape the three builtin interfaces need); paramNames give the spec-faithful
     // names. retName/retPrim must agree so the pre-resolved return node matches

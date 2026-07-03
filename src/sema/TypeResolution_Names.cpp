@@ -139,6 +139,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §5 / #975: IEqualityComparer<T> — the user-implemented equality agent
         // (Equals(a,b):bool, GetHashCode(value):int); arity 1.
         n == "IComparable" || n == "IEquatable" || n == "IEqualityComparer" ||
+        // stdlib §2.19 / §11.8 (v0.176, #807): the static-abstraction
+        // interfaces (abstract-only static members; recurrence-constrained).
+        // Auto-imported, arity 1; the synthesized declaration is attached by
+        // ctx_.builtinInterfaceSym below.
+        n == "INumber" || n == "ISteppable" || n == "IParsable" ||
         // §3 stdlib collection types (arity 1):
         n == "Stack" || n == "OwningStack" ||
         n == "Queue" || n == "OwningQueue" ||
@@ -1043,7 +1048,15 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // a `where` bound. The arity check above (still) diagnoses wrong
                 // arity; this only attaches the declaration when name+arity valid.
                 if (first == "IComparable" || first == "IEquatable" ||
-                    first == "IEqualityComparer" || first == "IReadOnlySpan") {
+                    first == "IEqualityComparer" || first == "IReadOnlySpan" ||
+                    // stdlib §2.19 / §11.8 (v0.176, #807): the static-
+                    // abstraction interfaces get a real synthesized Interface
+                    // TypeSymbol so `: INumber<Meters>` conformance and
+                    // `where T: INumber<T>` bounds resolve to a declaration
+                    // whose (static) member signatures drive the §11.8
+                    // conformance check and T.Member dispatch.
+                    first == "INumber" || first == "ISteppable" ||
+                    first == "IParsable") {
                     ref.declaration = ctx_.builtinInterfaceSym(first);
                 }
                 return;

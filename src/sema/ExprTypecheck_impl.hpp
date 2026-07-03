@@ -17,6 +17,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -112,6 +113,36 @@ private:
     // `x: T` where T has `where T: ISome` requires dispatching through the
     // constraint's member set, not the (null) declaration of T's TypeRef.
     const ast::MethodDecl* currentMethodDecl_ = nullptr;
+
+    // §11.8 (v0.176, #807): while visiting a MemberAccessExpr's TARGET child,
+    // this points at that target node. It lets the IdentifierExpr handler
+    // recognize `T` in `T.Member(...)` — a type-parameter receiver — and mark
+    // it with a GenericParamSymbol instead of reporting "unresolved
+    // identifier". A bare `T` in any other expression position keeps today's
+    // error. Saved/restored around each target visit.
+    const ast::Expr* maTargetHint_ = nullptr;
+    // §11.8: one synthesized GenericParamSymbol marker per type-parameter
+    // name, attached as the exprSymbol of a `T` member-access receiver so
+    // resolveMemberAccess (and codegen) can identify the receiver kind.
+    std::unordered_map<std::string_view, GenericParamSymbol*> typeParamMarkers_;
+    // §11.8: is `name` a declared generic type parameter of the enclosing
+    // method or type?
+    bool isInScopeTypeParam(std::string_view name) const;
+    // §11.8: the cached marker symbol for an in-scope type-parameter name.
+    GenericParamSymbol* typeParamMarker(std::string_view name);
+    // §11.8: search the enclosing method's constraints (then the enclosing
+    // type's) for a `where <paramName>: I<...>` bound whose interface declares
+    // a static OPERATOR member matching `op` with two parameters of the
+    // interface's own recurrence parameter. Returns the interface's operator
+    // MethodSymbol and stores the bound's instantiation TypeRef in *outBound.
+    MethodSymbol* findConstraintStaticOperator(std::string_view paramName,
+                                               std::string_view op,
+                                               TypeRef** outBound);
+    // §11.8: enumerate the `type`-kind constraint bounds declared for
+    // `paramName` (method constraints first, then the enclosing type's),
+    // invoking `fn` with each resolved bound TypeRef until it returns true.
+    bool forEachConstraintBound(std::string_view paramName,
+                                const std::function<bool(TypeRef*)>& fn);
 
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static

@@ -83,4 +83,29 @@ struct TypeRef {
 // Returns PrimitiveType::None for unknown lexemes.
 PrimitiveType primitiveFromName(std::string_view name);
 
+// stdlib §2.19 (v0.176, #807): the compiler-provided primitive conformance
+// table for the static-abstraction interfaces. The numeric tower (byte…ulong,
+// float, double, decimal) conforms to INumber<T>/ISteppable<T>/IParsable<T>;
+// `char` conforms to ISteppable<char> and IParsable<char> only. `string`
+// (and every other primitive) conforms to none.
+inline bool primitiveConformsToStaticIface(PrimitiveType p,
+                                           std::string_view ifaceName) {
+    if (ifaceName != "INumber" && ifaceName != "ISteppable" &&
+        ifaceName != "IParsable")
+        return false;
+    switch (p) {
+        case PrimitiveType::Byte:  case PrimitiveType::SByte:
+        case PrimitiveType::Short: case PrimitiveType::UShort:
+        case PrimitiveType::Int:   case PrimitiveType::UInt:
+        case PrimitiveType::Long:  case PrimitiveType::ULong:
+        case PrimitiveType::Float: case PrimitiveType::Double:
+        case PrimitiveType::Decimal:
+            return true;  // the numeric tower conforms to all three
+        case PrimitiveType::Char:
+            return ifaceName != "INumber";  // ISteppable + IParsable only
+        default:
+            return false;
+    }
+}
+
 } // namespace bezel::sema

@@ -8364,9 +8364,135 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     if (!id) return nullptr;
     sema::PrimitiveType pt = sema::primitiveFromName(id->name);
+    // §11.8 (v0.176, #807): `T.Parse(...)` / `T.Zero()` / … — a static
+    // interface member called through a constrained TYPE PARAMETER, at a
+    // specialization where T is a PRIMITIVE (the compiler-provided §2.19
+    // conformances). Resolve T through the active substitution and lower
+    // exactly like the concrete primitive's static (the existing per-member
+    // handlers below). Non-primitive substitutions fall through to the
+    // user-static redirect in lowerCall; sema guarantees only conforming
+    // primitives reach a §2.19-bearing constraint.
+    if (pt == sema::PrimitiveType::None &&
+        dynamic_cast<sema::GenericParamSymbol*>(ctx_.exprSymbol(*id))) {
+        auto sit = genericSubstSemaTy_.find(id->name);
+        if (sit != genericSubstSemaTy_.end() && sit->second &&
+            sit->second->kind == sema::TypeRef::Kind::Primitive)
+            pt = sit->second->primitive;
+    }
     if (pt == sema::PrimitiveType::None) return nullptr;
     const auto& m = ma->member;
     using P = sema::PrimitiveType;
+
+    // §11.8 / stdlib §2.19 (v0.176, #807): the compiler-provided conformance
+    // members of the primitive tower. Reached only through a constrained type
+    // parameter (sema rejects `int.Zero()` in ordinary code — §3.4's closed
+    // static-member sets are unchanged).
+    //   INumber<T>.Zero() / One()  → the primitive's 0 / 1 constant
+    //   ISteppable<T>.Step(v, by)  → advance in T's space (v + by)
+    if ((m == "Zero" || m == "One") && call.args.empty()) {
+        const bool one = (m == "One");
+        if (pt == P::Decimal) {
+            if (one) return emitDecimalOne();
+            llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+            emitIntToDecimal(builder_.getInt32(0), P::Int, slot);
+            return builder_.CreateLoad(decimalStructType(), slot, "dec.zero");
+        }
+        llvm::Type* t = lowerPrimitive(pt);
+        if (t->isFloatingPointTy())
+            return llvm::ConstantFP::get(t, one ? 1.0 : 0.0);
+        if (t->isIntegerTy())
+            return llvm::ConstantInt::get(t, one ? 1 : 0);
+        return nullptr;
+    }
+    if (m == "Step" && call.args.size() == 2 && call.args[0].value &&
+        call.args[1].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        llvm::Value* by = lowerExpr(*call.args[1].value);
+        if (!v || !by) return nullptr;
+        // `by` is declared `long` — normalize to i64 first.
+        if (by->getType()->isIntegerTy() && !by->getType()->isIntegerTy(64))
+            by = builder_.CreateSExt(by, i64(), "step.by64");
+        if (pt == P::Decimal) {
+            // decimal: promote `by` and add via the runtime (§6.4 semantics).
+            llvm::StructType* dst = decimalStructType();
+            llvm::AllocaInst* bySlot = entryAlloca(dst);
+            emitIntToDecimal(by, P::Long, bySlot);
+            llvm::AllocaInst* aSlot = entryAlloca(dst);
+            llvm::AllocaInst* oSlot = entryAlloca(dst);
+            builder_.CreateStore(v, aSlot);
+            auto vt = [&]() -> llvm::Value* {
+                auto it = builtinVtable_.find("OverflowException");
+                if (it == builtinVtable_.end())
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                return it->second;
+            };
+            auto* fn = declareC("bz_decimal_add", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {aSlot, bySlot, oSlot, vt()});
+            emitPendingCheck();
+            return builder_.CreateLoad(dst, oSlot, "dec.step");
+        }
+        if (v->getType()->isFloatingPointTy()) {
+            llvm::Value* byFp =
+                builder_.CreateSIToFP(by, v->getType(), "step.byfp");
+            return builder_.CreateFAdd(v, byFp, "step.f");
+        }
+        if (v->getType()->isIntegerTy()) {
+            // Integers and char: advance the value (code point) by `by`,
+            // performed at the value's own width (wrapping, like `+`).
+            unsigned w = v->getType()->getIntegerBitWidth();
+            llvm::Value* byW =
+                w < 64 ? builder_.CreateTrunc(by, v->getType(), "step.byw")
+                       : by;
+            return builder_.CreateAdd(v, byW, "step.i");
+        }
+        return nullptr;
+    }
+    // stdlib §9.5 / §2.19: char.Parse / char.TryParse — a one-code-point
+    // string yields that code point; anything else is FormatException /
+    // false. (Reached via IParsable<char>'s compiler-provided conformance;
+    // also completes the lowercase `char.Parse(s)` static surface.)
+    if (pt == P::Char && m == "Parse" && call.args.size() == 1 &&
+        call.args[0].value) {
+        llvm::Value* s = lowerExpr(*call.args[0].value);
+        if (!s) return nullptr;
+        llvm::Value* len = loadStringLen(s);
+        llvm::Value* isOne = builder_.CreateICmpEQ(
+            len, builder_.getInt64(1), "chp.one");
+        emitGuardThrow(builder_.CreateNot(isOne, "chp.bad"),
+                       "FormatException");
+        return loadCodePoint(s, builder_.getInt64(0));
+    }
+    if (pt == P::Char && m == "TryParse" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* s = lowerExpr(*call.args[0].value);
+        if (!s) return nullptr;
+        llvm::Type* et = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+        if (!outAddr) return nullptr;
+        llvm::Value* len = loadStringLen(s);
+        llvm::Value* ok = builder_.CreateICmpEQ(
+            len, builder_.getInt64(1), "chtp.ok");
+        // out = the sole code point on success, '\0' (the default) on failure.
+        llvm::Value* cp0 = loadCodePoint(s, builder_.getInt64(0));
+        llvm::Value* sel = builder_.CreateSelect(
+            ok, cp0, llvm::ConstantInt::get(cp0->getType(), 0), "chtp.sel");
+        builder_.CreateStore(sel, outAddr);
+        return ok;
+    }
+    // stdlib §9.3 / §2.19: decimal.TryParse(s, out result): bool — routes to
+    // bz_decimal_try_parse (no exception on failure; out gets 0 per §9.3).
+    if (pt == P::Decimal && m == "TryParse" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* s = lowerExpr(*call.args[0].value);
+        if (!s) return nullptr;
+        llvm::Type* et = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+        if (!outAddr) return nullptr;
+        auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* r = builder_.CreateCall(fn, {s, outAddr}, "dectp.r");
+        return builder_.CreateICmpNE(r, builder_.getInt32(0), "dectp.ok");
+    }
 
     // §8.1 / §8.4 (#1119): Object.ReferenceEquals(a, b): bool — compares object
     // identity, ignoring any Equals override. Classes / interfaces / Object? all
@@ -8759,15 +8885,21 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return okD;
     }
 
-    // int.TryParse / long.TryParse(s, out result): bool — stdlib §9.1
-    // Returns true and sets result if s is a valid integer in range;
-    // false and sets result to 0 (default) otherwise.
+    // Integer TryParse(s, out result): bool — stdlib §9.1. Returns true and
+    // sets result if s is a valid integer in the target type's range; false
+    // and sets result to 0 (default) otherwise.
     // #1227: on failure, out result receives 0, not the partial parse value.
     // Per §9.3: "TryParse returns false in every case where Parse would raise";
     // the out param gets the default.  No surrounding whitespace is accepted.
+    // §2.19 (v0.176, #807): extended from int/long to the whole integer tower
+    // (byte…ulong) — IParsable<T>'s compiler-provided conformance needs every
+    // tower member; each narrower width range-checks the strtoll result the
+    // same way int always did (#1134). ulong parses via strtoull (full width).
     if (m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value &&
-        (pt == P::Int || pt == P::Long)) {
+        (pt == P::Int || pt == P::Long || pt == P::UInt || pt == P::ULong ||
+         pt == P::Short || pt == P::UShort || pt == P::Byte ||
+         pt == P::SByte)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
@@ -8775,11 +8907,13 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Type* et = nullptr;
         llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
         if (!outAddr) return nullptr;
-        // strtoll(data, &endptr, 10) for validation.
-        auto* strtollFnT = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        // strtoll/strtoull(data, &endptr, 10) for validation.
+        auto* strtoFnT = (pt == P::ULong)
+            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
         auto* endSlotI = entryAlloca(ptrTy());
         llvm::Value* val64 = builder_.CreateCall(
-            strtollFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
+            strtoFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
         llvm::Value* endPtrI = builder_.CreateLoad(ptrTy(), endSlotI);
         // ok = first-char not whitespace AND (endPtr != strData) AND (*endPtr == '\0')
         auto* i8TyI = llvm::Type::getInt8Ty(llvm_);
@@ -8794,26 +8928,45 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             builder_.CreateNot(fcWsI),
             builder_.CreateAnd(advI, atNulI), "tryp.ok");
         // Store result: 0 on failure, parsed value on success.
-        if (pt == P::Long) {
+        if (pt == P::Long || pt == P::ULong) {
+            // ulong additionally rejects a leading '-' (strtoull silently
+            // negates it); long is the full strtoll width — no range check.
+            if (pt == P::ULong) {
+                llvm::Value* fcNeg = builder_.CreateICmpEQ(
+                    fcI, llvm::ConstantInt::get(i8TyI, '-'), "tryp.neg");
+                ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg),
+                                        "tryp.okU");
+            }
             llvm::Value* zero64 = builder_.getInt64(0);
             llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
             builder_.CreateStore(sel64, outAddr);
         } else {
-            // #1134 / stdlib §9.1: int.TryParse must return FALSE for an
-            // out-of-range value, not silently wrap the low 32 bits. strtoll on a
-            // 64-bit platform returns the full magnitude, so range-check it.
+            // #1134 / stdlib §9.1: TryParse must return FALSE for an
+            // out-of-range value, not silently wrap the low bits. strtoll on a
+            // 64-bit platform returns the full magnitude, so range-check it
+            // against the target type's bounds.
+            int64_t rlo, rhi;
+            switch (pt) {
+                case P::Int:    rlo = INT32_MIN; rhi = INT32_MAX;  break;
+                case P::UInt:   rlo = 0;         rhi = UINT32_MAX; break;
+                case P::Short:  rlo = INT16_MIN; rhi = INT16_MAX;  break;
+                case P::UShort: rlo = 0;         rhi = UINT16_MAX; break;
+                case P::Byte:   rlo = 0;         rhi = UINT8_MAX;  break;
+                default:        rlo = INT8_MIN;  rhi = INT8_MAX;   break; // SByte
+            }
             llvm::Value* inRange = builder_.CreateAnd(
                 builder_.CreateICmpSGE(
-                    val64, llvm::ConstantInt::getSigned(i64(), INT32_MIN)),
+                    val64, llvm::ConstantInt::getSigned(i64(), rlo)),
                 builder_.CreateICmpSLE(
-                    val64, llvm::ConstantInt::getSigned(i64(), INT32_MAX)),
+                    val64, llvm::ConstantInt::getSigned(i64(), rhi)),
                 "tryp.inrange");
             ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
             // On failure, store 0; on success store the truncated value.
-            llvm::Value* trunc32 = builder_.CreateTrunc(val64, i32());
-            llvm::Value* zero32 = builder_.getInt32(0);
-            llvm::Value* sel32 = builder_.CreateSelect(ok, trunc32, zero32, "tryp.sel");
-            builder_.CreateStore(sel32, outAddr);
+            llvm::Type* tt = lowerPrimitive(pt);
+            llvm::Value* truncV = builder_.CreateTrunc(val64, tt);
+            llvm::Value* zeroV = llvm::ConstantInt::get(tt, 0);
+            llvm::Value* selV = builder_.CreateSelect(ok, truncV, zeroV, "tryp.sel");
+            builder_.CreateStore(selV, outAddr);
         }
         return ok;
     }
@@ -9259,7 +9412,18 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         // 2. From the callee primitive type (for double/float TryParse).
         // 3. Default to i32.
         llvm::Type* slotTy = i32();
-        if (ms) {
+        if (ms && ms->parent &&
+            ms->parent->kind == ast::TypeDeclKind::Interface &&
+            isStaticMethod(ms) && loc && loc->declType) {
+            // §11.8 (v0.176, #807): `T.TryParse(s, out var v)` — a static
+            // interface member through a constrained type parameter. Sema
+            // typed the LOCAL from the call site (interface `T?` substituted
+            // to the call-site parameter, nullable stripped); the interface's
+            // own declared `T?` node would lower to the wrong slot shape here
+            // (a `{i8,T}` wrapper where the callee writes the bare value).
+            // Resolve the local's type through the active substitution.
+            slotTy = lowerTypeRef(resolveTypeParamRef(loc->declType));
+        } else if (ms) {
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
             if (md && pos < md->params.size() && md->params[pos].type) {
                 sema::TypeRef* pt = ctx_.resolvedType(*md->params[pos].type);
@@ -12285,6 +12449,60 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         return nullptr;
     }
 
+    // §11.8 (v0.176, #807): `T.Member(...)` — a STATIC interface member called
+    // through a constrained type parameter. Sema resolved the callee to the
+    // INTERFACE's static member symbol; at this specialization T is concrete
+    // (genericSubstSemaTy_), so redirect `ms` to the CONCRETE type's own
+    // static member — a direct call, no vtable/itable (statics have no runtime
+    // dispatch). A PRIMITIVE substitution was already intercepted by
+    // tryLowerPrimitiveStaticCall (the §2.19 compiler-provided conformances);
+    // reaching here with one means an unbridged member — emit the placeholder
+    // default so the (dead) generic template body still IR-verifies.
+    if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface &&
+        !ms->isOperator && isStaticMethod(ms)) {
+        if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            auto* tid = cma->target
+                ? dynamic_cast<const ast::IdentifierExpr*>(cma->target.get())
+                : nullptr;
+            if (tid && dynamic_cast<sema::GenericParamSymbol*>(
+                           ctx_.exprSymbol(*tid))) {
+                const sema::TypeRef* concrete = nullptr;
+                auto sit = genericSubstSemaTy_.find(tid->name);
+                if (sit != genericSubstSemaTy_.end()) concrete = sit->second;
+                sema::MethodSymbol* impl = nullptr;
+                if (concrete && concrete->kind == sema::TypeRef::Kind::Named &&
+                    concrete->declaration) {
+                    // The §11.8 conformance check guarantees a signature-exact
+                    // static; match by name + arity (statics don't overload on
+                    // the interface surface in v1).
+                    for (sema::Symbol* m : concrete->declaration->members) {
+                        auto* cand = dynamic_cast<sema::MethodSymbol*>(m);
+                        if (!cand || cand->isOperator) continue;
+                        if (cand->name != ms->name) continue;
+                        if (!isStaticMethod(cand)) continue;
+                        if (cand->params.size() != ms->params.size()) continue;
+                        impl = cand;
+                        break;
+                    }
+                }
+                if (impl) {
+                    ms = impl;  // direct static call on the concrete type
+                } else {
+                    // Unspecialized template body (T unbound) or an unbridged
+                    // substitution: produce a type-correct placeholder value —
+                    // the template is never a call target (#817 posture).
+                    sema::TypeRef* resTy = ctx_.exprType(call);
+                    if (resTy && resTy->kind != sema::TypeRef::Kind::Unit) {
+                        llvm::Type* t = lowerTypeRef(resolveTypeParamRef(resTy));
+                        if (t && !t->isVoidTy())
+                            return llvm::Constant::getNullValue(t);
+                    }
+                    return nullptr;
+                }
+            }
+        }
+    }
     std::vector<llvm::Value*> args;
     // issue #421 / #410: source expression per arg (index-aligned with `args`)
     // so emitMethodCall can recover each argument's signedness when widening.

@@ -4476,9 +4476,42 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // §25: a user-defined operator overload — sema resolved the binary
     // expression to a static `operator` method; call it with the two
     // operands.
-    if (auto* opm =
-            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(bin))) {
-        if (opm->isOperator) {
+    sema::MethodSymbol* opm =
+        dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(bin));
+    if (opm && !opm->isOperator) opm = nullptr;
+    // §11.8 (v0.176, #807): constraint-operator dispatch — sema resolved this
+    // binary expression to a STATIC INTERFACE operator member through a
+    // `where T: I<T>` constraint (the operands are T-typed). At this
+    // specialization T is concrete: a USER type redirects to its own operator
+    // (a direct static call through the block below); a PRIMITIVE falls
+    // through to the intrinsic op lowering further down — the §2.19
+    // compiler-provided conformance's operator IS the intrinsic op (§3.5
+    // lowering reused). An unbound T (the dead unspecialized template body,
+    // #817 posture) also falls through: its operands lower as the placeholder
+    // scalar, which the intrinsic path handles type-correctly.
+    if (opm && opm->parent &&
+        opm->parent->kind == ast::TypeDeclKind::Interface) {
+        const sema::TypeRef* lt =
+            bin.left ? ctx_.exprType(*bin.left) : nullptr;
+        const sema::TypeRef* concrete = resolveTypeParamRef(lt);
+        sema::MethodSymbol* impl = nullptr;
+        if (concrete && concrete != lt &&
+            concrete->kind == sema::TypeRef::Kind::Named &&
+            concrete->declaration) {
+            for (sema::Symbol* m : concrete->declaration->members) {
+                auto* cand = dynamic_cast<sema::MethodSymbol*>(m);
+                if (cand && cand->isOperator &&
+                    cand->operatorToken == opm->operatorToken &&
+                    cand->params.size() == 2) {
+                    impl = cand;
+                    break;
+                }
+            }
+        }
+        opm = impl;  // null → primitive/placeholder: intrinsic path below
+    }
+    if (opm) {
+        {
             // §8.4 (#848): a user `operator =`/`<>` on a record is invoked
             // through the null-safe equality wrapper when either operand is a
             // nullable `T?` or the `null` literal — both-null → equal, one-null
@@ -5502,8 +5535,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // pass their addresses, then load the result.
     {
         using P = sema::PrimitiveType;
-        const sema::TypeRef* lTy = bin.left  ? ctx_.exprType(*bin.left)  : nullptr;
-        const sema::TypeRef* rTy = bin.right ? ctx_.exprType(*bin.right) : nullptr;
+        // §11.8 (v0.176, #807): resolve T-typed operands through the active
+        // substitution so a `T = decimal` constraint-operator specialization
+        // routes through the decimal runtime instead of the integer ops.
+        const sema::TypeRef* lTy = bin.left
+            ? resolveTypeParamRef(ctx_.exprType(*bin.left)) : nullptr;
+        const sema::TypeRef* rTy = bin.right
+            ? resolveTypeParamRef(ctx_.exprType(*bin.right)) : nullptr;
         // fix #663: exclude nullable decimal (decimal?) — those values lower to
         // the {i8, %bz.decimal} tagged struct; the lifted-arithmetic block above
         // handles decimal? operands by extracting the payload before routing here.
@@ -5515,7 +5553,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     rTy->primitive == P::Decimal && !rTy->nullable;
         // §5.1: integers implicitly widen to decimal — promote an integer operand.
         // We detect this by: result type is decimal, and one operand is integer.
-        const sema::TypeRef* resTy = ctx_.exprType(bin);
+        const sema::TypeRef* resTy = resolveTypeParamRef(ctx_.exprType(bin));
         bool resDec = resTy && resTy->kind == sema::TypeRef::Kind::Primitive &&
                       resTy->primitive == P::Decimal && !resTy->nullable;
         // fix #663: if EITHER side is nullable decimal (decimal?), skip this

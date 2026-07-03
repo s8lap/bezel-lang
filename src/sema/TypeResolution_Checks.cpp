@@ -5,6 +5,7 @@
 #include "sema/TypeResolution.hpp"
 
 #include <cctype>
+#include <functional>
 #include <unordered_set>
 
 namespace bezel::sema {
@@ -1088,6 +1089,14 @@ void Resolver::checkOperatorGroups() {
                     "` may not be overloaded (§25.1)");
                 continue;
             }
+            // §11.8 (v0.176, #807): a STATIC INTERFACE operator member is a
+            // contract, not an overload declaration — its parameters are the
+            // constrained type parameter (`(a: T, b: T)`), it is implicitly
+            // public (§10.1), and the §2.19 interfaces normatively declare a
+            // lone `<` (no complete comparison group). The overload-shape
+            // rules below (public, declaring-type parameter, complete groups)
+            // apply to the CONFORMING type's operators, not to the contract.
+            if (t->kind == ast::TypeDeclKind::Interface) continue;
             // §25 (#1347, v0.160): operators must be declared `public`. An
             // operator invoked through `a + b` syntax has no call-site spelling
             // that could name a restricted member; any other visibility is a
@@ -1845,6 +1854,15 @@ void Resolver::checkAbstractImplementations() {
             bool curIsIface = (cur->kind == ast::TypeDeclKind::Interface);
             for (Symbol* m : cur->members) {
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                    // §11.8 (v0.176, #807): STATIC interface members (static
+                    // methods and operators — every interface operator is
+                    // static) are NOT instance obligations; their conformance
+                    // is checked signature-exactly by
+                    // checkStaticInterfaceConformance. Operators never
+                    // participate in the instance abstract-member set either
+                    // way (they dispatch by operand type, not by name).
+                    if (ms->isOperator) continue;
+                    if (curIsIface && hasMod(ms, "static")) continue;
                     if (methodIsAbstract(ms)) {
                         abstractNames.insert(ms->name);
                         abstractArities[ms->name].insert(ms->params.size());
@@ -1963,6 +1981,247 @@ void Resolver::checkAbstractImplementations() {
                         "` with a different type than the interface declares — "
                         "property types must match exactly (no covariance) "
                         "(§11.2)");
+                }
+            }
+        }
+    }
+}
+
+// §11.8 / §14.2 (v0.176, #807): re-run the type-bound BFS for every failure
+// deferred during resolution (see checkOneConstraint). All baseTypes are
+// populated by now, so a self-/mutually-referential conformance (the
+// recurrence `class Meters: INumber<Meters>`) passes and only genuine
+// violations report. Entries appended during checkDeferredNestedConstraints
+// are flushed by the same loop (the driver calls this after it).
+void Resolver::recheckDeferredTypeBounds() {
+    for (const auto& d : deferredTypeBoundFailures_) {
+        if (!argSatisfiesTypeBound(d.arg, d.bound)) {
+            ctx_.diagnostics().report(
+                Severity::Error, d.loc,
+                std::string("type argument `") + d.argName +
+                "` does not satisfy the constraint `where " + d.param +
+                ": " + d.boundName + "` (§14.2)");
+        }
+    }
+    deferredTypeBoundFailures_.clear();
+}
+
+// §11.8 (v0.176, #807): a class/record declaring `: I<...>` where I carries
+// STATIC members (static methods / static operators) must itself supply
+// matching statics — exact signatures per the §11.2 matching rule applied to
+// statics (same name/arity/param types/param modifiers/return type including
+// `owned`; operators match by token + signature). The interface member
+// signatures are compared AFTER substituting I's type parameters with the
+// conformance declaration's arguments (T → Meters for `: INumber<Meters>`).
+// Static members create no itable slots and no runtime dispatch — this check
+// is the whole conformance story for them; dispatch resolves statically at
+// each generic instantiation (§11.8).
+void Resolver::checkStaticInterfaceConformance() {
+    if (!ctx_.module()) return;
+
+    // Substitute the interface's own type-parameter names (a declaration-less
+    // Named TypeRef with a single-part name) with the conformance arguments,
+    // recursing through constructed generic args. Mirrors ExprTC's
+    // substituteReturnType, resolver-side.
+    std::function<TypeRef*(TypeRef*,
+                           const std::unordered_map<std::string_view, TypeRef*>&)>
+        subst = [&](TypeRef* d,
+                    const std::unordered_map<std::string_view, TypeRef*>& map)
+        -> TypeRef* {
+        if (!d) return d;
+        if (d->kind != TypeRef::Kind::Named) return d;
+        if (!d->declaration && d->astNode && d->astNode->name &&
+            d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
+            auto it = map.find(d->astNode->name->parts[0]);
+            if (it != map.end() && it->second) {
+                TypeRef* s = it->second;
+                if (d->nullable && !s->nullable) {
+                    TypeRef* nn = ctx_.makeTypeRef(*s);
+                    nn->nullable = true;
+                    return nn;
+                }
+                return s;
+            }
+            return d;
+        }
+        if (!d->genericArgs.empty()) {
+            bool changed = false;
+            std::vector<TypeRef*> newArgs;
+            newArgs.reserve(d->genericArgs.size());
+            for (TypeRef* ga : d->genericArgs) {
+                TypeRef* s = subst(ga, map);
+                changed = changed || (s != ga);
+                newArgs.push_back(s);
+            }
+            if (changed) {
+                TypeRef* nn = ctx_.makeTypeRef(*d);
+                nn->genericArgs = std::move(newArgs);
+                return nn;
+            }
+        }
+        return d;
+    };
+
+    // Structural equality that also distinguishes declaration-less builtins by
+    // their spelling (typeRefEqual treats two null declarations as equal, which
+    // would conflate e.g. Array<int> with Stack<int>).
+    std::function<bool(const TypeRef*, const TypeRef*)> typesMatch =
+        [&](const TypeRef* a, const TypeRef* b) -> bool {
+        if (!a || !b) return false;
+        if (a->kind == TypeRef::Kind::Named && b->kind == TypeRef::Kind::Named &&
+            !a->declaration && !b->declaration) {
+            auto spell = [](const TypeRef* t) -> std::string_view {
+                if (t->astNode && t->astNode->name &&
+                    !t->astNode->name->parts.empty())
+                    return t->astNode->name->parts.back();
+                return t->importedName;
+            };
+            if (spell(a) != spell(b)) return false;
+            if (a->nullable != b->nullable) return false;
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!typesMatch(a->genericArgs[i], b->genericArgs[i]))
+                    return false;
+            return true;
+        }
+        return typeRefEqual(a, b);
+    };
+
+    // Resolve a member's declared param/return TypeRef through the resolved-
+    // type map (both user interfaces and the synthesized §2.19 builtins have
+    // their nodes resolved).
+    auto resolvedOf = [&](const ast::Type* node) -> TypeRef* {
+        return node ? ctx_.resolvedType(*node) : nullptr;
+    };
+
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        if (t->kind != ast::TypeDeclKind::Class &&
+            t->kind != ast::TypeDeclKind::Record)
+            continue;
+        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+            TypeSymbol* iface = t->baseTypes[bi];
+            if (!iface || iface->kind != ast::TypeDeclKind::Interface) continue;
+            // Collect the interface's static members (static methods and
+            // operators — every interface operator is static per §11.8).
+            std::vector<MethodSymbol*> statics;
+            for (Symbol* m : iface->members) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (!ms) continue;
+                if (ms->isOperator || hasMod(ms, "static"))
+                    statics.push_back(ms);
+            }
+            if (statics.empty()) continue;
+            // Bind the interface's type-parameter names to the conformance
+            // declaration's arguments (`: INumber<Meters>` → T → Meters).
+            std::unordered_map<std::string_view, TypeRef*> map;
+            TypeRef* baseRef = bi < t->baseTypeRefs.size()
+                                   ? t->baseTypeRefs[bi] : nullptr;
+            if (!iface->genericParams.empty()) {
+                if (!baseRef || baseRef->genericArgs.size() !=
+                                    iface->genericParams.size())
+                    continue;  // arity error reported elsewhere
+                for (std::size_t gi = 0; gi < iface->genericParams.size(); ++gi)
+                    if (iface->genericParams[gi] && baseRef->genericArgs[gi])
+                        map[iface->genericParams[gi]->name] =
+                            baseRef->genericArgs[gi];
+            }
+            for (MethodSymbol* im : statics) {
+                // The interface member's declared signature pieces.
+                const ast::Type* imRetNode = nullptr;
+                bool imRetOwned = false;
+                if (auto* imd = dynamic_cast<const ast::MethodDecl*>(im->decl)) {
+                    imRetNode = imd->returnType.get();
+                    imRetOwned = imd->returnOwned;
+                } else if (auto* iod =
+                               dynamic_cast<const ast::OperatorDecl*>(im->decl)) {
+                    imRetNode = iod->returnType.get();
+                    imRetOwned = iod->returnOwned;
+                }
+                const std::string memberSpelling =
+                    im->isOperator
+                        ? ("operator " + std::string(im->operatorToken))
+                        : std::string(im->name);
+                // Candidates on the conforming type itself: statics only.
+                bool nameFound = false;
+                bool matched = false;
+                for (Symbol* cm : t->members) {
+                    auto* cms = dynamic_cast<MethodSymbol*>(cm);
+                    if (!cms) continue;
+                    if (im->isOperator) {
+                        if (!cms->isOperator ||
+                            cms->operatorToken != im->operatorToken)
+                            continue;
+                    } else {
+                        if (cms->isOperator || cms->name != im->name ||
+                            !hasMod(cms, "static"))
+                            continue;
+                    }
+                    nameFound = true;
+                    if (cms->params.size() != im->params.size()) continue;
+                    // Param-by-param: modifier + substituted type.
+                    bool ok = true;
+                    for (std::size_t pi = 0; pi < im->params.size(); ++pi) {
+                        auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
+                        auto* cp = dynamic_cast<ParameterSymbol*>(cms->params[pi]);
+                        if (!ip || !cp) { ok = false; break; }
+                        if (ip->modifier != cp->modifier) { ok = false; break; }
+                        TypeRef* it2 = resolvedOf(ip->declType);
+                        TypeRef* ct = resolvedOf(cp->declType);
+                        if (!it2 || !ct) { ok = false; break; }
+                        if (!typesMatch(subst(it2, map), ct)) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+                    // Return type (including `owned`, §11.2 exact-match rule).
+                    const ast::Type* cRetNode = nullptr;
+                    bool cRetOwned = false;
+                    if (auto* cmd =
+                            dynamic_cast<const ast::MethodDecl*>(cms->decl)) {
+                        cRetNode = cmd->returnType.get();
+                        cRetOwned = cmd->returnOwned;
+                    } else if (auto* cod = dynamic_cast<const ast::OperatorDecl*>(
+                                   cms->decl)) {
+                        cRetNode = cod->returnType.get();
+                        cRetOwned = cod->returnOwned;
+                    }
+                    if (imRetOwned != cRetOwned) continue;
+                    if (!imRetNode != !cRetNode) continue;  // unit vs typed
+                    if (imRetNode) {
+                        TypeRef* irt = resolvedOf(imRetNode);
+                        TypeRef* crt = resolvedOf(cRetNode);
+                        if (!irt || !crt) continue;
+                        if (!typesMatch(subst(irt, map), crt)) continue;
+                    }
+                    matched = true;
+                    break;
+                }
+                if (matched) continue;
+                if (!nameFound) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        (t->kind == ast::TypeDeclKind::Record
+                             ? std::string("record `")
+                             : std::string("class `")) +
+                        std::string(t->name) +
+                        "` does not implement static interface member `" +
+                        memberSpelling + "` of `" + std::string(iface->name) +
+                        "` — a type declaring conformance to an interface with "
+                        "static members must supply each of them as a `public "
+                        "static` member (§11.8)");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        (t->kind == ast::TypeDeclKind::Record
+                             ? std::string("record `")
+                             : std::string("class `")) +
+                        std::string(t->name) + "` implements static interface "
+                        "member `" + memberSpelling + "` of `" +
+                        std::string(iface->name) +
+                        "` with a different signature — the implementing static "
+                        "must match the interface member exactly: same "
+                        "parameter count, parameter types and modifiers, and "
+                        "return type including `owned` (§11.2 / §11.8)");
                 }
             }
         }
@@ -2278,12 +2537,50 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
             return;
         }
+        // stdlib §2.19 / §11.8 (v0.176, #807): a PRIMITIVE argument against one
+        // of the static-abstraction bounds (INumber/ISteppable/IParsable) is
+        // decided by the compiler-provided conformance table — the numeric
+        // tower conforms to all three, `char` to ISteppable/IParsable only,
+        // everything else (string, bool, Object) to none. Other builtin bounds
+        // keep the historical defer-on-primitive behaviour.
+        if (arg->kind == TypeRef::Kind::Primitive) {
+            std::string_view bn = bound->declaration->name;
+            if ((bn == "INumber" || bn == "ISteppable" || bn == "IParsable") &&
+                bound->declaration == ctx_.builtinInterfaceSym(bn)) {
+                if (arg->nullable ||
+                    !primitiveConformsToStaticIface(arg->primitive, bn))
+                    report(std::string(bn));
+                return;
+            }
+            // §11.8: a primitive can never conform to a USER interface that
+            // carries static members (primitives cannot declare conformances;
+            // only the §2.19 builtins have compiler-provided ones).
+            if (bound->declaration->kind == ast::TypeDeclKind::Interface) {
+                for (Symbol* bm : bound->declaration->members) {
+                    auto* bms = dynamic_cast<MethodSymbol*>(bm);
+                    if (!bms) continue;
+                    if (bms->isOperator || hasMod(bms, "static")) {
+                        report(std::string(bn));
+                        break;
+                    }
+                }
+            }
+            return;
+        }
         if (arg->kind != TypeRef::Kind::Named || !arg->declaration) {
             return;  // built-in / generic-param arg: defer
         }
         const std::string boundName(bound->declaration->name);
         if (arg->nullable) { report(boundName); return; }
-        if (!argSatisfiesTypeBound(arg, bound)) report(boundName);
+        // §11.8 (v0.176, #807): a failed BFS here may be an ORDERING artifact —
+        // the recurrence `class Meters: INumber<Meters>` checks this bound while
+        // Meters' base list is mid-resolution (baseTypes not yet pushed). Defer
+        // the report; recheckDeferredTypeBounds re-runs the BFS after every
+        // type's bases are populated and reports persistent failures.
+        if (!argSatisfiesTypeBound(arg, bound)) {
+            deferredTypeBoundFailures_.push_back(DeferredTypeBoundFailure{
+                t.span.begin, param, boundName, argName, arg, bound});
+        }
         return;
     }
     // Unknown constraint kind: ignore (parser would not produce it).

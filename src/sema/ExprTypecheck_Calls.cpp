@@ -1206,10 +1206,60 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             };
                             for (const auto& item : gc.items) {
                                 if (item.kind == "type" && item.typeArg) {
-                                    if (!argDecl) continue;  // defer: built-in/primitive bound match
                                     TypeRef* bound =
                                         ctx_.resolvedType(*item.typeArg);
                                     if (!bound || !bound->declaration) continue;
+                                    if (!argDecl) {
+                                        // stdlib §2.19 / §11.8 (v0.176, #807):
+                                        // a PRIMITIVE type argument against a
+                                        // static-abstraction bound is decided
+                                        // by the compiler-provided conformance
+                                        // table (numeric tower → all three;
+                                        // char → ISteppable/IParsable only).
+                                        // A primitive against any OTHER
+                                        // static-member-bearing interface can
+                                        // never conform (primitives cannot
+                                        // declare conformances). Non-static
+                                        // interface bounds keep the historical
+                                        // defer-on-primitive behaviour.
+                                        if (argRef->kind !=
+                                            TypeRef::Kind::Primitive)
+                                            continue;
+                                        std::string_view bn =
+                                            bound->declaration->name;
+                                        if ((bn == "INumber" ||
+                                             bn == "ISteppable" ||
+                                             bn == "IParsable") &&
+                                            bound->declaration ==
+                                                ctx_.builtinInterfaceSym(bn)) {
+                                            if (argRef->nullable ||
+                                                !primitiveConformsToStaticIface(
+                                                    argRef->primitive, bn))
+                                                report(std::string(bn));
+                                            continue;
+                                        }
+                                        bool boundHasStatics = false;
+                                        if (bound->declaration->kind ==
+                                            ast::TypeDeclKind::Interface) {
+                                            for (Symbol* bm :
+                                                 bound->declaration->members) {
+                                                auto* bms = dynamic_cast<
+                                                    MethodSymbol*>(bm);
+                                                if (!bms) continue;
+                                                bool st = bms->isOperator;
+                                                for (auto mod : bms->modifiers)
+                                                    if (mod == "static")
+                                                        st = true;
+                                                if (st) {
+                                                    boundHasStatics = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (boundHasStatics)
+                                            report(std::string(bn));
+                                        continue;
+                                    }
                                     if (!isSubtype(argDecl, bound->declaration))
                                         report(std::string(
                                             bound->declaration->name));
@@ -7685,6 +7735,64 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // when locals don't carry exprType yet but DO carry
             // exprSymbol whose decl gives the resolved type).
             auto* sym = ctx_.exprSymbol(*ma.target);
+            // §11.8 (v0.176, #807): `T.Member(...)` — the receiver is a
+            // TYPE-PARAMETER name (marked with a GenericParamSymbol by the
+            // identifier handler). Look the member up through the parameter's
+            // `where T: I<...>` constraint bounds (method constraints first,
+            // then the enclosing type's). Only a STATIC interface member is
+            // callable through the type parameter; resolution to the concrete
+            // type's static happens at instantiation (codegen).
+            if (auto* gps = dynamic_cast<GenericParamSymbol*>(sym)) {
+                TypeRef* boundWithMember = nullptr;
+                Symbol* member = nullptr;
+                forEachConstraintBound(
+                    gps->name, [&](TypeRef* ctr) -> bool {
+                        if (ctr->declaration->kind !=
+                            ast::TypeDeclKind::Interface)
+                            return false;
+                        Symbol* cm = lookupMember(ctr->declaration, ma.member);
+                        if (!cm) return false;
+                        boundWithMember = ctr;
+                        member = cm;
+                        return true;
+                    });
+                if (!member) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "type parameter `" + std::string(gps->name) +
+                        "` has no static member `" + std::string(ma.member) +
+                        "` — `" + std::string(gps->name) +
+                        ".Member(...)` requires a `where " +
+                        std::string(gps->name) +
+                        ": <interface>` constraint whose interface declares "
+                        "that static member (§11.8)");
+                    return;
+                }
+                auto* ims = dynamic_cast<MethodSymbol*>(member);
+                bool isStaticMember = false;
+                if (ims && !ims->isOperator) {
+                    for (auto mod : ims->modifiers)
+                        if (mod == "static") { isStaticMember = true; break; }
+                }
+                if (!isStaticMember) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`" + std::string(gps->name) + "." +
+                        std::string(ma.member) + "` requires a STATIC "
+                        "interface member — `" + std::string(ma.member) +
+                        "` is an instance member of the constraint interface; "
+                        "call it on a value of type `" +
+                        std::string(gps->name) + "` instead (§11.8)");
+                    return;
+                }
+                // Attach the constraint's instantiation (`I<T>`) as the
+                // receiver's type so the member/return substitution machinery
+                // below (substituteMemberType keyed on the receiver's
+                // declaration + genericArgs) resolves the interface's
+                // recurrence parameter to the call site's type parameter.
+                ctx_.setExprType(ma.target.get(), boundWithMember);
+                targetType = boundWithMember->declaration;
+            } else
             if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
                 if (loc->declType &&
                     loc->declType->kind == TypeRef::Kind::Named) {

@@ -2173,6 +2173,119 @@ Symbol* ExprTC::lookupExtensionMember(
     return nullptr;
 }
 
+// §11.8 (v0.176, #807): is `name` a declared generic type parameter of the
+// enclosing method (checked first — more specific) or the enclosing type?
+bool ExprTC::isInScopeTypeParam(std::string_view name) const {
+    if (currentMethodDecl_) {
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            if (gp.name == name) return true;
+    }
+    if (currentType_ && currentType_->decl) {
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl)) {
+            for (const auto& gp : td->genericParams)
+                if (gp.name == name) return true;
+        }
+    }
+    return false;
+}
+
+// §11.8: the cached marker GenericParamSymbol for a type-parameter receiver.
+// Consumers key off the SYMBOL KIND (dynamic_cast<GenericParamSymbol*>) and
+// the name; the marker needs no scope identity.
+GenericParamSymbol* ExprTC::typeParamMarker(std::string_view name) {
+    auto it = typeParamMarkers_.find(name);
+    if (it != typeParamMarkers_.end()) return it->second;
+    auto* gps = ctx_.makeSymbol<GenericParamSymbol>();
+    gps->name = name;
+    typeParamMarkers_[name] = gps;
+    return gps;
+}
+
+// §11.8: walk the `type`-kind constraint bounds declared for `paramName` —
+// the enclosing method's `where` clauses first (more specific), then the
+// enclosing type's — calling `fn` with each resolved bound until it accepts.
+bool ExprTC::forEachConstraintBound(
+    std::string_view paramName, const std::function<bool(TypeRef*)>& fn) {
+    auto tryList = [&](const std::vector<ast::GenericParam>& gps,
+                       const std::vector<ast::GenericConstraint>& gcs) -> bool {
+        bool isParam = false;
+        for (const auto& gp : gps)
+            if (gp.name == paramName) { isParam = true; break; }
+        if (!isParam) return false;
+        for (const auto& gc : gcs) {
+            if (gc.typeParam != paramName) continue;
+            for (const auto& item : gc.items) {
+                if (item.kind != "type" || !item.typeArg) continue;
+                TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
+                if (!ctr || ctr->kind != TypeRef::Kind::Named ||
+                    !ctr->declaration)
+                    continue;
+                if (fn(ctr)) return true;
+            }
+        }
+        return false;
+    };
+    if (currentMethodDecl_ && !currentMethodDecl_->genericParams.empty()) {
+        if (tryList(currentMethodDecl_->genericParams,
+                    currentMethodDecl_->genericConstraints))
+            return true;
+    }
+    if (currentType_ && currentType_->decl) {
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl)) {
+            if (!td->genericParams.empty() &&
+                tryList(td->genericParams, td->genericConstraints))
+                return true;
+        }
+    }
+    return false;
+}
+
+// §11.8 (v0.176, #807): find a static-interface OPERATOR member for a binary
+// op on `paramName`-typed operands. The interface member must carry the op's
+// token with two parameters of the interface's own recurrence parameter (the
+// §2.19 shape `static operator +(a: T, b: T): T`).
+MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
+                                                   std::string_view op,
+                                                   TypeRef** outBound) {
+    MethodSymbol* found = nullptr;
+    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
+        TypeSymbol* iface = ctr->declaration;
+        if (iface->kind != ast::TypeDeclKind::Interface) return false;
+        // The interface's own type-parameter names (`T` in `INumber<T>`).
+        std::unordered_set<std::string_view> ifaceParams;
+        for (Symbol* gp : iface->genericParams)
+            if (gp) ifaceParams.insert(gp->name);
+        for (Symbol* m : iface->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || !ms->isOperator || ms->operatorToken != op) continue;
+            if (ms->params.size() != 2) continue;
+            // Both parameters must be the recurrence parameter itself so the
+            // substituted signature is (paramName, paramName).
+            bool bothRecur = true;
+            for (Symbol* ps : ms->params) {
+                auto* par = dynamic_cast<ParameterSymbol*>(ps);
+                TypeRef* pt = (par && par->declType)
+                                  ? ctx_.resolvedType(*par->declType)
+                                  : nullptr;
+                if (!pt || pt->kind != TypeRef::Kind::Named ||
+                    pt->declaration || pt->nullable || !pt->astNode ||
+                    !pt->astNode->name ||
+                    pt->astNode->name->parts.size() != 1 ||
+                    !ifaceParams.count(pt->astNode->name->parts[0])) {
+                    bothRecur = false;
+                    break;
+                }
+            }
+            if (!bothRecur) continue;
+            found = ms;
+            if (outBound) *outBound = ctr;
+            return true;
+        }
+        return false;
+    });
+    return found;
+}
+
 Symbol* ExprTC::lookupName(std::string_view name) {
     for (Scope* s = currentScope_; s; s = s->parent) {
         auto it = s->names.find(name);

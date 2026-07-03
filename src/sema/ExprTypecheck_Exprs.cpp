@@ -579,6 +579,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             }()) {
             // Module-name prefix: silently pass — resolveMemberAccess will
             // handle the enclosing `ModuleName.TypeName` pattern.
+        } else if (&e == maTargetHint_ && isInScopeTypeParam(id->name)) {
+            // §11.8 (v0.176, #807): `T.Member(...)` — the receiver of a
+            // member access names an in-scope generic type parameter. Mark it
+            // with a GenericParamSymbol so resolveMemberAccess dispatches
+            // through the parameter's static-interface constraint. A bare `T`
+            // in any OTHER expression position (not a member-access target)
+            // keeps today's "unresolved identifier" error.
+            ctx_.setExprSymbol(&e, typeParamMarker(id->name));
         } else if (currentScope_) {
             ctx_.diagnostics().report(
                 Severity::Error, id->span.begin,
@@ -1246,7 +1254,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // (`int.MaxValue`) is fine; an instance value receiver is not.
                 sema::Symbol* recv = ctx_.exprSymbol(*ma->target);
                 bool recvIsType =
-                    dynamic_cast<sema::TypeSymbol*>(recv) != nullptr;
+                    dynamic_cast<sema::TypeSymbol*>(recv) != nullptr ||
+                    // §11.8 (v0.176, #807): a type-parameter receiver
+                    // (`T.Zero()`) IS a type-name receiver — the static
+                    // dispatches through the constraint at instantiation.
+                    dynamic_cast<sema::GenericParamSymbol*>(recv) != nullptr;
                 bool recvIsPrim = false;
                 if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get()))
@@ -2185,6 +2197,52 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     }
             return;
         }
+        // §11.8 (v0.176, #807): constraint-operator dispatch — a binary
+        // operator on TYPE-PARAMETER-typed operands resolves through a static
+        // operator member of the parameter's `where T: I<T>` constraint when
+        // no other resolution applies (findBinaryOperator found nothing above:
+        // a type-parameter TypeRef has no declaration to search). Both
+        // operands must be the SAME parameter; the interface member's shape is
+        // the §2.19 recurrence form `static operator <op>(a: T, b: T): R`.
+        // Resolution to the concrete type's operator (or the primitive
+        // intrinsic op) happens at instantiation in codegen.
+        {
+            auto typeParamNameOf = [&](const ast::Expr* e) -> std::string_view {
+                if (!e) return {};
+                const TypeRef* t = ctx_.exprType(*e);
+                if (!t || t->kind != TypeRef::Kind::Named || t->declaration ||
+                    t->nullable || !t->astNode || !t->astNode->name ||
+                    t->astNode->name->parts.size() != 1)
+                    return {};
+                std::string_view n = t->astNode->name->parts[0];
+                return isInScopeTypeParam(n) ? n : std::string_view{};
+            };
+            std::string_view lp = typeParamNameOf(be.left.get());
+            if (!lp.empty() && lp == typeParamNameOf(be.right.get())) {
+                TypeRef* bound = nullptr;
+                if (MethodSymbol* iop =
+                        findConstraintStaticOperator(lp, op, &bound)) {
+                    ctx_.setExprSymbol(&be, iop);
+                    // Result type: the operator's declared return with the
+                    // interface's recurrence parameter substituted by the
+                    // call-site parameter (i.e. the operand's own TypeRef);
+                    // a concrete return (bool for `<`) passes through.
+                    TypeRef* resTy = nullptr;
+                    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(
+                            iop->decl)) {
+                        if (od->returnType)
+                            resTy = ctx_.resolvedType(*od->returnType);
+                    }
+                    if (resTy && resTy->kind == TypeRef::Kind::Named &&
+                        !resTy->declaration) {
+                        // Bare recurrence-parameter return → the operand type.
+                        resTy = be.left ? ctx_.exprType(*be.left) : nullptr;
+                    }
+                    if (resTy) ctx_.setExprType(&be, resTy);
+                    return;
+                }
+            }
+        }
         // §7.11 (#1132): user-defined operator lifting over nullable operands is
         // DEFERRED. The operator did NOT resolve above (the nullability gate in
         // operandMatchesParam), but it IS declared on the operand's underlying
@@ -3096,7 +3154,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (ue->operand) visitExpr(*ue->operand);
     } else if (auto* ma =
                    dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // §11.8 (v0.176, #807): mark the target node while visiting it so the
+        // IdentifierExpr handler can recognize a type-parameter receiver
+        // (`T.Member(...)`) without resolving bare `T` anywhere else.
+        const ast::Expr* savedHint = maTargetHint_;
+        maTargetHint_ = ma->target.get();
         if (ma->target) visitExpr(*ma->target);
+        maTargetHint_ = savedHint;
     } else if (auto* nm =
                    dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (nm->target) visitExpr(*nm->target);
@@ -3117,8 +3181,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Resolve callee's parameter list to type out-var locals.
         sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
         const ast::MethodDecl* calleeMd2 = nullptr;
-        if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2))
+        sema::TypeSymbol* calleeParent2 = nullptr;
+        if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2)) {
             calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
+            calleeParent2 = ms2->parent;
+        }
         std::size_t pos2 = 0;
         for (const auto& a : ce->args) {
             // §22.4: `out var x` declares x in the current scope.
@@ -3135,6 +3202,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         calleeMd2->params[pos2].type) {
                         lsym->declType = ctx_.resolvedType(
                             *calleeMd2->params[pos2].type);
+                        // §11.8 (v0.176, #807): a STATIC interface member
+                        // called through a constrained type parameter
+                        // (`T.TryParse(s, out var v)`) declares its out param
+                        // in terms of the INTERFACE's recurrence parameter
+                        // (`value: T?` on IParsable<T>). Substitute it against
+                        // the receiver (whose exprType resolveMemberAccess set
+                        // to the constraint instantiation `I<T>`) so `v` is
+                        // typed by the CALL SITE's type parameter, not the
+                        // interface's unrelated `T` spelling.
+                        if (lsym->declType && calleeParent2 &&
+                            calleeParent2->kind ==
+                                ast::TypeDeclKind::Interface) {
+                            if (auto* maCal =
+                                    dynamic_cast<const ast::MemberAccessExpr*>(
+                                        ce->callee.get())) {
+                                if (maCal->target)
+                                    lsym->declType = substituteMemberType(
+                                        lsym->declType, maCal->target.get(),
+                                        calleeParent2);
+                            }
+                        }
                         // out params are nullable refs — strip nullable
                         // (the variable holds the non-nullable value).
                         if (lsym->declType && lsym->declType->nullable) {

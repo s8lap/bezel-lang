@@ -147,6 +147,12 @@ void Resolver::run(const ast::SourceFile& src) {
     // generic (`C<T> where T: new()`) was silently skipped when reached
     // through an outer generic (`Box<W>` ⇒ `C<W>`, then `Box<IFoo>`).
     checkDeferredNestedConstraints();
+    // §11.8 / §14.2 (v0.176, #807): re-check type-bound failures deferred
+    // during base-list resolution (the recurrence `class Meters:
+    // INumber<Meters>` cannot see its own conformance until baseTypes are
+    // fully populated). Runs after checkDeferredNestedConstraints so entries
+    // that pass appends there are flushed too.
+    recheckDeferredTypeBounds();
     // Slice S12: after every base-type reference is resolved,
     // walk each TypeSymbol's inheritance chain and report cycles.
     bool hadCycle = checkInheritanceCycles();
@@ -154,6 +160,9 @@ void Resolver::run(const ast::SourceFile& src) {
     // abstract / interface member. Skipped when a cycle exists
     // (the chain walk wouldn't terminate cleanly).
     if (!hadCycle) checkAbstractImplementations();
+    // §11.8 (v0.176, #807): a class/record conforming to an interface with
+    // STATIC members must supply matching statics (exact signature).
+    if (!hadCycle) checkStaticInterfaceConformance();
     // Slice S15: hiding forbidden / override must target a virtual.
     if (!hadCycle) checkHidingAndOverride();
     // Slice S14: duplicate non-overloadable member names within a

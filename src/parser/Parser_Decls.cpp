@@ -1209,14 +1209,19 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
 std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
     // §A.4 InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer |
     // IfaceEvent. No visibility (interface members are implicitly public per
-    // §10.1), signatures only. The pre-keyword prefix is just `readonly?` (for
-    // property) and `async?` (for event); both are scanned tentatively then
-    // dispatched on the kind keyword.
+    // §10.1), signatures only. The pre-keyword prefix is `readonly?` (for
+    // property), `async?` (for event), and — per §11.8 (v0.176, #807) —
+    // `static` for the abstract-only static method / static operator forms.
+    // All are scanned tentatively then dispatched on the kind keyword.
     bool readonlyMod = false;
     bool asyncMod = false;
-    while (isKeyword("readonly") || isKeyword("async")) {
+    bool staticMod = false;
+    while (isKeyword("readonly") || isKeyword("async") ||
+           isKeyword("static")) {
         if (isKeyword("readonly")) {
             readonlyMod = true;
+        } else if (isKeyword("static")) {
+            staticMod = true;  // per §11.8
         } else {
             asyncMod = true;
         }
@@ -1225,6 +1230,16 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
 
     // IfaceProperty / IfaceIndexer.
     if (consumeKeyword("property")) {
+        // per §11.8 (v0.176): static interface constants and properties are
+        // DEFERRED — only static methods and static operators are admitted.
+        // Spell a constant as a nullary method (`Zero()`).
+        if (staticMod) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`static` interface members may be methods or operators only; "
+                "static interface properties are deferred — spell a constant "
+                "as a nullary method (§11.8)");
+        }
         auto pd = std::make_unique<ast::PropertyDecl>();
         pd->visibility = ast::Visibility::None; // implicit public in iface
         if (readonlyMod) pd->modifiers.push_back("readonly");
@@ -1292,6 +1307,13 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
 
     // IfaceEvent.
     if (consumeKeyword("event")) {
+        // per §11.8 (v0.176): `static` admits only method/operator members.
+        if (staticMod) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`static` interface members may be methods or operators only "
+                "(§11.8)");
+        }
         auto ed = std::make_unique<ast::EventDecl>();
         ed->visibility = ast::Visibility::None;
         ed->isAsync = asyncMod;
@@ -1317,6 +1339,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
     if (consumeKeyword("method")) {
         auto m = std::make_unique<ast::MethodDecl>();
         m->visibility = ast::Visibility::None;
+        // per §11.8 (v0.176, #807): a static interface method. Same signature
+        // grammar; abstract-only (the `;` requirement below enforces no body).
+        if (staticMod) m->modifiers.push_back("static");
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected method name");
@@ -1341,6 +1366,16 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
             }
             m->returnType = parseType();
         }
+        // per §11.8: static interface members are ABSTRACT-ONLY — a body (the
+        // `=>` expression form is the recognisable shape) is a compile error.
+        if (staticMod && isPunctuator("=>")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "a static interface member is abstract-only and may not have "
+                "a body (§11.8)");
+            advance();               // past `=>`
+            (void)parseExpression(); // skim the body expression
+        }
         if (!consumePunctuator(";")) {
             diagnostics_.report(
                 Severity::Error, current_.location,
@@ -1350,9 +1385,64 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         return std::unique_ptr<ast::Member>(m.release());
     }
 
+    // per §11.8 (v0.176, #807): IfaceOperator — `"static" "operator" OpToken
+    // "(" ParamList ")" ":" "owned"? Type ";"`. Abstract-only: no body form is
+    // admitted. `operator` is a contextual keyword (App. B.2) — lexed as an
+    // Identifier — so it is matched by text.
+    if (current_.kind == TokenKind::Identifier && current_.text == "operator") {
+        if (!staticMod) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "an interface operator member requires `static` "
+                "(`static operator +(a: T, b: T): T;`) (§11.8)");
+        }
+        advance();  // past `operator`
+        auto op = std::make_unique<ast::OperatorDecl>();
+        op->visibility = ast::Visibility::None;  // implicit public (§10.1)
+        op->opToken = current_.text;
+        advance();  // past the OpToken
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected '(' to begin operator parameter list");
+        }
+        op->params = parseParamList();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close operator parameter list");
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "operator overload requires a return type");
+        }
+        if (isKeyword("owned")) {
+            op->returnOwned = true;
+            advance();
+        }
+        op->returnType = parseType();
+        // per §11.8: abstract-only — reject the expression-body form cleanly.
+        if (isPunctuator("=>")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "a static interface member is abstract-only and may not have "
+                "a body (§11.8)");
+            advance();               // past `=>`
+            (void)parseExpression(); // skim the body expression
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after static interface operator signature");
+        }
+        op->bodyKind = ast::MethodBodyKind::Abstract;
+        return std::unique_ptr<ast::Member>(op.release());
+    }
+
     diagnostics_.report(
         Severity::Error, current_.location,
-        "expected 'method', 'property', or 'event' in interface body");
+        "expected 'method', 'property', 'event', or 'static "
+        "method'/'static operator' (§11.8) in interface body");
     return nullptr;
 }
 

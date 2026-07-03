@@ -59,7 +59,10 @@ bool Emitter::isUnsignedBinOperand(const ast::BinaryExpr& bin) {
     // relational comparison of two unsigned-backed enums selects icmp ult.
     auto unsignedExpr = [&](const ast::Expr* e) {
         if (!e) return false;
-        return typeRefIsUnsigned(ctx_.exprType(*e));
+        // §11.8 (v0.176, #807): a T-typed operand under a constraint-operator
+        // dispatch — resolve the type parameter to its concrete substitution
+        // so a `T = uint/ulong` specialization selects the unsigned ops.
+        return typeRefIsUnsigned(resolveTypeParamRef(ctx_.exprType(*e)));
     };
     return unsignedExpr(bin.left.get()) && unsignedExpr(bin.right.get());
 }
@@ -68,7 +71,9 @@ bool Emitter::isUnsignedBinOperand(const ast::BinaryExpr& bin) {
 bool Emitter::isUnsignedTargetExpr(const ast::Expr& e) {
     // per §8.4/§10.3 (#1189): include a Named-kind enum target, whose signedness
     // is that of its underlying primitive (byte/ushort/uint/ulong → unsigned).
-    return typeRefIsUnsigned(ctx_.exprType(e));
+    // §11.8 (v0.176, #807): resolve a T-typed operand through the active
+    // substitution first (constraint-operator dispatch on T = uint/ulong).
+    return typeRefIsUnsigned(resolveTypeParamRef(ctx_.exprType(e)));
 }
 
 
