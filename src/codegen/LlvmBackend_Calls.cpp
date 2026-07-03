@@ -3561,8 +3561,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Type* outTy = nullptr;
             llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
             if (!outAddr) return nullptr;
+            // v0.171 (#1336): the out param is `T?`. A value instantiation
+            // (Stack<int>/Queue<int>) uses the tagged `{i8,T}` slot; a class
+            // instantiation a nullable pointer. On the FALSE (empty) path the
+            // slot is assigned null; on the TRUE path the extracted value.
+            const bool isValTy = tryOutIsNullableValue(recvTy, 0);
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "trypop.len");
+            // False-path null: store null now (the found path overwrites it).
+            storeTryOutNull(outAddr, outTy);
             llvm::Value* nonEmpty = builder_.CreateICmpNE(
                 len, builder_.getInt64(0), "trypop.ne");
             auto* foundBB =
@@ -3588,8 +3595,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 : builder_.CreateSub(len, builder_.getInt64(1), "trypop.idx");
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), i64(), ptrTy(), i64()});
-            builder_.CreateCall(getFn,
-                                {recv, idx, outAddr, builder_.getInt64(esz)});
+            if (isValTy) {
+                // Read the raw non-nullable element into a temp, then wrap it
+                // into the `{i8 1, T}` present form and store into the slot.
+                llvm::Type* rawTy = getElemTy();
+                llvm::AllocaInst* tmp = entryAlloca(rawTy);
+                builder_.CreateCall(getFn,
+                                    {recv, idx, tmp, builder_.getInt64(esz)});
+                llvm::Value* raw = builder_.CreateLoad(rawTy, tmp, "trypop.raw");
+                storeTryOutValue(outAddr, outTy, raw, /*isValTy=*/true);
+            } else {
+                builder_.CreateCall(getFn,
+                                    {recv, idx, outAddr, builder_.getInt64(esz)});
+            }
             if (m != "TryPeek") {
                 auto* remFn = declareC("bz_array_remove_at",
                                        llvm::Type::getVoidTy(llvm_),
@@ -3672,8 +3690,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Type* outTy = nullptr;
             llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
             if (!outAddr) return nullptr;
+            // v0.171 (#1336): the out param is `owned T?`. Owning collections
+            // require class elements, so the slot is a nullable pointer; still,
+            // handle the tagged-struct form uniformly. False path → null.
+            const bool isValTy = tryOutIsNullableValue(recvTy, 0);
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "trypopfl.len");
+            storeTryOutNull(outAddr, outTy);  // false-path null (§22.3)
             llvm::Value* nonEmpty = builder_.CreateICmpNE(
                 len, builder_.getInt64(0), "trypopfl.ne");
             auto* foundBB =
@@ -3690,8 +3713,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // slot WITHOUT disposal — same non-disposing transfer PopFirst uses.
             auto* popFn = declareC("bz_array_pop_at",
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
-            builder_.CreateCall(popFn,
-                {recv, idx, outAddr, builder_.getInt64(esz)});
+            if (isValTy) {
+                llvm::Type* rawTy = getElemTy();
+                llvm::AllocaInst* tmp = entryAlloca(rawTy);
+                builder_.CreateCall(popFn,
+                    {recv, idx, tmp, builder_.getInt64(esz)});
+                llvm::Value* raw = builder_.CreateLoad(rawTy, tmp, "trypopfl.raw");
+                storeTryOutValue(outAddr, outTy, raw, /*isValTy=*/true);
+            } else {
+                builder_.CreateCall(popFn,
+                    {recv, idx, outAddr, builder_.getInt64(esz)});
+            }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
             auto* phi = builder_.CreatePHI(i1(), 2, "trypopfl.r");
@@ -4379,39 +4411,45 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
             }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
-            // fix #685: any struct-typed value (record, nullable, or primitive
-            // struct e.g. decimal) is heap-boxed by encodeValue; load back from box.
-            if (outTy && outTy->isStructTy()) {
-                // Load the boxed struct and store it into the out slot.  Guard the
-                // box pointer (null on not-found) so we never dereference null.
-                auto* copyBB = llvm::BasicBlock::Create(llvm_, "tg.copy", currentFn_);
-                auto* endBB  = llvm::BasicBlock::Create(llvm_, "tg.end", currentFn_);
-                llvm::Value* nonNull = builder_.CreateICmpNE(
-                    valPtr, llvm::ConstantPointerNull::get(ptrTy()), "tg.nn");
-                builder_.CreateCondBr(nonNull, copyBB, endBB);
-                builder_.SetInsertPoint(copyBB);
-                llvm::Value* recVal = builder_.CreateLoad(outTy, valPtr, "tg.rec");
-                builder_.CreateStore(recVal, outAddr);
-                builder_.CreateBr(endBB);
-                builder_.SetInsertPoint(endBB);
-            } else if (outTy && !outTy->isPointerTy()) {
-                // Decode: ptrtoint → truncate/bitcast to target type
+            // v0.171 (#1336): the out param is `V?`. Assign null on the miss
+            // (false) path; on the hit path decode the stored value as V and
+            // coerce it into the recipient's (possibly tagged `{i8,V}`) slot.
+            // Keying the decode on V's STORAGE — not on the recipient LLVM type
+            // — is essential: a value V (int) is inttoptr-encoded, so a
+            // now-nullable `{i8,i32}` recipient must NOT be read as a boxed
+            // struct. coerceToNullableSlot wraps a bare V into `{i8 1, V}` when
+            // the recipient is the tagged form, and passes a pointer / an
+            // already-tagged value through unchanged.
+            // fix #685: a record / decimal / nullable-value V is heap-boxed by
+            // encodeValue; load it back from the box on the hit path.
+            llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
+            if (!valLlvm) valLlvm = ptrTy();
+            storeTryOutNull(outAddr, outTy);  // false-path null (§22.3)
+            auto* tgSetBB = llvm::BasicBlock::Create(llvm_, "tg.set", currentFn_);
+            auto* tgEndBB = llvm::BasicBlock::Create(llvm_, "tg.end", currentFn_);
+            builder_.CreateCondBr(found, tgSetBB, tgEndBB);
+            builder_.SetInsertPoint(tgSetBB);
+            llvm::Value* dv;
+            if (valLlvm->isStructTy()) {
+                dv = builder_.CreateLoad(valLlvm, valPtr, "tg.rec");
+            } else if (!valLlvm->isPointerTy()) {
                 llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
-                llvm::Value* decoded = asI64;
-                if (outTy->isFloatingPointTy()) {
-                    if (outTy->isDoubleTy())
-                        decoded = builder_.CreateBitCast(asI64, outTy);
-                    else {
-                        llvm::Value* trunc = builder_.CreateTrunc(asI64, i32());
-                        decoded = builder_.CreateBitCast(trunc, outTy);
-                    }
-                } else if (!outTy->isIntegerTy(64)) {
-                    decoded = builder_.CreateTrunc(asI64, outTy);
+                dv = asI64;
+                if (valLlvm->isFloatingPointTy()) {
+                    if (valLlvm->isDoubleTy())
+                        dv = builder_.CreateBitCast(asI64, valLlvm);
+                    else
+                        dv = builder_.CreateBitCast(
+                            builder_.CreateTrunc(asI64, i32()), valLlvm);
+                } else if (!valLlvm->isIntegerTy(64)) {
+                    dv = builder_.CreateTrunc(asI64, valLlvm);
                 }
-                builder_.CreateStore(decoded, outAddr);
             } else {
-                builder_.CreateStore(valPtr, outAddr);
+                dv = valPtr;  // pointer value (string / class)
             }
+            builder_.CreateStore(coerceToNullableSlot(outTy, dv), outAddr);
+            builder_.CreateBr(tgEndBB);
+            builder_.SetInsertPoint(tgEndBB);
             return found;
         }
         // .GetOrAdd(k, factory): V  (stdlib §4.8 borrowing / §4.9 owning)
@@ -9077,6 +9115,14 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             // §9.4 / issue #654: bool.TryParse out-slot is i1 (Bool lowers to i1).
             else if (callPrimTy == P::Bool) slotTy = i1();
             else slotTy = i32();
+        } else if (loc && loc->declType) {
+            // v0.171 (#1336): a BUILTIN collection Try's inline `out var x` has
+            // no MethodDecl; sema typed the local `T?`/`V?` (the borrowing
+            // TryPop/TryDequeue/TryPeek/TryGetValue family). Lower that nullable
+            // type so the slot is the tagged `{i8,T}` struct for a value
+            // instantiation (a class instantiation stays a nullable pointer);
+            // the false-path null-store and value writeback then land correctly.
+            slotTy = lowerTypeRef(loc->declType);
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             // §3: collection instance calls (e.g. dict.TryGetValue).
             // Infer out-param type from the collection's generic args.

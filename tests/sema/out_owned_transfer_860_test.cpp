@@ -230,7 +230,7 @@ BEZEL_TEST(out_owned_transfer_860, borrow_trypop_accepted) {
     auto r = parseAndCheckOwnership(withMain(
         "using var s := new Stack<int>(); "
         "s.Push(7); "
-        "var item: int := 0; "
+        "var item: int? := null; "  // v0.171 (#1336): TryPop out is int?
         "var ok := s.TryPop(out item); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -267,7 +267,7 @@ BEZEL_TEST(out_owned_transfer_860, out_non_owned_trygetvalue_accepted) {
     auto r = parseAndCheckOwnership(withMain(
         "using var d := new Dictionary<string, int>(); "
         "d.Add(\"a\", 5); "
-        "var v: int := 0; "
+        "var v: int? := null; "  // v0.171 (#1336): TryGetValue out is int?
         "var ok := d.TryGetValue(\"a\", out v); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

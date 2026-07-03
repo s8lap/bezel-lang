@@ -252,6 +252,7 @@ set(BEZEL_TEST_SOURCES
     sema/owning_rename_1372_test.cpp                  # v0.168 #1372: Owned* family renamed Owning* (interfaces gain `I`); new names resolve, old names fail with a rename hint (rationale §3.9)
     sema/out_owned_transfer_860_test.cpp              # fix #860: §28.3/§28.11 model the caller-side out-owned transfer — Try*(out owned item) receives ownership; dropping it leaks
     sema/out_owned_condition_892_test.cpp             # fix #892: §28.3 mark out-owned Try* recipients owned in if/while conditions — drop accepted (leak) before fix
+    sema/try_convention_1336_test.cpp                 # v0.171 #1336: every extraction Try's out is nullable (T?) — reject non-nullable recipient, inline out-var infers T?
     sema/nullable_field_narrowing_862_test.cpp        # fix #862: §7.4 reject nullable-field member access — fields are not narrowable
     sema/compound_assign_operator_result_851_test.cpp # fix #851: §25.1 reject compound op whose overload result differs from LHS
     sema/enum_cast_const_range_859_test.cpp           # fix #859: §5.4 reject a constant enum cast outside the underlying range
@@ -395,6 +396,7 @@ set(BEZEL_TEST_SOURCES
     codegen/mixed_sign_int_signedness_814_test.cpp
     codegen/case_wide_int_836_test.cpp
     codegen/owned_collection_trypop_831_test.cpp
+    codegen/try_convention_1336_test.cpp
     codegen/lambda_inferred_param_operator_829_test.cpp
     codegen/nested_generic_chained_field_828_test.cpp
     codegen/nullable_primitive_cast_827_test.cpp

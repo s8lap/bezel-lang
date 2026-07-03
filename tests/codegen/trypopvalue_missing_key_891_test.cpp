@@ -106,16 +106,18 @@ BEZEL_TEST(trypopvalue_missing_key_891, out_using_var_present_disposed_once) {
 }
 
 // (g) Regression — borrowing Dictionary<string,int>.TryGetValue(missing key):
-//     tmpSlot is now pre-nulled, so on the not-found path the out param receives
-//     0 (null decoded as int = 0) and there is no SIGSEGV.  §28.11, #891.
+//     tmpSlot is pre-nulled and, per v0.171 (#1336), the not-found path assigns
+//     `null` to the now-`int?` out param (§22.3 — every out assigned on every
+//     exit path) — no SIGSEGV, and the miss is observably null.  §28.11, #891.
 BEZEL_TEST(trypopvalue_missing_key_891, trygetvalue_missing_key_regression) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  do using var d := new Dictionary<string, int>(); "
         "    d.Add(\"a\", 42); "
-        "    var v: int := 0; "
+        "    var v: int? := null; "  // v0.171 (#1336): out is V?
         "    var ok := d.TryGetValue(\"missing\", out v); "
         "    if ok then return 1; end; "
-        "    return v; "
+        "    if v = null then return 0; end; "  // miss assigns null
+        "    return 5; "
         "  end; end Main; end C;"), 0);
 }

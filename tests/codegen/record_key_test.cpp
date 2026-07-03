@@ -35,9 +35,9 @@ BEZEL_TEST(codegen_record_key, dict_set_then_get_roundtrip_spec_4_8) {
         "  using var d := new Dictionary<Point, int>(); "
         "  d[new Point(1, 2)] := 100; "
         "  d[new Point(3, 4)] := 200; "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(new Point(1, 2), out v); "
-        "  return v; "
+        "  return v!; "
         "end Main; end C;"), 100);
 }
 
@@ -49,9 +49,9 @@ BEZEL_TEST(codegen_record_key, dict_get_second_key_spec_4_8) {
         "  using var d := new Dictionary<Point, int>(); "
         "  d[new Point(1, 2)] := 100; "
         "  d[new Point(3, 4)] := 200; "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(new Point(3, 4), out v); "
-        "  return v; "
+        "  return v!; "
         "end Main; end C;"), 200);
 }
 
@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_record_key, dict_equal_keys_same_entry_spec_8_3) {
         "  using var d := new Dictionary<Point, int>(); "
         "  d[new Point(1, 2)] := 100; "
         "  d[new Point(0 + 1, 1 + 1)] := 999; "  // equal key, distinct build
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(new Point(1, 2), out v); "
         "  return int(d.Count = 1 and v = 999); "
         "end Main; end C;"), 1);
@@ -121,7 +121,7 @@ BEZEL_TEST(codegen_record_key, dict_record_with_string_field_key_spec_8_3) {
         "class C public static method Main(): int "
         "  using var d := new Dictionary<Tag, int>(); "
         "  d[new Tag(\"alpha\", 1)] := 42; "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(new Tag(\"al\" + \"pha\", 1), out v); "  // distinct heap str
         "  return int(v = 42 and d.Count = 1 "
         "         and d.ContainsKey(new Tag(\"alpha\", 1)) "
@@ -138,7 +138,7 @@ BEZEL_TEST(codegen_record_key, dict_string_field_distinguishes_keys_spec_8_3) {
         "  using var d := new Dictionary<Tag, int>(); "
         "  d[new Tag(\"x\", 1)] := 10; "
         "  d[new Tag(\"y\", 1)] := 20; "  // same id, different name
-        "  var vx := 0; var vy := 0; "
+        "  var vx: int? := null; var vy: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(new Tag(\"x\", 1), out vx); "
         "  d.TryGetValue(new Tag(\"y\", 1), out vy); "
         "  return int(d.Count = 2 and vx = 10 and vy = 20); "
@@ -158,7 +158,7 @@ BEZEL_TEST(codegen_record_key, dict_body_record_key_spec_9_2) {
         "class C public static method Main(): int "
         "  using var d := new Dictionary<Coord, int>(); "
         "  d[new Coord(5, 6)] := 77; "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(new Coord(5, 6), out v); "
         "  return int(v = 77 and d.ContainsKey(new Coord(5, 6))); "
         "end Main; end C;"), 1);

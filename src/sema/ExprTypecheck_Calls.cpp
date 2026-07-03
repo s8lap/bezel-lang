@@ -2697,6 +2697,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         }  // end else (m != "Set")
                     }
+                    // v0.171 (#1336): every extraction Try's out parameter is
+                    // nullable (`T?`/`V?`) — the false path assigns `null`
+                    // (stdlib §1 / §22.3). A plain `out x` recipient with a
+                    // NON-nullable declared type cannot receive that null, so
+                    // reject it with a nullability mismatch. The inline forms
+                    // (`out var`/`out owned var`/`out using var`) already infer
+                    // the nullable type; `out _` discards it. (TryTake/TryReceive
+                    // are not part of the v0.171 sweep and are excluded.)
+                    if (isOwningContainer || isNonOwningContainer) {
+                        std::size_t outIdx = 0;
+                        bool isV171Try = false;
+                        if ((m == "TryPop" || m == "TryDequeue" ||
+                             m == "TryPeek" || m == "TryPopFirst" ||
+                             m == "TryPopLast") && ce.args.size() == 1) {
+                            outIdx = 0; isV171Try = true;
+                        } else if ((m == "TryGetValue" || m == "TryPopValue") &&
+                                   ce.args.size() == 2) {
+                            outIdx = 1; isV171Try = true;
+                        }
+                        if (isV171Try && outIdx < ce.args.size()) {
+                            const auto& oa = ce.args[outIdx];
+                            if (oa.modifier == "out" && oa.value &&
+                                !oa.isDiscard) {
+                                const TypeRef* ort = ctx_.exprType(*oa.value);
+                                if (ort && !ort->nullable &&
+                                    ort->kind != TypeRef::Kind::Error) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "the `out` recipient of `" +
+                                        std::string(m) + "` must be nullable: "
+                                        "every extraction Try's out parameter "
+                                        "is `T?` and the false path assigns "
+                                        "`null` (stdlib §1 / §22.3, v0.171 "
+                                        "#1336). Declare the recipient nullable "
+                                        "(`T?`) or use an inline `out var` / "
+                                        "`out owned var` / `out using var` form.");
+                                }
+                            }
+                        }
+                    }
                     // Array/Stack/Queue/Set/LinkedList methods
                     bool isArrLike = colName == "Array" || colName == "OwningArray" ||
                         colName == "Stack" || colName == "OwningStack" ||

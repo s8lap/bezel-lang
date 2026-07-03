@@ -48,8 +48,8 @@ BEZEL_TEST(codegen_collection_keys, dict_int_key_roundtrip_spec_4_8) {
         "  d[1] := 100; "
         "  d[2] := 200; "
         "  d[1] := 111; "                       // updates key 1, no new entry
-        "  var v := 0; d.TryGetValue(1, out v); "
-        "  var w := 0; d.TryGetValue(2, out w); "
+        "  var v: int? := null; d.TryGetValue(1, out v); "  // v0.171 (#1336): out is V?
+        "  var w: int? := null; d.TryGetValue(2, out w); "
         "  return int(d.Count = 2 and v = 111 and w = 200 "
         "         and d.ContainsKey(1) and not d.ContainsKey(9)); "
         "end Main; end C;"), 1);
@@ -96,7 +96,7 @@ BEZEL_TEST(codegen_collection_keys, dict_int_key_equal_keys_same_entry_spec_8_3)
         "  using var d := new Dictionary<int, int>(); "
         "  d[5] := 100; "
         "  d[2 + 3] := 999; "                   // equal key, distinct build
-        "  var v := 0; d.TryGetValue(5, out v); "
+        "  var v: int? := null; d.TryGetValue(5, out v); "  // v0.171 (#1336): out is V?
         "  return int(d.Count = 1 and v = 999); "
         "end Main; end C;"), 1);
 }
@@ -114,7 +114,7 @@ BEZEL_TEST(codegen_collection_keys, dict_enum_key_roundtrip_spec_4_8) {
         "  using var d := new Dictionary<Color, int>(); "
         "  d[Color.Red] := 50; "
         "  d[Color.Blue] := 70; "
-        "  var v := 0; d.TryGetValue(Color.Blue, out v); "
+        "  var v: int? := null; d.TryGetValue(Color.Blue, out v); "  // v0.171 (#1336): out is V?
         "  return int(d.Count = 2 and v = 70 "
         "         and d.ContainsKey(Color.Red) "
         "         and not d.ContainsKey(Color.Green)); "
@@ -135,12 +135,12 @@ BEZEL_TEST(codegen_collection_keys, dict_record_value_set_get_spec_4_8) {
         "  using var d := new Dictionary<string, Point>(); "
         "  d[\"a\"] := new Point(1, 2); "
         "  d[\"b\"] := new Point(3, 4); "
-        "  var p := new Point(0, 0); "
+        "  var p: Point? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(\"a\", out p); "
-        "  var q := new Point(0, 0); "
+        "  var q: Point? := null; "
         "  d.TryGetValue(\"b\", out q); "
-        "  return int(d.Count = 2 and p.x = 1 and p.y = 2 "
-        "         and q.x = 3 and q.y = 4); "
+        "  return int(d.Count = 2 and p!.x = 1 and p!.y = 2 "
+        "         and q!.x = 3 and q!.y = 4); "
         "end Main; end C;"), 1);
 }
 
@@ -154,10 +154,10 @@ BEZEL_TEST(codegen_collection_keys, dict_record_value_update_spec_4_8) {
         "  d[\"a\"] := new Point(1, 2); "
         "  d[\"b\"] := new Point(3, 4); "
         "  d[\"a\"] := new Point(9, 9); "       // update a's record value
-        "  var p := new Point(0, 0); d.TryGetValue(\"a\", out p); "
-        "  var q := new Point(0, 0); d.TryGetValue(\"b\", out q); "
-        "  return int(d.Count = 2 and p.x = 9 and p.y = 9 "
-        "         and q.x = 3 and q.y = 4); "
+        "  var p: Point? := null; d.TryGetValue(\"a\", out p); "  // v0.171 (#1336): out is V?
+        "  var q: Point? := null; d.TryGetValue(\"b\", out q); "
+        "  return int(d.Count = 2 and p!.x = 9 and p!.y = 9 "
+        "         and q!.x = 3 and q!.y = 4); "
         "end Main; end C;"), 1);
 }
 

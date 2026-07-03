@@ -105,7 +105,7 @@ BEZEL_TEST(collection_dict, add_get_contains) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"a\", 1); d.Add(\"b\", 2); "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(\"a\", out v); "
         "  return int(d.Count = 2 and v = 1 and d.ContainsKey(\"b\") and not d.ContainsKey(\"c\")); "
         "end Main; end C;"), 1);
@@ -117,7 +117,7 @@ BEZEL_TEST(collection_dict, set_and_remove) {
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"x\", 10); "
         "  d[\"x\"] := 99; "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(\"x\", out v); "
         "  d.Remove(\"x\"); "
         "  return int(v = 99 and d.Count = 0); "

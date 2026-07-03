@@ -2320,6 +2320,49 @@ private:
         return v;
     }
 
+    // v0.171 (#1336) — the Try-convention writeback. Every extraction
+    // `TryX(out item: T?)` builtin must assign the out slot on BOTH exit paths
+    // (§22.3): `null` on the false path, the extracted value on the true path.
+    // For a nullable VALUE instantiation (Stack<int>, Queue<int>,
+    // Dictionary<K,int>, …) the slot is the tagged `{i8 hasValue, T}` struct;
+    // for a class/ref instantiation it is a plain nullable pointer.
+    //   storeTryOutNull  — write the null form (getNullValue covers both:
+    //                       `{i8 0, T 0}` for the tagged struct, a null pointer
+    //                       for a ref slot, 0 for a legacy non-nullable scalar).
+    //   storeTryOutValue — write the present form, wrapping a raw non-nullable
+    //                       value into `{i8 1, T}` when the slot is the tagged
+    //                       struct, else storing the raw value/pointer directly.
+    void storeTryOutNull(llvm::Value* outAddr, llvm::Type* outTy) {
+        builder_.CreateStore(llvm::Constant::getNullValue(outTy), outAddr);
+    }
+    void storeTryOutValue(llvm::Value* outAddr, llvm::Type* outTy,
+                          llvm::Value* raw, bool isValTy) {
+        if (isValTy && outTy && outTy->isStructTy()) {
+            auto* nst = llvm::cast<llvm::StructType>(outTy);
+            raw = reinterpretToType(raw, nst->getElementType(1));
+            llvm::Value* res = builder_.CreateInsertValue(
+                llvm::UndefValue::get(nst),
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+            res = builder_.CreateInsertValue(res, raw, {1u});
+            builder_.CreateStore(res, outAddr);
+        } else {
+            builder_.CreateStore(raw, outAddr);
+        }
+    }
+    // Is the receiver's element/value sema type a nullable VALUE type? (i.e. a
+    // `Stack<int>`/`Dictionary<K,int>`-style value instantiation whose `T?` out
+    // slot is the tagged `{i8,T}` struct rather than a nullable pointer.)
+    // `genericIdx` selects the element (0) or dictionary value (1) argument.
+    bool tryOutIsNullableValue(const sema::TypeRef* recvTy,
+                               std::size_t genericIdx) {
+        if (!recvTy || recvTy->genericArgs.size() <= genericIdx ||
+            !recvTy->genericArgs[genericIdx])
+            return false;
+        sema::TypeRef nn = *recvTy->genericArgs[genericIdx];
+        nn.nullable = true;
+        return isNullableValueTy(&nn);
+    }
+
     llvm::Value* wrapNullableValue(const sema::TypeRef* rt, llvm::Value* val) {
         auto* st = nullableValueStructTy(rt);
         // fix #569 / §14.1 / #460: inside a monomorphized body the value slot may

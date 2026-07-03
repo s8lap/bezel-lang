@@ -129,7 +129,7 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_discard_discharge) {
         "  using var s := new OwningStack<Cell>(); "
         "  s.Push(move (new Cell())); "
         "  if s.TryPop(out owned var top) then "
-        "    top.Dispose(); "
+        "    top?.Dispose(); "  // v0.171 (#1336): out owned is T?, discharge via `?.`
         "  end; "
         "  return Cell._n; "
         "end Main; end C;"),
@@ -168,7 +168,7 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_auto_drop) {
         "  using var s := new OwningStack<Cell>(); "
         "  s.Push(move (new Cell())); "
         "  if s.TryPop(out owned var top) then "
-        "    top.Dispose(); "
+        "    top?.Dispose(); "  // v0.171 (#1336): out owned is T?, discharge via `?.`
         "  end; "
         "  snap := Cell._n; "
         "  return snap; "

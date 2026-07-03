@@ -135,8 +135,8 @@ BEZEL_TEST(out_owned_writeback_889, borrow_stack_int_trypop_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  do using var s := new Stack<int>(); s.Push(5); "
-        "    var item: int := 0; var ok := s.TryPop(out item); "
-        "    if ok then return item; end; return -1; end; "
+        "    var item: int? := null; var ok := s.TryPop(out item); "  // v0.171 (#1336): T?
+        "    if ok then return item!; end; return -1; end; "
         "end Main; end C;"), 5);
 }
 

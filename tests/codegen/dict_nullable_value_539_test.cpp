@@ -201,10 +201,10 @@ BEZEL_TEST(dict_nullable_value_539, control_scalar_int_unaffected_spec_4_8) {
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 100; "
         "  d[\"b\"] := 200; "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): TryGetValue out is V?
         "  var found := d.TryGetValue(\"a\", out v); "
         "  if not found then return -1; end; "
-        "  return v; "
+        "  return v!; "
         "end Main; end C;"), 100);
 }
 
@@ -217,10 +217,10 @@ BEZEL_TEST(dict_nullable_value_539, control_record_value_unaffected_spec_4_8) {
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Pair>(); "
         "  d[\"p\"] := new Pair(3, 7); "
-        "  var pv: Pair := new Pair(0, 0); "
+        "  var pv: Pair? := null; "  // v0.171 (#1336): TryGetValue out is V?
         "  var found := d.TryGetValue(\"p\", out pv); "
         "  if not found then return -1; end; "
-        "  return pv.a + pv.b; "
+        "  return pv!.a + pv!.b; "
         "end Main; end C;"), 10);
 }
 
@@ -231,9 +231,9 @@ BEZEL_TEST(dict_nullable_value_539, control_string_value_unaffected_spec_4_8) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, string>(); "
         "  d[\"k\"] := \"hello\"; "
-        "  var s := \"\"; "
+        "  var s: string? := null; "  // v0.171 (#1336): TryGetValue out is V?
         "  var found := d.TryGetValue(\"k\", out s); "
         "  if not found then return -1; end; "
-        "  return s.Length; "
+        "  return s!.Length; "
         "end Main; end C;"), 5);
 }

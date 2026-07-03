@@ -363,12 +363,12 @@ BEZEL_TEST(collections_r9, stack_trypop_725) {
         "module M; class C public static method Main(): int "
         "  using var s := new Stack<int>(); "
         "  s.Push(42); s.Push(99); "
-        "  var popped := 0; "
+        "  var popped: int? := null; "  // v0.171 (#1336): TryPop out is T?
         "  var ok := s.TryPop(out popped); "        // ok=true, popped=99
         "  var r := 0; "
-        "  if ok then r := r + popped; end; "       // +99
+        "  if ok then r := r + popped!; end; "      // +99
         "  using var e := new Stack<int>(); "
-        "  var x := 0; "
+        "  var x: int? := null; "
         "  if e.TryPop(out x) then r := r + 1000; end; "  // empty → false
         "  return r + s.Count; "                    // 99 + 1 = 100
         "end Main; end C;"), 100);
@@ -380,7 +380,7 @@ BEZEL_TEST(collections_r9, queue_trydequeue_725) {
         "module M; class C public static method Main(): int "
         "  using var q := new Queue<int>(); "
         "  q.Enqueue(5); q.Enqueue(7); "
-        "  var item := 0; "
+        "  var item: int? := null; "  // v0.171 (#1336): TryDequeue out is T?
         "  var ok := q.TryDequeue(out item); "      // front=5
         "  return (1 if (ok and item = 5 and q.Count = 1) else 0); "
         "end Main; end C;"), 1);
@@ -391,9 +391,9 @@ BEZEL_TEST(collections_r9, stack_queue_trypeek_no_removal_725) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var s := new Stack<int>(); s.Push(10); s.Push(20); "
-        "  var top := 0; var ok := s.TryPeek(out top); "          // top=20, kept
+        "  var top: int? := null; var ok := s.TryPeek(out top); "  // top=20, kept
         "  using var q := new Queue<int>(); q.Enqueue(3); q.Enqueue(4); "
-        "  var front := 0; var ok2 := q.TryPeek(out front); "     // front=3, kept
+        "  var front: int? := null; var ok2 := q.TryPeek(out front); "  // front=3, kept
         "  return (1 if (top = 20 and s.Count = 2 and front = 3 and q.Count = 2) else 0); "
         "end Main; end C;"), 1);
 }

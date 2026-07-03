@@ -48,8 +48,7 @@ BEZEL_TEST(dict_literal_534, string_key_count_and_lookup) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "
-        "  var va := 0; "
-        "  var vb := 0; "
+        "  var va: int? := null; var vb: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(\"a\", out va); "
         "  d.TryGetValue(\"b\", out vb); "
         "  return int(d.Count = 2 and va = 1 and vb = 2); "
@@ -70,7 +69,7 @@ BEZEL_TEST(dict_literal_534, string_key_three_entries) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d: Dictionary<string, int> := [\"one\": 1, \"two\": 2, \"three\": 3]; "
-        "  var v1 := 0; var v2 := 0; var v3 := 0; "
+        "  var v1: int? := null; var v2: int? := null; var v3: int? := null; "  // v0.171 (#1336)
         "  d.TryGetValue(\"one\",   out v1); "
         "  d.TryGetValue(\"two\",   out v2); "
         "  d.TryGetValue(\"three\", out v3); "
@@ -87,7 +86,7 @@ BEZEL_TEST(dict_literal_534, int_key_literal) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d: Dictionary<int, int> := [1: 10, 2: 20]; "
-        "  var v1 := 0; var v2 := 0; "
+        "  var v1: int? := null; var v2: int? := null; "  // v0.171 (#1336)
         "  d.TryGetValue(1, out v1); "
         "  d.TryGetValue(2, out v2); "
         "  return int(d.Count = 2 and v1 = 10 and v2 = 20); "
@@ -108,7 +107,7 @@ BEZEL_TEST(dict_literal_534, large_literal_forces_resize) {
         "     \"k06\": 6, \"k07\": 7, \"k08\": 8, \"k09\": 9, \"k10\": 10, "
         "     \"k11\": 11, \"k12\": 12, \"k13\": 13, \"k14\": 14, \"k15\": 15, "
         "     \"k16\": 16, \"k17\": 17, \"k18\": 18, \"k19\": 19, \"k20\": 20]; "
-        "  var v1 := 0; var v10 := 0; var v20 := 0; "
+        "  var v1: int? := null; var v10: int? := null; var v20: int? := null; "  // v0.171 (#1336)
         "  d.TryGetValue(\"k01\",  out v1); "
         "  d.TryGetValue(\"k10\", out v10); "
         "  d.TryGetValue(\"k20\", out v20); "
@@ -126,7 +125,7 @@ BEZEL_TEST(dict_literal_534, control_new_plus_add) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"a\", 1); d.Add(\"b\", 2); "
-        "  var va := 0; var vb := 0; "
+        "  var va: int? := null; var vb: int? := null; "  // v0.171 (#1336)
         "  d.TryGetValue(\"a\", out va); "
         "  d.TryGetValue(\"b\", out vb); "
         "  return int(d.Count = 2 and va = 1 and vb = 2); "

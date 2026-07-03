@@ -954,8 +954,8 @@ BEZEL_TEST(array_span_549, array_and_dict_real_surface_still_accepted_920) {
         "  a.Add(10); a.Add(20); a[0] := 99; "
         "  using var d := new Dictionary<string,int>(); "
         "  d.Add(\"k\", 1); d[\"k\"] := 42; "
-        "  var v := 0; d.TryGetValue(\"k\", out v); "
-        "  return a.Count + a.Where((x) => x > 10).Count() + v; "
+        "  var v: int? := null; d.TryGetValue(\"k\", out v); "  // v0.171 (#1336): out is V?
+        "  return a.Count + a.Where((x) => x > 10).Count() + v!; "
         // a=[99,20] after a[0]:=99; both >10; 2 + 2 + 42 = 46
         "end Main; end C;", 46);
 }

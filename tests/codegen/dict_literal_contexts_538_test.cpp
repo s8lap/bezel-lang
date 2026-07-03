@@ -53,7 +53,7 @@ BEZEL_TEST(dict_literal_contexts_538, field_init_string_key_count_and_lookup) {
         "class C "
         "  private _d: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "
         "  public method CountAndA(): int "
-        "    var va := 0; "
+        "    var va: int? := null; "  // v0.171 (#1336): out is V?
         "    _d.TryGetValue(\"a\", out va); "
         "    return int(_d.Count = 2 and va = 1); "
         "  end CountAndA; "
@@ -71,14 +71,14 @@ BEZEL_TEST(dict_literal_contexts_538, field_init_string_key_both_values) {
         "class C "
         "  private _d: Dictionary<string, int> := [\"x\": 10, \"y\": 20]; "
         "  public method GetX(): int "
-        "    var v := 0; "
+        "    var v: int? := null; "  // v0.171 (#1336): out is V?
         "    _d.TryGetValue(\"x\", out v); "
-        "    return v; "
+        "    return v!; "
         "  end GetX; "
         "  public method GetY(): int "
-        "    var v := 0; "
+        "    var v: int? := null; "  // v0.171 (#1336): out is V?
         "    _d.TryGetValue(\"y\", out v); "
-        "    return v; "
+        "    return v!; "
         "  end GetY; "
         "  public static method Main(): int "
         "    using var c := new C(); "
@@ -94,7 +94,7 @@ BEZEL_TEST(dict_literal_contexts_538, field_init_three_entries) {
         "class C "
         "  private _d: Dictionary<string, int> := [\"one\": 1, \"two\": 2, \"three\": 3]; "
         "  public method Check(): int "
-        "    var v1 := 0; var v2 := 0; var v3 := 0; "
+        "    var v1: int? := null; var v2: int? := null; var v3: int? := null; "  // v0.171 (#1336)
         "    _d.TryGetValue(\"one\",   out v1); "
         "    _d.TryGetValue(\"two\",   out v2); "
         "    _d.TryGetValue(\"three\", out v3); "
@@ -123,7 +123,7 @@ BEZEL_TEST(dict_literal_contexts_538, return_single_entry_count_and_value) {
         "  end Make; "
         "  public static method Main(): int "
         "    using var d := C.Make(); "
-        "    var v := 0; "
+        "    var v: int? := null; "  // v0.171 (#1336): out is V?
         "    d.TryGetValue(\"x\", out v); "
         "    return int(d.Count = 1 and v = 9); "
         "  end Main; "
@@ -140,7 +140,7 @@ BEZEL_TEST(dict_literal_contexts_538, return_two_entries) {
         "  end Make; "
         "  public static method Main(): int "
         "    using var d := C.Make(); "
-        "    var va := 0; var vb := 0; "
+        "    var va: int? := null; var vb: int? := null; "  // v0.171 (#1336)
         "    d.TryGetValue(\"a\", out va); "
         "    d.TryGetValue(\"b\", out vb); "
         "    return int(d.Count = 2 and va = 1 and vb = 2); "
@@ -204,7 +204,7 @@ BEZEL_TEST(dict_literal_contexts_538, control_local_dict_literal_534_still_works
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "
-        "  var va := 0; var vb := 0; "
+        "  var va: int? := null; var vb: int? := null; "  // v0.171 (#1336)
         "  d.TryGetValue(\"a\", out va); "
         "  d.TryGetValue(\"b\", out vb); "
         "  return int(d.Count = 2 and va = 1 and vb = 2); "
@@ -217,7 +217,7 @@ BEZEL_TEST(dict_literal_contexts_538, control_new_plus_add_unaffected) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"x\", 9); "
-        "  var v := 0; "
+        "  var v: int? := null; "  // v0.171 (#1336): out is V?
         "  d.TryGetValue(\"x\", out v); "
         "  return int(d.Count = 1 and v = 9); "
         "end Main; end C;"), 1);

@@ -113,6 +113,7 @@ BEZEL_TEST(out_owned_condition_892, while_drain_drop_rejected) {
 // §28.3 / #892 (BORROW-FORM GUARDRAIL): `Stack<int>.TryPop(out item)` —
 // non-owning collection, value-typed element, no `owned` modifier — carries no
 // discharge obligation. ACCEPT. Guards over-broad condition processing.
+// v0.171 (#1336): the out param is `int?`, so the recipient is nullable.
 BEZEL_TEST(out_owned_condition_892, if_borrow_form_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; "
@@ -121,7 +122,7 @@ BEZEL_TEST(out_owned_condition_892, if_borrow_form_accepted) {
         "    do "
         "      using var s := new Stack<int>(); "
         "      s.Push(42); "
-        "      var item: int := 0; "
+        "      var item: int? := null; "
         "      if s.TryPop(out item) then end; "
         "    end; "
         "    return 0; "

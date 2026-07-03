@@ -246,7 +246,7 @@ BEZEL_TEST(struct_scalar_685b, dict_string_decimal_trygetvalue) {
         "  public static method Main(): int "
         "    using var d := new Dictionary<string, decimal>(); "
         "    d.Add(\"pi\", 3.14m); "
-        "    var v: decimal := 0m; "
+        "    var v: decimal? := null; "  // v0.171 (#1336): out is V?
         "    d.TryGetValue(\"pi\", out v); "
         "    if v = 3.14m then return 42; end; "
         "    return 0; "
@@ -303,9 +303,9 @@ BEZEL_TEST(struct_scalar_685c, dict_decimal_key_trygetvalue) {
         "  public static method Main(): int "
         "    using var d := new Dictionary<decimal, int>(); "
         "    d.Add(10.5m, 99); "
-        "    var v := 0; "
+        "    var v: int? := null; "  // v0.171 (#1336): out is V?
         "    d.TryGetValue(10.5m, out v); "
-        "    return v; "
+        "    return v!; "
         "  end Main; "
         "end C;"), 99);
 }
@@ -318,9 +318,9 @@ BEZEL_TEST(struct_scalar_685c, dict_decimal_key_normalized_lookup) {
         "  public static method Main(): int "
         "    using var d := new Dictionary<decimal, int>(); "
         "    d.Add(1.0m, 55); "
-        "    var v := 0; "
+        "    var v: int? := null; "  // v0.171 (#1336): out is V?
         "    d.TryGetValue(1.00m, out v); "
-        "    return v; "
+        "    return v!; "
         "  end Main; "
         "end C;"), 55);
 }

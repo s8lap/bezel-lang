@@ -3033,6 +3033,60 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             lsym->declType = nn;
                         }
                     }
+                    // v0.171 (#1336): BUILTIN borrowing extraction Trys have no
+                    // MethodDecl (calleeMd2 == null), so the block above leaves
+                    // declType null. Their out param is `T?`/`V?` — infer the
+                    // nullable element/value type from the receiver so the inline
+                    // `out var x` recipient is nullable (read with `!` / a null
+                    // check on the success path).
+                    //   Stack/Queue/OwningStack/OwningQueue
+                    //     TryPop/TryDequeue/TryPeek    → T?  (genericArgs[0])
+                    //   Dictionary/SortedDictionary/OwningDictionary
+                    //     TryGetValue                  → V?  (genericArgs[1])
+                    if (!lsym->declType) {
+                        if (auto* maCallee =
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    ce->callee.get())) {
+                            if (maCallee->target) {
+                                if (const TypeRef* rt =
+                                        ctx_.exprType(*maCallee->target)) {
+                                    if (rt->kind == TypeRef::Kind::Named &&
+                                        !rt->declaration && rt->astNode &&
+                                        rt->astNode->name &&
+                                        !rt->astNode->name->parts.empty()) {
+                                        const std::string_view cn =
+                                            rt->astNode->name->parts[0];
+                                        const std::string_view mn =
+                                            maCallee->member;
+                                        const TypeRef* elemT = nullptr;
+                                        bool posElem =
+                                            (cn == "Stack" || cn == "Queue" ||
+                                             cn == "OwningStack" ||
+                                             cn == "OwningQueue") &&
+                                            (mn == "TryPop" ||
+                                             mn == "TryDequeue" ||
+                                             mn == "TryPeek");
+                                        bool valElem =
+                                            (cn == "Dictionary" ||
+                                             cn == "SortedDictionary" ||
+                                             cn == "OwningDictionary") &&
+                                            mn == "TryGetValue";
+                                        if (posElem && !rt->genericArgs.empty())
+                                            elemT = rt->genericArgs[0];
+                                        else if (valElem &&
+                                                 rt->genericArgs.size() >= 2)
+                                            elemT = rt->genericArgs[1];
+                                        if (elemT) {
+                                            TypeRef* nn =
+                                                ctx_.makeTypeRef(*elemT);
+                                            nn->nullable = true;
+                                            lsym->declType = nn;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -3121,15 +3175,24 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                             elemT = rt->genericArgs[1];
                                         }
                                         if (elemT) {
-                                            if (elemT->nullable) {
-                                                TypeRef* nn =
-                                                    ctx_.makeTypeRef(*elemT);
-                                                nn->nullable = false;
-                                                lsym->declType = nn;
-                                            } else {
-                                                lsym->declType =
-                                                    const_cast<TypeRef*>(elemT);
-                                            }
+                                            // v0.171 (#1336): every v0.171
+                                            // extraction Try's out param is `T?`
+                                            // — the inline recipient is nullable
+                                            // (its `!`/null-guarded discharge
+                                            // narrows on the success path).
+                                            // TryTake/TryReceive keep their
+                                            // pre-v0.171 non-nullable local (they
+                                            // are not part of the v0.171 sweep).
+                                            bool v171 =
+                                                mn == "TryPop" ||
+                                                mn == "TryDequeue" ||
+                                                mn == "TryPopFirst" ||
+                                                mn == "TryPopLast" ||
+                                                mn == "TryPopValue";
+                                            TypeRef* nn =
+                                                ctx_.makeTypeRef(*elemT);
+                                            nn->nullable = v171 ? true : false;
+                                            lsym->declType = nn;
                                         }
                                     }
                                 }
@@ -3228,17 +3291,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         !rt->genericArgs.empty() &&
                                         rt->genericArgs[0]) {
                                         // Element type = genericArgs[0] (T).
-                                        // Strip nullable if the stdlib param
-                                        // is T? (TryTake/TryReceive).
+                                        // v0.171 (#1336): the v0.171 extraction
+                                        // Trys (TryPop/TryDequeue/TryPopFirst/
+                                        // TryPopLast) deliver `owned T?` — the
+                                        // recipient is nullable. TryTake/
+                                        // TryReceive are NOT part of the v0.171
+                                        // sweep and keep the non-nullable local.
                                         const TypeRef* elemT = rt->genericArgs[0];
-                                        if (elemT->nullable) {
-                                            TypeRef* nn = ctx_.makeTypeRef(*elemT);
-                                            nn->nullable = false;
-                                            lsym->declType = nn;
-                                        } else {
-                                            lsym->declType =
-                                                const_cast<TypeRef*>(elemT);
-                                        }
+                                        bool v171 =
+                                            mn == "TryPop" ||
+                                            mn == "TryDequeue" ||
+                                            mn == "TryPopFirst" ||
+                                            mn == "TryPopLast";
+                                        TypeRef* nn = ctx_.makeTypeRef(*elemT);
+                                        nn->nullable = v171 ? true : false;
+                                        lsym->declType = nn;
 
                                     } else if (
                                         // OwningDictionary<K,V>.TryPopValue
@@ -3248,15 +3315,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         pos2 == 1 &&
                                         rt->genericArgs.size() >= 2 &&
                                         rt->genericArgs[1]) {
+                                        // v0.171 (#1336): `owned V?` recipient.
                                         const TypeRef* valT = rt->genericArgs[1];
-                                        if (valT->nullable) {
-                                            TypeRef* nn = ctx_.makeTypeRef(*valT);
-                                            nn->nullable = false;
-                                            lsym->declType = nn;
-                                        } else {
-                                            lsym->declType =
-                                                const_cast<TypeRef*>(valT);
-                                        }
+                                        TypeRef* nn = ctx_.makeTypeRef(*valT);
+                                        nn->nullable = true;
+                                        lsym->declType = nn;
                                     }
                                 }
                             }

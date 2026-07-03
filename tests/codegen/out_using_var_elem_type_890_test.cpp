@@ -58,7 +58,7 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_field_read) {
         "  s.Push(move (new Cell(42))); "
         "  var got := -1; "
         "  if s.TryPop(out using var item) then "
-        "    got := item._v; "
+        "    got := item!._v; "  // v0.171 (#1336): out is T?, narrow with `!`
         "  end; "
         "  return got; "
         "end Main; end C;"), 42);
@@ -73,7 +73,7 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_stack_trypop_method_call) {
         "  s.Push(move (new Cell(99))); "
         "  var got := -1; "
         "  if s.TryPop(out using var item) then "
-        "    got := item.GetV(); "
+        "    got := item!.GetV(); "  // v0.171 (#1336): out is T?, narrow with `!`
         "  end; "
         "  return got; "
         "end Main; end C;"), 99);
@@ -107,7 +107,7 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_queue_trydequeue_field_read) {
         "  q.Enqueue(move (new Cell(77))); "
         "  var got := -1; "
         "  if q.TryDequeue(out using var item) then "
-        "    got := item._v; "
+        "    got := item!._v; "  // v0.171 (#1336): out is T?, narrow with `!`
         "  end; "
         "  return got; "
         "end Main; end C;"), 77);
@@ -127,7 +127,7 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_linkedlist_trypopfirst_field_read)
         "  ll.AddLast(move (new Cell(22))); "
         "  var got := -1; "
         "  if ll.TryPopFirst(out using var first) then "
-        "    got := first._v; "
+        "    got := first!._v; "  // v0.171 (#1336): out is T?, narrow with `!`
         "  end; "
         "  return got; "
         "end Main; end C;"), 11);
@@ -142,7 +142,7 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_linkedlist_trypoplast_field_read) 
         "  ll.AddLast(move (new Cell(22))); "
         "  var got := -1; "
         "  if ll.TryPopLast(out using var last) then "
-        "    got := last._v; "
+        "    got := last!._v; "  // v0.171 (#1336): out is T?, narrow with `!`
         "  end; "
         "  return got; "
         "end Main; end C;"), 22);
@@ -161,7 +161,7 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_dict_trypopvalue_field_read) {
         "  d.Add(1, move (new Cell(55))); "
         "  var got := -1; "
         "  if d.TryPopValue(1, out using var v) then "
-        "    got := v._v; "
+        "    got := v!._v; "  // v0.171 (#1336): out is V?, narrow with `!`
         "  end; "
         "  return got; "
         "end Main; end C;"), 55);
