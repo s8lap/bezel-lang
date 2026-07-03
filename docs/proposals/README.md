@@ -14,6 +14,7 @@ Conventions:
 | 0001 | [Networking and the `Http` client](0001-networking-http.md) | draft | [#1376](https://github.com/s8lap/bezel-lang/issues/1376) |
 | 0002 | [The `Http` server](0002-http-server.md) — minimal-API routing over 0001's fetch-symmetric vocabulary; named-method handlers (§2.1); sendability-checked worker domains | draft | [#1402](https://github.com/s8lap/bezel-lang/issues/1402) |
 | 0003 | [`Locked<T>` / `RwLocked<T>`](0003-locked-t.md) — data-owning locks joining the §22.12 synchronized set; guard scope = critical section via the existing borrow rules | draft | [#1404](https://github.com/s8lap/bezel-lang/issues/1404) |
+| 0004 | [Bezel MVU](0004-ui-mvu.md) — Elm-style UI on a domain; messages-as-sendable-data; owned node trees with cascade teardown; early draft, architecture + code shape only | early draft | [#1410](https://github.com/s8lap/bezel-lang/issues/1410) |
 
 Supporting records (not numbered proposals):
 
