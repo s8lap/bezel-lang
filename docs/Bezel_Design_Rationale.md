@@ -7623,6 +7623,20 @@ v0.176 is the **static-interface-members revision** (#807) — the keystone the 
 
 None — purely additive. The §18 deferred-list entry is marked shipped.
 
+<a id="sec-v0-176-to-v0-177-changelog"></a>
+### v0.177 changelog (v0.176 → v0.177)
+
+v0.177 is the **call-bounded-default revision** (#1419) — one rule, closing the hole §28.14 left open: what a callee may do with a *plain* function-typed parameter.
+
+- **Spec §28.14 + §28.3 + §22.3**: a function-typed parameter without `scoped` is **call-bounded** — the callee may invoke it, bind it locally, and pass it to other call-bounded parameters, but may not store it in any field or externally-reachable collection, return it, capture it in an escaping closure, or forward it into a `scoped` position (it cannot vouch for captures it cannot see). Compiler-verified for user-authored callees — structural sink checks, no interprocedural analysis; that decidability is the reason this default was chosen over the alternative ("reject caller-side when the callee provably stores"), which needs whole-program facts. The caller side becomes fully unrestricted: any capture-bearing closure is admissible to a plain parameter, bounded by the call.
+- **Why plain function values may not be field-stored while plain object borrows may** (the recorded asymmetry): §28.3's borrowed-field rule is structural-check-plus-caller-trust, and for an object borrow the caller can hold that trust — it knows the source. A closure's bound is its capture set, which a plain signature does not carry, so neither party can accept the trust; `scoped` is the signature-carried form of it. No trust without a signature to hang it on.
+- **The extension-method-parameter carve-out retires**: subsumed on the caller side by the unrestricted default; the stdlib lazy query operators' retention is stdlib-certified until their signatures migrate to `scoped` (the §30.11 legacy path).
+- **Deferred third tier** (#1427): an `unbounded` marker for store/return/compose callees (`Compose(f, g)` is inexpressible over call-bounded parameters) — deferred on the evidence bar; recorded in §28.14.
+
+#### Migration
+
+Caller-side: none — strictly more permissive. Callee-side: user code that stores a plain function-typed parameter must declare it `scoped` (bounded storage) or restructure; the suite triage accompanies the enforcing compiler change (#1419, with the builtin `Subscribe`/`Register` flip #1420).
+
 ## 20. Closing
 
 If the opening framed Bezel by what it borrows, the body has shown what it actually contributes: not the features — those have ancestors — but the discipline applied to combining them. The recurring move in this document is the same one every time a hard question arrived. Ship the part that fits the foundations cleanly. Decline the part that fights them, with the reason written down so the question stays settled rather than perennially reopened. Scope whatever genuinely remains open by naming its precise blocker, not by deferring it vaguely. Member-access reflection is declined, not pending. The cyclic-serialization soundness obligation was discharged in prose before any syntax was written. Tuples and post-condition loops are conveniences with recorded costs, not gaps. The deferred list is a list of decisions deliberately not yet made — each with its reasoning — never a list of unsolved problems.
