@@ -283,6 +283,7 @@ set(BEZEL_TEST_SOURCES
     codegen/native_exe_test.cpp
     codegen/async_test.cpp
     codegen/async_618_domain_serial_test.cpp
+    codegen/bounded_channel_809_test.cpp        # §6.9/§30.15 v0.174 bounded channels + SendAsync (#809)
     codegen/tsan_704_bz_exc_threadlocal_test.cpp
     codegen/async_lambda_488_test.cpp
     codegen/task_combinators_test.cpp

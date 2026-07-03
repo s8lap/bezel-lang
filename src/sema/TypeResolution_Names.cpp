@@ -178,8 +178,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T> (arity 1).
     // Domain is a static class (arity 0); ChannelClosedException is a nullary
     // exception type (§30.15); DomainFaultedException is a nullary exception.
+    // §6.9 / §30.15 v0.174 (#809): ChannelFullException — nullary exception
+    // raised by the sync Send on a full bounded channel.
     if (n == "Channel" || n == "ChannelSender") return 1;
     if (n == "Domain" || n == "ChannelClosedException" ||
+        n == "ChannelFullException" ||
         n == "DomainFaultedException") return 0;
     // §6.4 / issue #647: Atomic<T> (arity 1) and AtomicInteger<T> (arity 1).
     // Both are generic compiler-intrinsic classes; T is restricted by the compiler

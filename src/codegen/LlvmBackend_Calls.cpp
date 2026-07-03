@@ -17389,6 +17389,14 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             return llvm::ConstantPointerNull::get(ptrTy());
         return vit->second;
     };
+    // v0.174 (#809): ChannelFullException vtable — raised by the sync Send on a
+    // full bounded channel (via bz_exc, like the closed-channel path).
+    auto getCFEVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("ChannelFullException");
+        if (vit == builtinVtable_.end())
+            return llvm::ConstantPointerNull::get(ptrTy());
+        return vit->second;
+    };
     auto getDFEVtable = [&]() -> llvm::Value* {
         auto vit = builtinVtable_.find("DomainFaultedException");
         if (vit == builtinVtable_.end())
@@ -17438,9 +17446,10 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 auto* fn = declareC("bz_channel_send",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {ch, itemArg, getCCEVtable()});
-                emitPendingCheck();  // per fix #634: bz_channel_send sets bz_exc on closed channel
+                                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, itemArg, getCCEVtable(),
+                                         getCFEVtable()});
+                emitPendingCheck();  // per fix #634 / v0.174 #809: bz_exc on closed or full
                 return nullptr;  // void — handled; fallthrough is benign (no symbol match)
             }
 
@@ -17588,6 +17597,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // Send(owned item): transfer ownership into the channel.
             // per fix #634 / §30.15: bz_channel_sender_send now takes cce_vtable
             // and signals ChannelClosedException via bz_exc when closed.
+            // v0.174 (#809): cfe_vtable signals ChannelFullException via bz_exc on
+            // a full bounded channel (the sync Send never blocks).
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
@@ -17604,10 +17615,39 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 auto* fn = declareC("bz_channel_sender_send",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {tx, itemArg, getCCEVtable()});
-                emitPendingCheck();  // per fix #634: signals ChannelClosedException via bz_exc
+                                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {tx, itemArg, getCCEVtable(),
+                                         getCFEVtable()});
+                emitPendingCheck();  // fix #634 / v0.174 #809: bz_exc on closed or full
                 return nullptr;
+            }
+
+            // v0.174 (#809) / §6.9: SendAsync(owned item): Task — awaits capacity.
+            // Mirrors Send's item encoding but returns the awaitable Task the
+            // runtime hands back (already-done when space is free / unbounded;
+            // pending on a full bounded channel until a Receive frees a slot).
+            // The close-while-waiting fault (ChannelClosedException) is delivered
+            // THROUGH the task and surfaces at the caller's await site — so no
+            // emitPendingCheck here (unlike the synchronous Send).
+            if (mname == "SendAsync" && call.args.size() == 1 &&
+                call.args[0].value) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                llvm::Value* itemArg = item;
+                if (item->getType()->isIntegerTy() &&
+                    !item->getType()->isIntegerTy(64)) {
+                    llvm::Value* ext = builder_.CreateZExt(item, i64());
+                    itemArg = builder_.CreateIntToPtr(ext, ptrTy());
+                } else if (item->getType()->isIntegerTy(64)) {
+                    itemArg = builder_.CreateIntToPtr(item, ptrTy());
+                } else if (!item->getType()->isPointerTy()) {
+                    llvm::Value* bits = builder_.CreateBitCast(item, i64());
+                    itemArg = builder_.CreateIntToPtr(bits, ptrTy());
+                }
+                auto* fn = declareC("bz_channel_sender_send_async", ptrTy(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {tx, itemArg, getCCEVtable()},
+                                           "ch.sendasync");
             }
 
             // Dispose() — release this sender handle (may close the channel).

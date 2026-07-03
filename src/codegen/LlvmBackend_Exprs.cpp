@@ -8986,8 +8986,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // (per §30.15 / §28.11 v0.135: class elements are owned, the
                 // runtime disposes them when the channel is closed/drained).
                 llvm::Value* dispArg = elementDisposerArg(chElemTy, /*owningFamily=*/true);
-                auto* allocFn = declareC("bz_channel_new", ptrTy(), {ptrTy()});
-                return builder_.CreateCall(allocFn, {dispArg}, "ch.new");
+                // v0.174 (#809) / §6.9: bounded ctor `new Channel<T>(capacity)`.
+                // capacity >= 1, else ArgumentException (a catchable guard, per
+                // §6.9). The nullary ctor passes capacity 0 (= unbounded).
+                llvm::Value* capArg = llvm::ConstantInt::get(i64(), 0);
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* cap = lowerExpr(*ne.args[0].value);
+                    if (cap) {
+                        if (!cap->getType()->isIntegerTy(32))
+                            cap = builder_.CreateIntCast(cap, i32(),
+                                                         /*isSigned=*/true, "cap.i32");
+                        // capacity < 1 → ArgumentException (thrown before we
+                        // allocate, so no channel leaks on the guard path).
+                        emitGuardThrow(
+                            builder_.CreateICmpSLT(cap, builder_.getInt32(1),
+                                                   "cap.bad"),
+                            "ArgumentException");
+                        capArg = builder_.CreateSExt(cap, i64(), "cap.i64");
+                    }
+                }
+                auto* allocFn = declareC("bz_channel_new", ptrTy(),
+                                         {ptrTy(), i64()});
+                return builder_.CreateCall(allocFn, {dispArg, capArg}, "ch.new");
             }
             // §6.2 / issue #647: new Mutex() — allocate via bz_mutex_new.
             // Mutex is a non-recursive POSIX mutex with refcounted core.

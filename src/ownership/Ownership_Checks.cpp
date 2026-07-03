@@ -2714,13 +2714,15 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         tt->astNode->name->parts.empty())
         return false;
     const std::string_view cn = tt->astNode->name->parts[0];
-    // per §30.15 / §6.9 (#600, #692): ChannelSender<T>.Send(owned item)
-    // transfers ownership only when T is a class or interface type — the
-    // channel takes ownership of the heap object and the owned-sink rule
-    // must fire so a borrow is rejected. For value-typed T and string the
-    // ownership modifiers drop out (§6.9: "Send(item: T)") — the slot is a
-    // copy, no heap disposal obligation, so the owned-sink rule must NOT fire.
-    if (cn == "ChannelSender" && ma->member == "Send" && argPos == 0) {
+    // per §30.15 / §6.9 (#600, #692): ChannelSender<T>.Send(owned item) — and
+    // v0.174 (#809) SendAsync(owned item) — transfer ownership only when T is a
+    // class or interface type: the channel takes ownership of the heap object
+    // and the owned-sink rule must fire so a borrow is rejected. For value-typed
+    // T and string the ownership modifiers drop out (§6.9: "Send(item: T)",
+    // "SendAsync(item: T)") — the slot is a copy, no heap disposal obligation,
+    // so the owned-sink rule must NOT fire.
+    if (cn == "ChannelSender" &&
+        (ma->member == "Send" || ma->member == "SendAsync") && argPos == 0) {
         // Inspect the first generic argument (T) of ChannelSender<T>.
         // If T is a class or interface type, the sink applies; otherwise skip.
         if (!tt->genericArgs.empty() && tt->genericArgs[0]) {

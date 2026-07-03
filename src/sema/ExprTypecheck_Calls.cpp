@@ -4770,16 +4770,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         if (m == "Send") {
                             // Send(owned item: T) → void (no return type set = unit).
+                        } else if (m == "SendAsync") {
+                            // §6.9 / §30.15 v0.174 (#809): SendAsync(owned item: T)
+                            // → Task — a non-generic (void) Task that completes
+                            // when the item is accepted (immediately when space is
+                            // free / the channel is unbounded; after a Receive
+                            // frees a slot on a full bounded channel). The type is
+                            // identical for class-T and value-T (awaited result is
+                            // unit): the ownership modifier only affects lowering.
+                            auto* tt = ctx_.makeTypeRef();
+                            tt->kind = TypeRef::Kind::Named;
+                            tt->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("Task");
+                            ann->name.reset(nm);
+                            tt->astNode = ann;
+                            ctx_.setExprType(&ce, tt);
                         } else if (m != "Dispose") {
-                            // §6.9 / #674: ChannelSender<T> exposes only Send()
-                            // and Dispose().  Any other member is an error.
-                            // Dispose is compiler-generated and must pass silently.
+                            // §6.9 / #674: ChannelSender<T> exposes only Send(),
+                            // SendAsync() and Dispose().  Any other member is an
+                            // error.  Dispose is compiler-generated (passes silently).
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
                                 "` on `ChannelSender<T>`; documented surface: "
-                                "Send(owned item: T), Dispose() "
-                                "(stdlib \xC2\xA7""6.9)");
+                                "Send(owned item: T), SendAsync(owned item: T): Task, "
+                                "Dispose() (stdlib \xC2\xA7""6.9)");
                         }
                         // Dispose(): unit; no return type set.
                     }
@@ -7709,6 +7727,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                // `catch var e: SerializationException` is used.
                                n == "SerializationException"    ||
                                n == "ChannelClosedException"    ||  // §30.15 #600c
+                               n == "ChannelFullException"      ||  // §6.9 v0.174 #809
                                n == "DomainFaultedException"    ||  // §30.14 #600c
                                // #976 / stdlib §7.4 / §7.5: System.Threading +
                                // System.IO exception families.

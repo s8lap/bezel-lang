@@ -2054,6 +2054,10 @@ Emitter::builtinExceptionHierarchy() {
         // §30.15 (#600 phase c): ChannelClosedException — raised when Receive()
         // is called on a drained+closed Channel<T>.
         {"ChannelClosedException", "Exception"},
+        // §6.9 / §30.15 v0.174 (#809): ChannelFullException — raised by the
+        // synchronous Send on a FULL bounded channel (the never-blocks contract;
+        // a producer that wants to wait uses SendAsync instead).
+        {"ChannelFullException", "Exception"},
         // §30.14 (#600 phase c): DomainFaultedException — raised at the join
         // of a spawned domain that threw an exception. Message carries a copy
         // of the original exception's message text.

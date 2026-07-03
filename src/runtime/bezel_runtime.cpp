@@ -8962,11 +8962,29 @@ struct bz_pending_receiver_t {
     bz_domain_t*   domain; // the domain to route the completion through
 };
 
+// per §6.9/§30.15 v0.174 (#809): a parked SendAsync awaiting capacity on a
+// bounded channel. Mirrors bz_pending_receiver_t in reverse — it carries the
+// owned item (handed into the freed slot when a Receive drains one) plus the
+// Task that completes when the item is accepted (or faults with
+// ChannelClosedException if the channel closes while the send is waiting).
+struct bz_pending_sender_t {
+    void*          item;   // the owned item awaiting a free slot
+    bz_task_t*     task;   // the SendAsync Task that completes on acceptance
+    bz_domain_t*   domain; // the domain to route the completion through
+};
+
 struct bz_channel_t {
     std::mutex                        mtx;
     std::deque<void*>                 items;   // buffered items (void*-sized)
     std::deque<bz_pending_receiver_t> pending; // pending receivers (FIFO)
+    // v0.174 (#809): parked SendAsyncs awaiting capacity on a full bounded
+    // channel, oldest-first (FIFO — completes in send order as slots free).
+    std::deque<bz_pending_sender_t>   pending_senders;
     void (*dispose_elem)(void*); // null for value/string; non-null for class
+    // v0.174 (#809): 0 = unbounded (the nullary ctor); >= 1 = bounded buffer
+    // limit. `SendAsync` awaits capacity on a bounded channel; the sync `Send`
+    // raises ChannelFullException when a bounded buffer is full.
+    int64_t  capacity;
     int64_t  sender_count;
     bool     closed;
     bool     disposed;
@@ -8996,10 +9014,14 @@ static void channel_core_release(bz_channel_t* ch) {
 }
 
 extern "C"
-void* bz_channel_new(void (*dispose_elem)(void*)) {
+void* bz_channel_new(void (*dispose_elem)(void*), int64_t capacity) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* ch = new bz_channel_t();
     ch->dispose_elem   = dispose_elem;
+    // v0.174 (#809): 0 = unbounded; >= 1 = bounded. Codegen guards capacity >= 1
+    // (ArgumentException) before the call, so any value < 1 reaching here that is
+    // not 0 would be a codegen bug; we still treat <= 0 as unbounded defensively.
+    ch->capacity       = capacity > 0 ? capacity : 0;
     ch->sender_count   = 0;
     ch->closed         = false;
     ch->disposed       = false;
@@ -9032,7 +9054,7 @@ void* bz_channel_new_sender(void* chp) {
 // item, build a ChannelClosedException object into bz_exc, and return.
 // The codegen caller must call emitPendingCheck() after every Send call.
 extern "C"
-void bz_channel_send(void* chp, void* item, void* cce_vtable) {
+void bz_channel_send(void* chp, void* item, void* cce_vtable, void* cfe_vtable) {
     auto* ch = (bz_channel_t*)chp;
     bz_pending_receiver_t recv{nullptr, nullptr};
     {   std::lock_guard<std::mutex> lk(ch->mtx);
@@ -9060,6 +9082,22 @@ void bz_channel_send(void* chp, void* item, void* cce_vtable) {
             recv = ch->pending.front();
             ch->pending.pop_front();
             // Don't push item to items -- deliver directly via the task below.
+        } else if (ch->capacity > 0 &&
+                   (int64_t)ch->items.size() >= ch->capacity) {
+            // v0.174 (#809) / §6.9 / §30.3: full bounded channel. The sync Send
+            // NEVER blocks — it raises ChannelFullException. Ownership of `item`
+            // was transferred to us and there is no give-back protocol (TrySend
+            // is deferred), so we dispose it — the same discipline as the
+            // closed-Send path above (class-T disposes; value/string drops).
+            if (item && ch->dispose_elem)
+                ch->dispose_elem(item);
+            if (cfe_vtable) {
+                void* excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+                memcpy(excObj, &cfe_vtable, sizeof(void*));
+                extern thread_local void* bz_exc;
+                bz_exc = excObj;
+            }
+            return;
         } else {
             ch->items.push_back(item);
         }
@@ -9077,9 +9115,87 @@ void bz_channel_send(void* chp, void* item, void* cce_vtable) {
 // sends raise ChannelClosedException (stored in bz_exc; codegen checks via
 // emitPendingCheck after the call).
 extern "C"
-void bz_channel_sender_send(void* txp, void* item, void* cce_vtable) {
+void bz_channel_sender_send(void* txp, void* item, void* cce_vtable,
+                            void* cfe_vtable) {
     auto* tx = (bz_channel_sender_t*)txp;
-    bz_channel_send(tx->ch, item, cce_vtable);
+    bz_channel_send(tx->ch, item, cce_vtable, cfe_vtable);
+}
+
+// bz_channel_send_async: §6.9 / §30.15 v0.174 (#809). Returns a Task that
+// completes when `item` has been accepted into the channel:
+//   - closed/disposed        → dispose the item, fault the task with
+//                              ChannelClosedException (immediate).
+//   - a receiver is parked    → deliver directly; task already-done (void).
+//   - unbounded or space free  → buffer the item; task already-done (void).
+//   - full bounded             → park {item, task} in the send-waiter FIFO; the
+//                                task completes when a later Receive/TryReceive
+//                                frees a slot and admits this item, or faults with
+//                                ChannelClosedException if the channel closes
+//                                first (the item is disposed on close — the
+//                                buffered-undelivered-items rule).
+// cce_vtable is the ChannelClosedException vtable (from codegen). The mirror of
+// the receiver-parking machinery in bz_channel_receive.
+extern "C"
+void* bz_channel_send_async(void* chp, void* item, void* cce_vtable) {
+    auto* ch = (bz_channel_t*)chp;
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
+    auto* task = new bz_task_t();
+    // fix #713: route completion to the caller's domain (as bz_channel_receive).
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }  // task holds a ref on its domain
+
+    bz_pending_receiver_t recv{nullptr, nullptr};
+    bool complete_now  = false;  // accepted immediately (void completion)
+    bool closed_fault  = false;  // channel closed → fault the task
+
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (ch->closed || ch->disposed) {
+            if (item && ch->dispose_elem)
+                ch->dispose_elem(item);
+            closed_fault = true;
+        } else if (!ch->pending.empty()) {
+            // A receiver is already waiting: hand the item straight across.
+            recv = ch->pending.front();
+            ch->pending.pop_front();
+            complete_now = true;
+        } else if (ch->capacity == 0 ||
+                   (int64_t)ch->items.size() < ch->capacity) {
+            // Unbounded, or a bounded channel with a free slot: buffer + done.
+            ch->items.push_back(item);
+            complete_now = true;
+        } else {
+            // Full bounded channel: park the sender (FIFO — completes in send
+            // order as Receive frees slots).
+            ch->pending_senders.push_back({item, task, task->domain});
+        }
+    }
+
+    // Complete outside the lock (mirrors bz_channel_send / bz_channel_receive):
+    // task completion dispatches continuations through the domain and may
+    // re-enter the channel, so ch->mtx must not be held.
+    if (recv.task) {
+        // Deliver the item to the waiting receiver (ptr-sized result).
+        bz_task_complete(recv.task, &item, sizeof(void*));
+    }
+    if (closed_fault) {
+        void* excObj = nullptr;
+        if (cce_vtable) {
+            excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+            memcpy(excObj, &cce_vtable, sizeof(void*));
+        }
+        bz_task_complete_error_obj(task, excObj);
+    } else if (complete_now) {
+        bz_task_complete(task, nullptr, 0);  // void Task — no result payload
+    }
+    // else: parked; a later Receive or a close completes it.
+    return task;
+}
+
+// bz_channel_sender_send_async: codegen wrapper for ChannelSender.SendAsync.
+extern "C"
+void* bz_channel_sender_send_async(void* txp, void* item, void* cce_vtable) {
+    auto* tx = (bz_channel_sender_t*)txp;
+    return bz_channel_send_async(tx->ch, item, cce_vtable);
 }
 
 // bz_channel_receive: return a task that will complete with the next item.
@@ -9100,12 +9216,24 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
     void* item = nullptr;
     bool  have_item = false;
     bool  is_closed_empty = false;
+    // v0.174 (#809): a sender parked on a full bounded channel, admitted into
+    // the slot this Receive just freed. Its SendAsync task completes below.
+    bz_pending_sender_t woken{nullptr, nullptr, nullptr};
 
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         if (!ch->items.empty()) {
             item = ch->items.front();
             ch->items.pop_front();
             have_item = true;
+            // v0.174 (#809): a slot just freed — admit the OLDEST parked sender
+            // (FIFO) into it and wake its SendAsync task below. Because senders
+            // only park when the buffer is full (items.size() == capacity >= 1),
+            // this keeps the buffer at capacity and never reorders deliveries.
+            if (!ch->pending_senders.empty()) {
+                woken = ch->pending_senders.front();
+                ch->pending_senders.pop_front();
+                ch->items.push_back(woken.item);
+            }
         } else if (ch->closed || ch->disposed) {
             is_closed_empty = true;
         } else {
@@ -9113,6 +9241,10 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
             ch->pending.push_back({task, task->domain});
         }
     }
+
+    // Wake an admitted sender outside the lock (task completion may re-enter).
+    if (woken.task)
+        bz_task_complete(woken.task, nullptr, 0);  // void SendAsync Task
 
     if (have_item) {
         // Fast path: already-done (item available).
@@ -9141,10 +9273,21 @@ extern "C"
 int32_t bz_channel_try_receive(void* chp, void** out_item) {
     if (!chp) { *out_item = nullptr; return 0; }  // fix #667: null = disposed = empty
     auto* ch = (bz_channel_t*)chp;
-    std::lock_guard<std::mutex> lk(ch->mtx);
-    if (ch->items.empty()) return 0;
-    *out_item = ch->items.front();
-    ch->items.pop_front();
+    // v0.174 (#809): like bz_channel_receive, a successful drain frees a slot and
+    // admits the oldest parked sender (FIFO) whose SendAsync task we wake below.
+    bz_pending_sender_t woken{nullptr, nullptr, nullptr};
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (ch->items.empty()) return 0;
+        *out_item = ch->items.front();
+        ch->items.pop_front();
+        if (!ch->pending_senders.empty()) {
+            woken = ch->pending_senders.front();
+            ch->pending_senders.pop_front();
+            ch->items.push_back(woken.item);
+        }
+    }
+    if (woken.task)
+        bz_task_complete(woken.task, nullptr, 0);  // void SendAsync Task
     return 1;
 }
 
@@ -9176,9 +9319,11 @@ int32_t bz_channel_is_closed(void* chp) {
 static void channel_close_and_drain_pending(bz_channel_t* ch,
                                             void* cce_vtable) {
     std::deque<bz_pending_receiver_t> pending;
+    std::deque<bz_pending_sender_t>   senders;  // v0.174 (#809)
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         ch->closed = true;
         pending.swap(ch->pending);
+        senders.swap(ch->pending_senders);
     }
     for (auto& r : pending) {
         void* excObj = nullptr;
@@ -9187,6 +9332,21 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
             memcpy(excObj, &cce_vtable, sizeof(void*));
         }
         bz_task_complete_error_obj(r.task, excObj);
+    }
+    // v0.174 (#809): a SendAsync still awaiting capacity when the channel closes.
+    // Dispose its pending item (the buffered-undelivered-items rule — class-T
+    // disposes, value/string drops) and fault its task with
+    // ChannelClosedException. dispose_elem is set once at construction, so it is
+    // safe to read here without the lock.
+    for (auto& s : senders) {
+        if (s.item && ch->dispose_elem)
+            ch->dispose_elem(s.item);
+        void* excObj = nullptr;
+        if (cce_vtable) {
+            excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+            memcpy(excObj, &cce_vtable, sizeof(void*));
+        }
+        bz_task_complete_error_obj(s.task, excObj);
     }
 }
 

@@ -1362,7 +1362,10 @@ int8_t bz_shared_is_disposed(void* handle);
 
 // Allocate a new empty Channel<T>. `dispose_elem` is the per-element
 // disposer (null for value/string elements; non-null for class elements).
-void* bz_channel_new(void (*dispose_elem)(void*));
+// v0.174 (#809): `capacity` is 0 for an unbounded channel (the nullary ctor)
+// or >= 1 for a bounded one; codegen guards capacity >= 1 (ArgumentException)
+// before the call.
+void* bz_channel_new(void (*dispose_elem)(void*), int64_t capacity);
 
 // Mint a new ChannelSender<T> handle. Increments the channel's sender count.
 // Caller owns the returned sender (must release via bz_channel_sender_release).
@@ -1373,11 +1376,24 @@ void* bz_channel_new_sender(void* ch);
 // the item and stores a ChannelClosedException in bz_exc (cce_vtable supplies
 // the vtable; may be null for best-effort). Codegen emits emitPendingCheck()
 // after every Call to this function.
-void bz_channel_send(void* ch, void* item, void* cce_vtable);
+// v0.174 (#809): on a FULL bounded channel the sync Send never blocks — it
+// disposes the item and stores a ChannelFullException in bz_exc (cfe_vtable).
+void bz_channel_send(void* ch, void* item, void* cce_vtable, void* cfe_vtable);
 
 // Send one item via a ChannelSender handle.
 // Per fix #634: also signals ChannelClosedException via bz_exc when closed.
-void bz_channel_sender_send(void* tx, void* item, void* cce_vtable);
+// v0.174 (#809): cfe_vtable supplies the ChannelFullException vtable for the
+// full-bounded case.
+void bz_channel_sender_send(void* tx, void* item, void* cce_vtable,
+                            void* cfe_vtable);
+
+// v0.174 (#809): SendAsync — returns a bz_task_t* that completes when the item
+// is accepted (immediately when space is free or the channel is unbounded;
+// after a Receive frees a slot on a full bounded channel). If the channel
+// closes while the send waits, the pending item is disposed and the task faults
+// with ChannelClosedException (cce_vtable supplies the vtable).
+void* bz_channel_send_async(void* ch, void* item, void* cce_vtable);
+void* bz_channel_sender_send_async(void* tx, void* item, void* cce_vtable);
 
 // Receive one item asynchronously. Returns a bz_task_t* (already-done if
 // an item is buffered; pending if empty+open; faulted with ChannelClosedException
