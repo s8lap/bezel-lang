@@ -7784,6 +7784,15 @@ Member          ::= FieldDecl | MethodDecl | PropertyDecl | IndexerDecl
 ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
 
 InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer | IfaceEvent
+                  | IfaceStaticMethod | IfaceStaticOperator
+IfaceStaticMethod   ::= "static" "method" Identifier GenericParams?
+                        "(" ParamList? ")" (":" "owned"? Type)? ";"
+IfaceStaticOperator ::= "static" "operator" OpToken
+                        "(" ParamList? ")" (":" "owned"? Type)? ";"
+                              /* §11.8 (v0.176): abstract-only — a body is an
+                                 error; static properties/consts/events are
+                                 deferred. Conformance and dispatch rules in
+                                 §11.8. */
 IfaceMethod     ::= "method" Identifier GenericParams?
                     "(" ParamList? ")" (":" "owned"? Type)? ";"
                               /* `owned` on the return type follows the same
