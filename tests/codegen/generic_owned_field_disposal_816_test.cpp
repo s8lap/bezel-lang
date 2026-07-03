@@ -133,7 +133,7 @@ BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_array_disposes_ele
         "  do "
         "    var arr := new OwningArray<Cell>(); "
         "    arr.Add(new Cell()); arr.Add(new Cell()); "
-        "    using var b := new Box<OwningArray<Cell>>(arr); "
+        "    using var b := new Box<OwningArray<Cell>>(owned arr); "
         "  end; "
         "  return Cell.n; "  // 0
         "end Main; end Program;"), 0);
@@ -147,7 +147,7 @@ BEZEL_TEST(generic_owned_field_disposal_816, owned_type_param_dict_disposes_valu
         "  do "
         "    var d := new OwningDictionary<string, Cell>(); "
         "    d.Add(\"a\", new Cell()); d.Add(\"b\", new Cell()); "
-        "    using var b := new Box<OwningDictionary<string, Cell>>(d); "
+        "    using var b := new Box<OwningDictionary<string, Cell>>(owned d); "
         "  end; "
         "  return Cell.n; "  // 0
         "end Main; end Program;"), 0);

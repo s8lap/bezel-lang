@@ -5,6 +5,7 @@
 // returning the integer it produced (the program's exit code). JIT keeps the
 // tests hermetic and fast — no external assembler/linker step.
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -12,6 +13,7 @@
 #include "ast/Node.hpp"
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
@@ -72,6 +74,47 @@ inline JitResult runJitWithOptions(std::string_view source,
     sema::resolveTypes(*unit, ctx);
     sema::typecheckExpressions(*unit, ctx);
     if (r.diagnostics.hasErrors()) return r;
+
+    // §22.3 migration gate (env-var BEZEL_CHECK_OWNERSHIP=1, off by default):
+    // run the ownership pass and, on failure, print the source + diagnostics so
+    // the test corpus can be audited for pre-v0.169 bare owned-transfer sites
+    // (issue #1401). The marker is surface-only — emitted objects are
+    // byte-identical — so this check does NOT block JIT execution; it only
+    // reports so that the caller can see which programs need migration.
+    {
+        static const bool checkOwn =
+            (std::getenv("BEZEL_CHECK_OWNERSHIP") != nullptr &&
+             std::string(std::getenv("BEZEL_CHECK_OWNERSHIP")) == "1");
+        if (checkOwn) {
+            DiagnosticEngine ownDiags;
+            sema::SemaContext ownCtx(ownDiags);
+            // Re-parse for an independent ctx so we don't disturb `r`.
+            Lexer ownLex(source, ownDiags);
+            Parser ownPar(ownLex, ownDiags);
+            auto ownUnit = ownPar.parseCompilationUnit();
+            if (ownUnit) {
+                sema::collectSymbols(*ownUnit, ownCtx);
+                sema::resolveTypes(*ownUnit, ownCtx);
+                sema::typecheckExpressions(*ownUnit, ownCtx);
+                ownership::checkOwnership(*ownUnit, ownCtx);
+            }
+            if (ownDiags.hasErrors()) {
+                // Print the source so a human/script can map line:col back.
+                std::string src(source);
+                std::fprintf(stderr,
+                             "\n===OWNERSHIP_FAIL_BEGIN===\n%s\n"
+                             "===OWNERSHIP_FAIL_DIAGS===\n",
+                             src.c_str());
+                for (const auto& d : ownDiags.diagnostics()) {
+                    if (d.severity != Severity::Error) continue;
+                    std::fprintf(stderr, "%u:%u: %s\n",
+                                 d.location.line, d.location.column,
+                                 d.message.c_str());
+                }
+                std::fprintf(stderr, "===OWNERSHIP_FAIL_END===\n");
+            }
+        }
+    }
 
     auto llvmCtx = std::make_unique<llvm::LLVMContext>();
     auto module = codegen::emitModule(*unit, ctx, *llvmCtx, opts);
