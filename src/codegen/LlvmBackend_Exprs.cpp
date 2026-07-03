@@ -8900,7 +8900,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.CreateCall(allocFn,
                     {builder_.getInt64(elemSize), builder_.getInt64(16)});
             }
-            if (colName == "Dictionary" || colName == "OwningDictionary") {
+            if (colName == "Dictionary" || colName == "OwningDictionary" ||
+                // stdlib §4.17 (#1354, #1406): SortedDictionary<K,V> shares
+                // the bz_dict_t* runtime representation (same hash-table backing
+                // as Dictionary). Without this branch lowerNew returned nullptr,
+                // leaving the variable slot uninitialized — bz_dict_* calls then
+                // received a zero/i32 receiver and produced malformed IR.
+                colName == "SortedDictionary") {
                 // issues #343 / D3 / §4.8: a non-string key uses the generic-key
                 // runtime variant, parameterized by the key's hash/eq via
                 // trampolines (§8.3). This covers records (#343) AND primitive/

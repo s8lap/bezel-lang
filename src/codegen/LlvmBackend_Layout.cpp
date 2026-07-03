@@ -519,6 +519,12 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // without this it fell through to i32 default → IR mismatch.
                     n == "OwningBuffer" ||
                     n == "Dictionary" || n == "OwningDictionary" ||
+                    // stdlib §4.17 (#1354, #1406): SortedDictionary<K,V> shares
+                    // the bz_dict_t* runtime representation. Without this entry
+                    // lowerTypeRef fell through to i32, so a SortedDictionary
+                    // variable slot was alloca i32 and bz_dict_try_get_* received
+                    // a truncated receiver — malformed IR.
+                    n == "SortedDictionary" ||
                     n == "Stack" || n == "OwningStack" ||
                     n == "Queue" || n == "OwningQueue" ||
                     n == "Set" || n == "OwningSet" ||
@@ -642,6 +648,8 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 // Heap-pointer types — all stdlib collection/interface/task names.
                 if (n == "Array"       || n == "OwningArray"     ||
                     n == "Dictionary"  || n == "OwningDictionary" ||
+                    // stdlib §4.17 (#1354, #1406): imported SortedDictionary.
+                    n == "SortedDictionary" ||
                     n == "Stack"       || n == "OwningStack"      ||
                     n == "Queue"       || n == "OwningQueue"      ||
                     n == "Set"         || n == "OwningSet"        ||
