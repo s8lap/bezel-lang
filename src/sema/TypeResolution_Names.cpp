@@ -49,6 +49,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // System.Threading (same stance as KeyNotFoundException / System.Collections.
         // Generic — see the comment near the KeyNotFoundException entry below).
         n == "CancellationTokenSource" ||
+        // stdlib §6.10 (v0.175, #808): TaskScope — the structured-concurrency
+        // nursery. Requires `import System.Threading` per the spec; import-
+        // gating not yet enforced (same stance as CancellationTokenSource).
+        n == "TaskScope" ||
         // §9.8 / issue #550: ISerializable / IDeserializable (stdlib §2.14).
         // Zero-arity interfaces; auto-imported with System (no explicit import
         // required). Resolved here so that `: ISerializable` / `: IDeserializable`
@@ -545,6 +549,13 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
 void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         if (fd->type) resolveType(*fd->type, parent);
+        // per §28.14 (v0.175): a `scoped` FIELD must be function-typed.
+        for (std::string_view mod : fd->modifiers) {
+            if (mod == "scoped") {
+                checkScopedIsFunctionTyped(fd->type.get(), parent, fd->name,
+                                           "field", fd->span.begin);
+            }
+        }
         // Issue #163: resolve types embedded in the initializer
         // expression (e.g. `new T()`), so a class-typed field
         // initializer is fully typed — mirrors what ctor/method
@@ -558,6 +569,10 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         }
         for (const auto& p : md->params) {
             if (p.type) resolveType(*p.type, &methodScope);
+            // per §28.14 / §22.3 (v0.175): `scoped` only on function-typed params.
+            if (p.modifier == "scoped")
+                checkScopedIsFunctionTyped(p.type.get(), &methodScope, p.name,
+                                           "parameter", md->span.begin);
             // per §17.11 (#1166): resolve the inner type nodes of a parameter's
             // default-value expression (e.g. the `T` in `:= default(T)`) so the
             // §17.11 defaultIllFormed well-formedness check in ExprTypecheck can
@@ -589,6 +604,10 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         methodScope.parent = parent;
         for (const auto& p : od->params) {
             if (p.type) resolveType(*p.type, &methodScope);
+            // per §28.14 / §22.3 (v0.175): `scoped` only on function-typed params.
+            if (p.modifier == "scoped")
+                checkScopedIsFunctionTyped(p.type.get(), &methodScope, p.name,
+                                           "parameter", od->span.begin);
             // per §17.11 (#1166): resolve a parameter default's inner types.
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
@@ -605,6 +624,10 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         ctorScope.parent = parent;
         for (const auto& p : cd->params) {
             if (p.type) resolveType(*p.type, &ctorScope);
+            // per §28.14 / §22.3 (v0.175): `scoped` only on function-typed params.
+            if (p.modifier == "scoped")
+                checkScopedIsFunctionTyped(p.type.get(), &ctorScope, p.name,
+                                           "parameter", cd->span.begin);
             // per §17.11 (#1166): resolve a parameter default's inner types.
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &ctorScope);
         }
@@ -719,6 +742,11 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                 fp.modifier = p.modifier;
                 fp.name = p.name;
                 if (p.type) fp.type = resolveType(*p.type, scope);
+                // per §28.14 / A.6 FuncParamMods (v0.175): `scoped` is valid
+                // only on a function-typed position inside a function type.
+                if (fp.modifier == "scoped")
+                    checkScopedIsFunctionTyped(p.type.get(), scope, p.name,
+                                               "parameter", t.span.begin);
                 ref->funcParams.push_back(std::move(fp));
             }
             if (t.funcReturn) {
@@ -731,6 +759,28 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
     }
     ctx_.setResolvedType(&t, ref);
     return ref;
+}
+
+// §28.14 / §22.3 (v0.175): `scoped` is valid only on a FUNCTION-typed
+// parameter / field. The check runs on the RESOLVED type so a type alias to a
+// function type is admitted transparently. A nullable function type
+// (`(() -> ())?`) is admitted — the natural shape of a clearable `scoped`
+// field. An unresolved (Error) type stays silent (the resolution error was
+// already reported; no cascade).
+void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
+                                          Scope* scope, std::string_view name,
+                                          std::string_view what,
+                                          SourceLocation loc) {
+    if (!declaredType) return;
+    TypeRef* rt = ctx_.resolvedType(*declaredType);
+    if (!rt) rt = resolveType(*declaredType, scope);
+    if (!rt || rt->kind == TypeRef::Kind::Error) return;
+    if (rt->kind == TypeRef::Kind::Function) return;
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("`scoped` is valid only on a function-typed ") +
+        std::string(what) + " (§22.3, §28.14 v0.175); `" + std::string(name) +
+        "` does not have a function type");
 }
 
 std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,

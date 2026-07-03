@@ -69,6 +69,26 @@ bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
     return false;
 }
 
+// §27.5 / §30 (#808 exposure): see the header comment on frameCapturedLocals_.
+// One pass over every lambda in the frame body; each captured LocalSymbol's
+// decl node (a LocalDecl or the anchoring ForStmt) enters the set.
+void Emitter::computeFrameCapturedLocals(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    frameCapturedLocals_.clear();
+    std::vector<const ast::LambdaExpr*> lambdas;
+    collectAllLambdas(body, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::unordered_set<const sema::Symbol*> caps;
+        collectCapturedSyms(*lam, caps);
+        for (const sema::Symbol* s : caps) {
+            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s))
+                if (loc->decl)
+                    frameCapturedLocals_.insert(
+                        static_cast<const void*>(loc->decl));
+        }
+    }
+}
+
 void Emitter::collectSuspendLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
@@ -92,6 +112,13 @@ void Emitter::collectSuspendLocals(
             } else if (ld->initializer) {
                 if (auto* rt = ctx_.exprType(*ld->initializer)) ty = lowerTypeRef(rt);
             }
+            // §27.5 / §30 (#808 exposure): a lambda-captured local's slot is
+            // rebound to a shared CELL POINTER (boxLocalSlot); the frame field
+            // must be ptr-typed or the 8-byte cell-pointer spill overflows a
+            // narrower value field and corrupts its neighbour (SIGSEGV on
+            // resume). frameCapturedLocals_ is computed per frame body.
+            if (frameCapturedLocals_.count(static_cast<const void*>(ld)))
+                ty = ptrTy();
             out.push_back({ld, ty});
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
             // The loop variable is anchored on the ForStmt node.
@@ -113,6 +140,11 @@ void Emitter::collectSuspendLocals(
                         if (!it->genericArgs.empty() && it->genericArgs[0])
                             ty = lowerTypeRef(it->genericArgs[0]);
                 }
+                // §27.5 / §30 (#808 exposure): a captured loop variable is
+                // cell-boxed too — its frame field must be ptr-typed (see the
+                // LocalDecl branch above).
+                if (frameCapturedLocals_.count(static_cast<const void*>(fs)))
+                    ty = ptrTy();
                 out.push_back({fs, ty});
             }
             // §29.7 (#944): a for-in whose lowering creates an iterator-format
@@ -206,6 +238,9 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
     }
 
     // Pre-scan body to find all locals that need to live across a suspend point.
+    // §27.5 / §30 (#808 exposure): first compute which locals are lambda-
+    // captured (cell-boxed) so collectSuspendLocals plans ptr-typed fields.
+    computeFrameCapturedLocals(body);
     collectSuspendLocals(body, frame.bodyLocals);
 
     // Build state struct type:

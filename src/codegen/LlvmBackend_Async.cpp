@@ -1001,7 +1001,13 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
     //           ptr outerTask, ptr pendingTask, ptr spill }. The three trailing
     //           async slots mirror emitAsyncMethod exactly.
     std::vector<std::pair<const ast::Node*, llvm::Type*>> bodyLocals;
-    if (!lam.exprBody) collectSuspendLocals(lam.stmts, bodyLocals);
+    // §27.5 / §30 (#808 exposure): compute the lambda-captured locals of THIS
+    // body first so collectSuspendLocals plans ptr-typed fields for cell-boxed
+    // locals (see frameCapturedLocals_).
+    if (!lam.exprBody) {
+        computeFrameCapturedLocals(lam.stmts);
+        collectSuspendLocals(lam.stmts, bodyLocals);
+    }
 
     std::vector<llvm::Type*> fields;
     fields.push_back(ptrTy());          // vtable → 0 (unused; kept for layout parity)
@@ -2461,6 +2467,41 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
     // destructor body is NOT re-run (DisposeAsync supersedes it per §28.12).
     auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
     builder_.CreateCall(freeFn, {obj});
+}
+
+
+// stdlib §6.10 / §28.14 (v0.175, #808): TaskScope disposal. Normal exit of an
+// active async state machine → bz_task_scope_dispose_async (cancel + drain +
+// swallow; IOE iff `await Join()` was never reached) and AWAIT the returned
+// task, so §6.10 quiescence holds: no child callback runs after this disposal
+// completes. Unwind edge (or non-async context) → the NON-BLOCKING
+// bz_task_scope_dispose_unwind zombie drain: a blocking wait inside a domain
+// continuation is a deterministic deadlock (bz_task_await_sync aborts on it),
+// and awaiting across an active unwind is the §28.12 deferred increment; the
+// runtime frees the scope (and swallows faults) at the last child completion,
+// so there is no leak and no UAF of the scope itself. The runtime frees the
+// scope struct on both paths — codegen emits no free().
+void Emitter::emitTaskScopeDispose(llvm::Value* sc, bool isUnwind) {
+    bool inAsyncSM = (smKind_ == SuspendKind::Await ||
+                      smKind_ == SuspendKind::AsyncYield) &&
+                     smStateStruct_ && smSelf_ && asyncResumeFn_;
+    if (isUnwind || !inAsyncSM) {
+        auto* fn = declareC("bz_task_scope_dispose_unwind",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {sc});
+        return;
+    }
+    llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
+    {   auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end()) ioeVt = vit->second;
+    }
+    auto* fn = declareC("bz_task_scope_dispose_async", ptrTy(),
+                        {ptrTy(), llvm::Type::getInt32Ty(llvm_), ptrTy()});
+    llvm::Value* task = builder_.CreateCall(
+        fn, {sc, builder_.getInt32(1), ioeVt}, "tscope.dispose.task");
+    // Await the drain — a real suspend point; a missing-Join IOE fault
+    // re-raises in the resume block. freeTaskAfter=true: single-use task.
+    emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true);
 }
 
 

@@ -548,6 +548,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // CancellationTokenSource is an owned class type — also a ptr.
                     n == "CancellationToken" ||
                     n == "CancellationTokenSource" ||
+                    // stdlib §6.10 (v0.175, #808): TaskScope is a compiler-known
+                    // heap-pointer builtin (bz_task_scope_t*).
+                    n == "TaskScope" ||
                     // §28.13 / stdlib §2.16 (#620): Shared<T> and Weak<T> are
                     // compiler-known heap-pointer types (no user TypeDecl).
                     // Without these entries lowerTypeRef fell through to the i32
@@ -600,7 +603,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // so lowerTypeRef returns ptrTy() for it.
             if (rt->declaration && !rt->declaration->decl &&
                 (rt->declaration->name == "CancellationToken" ||
-                 rt->declaration->name == "CancellationTokenSource")) {
+                 rt->declaration->name == "CancellationTokenSource" ||
+                 // stdlib §6.10 (v0.175, #808): TaskScope via builtinClassSym.
+                 rt->declaration->name == "TaskScope")) {
                     return ptrTy();
             }
             // per stdlib §2.6: Guid typed via builtinClassSym (declaration->name ==
@@ -651,6 +656,8 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "WString"     || n == "RawBytes"        ||
                     n == "CancellationToken" ||
                     n == "CancellationTokenSource" ||
+                    // stdlib §6.10 (v0.175, #808): imported TaskScope.
+                    n == "TaskScope" ||
                     // §28.13 / stdlib §2.16 (#620): imported Shared<T>/Weak<T>
                     // (type name carried in importedName — same fix as the
                     // astNode path above).

@@ -76,6 +76,18 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // borrow-store escape check can tell whether a closure assigned to a plain
     // local outlives the owned local it captures.
     collectLocalDepths(body);
+    // §28.14 (v0.175, #808): scoped callback parameters. Record the enclosing
+    // method's parameter symbols (distinguishes real captures from lambda-
+    // internal params), then run the three syntactic pre-passes: call-site
+    // admission (+ freeze recording), callee-obligation verification, and the
+    // stdlib §6.10 TaskScope consumption rules. All run BEFORE the dataflow so
+    // each diagnostic fires exactly once and the freeze map is complete when
+    // the transfer functions enforce it. // per §28.14, stdlib §6.10
+    if (paramSyms)
+        for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
+    scopedPreScan(body);
+    scopedCalleeScan(body);
+    checkTaskScopeConsumption(body);
     // Seed the dataflow entry state with `owned` / `out owned` parameters
     // (slice O10): each enters the method in the Owned state and must
     // reach a discharge point on every normal-exit path (§28.8).
@@ -1964,6 +1976,10 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // state to match the producer of EXPR.
     if (as.op != ":=") return;
     if (!as.target || !as.value) return;
+    // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
+    // may not be REASSIGNED until the bounding scope exits.
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
+        checkScopedFreeze(tid->name, as.target->span.begin, "reassign");
     // Slice O15: side-effects in the RHS — `x := move y` should
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.

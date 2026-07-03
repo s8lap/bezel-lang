@@ -556,7 +556,23 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected '(' to begin parameter list");
         }
+        const SourceLocation paramListLoc = current_.location;
         decl.params = parseParamList();
+        // per §32 / §28.14 (v0.175): `scoped` is illegal on extern
+        // declarations — neither the callee storage obligations nor the
+        // quiescence guarantee can be verified across the FFI boundary.
+        for (const auto& p : decl.params) {
+            if (p.modifier == "scoped") {
+                diagnostics_.report(
+                    Severity::Error, paramListLoc,
+                    std::string("`scoped` is illegal on an extern "
+                                "declaration — the callee's storage "
+                                "obligations and quiescence cannot be "
+                                "verified across the FFI boundary (§32, "
+                                "§28.14); parameter `") +
+                    std::string(p.name) + "`");
+            }
+        }
         if (!consumePunctuator(")")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ')' to close parameter list");
@@ -685,6 +701,21 @@ std::unique_ptr<ast::Type> Parser::parseType() {
                     else                          fp.modifier = "out";
                 } else if (consumeKeyword("owned")) {
                     fp.modifier = "owned";
+                } else if (current_.kind == TokenKind::Identifier &&
+                           current_.text == "scoped" &&
+                           (peekAt(1).kind == TokenKind::Identifier ||
+                            (peekAt(1).kind == TokenKind::Punctuator &&
+                             (peekAt(1).text == "(" ||
+                              peekAt(1).text == "[")))) {
+                    // per §28.14 / A.6 FuncParamMods (v0.175): contextual
+                    // `scoped` in a function type, e.g. `(scoped () -> Task)
+                    // -> ()`. It is the modifier exactly when the next token
+                    // can begin a FuncParamType (an Identifier — a named
+                    // param or a named type — or `(` / `[`); a lone param of
+                    // NAMED TYPE `scoped` is followed by `,` / `)` / `?` and
+                    // a param NAMED `scoped` by `:`, so neither matches.
+                    fp.modifier = "scoped";
+                    advance();
                 }
                 // Optional `Identifier ":"` prefix per A.5 FuncParamType.
                 if (current_.kind == TokenKind::Identifier &&
@@ -791,12 +822,29 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     // method-only ones (`async`, `abstract`, `virtual`, `sealed`, `override`).
     // The semantically valid combinations per member kind are sema's job.
     std::vector<std::string_view> modifiers;
-    while (isKeyword("static")   || isKeyword("owned")    ||
-           isKeyword("readonly") || isKeyword("async")    ||
-           isKeyword("abstract") || isKeyword("virtual")  ||
-           isKeyword("sealed")   || isKeyword("override")) {
-        modifiers.push_back(current_.text);
-        advance();
+    for (;;) {
+        if (isKeyword("static")   || isKeyword("owned")    ||
+            isKeyword("readonly") || isKeyword("async")    ||
+            isKeyword("abstract") || isKeyword("virtual")  ||
+            isKeyword("sealed")   || isKeyword("override")) {
+            modifiers.push_back(current_.text);
+            advance();
+            continue;
+        }
+        // per §28.14 (v0.175): `scoped` is a CONTEXTUAL field modifier (lexed
+        // as Identifier). A `scoped` FIELD holds a callback stored under a
+        // `scoped` parameter: invocable / overwritable / clearable, never
+        // readable-out. It is the modifier exactly when the next token is the
+        // field's name (an Identifier); a field NAMED `scoped` is followed by
+        // `:` and is not matched. Function-typed-ness is checked in sema.
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "scoped" &&
+            peekAt(1).kind == TokenKind::Identifier) {
+            modifiers.push_back(current_.text);
+            advance();
+            continue;
+        }
+        break;
     }
 
     // A.4 NestedTypeDecl as a Member: `class` / `interface` / `record` /
@@ -1796,6 +1844,18 @@ std::vector<ast::Param> Parser::parseParamList() {
             }
         } else if (consumeKeyword("owned")) {
             p.modifier = "owned";
+        } else if (current_.kind == TokenKind::Identifier &&
+                   current_.text == "scoped" &&
+                   peekAt(1).kind == TokenKind::Identifier) {
+            // per §28.14 / §22.3 (v0.175): `scoped` is a CONTEXTUAL modifier
+            // (lexed as Identifier, not a reserved keyword) valid only on
+            // function-typed parameters. It is the modifier exactly when the
+            // next token is the parameter's name (an Identifier); a parameter
+            // NAMED `scoped` is followed by `:` and is not matched here.
+            // Function-typed-ness is checked in sema (TypeResolution), where
+            // a type alias to a function type resolves transparently.
+            p.modifier = "scoped";
+            advance();
         }
         if (current_.kind != TokenKind::Identifier) {
             // Recovery: if a keyword was used as a parameter name, accept

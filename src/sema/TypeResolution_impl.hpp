@@ -393,6 +393,15 @@ private:
 
     TypeRef* resolveType(const ast::Type& t, Scope* scope);
 
+    // §28.14 / §22.3 (v0.175): `scoped` is valid only on a FUNCTION-typed
+    // parameter / field. Checks the RESOLVED type (so a type alias to a
+    // function type is admitted transparently) and reports otherwise.
+    // `what` selects the diagnostic wording ("parameter" / "field").
+    void checkScopedIsFunctionTyped(const ast::Type* declaredType,
+                                    Scope* scope, std::string_view name,
+                                    std::string_view what,
+                                    SourceLocation loc);
+
     // §15.1 (issue #734): fold an inline-array size `N` to a compile-time
     // integer. N must be a compile-time integer expression: integer literals,
     // `const` declarations whose value is itself an int-const expression, and

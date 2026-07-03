@@ -966,6 +966,124 @@ private:
     // (the single-consumer owning task an `await` consumes); generic-safe
     // (name-head based), unlike awaitTaskKind's result-class gate.
     bool operandIsOwnedTaskType(const ast::Expr& e);
+
+    // -- §28.14 (v0.175, #808): scoped callback parameters -------------------
+    //
+    // Storage-bounded capture. Two checker halves:
+    //   CALL-SITE ADMISSION — a closure argument bound to a `scoped` formal is
+    //   admitted iff the call's BOUNDING OBJECT resolves to a `using var` /
+    //   `await using var` local L (constructor→constructed, owned-return-as-
+    //   initializer→returned, else receiver) and every captured source is
+    //   declared BEFORE L; the sources are then FROZEN (no move / dispose /
+    //   reassign) until L's scope exits.
+    //   CALLEE VERIFICATION — a `scoped` parameter may only be invoked, stored
+    //   into a `scoped` field of `this`, or forwarded to a `scoped` parameter
+    //   of a call on `this`; a `scoped` FIELD may only be invoked, overwritten
+    //   from a `scoped` parameter, cleared to null, or null-compared.
+    //
+    // Both run as SYNTACTIC pre-passes at the start of run() (before the CFG
+    // dataflow), so each diagnostic is emitted exactly once and the freeze map
+    // is complete before the dataflow's enforcement hooks fire. // per §28.14
+
+    // Declaration-order index of every local declaration node, assigned in
+    // source order by scopedPreScan (which — unlike collectLocalDepths — also
+    // walks lambda bodies). Keys: LocalDecl*, ForStmt* (iteration variable),
+    // `out owned var` IdentifierExpr*. Parameters and `this` precede every
+    // local (they have no entry; absence + ParameterSymbol/this = index -1).
+    std::unordered_map<const ast::Node*, int> scopedDeclOrder_;
+    int scopedDeclCounter_ = 0;
+    // Initializer expression -> its `using var`/`await using var` LocalDecl,
+    // for bounding forms 1 (constructor) and 2 (owned-return initializer).
+    std::unordered_map<const ast::Expr*, const ast::LocalDecl*>
+        scopedInitOfUsingLocal_;
+    // The enclosing method's own parameter symbols — distinguishes a real
+    // capture of a method parameter from a lambda-internal parameter.
+    std::unordered_set<sema::Symbol*> methodParamSet_;
+    // §28.14 freeze: source symbol -> {bounding local's name, admission call
+    // site}. A frozen source may not be moved from, disposed, or reassigned
+    // AFTER the admission site (source-offset ordered; the pre-scan records,
+    // the dataflow transfer functions enforce). The freeze nominally ends when
+    // L's scope exits; v1 keeps it for the rest of the method — sound (only
+    // over-rejects mutation after L's block closed, a rare shape).
+    struct ScopedFreeze {
+        std::string_view boundingName;
+        SourceLocation admissionLoc;
+    };
+    std::unordered_map<sema::Symbol*, ScopedFreeze> scopedFrozen_;
+
+    // Walk the body once: assign scopedDeclOrder_, record using-var
+    // initializer anchors, then check every call with a `scoped` formal
+    // (admission) and every use of a `scoped` param / field (callee rules).
+    void scopedPreScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void scopedPreScanStmt(const ast::Stmt& s);
+    void scopedPreScanExpr(const ast::Expr& e);
+
+    // True when the call's formal at `argPos` is `scoped`. Resolves user
+    // methods/ctors via sema symbols, builtin TaskScope.Spawn by receiver
+    // type name, and function-VALUE callees via their Function TypeRef.
+    bool scopedFormalAt(const ast::Expr* callee, const ast::NewExpr* ne,
+                        std::size_t argPos);
+
+    // §28.14 call-site admission for one argument bound to a scoped formal.
+    // `callNode` is the CallExpr / NullCondCallExpr / NewExpr node.
+    void checkScopedAdmission(const ast::Expr& callNode,
+                              const ast::Expr* callee, const ast::NewExpr* ne,
+                              const ast::Expr& arg);
+
+    // Resolve the §28.14 bounding object of a call to a using/await-using
+    // LocalDecl, or null when the bounding object is not usable as a bound
+    // (plain expression receiver, field, non-initializer owned return, …).
+    const ast::LocalDecl* scopedBoundingLocal(const ast::Expr& callNode,
+                                              const ast::Expr* callee,
+                                              const ast::NewExpr* ne);
+
+    // COMPLETE capture enumeration for a lambda argument (statements,
+    // expressions, patterns, nested lambdas; `this` is an IdentifierExpr and
+    // is collected like any identifier). Unlike collectLambdaIdentifiers this
+    // walks every statement/expression form — a missed capture would be a
+    // silently-admitted escape. `declared` accumulates the lambda's own
+    // params/locals so uses of lambda-internal names are not captures.
+    void scopedCollectCaptures(const ast::LambdaExpr& lam,
+                               std::vector<const ast::IdentifierExpr*>& out);
+    void scopedCaptureWalkStmt(const ast::Stmt& s,
+                               std::vector<const ast::IdentifierExpr*>& out);
+    void scopedCaptureWalkExpr(const ast::Expr& e,
+                               std::vector<const ast::IdentifierExpr*>& out);
+
+    // §28.14 freeze enforcement: report when `name` resolves to a frozen
+    // source and the mutation site `loc` is at-or-after the admission site.
+    // `action` names the rejected operation for the diagnostic.
+    void checkScopedFreeze(std::string_view name, SourceLocation loc,
+                           std::string_view action);
+
+    // §28.14 callee verification pre-pass (see the header comment above).
+    void scopedCalleeScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void scopedCalleeWalkStmt(const ast::Stmt& s);
+    // `allowInvokeOf` lets a CallExpr's callee identifier through (invoke).
+    void scopedCalleeWalkExpr(const ast::Expr& e);
+    // Report + true when `e` is a bare use of a scoped param / scoped field
+    // outside every admitted context.
+    bool scopedRestrictedUse(const ast::Expr& e, std::string_view context);
+    // True when `e` is an identifier/member-access denoting a `scoped`
+    // parameter of THIS method (kind=1) or a `scoped` field (kind=2, bare or
+    // this-qualified). Returns 0 otherwise.
+    int scopedUseKind(const ast::Expr& e, std::string_view* nameOut = nullptr);
+
+    // -- stdlib §6.10 (v0.175, #808): TaskScope consumption rules ------------
+    // TaskScope may only be consumed by `await using`; a plain `using var`, an
+    // undisposed drop, or an explicit .Dispose() is a compile error naming the
+    // rule; `await L.Join()` must appear on the normal path (checked
+    // syntactically: error only when no such await exists AND the scope local
+    // is never delegated as a call argument — the provable subset).
+    bool exprTypeIsTaskScope(const ast::Expr& e) const;
+    bool typeRefIsTaskScope(const sema::TypeRef* rt) const;
+    void checkTaskScopeConsumption(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // Scan helpers: does `await <name>.Join()` / a bare-`name` argument occur?
+    void taskScopeUsageScanStmt(const ast::Stmt& s, std::string_view name,
+                                bool& sawAwaitJoin, bool& sawDelegation);
+    void taskScopeUsageScanExpr(const ast::Expr& e, std::string_view name,
+                                bool& sawAwaitJoin, bool& sawDelegation);
 };
 
 } // namespace bezel::ownership

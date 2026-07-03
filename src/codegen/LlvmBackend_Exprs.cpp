@@ -2110,6 +2110,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateCall(fn, {cts}, "cts.token.prop");
                 }
             }
+            // stdlib §6.10 (v0.175, #808): TaskScope.Token property read —
+            // the scope's internal CancellationToken (borrowed cell pointer).
+            if (cn == "TaskScope" && ma->member == "Token") {
+                llvm::Value* sc = lowerExpr(*ma->target);
+                if (!sc) return nullptr;
+                auto* fn = declareC("bz_task_scope_token", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {sc}, "tscope.token.prop");
+            }
             // per §6.8 / #652: Domain instance property reads.
             if (cn == "Domain" && ma->member == "Name") {
                 llvm::Value* dom = lowerExpr(*ma->target);
@@ -9176,6 +9184,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "CancellationTokenSource") {
                 auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "cts.alloc");
+            }
+            // stdlib §6.10 (v0.175, #808): new TaskScope() — allocate via
+            // bz_task_scope_new (fresh internal cancellation cell).
+            if (colName == "TaskScope") {
+                auto* allocFn = declareC("bz_task_scope_new", ptrTy(), {});
+                return builder_.CreateCall(allocFn, {}, "tscope.alloc");
             }
             // §8.1 / issue #646: new Stopwatch() — allocate via bz_stopwatch_alloc.
             // Stopwatch is a heap-allocated class with a bz_stopwatch_t layout

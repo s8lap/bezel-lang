@@ -5104,6 +5104,96 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     }
 
     // ---------------------------------------------------------------------------
+    // stdlib §6.10 / §28.14 (v0.175, #808): TaskScope instance methods.
+    // The receiver's exprType name-part is "TaskScope".
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isTS = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    builtinTypeName(recvTy) == "TaskScope";
+                if (isTS) {
+                    llvm::Value* sc = lowerExpr(*ma2->target);
+                    if (!sc) return nullptr;
+                    const auto& mname = ma2->member;
+                    // §6.10: Token property (call-form mirror of the Exprs path).
+                    if (mname == "Token" && call.args.empty()) {
+                        auto* fn = declareC("bz_task_scope_token",
+                                            ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {sc}, "tscope.token");
+                    }
+                    // §6.10: Cancel() — cancel all children now.
+                    if (mname == "Cancel" && call.args.empty()) {
+                        auto* fn = declareC("bz_task_scope_cancel",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {sc});
+                        return nullptr;  // unit
+                    }
+                    // §6.10: CancelAfter(delay: TimeSpan) — scope deadline.
+                    // TimeSpan lowers to i64 ticks (100 ns) → ms (the same
+                    // conversion as CTS.CancelAfter / Task.Delay).
+                    if (mname == "CancelAfter" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* span = lowerExpr(*call.args[0].value);
+                        if (!span) return nullptr;
+                        if (!span->getType()->isIntegerTy(64))
+                            span = builder_.CreateSExtOrTrunc(span, i64());
+                        llvm::Value* ms = builder_.CreateSDiv(
+                            span, builder_.getInt64(10000), "tscope.ca.ms");
+                        auto* fn = declareC("bz_task_scope_cancel_after",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64()});
+                        builder_.CreateCall(fn, {sc, ms});
+                        return nullptr;  // unit
+                    }
+                    // §6.10 / §28.14: Spawn(scoped body: () -> Task) — lower
+                    // the callback like an event handler (a closure cell with
+                    // a transferred +1; §28.14 admission was checked by the
+                    // ownership pass), start the child immediately on the
+                    // current domain, then check for the Spawn-after-close
+                    // InvalidOperationException (the runtime raises it via
+                    // bz_exc; emitPendingCheck turns it into a Bezel throw).
+                    if (mname == "Spawn" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* closure = lowerEventHandlerClosure(
+                            call.args[0].value.get(), /*payload=*/nullptr);
+                        if (!closure) return nullptr;
+                        llvm::Value* ioeVt =
+                            llvm::ConstantPointerNull::get(ptrTy());
+                        {   auto vit = builtinVtable_.find(
+                                "InvalidOperationException");
+                            if (vit != builtinVtable_.end()) ioeVt = vit->second;
+                        }
+                        auto* fn = declareC("bz_task_scope_spawn",
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {sc, closure, ioeVt});
+                        emitPendingCheck();  // Spawn-after-close IOE (§6.10)
+                        return nullptr;  // unit
+                    }
+                    // §6.10: await Join() — the sole re-raise site. Returns
+                    // the join task; the standard await machinery consumes it
+                    // (first fault re-raises in the awaiter).
+                    if (mname == "Join" && call.args.empty()) {
+                        auto* fn = declareC("bz_task_scope_join",
+                                            ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {sc}, "tscope.join");
+                    }
+                    // §6.10: explicit Dispose() is rejected by the ownership
+                    // pass (await-using only); defensively lower any residual
+                    // occurrence to the non-blocking unwind dispose.
+                    if (mname == "Dispose" && call.args.empty()) {
+                        auto* fn = declareC("bz_task_scope_dispose_unwind",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {sc});
+                        return nullptr;  // unit
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // §6.1 / §30.8: CancellationToken instance methods and properties.
     // The receiver's exprType name-part is "CancellationToken".
     // CancellationToken.None is handled in tryLowerStaticCall (member of type name).

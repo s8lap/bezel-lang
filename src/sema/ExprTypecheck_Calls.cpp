@@ -5004,6 +5004,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "TrySetCancelled, Dispose (stdlib \xC2\xA7""6.6)");
                         }
                     }
+                    // stdlib §6.10 (v0.175, #808): TaskScope instance methods.
+                    //   Spawn(scoped body: () -> Task): unit — starts the child
+                    //     immediately on the current domain (§28.14 admission is
+                    //     the ownership pass's job).
+                    //   Join(): Task — awaits all children; the sole re-raise
+                    //     site (first-fault-wins).
+                    //   Cancel(): unit; CancelAfter(delay: TimeSpan): unit.
+                    //   Token is a property (typed in resolveMemberAccess);
+                    //   Dispose is typed unit here so the §6.10 await-using-only
+                    //   consumption error is reported by the ownership pass with
+                    //   its dedicated wording (not a generic "no member").
+                    if (rcn == "TaskScope" && recvTy) {
+                        if (m == "Join") {
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("Task");
+                            ann->name.reset(nm);
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->nullable = false;
+                            tr->declaration = nullptr;
+                            tr->astNode = ann;
+                            ctx_.setExprType(&ce, tr);
+                        } else if (m == "Spawn" || m == "Cancel" ||
+                                   m == "CancelAfter" || m == "Dispose") {
+                            // unit; no return type set.
+                        } else {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `TaskScope`; documented surface: "
+                                "Spawn(scoped body), Join(), Cancel(), "
+                                "CancelAfter(delay), Token "
+                                "(stdlib \xC2\xA7""6.10, v0.175)");
+                        }
+                    }
                     // issue #545: Buffer<T> instance methods.
                     // Receiver: Named, no declaration, name "Buffer", genericArgs[0]=T.
                     // Surface: [i] (indexer), Length (property), Dispose().
@@ -8387,6 +8424,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 // Cancel() / CancelAfter() / Dispose() → unit (leave untyped).
+            }
+            // stdlib §6.10 (v0.175, #808): TaskScope builtin members.
+            if (cn == "TaskScope") {
+                // Token: CancellationToken — the scope's internal token; pass
+                // it to children for cooperative cancellation (§30.8).
+                if (ma.member == "Token") {
+                    auto* ctTy = ctx_.makeTypeRef();
+                    ctTy->kind = TypeRef::Kind::Named;
+                    ctTy->declaration = builtinClassSym("CancellationToken");
+                    ctx_.setExprType(&ma, ctTy);
+                    return;
+                }
+                // Spawn/Join/Cancel/CancelAfter are method-like members; the
+                // enclosing CallExpr handler types their results.
             }
             // per §6.8 / #652: Domain instance member access types.
             if (cn == "Domain") {

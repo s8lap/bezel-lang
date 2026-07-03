@@ -1,0 +1,213 @@
+// ASan/LSan AOT probes for TaskScope — stdlib §6.10 / spec §28.14 (v0.175,
+// #808).
+//
+// The JIT behaviour tests (taskscope_behavior_610_test.cpp) check VALUES; the
+// probes here compile the same shapes to a NATIVE binary linked against an
+// ASan+LSan-instrumented runtime and assert the memory discipline:
+//   - the FULL NURSERY LIFECYCLE (spawn × N with captures, join, dispose)
+//     leaks nothing and frees nothing twice (child tasks, closure cells,
+//     capture boxes, the scope struct, the internal cancellation cell);
+//   - the FAULT PATH (a child fault re-raised at Join; a swallowed sibling
+//     fault; the exception-edge unwind drain) neither leaks the exception
+//     objects nor touches freed memory (§6.10: DisposeAsync always swallows;
+//     the runtime disposes swallowed faults via their vtable).
+//
+// Mirrors the runUnderAsan recipe of array_reverse_chain_466_test.cpp
+// (lowerToObject + the memoized ASan runtime object + clang link).
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <sys/wait.h>
+
+#include "ast/Node.hpp"
+#include "codegen/LlvmBackend.hpp"
+#include "lexer/Lexer.hpp"
+#include "native_test_harness.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+#include "test_harness.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+
+#include <filesystem>
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Lower `source` to an object via the real native pipeline; -1 on failure.
+int lowerToObject(const std::string& source, const std::string& objPath) {
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(source, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return -1;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);
+    if (diags.hasErrors()) return -1;
+    llvm::LLVMContext llvmCtx;
+    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+    if (!module) return -1;
+    std::string err;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    return 0;
+}
+
+// Compile `source` under ASan + LSan, run it, and check the exit code.
+// Returns 0 (clean), 1 (sanitizer problem or wrong value), -1 (toolchain
+// unavailable: SKIP).
+int runUnderAsan(const std::string& source, int expectedExitCode) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_tscope808_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe = (dir / stem).string();
+    if (lowerToObject(source, objPath) != 0) return -1;
+    auto cleanup = [&] {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+    };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
+                         " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (status == -1) return -1;
+    if (!WIFEXITED(status)) return 1;          // crashed/aborted
+    int code = WEXITSTATUS(status);
+    if (code == 99) return 1;                  // sanitizer reported a problem
+    return (code == expectedExitCode) ? 0 : 1;
+}
+
+void expectAsanClean(const std::string& source, int expectedExitCode) {
+    int a = runUnderAsan(source, expectedExitCode);
+    if (a == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(a, 0);
+}
+
+}  // namespace
+
+// §6.10 / §28.14: the FULL NURSERY LIFECYCLE — two spawned children (static-
+// counter bodies: a lambda capturing an enclosing-frame LOCAL would also
+// exercise the PRE-EXISTING async capture-cell leak — reproduced without any
+// TaskScope, noted in cts_register_timer_1413_test.cpp — which would mask
+// what THIS probe measures), Join, dispose. No leak (child tasks, closure
+// cells, the scope struct, the internal cancel cell), no UAF, no double-free.
+BEZEL_TEST(taskscope_asan_808, full_nursery_lifecycle_clean) {
+    expectAsanClean(
+        "module M; import System.Threading; "
+        "class Prog "
+        "  public static _count: int := 0; "
+        "  public static async method Run(): Task<int> "
+        "    await using var scope := new TaskScope(); "
+        "    scope.Spawn(async () => do "
+        "      await Task.Delay(4); "
+        "      Prog._count := Prog._count + 1; "
+        "    end); "
+        "    scope.Spawn(async () => do "
+        "      await Task.Delay(2); "
+        "      Prog._count := Prog._count + 1; "
+        "    end); "
+        "    await scope.Join(); "
+        "    return Prog._count; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    var n := await Prog.Run(); "
+        "    if n = 2 then return 0; end; "
+        "    return 1; "
+        "  end Main; "
+        "end Prog;",
+        0);
+}
+
+// §6.10 FAULT PATH: the first fault re-raises at Join (caught), the sibling's
+// fault-free cancellation exit and the swallowed non-first fault leak nothing
+// — the runtime disposes swallowed exception objects via their vtable.
+BEZEL_TEST(taskscope_asan_808, fault_path_first_fault_and_swallow_clean) {
+    expectAsanClean(
+        "module M; import System.Threading; "
+        "class Prog "
+        "  public static async method Main(): Task<int> "
+        "    var caught := false; "
+        "    await using var scope := new TaskScope(); "
+        "    scope.Spawn(async () => do "
+        "      await Task.Delay(2); "
+        "      throw new InvalidOperationException(\"first\"); "
+        "    end); "
+        "    scope.Spawn(async () => do "
+        "      await Task.Delay(4); "
+        "      throw new ArgumentException(\"second — swallowed\"); "
+        "    end); "
+        "    try "
+        "      await scope.Join(); "
+        "    catch "
+        "      var e: Exception => do caught := true; end "
+        "    end; "
+        "    if caught then return 0; end; "
+        "    return 1; "
+        "  end Main; "
+        "end Prog;",
+        0);
+}
+
+// §6.10 EXCEPTION-EDGE drain: an outer throw between Spawn and Join unwinds
+// through the scope's disposal (cancel + non-blocking zombie drain + swallow);
+// the still-running child, its task, its closure, its own FAULT object, and
+// the scope itself are all reclaimed — no leak, no UAF. (The children's
+// bodies are capture-free for the same pre-existing-cell-leak reason as the
+// lifecycle probe above; the cancellation-VALUE observation lives in the JIT
+// behaviour tests.)
+BEZEL_TEST(taskscope_asan_808, exception_edge_unwind_drain_clean) {
+    expectAsanClean(
+        "module M; import System.Threading; "
+        "class Prog "
+        "  public static method Always(): bool => true; "
+        "  public static async method Run(): Task "
+        "    await using var scope := new TaskScope(); "
+        "    scope.Spawn(async () => do "
+        "      var i := 0; "
+        "      while i < 20 do "
+        "        await Task.Delay(2); "
+        "        i := i + 1; "
+        "      end; "
+        "    end); "
+        "    scope.Spawn(async () => do "
+        "      await Task.Delay(2); "
+        "      throw new InvalidOperationException(\"drained and swallowed\"); "
+        "    end); "
+        "    if Prog.Always() then "
+        "      throw new ArgumentException(\"outer\"); "
+        "    end; "
+        "    await scope.Join(); "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    var caught := false; "
+        "    try "
+        "      await Prog.Run(); "
+        "    catch "
+        "      var e: ArgumentException => do caught := true; end "
+        "    end; "
+        "    await Task.Delay(80); "
+        "    if caught then return 0; end; "
+        "    return 1; "
+        "  end Main; "
+        "end Prog;",
+        0);
+}

@@ -692,6 +692,17 @@ private:
         // fallback" (class not statically known, or DisposeAsync not found).
         bool asyncDispose = false;
         llvm::Function* disposeAsyncFn = nullptr;
+        // stdlib §6.10 / §28.14 (v0.175, #808): an `await using var` bound to
+        // a TaskScope. NORMAL exit: bz_task_scope_dispose_async (cancel the
+        // scope's token, drain remaining children, swallow their faults;
+        // fault the returned task with InvalidOperationException iff `await
+        // Join()` was never reached) and AWAIT the returned task — the drain
+        // is a real suspend point. UNWIND exit (or non-async context):
+        // bz_task_scope_dispose_unwind — cancel + NON-BLOCKING zombie drain
+        // (a blocking wait inside a domain continuation deadlocks by design;
+        // the runtime frees the scope at the last child completion). The
+        // runtime frees the scope struct on both paths — no free() here.
+        bool taskScope = false;
         // §30.15 (#600 phase c): a `using var` bound to a Channel<T>. At scope
         // end it is freed via bz_channel_dispose (closes the channel, faults any
         // pending receivers with ChannelClosedException, disposes undelivered
@@ -4584,6 +4595,14 @@ private:
                                   bool markSpentAfter = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
+    // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope
+    // object `sc` (non-null; the caller null-guards). On the normal exit of an
+    // active async state machine: bz_task_scope_dispose_async(sc, 1, ioeVt) +
+    // emitAwaitSuspend on the returned task (drain awaited; missing-Join IOE
+    // re-raises in the resume block). Otherwise (unwind edge, or no async SM):
+    // bz_task_scope_dispose_unwind(sc) — non-blocking zombie drain.
+    void emitTaskScopeDispose(llvm::Value* sc, bool isUnwind);
+
     // via `disposeAsyncFn` (the direct LLVM function pointer resolved at
     // registration time), await the returned Task (a proper suspend point), then
     // free the block (physical reclamation). Used by emitDisposals on the non-
@@ -5885,6 +5904,20 @@ private:
     void collectAllLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<const ast::LambdaExpr*>& out);
+
+    // §27.5 / §30 (#808 exposure; pre-existing spill-width bug): the LOCAL DECL
+    // NODES (LocalDecl* / ForStmt*) captured by ANY lambda in the CURRENT
+    // frame body. A captured local's storage slot is rebound to a shared CELL
+    // POINTER (boxLocalSlot, §27.5), so its async/iterator frame field must be
+    // POINTER-typed: the value-typed field collectSuspendLocals would plan
+    // from the declared type (e.g. i32) is overflowed by the 8-byte cell-
+    // pointer spill at a suspend point, corrupting the adjacent frame field
+    // (garbled pointer → SIGSEGV on resume). Computed by
+    // computeFrameCapturedLocals at each frame-building site (async method /
+    // async lambda / iterator), consulted in collectSuspendLocals.
+    std::unordered_set<const void*> frameCapturedLocals_;
+    void computeFrameCapturedLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // §27.5 / #754: does any closure in `fs.body` capture the for-loop variable?
     // Finds the outermost LambdaExprs in the body and runs collectCapturedSyms on

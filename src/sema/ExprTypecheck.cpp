@@ -1099,6 +1099,34 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         reportNotConvertible();
         return;
     }
+    // §27.2 / §28.14 (v0.175): `scoped` participates in function-signature
+    // IDENTITY like ref/out — `(scoped () -> Task) -> ()` and
+    // `(() -> Task) -> ()` are distinct types with no conversion either way.
+    // Deliberately NARROW: general function-to-function signature matching is
+    // still the deferred slice above, so this fires ONLY when the two sides
+    // disagree on a `scoped` position (same arity), leaving every previously-
+    // accepted function assignment unchanged.
+    if (from->kind == TypeRef::Kind::Function &&
+        to->kind == TypeRef::Kind::Function &&
+        from->funcParams.size() == to->funcParams.size()) {
+        for (std::size_t i = 0; i < from->funcParams.size(); ++i) {
+            const bool fromScoped = from->funcParams[i].modifier == "scoped";
+            const bool toScoped = to->funcParams[i].modifier == "scoped";
+            if (fromScoped != toScoped) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the ") + what +
+                    " has a function type whose parameter " +
+                    std::to_string(i + 1) +
+                    (fromScoped ? " is `scoped` but the target's is not"
+                                : " is not `scoped` but the target's is") +
+                    " — `scoped` is part of a function signature's identity; "
+                    "there is no conversion between the two (§27.2, §28.14 "
+                    "v0.175)");
+                return;
+            }
+        }
+    }
     // A nullable source assigned to a non-nullable target whose shapes did not
     // match either branch above — notably the `null` literal (typed `Object?`, a
     // Primitive) assigned to a non-nullable NAMED reference target

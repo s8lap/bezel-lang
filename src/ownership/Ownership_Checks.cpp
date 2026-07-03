@@ -2457,6 +2457,9 @@ LocalOwnership* MethodOwnership::lookupState(std::string_view name) {
 }
 
 void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation loc) {
+    // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
+    // may not be disposed until the bounding scope exits.
+    checkScopedFreeze(name, loc, "dispose");
     auto* st = lookupState(name);
     if (!st) return;
     if (st->state == OwnershipState::Disposed) {
@@ -2493,6 +2496,9 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
 }
 
 void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc) {
+    // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
+    // may not be moved from until the bounding scope exits.
+    checkScopedFreeze(name, loc, "move from");
     auto* st = lookupState(name);
     if (!st) return;
     if (st->state == OwnershipState::MovedFrom) {
@@ -3941,6 +3947,1456 @@ void MethodOwnership::addCompletionEdges(flow::CFG& cfg) {
         if (flow::CFG::hasAwaitSites(b) && !hasNormalEdgeToExit(b))
             cfg.addCompletionEdge(b, exit);
     }
+}
+
+// ===========================================================================
+// §28.14 (v0.175, #808) — scoped callback parameters: storage-bounded capture.
+//
+// See the block comment in Ownership_impl.hpp. Everything below runs as
+// SYNTACTIC pre-passes from run() (before the CFG dataflow): the walk order
+// is source order, so declaration indices are assigned before any admission
+// check that consults them, and each diagnostic is emitted exactly once.
+// The freeze map the admission records is enforced later, inside the
+// dataflow's transfer functions (markMovedByName / markDisposedByName /
+// handleAssignment), gated on source order so mutation BEFORE the admission
+// site is untouched.
+// ===========================================================================
+
+namespace {
+// Arguments of a call-like node, uniform over the three arg-bearing forms.
+const std::vector<ast::CallArgument>* scopedArgsOf(const ast::Expr& e) {
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) return &ce->args;
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+        return &nc->args;
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) return &ne->args;
+    return nullptr;
+}
+}  // namespace
+
+bool MethodOwnership::typeRefIsTaskScope(const sema::TypeRef* rt) const {
+    // stdlib §6.10: TaskScope is a compiler-known class. Sema resolves it
+    // either to the synthetic builtin TypeSymbol (declaration->name ==
+    // "TaskScope") or to a null-declaration Named ref whose AST name is
+    // "TaskScope" (annotation path).
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) return rt->declaration->name == "TaskScope";
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        return rt->astNode->name->parts[0] == "TaskScope";
+    return rt->importedName == "TaskScope";
+}
+
+bool MethodOwnership::exprTypeIsTaskScope(const ast::Expr& e) const {
+    if (typeRefIsTaskScope(ctx_.exprType(e))) return true;
+    // `new TaskScope()` — before sema typing lands on the NewExpr itself.
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
+        return ne->type && ne->type->name && !ne->type->name->parts.empty() &&
+               ne->type->name->parts[0] == "TaskScope";
+    return false;
+}
+
+// -- pre-scan: declaration order + using-var initializer anchors + admission
+
+void MethodOwnership::scopedPreScan(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body)
+        if (s) scopedPreScanStmt(*s);
+}
+
+void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        // Assign the declaration index BEFORE descending into the initializer:
+        // for bounding forms 1/2 the initializer's captures are checked
+        // against THIS local's index. // per §28.14
+        scopedDeclOrder_[ld] = scopedDeclCounter_++;
+        if (ld->initializer) {
+            if (ld->isUsing)
+                scopedInitOfUsingLocal_[ld->initializer.get()] = ld;
+            scopedPreScanExpr(*ld->initializer);
+        }
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) scopedPreScanExpr(*lc->value);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) scopedPreScanExpr(*rs->value);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) scopedPreScanExpr(*es->expr);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) scopedPreScanExpr(*as->target);
+        if (as->value) scopedPreScanExpr(*as->value);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) scopedPreScanExpr(*ts->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition) scopedPreScanExpr(*ifs->ifBranch.condition);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) scopedPreScanStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) scopedPreScanExpr(*el.condition);
+            for (const auto& bs : el.body)
+                if (bs) scopedPreScanStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) scopedPreScanStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) scopedPreScanExpr(*ws->condition);
+        for (const auto& bs : ws->body)
+            if (bs) scopedPreScanStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        // The iteration variable's LocalSymbol anchors on the ForStmt node.
+        scopedDeclOrder_[fs] = scopedDeclCounter_++;
+        if (fs->iterable) scopedPreScanExpr(*fs->iterable);
+        if (fs->withExpr) scopedPreScanExpr(*fs->withExpr);
+        for (const auto& bs : fs->body)
+            if (bs) scopedPreScanStmt(*bs);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) scopedPreScanStmt(*bs);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) scopedPreScanExpr(*is->target);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) scopedPreScanExpr(*ds->value);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) scopedPreScanExpr(*ys->value);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) scopedPreScanStmt(*bs);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) scopedPreScanExpr(*arm.guard);
+            if (arm.body) scopedPreScanStmt(*arm.body);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) scopedPreScanStmt(*bs);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) scopedPreScanExpr(*cs->scrutinee);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) scopedPreScanExpr(*arm.guard);
+            if (arm.exprBody) scopedPreScanExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) scopedPreScanStmt(*bs);
+        }
+        return;
+    }
+    // Break/Continue: nothing to scan.
+}
+
+void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
+    // Call-like nodes: run the §28.14 admission for each arg whose formal is
+    // `scoped`, then descend.
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
+    const ast::Expr* callee = nullptr;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+        callee = ce->callee.get();
+    else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+        callee = nc->callee.get();
+    if (const auto* args = scopedArgsOf(e)) {
+        for (std::size_t i = 0; i < args->size(); ++i) {
+            const auto& a = (*args)[i];
+            if (!a.value) continue;
+            if (scopedFormalAt(callee, ne, i))
+                checkScopedAdmission(e, callee, ne, *a.value);
+            scopedPreScanExpr(*a.value);
+        }
+        if (callee) scopedPreScanExpr(*callee);
+        return;
+    }
+    // Structural recursion over the remaining expression forms.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) scopedPreScanExpr(*ma->target);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) scopedPreScanExpr(*nm->target);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) scopedPreScanExpr(*ix->target);
+        for (const auto& a : ix->indices)
+            if (a.value) scopedPreScanExpr(*a.value);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) scopedPreScanExpr(*be->left);
+        if (be->right) scopedPreScanExpr(*be->right);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) scopedPreScanExpr(*un->operand);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) scopedPreScanExpr(*pb->operand);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) scopedPreScanExpr(*tt->operand);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) scopedPreScanExpr(*cd->condition);
+        if (cd->thenValue) scopedPreScanExpr(*cd->thenValue);
+        if (cd->elseValue) scopedPreScanExpr(*cd->elseValue);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) scopedPreScanExpr(*th->operand);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo) scopedPreScanExpr(*rg->lo);
+        if (rg->hi) scopedPreScanExpr(*rg->hi);
+        if (rg->step) scopedPreScanExpr(*rg->step);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) scopedPreScanExpr(*we->source);
+        for (const auto& ia : we->assigns)
+            if (ia.value) scopedPreScanExpr(*ia.value);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) scopedPreScanExpr(*k);
+        for (const auto& el : cl->elements)
+            if (el) scopedPreScanExpr(*el);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) scopedPreScanExpr(*part.expr);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // Walk lambda bodies too: a Spawn call inside a lambda still needs
+        // admission, and lambda-internal locals need declaration indices so
+        // an inner `using var` scope can be a bounding object.
+        if (lam->exprBody) scopedPreScanExpr(*lam->exprBody);
+        for (const auto& bs : lam->stmts)
+            if (bs) scopedPreScanStmt(*bs);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) scopedPreScanExpr(*cx->scrutinee);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) scopedPreScanExpr(*arm.guard);
+            if (arm.exprBody) scopedPreScanExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) scopedPreScanStmt(*bs);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit: no children
+    // with calls.
+}
+
+bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
+                                     const ast::NewExpr* ne,
+                                     std::size_t argPos) {
+    // Constructor form: match the ctor by arg count (as recordMovesIn does).
+    if (ne) {
+        if (!ne->type) return false;
+        const sema::TypeRef* rt = ctx_.resolvedType(*ne->type);
+        if (!rt || !rt->declaration) return false;
+        for (sema::Symbol* m : rt->declaration->members) {
+            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (d && d->params.size() == ne->args.size()) {
+                    return argPos < d->params.size() &&
+                           d->params[argPos].modifier == "scoped";
+                }
+            }
+        }
+        return false;
+    }
+    if (!callee) return false;
+    // User method: the resolved MethodSymbol's AST params carry the modifier.
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee))) {
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            return argPos < md->params.size() &&
+                   md->params[argPos].modifier == "scoped";
+        }
+    }
+    // Builtin: TaskScope.Spawn(scoped body: () -> Task) — stdlib §6.10.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
+        if (ma->member == "Spawn" && argPos == 0 && ma->target &&
+            typeRefIsTaskScope(ctx_.exprType(*ma->target)))
+            return true;
+    }
+    // Function VALUE callee whose Function type carries a scoped position
+    // (`var g: (scoped () -> Task) -> ()` … `g(cb)`).
+    if (const sema::TypeRef* ft = ctx_.exprType(*callee)) {
+        if (ft->kind == sema::TypeRef::Kind::Function &&
+            argPos < ft->funcParams.size())
+            return ft->funcParams[argPos].modifier == "scoped";
+    }
+    return false;
+}
+
+const ast::LocalDecl* MethodOwnership::scopedBoundingLocal(
+    const ast::Expr& callNode, const ast::Expr* callee,
+    const ast::NewExpr* ne) {
+    // Form 1 — constructor call: the constructed object. Usable as a bound
+    // only when the NewExpr IS the initializer of a using/await-using local.
+    if (ne) {
+        auto it = scopedInitOfUsingLocal_.find(&callNode);
+        return it != scopedInitOfUsingLocal_.end() ? it->second : nullptr;
+    }
+    if (!callee) return nullptr;
+    // Form 2 — a call whose return is `owned` AND is the initializer of a
+    // using/await-using local: the returned object.
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee))) {
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (md->returnOwned) {
+                auto it = scopedInitOfUsingLocal_.find(&callNode);
+                if (it != scopedInitOfUsingLocal_.end()) return it->second;
+            }
+        }
+    }
+    // Form 3 — otherwise the receiver: admissible only when the receiver is a
+    // bare identifier naming a using/await-using local.
+    const ast::Expr* recv = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        recv = ma->target.get();
+    else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        recv = nm->target.get();
+    if (!recv) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv);
+    if (!id || id->name == "this" || id->name == "base") return nullptr;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls || !ls->isUsing) return nullptr;
+    return dynamic_cast<const ast::LocalDecl*>(ls->decl);
+}
+
+void MethodOwnership::scopedCollectCaptures(
+    const ast::LambdaExpr& lam,
+    std::vector<const ast::IdentifierExpr*>& out) {
+    if (lam.exprBody) scopedCaptureWalkExpr(*lam.exprBody, out);
+    for (const auto& bs : lam.stmts)
+        if (bs) scopedCaptureWalkStmt(*bs, out);
+}
+
+void MethodOwnership::scopedCaptureWalkStmt(
+    const ast::Stmt& s, std::vector<const ast::IdentifierExpr*>& out) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) scopedCaptureWalkExpr(*ld->initializer, out);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) scopedCaptureWalkExpr(*lc->value, out);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) scopedCaptureWalkExpr(*rs->value, out);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) scopedCaptureWalkExpr(*es->expr, out);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) scopedCaptureWalkExpr(*as->target, out);
+        if (as->value) scopedCaptureWalkExpr(*as->value, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) scopedCaptureWalkExpr(*ts->value, out);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            scopedCaptureWalkExpr(*ifs->ifBranch.condition, out);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) scopedCaptureWalkExpr(*el.condition, out);
+            for (const auto& bs : el.body)
+                if (bs) scopedCaptureWalkStmt(*bs, out);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) scopedCaptureWalkExpr(*ws->condition, out);
+        for (const auto& bs : ws->body)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) scopedCaptureWalkExpr(*fs->iterable, out);
+        if (fs->withExpr) scopedCaptureWalkExpr(*fs->withExpr, out);
+        for (const auto& bs : fs->body)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) scopedCaptureWalkExpr(*is->target, out);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) scopedCaptureWalkExpr(*ds->value, out);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) scopedCaptureWalkExpr(*ys->value, out);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) scopedCaptureWalkExpr(*arm.guard, out);
+            if (arm.body) scopedCaptureWalkStmt(*arm.body, out);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) scopedCaptureWalkStmt(*bs, out);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) scopedCaptureWalkExpr(*cs->scrutinee, out);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) scopedCaptureWalkExpr(*arm.guard, out);
+            if (arm.exprBody) scopedCaptureWalkExpr(*arm.exprBody, out);
+            for (const auto& bs : arm.stmts)
+                if (bs) scopedCaptureWalkStmt(*bs, out);
+        }
+        return;
+    }
+    // Break/Continue: nothing.
+}
+
+void MethodOwnership::scopedCaptureWalkExpr(
+    const ast::Expr& e, std::vector<const ast::IdentifierExpr*>& out) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        out.push_back(id);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) scopedCaptureWalkExpr(*ma->target, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) scopedCaptureWalkExpr(*nm->target, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) scopedCaptureWalkExpr(*ce->callee, out);
+        for (const auto& a : ce->args)
+            if (a.value) scopedCaptureWalkExpr(*a.value, out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) scopedCaptureWalkExpr(*nc->callee, out);
+        for (const auto& a : nc->args)
+            if (a.value) scopedCaptureWalkExpr(*a.value, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) scopedCaptureWalkExpr(*a.value, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) scopedCaptureWalkExpr(*ix->target, out);
+        for (const auto& a : ix->indices)
+            if (a.value) scopedCaptureWalkExpr(*a.value, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) scopedCaptureWalkExpr(*be->left, out);
+        if (be->right) scopedCaptureWalkExpr(*be->right, out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) scopedCaptureWalkExpr(*un->operand, out);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) scopedCaptureWalkExpr(*pb->operand, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) scopedCaptureWalkExpr(*tt->operand, out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) scopedCaptureWalkExpr(*cd->condition, out);
+        if (cd->thenValue) scopedCaptureWalkExpr(*cd->thenValue, out);
+        if (cd->elseValue) scopedCaptureWalkExpr(*cd->elseValue, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) scopedCaptureWalkExpr(*th->operand, out);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo) scopedCaptureWalkExpr(*rg->lo, out);
+        if (rg->hi) scopedCaptureWalkExpr(*rg->hi, out);
+        if (rg->step) scopedCaptureWalkExpr(*rg->step, out);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) scopedCaptureWalkExpr(*we->source, out);
+        for (const auto& ia : we->assigns)
+            if (ia.value) scopedCaptureWalkExpr(*ia.value, out);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) scopedCaptureWalkExpr(*k, out);
+        for (const auto& el : cl->elements)
+            if (el) scopedCaptureWalkExpr(*el, out);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) scopedCaptureWalkExpr(*part.expr, out);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // A nested lambda's free variables are captures of the outer one.
+        scopedCollectCaptures(*lam, out);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) scopedCaptureWalkExpr(*cx->scrutinee, out);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) scopedCaptureWalkExpr(*arm.guard, out);
+            if (arm.exprBody) scopedCaptureWalkExpr(*arm.exprBody, out);
+            for (const auto& bs : arm.stmts)
+                if (bs) scopedCaptureWalkStmt(*bs, out);
+        }
+        return;
+    }
+    // Literals / typeof / nameof / default / unit: no identifiers.
+}
+
+void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
+                                           const ast::Expr* callee,
+                                           const ast::NewExpr* ne,
+                                           const ast::Expr& arg) {
+    // Classify the argument form and enumerate its captures.
+    std::vector<const ast::IdentifierExpr*> rawIds;
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
+        scopedCollectCaptures(*lam, rawIds);
+    } else if (dynamic_cast<const ast::NullLiteralExpr*>(&arg)) {
+        return;  // clearing a nullable scoped position — nothing captured
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&arg)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (ps->modifier == "scoped" && methodParamSet_.count(sym))
+                return;  // forwarding a scoped param — callee-side rule checks it
+        }
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+            // Bare method reference. A static method captures nothing; an
+            // instance method captures `this` (which outlives every local).
+            (void)ms;
+            return;
+        }
+        report(Severity::Error, arg.span.begin,
+               std::string("the captures of the function value `") +
+                   std::string(id->name) +
+                   "` cannot be verified at this `scoped` call site — pass "
+                   "the lambda literal directly, or a capture-free function "
+                   "(§28.14, v0.175)");
+        return;
+    } else if (auto* mref = dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
+        // Method reference `obj.M`: its captured environment is the receiver
+        // (§28.3 / §27.6) — enumerate the receiver's identifier roots.
+        if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(arg)) &&
+            mref->target) {
+            scopedCaptureWalkExpr(*mref->target, rawIds);
+        } else {
+            report(Severity::Error, arg.span.begin,
+                   "the captures of this function-typed expression cannot be "
+                   "verified at this `scoped` call site — pass a lambda "
+                   "literal, a method reference, or a capture-free function "
+                   "(§28.14, v0.175)");
+            return;
+        }
+    } else {
+        report(Severity::Error, arg.span.begin,
+               "the captures of this function-typed expression cannot be "
+               "verified at this `scoped` call site — pass a lambda literal, "
+               "a method reference, or a capture-free function (§28.14, "
+               "v0.175)");
+        return;
+    }
+
+    // Reduce raw identifiers to CAPTURED SOURCES: enclosing-method locals and
+    // parameters whose referent's lifetime is scope-bound. Lambda-internal
+    // names, statics, value-typed locals (their captured box outlives every
+    // scope), and `this`-mediated members (fields/methods — `this` is a
+    // caller-frame borrow that outlives every local of this frame) are not
+    // order-constrained sources. // per §28.14
+    struct Source {
+        const ast::IdentifierExpr* id;
+        sema::Symbol* sym;          // null for `this`
+        const ast::Node* declNode;  // null for params / this
+    };
+    std::vector<Source> sources;
+    bool anyCapture = false;
+    std::unordered_set<sema::Symbol*> seen;
+    for (const ast::IdentifierExpr* id : rawIds) {
+        if (id->name == "this" || id->name == "base") {
+            anyCapture = true;  // a borrow of the receiver — needs a bound,
+                                // but always precedes every local
+            continue;
+        }
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym || !seen.insert(sym).second) continue;
+        if (isCatchBorrow(sym)) {
+            report(Severity::Error, id->span.begin,
+                   std::string("closure bound to a `scoped` parameter "
+                               "captures the caught exception `") +
+                       std::string(sym->name) +
+                       "` — a caught exception is a borrow whose lifetime is "
+                       "the catch arm body; a stored callback outlives it "
+                       "(§28.14, §31.1)");
+            return;
+        }
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (!methodParamSet_.count(sym)) continue;  // lambda-internal param
+            anyCapture = true;
+            // Parameters precede every local — declaration order holds. An
+            // `owned` parameter is still a freezable source (it can be moved).
+            if (ps->modifier == "owned")
+                sources.push_back({id, sym, nullptr});
+            continue;
+        }
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // Value-typed captures live in their (heap) capture box, which the
+            // closure keeps alive — no lifetime constraint. Only a capture of
+            // a class/interface reference can dangle. Null declType stays
+            // conservative (treated as a reference).
+            if (ls->declType && !isBorrowableType(ls->declType)) continue;
+            anyCapture = true;
+            sources.push_back({id, sym, ls->decl});
+            continue;
+        }
+        if (dynamic_cast<sema::FieldSymbol*>(sym) ||
+            dynamic_cast<sema::MethodSymbol*>(sym) ||
+            dynamic_cast<sema::PropertySymbol*>(sym) ||
+            dynamic_cast<sema::EventSymbol*>(sym)) {
+            // Implicit `this` capture: needs a bound, precedes every local.
+            // (A static member would be admissible without a bound, but the
+            // conservative treatment only requires the bound — sound.)
+            anyCapture = true;
+            continue;
+        }
+        // TypeSymbol / const / enum constant / module: not a capture.
+    }
+
+    if (!anyCapture) return;  // capture-free callbacks are always admitted
+
+    const ast::LocalDecl* bounding = scopedBoundingLocal(callNode, callee, ne);
+    if (!bounding) {
+        report(Severity::Error, arg.span.begin,
+               "a capture-bearing closure is not admitted here: the call's "
+               "bounding object does not resolve to a `using var`/`await "
+               "using var` local (§28.14 — a plain expression, field, or "
+               "non-initializer receiver admits only capture-free "
+               "callbacks); bind the receiving object in a `using var` and "
+               "call through it");
+        return;
+    }
+    auto bIt = scopedDeclOrder_.find(bounding);
+    const int boundIdx =
+        bIt != scopedDeclOrder_.end() ? bIt->second : -1;
+    for (const Source& src : sources) {
+        // SELF-CAPTURE: the callback captures the bounding local ITSELF (the
+        // §28.14 re-registration idiom — `scope.Spawn(() => … scope.Spawn(…))`,
+        // considered in the #808 memo's adversarial analysis). Sound: the
+        // callback is stored IN the bounding object and every invocation
+        // happens before its disposal completes; during the drain the object
+        // is logically disposed but physically alive (§28.12), so the capture
+        // never dangles. No freeze needed — a using var is already unmovable
+        // and unreassignable. (The spec's "declared before L" sentence does
+        // not name this corner; recorded as an interpretation to ratify.)
+        if (src.declNode == static_cast<const ast::Node*>(bounding)) continue;
+        if (!src.declNode) {
+            // Enclosing-method parameter: precedes every local. Freeze below.
+        } else {
+            auto sIt = scopedDeclOrder_.find(src.declNode);
+            const bool ok = sIt != scopedDeclOrder_.end() && boundIdx >= 0 &&
+                            sIt->second < boundIdx;
+            if (!ok) {
+                report(
+                    Severity::Error, src.id->span.begin,
+                    std::string("captured source `") +
+                        std::string(src.id->name) +
+                        "` is not declared before the bounding `using var` `" +
+                        std::string(bounding->name) +
+                        "` — every captured source must be declared before "
+                        "the bounding object so it provably outlives every "
+                        "invocation of the stored callback (§28.14, v0.175; "
+                        "declare `" +
+                        std::string(src.id->name) + "` before `" +
+                        std::string(bounding->name) + "`)");
+                return;
+            }
+        }
+        // §28.14 freeze: no move / dispose / reassign of the source until the
+        // bounding local's scope exits. Keep the FIRST admission site.
+        scopedFrozen_.emplace(src.sym,
+                              ScopedFreeze{bounding->name,
+                                           callNode.span.begin});
+    }
+}
+
+void MethodOwnership::checkScopedFreeze(std::string_view name,
+                                        SourceLocation loc,
+                                        std::string_view action) {
+    for (const auto& [sym, fr] : scopedFrozen_) {
+        if (!sym || sym->name != name) continue;
+        // Only mutation AT-OR-AFTER the admission site violates the freeze
+        // (source order; a move before the callback was ever admitted is the
+        // ordinary §28.3 regime). Loop-carried mutation that lexically
+        // precedes the admission is not caught here — recorded residual.
+        if (loc.offset < fr.admissionLoc.offset) continue;
+        report(Severity::Error, loc,
+               std::string("cannot ") + std::string(action) + " `" +
+                   std::string(name) +
+                   "`: it is captured by a callback stored under a `scoped` "
+                   "parameter bounded by `" +
+                   std::string(fr.boundingName) +
+                   "`, and captured sources are frozen until that scope "
+                   "exits (§28.14, v0.175)");
+        return;
+    }
+}
+
+// -- §28.14 callee verification ---------------------------------------------
+
+int MethodOwnership::scopedUseKind(const ast::Expr& e,
+                                   std::string_view* nameOut) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (ps->modifier == "scoped" && methodParamSet_.count(sym)) {
+                if (nameOut) *nameOut = id->name;
+                return 1;
+            }
+        }
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) {
+            for (std::string_view mod : fs->modifiers) {
+                if (mod == "scoped") {
+                    if (nameOut) *nameOut = id->name;
+                    return 2;
+                }
+            }
+        }
+        return 0;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // `this._f` — a this-qualified scoped-field use.
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid || tid->name != "this") return 0;
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e))) {
+            for (std::string_view mod : fs->modifiers) {
+                if (mod == "scoped") {
+                    if (nameOut) *nameOut = ma->member;
+                    return 2;
+                }
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+bool MethodOwnership::scopedRestrictedUse(const ast::Expr& e,
+                                          std::string_view context) {
+    std::string_view name;
+    int kind = scopedUseKind(e, &name);
+    if (kind == 0) return false;
+    if (kind == 1) {
+        report(Severity::Error, e.span.begin,
+               std::string("`") + std::string(name) +
+                   "` is a `scoped` parameter — it may only be invoked, "
+                   "stored into a `scoped` field of `this`, or forwarded to "
+                   "a `scoped` parameter of a call on `this`; it may not " +
+                   std::string(context) + " (§28.14, v0.175)");
+    } else {
+        report(Severity::Error, e.span.begin,
+               std::string("`") + std::string(name) +
+                   "` is a `scoped` field — it may be invoked, overwritten "
+                   "from a `scoped` parameter, or cleared to null, but never "
+                   "read out as an escaping value; it may not " +
+                   std::string(context) + " (§28.14, v0.175)");
+    }
+    return true;
+}
+
+void MethodOwnership::scopedCalleeScan(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body)
+        if (s) scopedCalleeWalkStmt(*s);
+}
+
+void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // Store INTO a scoped field of `this`: RHS must be a scoped parameter
+        // of this method, or the null literal (clear). // per §28.14
+        if (as->target && scopedUseKind(*as->target) == 2) {
+            if (as->op != ":=") {
+                report(Severity::Error, as->target->span.begin,
+                       "a `scoped` field admits only plain assignment from a "
+                       "`scoped` parameter or `null` (§28.14, v0.175)");
+                return;
+            }
+            if (as->value) {
+                if (dynamic_cast<const ast::NullLiteralExpr*>(as->value.get()))
+                    return;  // clear — always admitted
+                if (scopedUseKind(*as->value) == 1) return;  // store the param
+                report(Severity::Error, as->value->span.begin,
+                       "a `scoped` field may only be assigned a `scoped` "
+                       "parameter of the enclosing method/constructor, or "
+                       "cleared to `null` — any other value's captures were "
+                       "never admitted against this object's bound (§28.14, "
+                       "v0.175)");
+            }
+            return;
+        }
+        // Store into ANOTHER object's scoped field (`x._f := …`): the callee
+        // may store only into the bounding object ITSELF. // per §28.14
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(as->target.get())) {
+            if (auto* fsym =
+                    dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma))) {
+                bool isScopedField = false;
+                for (std::string_view mod : fsym->modifiers)
+                    if (mod == "scoped") isScopedField = true;
+                auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+                const bool thisTarget = tid && tid->name == "this";
+                if (isScopedField && !thisTarget) {
+                    report(Severity::Error, as->target->span.begin,
+                           "a callback may be stored only into a `scoped` "
+                           "field of the bounding object ITSELF — storing "
+                           "into another object's `scoped` field extends the "
+                           "callback past its bound (§28.14, v0.175)");
+                    return;
+                }
+            }
+        }
+        // A scoped PARAMETER as assignment target (reassignment).
+        if (as->target && scopedUseKind(*as->target) == 1) {
+            report(Severity::Error, as->target->span.begin,
+                   "a `scoped` parameter may not be reassigned (§28.14, "
+                   "v0.175)");
+            return;
+        }
+        if (as->target) scopedCalleeWalkExpr(*as->target);
+        if (as->value) scopedCalleeWalkExpr(*as->value);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) {
+            if (scopedRestrictedUse(*rs->value, "be returned")) return;
+            scopedCalleeWalkExpr(*rs->value);
+        }
+        return;
+    }
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) {
+            if (scopedRestrictedUse(*ld->initializer,
+                                    "be bound to a local"))
+                return;
+            scopedCalleeWalkExpr(*ld->initializer);
+        }
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) scopedCalleeWalkExpr(*lc->value);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) scopedCalleeWalkExpr(*es->expr);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) scopedCalleeWalkExpr(*ts->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            scopedCalleeWalkExpr(*ifs->ifBranch.condition);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) scopedCalleeWalkExpr(*el.condition);
+            for (const auto& bs : el.body)
+                if (bs) scopedCalleeWalkStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) scopedCalleeWalkExpr(*ws->condition);
+        for (const auto& bs : ws->body)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) scopedCalleeWalkExpr(*fs->iterable);
+        if (fs->withExpr) scopedCalleeWalkExpr(*fs->withExpr);
+        for (const auto& bs : fs->body)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) scopedCalleeWalkExpr(*is->target);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) {
+            if (scopedRestrictedUse(*ds->value, "be discarded")) return;
+            scopedCalleeWalkExpr(*ds->value);
+        }
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) {
+            if (scopedRestrictedUse(*ys->value, "be yielded")) return;
+            scopedCalleeWalkExpr(*ys->value);
+        }
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) scopedCalleeWalkExpr(*arm.guard);
+            if (arm.body) scopedCalleeWalkStmt(*arm.body);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) scopedCalleeWalkExpr(*cs->scrutinee);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) scopedCalleeWalkExpr(*arm.guard);
+            if (arm.exprBody) scopedCalleeWalkExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) scopedCalleeWalkStmt(*bs);
+        }
+        return;
+    }
+}
+
+void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
+    // Admitted context 1: INVOCATION — the scoped param / field is the callee.
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        const bool calleeIsScoped =
+            ce->callee && scopedUseKind(*ce->callee) != 0;
+        if (!calleeIsScoped && ce->callee) scopedCalleeWalkExpr(*ce->callee);
+        for (std::size_t i = 0; i < ce->args.size(); ++i) {
+            const auto& a = ce->args[i];
+            if (!a.value) continue;
+            std::string_view name;
+            int kind = scopedUseKind(*a.value, &name);
+            if (kind == 1) {
+                // Admitted context 3: FORWARDING to a scoped parameter of a
+                // call whose bounding object is the same object (`this`).
+                bool formalScoped =
+                    scopedFormalAt(ce->callee.get(), nullptr, i);
+                bool onThis = false;
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce->callee.get())) {
+                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get());
+                    onThis = tid && tid->name == "this";
+                } else if (auto* cid =
+                               dynamic_cast<const ast::IdentifierExpr*>(
+                                   ce->callee.get())) {
+                    // Bare method name: an instance method of this class —
+                    // receiver is the implicit `this`.
+                    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                            ctx_.exprSymbol(*cid))) {
+                        onThis = true;
+                        for (std::string_view mod : ms->modifiers)
+                            if (mod == "static") onThis = false;
+                    }
+                }
+                if (formalScoped && onThis) continue;  // admitted forward
+                report(Severity::Error, a.value->span.begin,
+                       std::string("`") + std::string(name) +
+                           "` is a `scoped` parameter — it may be forwarded "
+                           "only to another `scoped` parameter of a call on "
+                           "the same bounding object (`this`) (§28.14, "
+                           "v0.175)");
+                continue;
+            }
+            if (kind == 2) {
+                report(Severity::Error, a.value->span.begin,
+                       std::string("`") + std::string(name) +
+                           "` is a `scoped` field — it is never readable-out "
+                           "as an escaping value, including as a call "
+                           "argument (§28.14, v0.175)");
+                continue;
+            }
+            scopedCalleeWalkExpr(*a.value);
+        }
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        // `_f?(...)` — null-conditional invocation of a nullable scoped field.
+        const bool calleeIsScoped =
+            nc->callee && scopedUseKind(*nc->callee) != 0;
+        if (!calleeIsScoped && nc->callee) scopedCalleeWalkExpr(*nc->callee);
+        for (const auto& a : nc->args) {
+            if (!a.value) continue;
+            if (scopedRestrictedUse(*a.value, "be passed here")) continue;
+            scopedCalleeWalkExpr(*a.value);
+        }
+        return;
+    }
+    // Admitted context 2: null comparison (`_f <> null`, `cb = null`) — a
+    // narrowing test, not an escaping read.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if ((be->op == "=" || be->op == "<>") && be->left && be->right) {
+            const bool leftNull =
+                dynamic_cast<const ast::NullLiteralExpr*>(be->left.get()) !=
+                nullptr;
+            const bool rightNull =
+                dynamic_cast<const ast::NullLiteralExpr*>(be->right.get()) !=
+                nullptr;
+            if (leftNull != rightNull) {
+                const ast::Expr& other = leftNull ? *be->right : *be->left;
+                if (scopedUseKind(other) != 0) return;  // admitted test
+            }
+        }
+        if (be->left) scopedCalleeWalkExpr(*be->left);
+        if (be->right) scopedCalleeWalkExpr(*be->right);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args) {
+            if (!a.value) continue;
+            // Forwarding into a CONSTRUCTOR is never same-object (the new
+            // object is a different bounding object). // per §28.14
+            if (scopedRestrictedUse(*a.value,
+                                    "be passed to a constructor"))
+                continue;
+            scopedCalleeWalkExpr(*a.value);
+        }
+        return;
+    }
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (scopedUseKind(e) != 0) {
+            scopedRestrictedUse(e, "be read as a value");
+            return;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target) scopedCalleeWalkExpr(*ma->target);
+        }
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) scopedCalleeWalkExpr(*nm->target);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) scopedCalleeWalkExpr(*ix->target);
+        for (const auto& a : ix->indices)
+            if (a.value) scopedCalleeWalkExpr(*a.value);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) {
+            if (un->op == "move" &&
+                scopedRestrictedUse(*un->operand, "be moved"))
+                return;
+            scopedCalleeWalkExpr(*un->operand);
+        }
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) scopedCalleeWalkExpr(*pb->operand);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) scopedCalleeWalkExpr(*tt->operand);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) scopedCalleeWalkExpr(*cd->condition);
+        if (cd->thenValue) scopedCalleeWalkExpr(*cd->thenValue);
+        if (cd->elseValue) scopedCalleeWalkExpr(*cd->elseValue);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) scopedCalleeWalkExpr(*th->operand);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo) scopedCalleeWalkExpr(*rg->lo);
+        if (rg->hi) scopedCalleeWalkExpr(*rg->hi);
+        if (rg->step) scopedCalleeWalkExpr(*rg->step);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) scopedCalleeWalkExpr(*we->source);
+        for (const auto& ia : we->assigns)
+            if (ia.value) scopedCalleeWalkExpr(*ia.value);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) scopedCalleeWalkExpr(*k);
+        for (const auto& el : cl->elements)
+            if (el) scopedCalleeWalkExpr(*el);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) scopedCalleeWalkExpr(*part.expr);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // A lambda CAPTURING a scoped param/field would let it escape through
+        // the closure — every use inside the body is checked as a bare use.
+        if (lam->exprBody) scopedCalleeWalkExpr(*lam->exprBody);
+        for (const auto& bs : lam->stmts)
+            if (bs) scopedCalleeWalkStmt(*bs);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) scopedCalleeWalkExpr(*cx->scrutinee);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) scopedCalleeWalkExpr(*arm.guard);
+            if (arm.exprBody) scopedCalleeWalkExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) scopedCalleeWalkStmt(*bs);
+        }
+        return;
+    }
+}
+
+// -- stdlib §6.10: TaskScope consumption ------------------------------------
+
+void MethodOwnership::taskScopeUsageScanExpr(const ast::Expr& e,
+                                             std::string_view name,
+                                             bool& sawAwaitJoin,
+                                             bool& sawDelegation) {
+    // `await <name>.Join()`
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->op == "await" && un->operand) {
+            if (auto* ce =
+                    dynamic_cast<const ast::CallExpr*>(un->operand.get())) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce->callee.get())) {
+                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get());
+                    if (tid && tid->name == name && ma->member == "Join")
+                        sawAwaitJoin = true;
+                }
+            }
+        }
+        if (un->operand)
+            taskScopeUsageScanExpr(*un->operand, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    // A bare-`name` call ARGUMENT delegates the scope (the callee may join
+    // it) — the missing-Join error is then not provable here.
+    auto scanArgs = [&](const std::vector<ast::CallArgument>& args) {
+        for (const auto& a : args) {
+            if (!a.value) continue;
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                if (id->name == name) sawDelegation = true;
+            taskScopeUsageScanExpr(*a.value, name, sawAwaitJoin,
+                                   sawDelegation);
+        }
+    };
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee)
+            taskScopeUsageScanExpr(*ce->callee, name, sawAwaitJoin,
+                                   sawDelegation);
+        scanArgs(ce->args);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee)
+            taskScopeUsageScanExpr(*nc->callee, name, sawAwaitJoin,
+                                   sawDelegation);
+        scanArgs(nc->args);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        scanArgs(ne->args);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target)
+            taskScopeUsageScanExpr(*ma->target, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left)
+            taskScopeUsageScanExpr(*be->left, name, sawAwaitJoin,
+                                   sawDelegation);
+        if (be->right)
+            taskScopeUsageScanExpr(*be->right, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // A lambda capturing the scope may Join it (a worker helper): treat
+        // as delegation — not provably missing.
+        std::vector<const ast::IdentifierExpr*> ids;
+        scopedCollectCaptures(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids)
+            if (id->name == name) sawDelegation = true;
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition)
+            taskScopeUsageScanExpr(*cd->condition, name, sawAwaitJoin,
+                                   sawDelegation);
+        if (cd->thenValue)
+            taskScopeUsageScanExpr(*cd->thenValue, name, sawAwaitJoin,
+                                   sawDelegation);
+        if (cd->elseValue)
+            taskScopeUsageScanExpr(*cd->elseValue, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+}
+
+void MethodOwnership::taskScopeUsageScanStmt(const ast::Stmt& s,
+                                             std::string_view name,
+                                             bool& sawAwaitJoin,
+                                             bool& sawDelegation) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer)
+            taskScopeUsageScanExpr(*ld->initializer, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr)
+            taskScopeUsageScanExpr(*es->expr, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value)
+            taskScopeUsageScanExpr(*as->value, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value)
+            taskScopeUsageScanExpr(*rs->value, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            taskScopeUsageScanExpr(*ifs->ifBranch.condition, name,
+                                   sawAwaitJoin, sawDelegation);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition)
+                taskScopeUsageScanExpr(*el.condition, name, sawAwaitJoin,
+                                       sawDelegation);
+            for (const auto& bs : el.body)
+                if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                               sawDelegation);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition)
+            taskScopeUsageScanExpr(*ws->condition, name, sawAwaitJoin,
+                                   sawDelegation);
+        for (const auto& bs : ws->body)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable)
+            taskScopeUsageScanExpr(*fs->iterable, name, sawAwaitJoin,
+                                   sawDelegation);
+        for (const auto& bs : fs->body)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        for (const auto& arm : trys->catches)
+            if (arm.body) taskScopeUsageScanStmt(*arm.body, name,
+                                                 sawAwaitJoin, sawDelegation);
+        for (const auto& bs : trys->finallyBody)
+            if (bs) taskScopeUsageScanStmt(*bs, name, sawAwaitJoin,
+                                           sawDelegation);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value)
+            taskScopeUsageScanExpr(*ds->value, name, sawAwaitJoin,
+                                   sawDelegation);
+        return;
+    }
+}
+
+void MethodOwnership::checkTaskScopeConsumption(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // Collect every await-using TaskScope local, then check §6.10's
+    // mandatory `await Join()` on the provable subset: no `await L.Join()`
+    // anywhere AND `L` is never delegated (passed / captured) — then the
+    // normal path certainly lacks the join and the error is deterministic at
+    // compile time; otherwise the runtime IOE from DisposeAsync backstops.
+    std::function<void(const ast::Stmt&)> scan = [&](const ast::Stmt& s) {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+            const bool isTS =
+                (ld->type && typeRefIsTaskScope(ctx_.resolvedType(*ld->type))) ||
+                (ld->initializer && exprTypeIsTaskScope(*ld->initializer));
+            if (isTS && ld->isUsing && !ld->isAwaitUsing) {
+                report(Severity::Error, ld->span.begin,
+                       std::string("`") + std::string(ld->name) +
+                           "` is a TaskScope — it may only be consumed by "
+                           "`await using` (stdlib §6.10, v0.175): a "
+                           "synchronous `using var` cannot await the drain "
+                           "of its children; write `await using var " +
+                           std::string(ld->name) + " := …`");
+            } else if (isTS && ld->isAwaitUsing) {
+                bool sawAwaitJoin = false, sawDelegation = false;
+                for (const auto& bs : body)
+                    if (bs) taskScopeUsageScanStmt(*bs, ld->name,
+                                                   sawAwaitJoin,
+                                                   sawDelegation);
+                if (!sawAwaitJoin && !sawDelegation) {
+                    report(Severity::Error, ld->span.begin,
+                           std::string("`await ") + std::string(ld->name) +
+                               ".Join()` is missing on the normal path — "
+                               "Join is the sole re-raise site for child "
+                               "faults and is mandatory before the scope is "
+                               "disposed (stdlib §6.10, v0.175)");
+                }
+            } else if (isTS && !ld->isUsing) {
+                report(Severity::Error, ld->span.begin,
+                       std::string("`") + std::string(ld->name) +
+                           "` is a TaskScope bound to a plain `var` — a "
+                           "TaskScope may only be consumed by `await using` "
+                           "(stdlib §6.10, v0.175); dropping it undisposed "
+                           "or disposing it synchronously cannot await the "
+                           "drain of its children");
+            }
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+            if (ds->value && exprTypeIsTaskScope(*ds->value)) {
+                report(Severity::Error, ds->value->span.begin,
+                       "a TaskScope may not be discarded — it may only be "
+                       "consumed by `await using` (stdlib §6.10, v0.175)");
+            }
+            return;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            for (const auto& bs : ifs->ifBranch.body) if (bs) scan(*bs);
+            for (const auto& el : ifs->elifBranches)
+                for (const auto& bs : el.body) if (bs) scan(*bs);
+            for (const auto& bs : ifs->elseBody) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+            for (const auto& bs : ws->body) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+            for (const auto& bs : fs->body) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            for (const auto& bs : db->body) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            for (const auto& bs : trys->body) if (bs) scan(*bs);
+            for (const auto& arm : trys->catches)
+                if (arm.body) scan(*arm.body);
+            for (const auto& bs : trys->finallyBody) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+            // `scope.Dispose()` — a synchronous dispose of a TaskScope.
+            if (auto* ce =
+                    dynamic_cast<const ast::CallExpr*>(es->expr.get())) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce->callee.get())) {
+                    if (ma->member == "Dispose" && ma->target &&
+                        exprTypeIsTaskScope(*ma->target)) {
+                        report(Severity::Error, es->expr->span.begin,
+                               "a TaskScope may not be disposed "
+                               "synchronously — its drain must be awaited; "
+                               "it may only be consumed by `await using` "
+                               "(stdlib §6.10, v0.175)");
+                    }
+                }
+            }
+            return;
+        }
+    };
+    for (const auto& s : body)
+        if (s) scan(*s);
 }
 
 } // namespace bezel::ownership

@@ -26,6 +26,7 @@
 // C++ std for the thread-pool implementation
 #include <atomic>
 #include <algorithm>
+#include <cassert>
 #include <deque>
 #include <mutex>
 #include <condition_variable>
@@ -13256,6 +13257,449 @@ void bz_tcs_dispose_owned_result(void* t) {
 }
 
 } // extern "C" (TCS)
+
+// ---------------------------------------------------------------------------
+// stdlib §6.10 / spec §28.14 (v0.175, #808): TaskScope — the structured-
+// concurrency nursery.
+//
+// bz_task_scope_t: an internal cancellation state cell (the same
+// bz_cancel_state_t the CTS machinery uses — Token/Cancel/CancelAfter reuse
+// the #810/#1413 paths verbatim), a pending-children counter, a closed flag,
+// and the first-fault record. There is NO stored child list: each spawned
+// child registers a completion continuation (bz_task_then → domain_enqueue,
+// so it runs domain-serialized) that records the fault (first-fault-wins,
+// cancelling siblings via the internal token), frees the child task, releases
+// the callback closure's +1, and decrements `pending`; the LAST completion
+// finalizes whichever join/dispose waiter is parked.
+//
+// Lifecycle (§6.10):
+//   Spawn  — invoke the callback synchronously on the calling (domain) thread
+//            (intra-domain; the child runs to its first suspension), retain
+//            nothing beyond the closure +1 (released at child completion).
+//            After close: InvalidOperationException via bz_exc (deterministic,
+//            never a silent extension of the drain).
+//   Join   — returns a task that completes when pending reaches 0 (drain-
+//            complete: children spawned DURING the drain increment `pending`
+//            before their spawner completes, so the counter never reaches 0
+//            early); completing Join marks the scope CLOSED and re-raises the
+//            FIRST fault (later faults were swallowed+disposed as they
+//            arrived).
+//   DisposeAsync (normal exit) — cancel the token, drain remaining children,
+//            SWALLOW their faults (Join is the sole re-raise site), then:
+//            if the scope was never Joined (missing await Join() on the
+//            normal path, not compile-provable) fault the dispose task with
+//            InvalidOperationException; else complete it. Frees the scope.
+//   Dispose (unwind edge / sync fallback) — cancel + NON-BLOCKING zombie
+//            drain: a blocking wait inside a domain continuation would
+//            deadlock (bz_task_await_sync aborts on it by design), so the
+//            scope is marked zombie and the LAST child completion frees it
+//            (faults swallowed+disposed; no leak, no UAF — the callbacks'
+//            captured boxes are runtime-managed). Residual: on this edge the
+//            enclosing frame's other disposals are not ordered after the
+//            drain (the §28.12 awaiting-across-unwind deferral); checked
+//            disposal mode's DisposedAccessException is the §28.2 backstop.
+// Quiescence (§28.14/§6.10 normative): the NORMAL-path DisposeAsync task
+// completes only after every child completed and was reclaimed; no callback
+// runs after it completes.
+// ---------------------------------------------------------------------------
+
+struct bz_task_scope_t {
+    std::mutex mtx;
+    bz_cancel_state_t* state;      // internal CTS state cell (scope holds rc 1)
+    int64_t pending = 0;           // children not yet completed
+    bool closed = false;           // Join completed or disposal began
+    bool joined = false;           // a Join re-raise point was reached
+    bool zombie = false;           // unwind-disposed; free at last completion
+    bool disposed = false;         // a dispose path ran (idempotence guard)
+    bool any_fault = false;        // first-fault latch
+    void* first_error_obj = nullptr;   // owned here until re-raised via Join
+    char* first_error_msg = nullptr;   // strdup'd when the fault carried only
+                                       // a message; owned here
+    std::vector<bz_task_t*> join_waiters;   // pending Join() aggregates
+    bz_task_t* dispose_waiter = nullptr;    // pending DisposeAsync task
+    bool dispose_missing_join = false;      // fault dispose_waiter with IOE
+    void* ioe_vtable = nullptr;    // InvalidOperationException vtable (codegen)
+};
+
+// Invoke a Bezel `() -> Task` closure from the runtime: fn at offset 0, env at
+// BZ_CLOSURE_ENV_OFFSET, env passed as the hidden first argument (the same ABI
+// bz_cancel_invoke_closure documents for `() -> ()`); returns the task ptr.
+static void* bz_scope_invoke_task_closure(void* closure) {
+    if (!closure) return nullptr;
+    void* fn = nullptr;
+    memcpy(&fn, closure, sizeof(void*));
+    if (!fn) return nullptr;
+    void* env = nullptr;
+    memcpy(&env, (uint8_t*)closure + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
+    typedef void* (*task_fn_t)(void*);
+    return ((task_fn_t)fn)(env);
+}
+
+// Dispose a swallowed Bezel exception object: dynamic dispatch through vtable
+// slot 2 (Dispose) then free — the bz_domain_spawn fault-wrap pattern.
+static void bz_scope_dispose_exc(void* exc) {
+    if (!exc) return;
+    void** vtbl = nullptr;
+    memcpy(&vtbl, exc, sizeof(void*));
+    if (vtbl && vtbl[2]) {
+        typedef void (*DispFn)(void*);
+        ((DispFn)vtbl[2])(exc);
+    }
+    free(exc);
+}
+
+// Build a 40-byte InvalidOperationException object with an optional message.
+static void* bz_scope_make_ioe(void* ioe_vtable, const char* msg) {
+    if (!ioe_vtable) return nullptr;
+    void* obj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+    if (!obj) return nullptr;
+    memcpy(obj, &ioe_vtable, sizeof(void*));
+    if (msg) {
+        void* s = bz_make_string(msg, (int64_t)strlen(msg));
+        memcpy((uint8_t*)obj + 8, &s, sizeof(void*));
+    }
+    return obj;
+}
+
+// Finalize helpers — called with sc->mtx HELD; they collect the completions
+// to perform and the caller performs them OUTSIDE the lock (completing a task
+// runs task_dispatch / domain_enqueue, which must not run under sc->mtx).
+namespace {
+struct BzScopeFinalActions {
+    std::vector<bz_task_t*> join_ok;      // complete with success
+    bz_task_t* join_fault = nullptr;      // complete with first_error_obj/msg
+    void* fault_obj = nullptr;
+    char* fault_msg = nullptr;            // ownership moves to this struct
+    bz_task_t* dispose_task = nullptr;    // complete (or IOE-fault) this
+    void* dispose_ioe = nullptr;          // non-null → fault dispose_task
+    void* swallow_obj = nullptr;          // dispose path: fault to dispose
+    bz_task_scope_t* free_scope = nullptr;  // zombie/dispose: free the struct
+};
+
+// Drain-complete (pending == 0): settle the parked waiters. Join waiters take
+// the fault (first waiter) / success; the dispose waiter swallows any
+// remaining fault and completes (or IOE-faults on the missing-Join edge).
+// Marks the scope CLOSED. Caller performs the returned actions off-lock.
+BzScopeFinalActions bz_scope_settle_locked(bz_task_scope_t* sc) {
+    BzScopeFinalActions act;
+    if (!sc->join_waiters.empty()) {
+        sc->closed = true;
+        sc->joined = true;
+        // First waiter re-raises the first fault; the rest see success.
+        act.join_fault = sc->join_waiters.front();
+        if (sc->any_fault) {
+            act.fault_obj = sc->first_error_obj;
+            act.fault_msg = sc->first_error_msg;
+            sc->first_error_obj = nullptr;
+            sc->first_error_msg = nullptr;
+            sc->any_fault = false;
+        }
+        for (std::size_t i = 1; i < sc->join_waiters.size(); ++i)
+            act.join_ok.push_back(sc->join_waiters[i]);
+        sc->join_waiters.clear();
+    }
+    if (sc->dispose_waiter) {
+        // Dispose path: swallow any un-re-raised fault (dispose it), then
+        // complete — or IOE-fault when Join was provably skipped at runtime.
+        act.swallow_obj = sc->first_error_obj;
+        sc->first_error_obj = nullptr;
+        free(sc->first_error_msg);
+        sc->first_error_msg = nullptr;
+        sc->any_fault = false;
+        act.dispose_task = sc->dispose_waiter;
+        sc->dispose_waiter = nullptr;
+        if (sc->dispose_missing_join)
+            act.dispose_ioe = bz_scope_make_ioe(
+                sc->ioe_vtable,
+                "TaskScope disposed without `await Join()` on the normal "
+                "path (stdlib \xC2\xA7""6.10)");
+        act.free_scope = sc;
+    } else if (sc->zombie) {
+        // Unwind edge: swallow the fault and free at last completion.
+        act.swallow_obj = sc->first_error_obj;
+        sc->first_error_obj = nullptr;
+        free(sc->first_error_msg);
+        sc->first_error_msg = nullptr;
+        sc->any_fault = false;
+        act.free_scope = sc;
+    }
+    return act;
+}
+
+void bz_scope_perform(BzScopeFinalActions& act) {
+    if (act.join_fault) {
+        if (act.fault_obj)
+            bz_task_complete_error_obj(act.join_fault, act.fault_obj);
+        else if (act.fault_msg)
+            bz_task_complete_error(act.join_fault, act.fault_msg);
+        else
+            bz_task_complete(act.join_fault, nullptr, 0);
+        free(act.fault_msg);
+        act.fault_msg = nullptr;
+    }
+    for (bz_task_t* t : act.join_ok) bz_task_complete(t, nullptr, 0);
+    if (act.swallow_obj) bz_scope_dispose_exc(act.swallow_obj);
+    if (act.dispose_task) {
+        if (act.dispose_ioe)
+            bz_task_complete_error_obj(act.dispose_task, act.dispose_ioe);
+        else
+            bz_task_complete(act.dispose_task, nullptr, 0);
+    }
+    if (act.free_scope) {
+        // §6.10 assert-no-children destructor: the scope is reclaimed only
+        // when every child has completed and been reclaimed.
+        assert(act.free_scope->pending == 0 &&
+               "TaskScope freed with live children");
+        if (act.free_scope->state) {
+            bz_cancel_state_release(act.free_scope->state);
+            act.free_scope->state = nullptr;
+        }
+        delete act.free_scope;
+    }
+}
+}  // namespace
+
+extern "C" {
+
+// stdlib §6.10: new TaskScope() — fresh internal CancellationTokenSource.
+void* bz_task_scope_new(void) {
+    auto* sc = new bz_task_scope_t();
+    sc->state = new bz_cancel_state_t();
+    sc->state->cancelled.store(0, std::memory_order_relaxed);
+    sc->state->rc.store(1, std::memory_order_relaxed);
+    return sc;
+}
+
+// Token property: the scope's CancellationToken handle (borrowed — the scope
+// keeps the cell alive; same contract as bz_cts_token).
+void* bz_task_scope_token(void* scp) {
+    auto* sc = (bz_task_scope_t*)scp;
+    if (!sc) return nullptr;
+    return sc->state;
+}
+
+// Cancel(): cancel all children now (latch + callbacks + cascade — the same
+// signal path as CancellationTokenSource.Cancel, #810).
+void bz_task_scope_cancel(void* scp) {
+    auto* sc = (bz_task_scope_t*)scp;
+    if (!sc || !sc->state) return;
+    bz_cancel_state_signal(sc->state);
+}
+
+// CancelAfter(delay): deadline for the whole scope — the #1413 timer path
+// (reschedule/later-call-wins via the state cell's generation counter).
+void bz_task_scope_cancel_after(void* scp, int64_t ms) {
+    auto* sc = (bz_task_scope_t*)scp;
+    if (!sc || !sc->state) return;
+    bz_cancel_state_t* s = sc->state;
+    uint64_t myGen = s->timer_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (!g_scheduler) bz_scheduler_init(4);
+    bz_timer_ensure();
+    int64_t d = ms < 0 ? 0 : ms;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(d);
+    bz_cancel_state_retain(s);
+    g_timer->schedule(deadline, [s, myGen]() {
+        if (s->timer_gen.load(std::memory_order_acquire) == myGen)
+            bz_cancel_state_signal(s);
+        bz_cancel_state_release(s);
+    });
+}
+
+// Child-completion continuation state.
+struct BzScopeChildCtx {
+    bz_task_scope_t* sc;
+    void* closure;  // the spawned callback's +1, released at completion
+};
+
+// Spawn(scoped body: () -> Task): start the child immediately on the current
+// domain. `closure` arrives with a transferred +1 (the lowerEventHandlerClosure
+// contract); it is released when the child completes. After close: IOE via
+// bz_exc (codegen emits the pending-exception check after the call).
+void bz_task_scope_spawn(void* scp, void* closure, void* ioe_vtable) {
+    auto* sc = (bz_task_scope_t*)scp;
+    if (!sc) { bz_closure_release(closure); return; }
+    {
+        std::lock_guard<std::mutex> lk(sc->mtx);
+        if (sc->ioe_vtable == nullptr) sc->ioe_vtable = ioe_vtable;
+        if (sc->closed || sc->disposed) {
+            // §6.10: Spawn after close — deterministic IOE, never a silent
+            // extension of the drain.
+            bz_closure_release(closure);
+            void* exc = bz_scope_make_ioe(
+                ioe_vtable,
+                "TaskScope.Spawn after the scope closed (Join returned or "
+                "disposal began) (stdlib \xC2\xA7""6.10)");
+            extern thread_local void* bz_exc;
+            bz_exc = exc;
+            return;
+        }
+        sc->pending += 1;  // counted BEFORE the body runs: a child that
+                           // spawns a grandchild does so while its own
+                           // completion is still pending, so the counter
+                           // never reaches 0 mid-drain (drain completeness).
+    }
+    // Invoke OUTSIDE the lock: the body runs arbitrary Bezel code (to its
+    // first suspension) and may itself Spawn.
+    void* child = bz_scope_invoke_task_closure(closure);
+    if (!child) {
+        // No task produced (defensive): undo the pending count.
+        bool settle = false;
+        {
+            std::lock_guard<std::mutex> lk(sc->mtx);
+            sc->pending -= 1;
+            settle = sc->pending == 0;
+        }
+        bz_closure_release(closure);
+        if (settle) {
+            BzScopeFinalActions act;
+            {
+                std::lock_guard<std::mutex> lk(sc->mtx);
+                if (sc->pending == 0) act = bz_scope_settle_locked(sc);
+            }
+            bz_scope_perform(act);
+        }
+        return;
+    }
+    auto* ctx = new BzScopeChildCtx{sc, closure};
+    bz_task_then(
+        child,
+        [](void* completedTask, void* state) {
+            auto* c = (BzScopeChildCtx*)state;
+            bz_task_scope_t* sc = c->sc;
+            // Record the fault: first-fault-wins; the winner cancels the
+            // siblings via the scope's token; later faults are swallowed
+            // and their exception objects disposed (§6.10 no-aggregation).
+            bool cancelSiblings = false;
+            void* swallow = nullptr;
+            if (bz_task_is_error(completedTask)) {
+                void* errObj = bz_task_error_obj(completedTask);
+                const char* errMsg = bz_task_error(completedTask);
+                std::lock_guard<std::mutex> lk(sc->mtx);
+                if (!sc->any_fault) {
+                    sc->any_fault = true;
+                    sc->first_error_obj = errObj;
+                    if (!errObj && errMsg)
+                        sc->first_error_msg = strdup(errMsg);
+                    cancelSiblings = true;
+                } else {
+                    swallow = errObj;
+                }
+            }
+            if (cancelSiblings) bz_cancel_state_signal(sc->state);
+            if (swallow) bz_scope_dispose_exc(swallow);
+            // The scope owned the child task; it is complete and its fault
+            // (if any) has been taken/disposed — reclaim it. error_obj
+            // ownership was transferred above, so clear it first (bz_task_
+            // free never frees error_obj, but no dangling pointer either).
+            ((bz_task_t*)completedTask)->error_obj = nullptr;
+            bz_task_free(completedTask);
+            bz_closure_release(c->closure);
+            BzScopeFinalActions act;
+            {
+                std::lock_guard<std::mutex> lk(sc->mtx);
+                sc->pending -= 1;
+                if (sc->pending == 0) act = bz_scope_settle_locked(sc);
+            }
+            delete c;
+            bz_scope_perform(act);
+        },
+        ctx);
+}
+
+// await Join(): a task that completes when every child (including children
+// spawned during the drain) has completed; re-raises the FIRST fault; marks
+// the scope closed on completion.
+void* bz_task_scope_join(void* scp) {
+    bz_main_domain_get();
+    auto* sc = (bz_task_scope_t*)scp;
+    auto* task = new bz_task_t();
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
+    if (!sc) { bz_task_complete(task, nullptr, 0); return task; }
+    BzScopeFinalActions act;
+    bool completeNow = false;
+    void* faultObj = nullptr;
+    char* faultMsg = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(sc->mtx);
+        if (sc->pending == 0) {
+            // Drain already complete (or nothing spawned): settle inline.
+            sc->closed = true;
+            sc->joined = true;
+            completeNow = true;
+            if (sc->any_fault) {
+                faultObj = sc->first_error_obj;
+                faultMsg = sc->first_error_msg;
+                sc->first_error_obj = nullptr;
+                sc->first_error_msg = nullptr;
+                sc->any_fault = false;
+            }
+        } else {
+            sc->join_waiters.push_back(task);
+        }
+    }
+    if (completeNow) {
+        if (faultObj) bz_task_complete_error_obj(task, faultObj);
+        else if (faultMsg) { bz_task_complete_error(task, faultMsg);
+                             free(faultMsg); }
+        else bz_task_complete(task, nullptr, 0);
+    }
+    bz_scope_perform(act);
+    return task;
+}
+
+// DisposeAsync (normal exit): cancel, drain, swallow; IOE iff Join was never
+// reached. Returns the dispose task; the scope struct is freed when it
+// completes. `normal_exit` distinguishes the source-visible normal path
+// (codegen's !isUnwind) from an explicit early-exit use.
+void* bz_task_scope_dispose_async(void* scp, int32_t normal_exit,
+                                  void* ioe_vtable) {
+    bz_main_domain_get();
+    auto* sc = (bz_task_scope_t*)scp;
+    auto* task = new bz_task_t();
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
+    if (!sc) { bz_task_complete(task, nullptr, 0); return task; }
+    BzScopeFinalActions act;
+    {
+        std::lock_guard<std::mutex> lk(sc->mtx);
+        if (sc->disposed) {  // idempotent (§28.2)
+            bz_task_complete(task, nullptr, 0);
+            return task;
+        }
+        sc->disposed = true;
+        sc->dispose_missing_join = normal_exit != 0 && !sc->joined;
+        if (sc->ioe_vtable == nullptr) sc->ioe_vtable = ioe_vtable;
+        sc->closed = true;
+        sc->dispose_waiter = task;
+        if (sc->state) bz_cancel_state_signal(sc->state);  // cancel children
+        if (sc->pending == 0) act = bz_scope_settle_locked(sc);
+    }
+    bz_scope_perform(act);
+    return task;
+}
+
+// Dispose (unwind edge / sync fallback): cancel + non-blocking zombie drain.
+// Never raises; the scope struct is freed at the last child completion (or
+// here, when no children remain).
+void bz_task_scope_dispose_unwind(void* scp) {
+    auto* sc = (bz_task_scope_t*)scp;
+    if (!sc) return;
+    BzScopeFinalActions act;
+    {
+        std::lock_guard<std::mutex> lk(sc->mtx);
+        if (sc->disposed) return;  // idempotent (§28.2)
+        sc->disposed = true;
+        sc->closed = true;
+        sc->zombie = true;
+        if (sc->state) bz_cancel_state_signal(sc->state);
+        if (sc->pending == 0) act = bz_scope_settle_locked(sc);
+    }
+    bz_scope_perform(act);
+}
+
+} // extern "C" (TaskScope)
 
 extern "C" {
 

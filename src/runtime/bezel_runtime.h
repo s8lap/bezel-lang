@@ -798,6 +798,39 @@ void* bz_task_when_all_owned(void* task_arr);
 void  bz_task_fire_and_forget(void* task);
 
 // ---------------------------------------------------------------------------
+// stdlib §6.10 / spec §28.14 (v0.175, #808): TaskScope — the structured-
+// concurrency nursery. See the implementation block comment for the full
+// lifecycle contract (Spawn/Join/DisposeAsync/unwind-dispose, first-fault-
+// wins + cancel-siblings, drain completeness, quiescence).
+// ---------------------------------------------------------------------------
+
+// new TaskScope(): allocate the scope with a fresh internal cancellation cell.
+void* bz_task_scope_new(void);
+// Token property: the scope's CancellationToken handle (borrowed).
+void* bz_task_scope_token(void* scope);
+// Cancel(): cancel all children now (same signal path as CTS.Cancel).
+void  bz_task_scope_cancel(void* scope);
+// CancelAfter(delay-ms): deadline for the whole scope (#1413 timer path).
+void  bz_task_scope_cancel_after(void* scope, int64_t ms);
+// Spawn(scoped body): invoke `closure` (a `() -> Task` cell, transferred +1)
+// synchronously on the current domain and track the child. After close:
+// InvalidOperationException via bz_exc (caller emits the pending check).
+void  bz_task_scope_spawn(void* scope, void* closure, void* ioe_vtable);
+// await Join(): returns a task completing when all children (including ones
+// spawned during the drain) are done; re-raises the FIRST fault; closes the
+// scope. Caller owns the returned task.
+void* bz_task_scope_join(void* scope);
+// await using normal-exit disposal: cancel + drain + swallow; faults the
+// returned task with InvalidOperationException iff `normal_exit` and Join
+// was never awaited. Frees the scope when the returned task completes.
+// Caller owns the returned task.
+void* bz_task_scope_dispose_async(void* scope, int32_t normal_exit,
+                                  void* ioe_vtable);
+// Unwind-edge / sync-fallback disposal: cancel + NON-BLOCKING zombie drain
+// (the scope is freed at the last child completion). Never raises.
+void  bz_task_scope_dispose_unwind(void* scope);
+
+// ---------------------------------------------------------------------------
 // Array enumerator (Part B2): wraps bz_array_t* as a vtable-based IEnumerator<T>.
 // The returned object has vtable slots: [0]=td/self, [1]=Dispose, [2]=MoveNext,
 // [3]=get_Current. This makes Array<T> usable wherever IEnumerator<T> is expected.

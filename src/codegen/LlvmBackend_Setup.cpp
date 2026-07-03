@@ -6825,6 +6825,46 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         }
     }
 
+    // stdlib §6.10 (v0.175, #808): an `await using var` (or, defensively, a
+    // `using var` that slipped past the ownership §6.10 reject) bound to a
+    // TaskScope. Recognised BEFORE the generic isAwaitUsing branch below —
+    // TaskScope has no user TypeSymbol/DisposeAsync MethodSymbol, so the
+    // generic branch's sync fallback would vtable-dispose a bz_task_scope_t
+    // (garbage). Disposal is emitted by the dedicated d.taskScope arm:
+    // normal exit → bz_task_scope_dispose_async + await (cancel, drain,
+    // swallow; IOE when Join was never awaited); unwind → the non-blocking
+    // bz_task_scope_dispose_unwind zombie drain.
+    {
+        auto isTaskScopeName = [](const sema::TypeRef* rt) {
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+            if (rt->declaration)
+                return !rt->declaration->decl &&
+                       rt->declaration->name == "TaskScope";
+            if (rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty())
+                return rt->astNode->name->parts[0] == "TaskScope";
+            return rt->importedName == "TaskScope";
+        };
+        bool isTS = false;
+        if (ld->type) isTS = isTaskScopeName(ctx_.resolvedType(*ld->type));
+        if (!isTS && ld->initializer) {
+            isTS = isTaskScopeName(ctx_.exprType(*ld->initializer));
+            if (!isTS) {
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(
+                        ld->initializer.get()))
+                    isTS = ne->type && ne->type->name &&
+                           !ne->type->name->parts.empty() &&
+                           ne->type->name->parts[0] == "TaskScope";
+            }
+        }
+        if (isTS) {
+            Disposal d{it->second, nullptr};
+            d.taskScope = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+
     // §28.12 / §30: `await using var` — the resource implements IAsyncDisposable.
     // On the normal-exit path: call DisposeAsync() directly, await the returned
     // Task (a proper suspend point), then free the block (physical reclamation).
@@ -13704,6 +13744,36 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tx, cceVt});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // stdlib §6.10 (v0.175, #808): an `await using var` TaskScope. Normal
+        // exit: bz_task_scope_dispose_async + await (cancel, drain, swallow;
+        // IOE iff Join was never awaited). Unwind / non-async: the
+        // non-blocking bz_task_scope_dispose_unwind zombie drain. The runtime
+        // frees the scope struct on both paths.
+        if (it->taskScope) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* sc = builder_.CreateLoad(ptrTy(), addr, "tscope.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                sc, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "tscope.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "tscope.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            // Null the slot BEFORE the (possibly awaited) dispose: the
+            // normal-path dispose task may FAULT (missing-Join IOE, §6.10),
+            // whose re-raise unwinds into the isUnwind disposal pass — which
+            // must find the slot already null (the runtime freed the scope
+            // when the dispose task completed; a second dispose through the
+            // stale pointer is a UAF).
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            emitTaskScopeDispose(sc, isUnwind);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
