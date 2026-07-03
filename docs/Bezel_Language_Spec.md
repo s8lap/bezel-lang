@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.171 — July 2026**
+**Version 0.172 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2953,7 +2953,7 @@ An interpolation may include alignment and a format specifier:
 ```
 
 - Alignment is a signed integer; positive right-aligns in a field of that width, negative left-aligns. Wider results overflow the field.
-- Format is a type-specific string passed to the value's formatter.
+- Format is a type-specific string passed to the value's formatter — see the dispatch rule below.
 
 ```bezel
 $"{amount:F2}"           // "1234.50"
@@ -2964,7 +2964,11 @@ $"|{name,20}|"           // right-aligned in 20-character field
 $"{amount,12:F2}"
 ```
 
-The lexer tracks brace nesting inside interpolations. Nested string literals within `{...}` are recognized by their own opening `"` and parsed as complete strings; they do not terminate the outer string. `case ... end` and other complex expressions inside `{...}` are handled by full expression parsing.
+**Format dispatch (v0.172, #812/#1339).** A hole *without* a format spec formats via the value's ordinary `ToString()` ([§8.5](#sec-object-methods)). A hole *with* a format spec dispatches to `ToString(format: string)`: the primitive and temporal types provide it intrinsically (the specifier vocabulary and its invariant-culture semantics are normative in stdlib [§2.18](Bezel_Standard_Library.md#sec-iformattable)); a **user** type opts in by implementing the auto-imported interface `IFormattable` (stdlib [§2.18](Bezel_Standard_Library.md#sec-iformattable)). A format spec on an operand whose type is neither intrinsically formattable nor `IFormattable` is a **compile error** naming this rule. An unrecognized specifier at runtime raises `FormatException` (the defined-fault rule, stdlib §2.18).
+
+**Hole delimitation (normative, v0.172, #1339).** Inside `{…}` the lexer tracks nesting of `(` `)` `[` `]` `{` `}` and skips nested string/char literals (recognized by their own opening quote and parsed as complete literals; they do not terminate the outer string). The alignment `,` and the format-spec `:` are recognized only at the **top nesting level** of the hole; the first top-level `,` begins the alignment, the first top-level `:` begins the format spec. Consequently `{d[k]: F2}` needs no parenthesization tricks (`[…]` nests its colon) and `{(a if c else b),8}` aligns the conditional. The format spec runs from its `:` to the hole's closing `}`; braces do not appear inside a format spec (a `{` there is a compile error).
+
+**Literal braces (v0.172, #1339).** In interpolated strings (`$"…"` and `$@"…"`), a doubled brace denotes a literal brace: `{{` produces `{`, `}}` produces `}` — previously a literal brace was unwritable. Non-interpolated strings are unaffected (braces are ordinary characters there).
 
 <a id="sec-verbatim-strings"></a>
 ### 18.6 Verbatim strings
@@ -7567,7 +7571,7 @@ InterpString    ::= '$"' (InterpPart | StringContent)* '"'
 InterpPart      ::= "{" Expression ("," "-"? IntLiteral)? (":" FormatSpec)? "}"
 ```
 
-`CharContent`, `StringContent`, `VerbatimContent`, and `FormatSpec` are not given productions; their content is described in [§18.3](#sec-character-literals), [§18.4](#sec-string-literals), [§18.5](#sec-interpolated-strings), [§18.6](#sec-verbatim-strings), and [§18.8](#sec-escape-sequences-non-verbatim) of the main text. Briefly: `CharContent` is one Unicode scalar value or one escape sequence; `StringContent` is any sequence of code points or escapes other than an unescaped `"`; `VerbatimContent` is any sequence of code points other than `"`, with `""` denoting a single `"`; `FormatSpec` is a sequence of format characters meaningful to the value's formatter.
+`CharContent`, `StringContent`, `VerbatimContent`, and `FormatSpec` are not given productions; their content is described in [§18.3](#sec-character-literals), [§18.4](#sec-string-literals), [§18.5](#sec-interpolated-strings), [§18.6](#sec-verbatim-strings), and [§18.8](#sec-escape-sequences-non-verbatim) of the main text. Briefly: `CharContent` is one Unicode scalar value or one escape sequence; `StringContent` is any sequence of code points or escapes other than an unescaped `"` (inside an `InterpString`, `{{` and `}}` denote literal braces and a single `{` begins an `InterpPart` — v0.172, #1339); `VerbatimContent` is any sequence of code points other than `"`, with `""` denoting a single `"`; `FormatSpec` is a brace-free sequence of format characters, terminated by the hole's closing `}`, with the §18.5 top-level delimitation rule deciding where it begins. Its vocabulary and semantics are normative in stdlib §2.18.
 
 <a id="sec-source-file"></a>
 ### A.2 Source file

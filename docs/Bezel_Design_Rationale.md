@@ -7557,6 +7557,20 @@ v0.171 is the **Try-convention revision** (#1336) — the review's P6 sweep.
 
 Breaking for callers that declared the out recipient non-nullable: the recipient becomes `T?` (inline `out var x` forms simply infer the nullable type; explicit `var x: T := ...; Try(out x)` forms change the local's type or switch to inline-out). The compiler train migrates the corpus; call sites already using `out using var`/`out owned var` + `!` (the Guide 2 idiom) are unaffected.
 
+<a id="sec-v0-171-to-v0-172-changelog"></a>
+### v0.172 changelog (v0.171 → v0.172)
+
+v0.172 is the **formatting revision** — discharging RFC #812's standout item together with #1339's lexical gaps and the gap review's formatting cluster.
+
+- **`IFormattable`** (new stdlib §2.18; spec §18.5 dispatch rule): a format spec dispatches to `ToString(format)`; primitives/temporals are intrinsically formattable; user types opt in nominally; a spec on a non-formattable operand is a compile error. This closes §18.5's "passed to the value's formatter" dangling reference — there was previously nothing for a user type's spec to route to (#812 item 1).
+- **The specifier vocabulary is normative and invariant-culture-only** (stdlib §2.18): integer D/X/B, floating F/E/G/P/R, temporal pattern letters, Guid D/N; unrecognized → `FormatException`. **Round-trip guarantee**: `double`/`float` no-format `ToString()` ≡ `R` ≡ shortest string that reparses identically. `C` (currency) deliberately absent — currency is culture by definition.
+- **Literal braces** (spec §18.5/§18.8/A.1, #1339): `{{`/`}}` doubling in `$"…"` and `$@"…"` — a literal brace was previously unwritable in interpolated strings.
+- **Hole delimitation made normative** (spec §18.5, #1339): `,`/`:` recognized only at the hole's top nesting level (brackets nest, nested literals skip); the format spec runs to the closing `}` and is brace-free. `\x` greediness stays as already specified in §18.8 (documented with workaround; not a gap).
+
+#### Migration
+
+Additive except: a format spec on a non-formattable operand — previously silently accepted and ignored or misrouted — is now a compile error; `{{`/`}}` in existing interpolated strings (none in the corpus — the sequence was previously meaningless) would change meaning.
+
 ## 20. Closing
 
 If the opening framed Bezel by what it borrows, the body has shown what it actually contributes: not the features — those have ancestors — but the discipline applied to combining them. The recurring move in this document is the same one every time a hard question arrived. Ship the part that fits the foundations cleanly. Decline the part that fights them, with the reason written down so the question stays settled rather than perennially reopened. Scope whatever genuinely remains open by naming its precise blocker, not by deferring it vaguely. Member-access reflection is declined, not pending. The cyclic-serialization soundness obligation was discharged in prose before any syntax was written. Tuples and post-condition loops are conveniences with recorded costs, not gaps. The deferred list is a list of decisions deliberately not yet made — each with its reasoning — never a list of unsolved problems.

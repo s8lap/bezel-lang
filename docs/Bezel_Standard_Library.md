@@ -864,6 +864,31 @@ Raised on access to a static member of a type whose static initialization failed
 ---
 
 <a id="sec-system-text-auto-imported"></a>
+<a id="sec-iformattable"></a>
+### 2.18 `IFormattable` and format specifiers (v0.172, #812/#1339)
+
+```bezel
+public interface IFormattable
+  method ToString(format: string): string;
+end IFormattable;
+```
+
+Auto-imported. String interpolation dispatches a hole's format spec here (language spec §18.5): `$"{money:C2}"` calls `money.ToString("C2")` when `money`'s type implements `IFormattable`. The primitive and temporal types are **intrinsically formattable** (they behave as conforming implementations without declaring the interface); a format spec on any other non-conforming operand is a compile error.
+
+**The specifier vocabulary is invariant-culture only** — Bezel has no culture machinery, and formatted output is identical on every platform. An unrecognized specifier raises `FormatException` (strict-fault, as everywhere).
+
+| Kind | Specifiers | Notes |
+|---|---|---|
+| Integers (`int`, `long`, `byte`, …) | `D`/`Dn` decimal (n = min digits, zero-padded) · `X`/`x` hex (upper/lower, `Xn` pads) · `B` binary | no grouping separators (no culture) |
+| Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals, default 2) · `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn` percent (×100, `%` suffix) · `R` round-trip | `R` and the **no-format `ToString()`** both produce the shortest string that parses back to the identical value (round-trip guarantee, v0.172) |
+| `decimal` | `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` | exact decimal semantics |
+| `DateTime`, `DateOnly`, `TimeOnly` | pattern strings of `yyyy` `MM` `dd` `HH` `mm` `ss` `fff` plus literal separators | e.g. `yyyy-MM-dd HH:mm:ss`; no-format `ToString()` is ISO 8601 |
+| `TimeSpan` | `c` (constant: `[-][d.]HH:mm:ss[.fffffff]`) | no-format = `c` |
+| `Guid` | `D` (hyphenated, lowercase), `N` (no hyphens) | no-format = `D` |
+| `bool`, `char`, `string` | *(none)* | a format spec on these is a compile error |
+
+`C` (currency) deliberately does not exist — currency formatting is culture by definition; format money explicitly (`$"{amount:F2} EUR"`).
+
 ## 3. `System.Text` (auto-imported)
 
 <a id="sec-stringbuilder"></a>
