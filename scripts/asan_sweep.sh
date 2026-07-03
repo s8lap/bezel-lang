@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Whole-suite ASan shard sweep (stage 0 of #1414). Builds (once) an ASan test
+# binary in a scratch tree and runs all shards in parallel, reporting any
+# AddressSanitizer errors. This is the gate that caught the v0.175 exception-
+# layout heap corruption and the pre-existing #1390 — run it for merges that
+# touch object layout, disposal, or the runtime.
+#
+# Usage: scripts/asan_sweep.sh [SHARDS=8]
+set -u
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+shards="${1:-8}"
+scratch=/var/tmp/bezel-scratch/build-asan
+mkdir -p "$scratch"
+cmake -B "$scratch" -S "$repo" -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" > /dev/null
+"$repo/scripts/dev_heavy.sh" build cmake --build "$scratch" -j14 --target bezel_tests || exit 2
+fail=0
+pids=()
+for (( i=0; i<shards; i++ )); do
+  d=/var/tmp/bezel-scratch/asan_sweep.$i; mkdir -p "$d"
+  ( ASAN_OPTIONS=detect_leaks=0 TMPDIR="$d" BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
+      "$scratch/tests/bezel_tests" > "$d/log" 2>&1 ) &
+  pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p" || true; done
+for (( i=0; i<shards; i++ )); do
+  n=$(grep -c "ERROR: AddressSanitizer" "/var/tmp/bezel-scratch/asan_sweep.$i/log" || true)
+  echo "shard $i: $n ASan errors"
+  [ "$n" -gt 0 ] && { fail=1; grep -m1 -A15 "ERROR: AddressSanitizer" "/var/tmp/bezel-scratch/asan_sweep.$i/log"; }
+done
+exit $fail

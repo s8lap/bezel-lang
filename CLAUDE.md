@@ -135,6 +135,13 @@ artifacts (probe binaries, big logs, scratch build trees) go in
 tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
 80G (a full 40G cache thrashes under multi-worktree churn).
 
+**Extra gates for delicate merges.** Merges touching object layout, disposal
+machinery, or the runtime additionally run (a) one full **serial** suite pass
+(`build/tests/bezel_tests` directly — twice this project, sharded-green runs
+masked heap corruption the serial order exposed) and (b)
+`scripts/asan_sweep.sh` — a whole-suite ASan shard sweep (caught the v0.175
+exception-layout corruption and #1390).
+
 ## When in doubt
 
 The project's overall discipline is: ship the part that fits cleanly now, decline-with-reasons the part that fights the foundations, keep adjacent open questions explicitly scoped. If you're not sure whether a given piece of work fits cleanly: stop, open an issue, describe what you're trying to do and what's giving you pause. The project has reached its current state by catching defects early and recording decisions with reasoning. That discipline continues to apply.
