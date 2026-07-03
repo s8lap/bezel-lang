@@ -25,7 +25,10 @@ cmake -B "$scratch" -S "$repo" -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" > /dev/null || {
     echo "asan_sweep: cmake configure FAILED"; exit 2; }
-"$repo/scripts/dev_heavy.sh" build cmake --build "$scratch" -j14 --target bezel_tests || exit 2
+# -j10, not -j14: a FRESH full ASan build (post stale-tree wipe) at -j14
+# exceeds the dev_heavy memory cage and gets SIGTERM'd; incremental rebuilds
+# never showed it because most TUs were cached. Override: ASAN_SWEEP_JOBS.
+"$repo/scripts/dev_heavy.sh" build cmake --build "$scratch" -j"${ASAN_SWEEP_JOBS:-10}" --target bezel_tests || exit 2
 fail=0
 pids=()
 for (( i=0; i<shards; i++ )); do
