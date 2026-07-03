@@ -66,7 +66,7 @@ BEZEL_TEST(builtin_registry_snapshot, owning_prefix_predicate) {
 
 // --- isArrayBackedCollectionName (§4.4–§4.7/§4.14) : isCollectionTypeName ---
 BEZEL_TEST(builtin_registry_snapshot, array_backed_collection_set) {
-    static constexpr std::array<std::string_view, 9> kSnapshot = {
+    static constexpr std::array<std::string_view, 10> kSnapshot = {
         "Array",  "OwningArray", "OwningBuffer",
         "Stack",  "OwningStack", "Queue",
         "OwningQueue", "Set",    "OwningSet",
