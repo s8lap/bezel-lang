@@ -77,15 +77,20 @@ All five conformances route through `WriteString`/`ReadString`. The format is pi
 
 §2.5 declares `DateTime` as a civil-time record with a `Kind: DateTimeKind` annotation (`Unspecified`, `Utc`, `Local`) — "CompareTo = tick order, Kind not normalized, matching .NET." It is not a fixed-point instant. `DateTime.ToString()` produces `yyyy-MM-ddTHH:mm:ss` (§2.5, §2.18 "no-format `ToString()` is ISO 8601") — this drops `Millisecond`.
 
-**Wire format decision:** use the fixed pattern `"yyyy-MM-ddTHH:mm:ss.fff"` via `ToString("yyyy-MM-ddTHH:mm:ss.fff")` (§2.18 vocabulary includes `fff`). This preserves the finest constructor-accepted granularity (`millisecond: int`, §2.5). `Kind` is **not encoded** in v1 — it is lost on round-trip; the deserialized value carries `Kind.Unspecified`. Time-zone-aware round-trip requires `DateTimeOffset` (gap-review item #10, deferred).
+**Wire format decision (RESOLVED, owner-accepted 2026-07-04): the conditional `Z` suffix.** Write `"yyyy-MM-ddTHH:mm:ss.fffZ"` when `Kind == DateTimeKind.Utc`, and `"yyyy-MM-ddTHH:mm:ss.fff"` (no suffix) when `Kind` is `Unspecified` or `Local`. Both forms preserve the finest constructor-accepted granularity (`millisecond: int`, §2.5). The parse side is a **strict two-case grammar**: a 24-character string ending in `Z` → `Kind.Utc`; a 23-character string with no suffix → `Kind.Unspecified`; any other form (e.g. an explicit `+00:00`/`+05:30` offset from a foreign producer) raises `FormatException`, propagated as `SerializationException`. No offset forms are ever written, so none need to be parsed. This preserves **exact** round-trip for `Kind.Utc` — the wire-protocol case (`DateTime.UtcNow` carries `Kind.Utc`, and under a bare-only format `dt.Kind == DateTimeKind.Utc` would silently become `false` after a round-trip). Full time-zone-*offset* round-trip (a `Kind.Local` machine offset, or a foreign `±HH:mm`) still requires `DateTimeOffset` (gap-review item #10, deferred); this proposal does **not** block on it.
 
-- **Text and binary v1:** `yyyy-MM-ddTHH:mm:ss.fff`, no offset indicator. Example: `"2024-03-15T14:30:00.000"`.
-- **v1 limitation:** `Kind` is not preserved. Applications that must round-trip UTC instants should use `DateTimeOffset` (pending) or hand-write `Serialize`/`Deserialize` (which suppresses synthesis — §9.8).
+- **Text and binary v1:** `yyyy-MM-ddTHH:mm:ss.fff` with a trailing `Z` iff `Kind.Utc`. Examples: `"2024-03-15T14:30:00.000Z"` (Utc), `"2024-03-15T14:30:00.000"` (Unspecified/Local).
+- **v1 limitation:** `Kind.Utc` round-trips **exactly** (via the `Z` suffix); `Kind.Unspecified` round-trips exactly (no suffix, no information to lose). `Kind.Local` round-trips as `Kind.Unspecified` — the one, honest, documented loss: a local offset has no encodable representation in Bezel (no tzdata or culture machinery, §2.18), so civil-time-with-no-marker is the correct wire form (exactly as Java's `LocalDateTime`). Applications needing a machine-local offset preserved should use `DateTimeOffset` (pending).
 - **Serialization sketch:**
   ```bezel
-  s.WriteString(this.ToString("yyyy-MM-ddTHH:mm:ss.fff"));
-  // Deserialize: DateTime.Parse produces Kind.Unspecified
-  return DateTime.Parse(d.ReadString());
+  // Serialize: Z iff Kind.Utc, bare otherwise.
+  s.WriteString(this.Kind == DateTimeKind.Utc
+      ? this.ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z"
+      : this.ToString("yyyy-MM-ddTHH:mm:ss.fff"));
+  // Deserialize: 24-char + trailing 'Z' → Kind.Utc (strip Z, parse the 23-char body);
+  //              23-char, no suffix   → Kind.Unspecified;
+  //              anything else        → FormatException → SerializationException.
+  return DateTime.Parse(d.ReadString());   // strict two-case grammar above
   ```
 
 ### `TimeSpan` (§2.5) — with prerequisite §2.5 addition
@@ -172,8 +177,11 @@ end TimeSpan;
 ```bezel
 public record DateTime: IComparable<DateTime>, IEquatable<DateTime>, ISerializable, IDeserializable
   // ... existing members unchanged ...
-  // Wire form (compiler-provided): WriteString("yyyy-MM-ddTHH:mm:ss.fff") / ReadString + Parse
-  // v1 limitation: Kind not preserved; deserialized as Kind.Unspecified
+  // Wire form (compiler-provided): WriteString(conditional Z) / ReadString + Parse
+  //   Kind.Utc          -> "yyyy-MM-ddTHH:mm:ss.fffZ"  (exact round-trip)
+  //   Unspecified/Local -> "yyyy-MM-ddTHH:mm:ss.fff"   (no suffix)
+  //   Parse: strict two-case grammar (Z -> Kind.Utc, bare -> Kind.Unspecified, else SerializationException)
+  // v1 limitation: Kind.Local round-trips as Kind.Unspecified (no encodable offset, §2.18)
 
 public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>, ISerializable, IDeserializable
   // ... existing members unchanged ...
@@ -214,8 +222,8 @@ end IDeserializer;
 
 ## Open questions (owner ruling required before landing)
 
-1. **`DateTime.Kind` loss in v1** — acceptable as a stated v1 limitation, or should this proposal be sequenced after gap-review item #10 (`DateTimeOffset`) so callers always have a round-trip path for UTC instants?
-2. **`WriteBytes` interface breakage** — the breakage at this stage (no external users) is manageable; is freezing the vocabulary interfaces once complete the intended stability posture?
+1. **`DateTime.Kind` loss in v1 — RESOLVED (owner, 2026-07-04).** Do **not** sequence after gap-review item #10 (`DateTimeOffset`). The **conditional `Z` suffix** (Design Q1) preserves round-trip fidelity for the `Kind.Utc` case — which *is* the wire-protocol case — so the most common UTC-instant path is exact today. `Kind.Local`'s loss to `Kind.Unspecified` is the one honest, documented residue (no encodable offset without tzdata); offset-bearing foreign strings stay rejected and belong to `DateTimeOffset`'s future conformance. Blocking on #10 would deny synthesis to every DateTime-bearing record — disproportionate to the residual loss.
+2. **`WriteBytes` interface breakage / vocabulary freeze — RESOLVED (owner, 2026-07-04).** `WriteBytes` completes the primitive-kind vocabulary — scalars, strings, bytes, structure — and with it the token set is treated as **frozen**: any future token addition is a **breaking, rationale-recorded major event**, not a routine extension. This gives implementations a stable target (the §2.14 "serialize once, serialize to every format" guarantee depends on exactly this stability). The current breakage is manageable (no external users; the stdlib's own four serializers/deserializers are all extended here).
 
 ---
 
@@ -225,5 +233,5 @@ end IDeserializer;
 |---|---|
 | New tokens `WriteGuid` / `WriteDateTime` / ... per type | Breaking change to `ISerializer`; binary compactness is version-local (gap-review #4 brief); format-internal fast-path optimization does not require new tokens |
 | `TimeSpan` as raw tick count via `WriteInt` | Changes token type from string to int; no semantic tag in the stream; JSON output is a bare number with no self-describing shape |
-| `DateTime` UTC offset (`yyyy-MM-ddTHH:mm:ssZ` for `Kind.Utc`) | `DateTime` is a civil-time record, not an instant (§2.5 "Kind not normalized"); partial UTC annotation is inconsistent for `Kind.Local` and `Kind.Unspecified`; deferred to `DateTimeOffset` (gap #10) |
+| ~~`DateTime` UTC offset (`yyyy-MM-ddTHH:mm:ssZ` for `Kind.Utc`)~~ **— RE-ADOPTED as the conditional `Z` suffix, 2026-07-04** | Originally declined as "partial UTC annotation inconsistent for `Kind.Local`/`Kind.Unspecified`." **That reasoning is reversed:** the three `Kind` values are *not* semantically identical, so applying `Z` only to `Utc` is **precision, not inconsistency** — `Utc` has a globally encodable meaning; `Local`/`Unspecified` have no encodable offset in Bezel (no tzdata or culture machinery, §2.18). Encoding what you know and not what you don't is principled (matches JSON.NET, and Java's `Instant`-vs-`LocalDateTime` split). Re-adopted as the wire format (Design Q1 above). Offset-bearing foreign strings (`±HH:mm`) stay rejected — they belong to `DateTimeOffset`'s future conformance (gap #10), whose zero-offset form must be `+00:00`, never bare `Z`, so the two types' wire grammars never overlap. |
 | `TimeOnly` using no-arg `ToString()` (`HH:mm:ss`) | Drops `Millisecond`; two `TimeOnly` values differing only in milliseconds serialize identically — not round-trip exact |

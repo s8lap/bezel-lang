@@ -20,6 +20,8 @@ An item is designed when it has ONE of: (a) a numbered proposal in this folder (
 | **Integer toolkit** (#9): wrapping/saturating ops, BitOperations, HashCode accumulator | numbered proposal | Prerequisite for checksums (#27); wrapping arithmetic interacts with §17 checked-arithmetic semantics, so it needs a real design pass, not just signatures. | M |
 | **Serialization eligibility conformances** (#4): Guid/DateTime/TimeSpan/DateOnly/TimeOnly as ISerializable + `WriteBytes` token (#17) | stdlib-section draft + issue | Wire-format decisions only; unblocks serializing any time-bearing record. After Base64. | S |
 
+**D1 rulings recorded (2026-07-04).** The four substantive D1 open questions are resolved (owner-accepted): (1) **0006** borrowed-stream ctor → the **scoped-construction rule** (generalize §28.14 `scoped` to class-typed borrow params), filed as spec RFC [#1439](https://github.com/s8lap/bezel-lang/issues/1439); v1 stays owned-only. (2) **#1438** async-span defect → borrow-bearing record params/returns forbidden on `async` methods (the two §7.1 span overloads removed; `CancellationToken` the enumerated exception), drafted for the next docs revision. (3) **0010** `DateTime` wire format → **conditional `Z` suffix** (Z iff `Kind.Utc`, bare otherwise), not blocked on `DateTimeOffset`; `WriteBytes` completes and freezes the token vocabulary. (4) **0008** `HashCode` → **immutable-chaining value record** (`Start()`/`Add`-returns-new/`Value`); `Checked*` naming, the int/uint/long/ulong cut, and per-process seeding all confirmed. See each proposal's open-questions section and the tracking issues (#1433/#1435/#1436/#1437/#1438).
+
 ## Wave D2 — platform and process
 
 | Item | Artifact | Notes | Size |

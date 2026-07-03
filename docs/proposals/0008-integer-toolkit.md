@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Draft |
 | **Tracking issue** | [#1437](https://github.com/s8lap/bezel-lang/issues/1437) |
-| **Target module(s)** | `System` (auto-imported): the primitive-wrapper records (`Int32`/`UInt32`/`Int64`/`UInt64`, stdlib §9.1), a new `BitOperations` static class (sibling to `Math` §2.2 and `BitConverter` §2.12), a new `HashCode` class |
+| **Target module(s)** | `System` (auto-imported): the primitive-wrapper records (`Int32`/`UInt32`/`Int64`/`UInt64`, stdlib §9.1), a new `BitOperations` static class (sibling to `Math` §2.2 and `BitConverter` §2.12), a new `HashCode` value record |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #9 (2×P0+P1), wave D1 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
 | **Unblocks** | Gap-review #27 (CRC-32/xxHash checksums, `System.IO.Hashing`); every custom `IEqualityComparer` / manual `GetHashCode` that needs a combiner better than XOR |
@@ -211,17 +211,21 @@ public class Money: IEquatable<Money>
 end Money;
 ```
 
-### 5.3 Surface
+### 5.3 Surface — an immutable-chaining value record
+
+`HashCode` is a **compiler-intrinsic value record** wrapping one word of fold state — the same shape as `Int32` (`public record Int32`, §9.1) and the generic `Range<T>` (§3.4). It is **immutable-chaining**: each `Add` returns a **new** `HashCode` value (the §25.3 `Counter` idiom), so there is no heap allocation, no `Dispose`/`using`, and — decisively — **no value-receiver mutation** (the exact thing §9.4 leaves unspecified). One word of primitive state means it is not borrow-bearing (§9.7), not move-only (§15.3), and sendable (§29): copies are one register, free.
 
 ```bezel
-public class HashCode
-  public constructor();
+public record HashCode
+  // Fresh accumulator carrying the per-process randomized seed (§5.1).
+  public static method Start(): HashCode;
 
-  // Streaming accumulator. Each `Add` folds one value's hash in, order-dependent.
-  // Returns `this` for chaining (the StringBuilder idiom, §3.1).
+  // Fold one value's hash in (order-dependent); returns a NEW HashCode value.
   public method Add<T>(value: T): HashCode;
   public method AddRange<T>(values: IEnumerable<T>): HashCode;
-  public method ToHashCode(): int;
+
+  // Finalize. A pure projection of the folded state — idempotent and re-readable.
+  public readonly property Value: int;
 
   // Allocation-free convenience for a fixed, known set of fields (the common case).
   public static method Combine<T1>(v1: T1): int;
@@ -231,22 +235,29 @@ public class HashCode
 end HashCode;
 ```
 
-Usage — the streaming form for a variable number of elements:
+Usage — chained fixed + streaming in one expression, zero heap:
 
 ```bezel
 public override method GetHashCode(): int
-  var hc := new HashCode();
-  hc.Add(_id);
-  hc.AddRange(_tags);            // fold every element, in order
-  return hc.ToHashCode();
+  return HashCode.Start().Add(_id).AddRange(_tags).Value;
 end GetHashCode;
 ```
 
-`new HashCode()` is an owned local; it has no owned fields, so its `Dispose` is a no-op and it is reclaimed at scope end with no `using` ceremony (as `StringBuilder`/`Random`).
+When `AddRange` is not enough, the loop form folds with plain value reassignment (`h := h.Add(e)` is a value copy — legal by §15.3/§28.6, since a value record with no owned fields has no ownership state):
 
-### 5.4 Why a class, not a value record — and the eligibility of `T`
+```bezel
+var h := HashCode.Start();
+for var e in elems do
+  h := h.Add(e);                // reassign the running value
+end;
+return h.Value;
+```
 
-**A class, not a mutable value record.** .NET's `System.HashCode` is a mutable `struct`, and a value record would avoid the per-call allocation. But an in-place mutating `Add` on a *value* receiver depends on value-type-receiver mutation semantics that **the spec does not currently define**: §9.4 permits mutable record *properties* but specifies no `mutating`-method receiver model, and every mutable builder the stdlib ships (`StringBuilder`, `Random`, `AtomicInteger`) is a class. Rather than silently commit to an unspecified interpretation (CLAUDE.md rule 1), v1 uses the class shape — unambiguously valid and precedented. The allocation is paid only by the *streaming* path; the **fixed-field path uses the static `Combine` overloads, which allocate nothing**, so the hot `GetHashCode` of a typical record stays allocation-free. A value-type `HashCode` record is recorded as a future optimization *if and when* value-receiver mutation is specified (§8).
+**`default(HashCode)` footgun (documented).** As a value record, `default(HashCode)` (§17.11) yields the all-zero *unseeded* state, **not** the seeded `Start()` state. `Start()` is the blessed entry point and the only supported way to begin an accumulation; `HashCode` deliberately exposes no meaningful `default` and no public constructor. (This is the one wrinkle the class shape would not have had — a small, documentable cost against the record's allocation-freedom, sendability, and no-ceremony copies.) `HashCode` is also not itself equality-bearing — its hidden state is not an exposed auto-property (§9.2) — so `.Equals`/`.GetHashCode` on an accumulator is a §9.2 use-site error; that is correct and harmless, as accumulators are never compared.
+
+### 5.4 Why the immutable-chaining value record — and the eligibility of `T`
+
+**An immutable-chaining value record — no receiver mutation needed.** The tempting reading is "a builder is a class" (every mutable builder the stdlib ships — `StringBuilder`, `Random`, `AtomicInteger` — is one). But those wrap *growable/multi-word/heap-backed* mutable state where copies are expensive or wrong; a one-word hash fold is the opposite case, where copies are free and immutable-chaining is natural. The only shape that would have forced a class is a **mutable value record** whose `Add` writes `this._state` and depends on that write being visible to the caller — and §9.4 is the relevant fact here: it (i) permits mutable body-record *properties*, (ii) defines **no** `mutating`-method receiver model (a grep of spec and rationale finds no value-receiver-mutation semantics at all), and (iii) explicitly calls mutable records **"inadvisable."** The immutable-chaining record sidesteps (i)/(ii) entirely — `Add` never writes a receiver field; it reads its receiver's folded state, computes a new state, and **returns a new value**, exactly §25.3's `Counter` (`operator ++(c: Counter): Counter => new Counter(c.Value + 1)`, which §17.6 calls "the typical record use") — and *aligns* with (iii). So the earlier conclusion flips: **no mutation is needed at all**, and no value-receiver-mutation ruling is a prerequisite. The record needs no heap allocation on any path (`Combine` and the streaming fold both allocate nothing), no `Dispose`, and is sendable. Precedent is direct: `Int32` is itself a compiler-intrinsic value record wrapping one word (§9.1), and `Range<T>` a compiler-intrinsic *generic* value record (§3.4) — `HashCode` with a generic value-in/value-out `Add<T>` is the same shape. The class shape survives only as a fallback if an owner ruling ever forbids value-record generic intrinsics.
 
 **Eligibility of `T` (why no `where` clause).** `Add<T>`/`Combine<…>` are **compiler-intrinsic generics** with a compiler-enforced eligibility rule, in the manner of `Range<T>`'s "integer-only" restriction (§9.8) and `Atomic<T>`'s "cell-sized primitive" restriction (§6.4) — restrictions the type system cannot phrase as a `where` clause. The rule: **`T` must be a type hashable under §8.3** — the compiler hashes each argument exactly as it would inside an auto-generated `GetHashCode`, so every admissible auto-equality component type (primitive, enum, `string`, `T?`, admissible inline array, and any auto-equality-bearing record — the §9.2 set) is accepted, and classes contribute their `GetHashCode` (identity or override). Passing a value whose static type is a **non-auto-equality-bearing record** is the *same compile error* §9.2 already raises for `.GetHashCode()` on such a type, pointing to the same fix (declare custom equality, or simplify to an auto-equality form). This is deliberately *not* a `where T: IEquatable<T>` bound: that would wrongly exclude enums (whose `IEquatable` conformance is not established by §2.9) and the nullable/inline-array components §9.2 admits, while adding nothing the intrinsic rule doesn't already give. The declined `IEquatable<T>` constraint is recorded in §7.
 
@@ -255,8 +266,9 @@ end GetHashCode;
 - Narrow-type (`byte`/`sbyte`/`short`/`ushort`) and signed-type overloads of `BitOperations`.
 - `WrappingDiv`/`CheckedDiv`, `SaturatingNeg`/`CheckedNeg`, and any wrapping/saturating on the narrow types.
 - A generic static interface for wrapping ops / bit ops (`IBinaryInteger<T>`-style) — deferred to a generic consumer (§3.5, §4.3).
-- A value-type `HashCode` record (pending a value-receiver-mutation ruling, §5.4).
 - The checksums themselves (CRC-32/xxHash, #27) — they are the *consumer* of this toolkit, a separate item.
+
+*(The v1 `HashCode` **is** a value record — the immutable-chaining form of §5.3/§5.4 — so it is no longer on this "leaves out" list. No value-receiver-mutation ruling was needed.)*
 
 ## 7. Declined alternatives (register)
 
@@ -266,16 +278,18 @@ end GetHashCode;
 4. **Adding wrapping/saturating to `INumber<T>`** — a wrapping `+` in a generic `Sum<T>` would silently change overflow behavior for all callers; the generic surface is a *separate* static interface, deferred (§3.5).
 5. **.NET `BitOperations` sentinel semantics** (`Log2(0) = 0`, `RoundUpToPowerOf2` overflow → 0) — declined for defined faults (`ArgumentOutOfRangeException`/`OverflowException`), per Bezel's no-silent-sentinel philosophy (§4.4).
 6. **`BitOperations` as primitive members or as a static interface** — declined for a discoverable static class mirroring `Math`/`BitConverter` (§4.3).
-7. **A mutable value-record `HashCode`** — depends on unspecified value-receiver mutation (§5.4).
+7. **A *mutable* value-record `HashCode`** (in-place `Add` mutating `this`) — declined: it is the one shape that depends on the unspecified value-receiver-mutation semantics (§9.4 permits mutable properties but defines no mutating-method receiver model), and §9.4 calls mutable records "inadvisable." Note: the **immutable-chaining** value record (each `Add` returns a new value, §25.3 `Counter` idiom) is a *distinct* option that needs no such ruling — it is the **chosen v1 shape** (§5.3/§5.4), not a declined one.
 8. **`where T: IEquatable<T>` on `Add`/`Combine`** — excludes enums and nullable/inline-array components that §9.2 admits; the compiler-intrinsic "hashable under §8.3" rule is broader and reuses §9.2's footgun protection (§5.4).
 9. **A stable/deterministic `HashCode`** — declined; determinism belongs to checksums (#27), and a stable in-process hash forgoes hash-flood defense that §8.3 permits us to have (§5.1).
 
-## 8. Open questions for the owner
+## 8. Open questions for the owner — RESOLVED (2026-07-04)
 
-1. **Checked-op naming:** keep `CheckedAdd`/`CheckedSub`/`CheckedMul` (parallel with `Wrapping*`/`Saturating*`) or rename to `TryAdd`/… for strict adherence to the Try-convention prefix (§3.3)? Both are shape-(b) Try methods; only the prefix is in question.
-2. **`HashCode` as a class** (v1, this proposal) vs. a **value record** — the latter needs a value-type-receiver-mutation ruling first. Is that ruling worth pulling forward for the allocation win, or is "static `Combine` for the fixed case, class for streaming" acceptable (§5.4)?
-3. **v1 type coverage** for the arithmetic methods — confirm `int`/`uint`/`long`/`ulong` only, with the narrow types deferred (§3.2)?
-4. **`HashCode` seeding** — confirm per-process randomization (matching §8.3's implementation-defined latitude and .NET) rather than a stable seed (§5.1).
+All four are resolved as follows (owner batch confirmations, 2026-07-04):
+
+1. **Checked-op naming — `Checked*` KEPT.** The v0.171 Try convention constrains **Try-named** methods (their `bool`/nullable-return shape); it does **not** reserve nullable-return for that prefix. `CheckedAdd`/`CheckedSub`/`CheckedMul` name the *semantics* (checked arithmetic), stay parallel with `Wrapping*`/`Saturating*`, avoid false kinship with collection `TryAdd`, and match the cross-language term (Rust's `checked_add`). They remain shape-(b) Try methods in behavior; only the prefix differs.
+2. **`HashCode` shape — DISSOLVED (value record, no ruling needed).** The former dichotomy (mutable-value-record-needs-a-ruling vs class) had a false gap: the **immutable-chaining** value record is a third option available *today* that touches neither the mutation-semantics problem nor §9.4's inadvisability. It is the chosen v1 shape (§5.3/§5.4). No value-type-receiver-mutation ruling is required. (The residual, narrower confirm — `Value` property vs a `ToHashCode()` finalizer, and `Start()` factory vs a public constructor — is a §5.3 surface detail, settled there as `Value` + `Start()`.)
+3. **v1 type coverage — CONFIRMED `int`/`uint`/`long`/`ulong` only.** `byte`/`short` arithmetic *does* exist (§6.2/§6.5), so restricting v1 to the 32/64-bit types is **scoping, not declining** — the narrow-type overloads are mechanical, additive, and deferred, not forbidden (§3.2).
+4. **`HashCode` seeding — CONFIRMED per-process randomization.** §8.3's auto-hash combining is implementation-defined and makes no cross-process stability promise, so a per-process randomized seed violates no stability contract while giving the standard hash-flood defense (§5.1). A stable seed is deliberately *not* adopted; determinism belongs to checksums (#27).
 
 ## 9. Relationship to existing work
 
