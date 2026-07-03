@@ -134,7 +134,20 @@ separate_arguments(BEZEL_LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 # layer: Array<T>, Dictionary<K,V>, File I/O, DateTime, Random, Task scheduler.
 # Linked into the compiler driver (for standalone executables) and available
 # to the JIT test harness via DynamicLibrarySearchGenerator.
-add_library(bezel_runtime STATIC src/runtime/bezel_runtime.cpp)
+add_library(bezel_runtime STATIC
+    src/runtime/bezel_runtime_collections.cpp
+    src/runtime/bezel_runtime_decimal_guid.cpp
+    src/runtime/bezel_runtime_time.cpp
+    src/runtime/bezel_runtime_fileio.cpp
+    src/runtime/bezel_runtime_shared_weak.cpp
+    src/runtime/bezel_runtime_concurrency.cpp
+    src/runtime/bezel_runtime_events.cpp
+    src/runtime/bezel_runtime_strings.cpp
+    src/runtime/bezel_runtime_encoding.cpp
+    src/runtime/bezel_runtime_refcounting.cpp
+    src/runtime/bezel_runtime_itable.cpp
+    src/runtime/bezel_runtime_serialization.cpp
+    src/runtime/bezel_runtime_sync.cpp)
 target_include_directories(bezel_runtime PUBLIC src/runtime)
 # bezel_runtime uses POSIX threads; suppress LLVM-specific warnings.
 target_compile_options(bezel_runtime PRIVATE -std=c++20 -pthread)

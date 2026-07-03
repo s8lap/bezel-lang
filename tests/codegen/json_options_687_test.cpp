@@ -72,19 +72,10 @@ static std::string laneLocalAsanObjectOpts() {
     static bool attempted = false;
     if (attempted) return cached;
     attempted = true;
-    std::string rtSrc = ::bezel::native_test::runtimeSourcePath();
     std::string rtObj = "/tmp/wt-opts/rt_asan.o";
-    // Ensure directory exists.
-    std::system("mkdir -p /tmp/wt-opts");
-    std::string cmd =
-        "systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=0 -- "
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        rtSrc + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(cmd.c_str()) != 0) {
-        cmd = "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-              rtSrc + " -o " + rtObj + " > /dev/null 2>&1";
-        if (std::system(cmd.c_str()) != 0) return cached;
-    }
+    // #1414: build the combined (ld -r) ASan runtime object at the lane-local path.
+    if (!::bezel::native_test::buildRuntimeSanitizerObject("address", rtObj))
+        return cached;  // leave empty → SKIP
     cached = rtObj;
     return cached;
 }

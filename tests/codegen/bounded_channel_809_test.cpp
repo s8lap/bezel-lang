@@ -42,6 +42,7 @@
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/TargetSelect.h"
+#include "native_test_harness.hpp"
 
 extern "C" void bz_flush_static_owned(void);
 
@@ -95,12 +96,6 @@ int run(const std::string& src) {
 
 namespace fs = std::filesystem;
 
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);
-    fs::path root = here.parent_path().parent_path().parent_path();
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 // AOT ASan probe (mirrors async_618_domain_serial_test.cpp::runUnderSanitizer):
 // emit an object from `source`, compile the runtime under ASan, link, run with
 // leak detection.  Returns 0 (clean), 1 (ASan/LSan hit — leak/double-free), or
@@ -139,10 +134,10 @@ int runUnderAsan(const std::string& source) {
         std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (!::bezel::native_test::buildRuntimeSanitizerObject("address", rtObj)) {
+        cleanup();
+        return -1;
+    }
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";

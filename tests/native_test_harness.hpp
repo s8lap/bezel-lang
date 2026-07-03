@@ -1,72 +1,118 @@
 #pragma once
 
-// Shared helpers for the "native ASan" test leg used in 19 test files.
+// Shared helpers for the "native ASan/TSan" test leg used across ~80 test files.
 //
-// The key function is asanRuntimeObject(): it compiles bezel_runtime.cpp once
-// with -fsanitize=address and caches the resulting .o path in a function-local
-// static. The first caller pays the ~2s compile; every subsequent call returns
-// the cached path instantly. Because runAll() drives tests single-threaded, no
-// locking is needed.
+// #1414 stage 2 split src/runtime/bezel_runtime.cpp into N per-domain TUs
+// (src/runtime/bezel_runtime_*.cpp). The native leg still needs ONE
+// sanitizer-instrumented runtime object to link against, so asanRuntimeObject()
+// now compiles every TU under -fsanitize=address and `ld -r`-combines the
+// objects into a single relocatable .o — preserving the single-path API:
 //
-// Usage in each test file:
 //   #include "native_test_harness.hpp"
-//   (remove the local runtimeSourcePath() and the rtCmd/rtObj compilation step)
-//   replace:  std::string rtCmd = "clang++ ... -c " + runtimeSourcePath() + ...
-//   with:     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-//             if (rtObj.empty()) { cleanup(); return -1; }
+//   const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+//   if (rtObj.empty()) { cleanup(); return -1; }   // toolchain/build unavailable → SKIP
 //
-// runtimeSourcePath() is also provided here so each test file can call it if
-// it needs to reference the source for any other reason.
+// The N-source compile + ld -r happens at most once per sanitizer (memoized).
+// buildRuntimeSanitizerObject(san, destObj) is the general form used by the few
+// tests that build the runtime under an explicit sanitizer (e.g. TSan) or to a
+// lane-local path: it ensures the combined object exists and copies it to
+// destObj.
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace bezel::native_test {
 
 namespace fs = std::filesystem;
 
-// Returns the absolute path to src/runtime/bezel_runtime.cpp, derived from
-// this header's __FILE__ location (tests/native_test_harness.hpp → repo root).
-inline std::string runtimeSourcePath() {
-    fs::path here(__FILE__);          // tests/native_test_harness.hpp
-    fs::path root = here.parent_path() // tests/
-                        .parent_path(); // repo root
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
+// Absolute path to repo-root/src/runtime, derived from this header's __FILE__
+// (tests/native_test_harness.hpp → repo root).
+inline fs::path runtimeSourceDir() {
+    fs::path here(__FILE__);              // tests/native_test_harness.hpp
+    return here.parent_path()             // tests/
+               .parent_path()             // repo root
+           / "src" / "runtime";
 }
 
-// Returns the path to bezel_runtime.cpp compiled with ASan, or an empty string
-// if the compilation fails (toolchain unavailable or error). The object is built
-// at most once per process: the result is cached in a function-local static so
-// every subsequent call returns the cached path with no recompile.
-//
-// Compiled with: clang++ -std=c++20 -g -fsanitize=address -pthread -c
-// This is the identical flag set used by every test file's runUnderLeakSanitizer.
-inline const std::string& asanRuntimeObject() {
-    static std::string cached;
-    static bool attempted = false;
-    if (attempted) return cached;
-    attempted = true;
-
-    // Check that clang++ is available.
-    if (std::system("clang++ --version > /dev/null 2>&1") != 0) {
-        // Toolchain unavailable: leave cached empty so callers SKIP.
-        return cached;
+// The per-domain runtime translation units (src/runtime/bezel_runtime_*.cpp),
+// sorted for a stable order. Post-#1414 there is no single bezel_runtime.cpp.
+inline std::vector<std::string> runtimeSourceFiles() {
+    std::vector<std::string> v;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(runtimeSourceDir(), ec)) {
+        const fs::path& p = e.path();
+        if (p.extension() == ".cpp" &&
+            p.filename().string().rfind("bezel_runtime_", 0) == 0)
+            v.push_back(p.string());
     }
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// Deprecated (#1414): the runtime is no longer a single .cpp. Retained for
+// source compatibility; returns the src/runtime directory. New code should use
+// runtimeSourceFiles() / asanRuntimeObject() / buildRuntimeSanitizerObject().
+inline std::string runtimeSourcePath() { return runtimeSourceDir().string(); }
+
+// Build (once per sanitizer) a single relocatable object that contains every
+// runtime TU compiled under -fsanitize=<san>, `ld -r`-combined. Returns the
+// cached master object path, or "" if the toolchain is unavailable or any step
+// fails (callers then SKIP). Memoized in a function-local static map so the
+// heavy N-source compile happens at most once per sanitizer per process.
+inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
+    static std::map<std::string, std::string> cache;
+    auto it = cache.find(san);
+    if (it != cache.end()) return it->second;
+    std::string& out = cache[san];  // default "" — memoize failures too so we
+                                    // don't re-attempt a broken toolchain build.
+
+    if (std::system("clang++ --version > /dev/null 2>&1") != 0) return out;
+    std::vector<std::string> srcs = runtimeSourceFiles();
+    if (srcs.empty()) return out;
 
     fs::path dir = fs::temp_directory_path();
-    std::string rtObj = (dir / "bezel_rt_asan_memoized.o").string();
-
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) {
-        // Compilation failed: leave cached empty so callers SKIP.
-        return cached;
+    const std::string inc = "-I" + runtimeSourceDir().string();
+    std::string objs;
+    for (const std::string& s : srcs) {
+        std::string stem = fs::path(s).stem().string();
+        std::string obj = (dir / ("bezel_rt_" + san + "_" + stem + ".o")).string();
+        std::string cmd = "clang++ -std=c++20 -g -fsanitize=" + san +
+                          " -pthread " + inc + " -c " + s + " -o " + obj +
+                          " > /dev/null 2>&1";
+        if (std::system(cmd.c_str()) != 0) return out;  // out stays "" → SKIP
+        objs += " " + obj;
     }
+    std::string combined = (dir / ("bezel_rt_" + san + "_combined.o")).string();
+    std::string ld = "ld -r -o " + combined + objs + " > /dev/null 2>&1";
+    if (std::system(ld.c_str()) != 0) return out;
+    out = combined;
+    return out;
+}
 
-    cached = rtObj;
-    return cached;
+// Ensure a <san>-instrumented combined runtime object exists at destObj (copied
+// from the memoized master). Returns false on toolchain/build failure (SKIP).
+// Replaces the pre-#1414 single-file `clang++ -c bezel_runtime.cpp -o destObj`.
+inline bool buildRuntimeSanitizerObject(const std::string& san,
+                                        const std::string& destObj) {
+    const std::string& master = sanitizerRuntimeMaster(san);
+    if (master.empty()) return false;
+    std::error_code ec;
+    fs::path dp(destObj);
+    if (dp.has_parent_path()) fs::create_directories(dp.parent_path(), ec);
+    fs::copy_file(master, destObj, fs::copy_options::overwrite_existing, ec);
+    return !ec;
+}
+
+// The ASan-instrumented combined runtime object — the common native leg. A
+// single stable path; ~80 test files link it. "" if the toolchain is
+// unavailable or the build fails, so callers SKIP.
+inline const std::string& asanRuntimeObject() {
+    return sanitizerRuntimeMaster("address");
 }
 
 } // namespace bezel::native_test

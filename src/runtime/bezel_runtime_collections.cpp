@@ -1,0 +1,2712 @@
+// bezel_runtime_collections.cpp — arrays, dictionaries, linked lists, Random, array/LINQ enumerators, GroupBy, Buffer<T>.
+// Split from bezel_runtime.cpp per #1414 stage 2 (behavior-preserving motion).
+#include "bezel_runtime_internal.hpp"
+
+// ---------------------------------------------------------------------------
+// bz_array_t — dynamic array
+// ---------------------------------------------------------------------------
+
+
+void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
+    auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (initial_cap > 0) {
+        arr->data = calloc((size_t)initial_cap, (size_t)elem_size);
+        arr->capacity = initial_cap;
+    }
+    return arr;
+}
+
+int64_t bz_array_len(void* arrp) {
+    return arrp ? ((bz_array_t*)arrp)->count : 0;
+}
+
+// stdlib §4.4/§4.5: the array-backed collection's allocated capacity (#741).
+int64_t bz_array_capacity(void* arrp) {
+    return arrp ? ((bz_array_t*)arrp)->capacity : 0;
+}
+
+// §4.14: allocate a bz_array_t with n pre-filled (zero-initialized) slots.
+// Used by `new OwningBuffer<T>(n)` so that index-assignment data[i] := v is valid
+// for i in 0..<n without requiring Add() first. All n elements are calloc'd to 0.
+void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
+    auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (n > 0) {
+        arr->data = calloc((size_t)n, (size_t)elem_size);
+        arr->capacity = n;
+        arr->count    = n;  // all slots are pre-populated (zero-valued)
+    }
+    return arr;
+}
+
+static void bz_array_grow(bz_array_t* arr, int64_t elem_size, int64_t min_cap) {
+    int64_t new_cap = arr->capacity < 4 ? 4 : arr->capacity * 2;
+    if (new_cap < min_cap) new_cap = min_cap;
+    arr->data = realloc(arr->data, (size_t)(new_cap * elem_size));
+    // Zero new entries for safety
+    if (new_cap > arr->capacity) {
+        memset((char*)arr->data + arr->capacity * elem_size, 0,
+               (size_t)((new_cap - arr->capacity) * elem_size));
+    }
+    arr->capacity = new_cap;
+}
+
+void bz_array_add(void* arrp, const void* elem, int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    if (arr->count >= arr->capacity) bz_array_grow(arr, elem_size, arr->count + 1);
+    memcpy((char*)arr->data + arr->count * elem_size, elem, (size_t)elem_size);
+    arr->count++;
+    arr->mod_count++;  // §29.12 / #1232: structural mutation
+}
+
+void bz_array_get(void* arrp, int64_t idx, void* out, int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    memcpy(out, (char*)arr->data + idx * elem_size, (size_t)elem_size);
+}
+
+void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+}
+
+// issue #388 / stdlib §4.5: OwningArray<T>'s `set(owned)` indexer — dispose the
+// element currently at idx (a pointer-sized owned object reference) before
+// overwriting the slot with the new owner. Reading the old pointer before the
+// store guarantees exactly-once disposal of the displaced owner.
+void bz_array_set_disposing(void* arrp, int64_t idx, const void* elem,
+                            int64_t elem_size, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (dispose_elem && arr->data) {
+        void* prev = ((void**)arr->data)[idx];
+        if (prev) dispose_elem(prev);
+    }
+    memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+}
+
+void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0 || idx >= arr->count) return;
+    // Shift elements left
+    int64_t tail = arr->count - idx - 1;
+    if (tail > 0) {
+        memmove((char*)arr->data + idx * elem_size,
+                (char*)arr->data + (idx + 1) * elem_size,
+                (size_t)(tail * elem_size));
+    }
+    arr->mod_count++;  // §29.12 / #1232: structural mutation (also covers pop_at and remove_at_disposing which delegate here)
+    arr->count--;
+}
+
+// stdlib §4.5: insert at idx, shifting [idx, count) up by one.
+void bz_array_insert_at(void* arrp, int64_t idx, const void* elem,
+                        int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0) idx = 0;
+    if (idx > arr->count) idx = arr->count;            // clamp; idx==count appends
+    if (arr->count >= arr->capacity)
+        bz_array_grow(arr, elem_size, arr->count + 1);
+    int64_t tail = arr->count - idx;                    // elements to shift up
+    if (tail > 0) {
+        memmove((char*)arr->data + (idx + 1) * elem_size,
+                (char*)arr->data + idx * elem_size,
+                (size_t)(tail * elem_size));
+    }
+    memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+    arr->count++;
+    arr->mod_count++;  // §29.12 / #1232: structural mutation
+}
+
+void bz_array_clear(void* arrp) {
+    if (arrp) {
+        auto* arr = (bz_array_t*)arrp;
+        arr->count = 0;
+        arr->mod_count++;  // §29.12 / #1232: structural mutation
+    }
+}
+
+// stdlib §4.5: dispose every non-null class-typed element, then empty.
+void bz_array_clear_disposing(void* arrp, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (dispose_elem && arr->data) {
+        for (int64_t i = 0; i < arr->count; ++i) {
+            void* elem_ptr = ((void**)arr->data)[i];
+            // Null the slot before disposing so the live range never re-reaches
+            // a disposed object (mirrors the spec's move-and-null pattern).
+            ((void**)arr->data)[i] = nullptr;
+            if (elem_ptr) dispose_elem(elem_ptr);
+        }
+    }
+    arr->count = 0;
+    arr->mod_count++;  // §29.12 / #1232: structural mutation
+}
+
+// stdlib §4.5: dispose the non-null element at idx, then remove it.
+void bz_array_remove_at_disposing(void* arrp, int64_t idx, int64_t elem_size,
+                                  void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0 || idx >= arr->count) return;
+    if (dispose_elem && arr->data) {
+        void* elem_ptr = ((void**)arr->data)[idx];
+        if (elem_ptr) dispose_elem(elem_ptr);
+    }
+    bz_array_remove_at(arrp, idx, elem_size);
+}
+
+// fix #642 / stdlib §4.5: PopAt(i) — copy element at idx into *out (transferring
+// ownership to the caller) then remove the slot WITHOUT disposal.  The caller
+// holds the sole reference after this call; it must dispose when done.
+// Unlike bz_array_remove_at_disposing this never invokes a disposer.
+void bz_array_pop_at(void* arrp, int64_t idx, void* out, int64_t elem_size) {
+    if (!arrp || !out) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0 || idx >= arr->count) return;
+    // Copy the element bytes BEFORE shifting so the pointer/value is captured.
+    memcpy(out, (char*)arr->data + idx * elem_size, (size_t)elem_size);
+    // Remove the slot (no disposal — ownership transferred to caller).
+    bz_array_remove_at(arrp, idx, elem_size);
+}
+
+void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (dispose_elem && arr->data) {
+        // Dispose elements in REVERSE insertion order per §28.11: ordered owning
+        // collections (OwningArray, OwningStack, OwningQueue) dispose last-inserted
+        // first. For pointer-sized elements, elem_size = sizeof(void*).
+        // bz_array_free with non-null dispose is for pointer-element arrays only
+        // (the codegen ensures this).
+        for (int64_t i = arr->count - 1; i >= 0; --i) {
+            void* elem_ptr = ((void**)arr->data)[i];
+            if (elem_ptr) dispose_elem(elem_ptr);
+        }
+    }
+    free(arr->data);
+    free(arr);
+}
+
+// §28.2 v0.135 / issue #621: checked-disposal-mode variant of bz_array_free.
+// Instead of freeing the header block, it:
+//  1. Runs element disposal (same as bz_array_free).
+//  2. Frees the DATA buffer (contents are gone, no double-free risk).
+//  3. Sets disposed = 1 on the HEADER, then leaves the header alive
+//     (quarantine) so the disposed flag remains readable for subsequent
+//     indexer-guard loads. This is a deliberate memory leak in checked
+//     (debug) builds — consistent with the class-instance quarantine used
+//     by emitDisposeAndReclaim for §28.2 compliance.
+void bz_array_mark_disposed(void* arrp, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (arr->disposed) return;  // idempotent
+    if (dispose_elem && arr->data) {
+        for (int64_t i = arr->count - 1; i >= 0; --i) {
+            void* elem_ptr = ((void**)arr->data)[i];
+            if (elem_ptr) dispose_elem(elem_ptr);
+        }
+    }
+    free(arr->data);
+    arr->data  = nullptr;
+    arr->count = 0;
+    arr->disposed = 1;
+    // Do NOT free(arr) — header stays alive for the disposed-flag guard.
+}
+
+// §28.2 v0.135 / issue #621: return the disposed byte for a bz_array_t*.
+// Called by checked-mode indexer guards to test use-after-dispose.
+// Returns 0 (live) or 1 (disposed).  Null pointer treated as non-disposed
+// (a null array hits the bounds-check guard separately).
+int8_t bz_array_is_disposed(void* arrp) {
+    if (!arrp) return 0;
+    return ((bz_array_t*)arrp)->disposed;
+}
+
+void bz_array_sort(void* arrp, int64_t elem_size,
+                   int (*cmp)(const void*, const void*)) {
+    auto* arr = (bz_array_t*)arrp;
+    if (arr && arr->count > 1)
+        qsort(arr->data, (size_t)arr->count, (size_t)elem_size, cmp);
+}
+
+// stdlib §3 / #472: Sort with a closure-bearing comparator.
+// `cmpfn(closure, a, b)` wraps the user lambda `(T, T) -> int`.
+// We use a thread-local shim so qsort (which takes a plain function pointer)
+// can reach the closure without a global lock.
+namespace {
+thread_local void*  bz_sort_cl_closure = nullptr;
+thread_local int  (*bz_sort_cl_fn)(void*, const void*, const void*) = nullptr;
+extern "C" int bz_sort_cl_shim(const void* a, const void* b) {
+    return bz_sort_cl_fn(bz_sort_cl_closure, a, b);
+}
+}  // namespace
+
+void bz_array_sort_closure(void* arrp, int64_t elem_size,
+                           void* closure,
+                           int (*cmpfn)(void*, const void*, const void*)) {
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr || arr->count < 2) return;
+    bz_sort_cl_closure = closure;
+    bz_sort_cl_fn      = cmpfn;
+    qsort(arr->data, (size_t)arr->count, (size_t)elem_size, bz_sort_cl_shim);
+    bz_sort_cl_closure = nullptr;
+    bz_sort_cl_fn      = nullptr;
+}
+
+// stdlib §3 / #472: Shallow-copy `arr` — allocate a new bz_array_t with the
+// same element bytes.  The copy does NOT deep-clone pointer-typed elements;
+// for the borrowing Array<T> this is correct (Array<T> does not own its class
+// elements — ownership stays with the original owner).  The returned array is
+// fresh-owned by the caller; dispose with bz_array_free(result, nullptr).
+void* bz_array_copy(void* arrp, int64_t elem_size) {
+    auto* src = (bz_array_t*)arrp;
+    if (!src) return bz_array_alloc(elem_size, 0);
+    auto* dst = (bz_array_t*)bz_array_alloc(elem_size, src->count);
+    if (src->count > 0 && src->data) {
+        memcpy(dst->data, src->data, (size_t)(src->count * elem_size));
+        dst->count = src->count;
+        if (dst->capacity < src->count) dst->capacity = src->count;
+    }
+    return dst;
+}
+
+// fix #682 / §15.6: copy elements [start, end) from `arr` into a fresh array.
+// `end` is exclusive (half-open interval). Precondition: callers have already
+// verified start >= 0, end <= Count, and start <= end via codegen bounds-checks
+// (emitGuardThrow before this call).
+void* bz_array_slice(void* arrp, int64_t start, int64_t end, int64_t elem_size) {
+    auto* src = (bz_array_t*)arrp;
+    int64_t count = end - start;
+    if (count < 0) count = 0;
+    auto* dst = (bz_array_t*)bz_array_alloc(elem_size, count > 0 ? count : 0);
+    if (count > 0 && src && src->data) {
+        memcpy(dst->data, (char*)src->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->count = count;
+    }
+    return dst;
+}
+
+// #429 / §4.6 / §28.9: retain every non-null pointer-sized string element so a
+// freshly copied / materialized Array<string> independently co-owns a +1 per
+// element. Each slot is a bz_string*; bz_string_retain is a no-op on a
+// sentinel/literal or null, so a partial/empty array is safe. This pairs with
+// the per-element bz_string_release the array's later free/dispose issues — an
+// insert-built array retains at Add (codegen), a copy/materialize-built array
+// retains here, so both are symmetric and release exactly their +1 at free.
+void bz_array_retain_strings(void* arrp) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr->data) return;
+    for (int64_t i = 0; i < arr->count; ++i) {
+        void* elem = ((void**)arr->data)[i];
+        if (elem) bz_string_retain(elem);
+    }
+}
+
+void* bz_array_ptr_at(void* arrp, int64_t idx, int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    return (char*)arr->data + idx * elem_size;
+}
+
+void bz_array_reserve(void* arrp, int64_t elem_size, int64_t cap) {
+    auto* arr = (bz_array_t*)arrp;
+    if (arr && cap > arr->capacity) bz_array_grow(arr, elem_size, cap);
+}
+
+// ---------------------------------------------------------------------------
+// bz_dict_t — open-addressing hash table (string keys, void* values)
+// ---------------------------------------------------------------------------
+
+struct bz_entry_t {
+    char*   key;        // malloc'd copy, null = empty slot
+    int64_t key_len;
+    void*   val;
+    uint32_t hash;
+    bool    deleted;
+};
+
+struct bz_dict_t {
+    bz_entry_t* buckets;
+    int64_t     count;
+    int64_t     capacity;  // always a power of 2
+    // Generic-key mode (issue #343, §4.8 "K must provide consistent Equals and
+    // GetHashCode"). When key_size > 0 the table holds raw key bytes and uses
+    // the synthesized hash/eq function pointers instead of the string path.
+    int64_t     key_size;  // 0 = string-key mode; >0 = generic key byte count
+    uint64_t  (*hash_fn)(const void* key);
+    bool      (*eq_fn)(const void* a, const void* b);
+    // issue #622 / stdlib §4.8: insertion-order tracking for Dictionary<K,V>.
+    // order[] holds bucket indices in insertion order; -1 entries are tombstones
+    // (from removes). order_count is the used length (including tombstones);
+    // order_cap is the allocated size. Iterated in 0..order_count order; -1
+    // slots are skipped. Compacted on rehash (tombstones dropped).
+    // OwningDictionary does NOT promise insertion order (§4.9) but shares this
+    // struct; we still maintain order for it (cheap, harmless).
+    int64_t*    order;       // malloc'd array of bucket indices
+    int64_t     order_count; // used length (including -1 tombstones)
+    int64_t     order_cap;   // allocated slots in order[]
+    // §28.2 v0.135 / issue #627: checked-disposal-mode quarantine flag.
+    // Set by bz_dict_mark_disposed (called instead of bz_dict_free in checked
+    // builds); tested by bz_dict_is_disposed for method guards.
+    int8_t      disposed;
+    // §29.12 / issue #1232: modification epoch. Bumped on every mutation
+    // (Add/Update/Remove/Clear). Captured by for-in codegen at loop start;
+    // checked on each iteration — mismatch → InvalidOperationException.
+    int64_t     mod_count;
+};
+
+static uint32_t fnv1a(const char* s, int64_t len) {
+    uint32_t h = 2166136261u;
+    for (int64_t i = 0; i < len; i++)
+        h = (h ^ (uint8_t)s[i]) * 16777619u;
+    return h;
+}
+
+// issue #622 / stdlib §4.8: append a bucket index to the insertion-order array.
+static void dict_order_append(bz_dict_t* d, int64_t slot) {
+    if (d->order_count == d->order_cap) {
+        int64_t new_cap = d->order_cap < 8 ? 8 : d->order_cap * 2;
+        d->order = (int64_t*)realloc(d->order, (size_t)new_cap * sizeof(int64_t));
+        d->order_cap = new_cap;
+    }
+    d->order[d->order_count++] = slot;
+}
+
+// issue #622 / stdlib §4.8: mark a bucket index as removed in the order array
+// (set its entry to -1). Linear scan — dictionaries are typically small.
+static void dict_order_remove(bz_dict_t* d, int64_t slot) {
+    for (int64_t i = 0; i < d->order_count; i++) {
+        if (d->order[i] == slot) {
+            d->order[i] = -1;
+            return;
+        }
+    }
+}
+
+static int64_t dict_find(bz_dict_t* d, const char* k, int64_t klen, uint32_t h) {
+    int64_t mask = d->capacity - 1;
+    int64_t idx = h & mask;
+    for (int64_t probe = 0; probe < d->capacity; probe++) {
+        int64_t i = (idx + probe) & mask;
+        bz_entry_t& e = d->buckets[i];
+        if (!e.key && !e.deleted) return -(i + 1); // empty: not found, insert here
+        if (e.deleted) continue;
+        if (e.hash == h && e.key_len == klen && memcmp(e.key, k, (size_t)klen) == 0)
+            return i; // found
+    }
+    return -1; // table full (shouldn't happen with load factor management)
+}
+
+static void dict_rehash(bz_dict_t* d) {
+    int64_t old_cap = d->capacity;
+    bz_entry_t* old = d->buckets;
+    int64_t new_cap = old_cap < 8 ? 8 : old_cap * 2;
+    d->buckets = (bz_entry_t*)calloc((size_t)new_cap, sizeof(bz_entry_t));
+    d->capacity = new_cap;
+    d->count = 0;
+
+    // issue #622 / stdlib §4.8: build a translation table old_slot → new_slot
+    // so we can compact and remap the order array after re-inserting all entries.
+    int64_t* slot_map = (int64_t*)malloc((size_t)old_cap * sizeof(int64_t));
+    for (int64_t i = 0; i < old_cap; i++) slot_map[i] = -1;
+
+    for (int64_t i = 0; i < old_cap; i++) {
+        bz_entry_t& e = old[i];
+        if (!e.key || e.deleted) continue;
+        // Re-insert into new buckets, record new slot index.
+        int64_t pos = e.hash & (new_cap - 1);
+        for (int64_t p = 0; p < new_cap; p++) {
+            int64_t j = (pos + p) & (new_cap - 1);
+            if (!d->buckets[j].key) {
+                d->buckets[j] = e;
+                d->count++;
+                slot_map[i] = j;
+                break;
+            }
+        }
+    }
+    free(old);
+
+    // Compact the order array: skip tombstones (-1 entries), translate surviving
+    // old bucket indices to their new positions via slot_map.
+    int64_t new_oc = 0;
+    for (int64_t i = 0; i < d->order_count; i++) {
+        int64_t old_slot = d->order[i];
+        if (old_slot < 0) continue;                  // tombstone: skip
+        int64_t new_slot = (old_slot < old_cap) ? slot_map[old_slot] : -1;
+        if (new_slot >= 0)
+            d->order[new_oc++] = new_slot;
+    }
+    d->order_count = new_oc;
+    free(slot_map);
+}
+
+void* bz_dict_alloc(void) {
+    auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    d->capacity = 8;
+    d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    // issue #622: order array starts null; lazily grown on first insert.
+    // order_count and order_cap are zero from calloc.
+    return d;
+}
+
+void bz_dict_free(void* dp, void (*dispose_val)(void*)) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    // §28.2 v0.135 / issue #627: in checked-disposal builds, bz_dict_mark_disposed
+    // quarantines the header (disposed=1, buckets freed) without freeing the block.
+    // A subsequent scope-end bz_dict_free must be a no-op — skip if already disposed.
+    if (d->disposed) return;
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            free(e.key);
+            if (dispose_val && e.val) dispose_val(e.val);
+        }
+    }
+    free(d->buckets);
+    free(d->order);  // issue #622: release the insertion-order tracking array
+    free(d);
+}
+
+// §28.2 v0.135 / issue #627: checked-disposal-mode quarantine for bz_dict_t.
+// Mirrors bz_array_mark_disposed: disposes values, frees the bucket/order
+// arrays, marks disposed=1 on the header, but does NOT free the header block —
+// keeping it alive so subsequent method-entry guards can read the disposed flag.
+// Idempotent (safe to call twice). Deliberate memory leak in checked (debug)
+// builds, consistent with the class-instance and array quarantine patterns.
+void bz_dict_mark_disposed(void* dp, void (*dispose_val)(void*)) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->disposed) return;  // idempotent
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            free(e.key);
+            if (dispose_val && e.val) dispose_val(e.val);
+        }
+    }
+    free(d->buckets);
+    d->buckets = nullptr;
+    d->count = 0;
+    free(d->order);
+    d->order = nullptr;
+    d->order_count = 0;
+    d->disposed = 1;
+    // Do NOT free(d) — header stays alive for the disposed-flag guard.
+}
+
+// §28.2 v0.135 / issue #627: return non-zero if the dict has been disposed
+// via bz_dict_mark_disposed (checked mode only).
+int8_t bz_dict_is_disposed(void* dp) {
+    if (!dp) return 0;
+    return ((bz_dict_t*)dp)->disposed;
+}
+
+bool bz_dict_try_get_str(void* dp, const char* k, int64_t k_len, void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !k) return false;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    return true;
+}
+
+void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
+    auto* d = (bz_dict_t*)dp;
+    // Rehash at 75% load
+    if (d->count * 4 >= d->capacity * 3) dict_rehash(d);
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx >= 0) {
+        // Key already present: update value, no order change (§4.8).
+        d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
+        return;
+    }
+    // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
+    int64_t ins = -(idx + 1);
+    d->buckets[ins].key = strndup(k, (size_t)k_len);
+    d->buckets[ins].key_len = k_len;
+    d->buckets[ins].val = val;
+    d->buckets[ins].hash = h;
+    d->buckets[ins].deleted = false;
+    dict_order_append(d, ins);
+    d->count++;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+}
+
+// issue #388 / stdlib §4.9: OwningDictionary<string,V>'s `set(owned)` indexer.
+// If `k` is already present, dispose the value stored under it before replacing
+// it (exactly-once disposal of the displaced owner); a fresh key just inserts.
+void bz_dict_set_str_disposing(void* dp, const char* k, int64_t k_len,
+                               void* val, void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d) return;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx >= 0) {
+        if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+        d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
+        return;
+    }
+    bz_dict_set_str(dp, k, k_len, val);   // fresh key: bz_dict_set_str bumps mod_count
+}
+
+bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
+    auto* d = (bz_dict_t*)dp;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+    return true;
+}
+
+// issue M1 / stdlib §4.9: OwningDictionary<string,V>.Remove(key) must dispose
+// the removed owned value (exactly-once disposal), then unlink the entry.
+// Mirrors bz_dict_clear's per-entry dispose pattern. The non-owning
+// Dictionary.Remove still calls bz_dict_remove_str (no disposer).
+bool bz_dict_remove_str_disposing(void* dp, const char* k, int64_t k_len,
+                                  void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
+    if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+    return true;
+}
+
+bool bz_dict_contains_str(void* dp, const char* k, int64_t k_len) {
+    return bz_dict_try_get_str(dp, k, k_len, nullptr);
+}
+
+int64_t bz_dict_count(void* dp) {
+    return dp ? ((bz_dict_t*)dp)->count : 0;
+}
+
+void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** keys = (char**)malloc((size_t)(n > 0 ? n : 1) * sizeof(char*));
+    auto*  lens = (int64_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t j = 0;
+    if (d) {
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
+            if (e.key && !e.deleted) {
+                keys[j] = strndup(e.key, (size_t)e.key_len);
+                lens[j] = e.key_len;
+                j++;
+            }
+        }
+    }
+    if (keys_out) *keys_out = keys; else free(keys);
+    if (lens_out) *lens_out = lens; else free(lens);
+    if (n_out)    *n_out    = j;
+}
+
+// Generic-key variants (issue #343, §4.8). Keys are raw byte blobs of
+// `key_size` bytes; hashing and equality are delegated to the synthesized
+// GetHashCode / Equals of the key type (§8.3 / §9.1 / §9.2) via the function
+// pointers the codegen passes at allocation time. This makes records (and any
+// value type with the equality contract) usable as Dictionary/Set keys.
+//
+// Storage reuses bz_entry_t: `key` holds a malloc'd copy of the key bytes and
+// `key_len` holds key_size, so bz_dict_free / dict_rehash work unchanged.
+
+// Find a generic key in the table. Returns the bucket index, or -(idx+1) for
+// the empty insertion slot, or -1 if full. Mirrors dict_find but compares with
+// the user-provided equality function (and matches the cached hash first).
+static int64_t dict_find_gen(bz_dict_t* d, const void* k, uint32_t h) {
+    int64_t mask = d->capacity - 1;
+    int64_t idx = h & mask;
+    for (int64_t probe = 0; probe < d->capacity; probe++) {
+        int64_t i = (idx + probe) & mask;
+        bz_entry_t& e = d->buckets[i];
+        if (!e.key && !e.deleted) return -(i + 1); // empty: not found, insert here
+        if (e.deleted) continue;
+        if (e.hash == h && d->eq_fn(e.key, k))
+            return i; // found
+    }
+    return -1; // table full (shouldn't happen with load factor management)
+}
+
+void* bz_dict_alloc_generic(int64_t key_size,
+                              uint64_t (*hash)(const void* key),
+                              bool     (*eq)(const void* a, const void* b)) {
+    auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    d->capacity = 8;
+    d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    d->key_size = key_size > 0 ? key_size : 1;
+    d->hash_fn = hash;
+    d->eq_fn = eq;
+    // issue #622: order array starts null; lazily grown on first insert.
+    // order_count and order_cap are zero from calloc.
+    return d;
+}
+
+bool bz_dict_try_get_gen(void* dp, const void* key, void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    return true;
+}
+
+void bz_dict_set_gen(void* dp, const void* key, void* val) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return;
+    // Rehash at 75% load (same policy as the string variant).
+    if (d->count * 4 >= d->capacity * 3) dict_rehash(d);
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx >= 0) {
+        // Key already present: update value, no order change (§4.8).
+        d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
+        return;
+    }
+    // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
+    int64_t ins = -(idx + 1);
+    char* kc = (char*)malloc((size_t)d->key_size);
+    memcpy(kc, key, (size_t)d->key_size);
+    d->buckets[ins].key = kc;
+    d->buckets[ins].key_len = d->key_size;
+    d->buckets[ins].val = val;
+    d->buckets[ins].hash = h;
+    d->buckets[ins].deleted = false;
+    dict_order_append(d, ins);
+    d->count++;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+}
+
+// issue #388 / stdlib §4.9: generic-key counterpart to
+// bz_dict_set_str_disposing — dispose the value under `key` (if present) before
+// replacing it; a fresh key just inserts.
+void bz_dict_set_gen_disposing(void* dp, const void* key, void* val,
+                               void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx >= 0) {
+        if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+        d->buckets[idx].val = val;
+        d->mod_count++;  // §29.12 / #1232: value update = modification
+        return;
+    }
+    bz_dict_set_gen(dp, key, val);        // fresh key: bz_dict_set_gen bumps mod_count
+}
+
+bool bz_dict_remove_gen(void* dp, const void* key) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+    return true;
+}
+
+// issue M1 / stdlib §4.9: OwningDictionary<K,V>.Remove(key) for generic keys —
+// dispose the removed owned value (exactly-once), then unlink. Mirrors the
+// string-key bz_dict_remove_str_disposing; the non-owning Dict uses
+// bz_dict_remove_gen (no disposer).
+bool bz_dict_remove_gen_disposing(void* dp, const void* key,
+                                  void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
+    if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+    return true;
+}
+
+bool bz_dict_contains_gen(void* dp, const void* key) {
+    return bz_dict_try_get_gen(dp, key, nullptr);
+}
+
+// fix #643 / stdlib §4.9: PopValue(key) — retrieve the stored value pointer,
+// unlink the entry WITHOUT disposing the value (ownership transfers to caller),
+// and return true.  Returns false when the key is absent (callee raises).
+// String-key variant.
+bool bz_dict_pop_value_str(void* dp, const char* k, int64_t k_len,
+                            void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !k) return false;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    dict_order_remove(d, idx);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+    return true;
+}
+
+// Generic-key variant.
+bool bz_dict_pop_value_gen(void* dp, const void* key, void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    dict_order_remove(d, idx);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+    return true;
+}
+
+// stdlib §4.10 / §4.8: empty a hash table in place, keeping it allocated for
+// reuse. Frees each live key's malloc'd copy and, if `dispose_val` is non-null,
+// disposes each live value; then zeroes every bucket and resets the count. Used
+// by Set<T>.Clear() / Dictionary<K,V>.Clear() over the generic table. The
+// capacity, key_size, and hash/eq function pointers are preserved. For a
+// dict-backed Set the value slots are non-owned sentinels, so callers pass null
+// for `dispose_val`.
+void bz_dict_clear(void* dp, void (*dispose_val)(void*)) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            free(e.key);
+            if (dispose_val && e.val) dispose_val(e.val);
+        }
+    }
+    memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
+    d->count = 0;
+    // issue #622 / stdlib §4.8: Clear() resets insertion order (§4.8: "Clear()
+    // resets the order"). Reuse the allocated order buffer but set count to 0.
+    d->order_count = 0;
+    d->mod_count++;  // §29.12 / #1232: structural mutation
+}
+
+// Enumerate the generic table's keys (issue #370, §4.8 Dictionary.Keys /
+// §4.10 Set iteration). Returns a malloc'd array of `n` pointers, each a
+// malloc'd copy of one live key's `key_size` bytes. Mirrors bz_dict_keys_str
+// (which strdup's string keys) but copies the raw key blob instead, so it
+// serves int/enum/string/record keys uniformly.
+// issue #622 / stdlib §4.8: iteration is now in insertion order via order[].
+void bz_dict_keys_gen(void* dp, void*** keys_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** keys = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    int64_t j = 0;
+    if (d && d->key_size > 0) {
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
+            if (e.key && !e.deleted) {
+                void* kc = malloc((size_t)d->key_size);
+                memcpy(kc, e.key, (size_t)d->key_size);
+                keys[j++] = kc;
+            }
+        }
+    }
+    if (keys_out) *keys_out = keys; else free(keys);
+    if (n_out)    *n_out    = j;
+}
+
+// issue #537 / stdlib §4.8: snapshot value arrays for `for var v in d.Values`.
+// Both functions return a malloc'd void** array of `n` slot values (one per live
+// entry).  The caller owns and must free() the array; the values themselves are
+// owned by the dictionary and must NOT be freed by the caller.
+//
+// bz_dict_values_str — string-keyed table (key_size == 0).
+// issue #622 / stdlib §4.8: values are returned in insertion order via order[].
+void bz_dict_values_str(void* dp, void*** vals_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** vals = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    int64_t j = 0;
+    if (d) {
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
+            if (e.key && !e.deleted)
+                vals[j++] = e.val;
+        }
+    }
+    if (vals_out) *vals_out = vals; else free(vals);
+    if (n_out)    *n_out    = j;
+}
+
+// bz_dict_values_gen — generic-key table (key_size > 0). Mirrors
+// bz_dict_values_str; the key_size check guards against null/uninitialized dicts.
+// issue #622 / stdlib §4.8: values are returned in insertion order via order[].
+void bz_dict_values_gen(void* dp, void*** vals_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** vals = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    int64_t j = 0;
+    if (d && d->key_size > 0) {
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
+            if (e.key && !e.deleted)
+                vals[j++] = e.val;
+        }
+    }
+    if (vals_out) *vals_out = vals; else free(vals);
+    if (n_out)    *n_out    = j;
+}
+
+// issue #628 / stdlib §4.9 v0.135: OwningDictionary<K,V>.Drain() per-entry pop.
+//
+// bz_dict_drain_next_str — string-keyed dict (key_size == 0).
+// Pops the next live entry in insertion order from the dict: removes it from
+// the bucket (marks deleted) and returns its raw key bytes and value pointer.
+// The caller takes ownership of the value; the key bytes are a freshly malloc'd
+// copy that the caller must free(). Returns true if an entry was popped; false
+// if the dict is empty (drain complete).
+//
+// The dict's `order[]` array is consumed from the front: we scan forward from
+// the current scan position (tracked by a caller-supplied cursor, starting at 0)
+// for the first live slot, pop it, and return. Because the caller advances the
+// cursor each call, the scan is amortized O(1) per live entry over the full drain.
+// The cursor is purely a scan hint; the caller passes a pointer to an int64_t
+// that starts at 0 and is updated here.
+bool bz_dict_drain_next_str(void* dp, int64_t* cursor,
+                             char** key_out, int64_t* key_len_out,
+                             void** val_out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0) return false;
+    // Advance cursor to the first live slot in the order array.
+    while (*cursor < d->order_count) {
+        int64_t slot = d->order[*cursor];
+        (*cursor)++;
+        if (slot < 0) continue;  // tombstone
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;  // already gone
+        // Found a live entry: hand ownership of key+val to caller.
+        if (key_out)     *key_out     = strndup(e.key, (size_t)e.key_len);
+        if (key_len_out) *key_len_out = e.key_len;
+        if (val_out)     *val_out     = e.val;
+        // Remove from the bucket (mark deleted, free key storage, nil val).
+        free(e.key);
+        e.key     = nullptr;
+        e.val     = nullptr;
+        e.deleted = true;
+        d->count--;
+        return true;
+    }
+    return false;
+}
+
+// bz_dict_drain_next_gen — generic-keyed dict (key_size > 0).
+// Mirrors bz_dict_drain_next_str; the key is returned as a malloc'd copy of the
+// raw bytes (size = d->key_size). The caller must free() it when done.
+bool bz_dict_drain_next_gen(void* dp, int64_t* cursor,
+                             void** key_out, void** val_out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0 || d->key_size <= 0) return false;
+    while (*cursor < d->order_count) {
+        int64_t slot = d->order[*cursor];
+        (*cursor)++;
+        if (slot < 0) continue;  // tombstone
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;
+        // Pop: return copies of key bytes and the value pointer.
+        if (key_out) {
+            void* kc = malloc((size_t)d->key_size);
+            memcpy(kc, e.key, (size_t)d->key_size);
+            *key_out = kc;
+        }
+        if (val_out) *val_out = e.val;
+        free(e.key);
+        e.key     = nullptr;
+        e.val     = nullptr;
+        e.deleted = true;
+        d->count--;
+        return true;
+    }
+    return false;
+}
+
+// issue #639 / stdlib §4.5/§4.7/§4.11 v0.135: OwningArray<T> / OwningLinkedList<T>
+// / OwningStack<T> / OwningQueue<T> .Drain() per-element pop.
+//
+// ---------------------------------------------------------------------------
+// §29.12 / issue #1232: modification-epoch accessors.
+// These are called by codegen at the START of a for-in loop (to capture the
+// epoch) and at the start of EACH ITERATION (to check for mutations).
+// A mismatch → codegen calls emitGuardThrow("InvalidOperationException").
+// ---------------------------------------------------------------------------
+
+int64_t bz_array_get_mod(void* arrp) {
+    return arrp ? ((bz_array_t*)arrp)->mod_count : 0;
+}
+
+int64_t bz_dict_get_mod(void* dp) {
+    return dp ? ((bz_dict_t*)dp)->mod_count : 0;
+}
+
+// bz_llist_get_mod is placed after the bz_llist_t struct definition below
+// (forward reference — the struct is declared at that point in the file).
+
+// ---------------------------------------------------------------------------
+// bz_array_drain_next — pops index 0 (front-to-back).
+// Used by OwningArray<T>.Drain() (front-to-back per §28.11 "iteration order")
+// and OwningQueue<T>.Drain() (FIFO, also front-to-back).
+// Returns true if an element was popped into *val_out; false when the array is
+// empty (drain complete). The caller takes ownership of the popped pointer.
+// The element slot is closed by bz_array_remove_at so count shrinks by 1.
+bool bz_array_drain_next(void* arrp, void** val_out) {
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr || arr->count == 0) return false;
+    // Read the pointer-sized element at index 0 (class-typed element).
+    void* elem = ((void**)arr->data)[0];
+    if (val_out) *val_out = elem;
+    // Remove the slot without disposal — ownership transferred to caller.
+    bz_array_remove_at(arrp, 0, (int64_t)sizeof(void*));
+    return true;
+}
+
+// bz_array_drain_next_lifo — pops the last element (LIFO / back-to-front).
+// Used by OwningStack<T>.Drain() which pops in top-first order (the stack's
+// Pop order), matching "iteration order" per §28.11.
+bool bz_array_drain_next_lifo(void* arrp, void** val_out) {
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr || arr->count == 0) return false;
+    int64_t last = arr->count - 1;
+    void* elem = ((void**)arr->data)[last];
+    if (val_out) *val_out = elem;
+    // Shrink count by 1 (the last element's slot needs no shift).
+    arr->count = last;
+    return true;
+}
+
+// issue #389 / stdlib §4.10: fold a snapshot of `other`'s elements into/against
+// a dict-backed Set `self`. See the header for the `op` codes and the snapshot
+// contract. Frees the snapshot before returning. UnionWith/ExceptWith iterate
+// the snapshot and mutate self (no mutate-while-iterate hazard — the snapshot is
+// a private copy). IntersectWith and the subset/superset queries first build a
+// temporary membership table from the snapshot using self's own hash/eq/key_size
+// (so equality follows T's contract, §8.3), then compare; IntersectWith also
+// snapshots self's keys before removing, so it never mutates a table it iterates.
+int32_t bz_set_algebra_gen(void* selfp, void** keys, int64_t n, int32_t op) {
+    auto* self = (bz_dict_t*)selfp;
+    int32_t result = 0;
+    if (!self || self->key_size <= 0) { /* fall through to free */ }
+    else if (op == 0) {                 // UnionWith
+        for (int64_t i = 0; i < n; i++)
+            bz_dict_set_gen(self, keys[i], (void*)1);
+    } else if (op == 1) {               // ExceptWith
+        for (int64_t i = 0; i < n; i++)
+            bz_dict_remove_gen(self, keys[i]);
+    } else {                            // IntersectWith / IsSubsetOf / IsSupersetOf
+        // Build a temp membership set from the snapshot, keyed like self.
+        auto* other = (bz_dict_t*)bz_dict_alloc_generic(
+            self->key_size, self->hash_fn, self->eq_fn);
+        for (int64_t i = 0; i < n; i++)
+            bz_dict_set_gen(other, keys[i], (void*)1);
+        if (op == 2) {                  // IntersectWith: keep self ∩ other
+            // Snapshot self's keys first, then remove every key not in `other`.
+            void** selfKeys = nullptr; int64_t sn = 0;
+            bz_dict_keys_gen(self, &selfKeys, &sn);
+            for (int64_t i = 0; i < sn; i++) {
+                if (!bz_dict_contains_gen(other, selfKeys[i]))
+                    bz_dict_remove_gen(self, selfKeys[i]);
+                free(selfKeys[i]);
+            }
+            free(selfKeys);
+        } else if (op == 3) {           // IsSubsetOf: every self element in other
+            result = 1;
+            void** selfKeys = nullptr; int64_t sn = 0;
+            bz_dict_keys_gen(self, &selfKeys, &sn);
+            for (int64_t i = 0; i < sn; i++) {
+                if (!bz_dict_contains_gen(other, selfKeys[i])) result = 0;
+                free(selfKeys[i]);
+            }
+            free(selfKeys);
+        } else if (op == 4) {           // IsSupersetOf: every other element in self
+            result = 1;
+            for (int64_t i = 0; i < n; i++)
+                if (!bz_dict_contains_gen(self, keys[i])) result = 0;
+        }
+        bz_dict_free(other, nullptr);   // sentinel values: nothing to dispose
+    }
+    for (int64_t i = 0; i < n; i++) free(keys[i]);
+    free(keys);
+    return result;
+}
+
+// issue #429 / §28.9 / §4.10: release every live string element's +1.
+// A Set<string> stores each element as a bz_string* in the generic-key
+// table's key slot (key_size == sizeof(void*)). This function reads the
+// string pointer from each key's raw bytes and calls bz_string_release on
+// it BEFORE bz_dict_free frees the key copy. Call this immediately before
+// bz_dict_free(d, null) — after this call the RC accounting is discharged;
+// the subsequent bz_dict_free reclaims the key copies and the table itself.
+// null/empty-table safe; a no-op on a non-generic table.
+void bz_set_string_keys_release(void* dp) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->key_size != (int64_t)sizeof(void*)) return;  // not a pointer-key set
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            void* strPtr;
+            memcpy(&strPtr, e.key, sizeof(void*));
+            if (strPtr) bz_string_release(strPtr);
+        }
+    }
+}
+
+// issue #429 / §28.9 / §4.10: like bz_dict_clear(d, null) but also releases
+// each live element's string +1 before freeing the key copy. Used by
+// Set<string>.Clear() so that cleared string elements are reclaimed (else
+// they would leak). The table itself stays allocated and usable afterward,
+// as with bz_dict_clear.
+void bz_dict_clear_set_strings(void* dp) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->key_size != (int64_t)sizeof(void*)) return;
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            // Release the string element (+1 discharge) before freeing key copy.
+            void* strPtr;
+            memcpy(&strPtr, e.key, sizeof(void*));
+            if (strPtr) bz_string_release(strPtr);
+            free(e.key);
+            // value is a sentinel (1) — nothing to dispose
+        }
+    }
+    memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
+    d->count = 0;
+    d->order_count = 0;  // issue #622: reset insertion-order tracking on Clear
+}
+
+// issue #429 / §28.9 / §4.10: like bz_dict_remove_gen but releases the
+// removed string element's +1 before freeing the key copy. Used by
+// Set<string>.Remove() so that the removed element is reclaimed (else it
+// would leak). Returns true iff the element was present and removed.
+bool bz_dict_remove_set_string(void* dp, const void* key) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
+    // Release the string element's +1 before freeing the key copy.
+    if (d->buckets[idx].key) {
+        void* strPtr;
+        memcpy(&strPtr, d->buckets[idx].key, sizeof(void*));
+        if (strPtr) bz_string_release(strPtr);
+    }
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// bz_llist_t — doubly-linked list (stdlib §4.6 / §4.7)
+// ---------------------------------------------------------------------------
+
+// Node layout: prev*, next*, then elem_size bytes of element value inline.
+// The list header tracks head, tail, count, and the fixed elem_size used to
+// allocate nodes (so remove/free don't need a separately-passed elem_size).
+struct bz_llist_node_t {
+    bz_llist_node_t* prev;
+    bz_llist_node_t* next;
+    // #869 / §28.11: monotonic insertion sequence, so OwningLinkedList disposal
+    // can run in REVERSE-INSERTION order regardless of whether elements were
+    // added at the head (AddFirst) or tail (AddLast) — the head/tail POSITION is
+    // not insertion order once AddFirst/AddBefore are mixed in.
+    int64_t          seq;
+    // element bytes follow immediately — flexible array trick via alloc
+};
+
+struct bz_llist_t {
+    bz_llist_node_t* head;
+    bz_llist_node_t* tail;
+    int64_t          count;
+    int64_t          elem_size;
+    int64_t          next_seq;  // #869: next insertion sequence to assign.
+    // §29.12 / issue #1232: modification epoch. Bumped on every structural
+    // mutation (AddFirst/Last/Before/After, Remove*, Pop*). Captured by
+    // lowerLinkedListFor at loop start; checked per iteration.
+    int64_t          mod_count;
+};
+
+// Allocate a node with elem_size bytes of value storage, stamping it with the
+// list's next insertion sequence (#869).
+static bz_llist_node_t* llist_node_alloc(bz_llist_t* l, int64_t elem_size,
+                                         const void* elem) {
+    auto* n = (bz_llist_node_t*)calloc(
+        1, sizeof(bz_llist_node_t) + (size_t)elem_size);
+    if (elem && elem_size > 0)
+        memcpy((char*)n + sizeof(bz_llist_node_t), elem, (size_t)elem_size);
+    n->seq = l->next_seq++;  // #869: monotonic insertion order
+    l->mod_count++;  // §29.12 / #1232: structural mutation (covers all Add*)
+    return n;
+}
+
+void* bz_llist_alloc(int64_t elem_size) {
+    auto* l = (bz_llist_t*)calloc(1, sizeof(bz_llist_t));
+    l->elem_size = elem_size;
+    return l;
+}
+
+int64_t bz_llist_count(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->count : 0;
+}
+
+int64_t bz_llist_get_mod(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->mod_count : 0;
+}
+
+void* bz_llist_add_first(void* listp, const void* elem, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return nullptr;
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
+    n->next = l->head;
+    n->prev = nullptr;
+    if (l->head) l->head->prev = n;
+    l->head = n;
+    if (!l->tail) l->tail = n;
+    l->count++;
+    return n;
+}
+
+void* bz_llist_add_last(void* listp, const void* elem, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return nullptr;
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
+    n->prev = l->tail;
+    n->next = nullptr;
+    if (l->tail) l->tail->next = n;
+    l->tail = n;
+    if (!l->head) l->head = n;
+    l->count++;
+    return n;
+}
+
+void* bz_llist_add_before(void* listp, void* nodep, const void* elem,
+                           int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    auto* node = (bz_llist_node_t*)nodep;
+    if (!l || !node) return nullptr;
+    if (node == l->head) return bz_llist_add_first(listp, elem, elem_size);
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
+    n->next = node;
+    n->prev = node->prev;
+    if (node->prev) node->prev->next = n;
+    node->prev = n;
+    l->count++;
+    return n;
+}
+
+void* bz_llist_add_after(void* listp, void* nodep, const void* elem,
+                          int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    auto* node = (bz_llist_node_t*)nodep;
+    if (!l || !node) return nullptr;
+    if (node == l->tail) return bz_llist_add_last(listp, elem, elem_size);
+    bz_llist_node_t* n = llist_node_alloc(l, elem_size, elem);
+    n->prev = node;
+    n->next = node->next;
+    if (node->next) node->next->prev = n;
+    node->next = n;
+    l->count++;
+    return n;
+}
+
+// Internal: unlink and free `node`, calling dispose_elem if non-null.
+static void llist_unlink(bz_llist_t* l, bz_llist_node_t* node,
+                         void (*dispose_elem)(void*)) {
+    if (node->prev) node->prev->next = node->next;
+    else l->head = node->next;
+    if (node->next) node->next->prev = node->prev;
+    else l->tail = node->prev;
+    l->count--;
+    l->mod_count++;  // §29.12 / #1232: structural mutation (covers all Remove*/Pop*)
+    if (dispose_elem) {
+        void* vp = (char*)node + sizeof(bz_llist_node_t);
+        // For OwningLinkedList<T: class>, element bytes hold a pointer; load it.
+        void* obj = *(void**)vp;
+        if (obj) dispose_elem(obj);
+    }
+    free(node);
+}
+
+void bz_llist_remove_first(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->head) return;
+    llist_unlink(l, l->head, dispose_elem);
+}
+
+void bz_llist_remove_last(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->tail) return;
+    llist_unlink(l, l->tail, dispose_elem);
+}
+
+void bz_llist_remove_node(void* listp, void* nodep,
+                           void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    auto* node = (bz_llist_node_t*)nodep;
+    if (!l || !node) return;
+    llist_unlink(l, node, dispose_elem);
+}
+
+// fix #642 / stdlib §4.7: PopFirst() / PopLast() — copy the first/last element
+// into *out, transferring ownership to the caller, then unlink WITHOUT disposal.
+// Unlike llist_unlink (which calls dispose_elem), these never invoke a disposer.
+void bz_llist_pop_first(void* listp, void* out, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->head || !out) return;
+    bz_llist_node_t* node = l->head;
+    // Copy the inline element bytes into the caller's output buffer.
+    memcpy(out, (char*)node + sizeof(bz_llist_node_t), (size_t)elem_size);
+    // Unlink without disposal (ownership transferred to caller).
+    llist_unlink(l, node, /*dispose_elem=*/nullptr);
+}
+
+void bz_llist_pop_last(void* listp, void* out, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->tail || !out) return;
+    bz_llist_node_t* node = l->tail;
+    memcpy(out, (char*)node + sizeof(bz_llist_node_t), (size_t)elem_size);
+    llist_unlink(l, node, /*dispose_elem=*/nullptr);
+}
+
+// Find by memcmp equality on the inline element bytes.
+// For class-typed elements (pointer-sized), elem points to a pointer; we
+// compare the pointer value (reference identity, per §8.3 / §4.6).
+void* bz_llist_find(void* listp, const void* elem, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !elem) return nullptr;
+    for (bz_llist_node_t* n = l->head; n; n = n->next) {
+        void* vp = (char*)n + sizeof(bz_llist_node_t);
+        if (memcmp(vp, elem, (size_t)elem_size) == 0) return n;
+    }
+    return nullptr;
+}
+
+void* bz_llist_first_node(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->head : nullptr;
+}
+
+void* bz_llist_last_node(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->tail : nullptr;
+}
+
+void* bz_llist_node_value_ptr(void* nodep) {
+    return nodep ? (char*)nodep + sizeof(bz_llist_node_t) : nullptr;
+}
+
+void* bz_llist_node_next(void* nodep) {
+    return nodep ? ((bz_llist_node_t*)nodep)->next : nullptr;
+}
+
+void* bz_llist_node_prev(void* nodep) {
+    return nodep ? ((bz_llist_node_t*)nodep)->prev : nullptr;
+}
+
+void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return;
+    // §28.11 (#869): dispose elements in REVERSE-INSERTION order — last-inserted
+    // first. The positional tail→head walk only equals reverse-insertion when
+    // every element was AddLast'd; once AddFirst/AddBefore are mixed in, the
+    // head/tail position no longer tracks insertion order, so dispose by
+    // DESCENDING insertion sequence (n->seq). Collect the live nodes, sort by
+    // seq descending, dispose in that order, then free the nodes and the list.
+    // dispose_elem is null for value-typed T (nothing to dispose), so the
+    // collect+sort is skipped in that common case.
+    if (dispose_elem && l->count > 0) {
+        int64_t cap = l->count;
+        bz_llist_node_t** arr =
+            (bz_llist_node_t**)malloc((size_t)cap * sizeof(bz_llist_node_t*));
+        if (arr) {
+            int64_t i = 0;
+            for (bz_llist_node_t* p = l->head; p && i < cap; p = p->next)
+                arr[i++] = p;
+            std::sort(arr, arr + i,
+                      [](bz_llist_node_t* a, bz_llist_node_t* b) {
+                          return a->seq > b->seq;  // descending = reverse-insertion
+                      });
+            for (int64_t k = 0; k < i; k++) {
+                void* obj = *(void**)((char*)arr[k] + sizeof(bz_llist_node_t));
+                if (obj) dispose_elem(obj);
+            }
+            free(arr);
+        } else {
+            // Allocation failed: fall back to the positional reverse walk (still
+            // correct for the AddLast-only case; best effort otherwise).
+            for (bz_llist_node_t* p = l->tail; p; p = p->prev) {
+                void* obj = *(void**)((char*)p + sizeof(bz_llist_node_t));
+                if (obj) dispose_elem(obj);
+            }
+        }
+    }
+    // Free all nodes (order irrelevant now) and the list header.
+    bz_llist_node_t* n = l->head;
+    while (n) {
+        bz_llist_node_t* nx = n->next;
+        free(n);
+        n = nx;
+    }
+    free(l);
+}
+
+// #639 / stdlib §4.7 v0.135: OwningLinkedList<T>.Drain() per-element pop.
+// Pops the head node (front-to-back / head-to-tail per §28.11 "iteration order").
+// Returns the pointer stored inline in the head node into *val_out, then
+// unlinks and frees the node WITHOUT disposal (ownership transferred to caller).
+// Returns true if a node was popped; false if the list is empty.
+bool bz_llist_drain_next(void* listp, void** val_out) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->head) return false;
+    bz_llist_node_t* node = l->head;
+    // Element bytes stored inline after the node header; for class-typed T this
+    // is a single void* (the owned class pointer).
+    void* elem = *(void**)((char*)node + sizeof(bz_llist_node_t));
+    if (val_out) *val_out = elem;
+    // Unlink without disposal — ownership transferred to caller.
+    llist_unlink(l, node, /*dispose_elem=*/nullptr);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Random
+// ---------------------------------------------------------------------------
+
+struct bz_rng_t { uint64_t state[2]; }; // xorshift128+
+
+static uint64_t xorshift128_next(uint64_t* s) {
+    uint64_t t = s[0];
+    uint64_t const r = s[1];
+    s[0] = r;
+    t ^= t << 23;
+    t ^= t >> 17;
+    t ^= r ^ (r >> 26);
+    s[1] = t;
+    return t + r;
+}
+
+void* bz_random_alloc(int64_t seed) {
+    auto* r = (bz_rng_t*)malloc(sizeof(bz_rng_t));
+    r->state[0] = (uint64_t)seed ^ 0xdeadbeef12345678ULL;
+    r->state[1] = (uint64_t)seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    if (r->state[0] == 0) r->state[0] = 1;
+    if (r->state[1] == 0) r->state[1] = 1;
+    return r;
+}
+
+void bz_random_free(void* r) { free(r); }
+
+int32_t bz_random_next_int(void* rp, int32_t lo, int32_t hi_exclusive) {
+    auto* r = (bz_rng_t*)rp;
+    uint64_t v = xorshift128_next(r->state);
+    if (hi_exclusive <= lo) return lo;
+    return lo + (int32_t)(v % (uint64_t)(hi_exclusive - lo));
+}
+
+double bz_random_next_double(void* rp) {
+    auto* r = (bz_rng_t*)rp;
+    uint64_t v = xorshift128_next(r->state);
+    // Map to [0, 1)
+    return (double)(v >> 11) * (1.0 / 9007199254740992.0);
+}
+
+void bz_random_next_bytes(void* rp, uint8_t* buf, int64_t len) {
+    auto* r = (bz_rng_t*)rp;
+    for (int64_t i = 0; i < len; i += 8) {
+        uint64_t v = xorshift128_next(r->state);
+        int64_t chunk = (len - i) < 8 ? (len - i) : 8;
+        memcpy(buf + i, &v, (size_t)chunk);
+    }
+}
+
+// per stdlib §2.7 / #1359: NextInt64 — full 64-bit unsigned xorshift128+ value
+// cast to int64_t (signed). Maps the full 64-bit range to [Long.MinValue..Long.MaxValue].
+int64_t bz_random_next_long(void* rp) {
+    auto* r = (bz_rng_t*)rp;
+    return (int64_t)xorshift128_next(r->state);
+}
+
+// per stdlib §2.7 / #1359: NextBoolean — test the low bit of a fresh PRNG word.
+int32_t bz_random_next_bool(void* rp) {
+    auto* r = (bz_rng_t*)rp;
+    return (int32_t)(xorshift128_next(r->state) & 1ULL);
+}
+
+// ---------------------------------------------------------------------------
+// StringBuilder helper
+// ---------------------------------------------------------------------------
+
+// The bz.string struct layout: {ptr data, i64 len, i8 width}
+
+// bz_array_enum_t: vtable-backed array enumerator for IEnumerator<T> protocol.
+// Vtable layout matches our iterator state machines: [td, Dispose, MoveNext, Current].
+struct bz_array_enum_t {
+    void* vtable;      // points to bz_array_enum_vtable
+    void* arr;         // the underlying bz_array_t*
+    int64_t idx;       // current index (-1 = before first)
+    int64_t esz;       // element size in bytes
+};
+
+static int32_t bz_array_enum_movenext(bz_array_enum_t* e) {
+    e->idx++;
+    return (e->idx < bz_array_len(e->arr)) ? 1 : 0;
+}
+static void* bz_array_enum_current(bz_array_enum_t* e) {
+    return bz_array_ptr_at(e->arr, e->idx, e->esz);
+}
+static void bz_array_enum_dispose(bz_array_enum_t* e) {
+    free(e);
+}
+
+// Static vtable: [self-ptr, Dispose, MoveNext, get_Current]
+static void* bz_array_enum_vtable[4] = {
+    nullptr,  // slot 0: filled at startup (see bz_array_enum_alloc)
+    (void*)bz_array_enum_dispose,
+    (void*)bz_array_enum_movenext,
+    (void*)bz_array_enum_current
+};
+
+void* bz_array_enum_alloc(void* arr, int64_t elem_size) {
+    auto* e = (bz_array_enum_t*)calloc(1, sizeof(bz_array_enum_t));
+    bz_array_enum_vtable[0] = bz_array_enum_vtable;  // self-referential td
+    e->vtable = bz_array_enum_vtable;
+    e->arr = arr;
+    e->idx = -1;
+    e->esz = elem_size;
+    return e;
+}
+
+// ---------------------------------------------------------------------------
+// Lazy LINQ enumerators (stdlib §5: "All are lazy unless documented otherwise").
+//
+// Every LINQ operator returns a deferred enumerator that does no work until it
+// is enumerated (by a for-loop or a materializer like ToArray). The enumerators
+// share the iterator vtable protocol [td, Dispose, MoveNext, Current] used by
+// the codegen iterator state machines (LlvmBackend_Iterators.cpp) and the array
+// enumerator above:
+//   slot 0 = type descriptor (self-pointer sentinel)
+//   slot 1 = Dispose(self) -> void
+//   slot 2 = MoveNext(self) -> int32 (1 = advanced, 0 = exhausted)
+//   slot 3 = Current(self)  -> void* (pointer to the current element's bytes)
+//
+// Element data is type-erased (raw bytes of `esz` bytes). Closures (predicates,
+// selectors, key functions) are invoked through codegen-emitted trampolines
+// with fixed C signatures so the runtime stays element-type-agnostic:
+//   predicate trampoline: int32_t f(void* closure, const void* elem_ptr)
+//   selector  trampoline: void    f(void* closure, const void* elem_ptr, void* out_ptr)
+//   key       trampoline: int64_t f(void* closure, const void* elem_ptr)
+// A lazy operator over an Array<T> wraps the array via bz_lazy_from_array; over
+// another lazy enumerator it stores the upstream enumerator pointer directly,
+// so chains (`a.Where(..).Select(..).Take(n)`) compose without materializing.
+// ---------------------------------------------------------------------------
+
+typedef int32_t (*bz_pred_fn)(void* closure, const void* elem);
+typedef void    (*bz_sel_fn)(void* closure, const void* elem, void* out);
+typedef int64_t (*bz_key_fn)(void* closure, const void* elem);
+// Element equality trampoline (Distinct): content-aware comparison the runtime
+// cannot do over type-erased bytes (e.g. string content equality vs. raw bytes).
+typedef int32_t (*bz_eq_fn)(const void* a, const void* b);
+// Element hash trampoline (Union/Intersect/Except membership dict): maps an
+// element's raw bytes to a uint64 hash value for the generic dict backing.
+typedef uint64_t (*bz_hash_fn)(const void* elem);
+// SelectMany selector trampoline: maps one element to a fresh lazy enumerator
+// (the inner IEnumerable<U>). Returns an opaque bz_lazy_t* the runtime drains.
+typedef void* (*bz_flatsel_fn)(void* closure, const void* elem);
+// Zip combine trampoline: pairs one element from each source into the output.
+typedef void  (*bz_comb_fn)(void* closure, const void* a, const void* b,
+                            void* out);
+
+enum bz_lazy_kind {
+    BZ_LAZY_ARRAY,     // source = bz_array_t*, iterate by index
+    BZ_LAZY_WHERE,     // filter via predicate
+    BZ_LAZY_SELECT,    // project via selector (esz = output element size)
+    BZ_LAZY_TAKE,      // first `n` elements
+    BZ_LAZY_SKIP,      // skip first `n` elements
+    BZ_LAZY_DISTINCT,  // de-duplicate (raw-byte equality, order preserved)
+    BZ_LAZY_ORDERBY,   // materialize-on-first-MoveNext: sorted snapshot
+    BZ_LAZY_SET,       // dict-backed Set<T> source: owned key snapshot by index
+    BZ_LAZY_CONCAT,    // §5 Combination: yield all of `up`, then all of `down`
+    BZ_LAZY_TAKEWHILE, // §5 Slicing: prefix while predicate holds, then stop
+    BZ_LAZY_SKIPWHILE, // §5 Slicing: drop leading run satisfying predicate
+    BZ_LAZY_SELECTMANY,// §5 Projection: flatten (T)->IEnumerable<U>
+    BZ_LAZY_ZIP,       // §5 Combination: pair `up` and `down` via combine
+    // stdlib §5 Set-like lazy operators (added milestone):
+    BZ_LAZY_UNION,     // §5 Set-like: unique elements from `up` ∪ `down`
+    BZ_LAZY_INTERSECT, // §5 Set-like: elements from `up` that are in `down`
+    BZ_LAZY_EXCEPT,    // §5 Set-like: elements from `up` not in `down`
+    // stdlib §5 Ordering secondary key:
+    BZ_LAZY_THENBY,    // §5 Ordering: composite (primary, secondary) sort
+    // stdlib §5 Lazy Reverse:
+    BZ_LAZY_REVERSE,   // §5 Ordering: materialize then yield backwards
+    // per §4.6/§4.7 + §5 fix #450:
+    BZ_LAZY_LLIST,     // source = bz_llist_t*, walk nodes head-to-tail
+    // issue #775 / §16.3: a `Range<T>` source — a counted sequence from
+    // idx(start)→n(end) by up_esz(step), inclusive/exclusive per phase bit0.
+    BZ_LAZY_RANGE,
+};
+
+struct bz_lazy_t {
+    void*   vtable;     // shared bz_lazy_vtable
+    int32_t kind;
+    int64_t esz;        // element size in bytes (output size for SELECT)
+    // Source: either an upstream lazy enumerator (`up`) or an array (`arr`).
+    bz_lazy_t* up;      // upstream enumerator (null for ARRAY)
+    bz_lazy_t* down;    // second source (CONCAT/ZIP/UNION/INTERSECT/EXCEPT)
+    void*   arr;        // bz_array_t* (ARRAY kind)
+    int64_t idx;        // ARRAY: current index; TAKE/SKIP: count consumed
+    int64_t n;          // TAKE/SKIP threshold
+    // Closure + trampoline (WHERE/SELECT/ORDERBY).
+    void*   closure;
+    bz_pred_fn pred;
+    bz_sel_fn  sel;
+    bz_key_fn  keyfn;
+    bz_eq_fn   eqfn;    // DISTINCT/UNION/INTERSECT/EXCEPT: element equality
+    bz_hash_fn hashfn;  // UNION/INTERSECT/EXCEPT: element hash (membership dict)
+    bz_flatsel_fn flatsel;  // SELECTMANY: element -> inner lazy enumerator
+    bz_comb_fn comb;        // ZIP: (a, b) -> out
+    int32_t descending; // ORDERBY/THENBY primary direction
+    int64_t up_esz;     // ZIP: byte stride of the `up`/left element
+    int64_t down_esz;   // ZIP: byte stride of the `down`/right element
+    // Scratch storage for the current element bytes (Current returns cur).
+    void*   cur;        // malloc'd, esz bytes
+    // DISTINCT: a dynamic array of seen elements.
+    void*   seen;       // bz_array_t* of element bytes (DISTINCT) OR
+                        // bz_dict_t* (UNION/INTERSECT/EXCEPT: elements seen so far)
+    // ORDERBY/THENBY/REVERSE: materialized + sorted snapshot, iterated by index.
+    // UNION/INTERSECT/EXCEPT: pre-built dict of `down` elements (membership test).
+    void*   sorted;     // bz_array_t* (ORDERBY/THENBY/REVERSE) or bz_dict_t*
+    int32_t skipped;    // SKIP/SKIPWHILE: have we already dropped the prefix?
+    int32_t materialized;
+    int32_t phase;      // CONCAT: 0 = draining `up`, 1 = draining `down`
+                        // UNION: 0 = draining `up` (unique), 1 = from `other_keys`
+    int32_t stopped;    // TAKEWHILE: predicate has failed; sequence ended
+    bz_lazy_t* inner;   // SELECTMANY: current inner enumerator (null = none)
+    // #422 / §28.9 / §28.3: when the operator's closure was produced INLINE (a
+    // lambda literal — a +1 transient this enumerator owns), codegen sets
+    // own_closure := 1 so bz_lazy_dispose releases it; a closure arriving via a
+    // variable/field is a BORROW (own_closure stays 0 from calloc) and is never
+    // freed here. Mirrors the GetOrAdd factoryIsInlineLambda guard.
+    int32_t own_closure;
+    // THENBY secondary sort key:
+    void*      closure2;   // secondary key closure (THENBY)
+    bz_key_fn  keyfn2;    // secondary key trampoline (THENBY)
+    int32_t    descending2; // secondary descending flag (THENBY)
+    int32_t    own_closure2; // secondary closure ownership (THENBY)
+    // UNION phase-1 iteration: pointer to the `down`-side key array snapshot.
+    // Built from the `sorted` (other_dict) when `up` is exhausted.
+    void**  other_keys;   // malloc'd array of element pointers for UNION phase 1
+    int64_t other_n;      // count of other_keys
+    // issue #995 / stdlib §5: ARRAY-kind ownership. A normal `bz_lazy_from_array`
+    // BORROWS its array (the array is owned by the Array<T> local and freed
+    // elsewhere — own_arr == 0). When the array is a FRESH temporary the lazy
+    // source owns — e.g. materialized from a vtable-backed IEnumerable<T> via
+    // bz_lazy_from_owned_array — own_arr == 1, so bz_lazy_dispose frees it (with a
+    // null disposer: the snapshot borrows its elements, it owns no element). This
+    // makes the materialize-then-enumerate bridge leak-free for both the terminal
+    // (bz_lazy_to_array) and the operator-chain (Where/Select/…) consumers.
+    int32_t own_arr;
+};
+
+// Advance the upstream enumerator and return a pointer to its current element,
+// or null when exhausted.
+static const void* bz_lazy_up_next(bz_lazy_t* up) {
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    void** vt = (void**)up->vtable;
+    if (!((mn_t)vt[2])(up)) return nullptr;
+    return ((cur_t)vt[3])(up);
+}
+
+extern "C" void bz_closure_release(void* c);  // defined below; released on dispose
+
+static int32_t bz_lazy_movenext(bz_lazy_t* e);
+static void*   bz_lazy_current(bz_lazy_t* e) { return e->cur; }
+static void    bz_lazy_dispose(bz_lazy_t* e) {
+    if (!e) return;
+    if (e->up) bz_lazy_dispose(e->up);
+    if (e->down) bz_lazy_dispose(e->down);   // CONCAT/ZIP second source
+    // LLIST uses `inner` as a bz_llist_node_t* borrow (not an owned enumerator).
+    if (e->inner && e->kind != BZ_LAZY_LLIST) bz_lazy_dispose(e->inner);  // SELECTMANY
+    if (e->cur) free(e->cur);
+    // DISTINCT uses `seen` as a bz_array_t*; UNION/INTERSECT/EXCEPT use it as a
+    // bz_dict_t* (membership dict). Both are heap-allocated and must be freed.
+    if (e->seen) {
+        if (e->kind == BZ_LAZY_UNION || e->kind == BZ_LAZY_INTERSECT ||
+            e->kind == BZ_LAZY_EXCEPT)
+            bz_dict_free(e->seen, nullptr);  // seen dict
+        else
+            bz_array_free(e->seen, nullptr);
+    }
+    // `sorted` is bz_array_t* for ORDERBY/THENBY/REVERSE/SET, bz_dict_t* for
+    // UNION/INTERSECT/EXCEPT (the `other` membership dict).
+    if (e->sorted) {
+        if (e->kind == BZ_LAZY_UNION || e->kind == BZ_LAZY_INTERSECT ||
+            e->kind == BZ_LAZY_EXCEPT)
+            bz_dict_free(e->sorted, nullptr);  // other dict
+        else
+            bz_array_free(e->sorted, nullptr);
+    }
+    // UNION phase-1 other_keys snapshot (if built).
+    if (e->other_keys) {
+        for (int64_t i = 0; i < e->other_n; i++) free(e->other_keys[i]);
+        free(e->other_keys);
+    }
+    // issue #995 / stdlib §5: free a fresh temporary ARRAY this lazy source OWNS
+    // (own_arr set by bz_lazy_from_owned_array — e.g. a snapshot materialized from
+    // a vtable-backed IEnumerable<T>). A borrowed array (own_arr == 0, the normal
+    // bz_lazy_from_array path) is left untouched. The snapshot owns no elements, so
+    // the disposer is null (no element disposal) — sound, no double-free.
+    if (e->own_arr && e->arr) bz_array_free(e->arr, nullptr);
+    // #422 / §28.9 / §28.3: release the operator's closure ONLY when it was an
+    // inline lambda we own (own_closure set by codegen). The closure BORROWS its
+    // captures, so this frees only the cell + env, never a capture — sound, no
+    // double-dispose. A borrowed (variable-form) closure has own_closure == 0 and
+    // is left untouched. Dispose runs exactly once per enumerator (cascaded from
+    // the for-loop / ToArray drain), so this is a single release, no double-free.
+    if (e->own_closure && e->closure) bz_closure_release(e->closure);
+    // THENBY secondary closure release (same ownership convention).
+    if (e->own_closure2 && e->closure2) bz_closure_release(e->closure2);
+    free(e);
+}
+
+static void* bz_lazy_vtable[4] = {
+    nullptr,
+    (void*)bz_lazy_dispose,
+    (void*)bz_lazy_movenext,
+    (void*)bz_lazy_current,
+};
+
+static bz_lazy_t* bz_lazy_new(int32_t kind, int64_t esz) {
+    auto* e = (bz_lazy_t*)calloc(1, sizeof(bz_lazy_t));
+    bz_lazy_vtable[0] = bz_lazy_vtable;  // self-referential td sentinel
+    e->vtable = bz_lazy_vtable;
+    e->kind = kind;
+    e->esz = esz;
+    e->idx = 0;
+    if (esz > 0) e->cur = malloc((size_t)esz);
+    return e;
+}
+
+extern "C" void* bz_lazy_from_array(void* arr, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
+    e->arr = arr;
+    return e;
+}
+
+// issue #995 / stdlib §5 / §29.11: wrap a FRESH temporary array as a lazy ARRAY
+// source that OWNS the array (own_arr := 1 → bz_lazy_dispose frees it with a null
+// disposer, the snapshot owning no element). Used by the vtable-backed
+// IEnumerable<T> bridge (materializeVtableIEnumerableToArray): the source object's
+// elements are snapshotted into a fresh array by driving the iterator vtable once,
+// and that array has no other owner — so it is freed when the lazy pipeline (a
+// terminal's bz_lazy_to_array drain, or a Where/Select/… for-in) disposes.
+extern "C" void* bz_lazy_from_owned_array(void* arr, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
+    e->arr = arr;
+    e->own_arr = 1;
+    return e;
+}
+
+// #422 / §28.9 / §28.3: mark a freshly-built lazy enumerator as the OWNER of its
+// operator closure, so bz_lazy_dispose releases it (frees the +1 inline-lambda
+// cell + env once the pipeline is disposed). Codegen calls this immediately
+// after a lazy-operator constructor ONLY when the closure argument is an inline
+// lambda literal — never for a borrowed (variable-form) closure. Returns the
+// enumerator so the call can be threaded inline at the lowering site. Null-safe.
+extern "C" void* bz_lazy_own_closure(void* lazy) {
+    if (lazy) ((bz_lazy_t*)lazy)->own_closure = 1;
+    return lazy;
+}
+
+// stdlib §5 Ordering: ThenBy secondary-closure ownership. Mirrors
+// bz_lazy_own_closure for the secondary sort key closure stored in closure2.
+// Called by codegen immediately after bz_lazy_thenby when the secondary key
+// argument was an inline lambda literal (own_closure2 := 1 → released at
+// bz_lazy_dispose). Returns the enumerator for inline threading. Null-safe.
+extern "C" void* bz_lazy_own_closure2(void* lazy) {
+    if (lazy) ((bz_lazy_t*)lazy)->own_closure2 = 1;
+    return lazy;
+}
+
+// issue #389 / stdlib §5 / §4.10: a dict-backed Set<T> as a lazy source. Snapshot
+// the set's element keys (bz_dict_keys_gen returns malloc'd esz-byte blobs) into
+// a fresh owned bz_array_t iterated by index, then free the snapshot pointers.
+// The array is stored in `sorted` so bz_lazy_dispose frees it (the set itself is
+// not owned by the enumerator). Set elements are value-semantic, so copying the
+// raw key bytes into the snapshot array is the correct (and only) representation.
+extern "C" void* bz_lazy_from_set(void* set, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_SET, esz);
+    e->sorted = bz_array_alloc(esz, 8);
+    void** keys = nullptr; int64_t n = 0;
+    bz_dict_keys_gen(set, &keys, &n);
+    for (int64_t i = 0; i < n; i++) {
+        bz_array_add(e->sorted, keys[i], esz);
+        free(keys[i]);
+    }
+    free(keys);
+    return e;
+}
+
+// per §4.6/§4.7 + §5 fix #450: wrap a bz_llist_t* as a lazy source that walks
+// nodes head-to-tail. `arr` holds the bz_llist_t*; `inner` is reused (distinct
+// kind, no SELECTMANY overlap) to store the current bz_llist_node_t*.
+// On first MoveNext `inner` is null → initialized to head. Does not own the list.
+extern "C" void* bz_lazy_from_llist(void* llist, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_LLIST, esz);
+    e->arr = llist;     // bz_llist_t*
+    e->inner = nullptr; // current node, null = not yet started
+    e->materialized = 0;// 0 = not yet advanced to head
+    return e;
+}
+
+// issue #775 / §16.3: wrap a `Range<T>` value (the codegen { i64 start, i64 end,
+// i64 step, i8 flags } struct) as a lazy IEnumerable<T> source so SelectMany and
+// the receiver-position LINQ operators (Count/Where/Select/…) can enumerate it.
+// `esz` is T's byte width; the i64 working value is truncated to its low esz
+// bytes on store (little-endian), matching the for-in counted-loop semantics.
+// flags bit0 = IsEndInclusive, bit1 = startOpen, bit2 = endOpen (§16.3 layout).
+// Open-ended ranges have no bounded enumeration: the receiver lowering raises
+// InvalidOperationException before calling this, and as a safe fallback for any
+// other path the enumerator is marked empty (movenext yields nothing).
+extern "C" void* bz_lazy_from_range(int64_t start, int64_t end, int64_t step,
+                                    int8_t flags, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_RANGE, esz);
+    e->idx = start;       // current working value
+    e->n = end;           // end bound
+    e->up_esz = step;     // signed stride (§16.4; sign decides direction)
+    e->phase = (int32_t)(uint8_t)flags;
+    if (((uint8_t)flags & 0x6u) != 0) e->stopped = 1;  // open-ended → empty
+    return e;
+}
+
+// ---------------------------------------------------------------------------
+// §5 (#651): GroupBy — bz_grouping_t wraps one group's key + element array.
+// bz_groupby_to_array(lazy, val_esz, key_esz, key_fn, closure) materializes
+// the source pipeline and groups elements by key, using memcmp for key equality
+// (value-type keys of known byte size).  Returns a bz_array_t* of
+// bz_grouping_t* pointers (each pointer is one group's heap object).
+//
+// The key function has the same `bz_sel_fn` signature as Select's selector:
+//   void key_fn(void* closure, const void* elem, void* key_out)
+// It writes `key_esz` bytes of the computed key into `key_out`.
+//
+// bz_grouping_count(g): number of elements in group g.
+// bz_grouping_key(g, out): copies the key bytes into `out`.
+// bz_grouping_elements(g): returns the bz_array_t* for indexed access.
+// bz_grouping_free(g): disposes the element array and frees the group object.
+// ---------------------------------------------------------------------------
+struct bz_grouping_t {
+    void*    elements;  // bz_array_t*
+    int64_t  key_esz;
+    void*    key_data;  // malloc'd key_esz bytes
+};
+
+static bz_grouping_t* bz_grouping_alloc(int64_t val_esz, int64_t key_esz,
+                                         const void* key) {
+    auto* g = (bz_grouping_t*)calloc(1, sizeof(bz_grouping_t));
+    g->elements = bz_array_alloc(val_esz, 4);
+    g->key_esz  = key_esz;
+    g->key_data = malloc((size_t)key_esz);
+    memcpy(g->key_data, key, (size_t)key_esz);
+    return g;
+}
+
+extern "C" int64_t bz_grouping_count(void* grp) {
+    if (!grp) return 0;
+    return bz_array_len(((bz_grouping_t*)grp)->elements);
+}
+
+// Copy the key bytes into `out` (caller allocates `key_esz` bytes).
+extern "C" void bz_grouping_key(void* grp, void* out) {
+    if (!grp || !out) return;
+    auto* g = (bz_grouping_t*)grp;
+    memcpy(out, g->key_data, (size_t)g->key_esz);
+}
+
+// Returns the bz_array_t* of elements so the caller can index into it.
+extern "C" void* bz_grouping_elements(void* grp) {
+    return grp ? ((bz_grouping_t*)grp)->elements : nullptr;
+}
+
+extern "C" void bz_grouping_free(void* grp) {
+    if (!grp) return;
+    auto* g = (bz_grouping_t*)grp;
+    bz_array_free(g->elements, nullptr);
+    free(g->key_data);
+    free(g);
+}
+
+// bz_groupby_to_array: materialize a lazy source, group by key, return an
+// Array<bz_grouping_t*>.  Caller owns the returned array and each grouping
+// inside it; call bz_groupby_free_groups to release all groupings, then
+// bz_array_free for the outer array.
+extern "C" void* bz_groupby_to_array(void* lazy, int64_t val_esz,
+                                      int64_t key_esz,
+                                      void* closure, void* key_fn_ptr) {
+    typedef void (*key_fn_t)(void*, const void*, void*);
+    auto  key_fn = (key_fn_t)key_fn_ptr;
+    auto* e = (bz_lazy_t*)lazy;
+    // Outer array holds bz_grouping_t* pointers.
+    void* groups = bz_array_alloc(sizeof(void*), 4);
+    void* key_buf = malloc((size_t)key_esz);
+    // Closure over the groups array to find/create a group by key.
+    auto find_or_create = [&](const void* key) -> bz_grouping_t* {
+        auto* garr = (bz_array_t*)groups;
+        for (int64_t i = 0; i < garr->count; ++i) {
+            void** slot = (void**)((char*)garr->data + i * sizeof(void*));
+            auto* g = (bz_grouping_t*)(*slot);
+            if (memcmp(g->key_data, key, (size_t)key_esz) == 0) return g;
+        }
+        auto* g = bz_grouping_alloc(val_esz, key_esz, key);
+        bz_array_add(groups, &g, sizeof(void*));
+        return g;
+    };
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e)) {
+        const void* elem = ((cur_t)vt[3])(e);
+        key_fn(closure, elem, key_buf);
+        bz_grouping_t* g = find_or_create(key_buf);
+        bz_array_add(g->elements, elem, val_esz);
+    }
+    bz_lazy_dispose(e);
+    free(key_buf);
+    return groups;
+}
+
+// Release all groupings inside a groups array (produced by bz_groupby_to_array).
+// After this call, the outer array itself must be freed with bz_array_free(...,null).
+extern "C" void bz_groupby_free_groups(void* groups_arr) {
+    auto* garr = (bz_array_t*)groups_arr;
+    if (!garr) return;
+    for (int64_t i = 0; i < garr->count; ++i) {
+        void** slot = (void**)((char*)garr->data + i * sizeof(void*));
+        bz_grouping_free(*slot);
+    }
+}
+
+extern "C" void* bz_lazy_where(void* up, void* closure, void* pred) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_WHERE, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->pred = (bz_pred_fn)pred;
+    return e;
+}
+
+extern "C" void* bz_lazy_select(void* up, int64_t out_esz,
+                                void* closure, void* sel) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SELECT, out_esz);
+    e->up = u;
+    e->closure = closure;
+    e->sel = (bz_sel_fn)sel;
+    return e;
+}
+
+extern "C" void* bz_lazy_take(void* up, int64_t n) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_TAKE, u->esz);
+    e->up = u;
+    e->n = n;
+    return e;
+}
+
+extern "C" void* bz_lazy_skip(void* up, int64_t n) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SKIP, u->esz);
+    e->up = u;
+    e->n = n;
+    return e;
+}
+
+extern "C" void* bz_lazy_distinct(void* up, void* eqfn) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_DISTINCT, u->esz);
+    e->up = u;
+    e->eqfn = (bz_eq_fn)eqfn;
+    e->seen = bz_array_alloc(u->esz, 8);
+    return e;
+}
+
+extern "C" void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
+                                 int32_t descending) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_ORDERBY, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->keyfn = (bz_key_fn)keyfn;
+    e->descending = descending;
+    return e;
+}
+
+// stdlib §5 Combination: Concat yields all of `up`, then all of `down`. Both
+// have the same element size (same T). Element bytes are copied through `cur`.
+extern "C" void* bz_lazy_concat(void* up, void* down) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_CONCAT, u->esz);
+    e->up = u;
+    e->down = (bz_lazy_t*)down;
+    e->phase = 0;
+    return e;
+}
+
+// stdlib §5 Slicing: TakeWhile yields the prefix while `pred` holds, then ends
+// the sequence permanently (later passing elements are NOT yielded).
+extern "C" void* bz_lazy_takewhile(void* up, void* closure, void* pred) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_TAKEWHILE, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->pred = (bz_pred_fn)pred;
+    return e;
+}
+
+// stdlib §5 Slicing: SkipWhile drops the leading run satisfying `pred`, then
+// yields the remainder verbatim (including elements that satisfy `pred`).
+extern "C" void* bz_lazy_skipwhile(void* up, void* closure, void* pred) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SKIPWHILE, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->pred = (bz_pred_fn)pred;
+    return e;
+}
+
+// stdlib §5 Projection: SelectMany flattens. `out_esz` is the inner element U's
+// byte size. The selector trampoline returns a fresh inner lazy enumerator per
+// upstream element; the runtime drains each before pulling the next upstream.
+extern "C" void* bz_lazy_selectmany(void* up, int64_t out_esz,
+                                    void* closure, void* sel) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SELECTMANY, out_esz);
+    e->up = u;
+    e->closure = closure;
+    e->flatsel = (bz_flatsel_fn)sel;
+    e->inner = nullptr;
+    return e;
+}
+
+// stdlib §5 Combination: Zip pairs `up` (left) and `down` (right) positionally,
+// applying `comb` to produce one `out_esz`-byte output per pair. Ends when
+// either source is exhausted (result length = min of the two).
+extern "C" void* bz_lazy_zip(void* up, void* down, int64_t out_esz,
+                             void* closure, void* comb) {
+    auto* u = (bz_lazy_t*)up;
+    auto* d = (bz_lazy_t*)down;
+    auto* e = bz_lazy_new(BZ_LAZY_ZIP, out_esz);
+    e->up = u;
+    e->down = d;
+    e->closure = closure;
+    e->comb = (bz_comb_fn)comb;
+    e->up_esz = u->esz;
+    e->down_esz = d->esz;
+    return e;
+}
+
+// stdlib §5 Set-like (lazy): Union/Intersect/Except with deduplication.
+// `down` is the `other` IEnumerable<T> lazy source, pre-built by the caller.
+// `hashfn` and `eqfn` are element-wise hash/equality trampolines (matching the
+// generic-dict contract). At construction time, `down` is drained into `sorted`
+// (the `other` membership dict) and disposed; `seen` is the dedup dict for `up`.
+//
+// Union:     yield unique elements from `up`, then elements from `down` not yet
+//            seen. Phase 0 = draining `up` (insert into seen, yield if new).
+//            Phase 1 = iterate other_keys snapshot and yield those not in seen.
+// Intersect: yield unique elements from `up` that appear in the `other` dict.
+// Except:    yield unique elements from `up` that do NOT appear in the `other` dict.
+//
+// Each needs a unique `seen` dict to prevent repeats on the self side. `sorted`
+// holds the pre-built `other` dict (Intersect/Except) or the full other-dict
+// (Union phase 1). `other_keys` / `other_n` are used by Union phase-1 iteration.
+static void bz_lazy_setop_build_other(bz_lazy_t* e, bz_lazy_t* down) {
+    // Materialize `down` into the `other` membership dict (`sorted`).
+    e->sorted = bz_dict_alloc_generic(e->esz,
+        (uint64_t(*)(const void*))e->hashfn,
+        (bool(*)(const void*, const void*))e->eqfn);
+    // Drain `down` into the other dict.
+    const void* p;
+    while ((p = bz_lazy_up_next(down)) != nullptr)
+        bz_dict_set_gen(e->sorted, p, (void*)1);
+    bz_lazy_dispose(down);
+    // Build the `seen` dedup dict (same hash/eq).
+    e->seen = bz_dict_alloc_generic(e->esz,
+        (uint64_t(*)(const void*))e->hashfn,
+        (bool(*)(const void*, const void*))e->eqfn);
+}
+
+extern "C" void* bz_lazy_union(void* up, void* down, void* hashfn, void* eqfn) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_UNION, u->esz);
+    e->up = u;
+    e->hashfn = (bz_hash_fn)hashfn;
+    e->eqfn   = (bz_eq_fn)eqfn;
+    bz_lazy_setop_build_other(e, (bz_lazy_t*)down);
+    e->phase = 0;
+    return e;
+}
+
+extern "C" void* bz_lazy_intersect(void* up, void* down, void* hashfn, void* eqfn) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_INTERSECT, u->esz);
+    e->up = u;
+    e->hashfn = (bz_hash_fn)hashfn;
+    e->eqfn   = (bz_eq_fn)eqfn;
+    bz_lazy_setop_build_other(e, (bz_lazy_t*)down);
+    return e;
+}
+
+extern "C" void* bz_lazy_except(void* up, void* down, void* hashfn, void* eqfn) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_EXCEPT, u->esz);
+    e->up = u;
+    e->hashfn = (bz_hash_fn)hashfn;
+    e->eqfn   = (bz_eq_fn)eqfn;
+    bz_lazy_setop_build_other(e, (bz_lazy_t*)down);
+    return e;
+}
+
+// stdlib §5 Ordering: ThenBy / ThenByDescending — secondary sort key applied
+// to the already-sorted output of an upstream OrderBy. On first MoveNext,
+// materializes all upstream elements and stable-sorts by (primary_key, secondary_key)
+// composite, accessing the primary key by reaching into the upstream ORDERBY node.
+extern "C" void* bz_lazy_thenby(void* up, void* closure2, void* keyfn2,
+                                int32_t descending2) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_THENBY, u->esz);
+    e->up = u;
+    // Copy the primary key from the upstream ORDERBY/THENBY node so the
+    // composite sort can apply it without re-visiting the chain structure.
+    e->closure   = u->closure;    // primary closure (BORROW, not owned)
+    e->keyfn     = u->keyfn;      // primary key trampoline
+    e->descending = u->descending; // primary direction
+    // Secondary key:
+    e->closure2   = closure2;
+    e->keyfn2     = (bz_key_fn)keyfn2;
+    e->descending2 = descending2;
+    return e;
+}
+
+// stdlib §5 Ordering: Reverse — materialize the upstream sequence, then yield
+// elements backwards. Per §5: "Reverse(): IEnumerable<T>".
+extern "C" void* bz_lazy_reverse(void* up) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_REVERSE, u->esz);
+    e->up = u;
+    return e;
+}
+
+// ORDERBY: drain upstream into a snapshot, then stable-sort by the int64 key.
+static void bz_lazy_orderby_materialize(bz_lazy_t* e) {
+    e->sorted = bz_array_alloc(e->esz, 8);
+    const void* p;
+    while ((p = bz_lazy_up_next(e->up)) != nullptr)
+        bz_array_add(e->sorted, p, e->esz);
+    auto* arr = (bz_array_t*)e->sorted;
+    int64_t cnt = arr->count;
+    // Stable insertion sort by int64 key (matches the spec's stable-ordering
+    // guarantee for OrderBy; n is small in test scenarios).
+    void* tmp = malloc((size_t)e->esz);
+    for (int64_t i = 1; i < cnt; ++i) {
+        memcpy(tmp, (char*)arr->data + i * e->esz, (size_t)e->esz);
+        int64_t key_i = e->keyfn(e->closure, tmp);
+        int64_t j = i - 1;
+        while (j >= 0) {
+            int64_t key_j = e->keyfn(e->closure, (char*)arr->data + j * e->esz);
+            int shift = e->descending ? (key_j < key_i) : (key_j > key_i);
+            if (!shift) break;
+            memcpy((char*)arr->data + (j + 1) * e->esz,
+                   (char*)arr->data + j * e->esz, (size_t)e->esz);
+            --j;
+        }
+        memcpy((char*)arr->data + (j + 1) * e->esz, tmp, (size_t)e->esz);
+    }
+    free(tmp);
+    e->idx = 0;
+    e->materialized = 1;
+}
+
+static int32_t bz_lazy_movenext(bz_lazy_t* e) {
+    switch (e->kind) {
+    case BZ_LAZY_ARRAY: {
+        if (e->idx >= bz_array_len(e->arr)) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->arr, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    // issue #775 / §16.3: counted iteration of a Range<T>. The direction is the
+    // sign of the step; inclusive/exclusive of the upper bound is phase bit0.
+    // This mirrors the for-in counted-loop semantics (a zero step yields nothing
+    // rather than looping forever; open-ended ranges were marked e->stopped).
+    case BZ_LAZY_RANGE: {
+        if (e->stopped) return 0;
+        int64_t cur = e->idx, end = e->n, step = e->up_esz;
+        if (step == 0) return 0;
+        bool incl = (e->phase & 1) != 0;
+        bool inRange = (step < 0) ? (incl ? cur >= end : cur > end)
+                                  : (incl ? cur <= end : cur < end);
+        if (!inRange) return 0;
+        memcpy(e->cur, &cur, (size_t)e->esz);  // low esz bytes = truncation to T
+        e->idx = cur + step;
+        return 1;
+    }
+    case BZ_LAZY_WHERE: {
+        const void* p;
+        while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+            if (e->pred(e->closure, p)) {
+                memcpy(e->cur, p, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_SELECT: {
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        e->sel(e->closure, p, e->cur);  // selector writes esz output bytes
+        return 1;
+    }
+    case BZ_LAZY_TAKE: {
+        if (e->idx >= e->n) return 0;
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_SKIP: {
+        if (!e->skipped) {
+            const void* p;
+            while (e->idx < e->n && (p = bz_lazy_up_next(e->up)) != nullptr)
+                e->idx++;
+            e->skipped = 1;
+        }
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_DISTINCT: {
+        const void* p;
+        auto* seen = (bz_array_t*)e->seen;
+        while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+            int dup = 0;
+            for (int64_t i = 0; i < seen->count; ++i) {
+                const void* s = (char*)seen->data + i * e->esz;
+                int same = e->eqfn ? e->eqfn(s, p)
+                                   : (memcmp(s, p, (size_t)e->esz) == 0);
+                if (same) { dup = 1; break; }
+            }
+            if (!dup) {
+                bz_array_add(e->seen, p, e->esz);
+                memcpy(e->cur, p, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_ORDERBY: {
+        if (!e->materialized) bz_lazy_orderby_materialize(e);
+        auto* arr = (bz_array_t*)e->sorted;
+        if (e->idx >= arr->count) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_SET: {
+        // issue #389: iterate the owned key snapshot (built in bz_lazy_from_set).
+        auto* arr = (bz_array_t*)e->sorted;
+        if (e->idx >= arr->count) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_CONCAT: {
+        // §5 Combination: drain `up` (phase 0), then `down` (phase 1).
+        if (e->phase == 0) {
+            const void* p = bz_lazy_up_next(e->up);
+            if (p) { memcpy(e->cur, p, (size_t)e->esz); return 1; }
+            e->phase = 1;  // fall through to the second source
+        }
+        const void* p = bz_lazy_up_next(e->down);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_TAKEWHILE: {
+        // §5 Slicing: yield while the predicate holds; the first failure ends
+        // the sequence (subsequent MoveNext calls return 0).
+        if (e->stopped) return 0;
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) { e->stopped = 1; return 0; }
+        if (!e->pred(e->closure, p)) { e->stopped = 1; return 0; }
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_SKIPWHILE: {
+        // §5 Slicing: on first MoveNext, drop the leading run satisfying the
+        // predicate and yield the first element that fails it; thereafter yield
+        // every remaining element verbatim.
+        if (!e->skipped) {
+            const void* p;
+            while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+                if (!e->pred(e->closure, p)) {
+                    e->skipped = 1;
+                    memcpy(e->cur, p, (size_t)e->esz);  // first non-skipped elem
+                    return 1;
+                }
+            }
+            e->skipped = 1;  // upstream exhausted entirely within the skip run
+            return 0;
+        }
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_SELECTMANY: {
+        // §5 Projection: pull from the current inner enumerator; when it is
+        // exhausted, advance the upstream to obtain the next inner sequence.
+        for (;;) {
+            if (e->inner) {
+                const void* p = bz_lazy_up_next(e->inner);
+                if (p) { memcpy(e->cur, p, (size_t)e->esz); return 1; }
+                bz_lazy_dispose(e->inner);  // inner drained — release it
+                e->inner = nullptr;
+            }
+            const void* up_elem = bz_lazy_up_next(e->up);
+            if (!up_elem) return 0;          // upstream exhausted
+            e->inner = (bz_lazy_t*)e->flatsel(e->closure, up_elem);
+            if (!e->inner) return 0;          // defensive: null inner sequence
+        }
+    }
+    case BZ_LAZY_ZIP: {
+        // §5 Combination: advance both sources; stop at the shorter. Each source
+        // owns its own `cur`, so read the left/right element pointers directly.
+        const void* a = bz_lazy_up_next(e->up);
+        if (!a) return 0;
+        const void* b = bz_lazy_up_next(e->down);
+        if (!b) return 0;
+        e->comb(e->closure, a, b, e->cur);  // writes esz output bytes
+        return 1;
+    }
+    case BZ_LAZY_UNION: {
+        // §5 Set-like: yield unique elements from `up`, then unique elements from
+        // `down` (those not already yielded from `up`).
+        // Phase 0: drain `up`, yielding elements not yet in `seen` dict.
+        if (e->phase == 0) {
+            const void* p;
+            while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+                if (!bz_dict_contains_gen(e->seen, p)) {
+                    bz_dict_set_gen(e->seen, p, (void*)1);
+                    memcpy(e->cur, p, (size_t)e->esz);
+                    return 1;
+                }
+            }
+            // `up` exhausted. Build the other_keys snapshot from `sorted` (other dict).
+            bz_dict_keys_gen(e->sorted, &e->other_keys, &e->other_n);
+            e->idx = 0;
+            e->phase = 1;
+        }
+        // Phase 1: iterate other_keys snapshot, yield elements not in `seen`.
+        while (e->idx < e->other_n) {
+            const void* k = e->other_keys[e->idx++];
+            if (!bz_dict_contains_gen(e->seen, k)) {
+                bz_dict_set_gen(e->seen, k, (void*)1);
+                memcpy(e->cur, k, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_INTERSECT: {
+        // §5 Set-like: yield unique elements from `up` that appear in `other` dict.
+        const void* p;
+        while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+            if (bz_dict_contains_gen(e->sorted, p) &&
+                !bz_dict_contains_gen(e->seen, p)) {
+                bz_dict_set_gen(e->seen, p, (void*)1);
+                memcpy(e->cur, p, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_EXCEPT: {
+        // §5 Set-like: yield unique elements from `up` that are NOT in `other` dict.
+        const void* p;
+        while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+            if (!bz_dict_contains_gen(e->sorted, p) &&
+                !bz_dict_contains_gen(e->seen, p)) {
+                bz_dict_set_gen(e->seen, p, (void*)1);
+                memcpy(e->cur, p, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_THENBY: {
+        // §5 Ordering: composite (primary, secondary) sort. On first MoveNext,
+        // drain upstream, sort by (primary_key, secondary_key) stably, then
+        // iterate from index 0.
+        if (!e->materialized) {
+            e->sorted = bz_array_alloc(e->esz, 8);
+            const void* p;
+            while ((p = bz_lazy_up_next(e->up)) != nullptr)
+                bz_array_add(e->sorted, p, e->esz);
+            auto* arr = (bz_array_t*)e->sorted;
+            int64_t cnt = arr->count;
+            void* tmp = malloc((size_t)e->esz);
+            // Stable insertion sort by (primary_key, secondary_key) composite.
+            for (int64_t i = 1; i < cnt; ++i) {
+                memcpy(tmp, (char*)arr->data + i * e->esz, (size_t)e->esz);
+                int64_t pk_i = e->keyfn  ? e->keyfn(e->closure, tmp)   : 0;
+                int64_t sk_i = e->keyfn2 ? e->keyfn2(e->closure2, tmp) : 0;
+                int64_t j = i - 1;
+                while (j >= 0) {
+                    void* jptr = (char*)arr->data + j * e->esz;
+                    int64_t pk_j = e->keyfn  ? e->keyfn(e->closure, jptr)   : 0;
+                    int64_t sk_j = e->keyfn2 ? e->keyfn2(e->closure2, jptr) : 0;
+                    // Compare primary first, then secondary on ties.
+                    int shift;
+                    if (pk_j != pk_i) {
+                        shift = e->descending ? (pk_j < pk_i) : (pk_j > pk_i);
+                    } else {
+                        shift = e->descending2 ? (sk_j < sk_i) : (sk_j > sk_i);
+                    }
+                    if (!shift) break;
+                    memcpy((char*)arr->data + (j + 1) * e->esz, jptr, (size_t)e->esz);
+                    --j;
+                }
+                memcpy((char*)arr->data + (j + 1) * e->esz, tmp, (size_t)e->esz);
+            }
+            free(tmp);
+            e->idx = 0;
+            e->materialized = 1;
+        }
+        auto* arr = (bz_array_t*)e->sorted;
+        if (e->idx >= arr->count) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_REVERSE: {
+        // §5 Ordering: materialize upstream, then yield in reverse order.
+        if (!e->materialized) {
+            e->sorted = bz_array_alloc(e->esz, 8);
+            const void* p;
+            while ((p = bz_lazy_up_next(e->up)) != nullptr)
+                bz_array_add(e->sorted, p, e->esz);
+            auto* arr = (bz_array_t*)e->sorted;
+            e->idx = arr->count - 1;  // start from last element
+            e->materialized = 1;
+        }
+        auto* arr = (bz_array_t*)e->sorted;
+        if (e->idx < 0) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
+        e->idx--;
+        return 1;
+    }
+    case BZ_LAZY_LLIST: {
+        // per §4.6/§4.7 + §5 fix #450: walk bz_llist_t nodes head-to-tail.
+        // `arr` = bz_llist_t*; `inner` = current node (null = not yet started).
+        // On the first call, initialize `inner` to the list's head.
+        if (!e->materialized) {
+            auto* l = (bz_llist_t*)e->arr;
+            e->inner = l ? (bz_lazy_t*)l->head : nullptr;
+            e->materialized = 1;
+        }
+        if (!e->inner) return 0;
+        auto* node = (bz_llist_node_t*)e->inner;
+        const void* vp = (const char*)node + sizeof(bz_llist_node_t);
+        memcpy(e->cur, vp, (size_t)e->esz);
+        e->inner = (bz_lazy_t*)node->next;
+        return 1;
+    }
+    }
+    return 0;
+}
+
+// Materialize a lazy enumerator into a fresh owned Array<T> (stdlib §5 ToArray,
+// the eager materialization point). Consumes (drains + disposes) the pipeline.
+extern "C" void* bz_lazy_to_array(void* lazy, int64_t esz) {
+    auto* e = (bz_lazy_t*)lazy;
+    void* arr = bz_array_alloc(esz, 8);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e))
+        bz_array_add(arr, ((cur_t)vt[3])(e), esz);
+    bz_lazy_dispose(e);
+    return arr;
+}
+
+// stdlib §5 ToSet: materialize a lazy enumerator into a fresh owned Set<T>.
+// Set<T> is dict-backed (bz_dict_t); all elements use the generic-key path
+// (hash/eq trampolines). Consumes (drains + disposes) the pipeline.
+// `hashfn` and `eqfn` are the element-wise hash/equality trampolines.
+extern "C" void* bz_lazy_to_set(void* lazy, int64_t esz, void* hashfn, void* eqfn) {
+    auto* e = (bz_lazy_t*)lazy;
+    void* set = bz_dict_alloc_generic(esz,
+        (uint64_t(*)(const void*))hashfn,
+        (bool(*)(const void*, const void*))eqfn);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e))
+        bz_dict_set_gen(set, ((cur_t)vt[3])(e), (void*)1);
+    bz_lazy_dispose(e);
+    return set;
+}
+
+// stdlib §5 ToDictionary<TKey>(key: (T)->TKey): materialize into a fresh
+// Dictionary<TKey, T>. Each element T is stored as value; the key is extracted
+// by the `keyfn` trampoline. Uses the generic-key dict path.
+// `key_esz` = byte size of TKey; `val_esz` = byte size of T (same as esz).
+// `hashfn` and `eqfn` are key-wise trampolines.
+// The element T bytes are copied into a fresh heap block and stored as the value.
+extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
+                                 void* keyfn, void* closure,
+                                 void* hashfn, void* eqfn, int64_t val_inline,
+                                 void* valfn, void* valclosure) {
+    auto* e = (bz_lazy_t*)lazy;
+    // The dict is keyed by TKey (key_esz bytes). #738: the VALUE must use the
+    // same generic-dict encoding the codegen Dictionary<TKey,T> read expects
+    // (encodeValue): a SCALAR value (val_inline != 0 — int/enum/char/class-ref,
+    // ≤ 8 bytes) is stored INLINE in the void* slot (the indexer read does
+    // ptrtoint, not a deref); a STRUCT value (record/decimal) is heap-boxed.
+    // Previously every value was heap-boxed, so an indexed read of a scalar
+    // value returned the pointer bits reinterpreted as the value — garbage.
+    void* dict = bz_dict_alloc_generic(key_esz,
+        (uint64_t(*)(const void*))hashfn,
+        (bool(*)(const void*, const void*))eqfn);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    typedef int64_t (*kfn_t)(void* cl, const void* elem);
+    // We need to store the key in a local buffer (key_esz may be ≤8 for
+    // primitive types — just use a stack buffer of max 8 bytes for the
+    // common case, or alloca for larger keys). Since key_esz is always a
+    // primitive or record and ≤ sizeof(void*) in most practical cases, a
+    // fixed 64-byte scratch covers all key types.
+    char key_buf[64] = {};
+    while (((mn_t)vt[2])(e)) {
+        void* elem = ((cur_t)vt[3])(e);
+        // Extract key into key_buf (the keyfn trampoline returns int64 for the
+        // common single-int-key path — ToDictionary's key is a scalar TKey).
+        int64_t k = ((kfn_t)keyfn)(closure, elem);
+        memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
+        void* val;
+        if (valfn) {
+            // Two-selector ToDictionary(key, value): apply the value selector to
+            // the element. The value trampoline (kind 2) returns the scalar
+            // TValue widened to i64; pack its low val_esz bytes inline (a value
+            // selector always produces a scalar value in this milestone, so
+            // val_inline is 1). (§5 / #747 R43)
+            int64_t vv = ((kfn_t)valfn)(valclosure, elem);
+            val = nullptr;
+            memcpy(&val, &vv, (size_t)(val_esz < 8 ? val_esz : 8));
+        } else if (val_inline) {
+            // Scalar: pack the value bytes directly into the void* slot.
+            val = nullptr;
+            memcpy(&val, elem, (size_t)(val_esz < 8 ? val_esz : 8));
+        } else {
+            // Struct (record/decimal): heap copy of the T element bytes.
+            val = malloc((size_t)val_esz);
+            memcpy(val, elem, (size_t)val_esz);
+        }
+        bz_dict_set_gen(dict, key_buf, val);
+    }
+    bz_lazy_dispose(e);
+    return dict;
+}
+
+// stdlib §5 FirstOrNull / LastOrNull / SingleOrNull: eager terminals returning
+// a nullable T (via a {hasValue:i8, value:T} tagged struct for value types, or
+// a null pointer sentinel for class types). Since these lower into LLVM IR
+// inline (not via a C call), we provide runtime helpers only for the
+// lazy-source path where we need to drain the enumerator.
+//
+// For the lazy-source path, the codegen calls:
+//   bz_lazy_first_or_null(lazy, esz, out) → 1 if found (copies into *out), 0 if empty
+//   bz_lazy_last_or_null(lazy, esz, out)  → 1 if found (copies into *out), 0 if empty
+//   bz_lazy_single_or_null(lazy, esz, out)→ 1 if exactly one (copies into *out),
+//                                           0 if empty or more than one
+// These drain and dispose the enumerator.
+extern "C" int32_t bz_lazy_first_or_null(void* lazy, int64_t esz, void* out) {
+    auto* e = (bz_lazy_t*)lazy;
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    int32_t found = 0;
+    if (((mn_t)vt[2])(e)) {
+        memcpy(out, ((cur_t)vt[3])(e), (size_t)esz);
+        found = 1;
+    }
+    bz_lazy_dispose(e);
+    return found;
+}
+
+extern "C" int32_t bz_lazy_last_or_null(void* lazy, int64_t esz, void* out) {
+    auto* e = (bz_lazy_t*)lazy;
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    int32_t found = 0;
+    while (((mn_t)vt[2])(e)) {
+        memcpy(out, ((cur_t)vt[3])(e), (size_t)esz);
+        found = 1;
+    }
+    bz_lazy_dispose(e);
+    return found;
+}
+
+extern "C" int32_t bz_lazy_single_or_null(void* lazy, int64_t esz, void* out) {
+    auto* e = (bz_lazy_t*)lazy;
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    int32_t found = 0;
+    if (((mn_t)vt[2])(e)) {
+        memcpy(out, ((cur_t)vt[3])(e), (size_t)esz);
+        found = 1;
+        if (((mn_t)vt[2])(e)) found = 2;  // more than one: signal failure
+    }
+    bz_lazy_dispose(e);
+    return (found == 1) ? 1 : 0;
+}
+
+// issue #389 / stdlib §4.10: drain a lazy enumerator into the bz_dict_keys_gen
+// snapshot shape — a malloc'd array of `n` pointers, each a malloc'd esz-byte
+// copy of one element. Used to feed a non-Set IEnumerable<T> `other` into
+// bz_set_algebra_gen. Disposes the drained enumerator. First materialize into a
+// growable array (count unknown up front), then repackage as pointer-per-element.
+extern "C" void bz_set_collect_enumerator(void* lazy, int64_t esz,
+                                          void*** keys_out, int64_t* n_out) {
+    auto* e = (bz_lazy_t*)lazy;
+    auto* tmp = (bz_array_t*)bz_array_alloc(esz, 8);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e))
+        bz_array_add(tmp, ((cur_t)vt[3])(e), esz);
+    bz_lazy_dispose(e);
+    int64_t n = tmp->count;
+    auto** keys = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    for (int64_t i = 0; i < n; i++) {
+        void* kc = malloc((size_t)esz);
+        memcpy(kc, (char*)tmp->data + i * esz, (size_t)esz);
+        keys[i] = kc;
+    }
+    bz_array_free(tmp, nullptr);
+    if (keys_out) *keys_out = keys; else free(keys);
+    if (n_out)    *n_out    = n;
+}
+
+// ---------------------------------------------------------------------------
+// Buffer<T> — fixed-capacity compiler-intrinsic primitive (issue #545).
+//
+// Layout: 16-byte header {int64 len, int64 elem_size} followed immediately by
+// the zero-initialised payload (calloc'd as one contiguous allocation).
+// bz_buffer_get_ptr: pointer arithmetic on the payload region (no bounds check
+// — caller emits §16 bounds check before calling this).
+// bz_buffer_free: plain free (value elements carry no ownership obligation).
+// ---------------------------------------------------------------------------
+
+struct bz_buffer_hdr_t {
+    int64_t len;
+    int64_t elem_size;
+    // payload follows immediately in the same calloc block.
+};
+
+extern "C" {
+
+// bz_buffer_new — allocate a zero-initialised Buffer<T>.
+// The allocation is: sizeof(bz_buffer_hdr_t) + len * elem_size bytes,
+// all zeroed by calloc.
+void* bz_buffer_new(int64_t len, int64_t elem_size) {
+    if (len < 0) len = 0;
+    if (elem_size <= 0) elem_size = 1;
+    // Overflow guard: use calloc for both zero-init and implicit overflow
+    // detection.  calloc(nmemb, size) multiplies safely on POSIX; the header
+    // fits in one extra elem_size-aligned block — allocate header + payload
+    // as a byte array of total_bytes.
+    int64_t payload = len * elem_size;      // len >= 0, elem_size >= 1
+    int64_t total   = (int64_t)sizeof(bz_buffer_hdr_t) + payload;
+    auto* hdr = static_cast<bz_buffer_hdr_t*>(calloc(1, (size_t)total));
+    if (!hdr) return nullptr;
+    hdr->len       = len;
+    hdr->elem_size = elem_size;
+    return hdr;
+}
+
+// bz_buffer_get_ptr — pointer to element at index idx inside the payload.
+// Does NOT bounds-check; caller emits the §16 guard before calling.
+void* bz_buffer_get_ptr(void* buf, int64_t idx) {
+    if (!buf) return nullptr;
+    auto* hdr = static_cast<bz_buffer_hdr_t*>(buf);
+    uint8_t* payload = reinterpret_cast<uint8_t*>(hdr + 1);
+    return payload + idx * hdr->elem_size;
+}
+
+// bz_buffer_free — null-safe free of the whole header+payload block.
+void bz_buffer_free(void* buf) {
+    if (!buf) return;
+    free(buf);
+}
+
+} // extern "C" (Buffer<T>)

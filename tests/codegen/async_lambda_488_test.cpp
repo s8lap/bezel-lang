@@ -48,6 +48,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+#include "native_test_harness.hpp"
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -74,14 +76,6 @@ int compileAndRun(const std::string& source) {
     std::remove(src.c_str());
     std::remove(exe.c_str());
     return code;
-}
-
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);                       // tests/codegen/<this>
-    fs::path root = here.parent_path()             // tests/codegen
-                        .parent_path()             // tests
-                        .parent_path();            // repo root
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
 }
 
 // LeakSanitizer verification (ASan exit 99 on any leak / UAF / double-free).
@@ -121,10 +115,10 @@ int runUnderLeakSanitizer(const std::string& source) {
         std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (!::bezel::native_test::buildRuntimeSanitizerObject("address", rtObj)) {
+        cleanup();
+        return -1;
+    }
     std::string linkCmd =
         "clang++ -fsanitize=address -g " + objPath + " " + rtObj +
         " -lm -lpthread -lstdc++ -o " + exe + " > /dev/null 2>&1";

@@ -1,0 +1,764 @@
+// bezel_runtime_time.cpp — DateTime/TimeSpan/TimeOnly, numeric-to-string, Stopwatch, Debug.
+// Split from bezel_runtime.cpp per #1414 stage 2 (behavior-preserving motion).
+#include "bezel_runtime_internal.hpp"
+
+// ---------------------------------------------------------------------------
+// DateTime — .NET compatible tick epoch (0001-01-01 00:00:00 UTC)
+// POSIX epoch is 1970-01-01 00:00:00 UTC = tick 621355968000000000
+// ---------------------------------------------------------------------------
+
+static const int64_t POSIX_EPOCH_TICKS = 621355968000000000LL;
+static const int64_t TICKS_PER_SECOND  = 10000000LL;
+static const int64_t TICKS_PER_MS      = 10000LL;
+
+int64_t bz_datetime_now_ticks(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return POSIX_EPOCH_TICKS
+         + (int64_t)ts.tv_sec * TICKS_PER_SECOND
+         + (int64_t)ts.tv_nsec / 100;
+}
+
+int64_t bz_datetime_utcnow_ticks(void) {
+    return bz_datetime_now_ticks(); // CLOCK_REALTIME is UTC
+}
+
+void bz_datetime_ticks_to_parts(int64_t ticks,
+                                 int32_t* year,  int32_t* month,  int32_t* day,
+                                 int32_t* hour,  int32_t* minute, int32_t* second,
+                                 int32_t* ms) {
+    int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+    int64_t rem_ticks = (ticks - POSIX_EPOCH_TICKS) % TICKS_PER_SECOND;
+    time_t t = (time_t)posix_sec;
+    struct tm* tm_info = gmtime(&t);
+    if (year)   *year   = tm_info->tm_year + 1900;
+    if (month)  *month  = tm_info->tm_mon  + 1;
+    if (day)    *day    = tm_info->tm_mday;
+    if (hour)   *hour   = tm_info->tm_hour;
+    if (minute) *minute = tm_info->tm_min;
+    if (second) *second = tm_info->tm_sec;
+    if (ms)     *ms     = (int32_t)(rem_ticks / TICKS_PER_MS);
+}
+
+int64_t bz_datetime_parts_to_ticks(int32_t year, int32_t month,  int32_t day,
+                                    int32_t hour, int32_t minute, int32_t second,
+                                    int32_t ms) {
+    struct tm t = {};
+    t.tm_year = year - 1900;
+    t.tm_mon  = month - 1;
+    t.tm_mday = day;
+    t.tm_hour = hour;
+    t.tm_min  = minute;
+    t.tm_sec  = second;
+    time_t posix = timegm(&t);
+    return POSIX_EPOCH_TICKS
+         + (int64_t)posix * TICKS_PER_SECOND
+         + (int64_t)ms * TICKS_PER_MS;
+}
+
+// Per §2.5: scalar property extractors from a DateTime tick value.
+// All delegate through bz_datetime_ticks_to_parts for calendar accuracy.
+
+int32_t bz_datetime_year(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return y;
+}
+int32_t bz_datetime_month(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return mo;
+}
+int32_t bz_datetime_day(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return d;
+}
+int32_t bz_datetime_hour(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return h;
+}
+int32_t bz_datetime_minute(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return mi;
+}
+int32_t bz_datetime_second(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return s;
+}
+int32_t bz_datetime_millisecond(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return ms;
+}
+
+// DayOfWeek: 0=Sunday...6=Saturday — per §2.5 DayOfWeek enum ordering.
+// Uses gmtime's tm_wday (0=Sunday, which matches the Bezel enum).
+int32_t bz_datetime_day_of_week(int64_t ticks) {
+    int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+    time_t t = (time_t)posix_sec;
+    struct tm* ti = gmtime(&t);
+    return (int32_t)ti->tm_wday;  // 0=Sunday ... 6=Saturday
+}
+
+// DayOfYear: 1..366 — per §2.5; uses gmtime's tm_yday (0-based) + 1.
+int32_t bz_datetime_day_of_year(int64_t ticks) {
+    int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+    time_t t = (time_t)posix_sec;
+    struct tm* ti = gmtime(&t);
+    return (int32_t)(ti->tm_yday + 1);
+}
+
+// Per §2.5: AddYears/AddMonths perform calendar-aware arithmetic.
+// We decompose to components, adjust, then recompose.
+int64_t bz_datetime_add_years(int64_t ticks, int32_t years) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    y += years;
+    // Clamp Feb 29 in a non-leap year to Feb 28.
+    if (mo == 2 && d == 29) {
+        bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+        if (!leap) d = 28;
+    }
+    return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+}
+
+int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    // Convert month to 0-based for arithmetic, then back.
+    int32_t total_months = (y * 12 + (mo - 1)) + months;
+    y  = total_months / 12;
+    mo = total_months % 12 + 1;
+    if (mo <= 0) { mo += 12; y--; }
+    // Clamp day to the last day of the resulting month.
+    static const int32_t days_in_month[] =
+        {0, 31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+    int32_t dim = (mo == 2 && leap) ? 29 : days_in_month[mo];
+    if (d > dim) d = dim;
+    return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+}
+
+// per stdlib §2.5 / #1357: ToUnixTimeSeconds — convert .NET ticks to POSIX
+// seconds (truncating sub-second precision).
+int64_t bz_datetime_to_unix_seconds(int64_t ticks) {
+    return (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+}
+
+// per stdlib §2.5 / #1357: FromUnixTimeSeconds — convert POSIX seconds to
+// .NET tick count (no sub-second precision).
+int64_t bz_datetime_from_unix_seconds(int64_t seconds) {
+    return POSIX_EPOCH_TICKS + seconds * TICKS_PER_SECOND;
+}
+
+// ---------------------------------------------------------------------------
+// Per §2.5: DateTime.Parse / TryParse — ISO-8601-subset string parsing.
+// Accepted formats (per §2.5; Parse throws FormatException on invalid input,
+// modelled here as returning 0 with ok=0 for TryParse):
+//   "yyyy-MM-dd"                         date only
+//   "yyyy-MM-ddTHH:mm:ss"               date + time (T separator)
+//   "yyyy-MM-dd HH:mm:ss"               date + time (space separator)
+//   "yyyy-MM-ddTHH:mm:ss.fff"           with milliseconds
+//   "yyyy-MM-dd HH:mm:ss.fff"           with milliseconds
+// The string argument is a bz_string header (§4.6 adaptive-width).
+// Returns 1 on success (result ticks written to *out), 0 on format error.
+// ---------------------------------------------------------------------------
+
+// Internal: parse an integer of exactly `width` decimal digits from s[pos..].
+// Returns -1 on failure (not enough chars, non-digit). pos is advanced by width.
+static int32_t parse_int_fixed(const char* s, int64_t slen,
+                                int64_t* pos, int width) {
+    int64_t p = *pos;
+    if (p + width > slen) return -1;
+    int32_t val = 0;
+    for (int i = 0; i < width; ++i) {
+        char c = s[p + i];
+        if (c < '0' || c > '9') return -1;
+        val = val * 10 + (c - '0');
+    }
+    *pos = p + width;
+    return val;
+}
+
+// per §2.5 / #648: TryParse(s, out result) — parse ISO-8601-subset, set
+// result ticks and return 1 on success, return 0 on failure (result = 0).
+extern "C" int32_t bz_datetime_try_parse(const void* str_p, int64_t* out_ticks) {
+    if (out_ticks) *out_ticks = 0;
+    if (!str_p) return 0;
+    const bz_string_hdr* h = (const bz_string_hdr*)str_p;
+    if (!h->data) return 0;
+    // Only width-1 (ASCII) strings are valid for date literals.
+    // Per §4.6: width field at offset 16.
+    if (h->width != 1) return 0;
+    const char* s = h->data;
+    int64_t len = h->len;
+    int64_t pos = 0;
+
+    // Parse year (4 digits), '-', month (2), '-', day (2).
+    int32_t yr = parse_int_fixed(s, len, &pos, 4);
+    if (yr < 0) return 0;
+    if (pos >= len || s[pos] != '-') return 0; pos++;
+    int32_t mo = parse_int_fixed(s, len, &pos, 2);
+    if (mo < 1 || mo > 12) return 0;
+    if (pos >= len || s[pos] != '-') return 0; pos++;
+    int32_t dy = parse_int_fixed(s, len, &pos, 2);
+    if (dy < 1 || dy > 31) return 0;
+
+    int32_t hr = 0, mn = 0, sc = 0, ms = 0;
+
+    if (pos < len) {
+        // Optional time component: 'T' or ' ' separator.
+        char sep = s[pos];
+        if (sep != 'T' && sep != ' ') return 0;
+        pos++;
+        hr = parse_int_fixed(s, len, &pos, 2);
+        if (hr < 0 || hr > 23) return 0;
+        if (pos >= len || s[pos] != ':') return 0; pos++;
+        mn = parse_int_fixed(s, len, &pos, 2);
+        if (mn < 0 || mn > 59) return 0;
+        if (pos >= len || s[pos] != ':') return 0; pos++;
+        sc = parse_int_fixed(s, len, &pos, 2);
+        if (sc < 0 || sc > 59) return 0;
+        // Optional fractional seconds '.fff' (exactly 3 digits accepted).
+        if (pos < len && s[pos] == '.') {
+            pos++;
+            ms = parse_int_fixed(s, len, &pos, 3);
+            if (ms < 0) return 0;
+        }
+    }
+
+    // Must be at end of string after all optional components.
+    if (pos != len) return 0;
+
+    if (out_ticks)
+        *out_ticks = bz_datetime_parts_to_ticks(yr, mo, dy, hr, mn, sc, ms);
+    return 1;
+}
+
+// per §2.5 / #648: Parse(s: string): DateTime — on failure raises
+// FormatException (not yet implemented; trap via unreachable guard in codegen).
+// Returns the tick value; codegen checks the ok flag and emits an unreachable
+// on failure (same pattern as Guid.Parse). For TryParse, codegen uses
+// bz_datetime_try_parse directly.
+extern "C" int64_t bz_datetime_parse(const void* str_p) {
+    int64_t ticks = 0;
+    bz_datetime_try_parse(str_p, &ticks);
+    return ticks;
+}
+
+// Internal: append a zero-padded decimal integer to buf[*pos], advancing *pos.
+// buf must have at least `width` bytes available.
+static void fmt_int(char* buf, int* pos, int32_t val, int width) {
+    char tmp[12];
+    int n = snprintf(tmp, sizeof(tmp), "%d", val);
+    // Left-pad with zeros to width.
+    int pad = width - n;
+    for (int i = 0; i < pad; ++i) buf[(*pos)++] = '0';
+    for (int i = 0; i < n; ++i) buf[(*pos)++] = tmp[i];
+}
+
+// per §2.5 / #648: ToString(format: string): string — format a DateTime tick
+// value using a .NET-style format string.
+// Supported specifiers (per §2.5 / .NET DateTime custom format conventions):
+//   yyyy  → 4-digit year
+//   MM    → 2-digit month (01-12)
+//   dd    → 2-digit day (01-31)
+//   HH    → 2-digit hour 24h (00-23)
+//   mm    → 2-digit minute (00-59)
+//   ss    → 2-digit second (00-59)
+//   fff   → 3-digit millisecond (000-999)
+// All other characters in the format string are emitted verbatim (e.g. '-',
+// 'T', ' ', ':' separators). Returns a fresh heap-allocated bz_string (rc=1).
+extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
+    int32_t yr, mo, dy, hr, mn, sc, ms;
+    bz_datetime_ticks_to_parts(ticks, &yr, &mo, &dy, &hr, &mn, &sc, &ms);
+
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    const char* fmt = (fh && fh->data && fh->width == 1) ? fh->data : "";
+    int64_t flen = fh ? fh->len : (int64_t)strlen(fmt);
+
+    // Max output: every char can expand to at most 4 digits (yyyy) + separators.
+    int outCap = (int)(flen * 4 + 4);
+    if (outCap < 32) outCap = 32;
+    char* out = (char*)malloc((size_t)outCap);
+    int pos = 0;
+
+    for (int64_t i = 0; i < flen; ) {
+        // Try to match multi-char specifiers first (longest first).
+        int rem = (int)(flen - i);
+        if (rem >= 4 && fmt[i]=='y' && fmt[i+1]=='y' && fmt[i+2]=='y' && fmt[i+3]=='y') {
+            fmt_int(out, &pos, yr, 4); i += 4; continue;
+        }
+        if (rem >= 3 && fmt[i]=='f' && fmt[i+1]=='f' && fmt[i+2]=='f') {
+            fmt_int(out, &pos, ms, 3); i += 3; continue;
+        }
+        if (rem >= 2 && fmt[i]=='M' && fmt[i+1]=='M') {
+            fmt_int(out, &pos, mo, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='d' && fmt[i+1]=='d') {
+            fmt_int(out, &pos, dy, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='H' && fmt[i+1]=='H') {
+            fmt_int(out, &pos, hr, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='m' && fmt[i+1]=='m') {
+            fmt_int(out, &pos, mn, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='s' && fmt[i+1]=='s') {
+            fmt_int(out, &pos, sc, 2); i += 2; continue;
+        }
+        // Verbatim character.
+        out[pos++] = fmt[i++];
+    }
+
+    // Build bz_string header (§4.6 layout: data/len/width/rc at offsets 0/8/16/24).
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data  = out;
+    sh->len   = (int64_t)pos;
+    sh->width = 1;
+    sh->rc    = 1;  // producer's reference (§4.6)
+    return sh;
+}
+
+// §9.3 (#1099B): Decimal.ToString(format) — honor the "F"/"f" fixed-point
+// specifier ("F2" → exactly 2 fraction digits; bare "F" → 2 by .NET default).
+// The mantissa is rounded half-up to the requested precision (bz_decimal_round)
+// then formatted with EXACTLY that many fraction digits (trailing zeros padded;
+// prec == 0 drops the point). Any other / malformed format falls back to the
+// plain ToString — no worse than before, when the format argument was discarded
+// entirely. `fmt_p` is a bz_string {data,len,width,rc}.
+extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
+                                          const void* fmt_p) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    const char* fmt = (fh && fh->data && fh->width == 1) ? fh->data : "";
+    int64_t flen = fh ? fh->len : (int64_t)strlen(fmt);
+    if (flen >= 1 && (fmt[0] == 'F' || fmt[0] == 'f')) {
+        int prec = 2;            // .NET default for "F" with no digit count
+        bool ok = true;
+        if (flen > 1) {
+            prec = 0;
+            for (int64_t i = 1; i < flen; ++i) {
+                if (fmt[i] < '0' || fmt[i] > '9') { ok = false; break; }
+                prec = prec * 10 + (fmt[i] - '0');
+                if (prec > 28) { ok = false; break; }  // decimal max scale
+            }
+        }
+        if (ok) {
+            bz_decimal_t r;
+            bz_decimal_round(a, prec, &r);
+            __uint128_t m = dec_mantissa(&r);
+            uint32_t s = dec_scale(&r);          // s <= prec after rounding
+            int neg = dec_sign(&r);
+            bool valueIsZero = (m == 0);
+            // mantissa digits, most-significant first.
+            char digits[40]; int nd = 0;
+            if (m == 0) { digits[0] = '0'; nd = 1; }
+            else { while (m > 0) { digits[nd++] = (char)('0' + (int)(m % 10)); m /= 10; } }
+            for (int i = 0; i < nd / 2; ++i) {
+                char t = digits[i]; digits[i] = digits[nd-1-i]; digits[nd-1-i] = t;
+            }
+            char buf[80]; int pos = 0;
+            if (neg && !valueIsZero) buf[pos++] = '-';   // never "-0.00"
+            int int_digits = nd - (int)s;
+            if (int_digits <= 0) buf[pos++] = '0';
+            else for (int i = 0; i < int_digits; ++i) buf[pos++] = digits[i];
+            if (prec > 0) {
+                buf[pos++] = '.';
+                int written = 0;
+                // leading zeros when |value| < 1 (int_digits < 0).
+                for (int i = 0; i < -int_digits && written < prec; ++i) {
+                    buf[pos++] = '0'; ++written;
+                }
+                int fracStart = int_digits > 0 ? int_digits : 0;
+                for (int i = fracStart; i < nd && written < prec; ++i) {
+                    buf[pos++] = digits[i]; ++written;
+                }
+                while (written < prec) { buf[pos++] = '0'; ++written; }  // pad
+            }
+            buf[pos] = '\0';
+            int64_t len = (int64_t)pos;
+            char* data = (char*)malloc((size_t)len + 1);
+            memcpy(data, buf, (size_t)len + 1);
+            bz_string_hdr* hdr = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+            hdr->data = data; hdr->len = len; hdr->width = 1; hdr->rc = 1;
+            return hdr;
+        }
+    }
+    return bz_decimal_to_string(a);   // unsupported / malformed format
+}
+
+// ---------------------------------------------------------------------------
+// v0.172 (#812/#1339, stdlib §2.18): the floating round-trip guarantee.
+// `double`/`float` no-format ToString() and the "R" specifier both produce the
+// SHORTEST decimal string that reparses to the identical bit pattern. Search
+// precisions 1..N with "%.*g", reparse with strtod/strtof, and take the first
+// that is bit-identical to the input (memcmp of the raw bits — distinguishes
+// -0.0 from 0.0 and never mistakes a NaN payload for an exact match). Correctness
+// over speed per CLAUDE.md; no caching.
+// ---------------------------------------------------------------------------
+
+// Build a fresh heap bz_string* (rc := 1) wrapping a copy of buf[0..len).
+void* bz_make_string(const char* buf, int64_t len) {
+    char* data = (char*)malloc((size_t)len + 1);
+    memcpy(data, buf, (size_t)len);
+    data[len] = '\0';
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data = data; sh->len = len; sh->width = 1; sh->rc = 1;
+    return sh;
+}
+
+extern "C" void* bz_double_to_string_r(double v) {
+    char buf[64];
+    int n = 0;
+    for (int prec = 1; prec <= 17; ++prec) {
+        n = snprintf(buf, sizeof(buf), "%.*g", prec, v);
+        double rt = strtod(buf, nullptr);
+        if (memcmp(&rt, &v, sizeof(double)) == 0) break;  // exact round-trip
+    }
+    return bz_make_string(buf, n);
+}
+
+extern "C" void* bz_float_to_string_r(float v) {
+    char buf[64];
+    int n = 0;
+    for (int prec = 1; prec <= 9; ++prec) {
+        n = snprintf(buf, sizeof(buf), "%.*g", prec, (double)v);
+        float rt = strtof(buf, nullptr);
+        if (memcmp(&rt, &v, sizeof(float)) == 0) break;   // exact round-trip
+    }
+    return bz_make_string(buf, n);
+}
+
+// v0.172 (stdlib §2.18): integer "B"/"Bn" — binary, no leading zeros beyond the
+// natural width, left-zero-padded to `min_digits`. `value` is the operand's
+// natural-width bit pattern zero-extended to 64 bits (so a signed operand's
+// two's-complement bits print correctly, e.g. int -1 → 32 ones).
+extern "C" void* bz_ulong_to_binary(uint64_t value, int32_t min_digits) {
+    char tmp[64];
+    int n = 0;
+    if (value == 0) tmp[n++] = '0';
+    else while (value) { tmp[n++] = (char)('0' + (int)(value & 1)); value >>= 1; }
+    int total = (n < min_digits) ? min_digits : n;
+    char out[80];
+    int pad = total - n;
+    for (int i = 0; i < pad; ++i) out[i] = '0';
+    for (int i = 0; i < n; ++i) out[pad + i] = tmp[n - 1 - i];  // reverse
+    return bz_make_string(out, total);
+}
+
+// v0.172 (stdlib §2.18): Guid "N" — 32 hex digits, lowercase, no hyphens.
+// ("D" is the canonical bz_guid_to_string form.)
+extern "C" void* bz_guid_to_string_n(const bz_guid_t* g) {
+    const uint8_t* b = (const uint8_t*)g;
+    char buf[33];
+    for (int i = 0; i < 16; ++i)
+        snprintf(buf + i * 2, 3, "%02x", b[i]);
+    return bz_make_string(buf, 32);
+}
+
+// ---------------------------------------------------------------------------
+// Per §2.5: TimeSpan component extractors.
+// Ticks are signed 100-ns units.
+// ---------------------------------------------------------------------------
+
+static const int64_t TICKS_PER_MINUTE = 600000000LL;     // 60 * 10_000_000
+static const int64_t TICKS_PER_HOUR   = 36000000000LL;   // 3600 * 10_000_000
+static const int64_t TICKS_PER_DAY    = 864000000000LL;  // 86400 * 10_000_000
+
+// v0.172 (stdlib §2.18): TimeSpan "c" (constant) format —
+// `[-][d.]hh:mm:ss[.fffffff]`. The day part appears only when non-zero; the
+// fractional part is 7 zero-padded digits (100-ns units) and appears only when
+// non-zero. Used for the "c" specifier and the no-format rendering.
+extern "C" void* bz_timespan_to_string_c(int64_t ticks) {
+    char buf[48];
+    int pos = 0;
+    int64_t t = ticks;
+    if (t < 0) { buf[pos++] = '-'; t = -t; }
+    int64_t days = t / TICKS_PER_DAY; t %= TICKS_PER_DAY;
+    int64_t hh   = t / TICKS_PER_HOUR; t %= TICKS_PER_HOUR;
+    int64_t mm   = t / TICKS_PER_MINUTE; t %= TICKS_PER_MINUTE;
+    int64_t ss   = t / TICKS_PER_SECOND; t %= TICKS_PER_SECOND;
+    int64_t frac = t;  // 0..9,999,999 (100-ns units)
+    if (days > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld.", (long long)days);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "%02lld:%02lld:%02lld",
+                    (long long)hh, (long long)mm, (long long)ss);
+    if (frac > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, ".%07lld", (long long)frac);
+    return bz_make_string(buf, pos);
+}
+
+void bz_timespan_components(int64_t ticks,
+                             int32_t* days, int32_t* hours,
+                             int32_t* minutes, int32_t* seconds,
+                             int32_t* ms) {
+    // Preserve sign: work with absolute value, then negate if negative.
+    int32_t sign = (ticks < 0) ? -1 : 1;
+    int64_t t = (ticks < 0) ? -ticks : ticks;
+    int64_t d   = t / TICKS_PER_DAY;
+    t %= TICKS_PER_DAY;
+    int64_t h   = t / TICKS_PER_HOUR;
+    t %= TICKS_PER_HOUR;
+    int64_t min = t / TICKS_PER_MINUTE;
+    t %= TICKS_PER_MINUTE;
+    int64_t sec = t / TICKS_PER_SECOND;
+    t %= TICKS_PER_SECOND;
+    int64_t mss = t / TICKS_PER_MS;
+    if (days)    *days    = (int32_t)(sign * d);
+    if (hours)   *hours   = (int32_t)(sign * h);
+    if (minutes) *minutes = (int32_t)(sign * min);
+    if (seconds) *seconds = (int32_t)(sign * sec);
+    if (ms)      *ms      = (int32_t)(sign * mss);
+}
+
+double bz_timespan_total_days(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_DAY;
+}
+double bz_timespan_total_hours(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_HOUR;
+}
+double bz_timespan_total_minutes(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_MINUTE;
+}
+double bz_timespan_total_seconds(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_SECOND;
+}
+double bz_timespan_total_milliseconds(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_MS;
+}
+
+// ---------------------------------------------------------------------------
+// per stdlib §2.5 / #1357: TimeOnly — value type stored as i32 ms from
+// midnight (0..86399999). Helpers for string conversion and parsing.
+// ---------------------------------------------------------------------------
+
+// Format ms_from_midnight as "HH:mm:ss" → fresh heap bz_string* (rc=1).
+void* bz_timeonly_to_string(int32_t ms_from_midnight) {
+    if (ms_from_midnight < 0) ms_from_midnight = 0;
+    int32_t total_sec = ms_from_midnight / 1000;
+    int32_t hh  = total_sec / 3600;
+    int32_t mm  = (total_sec % 3600) / 60;
+    int32_t ss  = total_sec % 60;
+    // "HH:mm:ss\0" — 9 chars.
+    char* out = (char*)malloc(9);
+    out[0] = '0' + hh / 10;
+    out[1] = '0' + hh % 10;
+    out[2] = ':';
+    out[3] = '0' + mm / 10;
+    out[4] = '0' + mm % 10;
+    out[5] = ':';
+    out[6] = '0' + ss / 10;
+    out[7] = '0' + ss % 10;
+    out[8] = '\0';
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data  = out;
+    sh->len   = 8;
+    sh->width = 1;
+    sh->rc    = 1;
+    return sh;
+}
+
+// Parse "HH:mm:ss" or "HH:mm:ss.fff" from a bz_string*.
+// Returns 1 on success (writes *out_ms in [0..86399999]), 0 on failure.
+int32_t bz_timeonly_try_parse(const void* str_p, int32_t* out_ms) {
+    if (out_ms) *out_ms = 0;
+    if (!str_p) return 0;
+    const bz_string_hdr* h = (const bz_string_hdr*)str_p;
+    if (!h->data || h->width != 1) return 0;
+    const char* s = h->data;
+    int64_t len = h->len;
+    if (len < 8) return 0;  // "HH:mm:ss" minimum
+    // Parse HH
+    if (s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9') return 0;
+    int32_t hh = (s[0]-'0')*10 + (s[1]-'0');
+    if (s[2] != ':') return 0;
+    // Parse mm
+    if (s[3] < '0' || s[3] > '9' || s[4] < '0' || s[4] > '9') return 0;
+    int32_t mm = (s[3]-'0')*10 + (s[4]-'0');
+    if (s[5] != ':') return 0;
+    // Parse ss
+    if (s[6] < '0' || s[6] > '9' || s[7] < '0' || s[7] > '9') return 0;
+    int32_t ss = (s[6]-'0')*10 + (s[7]-'0');
+    // Optional .fff
+    int32_t ms3 = 0;
+    if (len >= 12 && s[8] == '.') {
+        if (s[9] < '0' || s[9] > '9' || s[10] < '0' || s[10] > '9' ||
+            s[11] < '0' || s[11] > '9') return 0;
+        ms3 = (s[9]-'0')*100 + (s[10]-'0')*10 + (s[11]-'0');
+        if (len != 12) return 0;  // trailing chars not allowed
+    } else if (len != 8) {
+        return 0;  // trailing chars without .fff not allowed
+    }
+    // Validate ranges.
+    if (hh > 23 || mm > 59 || ss > 59) return 0;
+    if (out_ms) *out_ms = hh*3600000 + mm*60000 + ss*1000 + ms3;
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// §8.1 System.Diagnostics.Stopwatch runtime
+//
+// Representation: bz_stopwatch_t* (heap pointer, owned by the Bezel Stopwatch
+// instance). Layout mirrors the .NET semantics: accumulated elapsed_ns holds
+// time from previous Start/Stop cycles; start_ts holds the CLOCK_MONOTONIC
+// timestamp at the most recent Start() call (valid only when running == 1).
+//
+// ElapsedMilliseconds = (elapsed_ns + running_ns) / 1_000_000  (i64)
+// Elapsed (TimeSpan)  = (elapsed_ns + running_ns) / 100        (i64, 100-ns ticks)
+//
+// All functions are extern "C" with the bz_sw_* prefix.
+// ---------------------------------------------------------------------------
+
+struct bz_stopwatch_t {
+    struct timespec start_ts;  // CLOCK_MONOTONIC timestamp of last Start()
+    int64_t elapsed_ns;        // accumulated nanoseconds from completed Start/Stop cycles
+    int32_t running;           // 1 = running, 0 = stopped
+};
+
+// Internal: nanoseconds since start_ts (only call when running == 1).
+static int64_t bz_sw_running_ns(const bz_stopwatch_t* sw) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t sec_diff  = (int64_t)now.tv_sec  - (int64_t)sw->start_ts.tv_sec;
+    int64_t nsec_diff = (int64_t)now.tv_nsec - (int64_t)sw->start_ts.tv_nsec;
+    return sec_diff * (int64_t)1000000000 + nsec_diff;
+}
+
+extern "C" {
+
+// new Stopwatch() — allocate and zero-initialise.
+void* bz_stopwatch_alloc(void) {
+    auto* sw = (bz_stopwatch_t*)calloc(1, sizeof(bz_stopwatch_t));
+    return sw;
+}
+
+// Stopwatch.Dispose() — free the heap object (no IDisposable semantics needed).
+void bz_stopwatch_free(void* swp) {
+    free(swp);
+}
+
+// Stopwatch.Start() — begin (or resume) timing.
+void bz_stopwatch_start(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw || sw->running) return;  // idempotent: already running → no-op
+    clock_gettime(CLOCK_MONOTONIC, &sw->start_ts);
+    sw->running = 1;
+}
+
+// Stopwatch.Stop() — pause timing; accumulate elapsed.
+void bz_stopwatch_stop(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw || !sw->running) return;  // idempotent: already stopped → no-op
+    sw->elapsed_ns += bz_sw_running_ns(sw);
+    sw->running = 0;
+}
+
+// Stopwatch.Reset() — stop (if running) and zero elapsed.
+void bz_stopwatch_reset(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return;
+    sw->running = 0;
+    sw->elapsed_ns = 0;
+    sw->start_ts.tv_sec  = 0;
+    sw->start_ts.tv_nsec = 0;
+}
+
+// Stopwatch.Restart() — reset and start immediately.
+void bz_stopwatch_restart(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return;
+    sw->elapsed_ns = 0;
+    clock_gettime(CLOCK_MONOTONIC, &sw->start_ts);
+    sw->running = 1;
+}
+
+// Stopwatch.IsRunning — returns 1 (true) or 0 (false).
+int32_t bz_stopwatch_is_running(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return 0;
+    return sw->running;
+}
+
+// Stopwatch.ElapsedMilliseconds — total elapsed as i64 milliseconds.
+int64_t bz_stopwatch_elapsed_ms(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return 0;
+    int64_t ns = sw->elapsed_ns;
+    if (sw->running) ns += bz_sw_running_ns(sw);
+    return ns / (int64_t)1000000;
+}
+
+// Stopwatch.Elapsed — total elapsed as TimeSpan (i64, 100-ns ticks).
+int64_t bz_stopwatch_elapsed_ticks(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return 0;
+    int64_t ns = sw->elapsed_ns;
+    if (sw->running) ns += bz_sw_running_ns(sw);
+    return ns / (int64_t)100;   // nanoseconds → 100-ns ticks
+}
+
+} // extern "C" (Stopwatch)
+
+// ---------------------------------------------------------------------------
+// §8.2 System.Diagnostics.Debug runtime
+//
+// Debug.Assert(condition) / Debug.Assert(condition, message):
+//   If condition is false, write the assertion message to stderr and call
+//   abort(). This implementation is always-on (no --debug flag yet, per
+//   recorded choice in diagnostics_646_test.cpp §8.2 gap note 2).
+//
+// Debug.WriteLine(message):
+//   Write message followed by a newline to stderr. Always-on.
+// ---------------------------------------------------------------------------
+
+extern "C" {
+
+// bz_debug_assert_fail(msg_p) — print message to stderr and abort.
+// msg_p is a bz_string* (the string object; we extract data/len the same way
+// Console.Write does). Called only when the condition is false.
+void bz_debug_assert_fail(void* msg_p) {
+    if (msg_p) {
+        // bz_string layout: data ptr @ offset 0, len (code-point count) @ offset 8,
+        // width byte @ offset 16. UTF-8 (width=1) path only; mirror Console.Write.
+        const uint8_t* hdr = (const uint8_t*)msg_p;
+        void* data_ptr;
+        memcpy(&data_ptr, hdr, sizeof(void*));
+        int64_t len;
+        memcpy(&len, hdr + 8, sizeof(int64_t));
+        uint8_t width = hdr[16];
+        // Only width-1 (UTF-8) is printable without transcoding; for wider
+        // encodings fall through to the generic abort message.
+        if (width == 1 && data_ptr && len > 0) {
+            fputs("Assertion failed: ", stderr);
+            fwrite(data_ptr, 1, (size_t)len, stderr);
+            fputc('\n', stderr);
+            fflush(stderr);
+            abort();
+        }
+    }
+    fputs("Assertion failed\n", stderr);
+    fflush(stderr);
+    abort();
+}
+
+// bz_debug_writeline(msg_p) — write message + newline to stderr.
+void bz_debug_writeline(void* msg_p) {
+    if (!msg_p) { fputs("\n", stderr); return; }
+    const uint8_t* hdr = (const uint8_t*)msg_p;
+    void* data_ptr;
+    memcpy(&data_ptr, hdr, sizeof(void*));
+    int64_t len;
+    memcpy(&len, hdr + 8, sizeof(int64_t));
+    uint8_t width = hdr[16];
+    if (width == 1 && data_ptr && len > 0) {
+        fwrite(data_ptr, 1, (size_t)len, stderr);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+} // extern "C" (Debug)

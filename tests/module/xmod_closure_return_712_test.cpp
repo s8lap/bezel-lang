@@ -55,6 +55,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+#include "native_test_harness.hpp"
+
 namespace bezel::module {
 namespace {
 
@@ -95,10 +97,8 @@ static const std::string& laneLocalAsanRt712() {
     std::ifstream check(dst);
     if (check.good()) { cached = dst; return cached; }
     // Otherwise compile now.
-    std::string cmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSrcPath712() + " -o " + dst + " > /dev/null 2>&1";
-    if (std::system(cmd.c_str()) != 0) return cached;  // leave empty → SKIP
+    if (!::bezel::native_test::buildRuntimeSanitizerObject("address", dst))
+        return cached;  // leave empty → SKIP
     cached = dst;
     return cached;
 }

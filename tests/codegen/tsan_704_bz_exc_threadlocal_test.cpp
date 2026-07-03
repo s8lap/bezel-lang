@@ -47,15 +47,11 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+#include "native_test_harness.hpp"
+
 namespace {
 
 namespace fs = std::filesystem;
-
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);
-    fs::path root = here.parent_path().parent_path().parent_path();
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
 
 // Compile `source` to a temp native AOT binary (no sanitizer) and run it.
 // Returns exit code, or -1 on compile/link/run failure.
@@ -125,10 +121,10 @@ std::string runUnderTSanCaptureOutput(const std::string& source,
         if (!bezel::codegen::emitObjectFile(*module, objPath, err)) { cleanup(); return ""; }
     }
 
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=thread -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return ""; }
+    if (!::bezel::native_test::buildRuntimeSanitizerObject("thread", rtObj)) {
+        cleanup();
+        return "";
+    }
 
     std::string linkCmd =
         "clang++ -fsanitize=thread -g " + objPath + " " + rtObj +

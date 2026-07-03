@@ -67,6 +67,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+#include "native_test_harness.hpp"
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -93,12 +95,6 @@ int compileAndRun(const std::string& source) {
     std::remove(src.c_str());
     std::remove(exe.c_str());
     return code;
-}
-
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);
-    fs::path root = here.parent_path().parent_path().parent_path();
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
 }
 
 // Sanitizer verification (mirrors async_test.cpp::runUnderSanitizer).
@@ -138,10 +134,10 @@ int runUnderSanitizer(const std::string& source, const std::string& san,
         std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=" + san + " -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (!::bezel::native_test::buildRuntimeSanitizerObject(san, rtObj)) {
+        cleanup();
+        return -1;
+    }
 
     std::string linkCmd = "clang++ -fsanitize=" + san + " -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +

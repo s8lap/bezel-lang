@@ -39,6 +39,7 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "native_test_harness.hpp"
 
 namespace bezel::module {
 namespace {
@@ -70,10 +71,8 @@ static const std::string& laneLocalAsanRt783() {
     std::filesystem::create_directories("/tmp/wt-783");
     std::ifstream check(dst);
     if (check.good()) { cached = dst; return cached; }
-    std::string cmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSrcPath783() + " -o " + dst + " > /dev/null 2>&1";
-    if (std::system(cmd.c_str()) != 0) return cached;
+    if (!::bezel::native_test::buildRuntimeSanitizerObject("address", dst))
+        return cached;
     cached = dst;
     return cached;
 }

@@ -53,6 +53,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+#include "native_test_harness.hpp"
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -100,14 +102,6 @@ bool compileFails(const std::string& source) {
     return !r.success;
 }
 
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);                       // tests/codegen/<this>
-    fs::path root = here.parent_path()             // tests/codegen
-                        .parent_path()             // tests
-                        .parent_path();            // repo root
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 // Sanitizer verification for a single program under the given -fsanitize=<san>
 // (e.g. "address" for ASan/LSan, "thread" for TSan/#439). Returns:
 //   0  — ran clean: no leak / UAF / double-free / data race reported.
@@ -152,10 +146,10 @@ int runUnderSanitizer(const std::string& source, const std::string& san,
         std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=" + san + " -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
+    if (!::bezel::native_test::buildRuntimeSanitizerObject(san, rtObj)) {
+        cleanup();
+        return -1;
+    }
 
     std::string linkCmd = "clang++ -fsanitize=" + san + " -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +

@@ -1,0 +1,315 @@
+// bezel_runtime_fileio.cpp — File I/O and filesystem.
+// Split from bezel_runtime.cpp per #1414 stage 2 (behavior-preserving motion).
+#include "bezel_runtime_internal.hpp"
+
+// ---------------------------------------------------------------------------
+// File I/O
+// ---------------------------------------------------------------------------
+
+int32_t bz_file_read_all_bytes(const char* path, uint8_t** out, int64_t* len) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -errno;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* buf = (uint8_t*)malloc((size_t)sz + 1);
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = 0;
+    fclose(f);
+    *out = buf;
+    if (len) *len = (int64_t)n;
+    return 0;
+}
+
+int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len) {
+    uint8_t* buf; int64_t len;
+    int32_t r = bz_file_read_all_bytes(path, &buf, &len);
+    *out = (char*)buf;
+    if (byte_len) *byte_len = len;
+    return r;
+}
+
+// bz.string layout (§4.6, issue #422 strings increment):
+//   { void* data (off 0), int64_t len (off 8), int8_t width (off 16),
+//     int64_t rc (off 24) } = 32 bytes.
+// The reference count `rc` was appended AFTER `width` so the three original
+// fields keep their offsets (0/8/16): codegen accesses them by StructGEP index
+// (layout-agnostic) and the runtime touches them by raw byte offset, so neither
+// side moves. `rc` starts at 1 (the producer's reference) at every heap-alloc
+// site; bz_string_retain / bz_string_release maintain it; a static/literal
+// string carries the SENTINEL rc and is never freed (see below).
+
+// §33.4: build an Array<string> (bz_array_t* of bz_string*) from the process
+// argv, excluding argv[0] (the executable name).  The returned array is
+// freshly owned; each element's rc is initialised to 1.  Disposal:
+//   bz_array_free(result, bz_string_release)
+// argv[0] is excluded per §33.4: "The program's own executable path is not
+// included; args[0] is the first user-supplied argument."
+void* bz_args_array(int32_t argc, char** argv) {
+    int32_t n = (argc > 1) ? (argc - 1) : 0;
+    void* arr = bz_array_alloc(8, n);   // elem_size = sizeof(void*) = 8
+    for (int32_t i = 0; i < n; ++i) {
+        const char* src = argv[i + 1];  // skip argv[0]
+        int64_t len = (int64_t)strlen(src);
+        char* data = (char*)malloc((size_t)(len + 1));
+        memcpy(data, src, (size_t)len);
+        data[len] = '\0';
+        uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+        memcpy(s, &data, sizeof(void*));           // data ptr
+        memcpy(s + 8, &len, sizeof(int64_t));      // len field
+        s[16] = 1;                                  // width = 1 (UTF-8 bytes)
+        bz_string_init_rc(s);                       // producer's reference, rc := 1
+        bz_array_add(arr, &s, 8);                  // append the bz_string* pointer
+    }
+    return arr;
+}
+
+void* bz_file_read_all_lines(const char* path) {
+    uint8_t* buf; int64_t len;
+    if (bz_file_read_all_bytes(path, &buf, &len) != 0)
+        return bz_array_alloc(8, 0);  // empty array on error
+    void* arr = bz_array_alloc(8, 16);  // array of bz.string* pointers
+    int64_t start = 0;
+    for (int64_t i = 0; i <= len; ++i) {
+        if (i == len || buf[i] == '\n') {
+            int64_t lineLen = i - start;
+            if (lineLen > 0 && buf[start + lineLen - 1] == '\r') lineLen--;
+            // Skip a single trailing empty "line" produced by a terminal '\n'
+            // (mirrors .NET File.ReadAllLines, which returns n entries when
+            //  the file contains n lines each terminated by '\n').
+            if (i == len && lineLen == 0) break;
+            // Build a bz.string struct: { data ptr, len i64, width i8 }
+            char* lineData = (char*)malloc((size_t)(lineLen + 1));
+            memcpy(lineData, buf + start, (size_t)lineLen);
+            lineData[lineLen] = '\0';
+            uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+            memcpy(s, &lineData, sizeof(void*));            // data
+            memcpy(s + 8, &lineLen, sizeof(int64_t));      // len
+            s[16] = 1;                                      // width = 1 (ASCII)
+            bz_string_init_rc(s);  // #422: producer's reference, rc := 1
+            bz_array_add(arr, &s, 8);  // store the pointer to s
+            start = i + 1;
+        }
+    }
+    free(buf);
+    return arr;
+}
+
+int32_t bz_file_write_all_bytes(const char* path, const uint8_t* data, int64_t len) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return -errno;
+    fwrite(data, 1, (size_t)len, f);
+    fclose(f);
+    return 0;
+}
+
+int32_t bz_file_write_all_text(const char* path, const char* data, int64_t len) {
+    return bz_file_write_all_bytes(path, (const uint8_t*)data, len);
+}
+
+int32_t bz_file_append_all_text(const char* path, const char* data, int64_t len) {
+    FILE* f = fopen(path, "ab");
+    if (!f) return -errno;
+    fwrite(data, 1, (size_t)len, f);
+    fclose(f);
+    return 0;
+}
+
+bool bz_file_exists(const char* path) {
+    return access(path, F_OK) == 0;
+}
+
+bool bz_file_delete(const char* path) {
+    return unlink(path) == 0;
+}
+
+int32_t bz_file_copy(const char* src, const char* dst, bool overwrite) {
+    if (!overwrite && bz_file_exists(dst)) return -EEXIST;
+    uint8_t* buf; int64_t len;
+    int32_t r = bz_file_read_all_bytes(src, &buf, &len);
+    if (r) return r;
+    r = bz_file_write_all_bytes(dst, buf, len);
+    free(buf);
+    return r;
+}
+
+int32_t bz_file_move(const char* src, const char* dst) {
+    if (rename(src, dst) == 0) return 0;
+    int32_t r = bz_file_copy(src, dst, true);
+    if (r == 0) unlink(src);
+    return r;
+}
+
+// §7.3: higher-level File.ReadAllBytes → bz_array_t* of uint8_t (elem_size=1).
+void* bz_file_read_all_bytes_arr(const char* path) {
+    uint8_t* buf; int64_t len;
+    if (bz_file_read_all_bytes(path, &buf, &len) != 0)
+        return nullptr;
+    void* arr = bz_array_alloc(1, len > 0 ? len : 1);
+    auto* a = (bz_array_t*)arr;
+    memcpy(a->data, buf, (size_t)len);
+    a->count = len;
+    free(buf);
+    return arr;
+}
+
+// §7.3: File.WriteAllBytes — write from bz_array_t* of uint8_t (elem_size=1).
+int32_t bz_file_write_all_bytes_arr(const char* path, void* arrp) {
+    if (!arrp) return bz_file_write_all_bytes(path, nullptr, 0);
+    auto* a = (bz_array_t*)arrp;
+    return bz_file_write_all_bytes(path, (const uint8_t*)a->data, a->count);
+}
+
+// §7.3: File.WriteAllLines — write bz_array_t* of bz_string* with '\n' between
+// lines.  Mirrors .NET File.WriteAllLines: each line is terminated with a newline
+// (including the last), so ReadAllLines sees exactly n lines.  The trailing '\n'
+// is excluded for the empty-array case to avoid a spurious blank file entry.
+// bz_string layout: { void* data (off 0), int64_t len (off 8), int8_t width (off 16) }.
+int32_t bz_file_write_all_lines(const char* path, void* arrp) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return -errno;
+    auto* a = (bz_array_t*)arrp;
+    int64_t n = a ? a->count : 0;
+    for (int64_t i = 0; i < n; ++i) {
+        // each element is a pointer to a bz_string header
+        void* sp = ((void**)a->data)[i];
+        if (sp) {
+            void* strData; int64_t strLen;
+            memcpy(&strData, sp, sizeof(void*));
+            memcpy(&strLen, (uint8_t*)sp + 8, sizeof(int64_t));
+            if (strLen > 0 && strData) fwrite(strData, 1, (size_t)strLen, f);
+        }
+        // terminate each line with '\n'; ReadAllLines strips it back out
+        fputc('\n', f);
+    }
+    fclose(f);
+    return 0;
+}
+
+bool bz_dir_exists(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+int32_t bz_dir_create(const char* path) {
+    // Create all intermediate directories (like mkdir -p)
+    char* tmp = strdup(path);
+    char* p = tmp + 1;
+    while ((p = strchr(p, '/'))) {
+        *p = '\0';
+        mkdir(tmp, 0755);
+        *p = '/';
+        p++;
+    }
+    int r = mkdir(tmp, 0755);
+    free(tmp);
+    return (r == 0 || errno == EEXIST) ? 0 : -errno;
+}
+
+static int rmdir_recursive(const char* path) {
+    DIR* d = opendir(path);
+    if (!d) return -errno;
+    struct dirent* entry;
+    char buf[4096];
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        snprintf(buf, sizeof(buf), "%s/%s", path, entry->d_name);
+        struct stat st;
+        if (stat(buf, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) rmdir_recursive(buf);
+            else unlink(buf);
+        }
+    }
+    closedir(d);
+    return rmdir(path) == 0 ? 0 : -errno;
+}
+
+int32_t bz_dir_delete(const char* path, bool recursive) {
+    if (recursive) return rmdir_recursive(path);
+    return rmdir(path) == 0 ? 0 : -errno;
+}
+
+void* bz_dir_get_files(const char* path, int64_t* count_out) {
+    DIR* d = opendir(path);
+    if (!d) { if (count_out) *count_out = 0; return nullptr; }
+    std::vector<char*> results;
+    struct dirent* entry;
+    char fullpath[4096];
+    while ((entry = readdir(d))) {
+        if (entry->d_name[0] == '.') continue;
+        struct stat st;
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
+        if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode))
+            results.push_back(strdup(fullpath));
+    }
+    closedir(d);
+    char** arr = (char**)malloc(results.size() * sizeof(char*));
+    for (size_t i = 0; i < results.size(); i++) arr[i] = results[i];
+    if (count_out) *count_out = (int64_t)results.size();
+    return arr;
+}
+
+void* bz_dir_get_dirs(const char* path, int64_t* count_out) {
+    DIR* d = opendir(path);
+    if (!d) { if (count_out) *count_out = 0; return nullptr; }
+    std::vector<char*> results;
+    struct dirent* entry;
+    char fullpath[4096];
+    while ((entry = readdir(d))) {
+        if (entry->d_name[0] == '.') continue;
+        struct stat st;
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
+        if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode))
+            results.push_back(strdup(fullpath));
+    }
+    closedir(d);
+    char** arr = (char**)malloc(results.size() * sizeof(char*));
+    for (size_t i = 0; i < results.size(); i++) arr[i] = results[i];
+    if (count_out) *count_out = (int64_t)results.size();
+    return arr;
+}
+
+char* bz_path_combine(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b);
+    bool slash = la > 0 && a[la - 1] != '/';
+    char* out = (char*)malloc(la + lb + 2);
+    memcpy(out, a, la);
+    if (slash) out[la++] = '/';
+    memcpy(out + la, b, lb + 1);
+    return out;
+}
+
+char* bz_path_filename(const char* path) {
+    return strdup(basename((char*)path));  // POSIX basename
+}
+
+char* bz_path_extension(const char* path) {
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char* dot = strrchr(base, '.');
+    return dot ? strdup(dot) : strdup("");
+}
+
+char* bz_path_stem(const char* path) {
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char* dot = strrchr(base, '.');
+    if (!dot) return strdup(base);
+    size_t n = (size_t)(dot - base);
+    char* out = (char*)malloc(n + 1);
+    memcpy(out, base, n); out[n] = '\0';
+    return out;
+}
+
+char* bz_path_dirname(const char* path) {
+    char* copy = strdup(path);
+    char* dir = dirname(copy);  // POSIX dirname
+    char* result = strdup(dir);
+    free(copy);
+    return result;
+}
+
+char* bz_path_absolute(const char* path) {
+    char buf[4096];
+    return realpath(path, buf) ? strdup(buf) : strdup(path);
+}
