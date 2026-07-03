@@ -3994,12 +3994,72 @@ bool MethodOwnership::exprTypeIsTaskScope(const ast::Expr& e) const {
     return false;
 }
 
+namespace {
+// The three TypeRef name fallbacks shared by the builtin-type matchers
+// (cf. typeRefIsTaskScope): builtin TypeSymbol declaration name, annotation
+// AST name, imported name.
+std::string_view builtinTypeRefNameHead(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
+    if (rt->declaration) return rt->declaration->name;
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        return rt->astNode->name->parts[0];
+    return rt->importedName;
+}
+}  // namespace
+
+bool MethodOwnership::typeRefIsEventSourceLike(const sema::TypeRef* rt) const {
+    // §24.3 / stdlib §6.5: the four faces of an event member (or a value of
+    // one of those types). All carry the v0.175 `Subscribe(scoped handler)`
+    // signature.
+    const std::string_view n = builtinTypeRefNameHead(rt);
+    return n == "EventSource" || n == "AsyncEventSource" || n == "IEvent" ||
+           n == "IAsyncEvent";
+}
+
+bool MethodOwnership::typeRefIsCancellationToken(const sema::TypeRef* rt) const {
+    return builtinTypeRefNameHead(rt) == "CancellationToken";
+}
+
+bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
+                                                  std::size_t argPos) {
+    // #1420: builtin subscribe-and-store callees whose handler formal the
+    // stdlib declares `scoped` (stdlib §6.5 Subscribe, §6.1 Register; spec
+    // §24.3, v0.175). Enforcing here applies the §28.14 admission to their
+    // capture-bearing handler arguments. The event `Add`/`Remove` (`+=`/`-=`)
+    // producer-face forms are deliberately NOT included: §24.3's normative
+    // signatures keep them plain, so they remain stdlib-certified (§28.14
+    // v0.177 legacy path) until the spec migrates them.
+    if (argPos != 0) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    if (ma->member == "Subscribe") {
+        // `<event>.Subscribe(h)` — the target is the event member itself
+        // (bare `Clicked` or qualified `btn.Clicked`, both resolving to the
+        // EventSymbol) …
+        if (dynamic_cast<sema::EventSymbol*>(ctx_.exprSymbol(*ma->target)))
+            return true;
+        // … or a VALUE whose static type is one of the event faces
+        // (`ev: IEvent<int>` parameter, an EventSource-typed borrow, …).
+        return typeRefIsEventSourceLike(ctx_.exprType(*ma->target));
+    }
+    if (ma->member == "Register")
+        return typeRefIsCancellationToken(ctx_.exprType(*ma->target));
+    return false;
+}
+
 // -- pre-scan: declaration order + using-var initializer anchors + admission
 
 void MethodOwnership::scopedPreScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     for (const auto& s : body)
         if (s) scopedPreScanStmt(*s);
+    // Run the queued §28.14 admissions AFTER the whole walk so the
+    // lambda-literal-local and assigned-symbol maps are complete (the
+    // declaration-order comparisons are unaffected — see the queue's
+    // declaration comment). // per §28.14
+    for (const ScopedAdmission& wi : scopedAdmissionQueue_)
+        checkScopedAdmission(*wi.callNode, wi.callee, wi.ne, *wi.arg);
+    scopedAdmissionQueue_.clear();
 }
 
 void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
@@ -4011,6 +4071,14 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         if (ld->initializer) {
             if (ld->isUsing)
                 scopedInitOfUsingLocal_[ld->initializer.get()] = ld;
+            // A lambda-literal initializer makes this local a verifiable
+            // function value at a scoped call site (unless reassigned —
+            // scopedAssignedSyms_). // per §28.14
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                    ld->initializer.get())) {
+                if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
+                    scopedLambdaLocalInit_[ls] = lam;
+            }
             scopedPreScanExpr(*ld->initializer);
         }
         return;
@@ -4028,6 +4096,14 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // Record a reassigned local: a lambda-literal local that is ever an
+        // assignment target loses its verifiable-function-value status.
+        // // per §28.14
+        if (auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
+            if (sema::Symbol* tsym = ctx_.exprSymbol(*tid))
+                scopedAssignedSyms_.insert(tsym);
+        }
         if (as->target) scopedPreScanExpr(*as->target);
         if (as->value) scopedPreScanExpr(*as->value);
         return;
@@ -4118,8 +4194,23 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
         for (std::size_t i = 0; i < args->size(); ++i) {
             const auto& a = (*args)[i];
             if (!a.value) continue;
+            // An `out`/`ref` argument overwrites its identifier — a lambda-
+            // literal local passed that way is no longer verifiable.
+            if (!a.modifier.empty() &&
+                a.modifier.find("out") != std::string_view::npos) {
+                if (auto* oid = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get()))
+                    if (sema::Symbol* osym = ctx_.exprSymbol(*oid))
+                        scopedAssignedSyms_.insert(osym);
+            } else if (a.modifier == "ref") {
+                if (auto* oid = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get()))
+                    if (sema::Symbol* osym = ctx_.exprSymbol(*oid))
+                        scopedAssignedSyms_.insert(osym);
+            }
             if (scopedFormalAt(callee, ne, i))
-                checkScopedAdmission(e, callee, ne, *a.value);
+                scopedAdmissionQueue_.push_back(
+                    {&e, callee, ne, a.value.get()});
             scopedPreScanExpr(*a.value);
         }
         if (callee) scopedPreScanExpr(*callee);
@@ -4247,6 +4338,9 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
             typeRefIsTaskScope(ctx_.exprType(*ma->target)))
             return true;
     }
+    // Builtin: event Subscribe / CancellationToken.Register — the stdlib
+    // §6.5 / §6.1 `scoped` handler formals, enforced per #1420.
+    if (builtinScopedCallbackFormal(callee, argPos)) return true;
     // Function VALUE callee whose Function type carries a scoped position
     // (`var g: (scoped () -> Task) -> ()` … `g(cb)`).
     if (const sema::TypeRef* ft = ctx_.exprType(*callee)) {
@@ -4276,6 +4370,15 @@ const ast::LocalDecl* MethodOwnership::scopedBoundingLocal(
                 if (it != scopedInitOfUsingLocal_.end()) return it->second;
             }
         }
+    }
+    // Form 2 (builtin, #1420): event `Subscribe` / CancellationToken
+    // `Register` return `owned Subscription` (stdlib §2.11 / §6.5 / §6.1) —
+    // when the call initializes a `using var`/`await using var` local, the
+    // returned Subscription is the bounding object; its disposal severs the
+    // registration (quiescence by removal, §28.14 / §24.6). // per §28.14
+    if (builtinScopedCallbackFormal(callee, 0)) {
+        auto it = scopedInitOfUsingLocal_.find(&callNode);
+        if (it != scopedInitOfUsingLocal_.end()) return it->second;
     }
     // Form 3 — otherwise the receiver: admissible only when the receiver is a
     // bare identifier naming a using/await-using local.
@@ -4523,13 +4626,24 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             (void)ms;
             return;
         }
-        report(Severity::Error, arg.span.begin,
-               std::string("the captures of the function value `") +
-                   std::string(id->name) +
-                   "` cannot be verified at this `scoped` call site — pass "
-                   "the lambda literal directly, or a capture-free function "
-                   "(§28.14, v0.175)");
-        return;
+        // Verifiable-subset widening (#1420 triage): a local bound to a
+        // LAMBDA LITERAL and never reassigned is verifiable — its captures
+        // are the literal's captures, enumerated exactly as if the literal
+        // were passed directly. // per §28.14
+        auto lit = scopedLambdaLocalInit_.find(sym);
+        if (lit != scopedLambdaLocalInit_.end() &&
+            scopedAssignedSyms_.count(sym) == 0) {
+            scopedCollectCaptures(*lit->second, rawIds);
+        } else {
+            report(Severity::Error, arg.span.begin,
+                   std::string("the captures of the function value `") +
+                       std::string(id->name) +
+                       "` cannot be verified at this `scoped` call site — "
+                       "pass the lambda literal directly, bind it to a local "
+                       "that is never reassigned, or pass a capture-free "
+                       "function (§28.14, v0.175)");
+            return;
+        }
     } else if (auto* mref = dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
         // Method reference `obj.M`: its captured environment is the receiver
         // (§28.3 / §27.6) — enumerate the receiver's identifier roots.

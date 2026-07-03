@@ -179,15 +179,30 @@ BEZEL_TEST(scoped_capture_2814, move_before_admission_not_frozen) {
 }
 
 // §28.14: a function VALUE whose captures cannot be enumerated at the call
-// site is rejected (pass the lambda literal directly).
+// site is rejected. (Updated for the #1420 verifiable-subset widening: a
+// lambda-literal local that is never reassigned IS now verifiable — its
+// captures are the literal's — so the unverifiable case needs a REASSIGNED
+// binding.)
 BEZEL_TEST(scoped_capture_2814, function_value_arg_rejected_unverifiable) {
     auto r = parseAndCheckOwnership(prog(
         "    var f := () => (); "
+        "    f := () => (); "
         "    using var run := new Runner(() => ()); "
         "    run.Install(f); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "cannot be verified"));
+}
+
+// §28.14 (#1420 widening): the same shape WITHOUT the reassignment is
+// verifiable — the literal is capture-free, so it is admitted.
+BEZEL_TEST(scoped_capture_2814, lambda_literal_local_capture_free_admitted) {
+    auto r = parseAndCheckOwnership(prog(
+        "    var f := () => (); "
+        "    using var run := new Runner(() => ()); "
+        "    run.Install(f); "
+        "    return 0; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // §28.14 / §31.1: a catch-bound exception variable may not be captured into a

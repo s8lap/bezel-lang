@@ -1025,6 +1025,33 @@ private:
     };
     std::unordered_map<sema::Symbol*, ScopedFreeze> scopedFrozen_;
 
+    // §28.14 verifiable-subset widening (#1420 triage): a local initialized
+    // with a LAMBDA LITERAL and never reassigned is a verifiable function
+    // value at a scoped call site — its captures are the literal's captures
+    // (`var h := (v) => box.Add(v); … evt.Subscribe(h);`). Maps the
+    // LocalSymbol to its initializer lambda; consulted only when the symbol
+    // is absent from scopedAssignedSyms_.
+    std::unordered_map<sema::Symbol*, const ast::LambdaExpr*>
+        scopedLambdaLocalInit_;
+    // Every symbol that is an assignment target anywhere in the body
+    // (including through an `out`/`ref` call argument). A lambda-literal
+    // local among them is NOT verifiable (the binding may have been swapped
+    // before the call site — the pre-scan is flow-insensitive).
+    std::unordered_set<sema::Symbol*> scopedAssignedSyms_;
+    // Deferred §28.14 admission work items: the walk indexes declarations and
+    // records the maps above; the admission checks run AFTER the full walk so
+    // scopedLambdaLocalInit_ / scopedAssignedSyms_ are complete. (Declaration-
+    // order comparisons are unchanged: a source declared after the bounding
+    // local now carries a LARGER index instead of no index — rejected the
+    // same way.)
+    struct ScopedAdmission {
+        const ast::Expr* callNode;
+        const ast::Expr* callee;
+        const ast::NewExpr* ne;
+        const ast::Expr* arg;
+    };
+    std::vector<ScopedAdmission> scopedAdmissionQueue_;
+
     // Walk the body once: assign scopedDeclOrder_, record using-var
     // initializer anchors, then check every call with a `scoped` formal
     // (admission) and every use of a `scoped` param / field (callee rules).
@@ -1037,6 +1064,24 @@ private:
     // type name, and function-VALUE callees via their Function TypeRef.
     bool scopedFormalAt(const ast::Expr* callee, const ast::NewExpr* ne,
                         std::size_t argPos);
+
+    // §24.3 / stdlib §6.5, §6.1 (v0.175 signatures; enforced per #1420): true
+    // when `callee` is a builtin subscribe-and-store call whose handler formal
+    // at `argPos` is `scoped` — `<event>.Subscribe(handler)` (the target
+    // resolves to an EventSymbol, or the receiver's static type is
+    // EventSource / AsyncEventSource / IEvent / IAsyncEvent) or
+    // `<token>.Register(callback)` (receiver type CancellationToken). Both
+    // return `owned Subscription` (stdlib §2.11), so the §28.14 bounding
+    // object resolves per form 2 (owned return initializing a `using var`) —
+    // see scopedBoundingLocal. The event `Add`/`Remove` (`+=`/`-=`) forms are
+    // NOT flipped: §24.3's normative signatures keep `Add(handler: (T) -> ())`
+    // plain, so they stay on the §28.14 stdlib-certified legacy path.
+    bool builtinScopedCallbackFormal(const ast::Expr* callee,
+                                     std::size_t argPos);
+    // Name-head matchers for the builtin receiver types above (the same three
+    // TypeRef fallbacks as typeRefIsTaskScope).
+    bool typeRefIsEventSourceLike(const sema::TypeRef* rt) const;
+    bool typeRefIsCancellationToken(const sema::TypeRef* rt) const;
 
     // §28.14 call-site admission for one argument bound to a scoped formal.
     // `callNode` is the CallExpr / NullCondCallExpr / NewExpr node.
