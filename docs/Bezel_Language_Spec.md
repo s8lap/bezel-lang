@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.173 — July 2026**
+**Version 0.174 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -6934,6 +6934,9 @@ Bounded channels (back-pressure: an async `Send` that awaits capacity) and multi
 ## 31. Exception Handling
 
 <a id="sec-throwing"></a>
+
+**Bounded channels (v0.174, #809).** A channel constructed with a capacity bound buffers at most that many items. `SendAsync` awaits capacity (run-to-completion: the awaiting continuation resumes when space frees or the channel closes — closing disposes the pending item and faults the task with `ChannelClosedException`); the synchronous `Send` never blocks on any channel and raises `ChannelFullException` on a full bounded one. Back-pressure therefore composes with the ordinary task machinery and adds no new suspension concept. Full surface and the deferred variants: stdlib [§6.9](Bezel_Standard_Library.md#sec-channelt-and-channelsendert).
+
 ### 31.1 Throwing
 
 ```bezel

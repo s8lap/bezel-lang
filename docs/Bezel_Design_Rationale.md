@@ -7584,6 +7584,18 @@ v0.173 is the **cancellation-composition revision** — adopting RFC #810's firs
 
 None — purely additive.
 
+<a id="sec-v0-173-to-v0-174-changelog"></a>
+### v0.174 changelog (v0.173 → v0.174)
+
+v0.174 is the **back-pressure revision** — adopting RFC #809's bounded half.
+
+- **Bounded channels** (spec §30.15, stdlib §6.9): `new Channel<T>(capacity)`; `SendAsync(owned item): Task` awaits capacity (immediate on unbounded); sync `Send` keeps never-blocks on every channel and raises the new `ChannelFullException` on a full bounded one — a producer that wants to wait says so with `await`, per the §30.3 no-blocking discipline. Close-while-waiting disposes the pending item (the buffered-items rule) and faults the send task with `ChannelClosedException`.
+- **Deferred with reasons**: capacity-zero rendezvous (scheduling coupling; addable as `capacity: 0` later), `TrySend` and send-cancellation (both need a hand-the-owned-item-BACK protocol — a real ownership design, not sugar; cancellation additionally rides #1413's foundations), multi-consumer receiver cloning (RFC #809's other half — `Shared<T>` unblocked the mechanism but §28.13's domain-locality questions remain, and N single-consumer channels compose worker pools today; revisit with pipeline evidence).
+
+#### Migration
+
+None — purely additive.
+
 ## 20. Closing
 
 If the opening framed Bezel by what it borrows, the body has shown what it actually contributes: not the features — those have ancestors — but the discipline applied to combining them. The recurring move in this document is the same one every time a hard question arrived. Ship the part that fits the foundations cleanly. Decline the part that fights them, with the reason written down so the question stays settled rather than perennially reopened. Scope whatever genuinely remains open by naming its precise blocker, not by deferring it vaguely. Member-access reflection is declined, not pending. The cyclic-serialization soundness obligation was discharged in prose before any syntax was written. Tuples and post-condition loops are conveniences with recorded costs, not gaps. The deferred list is a list of decisions deliberately not yet made — each with its reasoning — never a list of unsolved problems.

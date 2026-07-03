@@ -3296,6 +3296,8 @@ The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§
 ```bezel
 public class Channel<T>: IDisposable                       // the receiving end; class T form
   public constructor();                                    // unbounded
+  public constructor(capacity: int);                       // BOUNDED (v0.174, #809): back-pressure;
+                                                           //   capacity >= 1, ArgumentException otherwise
 
   public readonly property Count: int;                     // items currently buffered
   public readonly property IsClosed: bool;                 // true once closed (see below)
@@ -3308,12 +3310,17 @@ end Channel;
 
 public class ChannelSender<T>: IDisposable                 // class T form
   public method Send(owned item: T);                       // transfers ownership into the channel;
-                                                           //   never blocks (unbounded);
+                                                           //   never blocks; on a FULL bounded channel
+                                                           //   raises ChannelFullException (v0.174);
                                                            //   ChannelClosedException if closed
+  public async method SendAsync(owned item: T): Task;      // v0.174 (#809): awaits capacity on a
+                                                           //   bounded channel (immediate when space
+                                                           //   or unbounded); ChannelClosedException
+                                                           //   if the channel closes while waiting
 end ChannelSender;
 ```
 
-For sendable value-typed T and `string`, the ownership modifiers drop out: `Receive(): Task<T>`, `TryReceive(out item: T?): bool`, `Send(item: T)`.
+For sendable value-typed T and `string`, the ownership modifiers drop out: `Receive(): Task<T>`, `TryReceive(out item: T?): bool`, `Send(item: T)`, `SendAsync(item: T): Task`.
 
 Semantics (normative statement: language spec [§30.15](Bezel_Language_Spec.md#sec-channels)):
 
@@ -3324,9 +3331,14 @@ Semantics (normative statement: language spec [§30.15](Bezel_Language_Spec.md#s
 ```bezel
 public class ChannelClosedException: Exception
 end ChannelClosedException;
+
+public class ChannelFullException: Exception        // v0.174: sync Send on a full bounded channel
+end ChannelFullException;
 ```
 
-Bounded channels (asynchronous `Send` awaiting capacity) and multi-consumer channels (receiver cloning, which requires shared ownership) are deferred — see the design rationale.
+**Bounded channels (v0.174, #809).** `new Channel<T>(capacity)` creates a channel that buffers at most `capacity` items. `SendAsync` **awaits capacity**: the returned task completes when the item has been accepted (immediately when space is free, and always immediately on an unbounded channel). The synchronous `Send` keeps its never-blocks contract on every channel — on a *full* bounded channel it raises **`ChannelFullException`** (a defined fault, §30.3's no-blocking discipline: a producer that wants to wait says so with `await`). If the channel closes while a `SendAsync` is waiting, the pending item is **disposed by the channel** (exactly like buffered undelivered items) and the task faults with `ChannelClosedException`. Ordering and exactly-once delivery are unchanged.
+
+Deferred, each with its reason recorded in the v0.174 rationale entry: **capacity-zero rendezvous** (couples producer/consumer scheduling; addable later as `capacity: 0` without breaking), **`TrySend`** (the failure path would need to hand the owned item *back* — an ownership-protocol design of its own), **cancellation of a pending send** (same give-back protocol, plus it rides #1413's foundations), and **multi-consumer receiver cloning** (drags `Shared<T>`'s §28.13 domain-locality questions; worker pools compose today from N single-consumer channels).
 
 ---
 
