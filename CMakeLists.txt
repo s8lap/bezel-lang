@@ -181,6 +181,7 @@ add_library(bezel_core STATIC
     src/codegen/CodeGen.cpp
     src/codegen/LlvmBackend.cpp
     src/codegen/LlvmBackend_Setup.cpp
+    src/codegen/LlvmBackend_Disposal.cpp
     src/codegen/LlvmBackend_ElementPolicy.cpp
     src/codegen/LlvmBackend_String.cpp
     src/codegen/LlvmBackend_Layout.cpp
