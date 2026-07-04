@@ -5412,11 +5412,17 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // §19.3 (#738): a RangePattern on a nullable value — hasValue AND the
         // unwrapped value is in range. Mirrors the non-nullable range logic
         // below, applied to innerVal. (Open-ended forms: an absent bound is
-        // vacuously satisfied.)
+        // vacuously satisfied.) §19.3/§19.5 (#1472): a bare `..` (no lo/hi/step,
+        // grammar A.7) has both bounds absent, so geL and leH both default to
+        // true and the result reduces to `hasValue` — a range pattern matches
+        // every PRESENT value but never null (§19.5: null is matched only by
+        // `null`/untyped `var x`/`_`). The guard therefore admits the both-
+        // bounds-absent case (previously excluded by `(lo || hi)`, which left
+        // `case.end` unterminated / the arm silently skipped).
         if (auto* rp = dynamic_cast<const ast::RangePattern*>(pat)) {
             auto* range =
                 dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
-            if (range && !range->step && (range->lo || range->hi)) {
+            if (range && !range->step) {
                 bool fp = innerVal->getType()->isFloatingPointTy();
                 // §19.3 (#1152): a `decimal?` value compares via bz_decimal_cmp;
                 // bounds are lowered via decOperand (a decimal literal lacking a
@@ -5779,8 +5785,14 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // `..<10`, `..b`) in addition to closed `a..b`/`a..<b`. One bound may be
         // absent: an absent lower bound matches everything below the upper
         // (geL = true), an absent upper bound matches everything at/above the
-        // lower (leH = true). A `..`-only pattern reduces to true.
-        if (range && !range->step && (range->lo || range->hi)) {
+        // lower (leH = true). §19.3 / grammar A.7 (#1472): a bare `..` pattern
+        // (no lo/hi/step) has BOTH bounds absent, so geL and leH both default to
+        // true and the result reduces to true — an unconditional match, matching
+        // every value (equivalently `_`). This case was previously excluded by
+        // the `(lo || hi)` clause, contradicting the comment, so `patternMatches`
+        // returned nullptr → an unterminated `case.end` block (expr-position IR-
+        // verification crash) or a silently-never-taken arm (stmt position).
+        if (range && !range->step) {
             bool fp = scrut->getType()->isFloatingPointTy();
             // §19.3 (#1152): a decimal scrutinee compares via bz_decimal_cmp;
             // ICmp on the 128-bit struct operands would abort the compiler. The

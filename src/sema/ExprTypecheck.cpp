@@ -433,6 +433,28 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     bool nullableUncovered =
         scrutTy && scrutTy->nullable && !armsCoverNull(ce);
 
+    // §19.3 / §19.5 / §19.6 (#1472): a bare `..` RangePattern (no lo/hi/step,
+    // grammar A.7) is vacuously satisfied by every value in the value domain,
+    // so an unguarded `..` arm covers all NON-NULL values — but a range pattern
+    // never matches null (§19.5: null is matched only by `null`/untyped `var
+    // x`/`_`). For a non-nullable scrutinee this is a total catch-all
+    // (exhaustive); for a nullable scrutinee the non-null domain is covered but
+    // `null` still needs its own arm (§19.6 nullable rule). Mirrors the
+    // typed-binding-covers-the-full-type logic below. Without this a valid
+    // total `..` case drew a spurious non-exhaustiveness warning.
+    for (const auto& arm : ce.arms) {
+        if (arm.guard) continue;
+        auto* rp = dynamic_cast<const ast::RangePattern*>(arm.pattern.get());
+        if (!rp) continue;
+        auto* re = dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
+        if (re && !re->lo && !re->hi && !re->step) {
+            if (!nullableUncovered) return;  // total over the value domain
+            warn("the nullable scrutinee's non-null values are covered by a "
+                 "`..` range pattern, but `null` is not");
+            return;
+        }
+    }
+
     // §19.5 / §19.6 (#784): an unguarded typed-binding arm `var n: T` matches
     // ALL non-null values (§19.5 — "a typed binding pattern `var n: T` matches
     // only non-null values"). When the scrutinee is assignable to T (T is the
