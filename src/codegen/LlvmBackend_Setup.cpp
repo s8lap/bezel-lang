@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include "common/OwnershipFacts.hpp"  // #1414 stage 4: shared ownership-facts core
 #include "sema/ConstFold.hpp"
 
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
@@ -3530,34 +3531,15 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 
 
 bool Emitter::isFreshOwnedClassProducer(const ast::Expr* e) const {
-    // #1039 / #1053: a literal `new T(...)` or a call to a method declared to
-    // return `owned T` — both transfer a fresh +1 the caller solely owns. A
-    // call WITHOUT an `owned` return transfers no ownership: its result is a
-    // BORROW (e.g. `return this.field`), and reclaiming it would free a value
-    // owned elsewhere (use-after-free). `returnOwned` (ast::MethodDecl) is the
-    // sound discriminator. A variable / field / `this` / property receiver is
-    // neither a NewExpr nor a call, so it is never a fresh producer.
-    if (!e) return false;
-    bool producer = false;
-    if (dynamic_cast<const ast::NewExpr*>(e)) {
-        producer = true;
-    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
-        if (call->callee)
-            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                    ctx_.exprSymbol(*call->callee)))
-                if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                    producer = md->returnOwned;
-    }
-    if (!producer) return false;
-    // The receiver type must be a heap CLASS: records/structs are value types
-    // with no heap block or vtable disposer; interfaces/enums are not `new`-of-
-    // class temporaries. A null declaration (builtin not exported as a TypeDecl)
-    // is conservatively excluded — leak, but sound.
-    const sema::TypeRef* rt = ctx_.exprType(*e);
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
-        return false;
-    const auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    return rtd && rtd->kind == ast::TypeDeclKind::Class;
+    // #1414 stage 4 phase A: the codegen-side consumer of the shared ownership-
+    // facts core. The expression-shape classification (#1039/#1053) now lives in
+    // common::isFreshOwnedClassProducer; this wrapper injects codegen's
+    // `resolveTypeParamRef` (backed by the active `genericSubstSemaTy_`
+    // monomorphization binding) as the TypeParamResolver hook. Behaviour is
+    // byte-identical to the pre-extraction predicate.
+    return common::isFreshOwnedClassProducer(
+        e, ctx_,
+        [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); });
 }
 
 
@@ -7733,36 +7715,11 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
 
 
 bool Emitter::isBuiltinOwnedTransferCall(const ast::CallExpr& call) {
-    // §4.5/§4.7/§4.9/§4.11/§2.14/§29.1: builtin methods that TRANSFER an owned
-    // class element to the caller. These have no MethodSymbol (sema sets no
-    // exprSymbol on the builtin callee), so recognition keys on the callee name
-    // plus — where a borrowing counterpart with the same name exists — an
-    // OWNING receiver type (a borrowing Stack.Pop returns a BORROW; disposing
-    // it would double-free).
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    if (!ma) return false;
-    const auto& nm = ma->member;
-    if (nm == "PopLast" || nm == "PopFirst" || nm == "PopAt" ||
-        nm == "PopValue" || nm == "Deserialize")
-        return true;
-    std::string_view rcn;
-    if (ma->target) {
-        const sema::TypeRef* rt = ctx_.exprType(*ma->target);
-        if (rt && rt->astNode && rt->astNode->name &&
-            !rt->astNode->name->parts.empty())
-            rcn = rt->astNode->name->parts[0];
-        else if (rt && !rt->importedName.empty())
-            rcn = rt->importedName;
-    }
-    if ((nm == "Pop" || nm == "Dequeue") &&
-        (rcn == "OwningStack" || rcn == "OwningQueue"))
-        return true;
-    // #1349 / §29.1 v0.161: TakeCurrent on the owning enumerators (vtable
-    // slot 3) transfers the yielded element.
-    if (nm == "TakeCurrent" &&
-        (rcn == "IOwningEnumerator" || rcn == "IOwningAsyncEnumerator"))
-        return true;
-    return false;
+    // #1414 stage 4 phase A: the codegen-side consumer of the shared ownership-
+    // facts core. The builtin owned-TRANSFER expression-shape classification
+    // (#1349/#642) now lives in common::isBuiltinOwnedTransferCall; behaviour is
+    // byte-identical to the pre-extraction predicate.
+    return common::isBuiltinOwnedTransferCall(call, ctx_);
 }
 
 

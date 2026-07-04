@@ -9,6 +9,7 @@
 
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
+#include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "sema/SemaContext.hpp"
@@ -1771,38 +1772,36 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // a call on a value with no symbol) falls through to the builtin
     // name-head check below. // per §28.3 / §30.14
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
-        if (ce->callee) {
-            if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
-                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-                    auto* md = dynamic_cast<const ast::MethodDecl*>(
-                        ms->decl);
-                    if (md) {
-                        if (md->returnOwned) return OwnershipState::Owned;
-                        // §28.6 / §5.11 (#1008 Part C): a USER method returning a
-                        // non-`owned` owning COLLECTION (OwningArray, …) yields a
-                        // BORROW (the `Owned*` name denotes ELEMENT ownership,
-                        // orthogonal to the container ownership the `owned`
-                        // qualifier governs). Do NOT fall through to the builtin
-                        // name-head fallback below for collections — that would
-                        // classify it Owned. The definition-site check
-                        // checkBorrowReturnedThroughOwningType guarantees such a
-                        // return is a genuine borrow (a bare receiver-field
-                        // read), never a fresh/`move`d/owned value, so this never
-                        // under-disposes an owned result. Owning WRAPPERS
-                        // (OwningTask, Shared, …) keep consumer-owns semantics —
-                        // they fall through to the name-head fallback (Owned),
-                        // and a borrow through them stays the #1007 reject.
-                        if (const sema::TypeRef* rt = ctx_.exprType(e))
-                            if (rt->kind == sema::TypeRef::Kind::Named &&
-                                rt->astNode && rt->astNode->name &&
-                                !rt->astNode->name->parts.empty() &&
-                                isOwningCollectionNameHead(
-                                    rt->astNode->name->parts.front()))
-                                return OwnershipState::Borrowed;
-                        // Other non-`owned` user returns: fall through.
-                    }
-                }
-            }
+        // #1414 stage 4 phase A: the sema-side consumer of the shared ownership-
+        // facts core. The callee → user-MethodDecl navigation that reaches the
+        // `returnOwned` authority is the one copy shared with codegen
+        // (common::calleeMethodDecl) — the #1388 drift locus. Behaviour is
+        // byte-identical: it is non-null under exactly the pre-refactor
+        // ce->callee / MethodSymbol / MethodDecl chain.
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            if (md->returnOwned) return OwnershipState::Owned;
+            // §28.6 / §5.11 (#1008 Part C): a USER method returning a
+            // non-`owned` owning COLLECTION (OwningArray, …) yields a
+            // BORROW (the `Owned*` name denotes ELEMENT ownership,
+            // orthogonal to the container ownership the `owned`
+            // qualifier governs). Do NOT fall through to the builtin
+            // name-head fallback below for collections — that would
+            // classify it Owned. The definition-site check
+            // checkBorrowReturnedThroughOwningType guarantees such a
+            // return is a genuine borrow (a bare receiver-field
+            // read), never a fresh/`move`d/owned value, so this never
+            // under-disposes an owned result. Owning WRAPPERS
+            // (OwningTask, Shared, …) keep consumer-owns semantics —
+            // they fall through to the name-head fallback (Owned),
+            // and a borrow through them stays the #1007 reject.
+            if (const sema::TypeRef* rt = ctx_.exprType(e))
+                if (rt->kind == sema::TypeRef::Kind::Named &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    isOwningCollectionNameHead(
+                        rt->astNode->name->parts.front()))
+                    return OwnershipState::Borrowed;
+            // Other non-`owned` user returns: fall through.
         }
         // #1290 / §27.1 / §28.3: a call through a FUNCTION-TYPED VALUE whose
         // declared return slot carries `owned` (`mk: () -> owned Res; mk()`)

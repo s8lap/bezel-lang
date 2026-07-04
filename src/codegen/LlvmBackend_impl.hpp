@@ -6399,7 +6399,10 @@ private:
     // (malformed IR / segfault — issue #567). Any non-type-parameter ref, or a
     // type param with no active binding, is returned unchanged. Mirrors the same
     // param-name lookup recordMemberTypeResolved / lowerNew's `new T()` path use.
-    const sema::TypeRef* resolveTypeParamRef(const sema::TypeRef* ty) {
+    // #1414 stage 4: const-qualified (pure reads of genericSubstSemaTy_) so the
+    // `const` isFreshOwnedClassProducer wrapper can inject it as the shared
+    // ownership-facts core's TypeParamResolver hook.
+    const sema::TypeRef* resolveTypeParamRef(const sema::TypeRef* ty) const {
         if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
             genericSubstSemaTy_.empty() || !ty->astNode || !ty->astNode->name ||
             ty->astNode->name->parts.size() != 1)
