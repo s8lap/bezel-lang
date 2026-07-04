@@ -379,10 +379,11 @@ llvm::Value* Emitter::emitStringEq(llvm::Value* l, llvm::Value* r) {
     // never dereference either operand without first confirming it is non-null.
     //
     // Control-flow structure (4-incoming PHI at endBB):
-    //   1. samePtr   (l == r)        → true   [covers null == null and same obj]
-    //   2. nullCheckBB (l==null | r==null, but l!=r) → false [null vs. non-null]
-    //   3. lenBB sameLen=false       → false  [both non-null, different lengths]
-    //   4. cmpBB memcmp result       → memcmp==0 [both non-null, same length]
+    //   1. samePtr       (l == r)            → true   [covers null == null]
+    //   2. nullCheckBB   (one null, l != r)  → false  [null vs. non-null]
+    //   3. lenBB         (sameLen=false)     → false  [different lengths]
+    //   4. cmpMergeBB    (same-length)       → fast memcmp (same-width) or
+    //                                           per-code-point loop (mixed width)
     auto* entryBB    = builder_.GetInsertBlock();
     auto* nullCheckBB = llvm::BasicBlock::Create(llvm_, "str.eq.nullchk", currentFn_);
     auto* lenBB      = llvm::BasicBlock::Create(llvm_, "str.eq.len",     currentFn_);
@@ -411,31 +412,86 @@ llvm::Value* Emitter::emitStringEq(llvm::Value* l, llvm::Value* r) {
     auto* lenEnd = builder_.GetInsertBlock();
     builder_.CreateCondBr(sameLen, cmpBB, endBB);
 
-    // Compare byte data: len * width bytes for each string.
-    // For equal-width strings: memcmp(dataL, dataR, len*width) == 0.
-    // For different-width strings (e.g. width=1 vs width=2): we compare
-    // lenL * max(wL,wR) bytes — but this can give false positives for
-    // mixed widths. Since all current strings are width=1, we always use
-    // memcmp(data, data, byteSize) which is correct when wL == wR.
+    // Compare byte data, guarding on equal storage width first.
+    // Fast path: same width → memcmp(data, data, len*width) == 0 (§4.6).
+    // Slow path: different widths → compare one code point at a time (§4.6).
+    // Fixes #1479: a width=2 slice of a wide string vs a width=1 literal must
+    // compare equal when their code-point sequences are identical; the old
+    // memcmp with byteSzL=len*widthL read the wrong number of bytes from the
+    // width-1 operand, giving a false "not equal" result.
     builder_.SetInsertPoint(cmpBB);
     llvm::Value* dataL = loadStringData(l);
     llvm::Value* dataR = loadStringData(r);
+    llvm::Value* wL8   = loadStringWidth(l);
+    llvm::Value* wR8   = loadStringWidth(r);
+    llvm::Value* sameW = builder_.CreateICmpEQ(wL8, wR8, "str.eq.samew");
+    auto* cmpFastBB  = llvm::BasicBlock::Create(llvm_, "str.eq.fast",  currentFn_);
+    auto* cmpSlowBB  = llvm::BasicBlock::Create(llvm_, "str.eq.slow",  currentFn_);
+    auto* cmpMergeBB = llvm::BasicBlock::Create(llvm_, "str.eq.merge", currentFn_);
+    builder_.CreateCondBr(sameW, cmpFastBB, cmpSlowBB);
+
+    // Fast path: same width — memcmp on raw bytes is correct.
+    builder_.SetInsertPoint(cmpFastBB);
     auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-    // Use the byte size of l (= len * widthL); correct when both widths equal.
     llvm::Value* byteSzL = loadStringByteSize(l);
-    llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, byteSzL});
-    llvm::Value* cmpEq = builder_.CreateICmpEQ(
-        cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
+    llvm::Value* fastCmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, byteSzL});
+    llvm::Value* fastEq = builder_.CreateICmpEQ(
+        fastCmpRes, llvm::ConstantInt::get(i32(), 0), "str.fasteq");
+    auto* cmpFastEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(cmpMergeBB);
+
+    // Slow path: different storage widths — decode each operand at its own width.
+    // per §4.6: storage width is invisible to the language; comparison is by
+    // code-point sequence. Use loadCodePoint to decode each side independently.
+    builder_.SetInsertPoint(cmpSlowBB);
+    auto* eqIdxS   = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), eqIdxS);
+    auto* eqCondBB = llvm::BasicBlock::Create(llvm_, "str.eq.scond", currentFn_);
+    auto* eqBodyBB = llvm::BasicBlock::Create(llvm_, "str.eq.sbody", currentFn_);
+    auto* eqNextBB = llvm::BasicBlock::Create(llvm_, "str.eq.snext", currentFn_);
+    auto* eqNeqBB  = llvm::BasicBlock::Create(llvm_, "str.eq.sneq",  currentFn_);
+    auto* eqDoneBB = llvm::BasicBlock::Create(llvm_, "str.eq.sdone", currentFn_);
+    builder_.CreateBr(eqCondBB);
+
+    builder_.SetInsertPoint(eqCondBB);
+    llvm::Value* eqSi = builder_.CreateLoad(i64(), eqIdxS, "str.eq.si");
+    // lenL == lenR was confirmed in lenBB; loop to lenL.
+    builder_.CreateCondBr(builder_.CreateICmpSLT(eqSi, lenL), eqBodyBB, eqDoneBB);
+
+    builder_.SetInsertPoint(eqBodyBB);
+    llvm::Value* cpL = loadCodePoint(l, eqSi);
+    llvm::Value* cpR = loadCodePoint(r, eqSi);
+    builder_.CreateCondBr(builder_.CreateICmpEQ(cpL, cpR, "str.eq.cpeq"),
+                          eqNextBB, eqNeqBB);
+
+    builder_.SetInsertPoint(eqNextBB);
+    builder_.CreateStore(builder_.CreateAdd(eqSi, builder_.getInt64(1)), eqIdxS);
+    builder_.CreateBr(eqCondBB);
+
+    builder_.SetInsertPoint(eqNeqBB);
+    auto* eqNeqEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(cmpMergeBB);
+
+    builder_.SetInsertPoint(eqDoneBB);
+    auto* eqDoneEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(cmpMergeBB);
+
+    // Merge comparison result from fast and slow paths.
+    builder_.SetInsertPoint(cmpMergeBB);
+    auto* mergedEq = builder_.CreatePHI(i1(), 3, "str.eq.merged");
+    mergedEq->addIncoming(fastEq,               cmpFastEnd);  // same-width memcmp
+    mergedEq->addIncoming(builder_.getFalse(),  eqNeqEnd);    // early mismatch
+    mergedEq->addIncoming(builder_.getTrue(),   eqDoneEnd);   // all code points equal
     auto* cmpEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 
-    // Merge: 4 incoming edges.
+    // Merge: 4 incoming edges (structure unchanged from original).
     builder_.SetInsertPoint(endBB);
     auto* phi = builder_.CreatePHI(i1(), 4, "str.eq");
-    phi->addIncoming(builder_.getTrue(),  entryBB);    // samePtr (incl. null==null)
-    phi->addIncoming(builder_.getFalse(), nullCheckEnd); // one side null
-    phi->addIncoming(builder_.getFalse(), lenEnd);      // different lengths
-    phi->addIncoming(cmpEq,              cmpEnd);       // memcmp result
+    phi->addIncoming(builder_.getTrue(),  entryBB);       // samePtr (incl. null==null)
+    phi->addIncoming(builder_.getFalse(), nullCheckEnd);  // one side null
+    phi->addIncoming(builder_.getFalse(), lenEnd);        // different lengths
+    phi->addIncoming(mergedEq,            cmpEnd);        // comparison result
     return phi;
 }
 
@@ -1162,27 +1218,89 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
 
 
 llvm::Value* Emitter::emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
-    // Compare min(lenL,lenR) code points with memcmp (scaled by width);
-    // if equal, compare code-point counts as tiebreak.
+    // Compare strings lexicographically by code-point sequence (§4.6 §9.6).
+    // Returns negative/0/positive: compare min(lenL,lenR) code points first;
+    // on tie, compare lengths. Fast path: same storage width → memcmp.
+    // Slow path: different widths → per-code-point loop. Fixes #1480.
     llvm::Value* lenL = loadStringLen(l);
     llvm::Value* lenR = loadStringLen(r);
     llvm::Value* minLen = builder_.CreateSelect(
         builder_.CreateICmpSLT(lenL, lenR), lenL, lenR, "str.minlen");
-    llvm::Value* dataL = loadStringData(l);
-    llvm::Value* dataR = loadStringData(r);
-    auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-    // Scale minLen by the element width so memcmp sees the right byte count.
-    llvm::Value* wL64 = builder_.CreateZExt(loadStringWidth(l), i64(), "ordw");
-    llvm::Value* minByteSz = builder_.CreateMul(minLen, wL64, "str.minbytes");
-    llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, minByteSz},
-                                              "str.cmp");
-    // If memcmp returned 0, fall back to comparing code-point counts.
-    auto* cmpZero = builder_.CreateICmpEQ(
-        cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
+    // Precompute length tiebreak (used by both paths on equal prefix).
     llvm::Value* lenDiff = builder_.CreateSub(
         builder_.CreateTrunc(lenL, i32()),
         builder_.CreateTrunc(lenR, i32()), "str.lendiff");
-    return builder_.CreateSelect(cmpZero, lenDiff, cmpRes, "str.ord");
+    llvm::Value* dataL = loadStringData(l);
+    llvm::Value* dataR = loadStringData(r);
+    auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
+
+    // Width check: fast path for equal widths; slow path for mixed (§4.6).
+    llvm::Value* wL8 = loadStringWidth(l);
+    llvm::Value* wR8 = loadStringWidth(r);
+    llvm::Value* sameW = builder_.CreateICmpEQ(wL8, wR8, "str.ord.samew");
+    auto* ordFastBB  = llvm::BasicBlock::Create(llvm_, "str.ord.fast",  currentFn_);
+    auto* ordSlowBB  = llvm::BasicBlock::Create(llvm_, "str.ord.slow",  currentFn_);
+    auto* ordMergeBB = llvm::BasicBlock::Create(llvm_, "str.ord.merge", currentFn_);
+    builder_.CreateCondBr(sameW, ordFastBB, ordSlowBB);
+
+    // Fast path: same width — memcmp(data, data, minLen*width); tiebreak on len.
+    builder_.SetInsertPoint(ordFastBB);
+    llvm::Value* wL64 = builder_.CreateZExt(loadStringWidth(l), i64(), "ordw");
+    llvm::Value* minByteSz = builder_.CreateMul(minLen, wL64, "str.minbytes");
+    llvm::Value* fastCmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, minByteSz},
+                                                  "str.cmp");
+    llvm::Value* fastCmpZero = builder_.CreateICmpEQ(
+        fastCmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
+    llvm::Value* ordFastResult = builder_.CreateSelect(
+        fastCmpZero, lenDiff, fastCmpRes, "str.ord.fast");
+    auto* ordFastEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(ordMergeBB);
+
+    // Slow path: different storage widths — decode each operand at its own width.
+    // per §4.6: storage width is invisible; comparison is on the code-point sequence.
+    builder_.SetInsertPoint(ordSlowBB);
+    auto* ordIdxS   = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), ordIdxS);
+    auto* ordCondBB = llvm::BasicBlock::Create(llvm_, "str.ord.scond", currentFn_);
+    auto* ordBodyBB = llvm::BasicBlock::Create(llvm_, "str.ord.sbody", currentFn_);
+    auto* ordNextBB = llvm::BasicBlock::Create(llvm_, "str.ord.snext", currentFn_);
+    auto* ordDiffBB = llvm::BasicBlock::Create(llvm_, "str.ord.sdiff", currentFn_);
+    auto* ordDoneBB = llvm::BasicBlock::Create(llvm_, "str.ord.sdone", currentFn_);
+    builder_.CreateBr(ordCondBB);
+
+    builder_.SetInsertPoint(ordCondBB);
+    llvm::Value* ordSi = builder_.CreateLoad(i64(), ordIdxS, "str.ord.si");
+    builder_.CreateCondBr(builder_.CreateICmpSLT(ordSi, minLen), ordBodyBB, ordDoneBB);
+
+    builder_.SetInsertPoint(ordBodyBB);
+    llvm::Value* ordCpL = loadCodePoint(l, ordSi);
+    llvm::Value* ordCpR = loadCodePoint(r, ordSi);
+    builder_.CreateCondBr(builder_.CreateICmpEQ(ordCpL, ordCpR, "str.ord.cpeq"),
+                          ordNextBB, ordDiffBB);
+
+    builder_.SetInsertPoint(ordNextBB);
+    builder_.CreateStore(builder_.CreateAdd(ordSi, builder_.getInt64(1)), ordIdxS);
+    builder_.CreateBr(ordCondBB);
+
+    // ordDiffBB only reachable from ordBodyBB → ordCpL/ordCpR are in scope (§SSA dom).
+    builder_.SetInsertPoint(ordDiffBB);
+    llvm::Value* cpDiff = builder_.CreateSub(
+        builder_.CreateTrunc(ordCpL, i32()),
+        builder_.CreateTrunc(ordCpR, i32()), "str.ord.cpdiff");
+    auto* ordDiffEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(ordMergeBB);
+
+    builder_.SetInsertPoint(ordDoneBB);
+    auto* ordDoneEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(ordMergeBB);
+
+    // Merge: fast result, or first-differing cp diff, or equal-prefix length tiebreak.
+    builder_.SetInsertPoint(ordMergeBB);
+    auto* phi = builder_.CreatePHI(i32(), 3, "str.ord");
+    phi->addIncoming(ordFastResult, ordFastEnd);  // same-width: memcmp + len tiebreak
+    phi->addIncoming(cpDiff,        ordDiffEnd);  // mixed: first differing code point
+    phi->addIncoming(lenDiff,       ordDoneEnd);  // mixed: equal prefix, len tiebreak
+    return phi;
 }
 
 
