@@ -189,6 +189,7 @@ add_library(bezel_core STATIC
     src/codegen/LlvmBackend_Async.cpp
     src/codegen/LlvmBackend_Stmts.cpp
     src/codegen/LlvmBackend_Exprs.cpp
+    src/codegen/LlvmBackend_Exprs2.cpp
     src/codegen/LlvmBackend_Calls.cpp
     src/codegen/LlvmBackend_Calls2.cpp
     src/codegen/LlvmBackend_Calls3.cpp
