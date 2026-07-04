@@ -1836,6 +1836,22 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         if (!calleeMs && common::isBuiltinOwnedTransferCall(*ce, ctx_) &&
             isClassOrInterfaceResult(ctx_.exprType(e)))
             return OwnershipState::Owned;
+        // #1415 / §28.10 / §28.3: an IMPORTED method returning `owned T` (T a
+        // class/interface). For an imported method ModuleLoader attaches no AST
+        // MethodDecl, so `ms->decl` — and thus calleeMethodDecl above — is null;
+        // the owned-return flag lives in SemaContext::importedReturnOwned_
+        // (populated by setImportedReturnType). producerState never consulted it,
+        // so `var x := Factory.MakeCell(7);` (MakeCell `: owned Cell` in another
+        // module) was never tracked Owned: no §28.3 affine warning, no
+        // autoDropAtScopeEnd, no scope-end disposal — a silent cross-module leak.
+        // Mirror EXACTLY codegen's fallback (unwindOwnedLocalClass /
+        // usingVarOwnsClassObjectDynamically b1, both `(md && md->returnOwned) ||
+        // (!md && ctx_.importedReturnOwned(ms))`): consult importedReturnOwned on
+        // the resolved MethodSymbol, gated on a class/interface result so a
+        // borrow return (importedReturnOwned false) is NEVER disposed. // fix #1415
+        if (calleeMs && ctx_.importedReturnOwned(calleeMs) &&
+            isClassOrInterfaceResult(ctx_.exprType(e)))
+            return OwnershipState::Owned;
         // #1290 / §27.1 / §28.3: a call through a FUNCTION-TYPED VALUE whose
         // declared return slot carries `owned` (`mk: () -> owned Res; mk()`)
         // produces a fresh owned value, exactly like an owned-returning method
