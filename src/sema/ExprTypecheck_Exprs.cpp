@@ -2165,7 +2165,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     if (op != "and" && op != "or" && op != "in") {
         if (MethodSymbol* opm = findBinaryOperator(be)) {
             ctx_.setExprSymbol(&be, opm);
-            if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl))
+            if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl)) {
                 if (od->returnType)
                     if (auto* rt = ctx_.resolvedType(*od->returnType)) {
                         // §25 / §14.1 (#1260): the operator is declared inside a
@@ -2195,6 +2195,20 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                         }
                         ctx_.setExprType(&be, rt);
                     }
+            } else if (ctx_.isImported(opm)) {
+                // §25 / §2.5 (#1485): an imported user-defined operator overload
+                // carries no ast::OperatorDecl (imported symbols have no AST
+                // node — decl == nullptr), so the dynamic_cast above yields null
+                // and the BinaryExpr's result type would never be set. Without
+                // it, `r := a + b` infers null, and a downstream `r.field`
+                // fails member resolution → codegen silently drops the whole
+                // expression (fieldAddr() returns null) or reads garbage. The
+                // loader stashed the operator's resolved return type keyed on
+                // the symbol; use it. Mirrors the imported-regular-method
+                // fallback in ExprTypecheck_Calls.cpp.
+                if (auto* rt = ctx_.importedReturnType(opm))
+                    ctx_.setExprType(&be, rt);
+            }
             return;
         }
         // §11.8 (v0.176, #807): constraint-operator dispatch — a binary
@@ -2917,10 +2931,21 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     // §25: a user-defined unary operator overload.
     if (MethodSymbol* opm = findUnaryOperator(ue)) {
         ctx_.setExprSymbol(&ue, opm);
-        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl))
+        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl)) {
             if (od->returnType)
                 if (auto* rt = ctx_.resolvedType(*od->returnType))
                     ctx_.setExprType(&ue, rt);
+        } else if (ctx_.isImported(opm)) {
+            // §25 / §2.5 (#1485): an imported unary operator overload has no
+            // ast::OperatorDecl (decl == nullptr for imported symbols), so the
+            // result type must come from the loader's stashed return type —
+            // otherwise the UnaryExpr is left untyped and a downstream member
+            // access on its value-typed result is silently dropped. Mirrors the
+            // binary-operator fallback above and the imported-method fallback in
+            // ExprTypecheck_Calls.cpp.
+            if (auto* rt = ctx_.importedReturnType(opm))
+                ctx_.setExprType(&ue, rt);
+        }
         return;
     }
     if (op == "not") {
