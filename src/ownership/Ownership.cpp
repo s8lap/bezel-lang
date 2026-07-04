@@ -1678,6 +1678,18 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     }
 }
 
+// #1388 / #1415 (§28.3): the RESULT of an owned-transfer / owned-returning call
+// carries a disposal obligation only when it is a heap CLASS or INTERFACE — a
+// value-type element (record/enum/value-builtin) has none. Mirrors codegen's
+// isClassOrInterfaceRef (LlvmBackend_Setup.cpp) so the sema auto-drop gate and
+// the codegen reclaim gate agree on exactly the same result shape.
+static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    return rt->declaration->kind == ast::TypeDeclKind::Class ||
+           rt->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
 OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // `new T(...)` is the canonical producer of Owned values — but only
     // for reference types (classes). §9: a record is a value type with
@@ -1803,6 +1815,27 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     return OwnershipState::Borrowed;
             // Other non-`owned` user returns: fall through.
         }
+        // #1388 / §28.3 / §28.11 / §29.1: builtin owned-TRANSFER calls — Pop /
+        // Dequeue on the OWNING stacks/queues, PopLast/PopFirst/PopAt/PopValue,
+        // T.Deserialize, and TakeCurrent on the owning enumerators — TRANSFER an
+        // owned CLASS element to the caller but have NO MethodSymbol, so
+        // calleeMethodDecl above returns null and the local was never tracked
+        // Owned: no §28.3 affine warning, no autoDropAtScopeEnd, no scope-end
+        // dispose (a SILENT leak). Codegen already reclaims these locals via the
+        // SAME shared predicate (LlvmBackend_Setup emitOwnedLocal case (b3);
+        // unwind; §28.7 drop-on-overwrite) — consult it here so the fact lives in
+        // ONE place. Guarded by `!calleeMs` (mirrors codegen's `!ms`: a user /
+        // imported method is handled by the returnOwned / importedReturnOwned
+        // paths, not here) and a class/interface result (a value-type element
+        // carries no obligation; a BORROWING Stack/Queue.Pop, whose receiver is
+        // not an OwningStack/OwningQueue, is excluded by the receiver guard inside
+        // isBuiltinOwnedTransferCall, so its borrow is never disposed). // fix #1388
+        auto* calleeMs = ce->callee ? dynamic_cast<sema::MethodSymbol*>(
+                                          ctx_.exprSymbol(*ce->callee))
+                                    : nullptr;
+        if (!calleeMs && common::isBuiltinOwnedTransferCall(*ce, ctx_) &&
+            isClassOrInterfaceResult(ctx_.exprType(e)))
+            return OwnershipState::Owned;
         // #1290 / §27.1 / §28.3: a call through a FUNCTION-TYPED VALUE whose
         // declared return slot carries `owned` (`mk: () -> owned Res; mk()`)
         // produces a fresh owned value, exactly like an owned-returning method
