@@ -5360,6 +5360,21 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             llvm::Value* any = builder_.getInt1(false);
             for (const auto& c : cp->constants) {
                 if (!c) continue;
+                // §19.5 (#1471): a `null` member folded into a `|`-alternative
+                // over a nullable VALUE scrutinee (`1 | null`, `Red | null`,
+                // `true | null`) lands here as a NullLiteralExpr, not as a
+                // standalone NullPattern, so the early NullPattern return above
+                // is never reached. Route it through the same has-no-value test:
+                // `null` matches exactly when hasValue == 0. Lowering it as a
+                // value instead produced a pointer (ConstantPointerNull) that
+                // emitEquals fed to an ICmp against the unwrapped inner value —
+                // an ICmp on mismatched types that aborted the backend.
+                if (dynamic_cast<const ast::NullLiteralExpr*>(c.get())) {
+                    llvm::Value* isNull =
+                        builder_.CreateNot(hasVal, "nv.null.match");
+                    any = builder_.CreateOr(any, isNull);
+                    continue;
+                }
                 // §19.3 (#1152): a `decimal?` value compares via bz_decimal_cmp;
                 // emitEquals would ICmp two 128-bit structs (illegal IR / abort).
                 // decOperand lowers the constant as a decimal (a decimal literal
