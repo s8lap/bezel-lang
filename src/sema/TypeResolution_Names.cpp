@@ -235,6 +235,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // per §2.5 / #1357: DateOnly and TimeOnly — value types (stored as i32),
         // auto-imported like DateTime/TimeSpan; no user TypeDecl.
         n == "DateOnly" || n == "TimeOnly" ||
+        // stdlib §2.6 (#1464): Guid — a 128-bit value record ({i64,i64}),
+        // auto-imported like the temporal value types; no user TypeDecl. Without
+        // this, `g: Guid` / `: Guid` / field-of-Guid annotations errored
+        // "unresolved type name `Guid`" even though `Guid.NewGuid()` etc. work.
+        n == "Guid" ||
         n == "File" || n == "Directory" || n == "Path" ||
         n == "Encoding" || n == "Linq" ||
         // §2.15 / issue #550: BinarySerializer / BinaryDeserializer (opaque

@@ -2905,6 +2905,24 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
             builder_.CreateBitCast(val, i64()), i32());
     if (val->getType()->isFloatTy())
         return builder_.CreateBitCast(val, i32());
+    // per §9.6 / stdlib §2.6 (#1464): a STRUCT-shaped value with no declared
+    // record type — a value-builtin like `Guid` ({i64,i64}) whose declaration
+    // is a builtin Class, not a Record, so the record branch above did not
+    // catch it — folds its field hashes in slot order (h = h*31 + fieldHash),
+    // the same combiner emitRecordHashCode uses. Without this a Guid key hashed
+    // to the constant 0 (all keys collide in one bucket); folding the fields
+    // keeps the hash consistent with the structural equality of the eq
+    // trampoline so equal keys hash identically and distinct keys spread.
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(val->getType())) {
+        llvm::Value* h = builder_.getInt32(17);   // non-zero seed
+        for (unsigned i = 0; i < st->getNumElements(); ++i) {
+            llvm::Value* fi = builder_.CreateExtractValue(val, {i});
+            llvm::Value* fh = emitValueHashCode(fi, nullptr);
+            h = builder_.CreateAdd(
+                builder_.CreateMul(h, builder_.getInt32(31)), fh);
+        }
+        return h;
+    }
     return builder_.getInt32(0);
 }
 

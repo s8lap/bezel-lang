@@ -356,8 +356,19 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
         eq = emitStringEq(a, b);                           // §4.6 content compare
     else if (lt->isFloatingPointTy())
         eq = builder_.CreateFCmpOEQ(a, b);                 // float/double compare
+    else if (lt->isStructTy() || lt->isArrayTy())
+        // per §9.6 / stdlib §2.6 (#1464): a STRUCT- or ARRAY-shaped key — a
+        // value-builtin like `Guid` ({i64,i64}), or an inline-array key —
+        // compares STRUCTURALLY (field/bytewise), not via a raw ICmp on a
+        // struct/array operand. `ICmpInst` accepts only int/ptr operands, so a
+        // struct reaching `CreateICmpEQ` tripped `ICmpInst::AssertOK`. Route
+        // through the canonical per-value equality helper (the same one the `=`
+        // operator and record-field equality use), which recurses into the
+        // struct's fields (guid → two i64 compares) — consistent with the hash
+        // trampoline's structural fold.
+        eq = emitValueEquality(a, b, ty);
     else
-        eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/enum
+        eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/enum/ptr
     builder_.CreateRet(eq);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
