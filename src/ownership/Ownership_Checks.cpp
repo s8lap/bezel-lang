@@ -3112,6 +3112,41 @@ void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
     }
 }
 
+// #1484 / §28.6: a field initializer that stores a fresh owned value into a
+// non-`owned` field. See the header. Mirrors handleAssignment's
+// targetIsNonOwnedField branch exactly: an `owned` field is the §28.5 storage
+// path (accepted); a non-`owned` field whose initializer is a fresh owned
+// producer (producerState == Owned — `new`, a call returning `owned T`, a
+// `move`, or an owned operator result) leaks and is rejected. A bare borrow
+// initializer (producerState == Borrowed) is the legitimate back-reference
+// store and is not flagged. The diagnostic wording matches the constructor-body
+// counterpart so the two positions read identically. // per §28.6
+void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
+    if (!fd.initializer) return;
+    // Scope: INSTANCE fields only. A STATIC field follows the §22.13 static-init
+    // model (its initializer runs at first-use, its value lives for the program
+    // and is not part of any instance's disposal), NOT the instance-field §28.6
+    // leak rule — a non-`owned` `static readonly w: Widget := new Widget()` is a
+    // legal static owner (#917/#918/§22.13), whereas the analogous instance form
+    // leaks. The constructor-body counterpart this mirrors is likewise an
+    // instance-field store (`this.f := …`). Skip static fields here. // per §22.13
+    for (std::string_view m : fd.modifiers)
+        if (m == "static") return;
+    // `owned` field → §28.5 owned-storage path: the containing object disposes
+    // the value, so a fresh owned initializer is exactly what it wants. Not here.
+    for (std::string_view m : fd.modifiers)
+        if (m == "owned") return;
+    if (producerState(*fd.initializer) == OwnershipState::Owned) {
+        report(Severity::Error, fd.initializer->span.begin,
+               std::string("a freshly-produced owned value cannot be stored "
+                           "into the non-`owned` field `") +
+                   std::string(fd.name) +
+                   "` — the field does not own it, so the value would leak; "
+                   "declare the field `owned` (§28.5), or hand it to a method "
+                   "that takes it `owned` (§28.6)");
+    }
+}
+
 void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
     if (!s) return;
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {

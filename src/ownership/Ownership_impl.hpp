@@ -117,6 +117,18 @@ public:
     void scanGetterReturns(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     void scanGetterReturnsStmt(const ast::Stmt* s);
 
+    // #1484 / §28.6: a field INITIALIZER (`f: T := E`) that stores a freshly-
+    // produced owned value (producerState == Owned) into a NON-`owned` (borrow)
+    // field is an error — the field does not own its referent, so the fresh value
+    // is left with no owner and leaks. This is the field-initializer counterpart
+    // of the constructor-body assignment reject (handleAssignment's
+    // targetIsNonOwnedField branch); the two positions enforce the identical
+    // §28.6 rule via the same producerState classifier and owned-modifier gate. A
+    // NARROW check only (not the full ownership pass), so a legal borrow
+    // initializer surfaces no other new diagnostics, and an `owned` field's fresh
+    // initializer stays accepted (§28.5). // per §28.6
+    void checkFieldInitializer(const ast::FieldDecl& fd);
+
     // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
     // constructed from a TEMPORARY bound to one of its borrow-carrying fields —
     // the temporary's lifetime ends at the construction expression, so the record

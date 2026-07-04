@@ -322,3 +322,90 @@ BEZEL_TEST(owned_field_assign, owned_param_consumed_then_reused_rejected) {
         "end Bad;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ---- §28.6 / #1484: fresh owned value in a FIELD INITIALIZER ---------------
+//
+// §28.6 (Leak prevention): "A freshly-produced owned value — a `new`
+// expression, a call returning `owned T`, a `move` expression, or an owned
+// operator result — stored into a non-`owned` (borrow) field is an error: the
+// field does not own its referent, so the fresh value would be left with no
+// owner and leak." The constructor-body assignment `this.f := new R()` is
+// already rejected (handleAssignment's targetIsNonOwnedField branch); the
+// FIELD-INITIALIZER form `f: R := new R()` was silently accepted and leaked the
+// R (issue #1484 — the FieldDecl member was never ownership-analysed). These
+// tests pin the two positions to the identical rule.
+
+// True when some ERROR diagnostic mentions the §28.6 non-owned-field leak text
+// (the same message the constructor-body path emits), so the reject cases prove
+// the §28.6 diagnostic fired — not some unrelated error.
+static bool hasNonOwnedFieldLeakError(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("freshly-produced owned value cannot be stored "
+                           "into the non-`owned` field") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// §28.6 / #1484 NEGATIVE: a `new` (fresh owned producer, §28.3 "`new T(...)` |
+// Owned") in the initializer of a NON-`owned` field. The field does not own the
+// value, so it leaks — REJECTED, exactly as the constructor-body `f := new R()`
+// form is.
+BEZEL_TEST(owned_field_assign,
+           fresh_new_into_non_owned_field_initializer_rejected_spec_28_6_1484) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "class R end R; "
+        "class Holder "
+        "  public r: R := new R(); "
+        "end Holder;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNonOwnedFieldLeakError(r));
+}
+
+// §28.6 / #1484 NEGATIVE: an owned-returning CALL (§28.3 "Method call returning
+// `owned T` | Owned") in the initializer of a NON-`owned` field is likewise a
+// fresh owned producer and leaks — REJECTED. Covers the second producer shape.
+BEZEL_TEST(owned_field_assign,
+           owned_call_into_non_owned_field_initializer_rejected_spec_28_6_1484) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "class R "
+        "  public static method Make(): owned R "
+        "    return new R(); "
+        "  end Make; "
+        "end R; "
+        "class Holder "
+        "  public r: R := R.Make(); "
+        "end Holder;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNonOwnedFieldLeakError(r));
+}
+
+// §28.6 / §28.5 / #1484 POSITIVE: the SAME fresh `new` in the initializer of an
+// `owned` field is ACCEPTED — the field owns the value and the containing object
+// disposes it (§28.5). This is the boundary the fix must not over-reject.
+BEZEL_TEST(owned_field_assign,
+           fresh_new_into_owned_field_initializer_accepted_spec_28_6_1484) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "class R end R; "
+        "class Holder "
+        "  public owned r: R := new R(); "
+        "  destructor end destructor; "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.6 / #1484 POSITIVE: a `new` of a VALUE type (a record) in a non-`owned`
+// field initializer is a plain value with no disposal obligation (§9.7 forbids
+// record destructors / owned fields), so producerState classifies it Borrowed —
+// NOT a fresh owned producer. ACCEPTED. This proves the reject is gated on
+// producerState == Owned, not merely on the `new` keyword.
+BEZEL_TEST(owned_field_assign,
+           fresh_record_into_non_owned_field_initializer_accepted_spec_28_6_1484) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "record Point(X: int, Y: int); "
+        "class Holder "
+        "  public p: Point := new Point(1, 2); "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

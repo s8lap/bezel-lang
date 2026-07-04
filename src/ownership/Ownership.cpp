@@ -2671,6 +2671,18 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
             MethodOwnership mo(ctx);
             mo.run(od->stmts);
         }
+    } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
+        // #1484 / §28.6: a field INITIALIZER (`f: T := E`) is an ownership-
+        // relevant store position that was previously never analysed — the
+        // FieldDecl branch was missing here, so a fresh owned value stored into a
+        // non-`owned` field via its initializer leaked with no diagnostic (the
+        // equivalent constructor-body `f := new R()` is correctly rejected via
+        // handleAssignment). Route the initializer through the same §28.6 check
+        // the constructor-body path applies. A NARROW check only. // per §28.6
+        if (fd->initializer) {
+            MethodOwnership mo(ctx);
+            mo.checkFieldInitializer(*fd);
+        }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
             for (const auto& innerM : nt->decl->members) {

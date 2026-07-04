@@ -42,8 +42,16 @@ namespace {
 std::string mod(const std::string& body) {
     return std::string("module M; "
         "class T end T; "
+        // §28.6 (#1484): `_back` is a non-owned class-typed field used only as a
+        // borrow SOURCE when read (`p._back`). It must be given its value by a
+        // back-reference store of a BORROW — a `:= new T()` initializer would
+        // store a freshly-produced owned value into a non-`owned` field, which
+        // §28.6 rejects (the field does not own it → leak). The constructor
+        // stores the borrow parameter `b` (producerState == Borrowed, the
+        // legitimate back-reference store), leaving `_back` a non-owned `T`. // per §28.6
         "class Pair "
-        "  public _back: T := new T(); "
+        "  public _back: T; "
+        "  public constructor(b: T) this._back := b; end constructor; "
         "end Pair; "
         "class Sink "
         "  private owned _slot: T := new T(); "
