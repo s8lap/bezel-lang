@@ -321,6 +321,56 @@ BEZEL_TEST(builtin_owned_transfer_1388, borrowing_stack_pop_no_warn_spec_28_3) {
         "end Main; end C;", "top"));
 }
 
+// #1388 soundness-review regression: the FOUR positional/keyed transfer names
+// (PopLast/PopFirst/PopAt/PopValue) on a BORROWING collection return borrows —
+// the receiver is a plain `Array`/`Dictionary`, not `Owning*`. Before the
+// isOwningCollectionHead gate they were classified Owned unconditionally, so
+// the §28.3 auto-drop disposed a borrow → double-free / SEGV. Each must NOT
+// warn (and the AOT control below proves each does NOT double-free).
+BEZEL_TEST(builtin_owned_transfer_1388, borrowing_array_poplast_no_warn_spec_28_3) {
+    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+        "class C public static method Main(): int "
+        "  using var owner := new R(1); "
+        "  using var arr := new Array<R>(); "
+        "  arr.Add(owner); "
+        "  var x := arr.PopLast(); "  // borrow — owned by `owner`
+        "  return 0; "
+        "end Main; end C;", "x"));
+}
+
+BEZEL_TEST(builtin_owned_transfer_1388, borrowing_array_popfirst_no_warn_spec_28_3) {
+    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+        "class C public static method Main(): int "
+        "  using var owner := new R(1); "
+        "  using var arr := new Array<R>(); "
+        "  arr.Add(owner); "
+        "  var x := arr.PopFirst(); "
+        "  return 0; "
+        "end Main; end C;", "x"));
+}
+
+BEZEL_TEST(builtin_owned_transfer_1388, borrowing_array_popat_no_warn_spec_28_3) {
+    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+        "class C public static method Main(): int "
+        "  using var owner := new R(1); "
+        "  using var arr := new Array<R>(); "
+        "  arr.Add(owner); "
+        "  var x := arr.PopAt(0); "
+        "  return 0; "
+        "end Main; end C;", "x"));
+}
+
+BEZEL_TEST(builtin_owned_transfer_1388, borrowing_dict_popvalue_no_warn_spec_28_3) {
+    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+        "class C public static method Main(): int "
+        "  using var owner := new R(1); "
+        "  using var d := new Dictionary<int, R>(); "
+        "  d.Add(1, owner); "
+        "  var x := d.PopValue(1); "
+        "  return 0; "
+        "end Main; end C;", "x"));
+}
+
 // ===========================================================================
 // (b) AOT + ASan/LSan — the never-discharged case is now LEAK-CLEAN, and the
 // auto-drop disposes exactly once (value-observable via a `do`-block).
@@ -401,6 +451,43 @@ BEZEL_TEST(builtin_owned_transfer_1388, asan_owning_stack_peek_borrow_clean_28_3
         "  s.Push(move (new R(1))); "
         "  var t := s.Peek(); "  // borrow — stack still owns the element
         "  return t.v; "
+        "end Main; end C;");
+    if (rc == -1) return;
+    BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// AOT + ASan REGRESSION (the soundness-review refutation): a borrowing
+// Array<R>.PopLast() bound to a plain var and never discharged. Before the
+// isOwningCollectionHead gate this classified the borrow Owned and the §28.3
+// auto-drop double-freed it (SEGV under ASan). Now: the borrow is not owned,
+// not disposed; `owner` is disposed exactly once by its own using var. Must be
+// double-free-clean AND leak-clean. Covers PopFirst/PopAt/PopValue by the same
+// codegen path.
+BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_array_poplast_no_double_free_28_3) {
+    int rc = runUnderASan(
+        "module M; " + kR +
+        "class C public static method Main(): int "
+        "  using var owner := new R(1); "
+        "  using var arr := new Array<R>(); "
+        "  arr.Add(owner); "
+        "  var x := arr.PopLast(); "  // borrow — was double-freed pre-fix
+        "  return 0; "
+        "end Main; end C;");
+    if (rc == -1) return;  // toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(rc, 0);  // 0 = no double-free, no leak (was SEGV)
+}
+
+// AOT + ASan CONTROL: a borrowing Dictionary<int,R>.PopValue(k) — same guard,
+// same no-double-free requirement.
+BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_dict_popvalue_no_double_free_28_3) {
+    int rc = runUnderASan(
+        "module M; " + kR +
+        "class C public static method Main(): int "
+        "  using var owner := new R(1); "
+        "  using var d := new Dictionary<int, R>(); "
+        "  d.Add(1, owner); "
+        "  var x := d.PopValue(1); "
+        "  return 0; "
         "end Main; end C;");
     if (rc == -1) return;
     BEZEL_EXPECT_EQ(rc, 0);

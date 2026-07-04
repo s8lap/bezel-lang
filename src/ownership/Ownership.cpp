@@ -1686,6 +1686,10 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
 static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
+    // A value-builtin (DateTime/Guid/TimeSpan/CancellationToken) carries
+    // kind==Class but has no disposal obligation — exclude it exactly as the
+    // sibling `new T` / `move` producer paths do (#1388 review consistency).
+    if (rt->declaration->isValueBuiltin) return false;
     return rt->declaration->kind == ast::TypeDeclKind::Class ||
            rt->declaration->kind == ast::TypeDeclKind::Interface;
 }

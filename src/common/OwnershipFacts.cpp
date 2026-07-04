@@ -1,4 +1,5 @@
 #include "common/OwnershipFacts.hpp"
+#include "common/BuiltinRegistry.hpp"
 
 #include <string_view>
 
@@ -77,9 +78,6 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma) return false;
     const auto& nm = ma->member;
-    if (nm == "PopLast" || nm == "PopFirst" || nm == "PopAt" ||
-        nm == "PopValue" || nm == "Deserialize")
-        return true;
     std::string_view rcn;
     if (ma->target) {
         const sema::TypeRef* rt = ctx.exprType(*ma->target);
@@ -89,6 +87,22 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
         else if (rt && !rt->importedName.empty())
             rcn = rt->importedName;
     }
+    // §4.7/§4.9/§4.11 (#1388 review): the positional/keyed removals transfer an
+    // owned element ONLY on an element-owning COLLECTION receiver. Sema leniently
+    // accepts these transfer-named calls on BORROWING collections too (Array /
+    // Dictionary hold borrows), so without the owning-receiver gate the caller's
+    // §28.3 auto-drop would dispose a value it does not own — a double-free.
+    // Gate on the registry's owning-collection set (not a hand-list — the miss-
+    // a-name bug class this refactor exists to kill). // per §5.11
+    if ((nm == "PopLast" || nm == "PopFirst" || nm == "PopAt" ||
+         nm == "PopValue") &&
+        isOwningCollectionHead(rcn))
+        return true;
+    // §2.14: `T.Deserialize(d)` is a fresh owned producer for a class target
+    // (the receiver is the TYPE, not a collection); a value-type target is
+    // filtered out by the caller's class/interface-result guard.
+    if (nm == "Deserialize")
+        return true;
     if ((nm == "Pop" || nm == "Dequeue") &&
         (rcn == "OwningStack" || rcn == "OwningQueue"))
         return true;
