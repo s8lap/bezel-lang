@@ -1,0 +1,4417 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+// ===========================================================================
+// stdlib §5: deferred (lazy) LINQ operators.
+//
+// LINQ operators do no work until enumerated. Each operator lowers to a call
+// into the runtime lazy-enumerator family (bz_lazy_*). Closures (predicates,
+// selectors, key functions) are bridged to the type-erased runtime via small
+// trampoline functions emitted here.
+// ===========================================================================
+
+// The byte size of an element of LLVM type `ty` as stored in a type-erased
+// array slot (mirrors collectionElemSize's element-size choices).
+// per §9 (bug D): pass the DataLayout so that a record StructType returns its
+// actual allocation size instead of the hardcoded 8.
+static int64_t lazyElemSize(llvm::Type* ty, const llvm::DataLayout& dl) {
+    if (!ty) return 8;
+    if (ty->isIntegerTy(32) || ty->isFloatTy()) return 4;
+    if (ty->isIntegerTy(1) || ty->isIntegerTy(8)) return 1;
+    if (ty->isIntegerTy(16)) return 2;
+    if (ty->isStructTy()) return (int64_t)dl.getTypeAllocSize(ty);
+    return 8;  // i64 / double / pointer (string, class)
+}
+
+bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
+    // The lazy LINQ sentinel: a Named TypeRef with no declaration and no
+    // astNode, carrying the element type as genericArgs[0]. Produced only by
+    // the LINQ-operator typing in ExprTypecheck_Calls.cpp.
+    //
+    // §2.5 / §29.3 (issue #495): a TypeRef reconstructed from module metadata
+    // for a builtin interface (IEnumerable<T>, IAsyncEnumerable<T>, etc.) has
+    // the SAME shape — Named, no declaration, no astNode — but carries the
+    // type name in importedName (set by ModuleLoader).  Exclude those from the
+    // lazy-LINQ path so they fall through to lowerIEnumerableBuiltinFor /
+    // lowerIAsyncEnumerableFor, which use the correct vtable protocol (Current
+    // returns the element value directly, not a pointer to it).
+    return rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+           !rt->astNode && !rt->genericArgs.empty() && rt->importedName.empty();
+}
+
+// issue #995 / stdlib §5 / §29: a VTABLE-BACKED `IEnumerable<T>` receiver — an
+// interface-typed local/param/field (`var e: IEnumerable<int> := …`) or a
+// yield-method result bound to such a type. Unlike the lazy-LINQ sentinel
+// (isLazyEnumerableType: declaration-less, NO astNode, NO importedName), this
+// type carries the interface name in an astNode (local annotation) or in
+// importedName (cross-module). Its runtime value is the iterator-vtable object
+// ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,[4]=GetEnumerator — §29.11),
+// NOT a bz_lazy_t* or a bz_array_t*. LINQ terminals/operators and the lazy
+// for-in were built only for the lazy sentinel, so such a receiver silently
+// fell through to a wrong path and returned garbage (the #995 miscompile).
+// Recognise it here so lowerToLazyEnumerator can materialize it into a concrete
+// Array<T> (driving the vtable protocol once) and the rest of the lazy
+// machinery composes uniformly. EXCLUDES the array/llist/dict/set/range/lazy
+// cases (those carry a declaration or take a dedicated wrap path) and the
+// richer list interfaces (IReadOnlyList/IList — array-backed, indexer-bearing,
+// NOT vtable objects) and the polymorphic collection interfaces
+// (IReadOnlyCollection/ICollection/IOwningCollection — diagnosed, #853).
+bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+    // Must carry a name source other than the lazy sentinel's empty shape.
+    std::string_view n = builtinTypeName(rt);
+    if (n.empty()) return false;
+    // Only the pure iteration interfaces the for-in builtin path drives through
+    // the iterator vtable (slot-1 Dispose, slot-4 GetEnumerator). These are
+    // implemented uniformly by the yield-iterator / array-wrapper / user-class
+    // -wrapper producers (§29.11), so the vtable read is always in-bounds.
+    return n == "IEnumerable" || n == "IOwningEnumerable";
+}
+
+// issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
+// pointer `uint64_t(const void* key)`. The runtime stores raw record bytes; we
+// reinterpret the byte pointer as a record-struct pointer, load the value, and
+// run the synthesized GetHashCode (emitRecordHashCode, §9.1/§9.2). The i32 hash
+// is zero-extended to i64 (the runtime keeps the low 32 bits for bucketing).
+llvm::Function* Emitter::buildRecordHashTrampoline(const sema::TypeSymbol* rec) {
+    llvm::StructType* st = recordStruct(rec);
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$reckey$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* rv = builder_.CreateLoad(st, fn->getArg(0), "key.rec");
+    llvm::Value* h = emitRecordHashCode(rv, rec);          // i32
+    builder_.CreateRet(builder_.CreateZExt(h, i64()));
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// issue #343 / §8.3: trampoline matching the runtime's generic-dict equality fn
+// pointer `bool(const void* a, const void* b)`. Loads both record values and
+// runs the synthesized structural equality (emitStructEquality, §9.1/§9.2),
+// which compares string fields by content (#346) consistent with the hash.
+llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
+    llvm::StructType* st = recordStruct(rec);
+    auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$reckey$eq", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
+    llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+    builder_.CreateRet(emitStructEquality(a, b, st, rec));  // i1
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// issues D3 / D8 / §4.8 / §4.10: decide whether a Dictionary key / Set element
+// at generic-arg index `idx` needs the generic-key runtime backing, and if so
+// return its resolved TypeRef and the per-key byte count.
+//
+//   Dictionary (isSet=false): a string key keeps the bz_dict_*_str fast path
+//     (returns null). Every other equality-bearing key — primitives, enums,
+//     records (§4.8: "K must provide consistent Equals and GetHashCode") — uses
+//     the generic path. The stored key bytes are the key's natural LLVM layout.
+//   Set (isSet=true): the array backing cannot deduplicate (§4.10), so ALL
+//     element types route through the generic hash table — including strings.
+//
+// `*byteSize` receives the stored key/element byte count (the LLVM alloc size
+// of the key type: 8 for a string pointer, 4 for an int, sizeof(record), …).
+// stdlib §4.10 (#351/#389): lower a dict-backed Set's set-algebra op. `other` is
+// snapshotted into a malloc'd array of element-byte-blob pointers (the shape
+// bz_dict_keys_gen produces), then folded into/against self by the runtime
+// (bz_set_algebra_gen, which frees the snapshot). Two snapshot sources:
+//   * a same-typed dict-backed Set `other` → bz_dict_keys_gen on its table (#370)
+//   * a non-Set IEnumerable<T> `other` (e.g. an Array<T> source) → enumerate via
+//     the lazy enumerator (#326) and collect each element via
+//     bz_set_collect_enumerator.
+// Either way the element type must match self's (same LLVM type + record-ness) so
+// the snapshot bytes are layout-compatible with self's keys. Returns nullptr
+// (caller defers) only on an element-type mismatch.
+llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
+                                         llvm::Value* selfTbl,
+                                         const ast::Expr& otherExpr,
+                                         const sema::TypeRef* selfElemRef,
+                                         bool elemIsRecord) {
+    if (!selfElemRef) return nullptr;
+    auto* otherTy = ctx_.exprType(otherExpr);
+
+    // Determine `other`'s element type and whether it is a same-typed dict-backed
+    // Set (whose key table we can snapshot directly) or some other IEnumerable<T>.
+    bool otherIsSet = otherTy && otherTy->astNode && otherTy->astNode->name &&
+                      !otherTy->astNode->name->parts.empty() &&
+                      !otherTy->declaration &&
+                      (otherTy->astNode->name->parts[0] == "Set" ||
+                       otherTy->astNode->name->parts[0] == "OwningSet") &&
+                      genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
+
+    const sema::TypeRef* otherElem =
+        (otherTy && !otherTy->genericArgs.empty()) ? otherTy->genericArgs[0]
+                                                    : nullptr;
+    if (!otherElem) return nullptr;
+    if (lowerTypeRef(otherElem) != lowerTypeRef(selfElemRef))
+        return nullptr;  // element LLVM-type mismatch → defer
+    if ((recordTypeOfRef(otherElem) != nullptr) != elemIsRecord)
+        return nullptr;  // record-ness mismatch → defer
+
+    // Build the snapshot (keys: void**, n: i64) of `other`'s elements.
+    auto* keysOutSlot = entryAlloca(ptrTy());
+    auto* cntSlot     = entryAlloca(i64());
+    if (otherIsSet) {
+        llvm::Value* otherTbl = lowerExpr(otherExpr);
+        if (!otherTbl) return nullptr;
+        auto* keysFn = declareC("bz_dict_keys_gen", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(keysFn, {otherTbl, keysOutSlot, cntSlot});
+    } else {
+        // Non-Set IEnumerable<T>: drain the lazy enumerator into the snapshot.
+        // The enumerator's per-element byte stride (collectionElemSize) must
+        // equal self's key_size, so the snapshot bytes are layout-compatible
+        // with self's keys; they agree for primitives/enums/strings and for
+        // records that fit the array stride. If they differ — a record wider
+        // than the array's element stride, an independent Array<T>-storage
+        // limitation — defer rather than read past the enumerator's buffer.
+        uint64_t ksz = 0;
+        genericBackingType(otherTy, 0, /*isSet=*/true, &ksz);  // self.key_size
+        if ((int64_t)ksz != collectionElemSize(otherTy)) return nullptr;
+        sema::TypeRef* enumElemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(otherExpr, enumElemRef);
+        if (!lazy) return nullptr;
+        auto* collectFn = declareC("bz_set_collect_enumerator",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), ptrTy()});
+        builder_.CreateCall(collectFn,
+            {lazy, builder_.getInt64((int64_t)ksz), keysOutSlot, cntSlot});
+    }
+    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);  // void**
+    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+    // Map the method to the runtime op code and fold.
+    int32_t op = method == "UnionWith"     ? 0
+               : method == "ExceptWith"    ? 1
+               : method == "IntersectWith" ? 2
+               : method == "IsSubsetOf"    ? 3
+               : /* IsSupersetOf */          4;
+    bool isQuery = (op == 3 || op == 4);
+    auto* foldFn = declareC("bz_set_algebra_gen", i32(),
+                            {ptrTy(), ptrTy(), i64(), i32()});
+    llvm::Value* r = builder_.CreateCall(foldFn,
+        {selfTbl, keysArr, cnt, builder_.getInt32(op)}, "set.algebra");
+    if (isQuery)
+        return builder_.CreateTrunc(r, i1(), "set.algebra.r");
+    return llvm::ConstantInt::get(i32(), 0);  // unit result for mutators
+}
+
+const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
+                                                 unsigned idx, bool isSet,
+                                                 uint64_t* byteSize) {
+    if (!collTy || collTy->genericArgs.size() <= idx) return nullptr;
+    const sema::TypeRef* ty = collTy->genericArgs[idx];
+    if (!ty) return nullptr;
+    // fix #567 / §14.1: inside a monomorphized generic body the key/element
+    // genericArg is still the bare type parameter (`K` / `T`). Resolve it to the
+    // concrete substituted type so eligibility + the hash/eq trampolines follow
+    // the CONCRETE key/element's contract (§8.3), not the placeholder's string
+    // fast path — which mismatches the caller's concrete dispatch (malformed IR /
+    // segfault). No-op outside a generic body or for a concrete genericArg.
+    ty = resolveTypeParamRef(ty);
+    using K = sema::TypeRef::Kind;
+    bool isString = ty->kind == K::Primitive &&
+                    ty->primitive == sema::PrimitiveType::String && !ty->nullable;
+    // Dictionary: string keys keep their dedicated fast path (bz_dict_*_str).
+    if (!isSet && isString) return nullptr;
+    // fix #567 / §14.1: a still-UNRESOLVED type parameter (a single-part Named
+    // with no `declaration`, e.g. `K`/`T` with no active binding — the
+    // UNSPECIALIZED template body emitted by emitFunctionBody) routes through the
+    // generic-key hash path, NOT the string fast path. The template body is dead
+    // (only monomorphized specializations are called), but it must still pass IR
+    // verification; the placeholder lowers consistently to i32, so the i32-keyed
+    // generic trampolines (store i32 / hash i32 / compare i32) produce valid IR,
+    // whereas the string fast path would GEP the i32 key as a %bz.string pointer
+    // (malformed IR). Every real call site sees the concrete substituted key.
+    if (ty->kind == K::Named && !ty->declaration && ty->astNode &&
+        ty->astNode->name && ty->astNode->name->parts.size() == 1) {
+        if (byteSize) {
+            llvm::Type* lt = lowerTypeRef(ty);  // i32 placeholder
+            *byteSize = lt ? module_->getDataLayout().getTypeAllocSize(lt)
+                           : (uint64_t)8;
+        }
+        return ty;
+    }
+    // Eligible generic-backed types: a record (existing path) or a non-nullable
+    // primitive/enum scalar (D3) — plus string for sets (D8). Nullable keys and
+    // other shapes are not wired here.
+    bool eligible = false;
+    if (recordTypeOfRef(ty)) eligible = true;
+    else if (isString) eligible = true;  // set element only (dict returned above)
+    else if (!ty->nullable && ty->kind == K::Primitive &&
+             ty->primitive != sema::PrimitiveType::String &&
+             ty->primitive != sema::PrimitiveType::Object)
+        // fix #685 / §4.4 / §8.3: decimal is a 16-byte struct but has well-defined
+        // value equality (bz_decimal_cmp) and hash (bz_decimal_hash — normalized so
+        // 1.0m == 1.00m).  Allow decimal as a generic-backed key/set-element.
+        eligible = true;  // int/long/bool/char/byte/short/uint/.../float/double/decimal
+    else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
+             ty->declaration->kind == ast::TypeDeclKind::Enum)
+        eligible = true;  // enum key/element (lowers to i32; value-compared)
+    if (!eligible) return nullptr;
+    if (byteSize) {
+        llvm::Type* lt = lowerTypeRef(ty);
+        *byteSize = lt ? module_->getDataLayout().getTypeAllocSize(lt)
+                       : (uint64_t)8;
+    }
+    return ty;
+}
+
+// issues D3 / D8 / §8.3: generic-dict hash trampoline `uint64_t(const void*)`
+// over an arbitrary equality-bearing value type. The runtime stores the key's
+// natural bytes; the trampoline reinterprets the byte pointer as a pointer to
+// the key's LLVM type, loads the value, and runs the same hash the language
+// uses for the type — emitValueHashCode (§8.3): a string folds its code points
+// (#346 content hash), a record folds its field hashes, a scalar derives an i32
+// from its bits. The i32 is zero-extended (the runtime keeps the low 32 bits).
+llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
+    // A record key reuses the existing record trampoline (tested path).
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty)) {
+        // issue #462 / §14.1: a GENERIC record key (`Dictionary<Box<string>, V>`)
+        // needs the specialized struct layout + concrete per-field hashing inside
+        // the trampoline. A no-op for a non-generic record key.
+        RecordSubstGuard keySubst(this, ty);
+        return buildRecordHashTrampoline(rec);
+    }
+    llvm::Type* lt = lowerTypeRef(ty);
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$valkey$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* v = builder_.CreateLoad(lt, fn->getArg(0), "key.val");
+    // emitValueHashCode hashes a string by content when fieldTy is the string
+    // primitive; a scalar by its bits.
+    llvm::Value* h = emitValueHashCode(v, ty);             // i32
+    builder_.CreateRet(builder_.CreateZExt(h, i64()));
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// issues D3 / D8 / §8.3: generic-dict equality trampoline
+// `bool(const void* a, const void* b)` over an arbitrary equality-bearing value
+// type. Loads both keys from their byte pointers and compares them by the
+// language's equality for the type: string content (emitStringEq, §4.6),
+// structural record equality (emitStructEquality, §9.1/§9.2 — consistent with
+// the hash), or an integer/float compare for primitives/enums.
+llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty)) {
+        // issue #462 / §14.1: a GENERIC record key needs the specialized struct
+        // layout + concrete per-field equality inside the trampoline. A no-op for
+        // a non-generic record key.
+        RecordSubstGuard keySubst(this, ty);
+        return buildRecordEqTrampoline(rec);
+    }
+    llvm::Type* lt = lowerTypeRef(ty);
+    auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$valkey$eq", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    using K = sema::TypeRef::Kind;
+    // fix #685 / §4.4 / §8.3: decimal trampoline — load the two structs directly
+    // from the byte pointers and call bz_decimal_cmp (normalized equality).
+    bool isDecimal = ty && ty->kind == K::Primitive &&
+                     ty->primitive == sema::PrimitiveType::Decimal && !ty->nullable;
+    if (isDecimal) {
+        // The key bytes are the raw %bz.decimal struct bytes; ptr arg is the key ptr.
+        auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* cmp = builder_.CreateCall(cmpFn,
+            {fn->getArg(0), fn->getArg(1)}, "dec.eq.cmp");
+        llvm::Value* eq = builder_.CreateICmpEQ(cmp, llvm::ConstantInt::get(i32(), 0));
+        builder_.CreateRet(eq);
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
+    llvm::Value* a = builder_.CreateLoad(lt, fn->getArg(0), "eq.a");
+    llvm::Value* b = builder_.CreateLoad(lt, fn->getArg(1), "eq.b");
+    bool isString = ty->kind == K::Primitive &&
+                    ty->primitive == sema::PrimitiveType::String;
+    llvm::Value* eq;
+    if (isString)
+        eq = emitStringEq(a, b);                           // §4.6 content compare
+    else if (lt->isFloatingPointTy())
+        eq = builder_.CreateFCmpOEQ(a, b);                 // float/double compare
+    else
+        eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/enum
+    builder_.CreateRet(eq);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// fix #1426 / stdlib §4.17–§4.18: Build a comparison thunk for SortedDictionary
+// FirstKey/LastKey, SortedSet First/Last, and sorted-snapshot iteration.
+// Signature: int cmp(const void* a, const void* b)
+//   a, b = direct pointers to key bytes (NOT void** of void*).
+// Returns null for unsupported key types (record, decimal, unresolved param).
+// Supported: integer types (i32, i64, i8, i16, i1), float/double.
+// String-key SortedDictionary uses a dedicated bz_sort_kv_str/bz_dict_min_key_str
+// path and does NOT use this comparator.
+llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
+    if (!keyTy) return nullptr;
+    llvm::Type* kllvm = lowerTypeRef(keyTy);
+    if (!kllvm) return nullptr;
+
+    // Build a unique name per key LLVM type to cache it per module.
+    std::string name = "bz$sdcmp$";
+    if (kllvm->isIntegerTy(32))       name += "i32";
+    else if (kllvm->isIntegerTy(64))  name += "i64";
+    else if (kllvm->isIntegerTy(8))   name += "i8";
+    else if (kllvm->isIntegerTy(16))  name += "i16";
+    else if (kllvm->isIntegerTy(1))   name += "i1";
+    else if (kllvm->isFloatTy())      name += "f32";
+    else if (kllvm->isDoubleTy())     name += "f64";
+    else return nullptr;  // unsupported (record, decimal, etc.)
+
+    if (auto* existing = module_->getFunction(name)) return existing;
+
+    auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    auto* fn   = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                        name, module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(bb);
+    llvm::Value* aPtr = fn->getArg(0);
+    llvm::Value* bPtr = fn->getArg(1);
+    llvm::Value* av   = builder_.CreateLoad(kllvm, aPtr, "ka");
+    llvm::Value* bv   = builder_.CreateLoad(kllvm, bPtr, "kb");
+    llvm::Value* isLess, *isGreater;
+    if (kllvm->isFloatingPointTy()) {
+        isLess    = builder_.CreateFCmpOLT(av, bv, "flt");
+        isGreater = builder_.CreateFCmpOGT(av, bv, "fgt");
+    } else {
+        isLess    = builder_.CreateICmpSLT(av, bv, "ilt");
+        isGreater = builder_.CreateICmpSGT(av, bv, "igt");
+    }
+    llvm::Value* res = builder_.CreateSelect(
+        isLess,    builder_.getInt32(-1),
+        builder_.CreateSelect(isGreater, builder_.getInt32(1), builder_.getInt32(0)));
+    builder_.CreateRet(res);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
+                                             llvm::Type* outTy,
+                                             const sema::TypeSymbol* elemRec) {
+    // Build a fresh internal function (each LINQ-operator site gets its own;
+    // they are tiny and the closure type is baked into the IR).
+    llvm::FunctionType* fty = nullptr;
+    if (kind == 0)        // predicate: i32(ptr closure, ptr elem)
+        fty = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    else if (kind == 1)   // selector: void(ptr closure, ptr elem, ptr out)
+        fty = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                      {ptrTy(), ptrTy(), ptrTy()}, false);
+    else if (kind == 2)   // key: i64(ptr closure, ptr elem)
+        fty = llvm::FunctionType::get(i64(), {ptrTy(), ptrTy()}, false);
+    else                  // equality: i32(ptr a, ptr b) — no closure
+        fty = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$tramp", module_.get());
+    // Save/restore the builder's insert point AND currentFn_ — buildLinqTrampoline
+    // is called mid-lowering of the enclosing function, and helpers like
+    // emitStringEq create basic blocks in currentFn_, which must be the
+    // trampoline while we emit its body.
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+
+    if (kind == 3) {
+        // Element equality (Distinct): content-aware compare of two elements.
+        llvm::Value* a = builder_.CreateLoad(elemTy, fn->getArg(0), "eq.a");
+        llvm::Value* b = builder_.CreateLoad(elemTy, fn->getArg(1), "eq.b");
+        llvm::Value* eq;
+        if (elemRec) {
+            // issue D6 / §9.1 / §9.2: a record element dedups by synthesized
+            // structural equality (the same machinery Set<record> uses), NOT an
+            // ICmp on the aggregate (which LLVM rejects). String fields compare
+            // by content, nested records recurse — consistent with the hash.
+            eq = emitStructEquality(a, b, llvm::cast<llvm::StructType>(elemTy),
+                                    elemRec);
+        } else if (elemTy->isPointerTy()) {
+            eq = emitStringEq(a, b);           // string content equality (§4.6)
+        } else {
+            eq = builder_.CreateICmpEQ(a, b);  // value equality
+        }
+        builder_.CreateRet(builder_.CreateZExt(eq, i32()));
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
+
+    llvm::Value* closure = fn->getArg(0);
+    llvm::Value* elemPtr = fn->getArg(1);
+    // Load the element value from the type-erased pointer.
+    llvm::Value* elem = builder_.CreateLoad(elemTy, elemPtr, "tramp.elem");
+    // Closure ABI: { ptr fn, ptr env }; call as fn(env, elem).
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+
+    if (kind == 1) {
+        // Selector: call returns outTy; store it through the out pointer.
+        auto* clTy = llvm::FunctionType::get(outTy, {ptrTy(), elemTy}, false);
+        llvm::Value* mapped = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
+        builder_.CreateStore(mapped, fn->getArg(2));
+        builder_.CreateRetVoid();
+    } else if (kind == 0) {
+        // Predicate: closure returns i1; widen to i32 for the C ABI.
+        auto* clTy = llvm::FunctionType::get(i1(), {ptrTy(), elemTy}, false);
+        llvm::Value* ok = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
+        builder_.CreateRet(builder_.CreateZExt(ok, i32()));
+    } else {
+        // Key: closure returns the int key; widen to i64.
+        auto* clTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy}, false);
+        llvm::Value* k = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
+        builder_.CreateRet(builder_.CreateSExt(k, i64()));
+    }
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// stdlib §5 Projection: SelectMany flatten-selector trampoline. The runtime
+// calls this `void*(closure, elem)` per upstream element; it invokes the user
+// selector `(T) -> Array<U>` (returns a collection pointer) and wraps that
+// collection as a lazy enumerator the runtime then drains. innerEsz is U's size.
+llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
+                                                   int64_t innerEsz,
+                                                   bool innerIsLazy,
+                                                   bool rangeInner) {
+    auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$flatsel", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* closure = fn->getArg(0);
+    llvm::Value* elem = builder_.CreateLoad(elemTy, fn->getArg(1), "fs.elem");
+    // Closure ABI { ptr fn, ptr env }; call fn(env, elem) -> ptr (the collection).
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "fs.fn");
+    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "fs.env");
+    llvm::Value* inner;
+    if (rangeInner) {
+        // issue #775 / §16.3: the selector returns a `Range<T>` VALUE — a 32-byte
+        // { i64 start, i64 end, i64 step, i8 flags } struct, NOT a collection
+        // pointer. Call it via the struct-return ABI (LLVM lowers the sret
+        // automatically), extract the fields, and wrap them as a lazy range
+        // enumerator the runtime drains. (Open-ended selector ranges yield empty
+        // via bz_lazy_from_range — the per-element trampoline has no unwind
+        // context to raise InvalidOperationException; the receiver path does.)
+        auto* rty = rangeStructType();
+        auto* clTy = llvm::FunctionType::get(rty, {ptrTy(), elemTy}, false);
+        llvm::Value* rv = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "fs.rng");
+        llvm::Value* start = builder_.CreateExtractValue(rv, {0u}, "fs.rs");
+        llvm::Value* end   = builder_.CreateExtractValue(rv, {1u}, "fs.re");
+        llvm::Value* step  = builder_.CreateExtractValue(rv, {2u}, "fs.rp");
+        llvm::Value* flags = builder_.CreateExtractValue(rv, {3u}, "fs.rf");
+        auto* frFn = declareC("bz_lazy_from_range", ptrTy(),
+            {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
+        inner = builder_.CreateCall(frFn,
+            {start, end, step, flags, builder_.getInt64(innerEsz)}, "fs.inner.rng");
+        builder_.CreateRet(inner);
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
+    auto* clTy = llvm::FunctionType::get(ptrTy(), {ptrTy(), elemTy}, false);
+    llvm::Value* coll = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "fs.coll");
+    if (innerIsLazy) {
+        // stdlib §5 (#758): the selector returns a LAZY enumerable directly — a
+        // LINQ chain such as `(n) => arr.Where(...)`, whose result is already a
+        // `bz_lazy_t*` enumerator. Hand it back unchanged for the runtime to
+        // drain. Wrapping it via `bz_lazy_from_array` (the concrete-collection
+        // path below) would mis-read the enumerator struct as an array header
+        // and yield only a garbage prefix (the WRONG_VALUE behind the IR_FAIL).
+        inner = coll;
+    } else {
+        // Wrap the returned Array<U> as a lazy enumerator (the runtime drains it).
+        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        inner = builder_.CreateCall(wrapFn,
+            {coll, builder_.getInt64(innerEsz)}, "fs.inner");
+    }
+    builder_.CreateRet(inner);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// stdlib §5 Set-like (Union/Intersect/Except): hash trampoline for the
+// membership dict. Matches the runtime's `uint64_t(*)(const void*)` function
+// pointer slot in bz_dict_t. Reuses buildValueHashTrampoline for non-null
+// elemRef (record / scalar / string — all equality-bearing types). Falls back
+// to a simple identity hash on the raw element bytes for pointer-sized elements
+// (class pointers) where content equality is reference equality.
+llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
+                                                  const sema::TypeRef* elemRef,
+                                                  const sema::TypeSymbol* elemRec) {
+    // For an equality-bearing value type (record, primitive, enum) reuse the
+    // existing value-hash trampoline (tested path; string hashes by content).
+    if (elemRef && (elemRec || (elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                                elemRef->primitive != sema::PrimitiveType::Object)))
+        return buildValueHashTrampoline(elemRef);
+    // Fallback: hash the element bytes by loading the pointer-width value and
+    // returning its bit pattern as a uint64. For a class pointer `T*` this is
+    // identity hash (pointer value), consistent with reference equality.
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* v = builder_.CreateLoad(elemTy, fn->getArg(0), "hash.v");
+    llvm::Value* h = elemTy->isIntegerTy(64) ? v
+                   : elemTy->isIntegerTy(32)
+                       ? builder_.CreateZExt(v, i64())
+                       : elemTy->isPointerTy()
+                           ? builder_.CreatePtrToInt(v, i64())
+                           : builder_.CreateZExtOrBitCast(v, i64());
+    builder_.CreateRet(h);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// stdlib §5 Combination: Zip combine trampoline `void(closure, a, b, out)`.
+// Loads the left (aTy) and right (bTy) elements, calls the closure
+// `(env, a, b) -> outTy`, and stores the projected result through `out`.
+llvm::Function* Emitter::buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
+                                            llvm::Type* outTy) {
+    auto* fty = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$zip", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* closure = fn->getArg(0);
+    llvm::Value* a = builder_.CreateLoad(aTy, fn->getArg(1), "zip.a");
+    llvm::Value* b = builder_.CreateLoad(bTy, fn->getArg(2), "zip.b");
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "zip.fn");
+    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "zip.env");
+    auto* clTy = llvm::FunctionType::get(outTy, {ptrTy(), aTy, bTy}, false);
+    llvm::Value* r = builder_.CreateCall(clTy, fnPtr, {envPtr, a, b}, "zip.r");
+    builder_.CreateStore(r, fn->getArg(3));
+    builder_.CreateRetVoid();
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// stdlib §5 (#651/#752): is `e` a `GroupBy(keySelector)` call — a CallExpr whose
+// callee is a MemberAccessExpr with member "GroupBy" and exactly one argument?
+static bool isGroupByCall(const ast::Expr* e) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee || call->args.size() != 1 || !call->args[0].value)
+        return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    return ma && ma->member == "GroupBy" && ma->target;
+}
+
+llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
+    // The caller guarantees isGroupByCall(&srcCall).
+    auto* srcMa = dynamic_cast<const ast::MemberAccessExpr*>(srcCall.callee.get());
+    if (!srcMa || !srcMa->target) return nullptr;
+    // srcMa->target is the source collection/lazy.
+    auto* srcRecvTy = ctx_.exprType(*srcMa->target);
+    sema::TypeRef* valElemRef =
+        (srcRecvTy && !srcRecvTy->genericArgs.empty())
+        ? srcRecvTy->genericArgs[0] : nullptr;
+    llvm::Type* valElemTy = valElemRef ? lowerTypeRef(valElemRef) : i32();
+    int64_t val_esz = lazyElemSize(valElemTy, module_->getDataLayout());
+    // Determine key element type from the key lambda's return.
+    sema::TypeRef* keyElemRef = valElemRef; // default: identity
+    auto* callTy = ctx_.exprType(srcCall);
+    // callTy = IEnumerable<IGrouping<TKey,T>>; IGrouping genericArgs[0]=TKey.
+    if (callTy && !callTy->genericArgs.empty() &&
+        callTy->genericArgs[0] &&
+        callTy->genericArgs[0]->astNode &&
+        callTy->genericArgs[0]->astNode->name &&
+        !callTy->genericArgs[0]->astNode->name->parts.empty() &&
+        callTy->genericArgs[0]->astNode->name->parts[0] == "IGrouping" &&
+        callTy->genericArgs[0]->genericArgs.size() >= 1) {
+        keyElemRef = callTy->genericArgs[0]->genericArgs[0];
+    }
+    llvm::Type* keyElemTy = keyElemRef ? lowerTypeRef(keyElemRef) : i32();
+    int64_t key_esz = lazyElemSize(keyElemTy, module_->getDataLayout());
+    // Lower the source to a lazy enumerator.
+    sema::TypeRef* dummyElem = nullptr;
+    llvm::Value* srcLazy = lowerToLazyEnumerator(*srcMa->target, dummyElem);
+    if (!srcLazy) return nullptr;
+    // Lower the key lambda to a closure. Use selector trampoline (kind 1):
+    // void(cl, elem, out) so the key is written as bytes into the output slot.
+    const bool relCl =
+        srcCall.args[0].value &&
+        dynamic_cast<const ast::LambdaExpr*>(srcCall.args[0].value.get()) != nullptr;
+    llvm::Value* closure = nullptr;
+    {
+        auto* funcRef = ctx_.makeTypeRef();
+        funcRef->kind = sema::TypeRef::Kind::Function;
+        funcRef->funcReturn = keyElemRef;
+        if (valElemRef) {
+            sema::TypeRef::FuncParam fp;
+            fp.type = valElemRef;
+            funcRef->funcParams.push_back(std::move(fp));
+        }
+        const sema::TypeRef* saved = expectedFunctionType_;
+        expectedFunctionType_ = funcRef;
+        closure = lowerExpr(*srcCall.args[0].value);
+        expectedFunctionType_ = saved;
+    }
+    if (!closure) return nullptr;
+    llvm::Function* keyTramp = buildLinqTrampoline(1, valElemTy, keyElemTy);
+    auto* gbFn = declareC("bz_groupby_to_array", ptrTy(),
+        {ptrTy(), i64(), i64(), ptrTy(), ptrTy()});
+    llvm::Value* groups = builder_.CreateCall(gbFn,
+        {srcLazy, builder_.getInt64(val_esz), builder_.getInt64(key_esz),
+         closure, keyTramp}, "linq.groupby");
+    if (relCl && closure) emitClosureRelease(closure);
+    return groups;
+}
+
+// issue #995 / stdlib §5 / §29.11: materialize a VTABLE-BACKED `IEnumerable<T>`
+// receiver (interface-typed local/param, or a yield-method result) into a fresh
+// owned `Array<T>` (a bz_array_t* of element bytes) by driving the iterator
+// vtable protocol ONCE in IR. The vtable layout is
+// [0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,[4]=GetEnumerator (§29.11).
+//
+// Protocol (mirrors lowerIEnumerableBuiltinFor's vtable branch):
+//   1. GetEnumerator (slot 4) on the source → a FRESH, INDEPENDENT enumerator.
+//   2. Loop: MoveNext (slot 2) → i1; while true, Current (slot 3) → element BY
+//      VALUE in its natural LLVM type; append the element's bytes to the array.
+//   3. Dispose (slot 1) the enumerator exactly once after the drain.
+//
+// Disposal is exactly-once and leak-free:
+//   - The per-consumption ENUMERATOR (the GetEnumerator clone) is disposed here.
+//   - The SOURCE IEnumERABLE is NOT disposed here when it is a named
+//     local/param/field — that value is disposed at its own scope end
+//     (registerIterableSourceDisposal / registerUsingDisposal, §29.11). It IS
+//     disposed here when it is a freshly produced temporary (a CallExpr/NewExpr
+//     result with no owning binding, e.g. `P.Seq().Count()`) — nobody else owns
+//     it. This mirrors lowerIEnumerableBuiltinFor's `sourceIsNamedLocal` rule,
+//     so there is no double-free and no leak.
+//
+// The resulting Array<T> is a borrowing snapshot of the enumerated bytes (it
+// owns no elements). The caller wraps it via bz_lazy_from_owned_array, so the
+// lazy pipeline's dispose (a terminal's bz_lazy_to_array drain, or a
+// Where/Select/… for-in) frees the array exactly once with a null disposer
+// (leak-free, no double-free). Returns the array pointer, or null if the
+// receiver is not a vtable-backed IEnumerable.
+llvm::Value* Emitter::materializeVtableIEnumerableToArray(
+    const ast::Expr& recvExpr, sema::TypeRef*& elemRef) {
+    auto* recvTy = ctx_.exprType(recvExpr);
+    if (!isVtableBackedIEnumerableType(recvTy)) return nullptr;
+    elemRef = recvTy->genericArgs[0];
+    llvm::Type* elemTy = lowerTypeRef(elemRef);
+    if (!elemTy) return nullptr;
+
+    llvm::Value* srcObj = lowerExpr(recvExpr);
+    if (!srcObj) return nullptr;
+
+    // Element byte size for the array (mirrors lazyElemSize / collectionElemSize).
+    const llvm::DataLayout& dl = module_->getDataLayout();
+    int64_t esz = 8;
+    if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
+    else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
+    else if (elemTy->isIntegerTy(16)) esz = 2;
+    else if (elemTy->isStructTy()) esz = (int64_t)dl.getTypeAllocSize(elemTy);
+
+    // 1. GetEnumerator (slot 4): a fresh, independent enumerator over the source.
+    llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), srcObj);
+    llvm::Value* geSlotPtr =
+        builder_.CreateGEP(ptrTy(), srcVt, {builder_.getInt32(4)});
+    llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+    auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* en = builder_.CreateCall(geTy, geFnPtr, {srcObj}, "mat.getenum");
+
+    // Allocate the result array (esz-byte elements).
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(8)}, "mat.arr");
+
+    auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), ptrTy(), i64()});
+    auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+    auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+
+    // 2. Drain loop: while MoveNext(en) { append Current(en) to arr }.
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "mat.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mat.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mat.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* vt = builder_.CreateLoad(ptrTy(), en);
+    llvm::Value* mnSlot = builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(2)});
+    llvm::Value* mnFn = builder_.CreateLoad(ptrTy(), mnSlot);
+    llvm::Value* moved = builder_.CreateCall(moveNextTy, mnFn, {en}, "mat.moved");
+    // §29.2/§31 (#630): MoveNext runs the iterator body; an exception thrown
+    // there sets bz$exc and returns false. Surface it (the standard post-call
+    // gate) instead of silently ending the drain. The enumerator/source are not
+    // yet registered on the disposeStack_ here, but emitPendingCheck unwinds to
+    // the enclosing handler; the small temporary leak on a thrown exception is
+    // acceptable (no double-free) and matches the lazy-terminal materialize path.
+    emitPendingCheck();
+    builder_.CreateCondBr(moved, bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), en);
+    llvm::Value* curSlot = builder_.CreateGEP(ptrTy(), vt2, {builder_.getInt32(3)});
+    llvm::Value* curFn = builder_.CreateLoad(ptrTy(), curSlot);
+    llvm::Value* curVal = builder_.CreateCall(currentTy, curFn, {en}, "mat.cur");
+    // Spill the by-value element to a stack slot and append its bytes.
+    auto* elemSlot = entryAlloca(elemTy);
+    builder_.CreateStore(curVal, elemSlot);
+    builder_.CreateCall(addFn, {arr, elemSlot, builder_.getInt64(esz)});
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    // 3. Dispose the enumerator exactly once (slot 1 — iterator format, not the
+    //    class vtable's slot 2). Runs the state machine's pending finally blocks
+    //    (state → -1) and frees the frame.
+    {
+        llvm::Value* dvt = builder_.CreateLoad(ptrTy(), en);
+        llvm::Value* dSlot =
+            builder_.CreateGEP(ptrTy(), dvt, {builder_.getInt32(1)});
+        llvm::Value* dFn = builder_.CreateLoad(ptrTy(), dSlot);
+        auto* dispTy =
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+        builder_.CreateCall(dispTy, dFn, {en});
+    }
+    // Dispose the SOURCE too when it is a freshly produced temporary (no owning
+    // binding) — a named local/param/field source is disposed at its own scope
+    // end, so disposing here would double-free.
+    bool sourceIsNamed = false;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&recvExpr)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        sourceIsNamed = dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                        dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr;
+    } else if (dynamic_cast<const ast::MemberAccessExpr*>(&recvExpr)) {
+        // A field/property read (`this.seq`, `obj.seq`) is owned by the object,
+        // not this expression — do not dispose it here.
+        sourceIsNamed = true;
+    }
+    if (!sourceIsNamed) {
+        llvm::Value* svt = builder_.CreateLoad(ptrTy(), srcObj);
+        llvm::Value* sSlot =
+            builder_.CreateGEP(ptrTy(), svt, {builder_.getInt32(1)});
+        llvm::Value* sFn = builder_.CreateLoad(ptrTy(), sSlot);
+        auto* dispTy =
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+        builder_.CreateCall(dispTy, sFn, {srcObj});
+    }
+    return arr;
+}
+
+llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
+                                            sema::TypeRef*& elemRef) {
+    auto* recvTy = ctx_.exprType(recvExpr);
+    // stdlib §5 (#752): a bare `GroupBy(...)` is IEnumerable<IGrouping<TKey,T>>
+    // (so isLazyEnumerableType below is true), but lowerExpr cannot lower it to
+    // a usable enumerator — only the `.ToArray()` interception handled GroupBy,
+    // so Count()/Any()/Sum()/for-in over a bare GroupBy enumerated garbage.
+    // Materialize the groups into an owned Array<IGrouping> and wrap it as a
+    // lazy ARRAY source: each element is a bz_grouping_t* pointer, so the lazy
+    // element size is one pointer. Now every lazy consumer composes uniformly.
+    if (isGroupByCall(&recvExpr)) {
+        llvm::Value* groups =
+            lowerGroupByMaterialize(*static_cast<const ast::CallExpr*>(&recvExpr));
+        if (!groups) return nullptr;
+        elemRef = (recvTy && !recvTy->genericArgs.empty())
+                  ? recvTy->genericArgs[0] : nullptr;
+        int64_t esz = lazyElemSize(ptrTy(), module_->getDataLayout());
+        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(wrapFn, {groups, builder_.getInt64(esz)},
+                                   "lazy.groupby");
+    }
+    // issue #995 / stdlib §5 / §29.11: a VTABLE-BACKED `IEnumerable<T>` receiver
+    // (interface-typed local/param/field, or a yield-method result) carries the
+    // iterator-vtable object, not a bz_array_t*/bz_lazy_t*. Drive its vtable
+    // protocol once to materialize the elements into a fresh Array<T> (disposing
+    // the per-consumption enumerator, and the source iff it is a temporary), then
+    // wrap that array as a lazy ARRAY source so every lazy consumer composes
+    // uniformly. Without this the receiver fell through to bz_lazy_from_array over
+    // the raw vtable object pointer → garbage (the #995 silent miscompile).
+    if (isVtableBackedIEnumerableType(recvTy)) {
+        llvm::Value* matArr =
+            materializeVtableIEnumerableToArray(recvExpr, elemRef);
+        if (!matArr) return nullptr;
+        llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
+        int64_t esz = lazyElemSize(et, module_->getDataLayout());
+        // The materialized array is a fresh temporary with no other owner — wrap
+        // it as an OWNING lazy ARRAY source so bz_lazy_dispose frees it (leak-free
+        // for both the terminal drain and the Where/Select/… for-in consumers).
+        auto* wrapFn =
+            declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(wrapFn, {matArr, builder_.getInt64(esz)},
+                                   "lazy.ienum");
+    }
+    llvm::Value* recv = lowerExpr(recvExpr);
+    if (!recv) return nullptr;
+    // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> LINQ source.
+    // Materialize the dictionary's entries into a fresh owned bz_array_t of
+    // {K,V} structs (same layout as lowerDictEntryFor), then wrap it as an
+    // owning lazy array source. `recv` is the dict ptr (already lowered above).
+    if (isDictTypeName(recvTy) && recvTy && recvTy->genericArgs.size() >= 2 &&
+        recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
+        const sema::TypeRef* keyTy = recvTy->genericArgs[0];
+        const sema::TypeRef* valTy = recvTy->genericArgs[1];
+
+        // Determine record / nullable-val flags for value (mirrors lowerDictEntryFor).
+        const sema::TypeSymbol* valRec =
+            (valTy->kind == sema::TypeRef::Kind::Named &&
+             valTy->declaration &&
+             valTy->declaration->kind == ast::TypeDeclKind::Record)
+                ? valTy->declaration : nullptr;
+        bool valNullableVal = isNullableValueTy(valTy);
+
+        llvm::Type* keyLlvm = lowerTypeRef(keyTy);
+        llvm::Type* valLlvm = lowerTypeRef(valTy);
+        if (keyLlvm && valLlvm) {
+            llvm::StructType* entryStTy =
+                llvm::StructType::get(llvm_, {keyLlvm, valLlvm});
+            const llvm::DataLayout& dl = module_->getDataLayout();
+            int64_t esz = (int64_t)dl.getTypeAllocSize(entryStTy);
+
+            bool useGen = genericBackingType(recvTy, 0, /*isSet=*/false, nullptr) != nullptr;
+            using K = sema::TypeRef::Kind;
+            bool isStringKey = keyTy->kind == K::Primitive &&
+                               keyTy->primitive == sema::PrimitiveType::String;
+
+            // Build element TypeRef for the lazy pipeline's element tracking.
+            {
+                auto* entryTy = ctx_.makeTypeRef();
+                entryTy->kind = sema::TypeRef::Kind::Named;
+                entryTy->declaration = nullptr;
+                entryTy->astNode = nullptr;
+                static const char kDictEntryMat[] = "DictionaryEntry";
+                entryTy->importedName = kDictEntryMat;
+                entryTy->genericArgs.push_back(
+                    const_cast<sema::TypeRef*>(keyTy));
+                entryTy->genericArgs.push_back(
+                    const_cast<sema::TypeRef*>(valTy));
+                elemRef = entryTy;
+            }
+
+            // --- snapshot keys + values ---
+            auto* keysOutSlot = entryAlloca(ptrTy());
+            auto* lensOutSlot = entryAlloca(ptrTy());
+            auto* cntSlot     = entryAlloca(i64());
+            auto* valsOutSlot = entryAlloca(ptrTy());
+
+            if (useGen) {
+                auto* kfn = declareC("bz_dict_keys_gen",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfn, {recv, keysOutSlot, cntSlot});
+                auto* vfn = declareC("bz_dict_values_gen",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(vfn, {recv, valsOutSlot, entryAlloca(i64())});
+            } else {
+                auto* kfn = declareC("bz_dict_keys_str",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(kfn,
+                    {recv, keysOutSlot, lensOutSlot, cntSlot});
+                auto* vfn = declareC("bz_dict_values_str",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(vfn, {recv, valsOutSlot, entryAlloca(i64())});
+            }
+
+            llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+            llvm::Value* lensArr = isStringKey
+                                       ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                                       : nullptr;
+            llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
+            llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+            // Allocate the result bz_array_t.
+            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* arr = builder_.CreateCall(
+                allocFn,
+                {builder_.getInt64(esz), builder_.getInt64(8)},
+                "dmat.arr");
+
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()});
+
+            // Decode loop — build entry structs and append to arr.
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* entrySlot = entryAlloca(entryStTy);
+
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "dmat.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dmat.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "dmat.end",  currentFn_);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(condBB);
+            {
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+            }
+
+            builder_.SetInsertPoint(bodyBB);
+            {
+                llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+
+                // --- decode key (mirrors lowerDictEntryFor) ---
+                llvm::Value* keyDecoded;
+                if (isStringKey) {
+                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                    auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                              {ptrTy(), ptrTy(), i64()});
+                    auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                    uint64_t strSz =
+                        dl.getTypeAllocSize(stringType());
+                    llvm::Value* kpPtr =
+                        builder_.CreateGEP(ptrTy(), keysArr, idxB);
+                    llvm::Value* kp   = builder_.CreateLoad(ptrTy(), kpPtr);
+                    llvm::Value* lpPtr =
+                        builder_.CreateGEP(i64(), lensArr, idxB);
+                    llvm::Value* kl   = builder_.CreateLoad(i64(), lpPtr);
+                    llvm::Value* dataSz =
+                        builder_.CreateAdd(kl, builder_.getInt64(1));
+                    llvm::Value* dataCpy =
+                        builder_.CreateCall(mallocFn, {dataSz});
+                    builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
+                    llvm::Value* nulPtr =
+                        builder_.CreateGEP(i8Ty, dataCpy, kl);
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+                    llvm::Value* strObj = builder_.CreateCall(
+                        callocFn,
+                        {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+                    builder_.CreateStore(
+                        dataCpy,
+                        builder_.CreateStructGEP(stringType(), strObj, 0));
+                    builder_.CreateStore(
+                        kl,
+                        builder_.CreateStructGEP(stringType(), strObj, 1));
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(i8Ty, 1),
+                        builder_.CreateStructGEP(stringType(), strObj, 2));
+                    initStringRc(strObj);
+                    // Free the raw key bytes from bz_dict_keys_str (same as
+                    // lowerDictEntryFor's incBB per-slot free).
+                    builder_.CreateCall(freeFn, {kp});
+                    keyDecoded = strObj;
+                } else if (useGen) {
+                    llvm::Value* kpPtr =
+                        builder_.CreateGEP(ptrTy(), keysArr, idxB);
+                    llvm::Value* keyPtr =
+                        builder_.CreateLoad(ptrTy(), kpPtr);
+                    keyDecoded =
+                        builder_.CreateLoad(keyLlvm, keyPtr, "dmat.kgen");
+                    // Free the malloc'd raw-bytes key copy (same as
+                    // lowerDictEntryFor's incBB per-slot free for useGen).
+                    builder_.CreateCall(freeFn, {keyPtr});
+                } else {
+                    keyDecoded = llvm::Constant::getNullValue(keyLlvm);
+                }
+
+                // --- decode value (mirrors lowerDictEntryFor) ---
+                llvm::Value* vpPtr =
+                    builder_.CreateGEP(ptrTy(), valsArr, idxB);
+                llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
+                llvm::Value* valDecoded;
+                if (valRec) {
+                    valDecoded = builder_.CreateLoad(valLlvm, slotV, "dmat.vrec");
+                } else if (valNullableVal && valLlvm->isStructTy()) {
+                    valDecoded = builder_.CreateLoad(valLlvm, slotV, "dmat.vnv");
+                } else if (!valLlvm->isPointerTy()) {
+                    llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+                    if (valLlvm->isDoubleTy())
+                        valDecoded = builder_.CreateBitCast(asI64, valLlvm);
+                    else if (valLlvm->isFloatTy())
+                        valDecoded = builder_.CreateBitCast(
+                            builder_.CreateTrunc(asI64, i32()), valLlvm);
+                    else if (valLlvm->isIntegerTy(64))
+                        valDecoded = asI64;
+                    else
+                        valDecoded = builder_.CreateTrunc(asI64, valLlvm);
+                } else {
+                    valDecoded = slotV;
+                }
+
+                // Store key at field 0, value at field 1 and append.
+                builder_.CreateStore(
+                    keyDecoded,
+                    builder_.CreateStructGEP(entryStTy, entrySlot, 0));
+                builder_.CreateStore(
+                    valDecoded,
+                    builder_.CreateStructGEP(entryStTy, entrySlot, 1));
+                builder_.CreateCall(addFn,
+                    {arr, entrySlot, builder_.getInt64(esz)});
+                builder_.CreateStore(
+                    builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+            }
+
+            builder_.SetInsertPoint(endBB);
+            builder_.CreateCall(freeFn, {keysArr});
+            if (isStringKey)
+                builder_.CreateCall(freeFn, {lensArr});
+            builder_.CreateCall(freeFn, {valsArr});
+
+            auto* ownFn =
+                declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+            return builder_.CreateCall(ownFn,
+                {arr, builder_.getInt64(esz)}, "lazy.dict");
+        }
+    }
+    // issue #775 / §16.3: a `Range<T>` is IEnumerable<T>. Wrap its value struct
+    // { i64 start, i64 end, i64 step, i8 flags } as a lazy range source so the
+    // receiver-position operators (Count/Where/Select/Sum/…) enumerate it. An
+    // open-ended range (flags bit1/bit2) raises InvalidOperationException per
+    // §16.3 (GetEnumerator on an open-ended range).
+    // A Range-typed receiver is recognized by name: in receiver position its
+    // TypeSymbol carries the builtin Range class decl (so isRangeType's
+    // `!declaration->decl` guard is false), but the lowered value is still the
+    // `%bz.range` { i64 start, i64 end, i64 step, i8 flags } struct.
+    bool isRangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                       recvTy->declaration &&
+                       recvTy->declaration->name == "Range";
+    if (isRangeRecv) {
+        elemRef = (recvTy && !recvTy->genericArgs.empty())
+                      ? recvTy->genericArgs[0] : nullptr;
+        llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
+        int64_t esz = lazyElemSize(et, module_->getDataLayout());
+        llvm::Value* start = builder_.CreateExtractValue(recv, {0u}, "rng.start");
+        llvm::Value* end   = builder_.CreateExtractValue(recv, {1u}, "rng.end");
+        llvm::Value* step  = builder_.CreateExtractValue(recv, {2u}, "rng.step");
+        llvm::Value* flags = builder_.CreateExtractValue(recv, {3u}, "rng.flags");
+        llvm::Value* isOpen = builder_.CreateICmpNE(
+            builder_.CreateAnd(flags, builder_.getInt8(6)),
+            builder_.getInt8(0), "rng.open");
+        emitGuardThrow(isOpen, "InvalidOperationException");
+        auto* fn = declareC("bz_lazy_from_range", ptrTy(),
+            {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
+        return builder_.CreateCall(fn,
+            {start, end, step, flags, builder_.getInt64(esz)}, "lazy.range");
+    }
+    if (isLazyEnumerableType(recvTy)) {
+        // Already a lazy enumerator (chained LINQ): use it directly.
+        elemRef = recvTy->genericArgs[0];
+        return recv;
+    }
+    // issue #389 / stdlib §5 / §4.10: a dict-backed Set<T> is IEnumerable<T>
+    // (Set: ICollection<T>: IEnumerable<T>) but its backing pointer is a
+    // bz_dict_t*, not a bz_array_t* — wrap it via the Set lazy source, which
+    // snapshots the element keys. Only the generic dict-backed Sets (record /
+    // primitive / enum / string elements) need this; a plain class-element
+    // OwningSet is array-backed and takes the ARRAY path below.
+    elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                       : nullptr;
+    if (recvTy && recvTy->astNode && recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty() &&
+        (recvTy->astNode->name->parts[0] == "Set" ||
+         recvTy->astNode->name->parts[0] == "OwningSet")) {
+        uint64_t ksz = 0;
+        if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
+            auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
+            return builder_.CreateCall(setFn,
+                {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set");
+        }
+    }
+    // per §4.6/§4.7 + §5 fix #450: LinkedList<T>/OwningLinkedList<T> is
+    // IEnumerable<T> but backed by bz_llist_t*, not bz_array_t*.  Wrap via
+    // bz_lazy_from_llist so LINQ operators can enumerate it correctly.
+    if (isLinkedListTypeName(recvTy)) {
+        int64_t esz = collectionElemSize(recvTy);
+        auto* fn = declareC("bz_lazy_from_llist", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, builder_.getInt64(esz)}, "lazy.llist");
+    }
+    // fix #1220 / §5 / §9.6: string is IEnumerable<char>. Materialize it into
+    // a fresh owned Array<char> (elem_size=4, one i32 code-point per slot) via
+    // bz_str_to_char_array (already lowered to `recv` above), then wrap as an
+    // OWNING lazy ARRAY source so the lazy pipeline (Where/Select/Count/…) owns
+    // and frees it on drain. `recv` is the string pointer (already evaluated).
+    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Primitive &&
+        recvTy->primitive == sema::PrimitiveType::String) {
+        auto* toArrFn = declareC("bz_str_to_char_array", ptrTy(), {ptrTy()});
+        llvm::Value* charArr =
+            builder_.CreateCall(toArrFn, {recv}, "str.chararray");
+        // Element type for char is i32 (code point); size = 4.
+        elemRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Char);
+        auto* ownFn =
+            declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(ownFn,
+            {charArr, builder_.getInt64(4)}, "lazy.str");
+    }
+    // fix #449: only Array<T>-family (isCollectionTypeName) collections are
+    // bz_array_t*-backed.  Do NOT fall through for an unrecognised receiver type
+    // (e.g. the i32(0) produced by in-place Array.Reverse()) — that would pass
+    // garbage as a pointer to bz_lazy_from_array, causing SIGABRT.
+    if (!isCollectionTypeName(recvTy)) return nullptr;
+    // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
+    int64_t esz = collectionElemSize(recvTy);
+    auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+    return builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src");
+}
+
+llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    // Only intercept on a collection, lazy-enumerable, or LinkedList receiver.
+    auto* recvTy = ctx_.exprType(*ma->target);
+    bool collRecv = isCollectionTypeName(recvTy);
+    bool lazyRecv = isLazyEnumerableType(recvTy);
+    // fix #454 / §5 / §4.6: LinkedList<T> implements IEnumerable<T> but is
+    // bz_llist_t*-backed, not bz_array_t*-backed.  lowerToLazyEnumerator already
+    // routes it via bz_lazy_from_llist, but the guard here used to exclude it
+    // (neither isCollectionTypeName nor isLazyEnumerableType is true for a
+    // LinkedList), so Where/Select/ToArray/etc. silently fell through and returned
+    // 0 or crashed.  Include it so the lazy operators wrap it correctly.
+    bool llRecv = isLinkedListTypeName(recvTy);
+    // issue #775 / §16.3: a `Range<T>` is IEnumerable<T> but is neither a
+    // bz_array_t*-backed collection nor a lazy enumerator — without this it fell
+    // through and Count()/Where()/Sum()/… over a range returned 0. lowerToLazy-
+    // Enumerator wraps it via bz_lazy_from_range, so admit it here too.
+    bool rangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                     recvTy->declaration &&
+                     recvTy->declaration->name == "Range";
+    // issue #995 / stdlib §5 / §29.11: a vtable-backed IEnumerable<T> receiver
+    // (interface-typed local/param, or a yield-method result) — lowerToLazy-
+    // Enumerator materializes it into an Array<T> via the iterator vtable, so the
+    // LINQ operators (Where/Select/Take/…) can enumerate it. Without this they
+    // silently fell through (the #995 Where/Select garbage/NYI).
+    bool vtRecv = isVtableBackedIEnumerableType(recvTy);
+    // fix #1220 / §5 / §9.6: string is IEnumerable<char> — lowerToLazyEnumerator
+    // materializes it via bz_str_to_char_array so LINQ operators can enumerate it.
+    bool strRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Primitive &&
+                   recvTy->primitive == sema::PrimitiveType::String;
+    // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> is
+    // ICollection<DictionaryEntry<K,V>> — LINQ operators on a Dictionary
+    // materialize its entries into a lazy array of {K,V} structs via
+    // lowerToLazyEnumerator's Dictionary branch (see below).
+    bool dictRecv = isDictTypeName(recvTy) &&
+                    recvTy && recvTy->genericArgs.size() >= 2 &&
+                    recvTy->genericArgs[0] && recvTy->genericArgs[1];
+    if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv &&
+        !dictRecv)
+        return nullptr;
+
+    // Element LLVM type for the receiver's element TypeRef.
+    auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {
+        if (er) if (auto* t = lowerTypeRef(er)) return t;
+        return i32();
+    };
+
+    // ----- ToArray: materialize the (lazy) pipeline into an owned Array<T> ---
+    if (m == "ToArray" && call.args.empty()) {
+        // stdlib §5 (#651): GroupBy(...).ToArray() — intercept before the
+        // generic lazy-materialization path and return the materialized groups
+        // array directly (avoids a redundant array→lazy→array round-trip). The
+        // GroupBy source is itself a call expression.
+        if (auto* srcCall = dynamic_cast<const ast::CallExpr*>(ma->target.get())) {
+            if (isGroupByCall(srcCall)) {
+                if (llvm::Value* groups = lowerGroupByMaterialize(*srcCall))
+                    return groups;
+            }
+        }
+
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        int64_t esz = lazyElemSize(elemLlvmOf(elemRef), module_->getDataLayout());
+        auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+        llvm::Value* arr =
+            builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
+        // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a materialized Array<string>
+        // co-owns a +1 per element so it can be released symmetrically. Keyed on
+        // the produced element type being in the RuntimeManaged row AND specifically
+        // a non-nullable string primitive (same logic as emitArrayRetainStringsIfStringArray;
+        // #602 batch 4: isStringElementArray was deleted, RuntimeManaged check is direct).
+        {
+            const ElementPolicy toArrPol =
+                elementPolicyFor(elemRef, /*owningFamily=*/false);
+            if (toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                elemRef &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String &&
+                !elemRef->nullable) {
+                auto* rf = declareC("bz_array_retain_strings",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(rf, {arr});
+            }
+        }
+        return arr;
+    }
+
+    // ----- ToSet: materialize the (lazy) pipeline into an owned Set<T> -------
+    // stdlib §5: ToSet() → owned Set<T>. The Set is dict-backed (generic-key
+    // path); element hash and equality trampolines are the same as Distinct uses.
+    if (m == "ToSet" && call.args.empty()) {
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        llvm::Type* elemTy2 = elemLlvmOf(elemRef);
+        int64_t esz = lazyElemSize(elemTy2, module_->getDataLayout());
+        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec);
+        auto* toSet = declareC("bz_lazy_to_set", ptrTy(),
+                               {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(toSet,
+            {lazy, builder_.getInt64(esz), hashTramp, eqTramp}, "linq.toset");
+    }
+
+    // ----- ToDictionary: materialize into an owned Dictionary<TKey, TValue> --
+    // stdlib §5: ToDictionary<TKey>(key: (T)->TKey): owned Dictionary<TKey, T>,
+    // and the two-selector ToDictionary<TKey,TValue>(key, value: (T)->TValue):
+    // owned Dictionary<TKey, TValue> (#747 R43 — was silently ignoring the value
+    // selector and storing the element). The value selector is applied per
+    // element when supplied.
+    if (m == "ToDictionary" && call.args.size() >= 1 && call.args[0].value) {
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        llvm::Type* elemTy2 = elemLlvmOf(elemRef);
+
+        // Key type: the lambda (T)->TKey; TKey is its return type.
+        sema::TypeRef* keyRefSema = nullptr;
+        llvm::Type* keyTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                keyRefSema = lamTy->funcReturn;
+                if (auto* t = lowerTypeRef(keyRefSema)) keyTy = t;
+            }
+        int64_t keyEsz = lazyElemSize(keyTy, module_->getDataLayout());
+
+        // Value type/encoding: with a value selector (two-arg form) the value is
+        // the selector's TValue return; otherwise it is the element T.
+        bool hasValueSel = call.args.size() >= 2 && call.args[1].value;
+        llvm::Type* valTy = elemTy2;
+        if (hasValueSel) {
+            if (auto* lamTy = ctx_.exprType(*call.args[1].value))
+                if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                    lamTy->funcReturn)
+                    if (auto* t = lowerTypeRef(lamTy->funcReturn)) valTy = t;
+            // The value trampoline (kind 2) carries the selector result through
+            // an i32→i64 closure call, so only an i32-lowered scalar TValue
+            // (int/enum/char) round-trips correctly. Reject wider/struct value
+            // types with a clean diagnostic rather than silently miscompiling.
+            if (valTy != i32()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "two-selector `ToDictionary(key, value)` currently supports "
+                    "only an `int`-typed value selector in codegen; a value "
+                    "selector returning another type is not yet implemented "
+                    "(stdlib \xC2\xA7""5, #747)");
+                return llvm::PoisonValue::get(ptrTy());
+            }
+        }
+        int64_t valEsz = lazyElemSize(valTy, module_->getDataLayout());
+
+        // Key closure + trampoline (kind 2 = key: i64(closure, elem_ptr)).
+        // Note: lowerLinqLambda is not in scope here (defined later in the isOp
+        // section). For ToDictionary the user always annotates the lambda key
+        // type explicitly, so lowerExpr suffices.
+        llvm::Value* keyClosure = lowerExpr(*call.args[0].value);
+        if (!keyClosure) return nullptr;
+        llvm::Function* keyTramp = buildLinqTrampoline(2, elemTy2, nullptr);
+
+        // Value closure + trampoline (kind 2 over the element type: applies the
+        // value selector to each element). Null when there is no value selector.
+        llvm::Value* valClosure =
+            llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* valTramp = llvm::ConstantPointerNull::get(ptrTy());
+        if (hasValueSel) {
+            valClosure = lowerExpr(*call.args[1].value);
+            if (!valClosure) return nullptr;
+            valTramp = buildLinqTrampoline(2, elemTy2, nullptr);
+        }
+
+        // Key hash + equality trampolines for the dict backing.
+        const sema::TypeSymbol* keyRec = recordTypeOfRef(keyRefSema);
+        llvm::Function* hashTramp = buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, keyTy, nullptr, keyRec);
+
+        // #738: the value encoding must match the codegen Dictionary<K,V> read
+        // (encodeValue) — a SCALAR value (non-struct LLVM type) is stored inline
+        // in the void* slot; a STRUCT value (record/decimal) is heap-boxed. A
+        // value selector always yields a scalar TValue (gated to i32 above).
+        bool valInline = hasValueSel || (valTy && !valTy->isStructTy());
+        auto* toDict = declareC("bz_lazy_to_dict", ptrTy(),
+            {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64(),
+             ptrTy(), ptrTy()});
+        llvm::Value* result = builder_.CreateCall(toDict,
+            {lazy, builder_.getInt64(valEsz), builder_.getInt64(keyEsz),
+             keyTramp, keyClosure, hashTramp, eqTramp,
+             builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure},
+            "linq.todict");
+        // Release the inline-lambda key/value closures if we own them (eager
+        // materialization — the closures are fully consumed during
+        // bz_lazy_to_dict, same as eager LINQ terminals like Count/Sum).
+        if (call.args[0].value &&
+            dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+            emitClosureRelease(keyClosure);
+        if (hasValueSel &&
+            dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get()))
+            emitClosureRelease(valClosure);
+        return result;
+    }
+
+    // The deferred operators. Lower the source to a lazy enumerator first.
+    // NOTE: Reverse is intercepted ONLY on a lazy receiver — on a concrete
+    // collection (Array) it falls through to the in-place Array.Reverse()
+    // handler in tryLowerCollectionInstanceCall (§3).
+    bool isOp = (m == "Where" || m == "Select" || m == "Take" || m == "Skip" ||
+                 m == "Distinct" || m == "OrderBy" || m == "OrderByDescending" ||
+                 m == "Concat" || m == "TakeWhile" || m == "SkipWhile" ||
+                 m == "SelectMany" || m == "Zip" ||
+                 // stdlib §5 Set-like lazy ops (this milestone):
+                 m == "Union" || m == "Intersect" || m == "Except" ||
+                 // stdlib §5 Ordering secondary key:
+                 m == "ThenBy" || m == "ThenByDescending" ||
+                 // stdlib §5 lazy Reverse — on a lazy receiver (not Array, which
+                 // has an in-place Array.Reverse()). issue #775: a Range<T> also
+                 // has no in-place Reverse, so `(1..n).Reverse()` is the lazy
+                 // materialize-then-yield-backwards form — without rangeRecv it
+                 // fell through to the Array in-place handler (Count/Sum = 0;
+                 // ToArray SIGABRT on the bz.range struct read as an array).
+                 // fix #1220: string is IEnumerable<char> — admit Reverse on it.
+                 (m == "Reverse" && (lazyRecv || rangeRecv || strRecv)) ||
+                 // stdlib §5 (#651): OfType<U>() — lazy identity/type-filter.
+                 m == "OfType");
+    if (!isOp) return nullptr;
+
+    sema::TypeRef* elemRef = nullptr;
+    llvm::Value* src = lowerToLazyEnumerator(*ma->target, elemRef);
+    if (!src) return nullptr;
+    llvm::Type* elemTy = elemLlvmOf(elemRef);
+
+    // #422 / §28.9 / §28.3: a LAZY operator stores its closure in the enumerator
+    // (e->closure) and invokes it LATER during iteration — so the closure must
+    // OUTLIVE the call. When it was produced INLINE (a lambda literal), it is a
+    // +1 transient the enumerator owns; mark the enumerator with
+    // bz_lazy_own_closure so bz_lazy_dispose releases it at enumerator dispose
+    // (NOT here — a call-site release would be a use-after-free). A closure
+    // arriving via a variable/field is a BORROW and is left untouched. Mirrors
+    // the GetOrAdd/eager factoryIsInlineLambda guard.
+    auto argIsInlineLambda = [&](size_t i) -> bool {
+        return i < call.args.size() && call.args[i].value &&
+               dynamic_cast<const ast::LambdaExpr*>(call.args[i].value.get())
+                   != nullptr;
+    };
+    // Thread the enumerator pointer through bz_lazy_own_closure(e) iff the
+    // operator's closure arg was an inline lambda; otherwise return it unchanged.
+    auto ownClosureIf = [&](llvm::Value* e, bool inlineLambda) -> llvm::Value* {
+        if (!inlineLambda || !e) return e;
+        auto* fn = declareC("bz_lazy_own_closure", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {e}, "linq.owncl");
+    };
+
+    // Lower a LINQ lambda argument with the expected (T)->ret function type so
+    // unannotated lambda params get the right LLVM type.
+    auto lowerLinqLambda = [&](const ast::Expr* argExpr,
+                               sema::TypeRef* retTypeRef) -> llvm::Value* {
+        auto* funcRef = ctx_.makeTypeRef();
+        funcRef->kind = sema::TypeRef::Kind::Function;
+        funcRef->funcReturn = retTypeRef;
+        if (elemRef) {
+            sema::TypeRef::FuncParam fp;
+            fp.type = elemRef;
+            funcRef->funcParams.push_back(std::move(fp));
+        }
+        const sema::TypeRef* saved = expectedFunctionType_;
+        expectedFunctionType_ = funcRef;
+        llvm::Value* v = lowerExpr(*argExpr);
+        expectedFunctionType_ = saved;
+        return v;
+    };
+
+    if (m == "Where" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* closure = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(0, elemTy, nullptr);
+        auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        llvm::Value* e = builder_.CreateCall(whereFn, {src, closure, tramp}, "linq.where");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+    }
+    if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* retSemaType = nullptr;
+        llvm::Type* outTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retSemaType = lamTy->funcReturn;
+                if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
+            }
+        llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(1, elemTy, outTy);
+        int64_t outEsz = lazyElemSize(outTy, module_->getDataLayout());
+        auto* selFn = declareC("bz_lazy_select", ptrTy(),
+                               {ptrTy(), i64(), ptrTy(), ptrTy()});
+        llvm::Value* e = builder_.CreateCall(selFn,
+            {src, builder_.getInt64(outEsz), closure, tramp}, "linq.select");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+    }
+    if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* nV = lowerExpr(*call.args[0].value);
+        if (!nV) return nullptr;
+        llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+            : builder_.CreateSExt(nV, i64(), "tk.n");
+        auto* takeFn = declareC("bz_lazy_take", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(takeFn, {src, n64}, "linq.take");
+    }
+    if (m == "Skip" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* nV = lowerExpr(*call.args[0].value);
+        if (!nV) return nullptr;
+        llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+            : builder_.CreateSExt(nV, i64(), "sk.n");
+        auto* skipFn = declareC("bz_lazy_skip", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(skipFn, {src, n64}, "linq.skip");
+    }
+    if (m == "Distinct" && call.args.empty()) {
+        // issue D6 / §9.1 / §9.2: a record element sequence dedups by its
+        // synthesized structural equality (mirroring Set<record>), not an ICmp
+        // on the aggregate. recordTypeOfRef is non-null only for an
+        // equality-bearing record element type.
+        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(distFn, {src, eqTramp}, "linq.distinct");
+    }
+    if ((m == "OrderBy" || m == "OrderByDescending") &&
+        call.args.size() == 1 && call.args[0].value) {
+        int32_t desc = (m == "OrderByDescending") ? 1 : 0;
+        llvm::Value* closure = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(2, elemTy, nullptr);
+        auto* obFn = declareC("bz_lazy_orderby", ptrTy(),
+                              {ptrTy(), ptrTy(), ptrTy(), i32()});
+        llvm::Value* e = builder_.CreateCall(obFn,
+            {src, closure, tramp, builder_.getInt32(desc)}, "linq.orderby");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+    }
+    // stdlib §5 Combination: Concat(other) — yield all of self, then all of
+    // `other`. Lower `other` (an Array<T> or lazy IEnumerable<T>) to its own lazy
+    // enumerator and hand both to the runtime.
+    if (m == "Concat" && call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* otherElem = nullptr;
+        llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
+        if (!down) return nullptr;
+        auto* concatFn = declareC("bz_lazy_concat", ptrTy(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(concatFn, {src, down}, "linq.concat");
+    }
+    // stdlib §5 Slicing: TakeWhile/SkipWhile(predicate) — gate by a `(T)->bool`
+    // predicate (reusing the kind-0 predicate trampoline).
+    if ((m == "TakeWhile" || m == "SkipWhile") &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* closure = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(0, elemTy, nullptr);
+        const char* rt = (m == "TakeWhile") ? "bz_lazy_takewhile"
+                                            : "bz_lazy_skipwhile";
+        auto* fn = declareC(rt, ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        llvm::Value* e = builder_.CreateCall(fn, {src, closure, tramp},
+                                   m == "TakeWhile" ? "linq.takewhile"
+                                                    : "linq.skipwhile");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+    }
+    // stdlib §5 Projection: SelectMany(selector: (T)->IEnumerable<U>) — flatten.
+    // The selector returns an inner collection; the trampoline wraps it as a lazy
+    // enumerator. The inner element size U comes from the selector's return type
+    // (a collection/lazy carrying U at genericArgs[0]).
+    if (m == "SelectMany" && call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* retSemaType = nullptr;
+        llvm::Type* innerElemTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retSemaType = lamTy->funcReturn;  // IEnumerable<U> / Array<U>
+                if (!retSemaType->genericArgs.empty() && retSemaType->genericArgs[0])
+                    if (auto* t = lowerTypeRef(retSemaType->genericArgs[0]))
+                        innerElemTy = t;
+            }
+        llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
+        if (!closure) return nullptr;
+        int64_t innerEsz = lazyElemSize(innerElemTy, module_->getDataLayout());
+        // #758: when the selector returns a lazy LINQ chain (not a concrete
+        // collection), its result is already a `bz_lazy_t*` enumerator — the
+        // trampoline returns it directly instead of wrapping it as an array.
+        bool innerIsLazy = isLazyEnumerableType(retSemaType);
+        // issue #775 / §16.3: the selector returns a `Range<T>` value (a 32-byte
+        // struct, not a collection pointer) — the trampoline must call it via the
+        // struct-return ABI and wrap it via bz_lazy_from_range. Recognized by
+        // name (its TypeSymbol carries the builtin Range class decl).
+        bool rangeInner = retSemaType &&
+                          retSemaType->kind == sema::TypeRef::Kind::Named &&
+                          retSemaType->declaration &&
+                          retSemaType->declaration->name == "Range";
+        llvm::Function* tramp =
+            buildSelectManyTrampoline(elemTy, innerEsz, innerIsLazy, rangeInner);
+        auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
+                              {ptrTy(), i64(), ptrTy(), ptrTy()});
+        llvm::Value* e = builder_.CreateCall(smFn,
+            {src, builder_.getInt64(innerEsz), closure, tramp}, "linq.selectmany");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+    }
+    // stdlib §5 Combination: Zip<U,R>(other, combine: (T,U)->R) — pair positionally.
+    if (m == "Zip" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        // Lower `other` (the second source) to its own lazy enumerator; capture
+        // its element type for the combine's 2nd parameter.
+        sema::TypeRef* otherElem = nullptr;
+        llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
+        if (!down) return nullptr;
+        llvm::Type* bTy = elemLlvmOf(otherElem);
+        // The combine lambda `(T, U) -> R`. Lower it with the expected function
+        // type so unannotated params get the right element LLVM types.
+        sema::TypeRef* retSemaType = nullptr;
+        llvm::Type* outTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[1].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retSemaType = lamTy->funcReturn;
+                if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
+            }
+        auto* combRef = ctx_.makeTypeRef();
+        combRef->kind = sema::TypeRef::Kind::Function;
+        combRef->funcReturn = retSemaType;
+        if (elemRef) { sema::TypeRef::FuncParam fp; fp.type = elemRef;
+                       combRef->funcParams.push_back(std::move(fp)); }
+        if (otherElem) { sema::TypeRef::FuncParam fp; fp.type = otherElem;
+                         combRef->funcParams.push_back(std::move(fp)); }
+        const sema::TypeRef* savedExp = expectedFunctionType_;
+        expectedFunctionType_ = combRef;
+        llvm::Value* closure = lowerExpr(*call.args[1].value);
+        expectedFunctionType_ = savedExp;
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildZipTrampoline(elemTy, bTy, outTy);
+        int64_t outEsz = lazyElemSize(outTy, module_->getDataLayout());
+        auto* zipFn = declareC("bz_lazy_zip", ptrTy(),
+                               {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
+        llvm::Value* e = builder_.CreateCall(zipFn,
+            {src, down, builder_.getInt64(outEsz), closure, tramp}, "linq.zip");
+        return ownClosureIf(e, argIsInlineLambda(1));  // #422: combine is args[1]
+    }
+    // stdlib §5 Set-like lazy: Union/Intersect/Except(other: IEnumerable<T>).
+    // Each builds a membership dict from `other` at construction, then yields
+    // unique elements (Union: self∪other; Intersect: self∩other; Except: self∖other).
+    // Element dedup uses the generic-dict hash/equality trampolines (same as
+    // Distinct, but also needs a hash function for the O(1) dict path).
+    if ((m == "Union" || m == "Intersect" || m == "Except") &&
+        call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* otherElem = nullptr;
+        llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
+        if (!down) return nullptr;
+        // Build element hash + equality trampolines for the membership dict.
+        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy, elemRef, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        const char* rtFn = (m == "Union")     ? "bz_lazy_union"
+                         : (m == "Intersect") ? "bz_lazy_intersect"
+                                              : "bz_lazy_except";
+        auto* fn = declareC(rtFn, ptrTy(), {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {src, down, hashTramp, eqTramp},
+                                   "linq." + std::string(m == "Union" ? "union"
+                                                        : m == "Intersect" ? "intersect"
+                                                                           : "except"));
+    }
+    // stdlib §5 Ordering: ThenBy / ThenByDescending(key: (T)->TKey) secondary sort.
+    // The receiver is an IOrderedEnumerable<T> (lazy sentinel carrying T at [0]).
+    // The primary key is already baked into the upstream ORDERBY node; ThenBy
+    // reaches into it via the runtime (bz_lazy_thenby reads up->keyfn/closure).
+    if ((m == "ThenBy" || m == "ThenByDescending") &&
+        call.args.size() == 1 && call.args[0].value) {
+        int32_t desc2 = (m == "ThenByDescending") ? 1 : 0;
+        llvm::Value* closure2 = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+        if (!closure2) return nullptr;
+        llvm::Function* tramp2 = buildLinqTrampoline(2, elemTy, nullptr);
+        auto* tbFn = declareC("bz_lazy_thenby", ptrTy(),
+                              {ptrTy(), ptrTy(), ptrTy(), i32()});
+        llvm::Value* e = builder_.CreateCall(tbFn,
+            {src, closure2, tramp2, builder_.getInt32(desc2)}, "linq.thenby");
+        // Mark closure2 as owned by the THENBY enumerator if it was an inline
+        // lambda — disposed via own_closure2 at bz_lazy_dispose.
+        if (argIsInlineLambda(0) && e) {
+            auto* fn = declareC("bz_lazy_own_closure2", ptrTy(), {ptrTy()});
+            e = builder_.CreateCall(fn, {e}, "linq.owncl2");
+        }
+        return e;
+    }
+    // stdlib §5 Ordering: Reverse() on an IEnumerable<T> receiver — lazy
+    // materialize + yield backwards. (The in-place Array Reverse is lowered
+    // separately before tryLowerLazyLinqCall is reached.)
+    if (m == "Reverse" && call.args.empty()) {
+        auto* revFn = declareC("bz_lazy_reverse", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(revFn, {src}, "linq.reverse");
+    }
+    // stdlib §5 (#651): OfType<U>() — type-filter lazy operator.
+    // For value-type sources (monomorphic): U must equal T (statically enforced
+    // by sema since Bezel has no runtime type tags for value types), so OfType
+    // is an identity — wrap source as a Where-all (predicate always true).
+    // The element size is unchanged (U == T).
+    if (m == "OfType" && call.args.empty()) {
+        // Build a Where with an always-true predicate trampoline.
+        // kind-0 trampoline: i32(ptr closure, ptr elem) returns 1 always.
+        llvm::FunctionType* fty = llvm::FunctionType::get(i32(),
+            {ptrTy(), ptrTy()}, false);
+        auto* alwaysTrueFn = llvm::Function::Create(fty,
+            llvm::Function::InternalLinkage, "bz$oftype$tramp", module_.get());
+        auto savedIP = builder_.saveIP();
+        llvm::Function* savedFn = currentFn_;
+        currentFn_ = alwaysTrueFn;
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", alwaysTrueFn);
+        builder_.SetInsertPoint(entry);
+        builder_.CreateRet(builder_.getInt32(1));
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        // bz_lazy_where with nullptr closure and alwaysTrueFn → pass-through.
+        auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(whereFn,
+            {src, llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_, 0)),
+             alwaysTrueFn},
+            "linq.oftype");
+    }
+    return nullptr;
+}
+
+
+// ---------------------------------------------------------------------------
+// per §4.6/§4.7: LinkedList<T> / OwningLinkedList<T> node-based API codegen.
+// The runtime is bz_llist_t (doubly-linked list of inline-value nodes).
+// A LinkedListNode<T> Bezel value is a raw ptr to bz_llist_node_t; `.Value`
+// loads the inline bytes; `.Next`/`.Previous` follow the pointer chain.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    auto* recvTy = ctx_.exprType(*ma->target);
+
+    // -----------------------------------------------------------------------
+    // LinkedListNode<T> property accessor lowerings (syntactically a call-expr
+    // when the parser sees node.Next or node.Value — or a member-access expr;
+    // handled here for safety).  In practice these are MemberAccessExprs, not
+    // CallExprs, so this block likely won't fire — but guard anyway.
+    // -----------------------------------------------------------------------
+    // (The real work for node properties is in lowerExpr's MemberAccessExpr
+    // handling below.  tryLowerLinkedListInstanceCall handles CALL forms.)
+
+    // -----------------------------------------------------------------------
+    // LinkedList<T> / OwningLinkedList<T> method lowerings.
+    // -----------------------------------------------------------------------
+    if (!isLinkedListTypeName(recvTy)) return nullptr;
+
+    // Element size for this instantiation.
+    int64_t esz = collectionElemSize(recvTy);
+    bool isOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    recvTy->astNode->name->parts[0] == "OwningLinkedList";
+
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv) return nullptr;
+
+    // Element LLVM type (for loading values from nodes).
+    llvm::Type* elemLLTy = i32();
+    if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+        elemLLTy = lowerTypeRef(recvTy->genericArgs[0]);
+
+    // #602 / §28.11 v0.134: hoist one element-slot policy lookup for LinkedList
+    // operations that need per-element equality (Find/Remove/Contains) or disposal
+    // (OwningLinkedList RemoveFirst/RemoveLast/Clear/Remove).
+    // LinkedList is always in the borrowing family (no Owned* string elements);
+    // OwningLinkedList is in the owning family (isOwning flag above).
+    const sema::TypeRef* llElemRef =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+    const ElementPolicy llElemPol = elementPolicyFor(llElemRef, isOwning);
+    // llElemIsClass: class-or-interface element — per §28.11 v0.135 fix #619:
+    // elementPolicyFor now returns ClassOwned/ClassBorrow for interface elements.
+    bool llElemIsClass =
+        llElemPol.cat == ElementPolicy::Category::ClassOwned ||
+        llElemPol.cat == ElementPolicy::Category::ClassBorrow;
+
+    // --- AddFirst(item): LinkedListNode<T> ---
+    if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_first", ptrTy(),
+                            {ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
+                                   "ll.addFirst");
+    }
+    // --- AddLast(item): LinkedListNode<T> ---
+    if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_last", ptrTy(),
+                            {ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
+                                   "ll.addLast");
+    }
+    // --- AddBefore(node, item): LinkedListNode<T> ---
+    if (m == "AddBefore" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* node = lowerExpr(*call.args[0].value);
+        llvm::Value* v    = lowerExpr(*call.args[1].value);
+        if (!node || !v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_before", ptrTy(),
+                            {ptrTy(), ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn,
+            {recv, node, slot, builder_.getInt64(esz)}, "ll.addBefore");
+    }
+    // --- AddAfter(node, item): LinkedListNode<T> ---
+    if (m == "AddAfter" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* node = lowerExpr(*call.args[0].value);
+        llvm::Value* v    = lowerExpr(*call.args[1].value);
+        if (!node || !v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_after", ptrTy(),
+                            {ptrTy(), ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn,
+            {recv, node, slot, builder_.getInt64(esz)}, "ll.addAfter");
+    }
+    // --- PopFirst(): owned T / PopLast(): owned T (OwningLinkedList only) ---
+    // fix #642 / stdlib §4.7: transfer ownership of the first/last element to the
+    // caller; remove WITHOUT disposal.  Only valid on OwningLinkedList<T> (the
+    // borrowing LinkedList<T> has no owned-return variants).
+    if ((m == "PopFirst" || m == "PopLast") && call.args.empty()) {
+        // Guard: raise InvalidOperationException when empty.
+        auto* cntFn = declareC("bz_llist_count", i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "llpop.cnt");
+        llvm::Value* isEmpty = builder_.CreateICmpEQ(
+            cnt, builder_.getInt64(0), "llpop.empty");
+        emitGuardThrow(isEmpty, "InvalidOperationException");
+        // Output slot for the copied element.
+        llvm::AllocaInst* out = entryAlloca(elemLLTy);
+        if (m == "PopFirst") {
+            auto* fn = declareC("bz_llist_pop_first",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, out, builder_.getInt64(esz)});
+        } else {
+            auto* fn = declareC("bz_llist_pop_last",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, out, builder_.getInt64(esz)});
+        }
+        return builder_.CreateLoad(elemLLTy, out, "llpop.val");
+    }
+    // --- TryPopFirst(out owned item): bool / TryPopLast(out owned item): bool ---
+    // fix #831 / stdlib §4.7: the TRY analogue of PopFirst / PopLast on
+    // OwningLinkedList<T>. On a non-empty list write the first/last element to the
+    // out param and remove it WITHOUT disposal (ownership transfers to the out
+    // param), returning true; on empty return false and leave the out param
+    // unchanged. Before this fix it fell through → malformed IR (bug16).
+    if ((m == "TryPopFirst" || m == "TryPopLast") &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Type* outTy = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
+        if (!outAddr) return nullptr;
+        auto* cntFn = declareC("bz_llist_count", i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "lltrypop.cnt");
+        llvm::Value* nonEmpty = builder_.CreateICmpNE(
+            cnt, builder_.getInt64(0), "lltrypop.ne");
+        auto* foundBB =
+            llvm::BasicBlock::Create(llvm_, "lltrypop.found", currentFn_);
+        auto* endBB =
+            llvm::BasicBlock::Create(llvm_, "lltrypop.end", currentFn_);
+        llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+        builder_.CreateCondBr(nonEmpty, foundBB, endBB);
+        builder_.SetInsertPoint(foundBB);
+        if (m == "TryPopFirst") {
+            auto* fn = declareC("bz_llist_pop_first",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, outAddr, builder_.getInt64(esz)});
+        } else {
+            auto* fn = declareC("bz_llist_pop_last",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, outAddr, builder_.getInt64(esz)});
+        }
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "lltrypop.r");
+        phi->addIncoming(builder_.getTrue(), foundBB);
+        phi->addIncoming(builder_.getFalse(), preBB);
+        return phi;
+    }
+    // --- RemoveFirst() ---
+    if (m == "RemoveFirst" && call.args.empty()) {
+        // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
+        // Interface elements now produce a non-null disposerThunk via ClassOwned.
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_remove_first", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, disp});
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- RemoveLast() ---
+    if (m == "RemoveLast" && call.args.empty()) {
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_remove_last", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, disp});
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- RemoveNode(node) ---
+    if (m == "RemoveNode" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* node = lowerExpr(*call.args[0].value);
+        if (!node) return nullptr;
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_remove_node", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, node, disp});
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- Find(item): LinkedListNode<T>? ---
+    // fix #566 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
+    // raw element bytes, comparing bz_string* pointer values (not content) for
+    // string elements and raw pointer bytes for records with string fields.
+    // Mirror the #562 fix for LinkedList<T>.Contains: walk node-by-node applying
+    // emitRemoveElementEquality for per-element comparison, then return the
+    // matching node pointer (LinkedListNode<T>?) — null if no match found.
+    // No disposal: Find only borrows elements (§4.6, LinkedList<T> is non-owning).
+    if (m == "Find" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
+        const sema::TypeRef* elemRef = llElemRef;
+        // Spill the search target to a stable alloca slot.
+        llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, tgtSlot);
+        // nodeSlot: current node pointer during the walk.
+        llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+        // foundNodeSlot: the matching node pointer, null if not found.
+        llvm::AllocaInst* foundNodeSlot = entryAlloca(ptrTy());
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        builder_.CreateStore(nullP, foundNodeSlot);
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        auto* nextFn  = declareC("bz_llist_node_next",  ptrTy(), {ptrTy()});
+        auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "llf.first");
+        builder_.CreateStore(firstNode, nodeSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "llf.c",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llf.b",  currentFn_);
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "llf.m",  currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llf.n",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "llf.e",  currentFn_);
+        builder_.CreateBr(condBB);
+        // Loop header: exit when node == null.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot, "llf.cur");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(curNode, nullP, "llf.nnull"),
+            bodyBB, endBB);
+        // Loop body: load element, test structural equality.
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llf.vp");
+        llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llf.el");
+        llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llf.tgt");
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, llElemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, matchBB, nextBB);
+        // Match: save the node pointer and exit the loop.
+        builder_.SetInsertPoint(matchBB);
+        builder_.CreateStore(curNode, foundNodeSlot);
+        builder_.CreateBr(endBB);
+        // No match: advance to next node.
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode}, "llf.next");
+        builder_.CreateStore(nxt, nodeSlot);
+        builder_.CreateBr(condBB);
+        // Return the matching node pointer (null if not found) — LinkedListNode<T>?.
+        builder_.SetInsertPoint(endBB);
+        return builder_.CreateLoad(ptrTy(), foundNodeSlot, "llf.result");
+    }
+    // --- Count (no-arg call form, e.g. l.Count()) → int ---
+    if (m == "Count" && call.args.empty()) {
+        auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(fn, {recv}, "ll.cnt");
+        return builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
+    }
+    // --- Clear() --- disposes all elements (OwningLinkedList) and frees all
+    // nodes, then re-allocates an empty list. Simplest: remove all from front.
+    // We implement by calling bz_llist_free then re-alloc would break existing
+    // pointer. Instead: walk and free each node via remove_first repeatedly.
+    // Cleanest: add bz_llist_clear to runtime. For now, implement as a loop.
+    if (m == "Clear" && call.args.empty()) {
+        // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
+        // Interface elements now produce a non-null disposerThunk via ClassOwned.
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        // Loop: while (first_node != null) remove_first.
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "ll.clr.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ll.clr.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ll.clr.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "ll.first");
+        llvm::Value* notNull = builder_.CreateICmpNE(
+            firstNode, llvm::ConstantPointerNull::get(ptrTy()), "ll.notNull");
+        builder_.CreateCondBr(notNull, bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        auto* remFn = declareC("bz_llist_remove_first",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(remFn, {recv, disp});
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- Remove(item): bool — per §4.6/§4.3 IOwningCollection ---
+    // fix #565 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
+    // raw element bytes, comparing bz_string* pointer values (not content) for
+    // string elements and raw pointer bytes for records with string fields.
+    // Mirror the #562 fix for LinkedList<T>.Contains: walk node-by-node applying
+    // emitRemoveElementEquality for per-element comparison, then call
+    // bz_llist_remove_node on the matching node (unlinks + optionally disposes).
+    // Ownership semantics are preserved: OwningLinkedList passes its disposer;
+    // non-owning LinkedList passes null (§4.6, borrows — no element disposal).
+    if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
+        const sema::TypeRef* elemRef = llElemRef;
+        // Spill the search target to a stable alloca slot.
+        llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, tgtSlot);
+        // nodeSlot: current node pointer during the walk.
+        llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+        // foundNodeSlot: the node pointer saved when a match is found.
+        llvm::AllocaInst* foundNodeSlot = entryAlloca(ptrTy());
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        builder_.CreateStore(nullP, foundNodeSlot);
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        auto* nextFn  = declareC("bz_llist_node_next",  ptrTy(), {ptrTy()});
+        auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "llr.first");
+        builder_.CreateStore(firstNode, nodeSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "llr.c",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llr.b",  currentFn_);
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "llr.m",  currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llr.n",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "llr.e",  currentFn_);
+        builder_.CreateBr(condBB);
+        // Loop header: exit when node == null OR a match was stored.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot, "llr.cur");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(curNode, nullP, "llr.nnull"),
+            bodyBB, endBB);
+        // Loop body: load element, test equality.
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llr.vp");
+        llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llr.el");
+        llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llr.tgt");
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, llElemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, matchBB, nextBB);
+        // Match: save the node pointer and exit the loop.
+        builder_.SetInsertPoint(matchBB);
+        builder_.CreateStore(curNode, foundNodeSlot);
+        builder_.CreateBr(endBB);
+        // No match: advance to next node.
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode}, "llr.next");
+        builder_.CreateStore(nxt, nodeSlot);
+        builder_.CreateBr(condBB);
+        // After loop: check if a match was found (foundNodeSlot != null).
+        builder_.SetInsertPoint(endBB);
+        llvm::Value* foundNode = builder_.CreateLoad(ptrTy(), foundNodeSlot,
+                                                     "llr.fnd");
+        llvm::Value* found = builder_.CreateICmpNE(foundNode, nullP, "llr.found");
+        // If found, call RemoveNode (which unlinks + optionally disposes).
+        // OwningLinkedList disposes the element; LinkedList borrows, no disposal.
+        // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk from policy
+        // hoist.  Interface elements now produce a non-null disposerThunk.
+        llvm::Function* elemDisp =
+            isOwning ? llElemPol.disposerThunk : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* remBB  = llvm::BasicBlock::Create(llvm_, "llr.rem", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "llr.cont", currentFn_);
+        builder_.CreateCondBr(found, remBB, contBB);
+        builder_.SetInsertPoint(remBB);
+        auto* remFn = declareC("bz_llist_remove_node",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(remFn, {recv, foundNode, disp});
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        // Return i1 bool — the branch condition MUST be i1 (M3 fix).
+        return found;
+    }
+    // --- Contains(item): bool — node-walk with structural equality ---
+    // fix #562 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
+    // raw element bytes, comparing bz_string* pointer values (not content) for
+    // string elements and raw pointer bytes for records with string fields.
+    // Mirror the #560 fix for `x in LinkedList<T>`: walk node-by-node applying
+    // emitRemoveElementEquality so that string content equality (§4.6) and
+    // record structural equality (§8.3/§9.1) are correctly observed.
+    if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
+        const sema::TypeRef* elemRef = llElemRef;
+        // Spill the search target to a stable alloca slot (same pattern as the
+        // `in` operator LinkedList path in LlvmBackend_Exprs.cpp §2764).
+        llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, tgtSlot);
+        llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        auto* nextFn  = declareC("bz_llist_node_next",  ptrTy(), {ptrTy()});
+        auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "llc.first");
+        builder_.CreateStore(firstNode, nodeSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "llc.c",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llc.b",  currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "llc.f",  currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llc.n",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "llc.e",  currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot, "llc.cur");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(curNode, nullP, "llc.nnull"),
+            bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llc.vp");
+        llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llc.el");
+        llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llc.tgt");
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, llElemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode}, "llc.next");
+        builder_.CreateStore(nxt, nodeSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "llc.result");
+        phi->addIncoming(builder_.getTrue(),  foundBB);
+        phi->addIncoming(builder_.getFalse(), condBB);
+        return phi;
+    }
+    return nullptr;
+}
+
+
+// §4.15 (#549): lower Array<T>.AsSpan()/AsReadOnlySpan() constructor overloads
+// and ArraySpan<T>/ReadOnlyArraySpan<T> instance method calls.
+//
+// LLVM representation: { ptr source, i32 start, i32 length }
+//   source — the underlying bz_array_t* pointer (borrowed; never freed by the span)
+//   start  — the offset into the array (first element of the view)
+//   length — the number of elements in the view
+//
+// The span is a by-value record (no heap allocation).  Disposing the span does
+// NOT free the source array.  Per §4.15: "The `Source` field carries a borrow
+// of the array; per the borrow-bearing-record rule, the span's lifetime is
+// bounded by the source's lifetime."
+//
+// Overloads:
+//   AsSpan()                  → ArraySpan<T>(arr, 0, arr.Count)
+//   AsSpan(start)             → ArraySpan<T>(arr, start, arr.Count - start)
+//   AsSpan(start, length)     → ArraySpan<T>(arr, start, length)
+//   AsReadOnlySpan()          → ReadOnlyArraySpan<T>(arr, 0, arr.Count)
+//   … (same pattern for AsReadOnlySpan overloads)
+//
+// Instance methods implemented here:
+//   Length        → load field 2 (i32), sext to i32 (already i32)
+//   IsEmpty       → Length == 0
+//   Slice(s,l)    → build new span(Source, Start+s, l)
+//   AsReadOnly()  → build ReadOnlyArraySpan with same (Source, Start, Length)
+//   IndexOf(v)    → linear scan from Start to Start+Length; return first match
+//   Contains(v)   → IndexOf(v) >= 0
+//   Fill(v)       → write v into every slot (ArraySpan only)
+//   CopyFrom(src) → copy src slots into this span's slots (ArraySpan only)
+//   CopyTo(dst)   → copy this span's slots into dst (both span types)
+//   Reverse()     → reverse elements in place (ArraySpan only)
+//   SequenceEqual → compare pairwise
+//
+// Deferred (not implemented in this slice; guarded by a clean diagnostic):
+//   <none – all declared members are implemented or emit a clear error>
+//
+// The span indexer get (`span[i]`) and set (`span[i] := v`) are handled in
+// lowerCollectionIndexerGet / lowerCollectionIndexerSet in LlvmBackend_Assign.cpp.
+// The for-in loop (`for var x in span`) is handled in LlvmBackend_Stmts.cpp.
+llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        recvTy->declaration)
+        return nullptr;
+    if (!recvTy->astNode || !recvTy->astNode->name ||
+        recvTy->astNode->name->parts.empty())
+        return nullptr;
+    std::string_view rcn = recvTy->astNode->name->parts[0];
+
+    // §3.3 (#883): ReadOnlyStringSpan instance methods (call form). The struct is
+    // {string-ptr, i32 start, i32 length}; Length/IsEmpty are field reads and
+    // Slice reconstructs a sub-view. The indexer is handled in
+    // lowerCollectionIndexerGet (loadCodePoint); the search methods
+    // (IndexOf/Contains/StartsWith/EndsWith/SequenceEqual) are deferred — sema
+    // rejects them, so they never reach here.
+    if (rcn == "ReadOnlyStringSpan") {
+        llvm::Value* spanVal = lowerExpr(*ma->target);
+        if (!spanVal) return nullptr;
+        auto* spanSt = arraySpanStructType();
+        auto* spanSlot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, spanSlot);
+        auto fSrc = [&] { return builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 0), "ss.src"); };
+        auto fBase = [&] { return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 1), "ss.st"); };
+        auto fLen = [&] { return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 2), "ss.len"); };
+        if (m == "Length" && call.args.empty()) return fLen();
+        if (m == "IsEmpty" && call.args.empty())
+            return builder_.CreateICmpEQ(fLen(), builder_.getInt32(0), "ss.empty");
+        if (m == "Slice" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* st = lowerExpr(*call.args[0].value);
+            llvm::Value* sl = lowerExpr(*call.args[1].value);
+            if (!st || !sl) return nullptr;
+            if (!st->getType()->isIntegerTy(32))
+                st = builder_.CreateTrunc(st, i32());
+            if (!sl->getType()->isIntegerTy(32))
+                sl = builder_.CreateTrunc(sl, i32());
+            llvm::Value* b = fBase();
+            llvm::Value* L = fLen();
+            emitGuardThrow(builder_.CreateOr(
+                builder_.CreateICmpSLT(st, builder_.getInt32(0)),
+                builder_.CreateICmpSGT(st, L)), "IndexOutOfRangeException");
+            llvm::Value* avail = builder_.CreateSub(L, st);
+            emitGuardThrow(builder_.CreateOr(
+                builder_.CreateICmpSLT(sl, builder_.getInt32(0)),
+                builder_.CreateICmpSGT(sl, avail)), "IndexOutOfRangeException");
+            return buildArraySpan(fSrc(), builder_.CreateAdd(b, st), sl);
+        }
+        return nullptr;
+    }
+
+    // Helper: get the element size for a span over Array<T>.
+    // Uses recvTy->genericArgs[0] (the element type T of the span).
+    auto spanElemSize = [&]() -> int64_t {
+        if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return 8;
+        return collectionElemSize(recvTy);
+    };
+    auto spanElemTy = [&]() -> llvm::Type* {
+        if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return i32();
+        llvm::Type* t = lowerTypeRef(recvTy->genericArgs[0]);
+        return t ? t : i32();
+    };
+
+    // -----------------------------------------------------------------------
+    // Array<T>.AsSpan() / AsReadOnlySpan() — construct a span from an array.
+    // §4.14 / #636: OwningBuffer<T> uses the same bz_array_t* backing as
+    // Array<T>, so OwningBuffer<T>.AsSpan() / AsReadOnlySpan() lower identically.
+    // The resulting span struct is { ptr source, i32 start, i32 length } —
+    // the same bz.arrayspan used for ArraySpan<T> / ReadOnlyArraySpan<T>.
+    // Previously a duplicate path in tryLowerSerializationCall handled only
+    // the byte-element case and lacked bounds checks; delegating here closes
+    // that gap and gives a single, element-width–correct lowering for all T.
+    // -----------------------------------------------------------------------
+    if ((rcn == "Array" || rcn == "OwningBuffer") &&
+        (m == "AsSpan" || m == "AsReadOnlySpan")) {
+        // The span element type and size are those of the array (genericArgs[0]).
+        llvm::Value* arr = lowerExpr(*ma->target);
+        if (!arr) return nullptr;
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "arr.count");
+        llvm::Value* count = builder_.CreateTrunc(count64, i32(), "arr.count32");
+        // No-arg form: full array [0, Count)
+        if (call.args.empty()) {
+            return buildArraySpan(arr, builder_.getInt32(0), count);
+        }
+        // §4.14 (#746 R41-J): AsSpan(r: Range<int>) — Start = r.Start, Length =
+        // the range's element count (End - Start + 1 inclusive, End - Start
+        // half-open). Previously the Range fell into the (start) form below,
+        // which read only its low bound and set Length = Count - Start, ignoring
+        // the End entirely (and never bounds-checking it).
+        if (call.args.size() == 1 && call.args[0].value &&
+            isRangeType(ctx_.exprType(*call.args[0].value))) {
+            llvm::Value* rv = lowerExpr(*call.args[0].value);
+            if (!rv || !rv->getType()->isStructTy()) return nullptr;
+            llvm::Value* lo = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {0u}), i32(), "sp.r.lo");
+            llvm::Value* hi = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {1u}), i32(), "sp.r.hi");
+            llvm::Value* incl = builder_.CreateTrunc(
+                builder_.CreateExtractValue(rv, {3u}), i1(), "sp.r.incl");
+            llvm::Value* span0 = builder_.CreateSub(hi, lo, "sp.r.span");
+            llvm::Value* len = builder_.CreateSelect(
+                incl, builder_.CreateAdd(span0, builder_.getInt32(1)), span0,
+                "sp.r.len");
+            // bounds: Start ∈ [0, Count], len ≥ 0, Start+len ∈ [0, Count].
+            llvm::Value* startNeg =
+                builder_.CreateICmpSLT(lo, builder_.getInt32(0));
+            llvm::Value* lenNeg =
+                builder_.CreateICmpSLT(len, builder_.getInt32(0));
+            llvm::Value* endOOB =
+                builder_.CreateICmpSGT(builder_.CreateAdd(lo, len), count);
+            emitGuardThrow(
+                builder_.CreateOr(builder_.CreateOr(startNeg, lenNeg), endOOB),
+                "IndexOutOfRangeException");
+            return buildArraySpan(arr, lo, len);
+        }
+        // (start) form: [start, Count)
+        if (call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* start = lowerExpr(*call.args[0].value);
+            if (!start) return nullptr;
+            if (!start->getType()->isIntegerTy(32))
+                start = builder_.CreateTrunc(start, i32());
+            // bounds check: start must be in [0, Count]
+            llvm::Value* startNeg = builder_.CreateICmpSLT(
+                start, builder_.getInt32(0), "span.stneg");
+            llvm::Value* startOOB = builder_.CreateICmpSGT(
+                start, count, "span.stoob");
+            emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                           "IndexOutOfRangeException");
+            llvm::Value* len = builder_.CreateSub(count, start, "span.len");
+            return buildArraySpan(arr, start, len);
+        }
+        // (start, length) form — also handles Range<int> (deferred; treat as 2-arg)
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* start = lowerExpr(*call.args[0].value);
+            llvm::Value* len   = lowerExpr(*call.args[1].value);
+            if (!start || !len) return nullptr;
+            if (!start->getType()->isIntegerTy(32))
+                start = builder_.CreateTrunc(start, i32());
+            if (!len->getType()->isIntegerTy(32))
+                len = builder_.CreateTrunc(len, i32());
+            // bounds check: start ∈ [0, Count], len ∈ [0, Count-start]
+            llvm::Value* startNeg = builder_.CreateICmpSLT(
+                start, builder_.getInt32(0));
+            llvm::Value* startOOB = builder_.CreateICmpSGT(start, count);
+            emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                           "IndexOutOfRangeException");
+            llvm::Value* avail = builder_.CreateSub(count, start);
+            llvm::Value* lenNeg  = builder_.CreateICmpSLT(
+                len, builder_.getInt32(0));
+            llvm::Value* lenOOB  = builder_.CreateICmpSGT(len, avail);
+            emitGuardThrow(builder_.CreateOr(lenNeg, lenOOB),
+                           "IndexOutOfRangeException");
+            return buildArraySpan(arr, start, len);
+        }
+        return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // ArraySpan<T> / ReadOnlyArraySpan<T> (§4.15, borrowing) and
+    // Span<T> / ReadOnlySpan<T> (§4.14, owning over OwningBuffer) instance method
+    // calls. All four share the bz.arrayspan layout, so the read-only / value
+    // surface (Length, IsEmpty, Slice, IndexOf, Contains, SequenceEqual,
+    // AsReadOnly, CopyTo, CopyFrom, Fill, Reverse) lowers identically. The owning
+    // Span<classT> additionally exposes Clear / MoveFrom / MoveTo (§4.14).
+    // -----------------------------------------------------------------------
+    if (rcn != "ArraySpan" && rcn != "ReadOnlyArraySpan" &&
+        rcn != "Span" && rcn != "ReadOnlySpan") return nullptr;
+    bool isWritable   = (rcn == "ArraySpan" || rcn == "Span");
+    bool isOwningSpan = (rcn == "Span");
+
+    llvm::Value* spanVal = lowerExpr(*ma->target);
+    if (!spanVal) return nullptr;
+
+    // Spill the span value to an alloca once so repeated GEPs are stable.
+    auto* spanSt = arraySpanStructType();
+    auto* spanSlot = entryAlloca(spanSt);
+    builder_.CreateStore(spanVal, spanSlot);
+    auto loadSource = [&]() {
+        return builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 0), "sp.src");
+    };
+    auto loadStart = [&]() {
+        return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 1), "sp.st");
+    };
+    auto loadLen = [&]() {
+        return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 2), "sp.len");
+    };
+
+    // #602 / §28.11 v0.134: hoist one element-slot policy lookup for ArraySpan
+    // operations that need per-element equality (IndexOf / Contains /
+    // SequenceEqual). Spans are always in the borrowing family (they never own
+    // elements — §4.15: "the span's lifetime is bounded by the source").
+    const sema::TypeRef* spanElemRef =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+    const ElementPolicy spanElemPol =
+        elementPolicyFor(spanElemRef, /*owningFamily=*/false);
+    // spanElemIsClass: class-or-interface element — per §28.11 v0.135 fix #619.
+    // elementPolicyFor returns ClassBorrow for interface elements (spans are always
+    // borrowing — §4.15). collectionElemIsClass is also widened.
+    bool spanElemIsClass =
+        spanElemPol.cat == ElementPolicy::Category::ClassOwned ||
+        spanElemPol.cat == ElementPolicy::Category::ClassBorrow;
+
+    // -- Length / IsEmpty -------------------------------------------------------
+    if (m == "Length" && call.args.empty()) {
+        return loadLen();  // i32
+    }
+    if (m == "IsEmpty" && call.args.empty()) {
+        return builder_.CreateICmpEQ(loadLen(), builder_.getInt32(0), "sp.empty");
+    }
+
+    // -- Slice(start: int, length: int) ----------------------------------------
+    if (m == "Slice" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        llvm::Value* start = lowerExpr(*call.args[0].value);
+        llvm::Value* slen2 = lowerExpr(*call.args[1].value);
+        if (!start || !slen2) return nullptr;
+        if (!start->getType()->isIntegerTy(32))
+            start = builder_.CreateTrunc(start, i32());
+        if (!slen2->getType()->isIntegerTy(32))
+            slen2 = builder_.CreateTrunc(slen2, i32());
+        // bounds check against this span's length
+        llvm::Value* startNeg = builder_.CreateICmpSLT(start, builder_.getInt32(0));
+        llvm::Value* startOOB = builder_.CreateICmpSGT(start, slen);
+        emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* avail = builder_.CreateSub(slen, start);
+        llvm::Value* slen2Neg = builder_.CreateICmpSLT(slen2, builder_.getInt32(0));
+        llvm::Value* slen2OOB = builder_.CreateICmpSGT(slen2, avail);
+        emitGuardThrow(builder_.CreateOr(slen2Neg, slen2OOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* newStart = builder_.CreateAdd(base, start, "sl.newst");
+        return buildArraySpan(src, newStart, slen2);
+    }
+
+    // -- AsReadOnly(): ArraySpan<T> → ReadOnlyArraySpan<T> -------------------
+    if (m == "AsReadOnly" && isWritable && call.args.empty()) {
+        // Same bit pattern; the type distinction is static only (§4.15).
+        return spanVal;  // struct value is identical for both span types
+    }
+
+    // -- IndexOf(value: T) → int -----------------------------------------------
+    if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        // idx32 = 0; loop while idx32 < slen
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "iof.f", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iof.n", currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "iof.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "iof.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()), "iof.ai");
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+            {src, absIdx, builder_.getInt64(esz)}, "iof.ep");
+        llvm::Value* el = builder_.CreateLoad(ety, ep, "iof.el");
+        // #602 / §28.11 v0.134: spanElemRef and spanElemIsClass from policy hoist.
+        llvm::Value* eq = emitRemoveElementEquality(el, v,
+            spanElemRef, spanElemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+        builder_.SetInsertPoint(nextBB);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i32(), 2, "iof.r");
+        phi->addIncoming(idx32, foundBB);  // found: return current local index
+        phi->addIncoming(builder_.getInt32(-1), condBB);  // not found: -1
+        return phi;
+    }
+
+    // -- Contains(value: T) → bool ---------------------------------------------
+    if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+        // Reuse IndexOf: Contains = IndexOf >= 0
+        // Build a synthetic IndexOf call result by inlining the same logic.
+        // (Sharing code with the IndexOf path above would require factoring; for
+        // clarity we simply check IndexOf's result here via an inline call.)
+        // Re-enter tryLowerArraySpanCall with a temporary CallExpr? — too complex.
+        // Instead, just inline: emit IndexOf and compare.
+        // (This means two code-size copies, but both are inlined; acceptable.)
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "cnt.c", currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "cnt.b", currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "cnt.f", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "cnt.n", currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "cnt.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "cnt.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+            {src, absIdx, builder_.getInt64(esz)});
+        llvm::Value* el = builder_.CreateLoad(ety, ep);
+        // #602 / §28.11 v0.134: spanElemRef and spanElemIsClass from policy hoist.
+        llvm::Value* eq = emitRemoveElementEquality(el, v,
+            spanElemRef, spanElemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+        builder_.SetInsertPoint(nextBB);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "cnt.r");
+        phi->addIncoming(builder_.getTrue(),  foundBB);
+        phi->addIncoming(builder_.getFalse(), condBB);
+        return phi;
+    }
+
+    // -- Fill(value: T) — ArraySpan<T> only ------------------------------------
+    if (m == "Fill" && isWritable &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        int64_t esz = spanElemSize();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "fill.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "fill.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "fill.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "fill.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+            {src, absIdx, builder_.getInt64(esz)});
+        builder_.CreateStore(v, ep);  // opaque ptr; store writes ety bytes
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- CopyTo(destination: ArraySpan<T>) — both span types ------------------
+    // -- CopyFrom(source: ReadOnlyArraySpan<T>) — ArraySpan<T> only ----------
+    if ((m == "CopyTo" || (m == "CopyFrom" && isWritable)) &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+        if (!otherVal) return nullptr;
+        // Spill the other span to an alloca.
+        auto* otherSlot = entryAlloca(spanSt);
+        builder_.CreateStore(otherVal, otherSlot);
+        llvm::Value* dstSrc  = nullptr, *dstBase = nullptr, *dstLen = nullptr;
+        llvm::Value* srcSrc  = nullptr, *srcBase = nullptr, *srcLen = nullptr;
+        if (m == "CopyTo") {
+            // copy THIS → dst (other)
+            srcSrc  = loadSource(); srcBase = loadStart(); srcLen = loadLen();
+            dstSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            dstBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            dstLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        } else {
+            // CopyFrom: copy other (src) → THIS (dst)
+            dstSrc  = loadSource(); dstBase = loadStart(); dstLen = loadLen();
+            srcSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            srcBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            srcLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        }
+        // lengths must match (§4.15 "lengths must match, else ArgumentException")
+        emitGuardThrow(builder_.CreateICmpNE(srcLen, dstLen),
+                       "ArgumentException");
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "cpy.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cpy.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "cpy.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "cpy.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, srcLen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* si = builder_.CreateAdd(
+            builder_.CreateSExt(srcBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* di = builder_.CreateAdd(
+            builder_.CreateSExt(dstBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* sp = builder_.CreateCall(ptrAtFn,
+            {srcSrc, si, builder_.getInt64(esz)});
+        llvm::Value* dp = builder_.CreateCall(ptrAtFn,
+            {dstSrc, di, builder_.getInt64(esz)});
+        llvm::Value* val = builder_.CreateLoad(ety, sp);
+        builder_.CreateStore(val, dp);  // opaque ptr
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- Reverse() — ArraySpan<T> only ----------------------------------------
+    if (m == "Reverse" && isWritable && call.args.empty()) {
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "sprev.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sprev.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "sprev.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "rv.i");
+        llvm::Value* half  = builder_.CreateSDiv(slen, builder_.getInt32(2));
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, half), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* j = builder_.CreateSub(
+            builder_.CreateSub(slen, idx32), builder_.getInt32(1));
+        llvm::Value* ai = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* aj = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(j, i64()));
+        llvm::Value* pa = builder_.CreateCall(ptrAtFn,
+            {src, ai, builder_.getInt64(esz)});
+        llvm::Value* pb = builder_.CreateCall(ptrAtFn,
+            {src, aj, builder_.getInt64(esz)});
+        llvm::Value* ta = builder_.CreateLoad(ety, pa);
+        llvm::Value* tb = builder_.CreateLoad(ety, pb);
+        builder_.CreateStore(tb, pa);  // opaque ptrs
+        builder_.CreateStore(ta, pb);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- SequenceEqual(other: ArraySpan<T> | ReadOnlyArraySpan<T>) → bool -----
+    if (m == "SequenceEqual" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+        if (!otherVal) return nullptr;
+        auto* otherSlot = entryAlloca(spanSt);
+        builder_.CreateStore(otherVal, otherSlot);
+        llvm::Value* aLen = loadLen();
+        llvm::Value* bLen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, otherSlot, 2), "se.blen");
+        // Fast-path: different lengths → false.
+        auto* fastFalse = llvm::BasicBlock::Create(llvm_, "se.ff", currentFn_);
+        auto* loopEntry = llvm::BasicBlock::Create(llvm_, "se.le", currentFn_);
+        auto* condBB    = llvm::BasicBlock::Create(llvm_, "se.c",  currentFn_);
+        auto* bodyBB    = llvm::BasicBlock::Create(llvm_, "se.b",  currentFn_);
+        auto* neqBB     = llvm::BasicBlock::Create(llvm_, "se.ne", currentFn_);
+        auto* incBB     = llvm::BasicBlock::Create(llvm_, "se.i",  currentFn_);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "se.e",  currentFn_);
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(aLen, bLen), fastFalse, loopEntry);
+        builder_.SetInsertPoint(fastFalse);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(loopEntry);
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        // Compute src/start pointers here (in loopEntry) BEFORE the branch to
+        // condBB so that no instructions are inserted after a terminator.
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* aSrc  = loadSource();
+        llvm::Value* aBase = loadStart();
+        llvm::Value* bSrc  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, otherSlot, 0));
+        llvm::Value* bBase = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, otherSlot, 1));
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "se.idx");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, aLen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* ai = builder_.CreateAdd(
+            builder_.CreateSExt(aBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* bi = builder_.CreateAdd(
+            builder_.CreateSExt(bBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* ap = builder_.CreateCall(ptrAtFn,
+            {aSrc, ai, builder_.getInt64(esz)});
+        llvm::Value* bp = builder_.CreateCall(ptrAtFn,
+            {bSrc, bi, builder_.getInt64(esz)});
+        llvm::Value* aEl = builder_.CreateLoad(ety, ap);
+        llvm::Value* bEl = builder_.CreateLoad(ety, bp);
+        // #602 / §28.11 v0.134: spanElemRef and spanElemIsClass from policy hoist.
+        llvm::Value* eq = emitRemoveElementEquality(aEl, bEl,
+            spanElemRef, spanElemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, incBB, neqBB);
+        builder_.SetInsertPoint(neqBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(incBB);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "se.r");
+        phi->addIncoming(builder_.getFalse(), fastFalse);
+        phi->addIncoming(builder_.getFalse(), neqBB);
+        phi->addIncoming(builder_.getTrue(),  condBB);
+        return phi;
+    }
+
+    // -- Clear() — owning Span<classT> only (§4.14) ---------------------------
+    // Dispose every owned element and leave each slot NULL (moved-from), so the
+    // underlying OwningBuffer's scope-end disposal skips them (no double-free).
+    if (m == "Clear" && isOwningSpan && call.args.empty()) {
+        llvm::Function* disp =
+            elementPolicyFor(spanElemRef, /*owningFamily=*/true).disposerThunk;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* setDispFn = declareC("bz_array_set_disposing",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+        auto* setFn = declareC("bz_array_set",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
+        auto* nullSlot = entryAlloca(ety);
+        builder_.CreateStore(llvm::Constant::getNullValue(ety), nullSlot);
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "spclr.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "spclr.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "spclr.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "clr.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* ai = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        // dispose-then-null (bz_array_set_disposing reads the old slot, disposes
+        // it if non-null, then stores the new value — here NULL).
+        if (disp)
+            builder_.CreateCall(setDispFn,
+                {src, ai, nullSlot, builder_.getInt64(esz), disp});
+        else
+            builder_.CreateCall(setFn, {src, ai, nullSlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- MoveFrom(source: Span<T>) / MoveTo(destination: Span<T>) -------------
+    // owning Span<classT> only (§4.14): move ownership slot-by-slot. The dest's
+    // previously-owned element is disposed before the moved owner is stored; the
+    // source slot is left NULL (moved-from). Lengths must match.
+    if ((m == "MoveFrom" || m == "MoveTo") && isOwningSpan &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+        if (!otherVal) return nullptr;
+        auto* otherSlot = entryAlloca(spanSt);
+        builder_.CreateStore(otherVal, otherSlot);
+        llvm::Value *srcSrc, *srcBase, *srcLen, *dstSrc, *dstBase, *dstLen;
+        if (m == "MoveTo") {                 // this(src) → other(dst)
+            srcSrc = loadSource(); srcBase = loadStart(); srcLen = loadLen();
+            dstSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            dstBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            dstLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        } else {                             // MoveFrom: other(src) → this(dst)
+            dstSrc = loadSource(); dstBase = loadStart(); dstLen = loadLen();
+            srcSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            srcBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            srcLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        }
+        emitGuardThrow(builder_.CreateICmpNE(srcLen, dstLen), "ArgumentException");
+        llvm::Function* disp =
+            elementPolicyFor(spanElemRef, /*owningFamily=*/true).disposerThunk;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* setDispFn = declareC("bz_array_set_disposing",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+        auto* setFn = declareC("bz_array_set",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
+        auto* nullSlot = entryAlloca(ety);
+        builder_.CreateStore(llvm::Constant::getNullValue(ety), nullSlot);
+        auto* valSlot = entryAlloca(ety);
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "spmv.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "spmv.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "spmv.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "mv.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, srcLen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* si = builder_.CreateAdd(
+            builder_.CreateSExt(srcBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* di = builder_.CreateAdd(
+            builder_.CreateSExt(dstBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        // read the moved element out of the source slot
+        llvm::Value* sp = builder_.CreateCall(ptrAtFn,
+            {srcSrc, si, builder_.getInt64(esz)});
+        llvm::Value* v = builder_.CreateLoad(ety, sp, "mv.v");
+        builder_.CreateStore(v, valSlot);
+        // dispose displaced dest, then store the moved owner
+        if (disp)
+            builder_.CreateCall(setDispFn,
+                {dstSrc, di, valSlot, builder_.getInt64(esz), disp});
+        else
+            builder_.CreateCall(setFn, {dstSrc, di, valSlot, builder_.getInt64(esz)});
+        // leave the source slot moved-from (NULL)
+        builder_.CreateCall(setFn, {srcSrc, si, nullSlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // §4.15 (#1358): byte-buffer accessors — Read*/TryRead*/Write*/TryWrite*
+    // for all four span types (ArraySpan/ReadOnlyArraySpan/Span/ReadOnlySpan)
+    // when the element type is `byte`.  Methods operate from the start of the
+    // span (no offset parameter — callers use .Slice() to position; stdlib §4.15).
+    //
+    // Names: {Try}{Read|Write}{Int16|UInt16|Int32|UInt32|Int64|UInt64|
+    //                          Float|Double}{LittleEndian|BigEndian}
+    if (spanElemRef &&
+        spanElemRef->kind == sema::TypeRef::Kind::Primitive &&
+        spanElemRef->primitive == sema::PrimitiveType::Byte) {
+        std::string_view mv(m);
+        bool isTry  = mv.starts_with("Try");
+        std::string_view op = isTry ? mv.substr(3) : mv;
+        bool isRead  = op.starts_with("Read");
+        bool isWrite = op.starts_with("Write");
+        if ((isRead || isWrite) &&
+            (op.ends_with("LittleEndian") || op.ends_with("BigEndian"))) {
+            bool isBE    = op.ends_with("BigEndian");
+            std::string_view inner = isWrite ? op.substr(5) : op.substr(4);
+            // Map method name → LLVM integer type + byte width.
+            int byteWidth = 0;
+            llvm::Type* intTy   = nullptr;
+            bool        isFloat = false;
+            if      (inner.starts_with("Int16")  || inner.starts_with("UInt16"))
+                { byteWidth = 2; intTy = llvm::Type::getInt16Ty(llvm_); }
+            else if (inner.starts_with("Int32")  || inner.starts_with("UInt32"))
+                { byteWidth = 4; intTy = i32(); }
+            else if (inner.starts_with("Float"))
+                { byteWidth = 4; intTy = i32();  isFloat = true; }
+            else if (inner.starts_with("Int64")  || inner.starts_with("UInt64"))
+                { byteWidth = 8; intTy = i64(); }
+            else if (inner.starts_with("Double"))
+                { byteWidth = 8; intTy = i64();  isFloat = true; }
+            if (byteWidth > 0) {
+                // isWritable was already set from rcn above.
+                // Write*/TryWrite* require a writable span (sema enforces this;
+                // we bail silently here if somehow wrong at codegen).
+                if (isWrite && !isWritable) return nullptr;
+
+                llvm::Value* src  = loadSource();
+                llvm::Value* base = loadStart();
+                llvm::Value* slen = loadLen();
+                // Raw byte pointer: bz_array_ptr_at(src, i64(base), 1).
+                auto* ptrAtFn = declareC(
+                    "bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* base64 = builder_.CreateSExt(base, i64());
+                llvm::Value* rawPtr = builder_.CreateCall(
+                    ptrAtFn, {src, base64, builder_.getInt64(1)}, "bba.ptr");
+                llvm::Value* slen64 = builder_.CreateSExt(slen, i64());
+                llvm::Value* wid64  = builder_.getInt64(byteWidth);
+
+                if (!isTry) {
+                    // Non-try variants: throw IndexOutOfRangeException if too short.
+                    emitGuardThrow(
+                        builder_.CreateICmpSLT(slen64, wid64),
+                        "IndexOutOfRangeException");
+                    if (isRead) {
+                        // Load integer value, bswap if BE, bitcast to float/double.
+                        llvm::Value* raw = builder_.CreateLoad(intTy, rawPtr, "bba.raw");
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            raw = builder_.CreateCall(bswapFn, {raw}, "bba.bswap");
+                        }
+                        if (isFloat) {
+                            llvm::Type* fpTy = byteWidth == 4
+                                ? llvm::Type::getFloatTy(llvm_)
+                                : llvm::Type::getDoubleTy(llvm_);
+                            return builder_.CreateBitCast(raw, fpTy, "bba.fp");
+                        }
+                        return raw;
+                    } else {
+                        // Write: for float/double, bitcast the argument to int first.
+                        if (call.args.empty() || !call.args[0].value) return nullptr;
+                        llvm::Value* val = lowerExpr(*call.args[0].value);
+                        if (!val) return nullptr;
+                        if (isFloat) {
+                            val = builder_.CreateBitCast(val, intTy, "bba.fi");
+                        } else {
+                            // Ensure correct bit-width for integer types.
+                            if (val->getType() != intTy) {
+                                if (intTy->getIntegerBitWidth() <
+                                    val->getType()->getIntegerBitWidth())
+                                    val = builder_.CreateTrunc(val, intTy, "bba.trunc");
+                                else
+                                    val = builder_.CreateZExt(val, intTy, "bba.zext");
+                            }
+                        }
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            val = builder_.CreateCall(bswapFn, {val}, "bba.bswap");
+                        }
+                        builder_.CreateStore(val, rawPtr);
+                        return llvm::ConstantInt::get(i32(), 0);  // unit
+                    }
+                } else {
+                    // Try variants: return false (no throw) if span too short.
+                    auto* okBB   = llvm::BasicBlock::Create(llvm_, "bba.ok", currentFn_);
+                    auto* failBB = llvm::BasicBlock::Create(llvm_, "bba.fail", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "bba.end", currentFn_);
+                    llvm::Value* hasRoom =
+                        builder_.CreateICmpSGE(slen64, wid64, "bba.room");
+                    builder_.CreateCondBr(hasRoom, okBB, failBB);
+                    if (isRead) {
+                        // TryRead*(out value: T): bool
+                        // out parameter is call.args[0]
+                        if (call.args.empty() || !call.args[0].value) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
+                        }
+                        llvm::Type* outTy = nullptr;
+                        llvm::Value* outAddr =
+                            lvalueAddr(*call.args[0].value, outTy);
+                        // okBB: load, bswap if BE, bitcast, store to out, jump end
+                        builder_.SetInsertPoint(okBB);
+                        llvm::Value* raw =
+                            builder_.CreateLoad(intTy, rawPtr, "bba.tryraw");
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            raw = builder_.CreateCall(bswapFn, {raw}, "bba.tbswap");
+                        }
+                        llvm::Value* result = raw;
+                        if (isFloat) {
+                            llvm::Type* fpTy = byteWidth == 4
+                                ? llvm::Type::getFloatTy(llvm_)
+                                : llvm::Type::getDoubleTy(llvm_);
+                            result = builder_.CreateBitCast(raw, fpTy, "bba.tfp");
+                        }
+                        if (outAddr) builder_.CreateStore(result, outAddr);
+                        builder_.CreateBr(endBB);
+                        // failBB: store default (0/0.0) to out, jump end
+                        builder_.SetInsertPoint(failBB);
+                        if (outAddr) {
+                            llvm::Type* storeTy = result->getType();
+                            builder_.CreateStore(
+                                llvm::Constant::getNullValue(storeTy), outAddr);
+                        }
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2, "bba.tryres");
+                        phi->addIncoming(builder_.getTrue(),  okBB);
+                        phi->addIncoming(builder_.getFalse(), failBB);
+                        return phi;
+                    } else {
+                        // TryWrite*(value: T): bool
+                        if (call.args.empty() || !call.args[0].value) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
+                        }
+                        llvm::Value* val = lowerExpr(*call.args[0].value);
+                        if (!val) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
+                        }
+                        // okBB: bitcast/bswap, store, return true
+                        builder_.SetInsertPoint(okBB);
+                        llvm::Value* toStore = val;
+                        if (isFloat) {
+                            toStore = builder_.CreateBitCast(val, intTy, "bba.twfi");
+                        } else if (toStore->getType() != intTy) {
+                            if (intTy->getIntegerBitWidth() <
+                                toStore->getType()->getIntegerBitWidth())
+                                toStore = builder_.CreateTrunc(toStore, intTy);
+                            else
+                                toStore = builder_.CreateZExt(toStore, intTy);
+                        }
+                        if (isBE) {
+                            auto* bswapFn = llvm::Intrinsic::getDeclaration(
+                                module_.get(), llvm::Intrinsic::bswap, {intTy});
+                            toStore = builder_.CreateCall(
+                                bswapFn, {toStore}, "bba.twbswap");
+                        }
+                        builder_.CreateStore(toStore, rawPtr);
+                        builder_.CreateBr(endBB);
+                        // failBB: no-op, jump end
+                        builder_.SetInsertPoint(failBB);
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2, "bba.twres");
+                        phi->addIncoming(builder_.getTrue(),  okBB);
+                        phi->addIncoming(builder_.getFalse(), failBB);
+                        return phi;
+                    }
+                }
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// §30.14/§30.15 (#600 phase c): Channel<T> and Domain.Spawn codegen.
+//
+// Handles:
+//   Channel<T>:
+//     NewSender()               → bz_channel_new_sender(ch)        → ptr (ChannelSender<T>)
+//     Send(owned item)          → bz_channel_send(ch, item)        → void
+//     Receive()                 → bz_channel_receive(ch, cce_vtable) → Task/OwningTask<T>
+//     TryReceive(out item)      → bz_channel_try_receive(ch, &slot)  → bool
+//     Count                     → bz_channel_count(ch)             → int
+//     IsClosed                  → bz_channel_is_closed(ch)         → bool
+//     Dispose()                 → bz_channel_dispose(ch, cce_vtable)→ void
+//   ChannelSender<T>:
+//     Send(owned item)          → bz_channel_sender_send(tx, item) → void
+//     Dispose()                 → bz_channel_sender_release(tx, cce_vtable) → void
+//   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable) → OwningTask<R>
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+
+    // Helper: get ChannelClosedException vtable constant (or null if not set up).
+    auto getCCEVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("ChannelClosedException");
+        if (vit == builtinVtable_.end())
+            return llvm::ConstantPointerNull::get(ptrTy());
+        return vit->second;
+    };
+    // v0.174 (#809): ChannelFullException vtable — raised by the sync Send on a
+    // full bounded channel (via bz_exc, like the closed-channel path).
+    auto getCFEVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("ChannelFullException");
+        if (vit == builtinVtable_.end())
+            return llvm::ConstantPointerNull::get(ptrTy());
+        return vit->second;
+    };
+    auto getDFEVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("DomainFaultedException");
+        if (vit == builtinVtable_.end())
+            return llvm::ConstantPointerNull::get(ptrTy());
+        return vit->second;
+    };
+
+    // -----------------------------------------------------------------------
+    // Channel<T> instance methods (receiver type name == "Channel").
+    // -----------------------------------------------------------------------
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isChannel = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                         builtinTypeName(recvTy) == "Channel";
+        if (isChannel) {
+            llvm::Value* ch = lowerExpr(*ma->target);
+            if (!ch) return nullptr;
+
+            // NewSender(): allocate a ChannelSender handle.
+            if (mname == "NewSender" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_new_sender", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {ch}, "ch.newsender");
+            }
+
+            // Send(owned item): transfer ownership of item into the channel.
+            // per fix #634 / §30.15: bz_channel_send now takes cce_vtable and
+            // stores a ChannelClosedException in bz_exc when the channel is
+            // closed; emitPendingCheck() unwinds on that path.
+            if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                // Value types (int/bool/etc.) need to be widened to ptr-size.
+                // We store them as bit-cast void* (uint64 reinterpretation).
+                // For ptr-typed items (class, string) just pass as-is.
+                llvm::Value* itemArg = item;
+                if (item->getType()->isIntegerTy() &&
+                    !item->getType()->isIntegerTy(64)) {
+                    // Zero-extend to i64 then inttoptr.
+                    llvm::Value* ext = builder_.CreateZExt(item, i64(), "send.ext");
+                    itemArg = builder_.CreateIntToPtr(ext, ptrTy(), "send.cast");
+                } else if (item->getType()->isIntegerTy(64)) {
+                    itemArg = builder_.CreateIntToPtr(item, ptrTy(), "send.cast");
+                } else if (!item->getType()->isPointerTy()) {
+                    // double/float: bitcast to i64 then inttoptr.
+                    llvm::Value* bits = builder_.CreateBitCast(item, i64(), "send.bits");
+                    itemArg = builder_.CreateIntToPtr(bits, ptrTy(), "send.cast");
+                }
+                auto* fn = declareC("bz_channel_send",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, itemArg, getCCEVtable(),
+                                         getCFEVtable()});
+                emitPendingCheck();  // per fix #634 / v0.174 #809: bz_exc on closed or full
+                return nullptr;  // void — handled; fallthrough is benign (no symbol match)
+            }
+
+            // Receive(): returns a Task<T> or OwningTask<T>.
+            if (mname == "Receive" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_receive", ptrTy(),
+                                    {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {ch, getCCEVtable()}, "ch.recv");
+            }
+
+            // TryReceive(out owned item: T?) → bool.
+            // The out-var slot was pre-created by ensureOutVarSlots.
+            // fix #667 / §30.15 / stdlib §6.9: value-type payload decode.
+            // The runtime stores value-typed items as inttoptr(zext(val,i64)).
+            // The out-slot for T? is {i8 hasValue; T value} (nullable struct)
+            // for primitive/enum T, or a pointer for class/string T.
+            // We must decode rawItem correctly:
+            //   - struct outEty (nullable value type): ptrtoint → trunc/bitcast
+            //     to inner type, then build {i8=1, innerVal} and store.
+            //   - pointer outEty (class/string): store rawItem directly.
+            if (mname == "TryReceive" && call.args.size() == 1 &&
+                call.args[0].value) {
+                // The out argument's address.
+                llvm::Type* outEty = nullptr;
+                llvm::Value* outSlot = lvalueAddr(*call.args[0].value, outEty);
+                if (!outSlot) {
+                    // Fallback: create a temporary slot.
+                    outSlot = entryAlloca(ptrTy());
+                }
+                // Allocate a ptr-sized slot for the raw item pointer.
+                llvm::AllocaInst* rawSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     rawSlot);
+                auto* fn = declareC("bz_channel_try_receive", i32(),
+                                    {ptrTy(), ptrTy()});
+                llvm::Value* ok = builder_.CreateCall(fn, {ch, rawSlot},
+                                                      "ch.tryrecv");
+                // If ok: decode and copy rawItem into outSlot (the caller's out-var).
+                auto* okBB   = llvm::BasicBlock::Create(llvm_, "tryrecv.ok",
+                                                         currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(llvm_, "tryrecv.cont",
+                                                         currentFn_);
+                llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+                builder_.CreateCondBr(isOk, okBB, contBB);
+                builder_.SetInsertPoint(okBB);
+                llvm::Value* rawItem = builder_.CreateLoad(ptrTy(), rawSlot);
+                // fix #667 / §30.15: decode the stored void* into the out-slot type.
+                // For nullable value types (outEty is a struct) the item was encoded
+                // as inttoptr(zext(T_value, i64)) by the Send lowering above; decode
+                // by ptrtoint + trunc/bitcast to the inner field type, then wrap in
+                // the nullable struct {i8=1, innerVal}.
+                // For pointer types (class, string) the item IS the raw pointer; store
+                // directly (the slot holds a nullable pointer: non-null = has value).
+                if (outEty && outEty->isStructTy()) {
+                    // Nullable value type path.
+                    auto* stTy = llvm::cast<llvm::StructType>(outEty);
+                    llvm::Type* innerTy = stTy->getNumElements() > 1
+                                         ? stTy->getElementType(1)
+                                         : i32();
+                    llvm::Value* asI64 = builder_.CreatePtrToInt(
+                        rawItem, i64(), "tr.i64");
+                    llvm::Value* decoded;
+                    if (innerTy->isDoubleTy()) {
+                        decoded = builder_.CreateBitCast(asI64, innerTy, "tr.dbl");
+                    } else if (innerTy->isFloatTy()) {
+                        llvm::Value* t32 = builder_.CreateTrunc(asI64, i32(), "tr.f32b");
+                        decoded = builder_.CreateBitCast(t32, innerTy, "tr.flt");
+                    } else if (innerTy->isIntegerTy(64)) {
+                        decoded = asI64;
+                    } else if (innerTy->isIntegerTy()) {
+                        decoded = builder_.CreateTrunc(asI64, innerTy, "tr.int");
+                    } else {
+                        // Fallback for unexpected inner types (e.g. record struct):
+                        // store as i64 and let the struct initialiser zero the rest.
+                        decoded = asI64;
+                    }
+                    // Build the nullable struct {i8=1, decoded}.
+                    llvm::Value* nv = llvm::UndefValue::get(stTy);
+                    nv = builder_.CreateInsertValue(
+                        nv,
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u},
+                        "tr.hv");
+                    // Coerce decoded to the exact inner slot type (handles the rare
+                    // case where the truncation produced a slightly wrong width).
+                    if (decoded->getType() != stTy->getElementType(1))
+                        decoded = builder_.CreateIntCast(
+                            decoded, stTy->getElementType(1),
+                            /*isSigned=*/false, "tr.coerce");
+                    nv = builder_.CreateInsertValue(nv, decoded, {1u}, "tr.nv");
+                    builder_.CreateStore(nv, outSlot);
+                } else {
+                    // Pointer type (class, string): rawItem is the object pointer.
+                    builder_.CreateStore(rawItem, outSlot);
+                }
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                return builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
+            }
+
+            // Count → int64.
+            if (mname == "Count" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_count", i64(), {ptrTy()});
+                llvm::Value* c = builder_.CreateCall(fn, {ch}, "ch.count");
+                // Truncate to i32 (Bezel int).
+                return builder_.CreateTrunc(c, i32(), "ch.count.i");
+            }
+
+            // IsClosed → bool.
+            if (mname == "IsClosed" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_is_closed", i32(), {ptrTy()});
+                llvm::Value* r = builder_.CreateCall(fn, {ch}, "ch.isclosed");
+                return builder_.CreateICmpNE(r, builder_.getInt32(0));
+            }
+
+            // Dispose() — explicit dispose of the channel (frees backing struct).
+            // Null the receiver slot after the call so any subsequent
+            // using-var scope-exit reload sees null and skips (§28.2).
+            if (mname == "Dispose" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_dispose",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, getCCEVtable()});
+                if (!checkedDisposal_) {
+                    llvm::Type* slotTy = nullptr;
+                    if (llvm::Value* slot = lvalueAddr(*ma->target, slotTy))
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), slot);
+                }
+                return nullptr;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ChannelSender<T> instance methods (receiver type name == "ChannelSender").
+    // -----------------------------------------------------------------------
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isSender = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(recvTy) == "ChannelSender";
+        if (isSender) {
+            llvm::Value* tx = lowerExpr(*ma->target);
+            if (!tx) return nullptr;
+
+            // Send(owned item): transfer ownership into the channel.
+            // per fix #634 / §30.15: bz_channel_sender_send now takes cce_vtable
+            // and signals ChannelClosedException via bz_exc when closed.
+            // v0.174 (#809): cfe_vtable signals ChannelFullException via bz_exc on
+            // a full bounded channel (the sync Send never blocks).
+            if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                llvm::Value* itemArg = item;
+                if (item->getType()->isIntegerTy() &&
+                    !item->getType()->isIntegerTy(64)) {
+                    llvm::Value* ext = builder_.CreateZExt(item, i64());
+                    itemArg = builder_.CreateIntToPtr(ext, ptrTy());
+                } else if (item->getType()->isIntegerTy(64)) {
+                    itemArg = builder_.CreateIntToPtr(item, ptrTy());
+                } else if (!item->getType()->isPointerTy()) {
+                    llvm::Value* bits = builder_.CreateBitCast(item, i64());
+                    itemArg = builder_.CreateIntToPtr(bits, ptrTy());
+                }
+                auto* fn = declareC("bz_channel_sender_send",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {tx, itemArg, getCCEVtable(),
+                                         getCFEVtable()});
+                emitPendingCheck();  // fix #634 / v0.174 #809: bz_exc on closed or full
+                return nullptr;
+            }
+
+            // v0.174 (#809) / §6.9: SendAsync(owned item): Task — awaits capacity.
+            // Mirrors Send's item encoding but returns the awaitable Task the
+            // runtime hands back (already-done when space is free / unbounded;
+            // pending on a full bounded channel until a Receive frees a slot).
+            // The close-while-waiting fault (ChannelClosedException) is delivered
+            // THROUGH the task and surfaces at the caller's await site — so no
+            // emitPendingCheck here (unlike the synchronous Send).
+            if (mname == "SendAsync" && call.args.size() == 1 &&
+                call.args[0].value) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                llvm::Value* itemArg = item;
+                if (item->getType()->isIntegerTy() &&
+                    !item->getType()->isIntegerTy(64)) {
+                    llvm::Value* ext = builder_.CreateZExt(item, i64());
+                    itemArg = builder_.CreateIntToPtr(ext, ptrTy());
+                } else if (item->getType()->isIntegerTy(64)) {
+                    itemArg = builder_.CreateIntToPtr(item, ptrTy());
+                } else if (!item->getType()->isPointerTy()) {
+                    llvm::Value* bits = builder_.CreateBitCast(item, i64());
+                    itemArg = builder_.CreateIntToPtr(bits, ptrTy());
+                }
+                auto* fn = declareC("bz_channel_sender_send_async", ptrTy(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {tx, itemArg, getCCEVtable()},
+                                           "ch.sendasync");
+            }
+
+            // Dispose() — release this sender handle (may close the channel).
+            // Null the receiver slot after the call so any subsequent
+            // using-var scope-exit reload sees null and skips (§28.2).
+            if (mname == "Dispose" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_sender_release",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {tx, getCCEVtable()});
+                if (!checkedDisposal_ && ma) {
+                    llvm::Type* slotTy = nullptr;
+                    if (llvm::Value* slot = lvalueAddr(*ma->target, slotTy))
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), slot);
+                }
+                return nullptr;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Domain.Spawn(entry, arg?) — static class "Domain".
+    // The entry expression is a static method reference (a MemberAccessExpr
+    // like `Worker.Compute` or `Producer.SendOne`). We:
+    //   1. Resolve the MethodSymbol from the entry expression.
+    //   2. Build a static adapter function: `void* adapter(void* arg)` that
+    //      calls the actual method with the right ABI and returns the result
+    //      as a void* (or null for void). The adapter is what bz_domain_spawn
+    //      receives as its entry_fn.
+    //   3. Lower the optional argument and pass it to bz_domain_spawn.
+    // -----------------------------------------------------------------------
+    {
+        auto* targetId = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (targetId && targetId->name == "Domain" && mname == "Spawn" &&
+            !call.args.empty()) {
+            const ast::Expr* entryExpr = call.args[0].value.get();
+            if (!entryExpr) return nullptr;
+
+            // Resolve the entry method symbol.
+            sema::MethodSymbol* entryMs =
+                dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*entryExpr));
+
+            // §30.14 / fix #1228: non-capturing lambda as Domain.Spawn entry.
+            // The spec allows `() => expr` and block-body lambdas as spawn entries
+            // alongside static method refs. A non-capturing lambda lowers to a
+            // closure cell { fn_ptr, env_ptr=null, rc=1, envdtor=null }. We build a
+            // spawn adapter that loads fn+env from the cell, calls fn(env), releases
+            // the closure, and returns null. The cell is the bz_domain_spawn arg
+            // (ownership transferred — no caller-side release). per §30.14 / §27.5.
+            if (!entryMs) {
+                if (auto* lamExpr =
+                        dynamic_cast<const ast::LambdaExpr*>(entryExpr)) {
+                    // Only handle zero-extra-arg form: Domain.Spawn(() => …).
+                    // Lambda-with-param-plus-extra-arg entries not yet handled.
+                    if (call.args.size() == 1) {
+                        // 1. Lower the lambda → closure cell (inline transient).
+                        llvm::Value* closureCell = lowerLambda(*lamExpr);
+                        if (!closureCell) return nullptr;
+
+                        // 2. Compute the lambda fn's LLVM return type, mirroring
+                        //    lowerLambda's retTy logic so the indirect call type-
+                        //    checks in IR. fn signature: (ptr env_ptr) -> lamRetTy.
+                        llvm::Type* lamRetTy = i32();  // default (unresolved)
+                        if (lamExpr->isAsync) {
+                            // async lambda: state machine wraps into Task → ptr.
+                            lamRetTy = ptrTy();
+                        } else if (lamExpr->exprBody) {
+                            if (sema::TypeRef* rt =
+                                    ctx_.exprType(*lamExpr->exprBody))
+                                lamRetTy = lowerTypeRef(rt);
+                            else if (isLambdaExprBodyVoidBuiltin(*lamExpr))
+                                lamRetTy = llvm::Type::getVoidTy(llvm_);
+                        } else {
+                            // Block-body: use the sema-inferred funcReturn.
+                            if (sema::TypeRef* lamTy =
+                                    ctx_.exprType(*lamExpr)) {
+                                if (lamTy->kind ==
+                                        sema::TypeRef::Kind::Function &&
+                                        lamTy->funcReturn) {
+                                    llvm::Type* inf =
+                                        lowerTypeRef(lamTy->funcReturn);
+                                    if (inf != i32()) lamRetTy = inf;
+                                }
+                            }
+                        }
+                        // Lambda fn LLVM type: (ptr env_ptr) -> lamRetTy.
+                        auto* lamFnTy = llvm::FunctionType::get(
+                            lamRetTy, {ptrTy()}, false);
+
+                        // 3. Build spawn adapter: void* adapter(void* arg)
+                        //    where arg = closure cell. Loads fn+env from the cell,
+                        //    calls fn(env), releases the closure, returns null.
+                        static std::atomic<unsigned> spawnLamCtr{0};
+                        std::string aName = "spawn.lam$" +
+                            std::to_string(spawnLamCtr.fetch_add(1));
+                        auto* aTy = llvm::FunctionType::get(
+                            ptrTy(), {ptrTy()}, false);
+                        auto* adapter = llvm::Function::Create(
+                            aTy, llvm::Function::InternalLinkage,
+                            aName, module_.get());
+
+                        {
+                            llvm::Function*   svFn   = currentFn_;
+                            llvm::Value*      svThis = currentThis_;
+                            llvm::BasicBlock* svBB   = builder_.GetInsertBlock();
+
+                            currentFn_   = adapter;
+                            currentThis_ = nullptr;
+                            auto* aBB = llvm::BasicBlock::Create(
+                                llvm_, "entry", adapter);
+                            builder_.SetInsertPoint(aBB);
+
+                            llvm::Value* cellArg = adapter->getArg(0);
+
+                            // Load fn_ptr from closure cell slot 0.
+                            llvm::Value* fnPtr = builder_.CreateLoad(
+                                ptrTy(), cellArg, "spawn.lam.fn");
+                            // Load env_ptr from closure cell slot 1 (offset 8).
+                            llvm::Value* envSlot = builder_.CreateGEP(
+                                ptrTy(), cellArg,
+                                {builder_.getInt32(1)},
+                                "spawn.lam.env.slot");
+                            llvm::Value* envPtr = builder_.CreateLoad(
+                                ptrTy(), envSlot, "spawn.lam.env");
+
+                            // Invoke lambda: fn_ptr(env_ptr).
+                            builder_.CreateCall(lamFnTy, fnPtr, {envPtr});
+
+                            // Release closure cell in the spawned domain.
+                            // Non-capturing lambda: rc=1→0, env=null, envdtor=null
+                            // → free(cell). Caller transfers ownership on spawn;
+                            // no caller-side release → no double-free. §28.9/§27.5.
+                            auto* relFn = declareC(
+                                "bz_closure_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(relFn, {cellArg});
+
+                            builder_.CreateRet(
+                                llvm::ConstantPointerNull::get(ptrTy()));
+
+                            currentFn_   = svFn;
+                            currentThis_ = svThis;
+                            if (svBB) builder_.SetInsertPoint(svBB);
+                        }
+
+                        // 4. bz_domain_spawn(adapter, closureCell, dfe_vtable).
+                        //    closureCell is the arg; ownership transferred to the
+                        //    spawned domain's adapter — no caller-side release.
+                        auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
+                                                 {ptrTy(), ptrTy(), ptrTy()});
+                        return builder_.CreateCall(
+                            spawnFn,
+                            {adapter, closureCell, getDFEVtable()},
+                            "domain.spawn");
+                    }
+                }
+                return nullptr;
+            }
+
+            // Find the actual LLVM function for the method.
+            auto mfIt = methodFns_.find(entryMs);
+            if (mfIt == methodFns_.end()) return nullptr;
+            llvm::Function* origFn = mfIt->second;
+
+            // Compute the number of extra arguments (args beyond pos 0).
+            // Each extra arg is owned-transferred into the spawned domain.
+            // §30.14 / #693: all args at pos >= 1 are owned-consumed.
+            std::size_t nExtra = call.args.size() > 1 ? call.args.size() - 1 : 0;
+            std::size_t nOrigParams = origFn->arg_size();
+
+            // Build the adapter: `void* adapter(void* arg)`.
+            // The adapter's body:
+            //   - N==0 params: call origFn(), ignore arg.
+            //   - N==1 param:  call origFn(arg) — arg IS the single param value.
+            //   - N>=2 params: arg is a malloc'd void*[N] array; unpack each slot,
+            //     free the array, then call origFn(p0, p1, …).
+            // Return value: origFn's result cast to void* (or null for void).
+            // per §30.14 / #693
+            static std::atomic<unsigned> spawnAdaptCtr{0};
+            std::string adaptName = "spawn.adapter$" +
+                std::to_string(spawnAdaptCtr.fetch_add(1));
+            auto* adaptFnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+            auto* adapter = llvm::Function::Create(
+                adaptFnTy, llvm::Function::InternalLinkage,
+                adaptName, module_.get());
+
+            // Emit the adapter body.
+            {
+                llvm::Function* savedFn = currentFn_;
+                llvm::Value*    savedThis = currentThis_;
+                llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+
+                currentFn_   = adapter;
+                currentThis_ = nullptr;
+                auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", adapter);
+                builder_.SetInsertPoint(entryBB);
+
+                llvm::Value* argParam = adapter->getArg(0);  // void* arg
+
+                // Helper: cast a void* to the expected param type.
+                auto castToParamTy = [&](llvm::Value* voidPtr,
+                                         llvm::Type*  paramTy) -> llvm::Value* {
+                    if (paramTy->isPointerTy()) return voidPtr;
+                    if (paramTy->isIntegerTy(64))
+                        return builder_.CreatePtrToInt(voidPtr, i64());
+                    if (paramTy->isIntegerTy(32)) {
+                        llvm::Value* w = builder_.CreatePtrToInt(voidPtr, i64());
+                        return builder_.CreateTrunc(w, i32());
+                    }
+                    return builder_.CreatePtrToInt(voidPtr, i64());
+                };
+
+                std::vector<llvm::Value*> callArgs;
+                if (nOrigParams == 1) {
+                    // Single-argument entry: arg IS the param value (single void*).
+                    callArgs.push_back(castToParamTy(
+                        argParam, origFn->getArg(0)->getType()));
+                } else if (nOrigParams >= 2) {
+                    // Multi-argument entry: arg is a void*[N] malloc'd array.
+                    // Unpack each slot from the array, then free it.
+                    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy()});
+                    for (std::size_t i = 0; i < nOrigParams; ++i) {
+                        // GEP into the void*[] at index i.
+                        llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
+                            ptrTy(), argParam,
+                            builder_.getInt64(static_cast<uint64_t>(i)),
+                            "spawn.slot" + std::to_string(i));
+                        llvm::Value* slotVal = builder_.CreateLoad(
+                            ptrTy(), slotPtr, "spawn.val" + std::to_string(i));
+                        callArgs.push_back(castToParamTy(
+                            slotVal, origFn->getArg(i)->getType()));
+                    }
+                    // Free the packed-arg array after unpacking.
+                    builder_.CreateCall(freeFn, {argParam});
+                }
+                // else: nOrigParams == 0 — no-arg entry, no call args.
+
+                llvm::Value* ret = builder_.CreateCall(origFn, callArgs);
+                if (origFn->getReturnType()->isVoidTy()) {
+                    builder_.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+                } else if (origFn->getReturnType()->isPointerTy()) {
+                    builder_.CreateRet(ret);
+                } else {
+                    // Value result: inttoptr.
+                    llvm::Value* wide = ret;
+                    if (!wide->getType()->isIntegerTy(64))
+                        wide = builder_.CreateZExt(wide, i64());
+                    builder_.CreateRet(
+                        builder_.CreateIntToPtr(wide, ptrTy()));
+                }
+
+                // Restore emitter state.
+                currentFn_   = savedFn;
+                currentThis_ = savedThis;
+                if (savedBB) builder_.SetInsertPoint(savedBB);
+            }
+
+            // Lower the argument(s) to pass to bz_domain_spawn.
+            // N==0: null.
+            // N==1: the single extra arg as void*.
+            // N>=2: malloc a void*[N] array, store each arg, pass the array.
+            // per §30.14 / #693
+            llvm::Value* argVal = llvm::ConstantPointerNull::get(ptrTy());
+            if (nExtra == 1 && call.args[1].value) {
+                // Single extra arg — existing single-ptr path.
+                llvm::Value* argExprV = lowerExpr(*call.args[1].value);
+                if (argExprV) {
+                    if (argExprV->getType()->isPointerTy()) {
+                        argVal = argExprV;
+                    } else if (argExprV->getType()->isIntegerTy(64)) {
+                        argVal = builder_.CreateIntToPtr(argExprV, ptrTy(),
+                                                         "spawn.arg.cast");
+                    } else if (argExprV->getType()->isIntegerTy()) {
+                        argVal = builder_.CreateIntToPtr(
+                            builder_.CreateZExt(argExprV, i64()), ptrTy(),
+                            "spawn.arg.cast");
+                    } else {
+                        argVal = builder_.CreateIntToPtr(
+                            builder_.CreateBitCast(argExprV, i64()), ptrTy(),
+                            "spawn.arg.cast");
+                    }
+                } else {
+                    // #1386: ICE — lowerExpr returned null for a single
+                    // Domain.Spawn argument; arg silently passed as null.
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.args[1].value->span.begin,
+                        "internal: lowerExpr returned null for single-arg "
+                        "Domain.Spawn argument — #1386");
+                }
+            } else if (nExtra >= 2) {
+                // Multi-arg: malloc a void*[nExtra] array and store each arg.
+                // The adapter will free the array after unpacking.
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                llvm::Value* arrSize = builder_.getInt64(
+                    static_cast<uint64_t>(nExtra) * 8u);  // nExtra * sizeof(void*)
+                llvm::Value* arr = builder_.CreateCall(mallocFn, {arrSize},
+                                                       "spawn.argpack");
+                for (std::size_t i = 0; i < nExtra; ++i) {
+                    const auto& a = call.args[i + 1];
+                    if (!a.value) continue;
+                    llvm::Value* val = lowerExpr(*a.value);
+                    if (!val) {
+                        // #1386: ICE — lowerExpr returned null for a
+                        // Domain.Spawn extra argument; the expression kind
+                        // is not yet handled by codegen.
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            "internal: lowerExpr returned null for "
+                            "Domain.Spawn argument — #1386");
+                        continue;
+                    }
+                    // Cast to void* if needed.
+                    llvm::Value* asPtr;
+                    if (val->getType()->isPointerTy()) {
+                        asPtr = val;
+                    } else if (val->getType()->isIntegerTy(64)) {
+                        asPtr = builder_.CreateIntToPtr(val, ptrTy());
+                    } else if (val->getType()->isIntegerTy()) {
+                        asPtr = builder_.CreateIntToPtr(
+                            builder_.CreateZExt(val, i64()), ptrTy());
+                    } else {
+                        asPtr = builder_.CreateIntToPtr(
+                            builder_.CreateBitCast(val, i64()), ptrTy());
+                    }
+                    llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
+                        ptrTy(), arr,
+                        builder_.getInt64(static_cast<uint64_t>(i)),
+                        "spawn.slot" + std::to_string(i));
+                    builder_.CreateStore(asPtr, slotPtr);
+                }
+                argVal = arr;
+            }
+
+            auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
+                                     {ptrTy(), ptrTy(), ptrTy()});
+            return builder_.CreateCall(spawnFn,
+                {adapter, argVal, getDFEVtable()},
+                "domain.spawn");
+        }
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 / issue #647: Mutex instance methods.
+//
+//   Acquire()                 → bz_mutex_acquire(mx)             → ptr (owned Lock)
+//   TryAcquire(timeout: ts)   → bz_mutex_try_acquire(mx, ms)     → ptr? (owned Lock?)
+//   AcquireAsync(token?)      → bz_mutex_acquire_async(mx,t,oce) → ptr (OwningTask<Lock>)
+//   TryAcquireAsync(ts,tok?)  → bz_mutex_try_acquire_async(...)  → ptr (OwningTask<Lock?>)
+//   Dispose()                 → handled in the explicit-Dispose block above.
+//
+// TryAcquire lowers the TimeSpan argument to milliseconds (i64) using
+// bz_timespan_total_milliseconds, truncated to int64_t. A null return from the
+// runtime (timeout) is returned as a null ptr to the Bezel nullable owned Lock?.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || builtinTypeName(recvTy) != "Mutex") return nullptr;
+
+    llvm::Value* mx = lowerExpr(*ma->target);
+    if (!mx) return nullptr;
+
+    if (mname == "Acquire" && call.args.empty()) {
+        // Acquire(): blocks until the mutex is available, returns owned Lock.
+        // per §6.2: the non-null return makes the guard idiom straightforward.
+        auto* fn = declareC("bz_mutex_acquire", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {mx}, "mx.acquire");
+    }
+
+    if (mname == "TryAcquire" && call.args.size() == 1 && call.args[0].value) {
+        // TryAcquire(timeout: TimeSpan): owned Lock?
+        // Convert the TimeSpan (i64 tick value) to milliseconds (i64) and
+        // call bz_mutex_try_acquire(mutex, timeout_ms). Returns null on timeout.
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        // TimeSpan is stored as an i64 tick value (100-ns units).
+        // Convert to milliseconds via bz_timespan_total_milliseconds (returns double).
+        // Then truncate to i64 for the runtime's timeout_ms parameter.
+        if (!tsVal->getType()->isIntegerTy(64)) {
+            // Coerce to i64 if needed (e.g. i32 zero-extension).
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        }
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        // Truncate double to i64 (floor towards zero per standard C conv).
+        llvm::Value* msI64 = builder_.CreateFPToSI(
+            msDouble, i64(), "ts.ms.i64");
+        auto* fn = declareC("bz_mutex_try_acquire", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {mx, msI64}, "mx.tryacq");
+    }
+
+    // §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync.
+    //
+    // AcquireAsync(token := CancellationToken.None): OwningTask<Lock>
+    //   → bz_mutex_acquire_async(mx, token, oce_vtable)
+    // TryAcquireAsync(timeout: TimeSpan,
+    //                  token := CancellationToken.None): OwningTask<Lock?>
+    //   → bz_mutex_try_acquire_async(mx, timeout_ms, token, oce_vtable)
+    //
+    // token is the last argument (optional with default CancellationToken.None).
+    // If the argument is absent or the runtime default applies, emit a null ptr
+    // (CancellationToken.None = null per §6.1 runtime convention).
+    //
+    // oce_vtable: retrieve from builtinVtable_ for OperationCanceledException;
+    // fall back to null (disables OCE object construction, fault still fires).
+
+    // Helper: retrieve the OCE vtable value (same as in tryLowerStaticCall /
+    // Task.Delay cancelable path).
+    auto getOceVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    // Helper: extract the token argument (last arg, optional).
+    // If not provided or evaluates to a null-typed expr, return null ptr
+    // (CancellationToken.None).
+    auto getTokenArg = [&](size_t argIdx) -> llvm::Value* {
+        if (argIdx < call.args.size() && call.args[argIdx].value) {
+            llvm::Value* tok = lowerExpr(*call.args[argIdx].value);
+            if (tok) return tok;
+        }
+        // Default: CancellationToken.None = null ptr.
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    if (mname == "AcquireAsync") {
+        // AcquireAsync(token := CancellationToken.None)
+        // token is args[0] if provided; otherwise null.
+        llvm::Value* token = getTokenArg(0);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_mutex_acquire_async",
+                             ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {mx, token, oceVtable}, "mx.acq.async");
+    }
+
+    if (mname == "TryAcquireAsync" && !call.args.empty() && call.args[0].value) {
+        // TryAcquireAsync(timeout: TimeSpan,
+        //                  token := CancellationToken.None)
+        // timeout is args[0]; token is args[1] if present.
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        // Convert TimeSpan (i64 ticks, 100-ns units) to milliseconds.
+        if (!tsVal->getType()->isIntegerTy(64))
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
+        llvm::Value* token = getTokenArg(1);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_mutex_try_acquire_async",
+                             ptrTy(), {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn,
+            {mx, msI64, token, oceVtable}, "mx.tryacq.async");
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// §6.3 / issue #647: Semaphore instance methods.
+//
+//   Acquire()                 → bz_semaphore_acquire(sem)             → ptr (SemaphoreToken)
+//   TryAcquire(timeout: ts)   → bz_semaphore_try_acquire(sem, ms)     → ptr? (SemaphoreToken?)
+//   AcquireAsync(token?)      → bz_semaphore_acquire_async(sem,t,oce) → ptr (OwningTask<SemaphoreToken>)
+//   TryAcquireAsync(ts,tok?)  → bz_semaphore_try_acquire_async(...)   → ptr (OwningTask<SemaphoreToken?>)
+//   Dispose()                 → handled in the explicit-Dispose block above.
+//
+// Mirrors tryLowerMutexLockCall exactly, substituting Semaphore/SemaphoreToken
+// for Mutex/Lock and the bz_semaphore_* runtime functions.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerSemaphoreTokenCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || builtinTypeName(recvTy) != "Semaphore") return nullptr;
+
+    llvm::Value* sem = lowerExpr(*ma->target);
+    if (!sem) return nullptr;
+
+    if (mname == "Acquire" && call.args.empty()) {
+        // Acquire(): blocks until a permit is available, returns owned SemaphoreToken.
+        auto* fn = declareC("bz_semaphore_acquire", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {sem}, "sem.acquire");
+    }
+
+    if (mname == "TryAcquire" && call.args.size() == 1 && call.args[0].value) {
+        // TryAcquire(timeout: TimeSpan): owned SemaphoreToken?
+        // Convert TimeSpan to milliseconds (i64) and call bz_semaphore_try_acquire.
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        if (!tsVal->getType()->isIntegerTy(64))
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
+        auto* fn = declareC("bz_semaphore_try_acquire", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {sem, msI64}, "sem.tryacq");
+    }
+
+    // §6.3 / #647 / v0.140: AcquireAsync / TryAcquireAsync.
+    //   AcquireAsync(token?)   → bz_semaphore_acquire_async(sem, token, oce_vtable)
+    //   TryAcquireAsync(ts, token?) → bz_semaphore_try_acquire_async(...)
+    auto getOceVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+    auto getTokenArg = [&](size_t argIdx) -> llvm::Value* {
+        if (argIdx < call.args.size() && call.args[argIdx].value) {
+            llvm::Value* tok = lowerExpr(*call.args[argIdx].value);
+            if (tok) return tok;
+        }
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    if (mname == "AcquireAsync") {
+        llvm::Value* token = getTokenArg(0);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_semaphore_acquire_async",
+                             ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {sem, token, oceVtable}, "sem.acq.async");
+    }
+
+    if (mname == "TryAcquireAsync" && !call.args.empty() && call.args[0].value) {
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        if (!tsVal->getType()->isIntegerTy(64))
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
+        llvm::Value* token = getTokenArg(1);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_semaphore_try_acquire_async",
+                             ptrTy(), {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn,
+            {sem, msI64, token, oceVtable}, "sem.tryacq.async");
+    }
+
+    return nullptr;
+}
+
+
+// §6.4 / issue #647: Atomic<T> / AtomicInteger<T> instance methods.
+//
+// Handles:
+//   Exchange(value: T): T      → bz_atomic_exchange(atom, val, cell_size)
+//   CompareExchange(expected: T, replacement: T): T
+//                              → bz_atomic_compare_exchange(atom, exp, rep, cell_size)
+//   Increment(): T             → bz_atomic_add(atom,  1, signed_, cell_size, ove)
+//   Decrement(): T             → bz_atomic_add(atom, -1, signed_, cell_size, ove)
+//   Add(delta: T): T           → bz_atomic_add(atom, delta, signed_, cell_size, ove)
+//
+// The Value property setter `atom.Value := v` is handled in LlvmBackend_Stmts.cpp
+// (tryLowerAtomicValueSet) so it intercepts before the plain lvalue path.
+// The Value getter is handled in LlvmBackend_Exprs.cpp (cn == "Atomic" branch).
+llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
+    // Callee must be a MemberAccessExpr whose target type is Atomic<T> or
+    // AtomicInteger<T>.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    std::string_view rbn = builtinTypeName(recvTy);
+    if (rbn != "Atomic" && rbn != "AtomicInteger") return nullptr;
+
+    const std::string mname(ma->member);
+    llvm::Value* atom = lowerExpr(*ma->target);
+    if (!atom) return nullptr;
+
+    // Helper: compute cell_size from T (genericArgs[0]).
+    auto getCellSize = [&]() -> int {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+            const sema::TypeRef* tArg = recvTy->genericArgs[0];
+            if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+                using P = sema::PrimitiveType;
+                switch (tArg->primitive) {
+                    case P::Bool: case P::Byte: case P::SByte: return 1;
+                    case P::Short: case P::UShort:             return 2;
+                    case P::Long: case P::ULong:               return 8;
+                    default: return 4;
+                }
+            }
+            return 8;  // IntPtr/UIntPtr
+        }
+        return 4;
+    };
+
+    // Helper: is T a signed type (for overflow detection in bz_atomic_add).
+    auto isSigned = [&]() -> bool {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+            const sema::TypeRef* tArg = recvTy->genericArgs[0];
+            if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+                using P = sema::PrimitiveType;
+                auto p = tArg->primitive;
+                return (p == P::SByte || p == P::Short ||
+                        p == P::Int   || p == P::Long);
+            }
+        }
+        return true;  // default: int (signed)
+    };
+
+    // Helper: get T's LLVM type for truncation.
+    auto getTTy = [&]() -> llvm::Type* {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* ty = lowerTypeRef(recvTy->genericArgs[0])) return ty;
+        return i32();
+    };
+
+    // Helper: truncate an i64 result to T's width.
+    auto truncResult = [&](llvm::Value* v64, const char* name) -> llvm::Value* {
+        llvm::Type* tTy = getTTy();
+        if (tTy->isIntegerTy() && !tTy->isIntegerTy(64))
+            return builder_.CreateTrunc(v64, tTy, name);
+        return v64;
+    };
+
+    int cs = getCellSize();
+
+    if (mname == "Exchange" && !call.args.empty() && call.args[0].value) {
+        // Exchange(value: T): T — seq-cst swap, returns old value.
+        llvm::Value* rawVal = lowerExpr(*call.args[0].value);
+        if (!rawVal) return nullptr;
+        // Widen arg to i64.
+        llvm::Value* v64 = rawVal;
+        if (rawVal->getType()->isIntegerTy() && !rawVal->getType()->isIntegerTy(64))
+            v64 = builder_.CreateZExt(rawVal, i64(), "exch.v64");
+        auto* fn = declareC("bz_atomic_exchange", i64(), {ptrTy(), i64(), i32()});
+        llvm::Value* old64 = builder_.CreateCall(
+            fn, {atom, v64, builder_.getInt32(cs)}, "atom.exch");
+        return truncResult(old64, "atom.exch.v");
+    }
+
+    if (mname == "CompareExchange" &&
+        call.args.size() >= 2 && call.args[0].value && call.args[1].value) {
+        // CompareExchange(expected: T, replacement: T): T — strong CAS.
+        llvm::Value* expVal = lowerExpr(*call.args[0].value);
+        llvm::Value* repVal = lowerExpr(*call.args[1].value);
+        if (!expVal || !repVal) return nullptr;
+        auto widen = [&](llvm::Value* v) -> llvm::Value* {
+            if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(64))
+                return builder_.CreateZExt(v, i64());
+            return v;
+        };
+        auto* fn = declareC("bz_atomic_compare_exchange",
+                             i64(), {ptrTy(), i64(), i64(), i32()});
+        llvm::Value* obs64 = builder_.CreateCall(
+            fn, {atom, widen(expVal), widen(repVal), builder_.getInt32(cs)},
+            "atom.cas");
+        return truncResult(obs64, "atom.cas.v");
+    }
+
+    // AtomicInteger<T> arithmetic (§6.4): Increment, Decrement, Add.
+    // bz_atomic_add(atom, delta, signed_, cell_size, ove_vtable) → post-add as i64.
+    if (rbn == "AtomicInteger") {
+        auto getOveVtable = [&]() -> llvm::Value* {
+            auto vit = builtinVtable_.find("OverflowException");
+            if (vit != builtinVtable_.end())
+                return builder_.CreateBitCast(vit->second, ptrTy());
+            return llvm::ConstantPointerNull::get(ptrTy());
+        };
+        auto* addFn = declareC("bz_atomic_add",
+                                i64(), {ptrTy(), i64(), i32(), i32(), ptrTy()});
+        int sg = isSigned() ? 1 : 0;
+
+        if (mname == "Increment" && call.args.empty()) {
+            llvm::Value* res = builder_.CreateCall(
+                addFn,
+                {atom, builder_.getInt64(1), builder_.getInt32(sg),
+                 builder_.getInt32(cs), getOveVtable()},
+                "atom.incr");
+            emitPendingCheck();  // OverflowException from bz_atomic_add
+            return truncResult(res, "atom.incr.v");
+        }
+        if (mname == "Decrement" && call.args.empty()) {
+            llvm::Value* res = builder_.CreateCall(
+                addFn,
+                {atom, builder_.getInt64(-1LL), builder_.getInt32(sg),
+                 builder_.getInt32(cs), getOveVtable()},
+                "atom.decr");
+            emitPendingCheck();
+            return truncResult(res, "atom.decr.v");
+        }
+        if (mname == "Add" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* deltaRaw = lowerExpr(*call.args[0].value);
+            if (!deltaRaw) return nullptr;
+            // Sign-extend to i64 for signed T; zero-extend for unsigned T.
+            llvm::Value* delta64 = deltaRaw;
+            if (deltaRaw->getType()->isIntegerTy() &&
+                !deltaRaw->getType()->isIntegerTy(64)) {
+                delta64 = sg ? builder_.CreateSExt(deltaRaw, i64(), "add.d64")
+                             : builder_.CreateZExt(deltaRaw, i64(), "add.d64");
+            }
+            llvm::Value* res = builder_.CreateCall(
+                addFn,
+                {atom, delta64, builder_.getInt32(sg),
+                 builder_.getInt32(cs), getOveVtable()},
+                "atom.add");
+            emitPendingCheck();
+            return truncResult(res, "atom.add.v");
+        }
+    }
+
+    return nullptr;
+}
+
+
+// §6.6 / issue #974: TaskCompletionSource<T> / OwningTaskCompletionSource<T> /
+// TaskCompletionSource (non-generic) instance method lowering.
+//
+// Handled methods:
+//   TrySetResult(result: T): bool  → bz_tcs_try_set_result(tcs, &val, sizeof(T)) → i1
+//   SetResult(result: T)           → same + emitGuardThrow(IOE) if already done
+//   TrySetException(exc): bool     → bz_tcs_try_set_exception(tcs, exc_obj)      → i1
+//   SetException(exc)              → same + emitGuardThrow(IOE) if already done
+//   TrySetCancelled(): bool        → bz_tcs_try_set_cancelled(tcs, oce_vtable)   → i1
+//   SetCancelled()                 → same + emitGuardThrow(IOE) if already done
+//   Dispose()                      → no-op here; real work done by emitDisposals
+//
+// Detection: receiver builtin type name "TaskCompletionSource" or
+// "OwningTaskCompletionSource" (both map to a bz_tcs_t* opaque pointer).
+llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    std::string_view rcn = builtinTypeName(recvTy);
+    if (rcn != "TaskCompletionSource" && rcn != "OwningTaskCompletionSource")
+        return nullptr;
+
+    llvm::Value* tcs = lowerExpr(*ma->target);
+    if (!tcs) return nullptr;
+
+    // Helper: get InvalidOperationException vtable for Set* guard throws.
+    auto getIoeVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+    (void)getIoeVtable;  // used only in SetCancelled via emitGuardThrow
+
+    // Helper: get OperationCanceledException vtable for TrySetCancelled.
+    auto getOceVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    // TrySetResult / SetResult — pass the value through a stack slot.
+    // Pattern mirrors Task.FromResult (LlvmBackend_Calls.cpp §6.7 arm above).
+    // For OwningTaskCompletionSource<T>, T is a class pointer — same layout as
+    // any other pointer-width value; ownership transfer is the caller's concern.
+    if ((mname == "TrySetResult" || mname == "SetResult") &&
+        !call.args.empty() && call.args[0].value) {
+        llvm::Value* val = lowerExpr(*call.args[0].value);
+        if (!val) return nullptr;
+        llvm::Type* valTy = val->getType();
+        llvm::AllocaInst* slot = builder_.CreateAlloca(valTy, nullptr,
+                                                        "tcs.setres.slot");
+        builder_.CreateStore(val, slot);
+        int64_t sz = static_cast<int64_t>(
+            module_->getDataLayout().getTypeAllocSize(valTy));
+        auto* tryFn = declareC("bz_tcs_try_set_result", i32(),
+                                {ptrTy(), ptrTy(), i64()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn,
+            {tcs, builder_.CreateBitCast(slot, ptrTy()), builder_.getInt64(sz)},
+            "tcs.trysetres");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetres.b");
+        if (mname == "SetResult") {
+            // SetResult: throw InvalidOperationException if already completed.
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setres.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;  // unit return
+        }
+        return ok1;
+    }
+
+    // TrySetException / SetException — pass the exception object directly.
+    if ((mname == "TrySetException" || mname == "SetException") &&
+        !call.args.empty() && call.args[0].value) {
+        llvm::Value* exc = lowerExpr(*call.args[0].value);
+        if (!exc) return nullptr;
+        auto* tryFn = declareC("bz_tcs_try_set_exception", i32(),
+                                {ptrTy(), ptrTy()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn, {tcs, exc},
+                                                 "tcs.trysetexc");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetexc.b");
+        if (mname == "SetException") {
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setexc.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;
+        }
+        return ok1;
+    }
+
+    // TrySetCancelled / SetCancelled — build OCE from vtable in the runtime.
+    if (mname == "TrySetCancelled" || mname == "SetCancelled") {
+        auto* tryFn = declareC("bz_tcs_try_set_cancelled", i32(),
+                                {ptrTy(), ptrTy()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn, {tcs, getOceVtable()},
+                                                 "tcs.trysetcxl");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetcxl.b");
+        if (mname == "SetCancelled") {
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setcxl.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;
+        }
+        return ok1;
+    }
+
+    // Dispose() — real work is done by the using-var emitDisposals path.
+    // An explicit tcs.Dispose() call in user code is a no-op here; the
+    // disposal contract (bz_tcs_fault_if_pending + inner task fire-and-forget +
+    // bz_tcs_free) is enforced by the Disposal.tcs emitDisposals arm.
+    if (mname == "Dispose") {
+        return nullptr;
+    }
+
+    return nullptr;
+}
+
+
+// §15.1.2 / §17.5 / #1342: lower an inline-array `[N]T` built-in intrinsic:
+//   ToArray()    — copies all N slots into a fresh bz_array_t* (owned Array<T>).
+//                  String elements are +1 retained (bz_array_retain_strings).
+//   Contains(v)  — linear scan over the N slots; returns i1.  Element equality
+//                  uses emitRemoveElementEquality (§9.2: value-eq for values,
+//                  content-eq for strings, identity/Equals for classes, structural
+//                  for records).
+//
+// The receiver is an InlineArray-typed expression that lowers to an LLVM
+// `[N x elemTy]` value (usually an lvalue, but we spill to a temp alloca when
+// it is a computed expression).  The same pattern is used by lowerArrayFor.
+llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view m = ma->member;
+    if (m != "ToArray" && m != "Contains") return nullptr;
+
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::InlineArray) return nullptr;
+
+    sema::TypeRef* elemRef = recvTy->arrayElement;
+    int64_t N = recvTy->arraySizeValue;
+
+    llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : i64();
+    if (!elemTy) elemTy = i64();
+
+    // Compute element byte size (mirrors collectionElemSize logic).
+    auto elemSzOf = [&](llvm::Type* et) -> int64_t {
+        if (!et) return 8;
+        if (et->isIntegerTy(32) || et->isFloatTy()) return 4;
+        if (et->isIntegerTy(1) || et->isIntegerTy(8)) return 1;
+        if (et->isIntegerTy(16)) return 2;
+        if (et->isStructTy())
+            return (int64_t)module_->getDataLayout().getTypeAllocSize(et);
+        return 8;  // ptr, i64, double
+    };
+    int64_t esz = elemSzOf(elemTy);
+
+    // Get the receiver array address: try lvalue first, spill if needed.
+    // Same pattern as lowerArrayFor (§15.1.2 iteration, LlvmBackend_Stmts.cpp).
+    llvm::Type* arrSlotTy = nullptr;
+    llvm::Value* arrAddr = lvalueAddr(*ma->target, arrSlotTy);
+    if (!arrAddr || !arrSlotTy) {
+        llvm::Value* v = lowerExpr(*ma->target);
+        if (!v) return nullptr;
+        auto* at = llvm::dyn_cast<llvm::ArrayType>(v->getType());
+        if (!at) return nullptr;
+        llvm::AllocaInst* tmp = entryAlloca(at);
+        builder_.CreateStore(v, tmp);
+        arrAddr = tmp;
+        arrSlotTy = at;
+    }
+    auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy);
+    if (!arrTy) return nullptr;
+
+    // -----------------------------------------------------------------------
+    // ToArray(): allocate a bz_array_t, copy N elements, retain strings.
+    // -----------------------------------------------------------------------
+    if (m == "ToArray" && call.args.empty()) {
+        auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+        llvm::Value* result = builder_.CreateCall(
+            allocFn,
+            {builder_.getInt64(esz), builder_.getInt64(N > 0 ? N : 0)},
+            "ia.toarr");
+
+        if (N > 0) {
+            auto* addFn = declareC("bz_array_add",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            // Emit a counted loop: for i in 0..N-1: arr.add(&src[i], esz).
+            auto* idxSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "iat.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "iat.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "iat.end",  currentFn_);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot);
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx,
+                    builder_.getInt32(static_cast<uint32_t>(N))),
+                bodyBB, endBB);
+
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* cur = builder_.CreateLoad(i32(), idxSlot);
+            llvm::Value* ep = builder_.CreateGEP(
+                arrTy, arrAddr, {builder_.getInt64(0), cur});
+            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+            builder_.CreateStore(
+                builder_.CreateAdd(cur, builder_.getInt32(1)), idxSlot);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(endBB);
+
+            // §15.1.2 / #1342: string elements — after filling, retain each
+            // element +1 so the Array<string> co-owns a refcount per slot.
+            // Mirrors the LINQ ToArray string path (tryLowerLazyLinqCall).
+            if (elemRef &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String &&
+                !elemRef->nullable) {
+                auto* rf = declareC("bz_array_retain_strings",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(rf, {result});
+            }
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Contains(v): linear scan, element-type equality per §9.2.
+    // -----------------------------------------------------------------------
+    if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* target = lowerExpr(*call.args[0].value);
+        if (!target) return nullptr;
+
+        // Empty array always returns false.
+        if (N == 0) return builder_.getFalse();
+
+        bool elemIsClass = elemRef &&
+            elemRef->kind == sema::TypeRef::Kind::Named &&
+            elemRef->declaration &&
+            (elemRef->declaration->kind == ast::TypeDeclKind::Class ||
+             elemRef->declaration->kind == ast::TypeDeclKind::Interface);
+
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "iac.cond",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iac.body",  currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "iac.found", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iac.next",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "iac.end",   currentFn_);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot);
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx,
+                builder_.getInt32(static_cast<uint32_t>(N))),
+            bodyBB, endBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* cur = builder_.CreateLoad(i32(), idxSlot);
+        llvm::Value* ep = builder_.CreateGEP(
+            arrTy, arrAddr, {builder_.getInt64(0), cur});
+        llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+        llvm::Value* eq = emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* inc = builder_.CreateAdd(cur, builder_.getInt32(1));
+        builder_.CreateStore(inc, idxSlot);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "iac.result");
+        phi->addIncoming(builder_.getTrue(),  foundBB);
+        phi->addIncoming(builder_.getFalse(), condBB);
+        return phi;
+    }
+
+    return nullptr;
+}
+
+
+}  // namespace bezel::codegen
