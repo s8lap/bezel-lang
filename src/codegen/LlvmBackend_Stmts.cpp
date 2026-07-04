@@ -588,7 +588,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             rtv->primitive != sema::PrimitiveType::String)
                             rStr = emitPrimitiveToString(rhs, rtv->primitive);
                         llvm::Value* res = emitStringConcat(curS, rStr);
+                        // §4.6: a non-string RHS was rendered to a fresh `rStr`
+                        // (emitPrimitiveToString, rc=1) — release it after the
+                        // concat borrows it.
                         if (rStr != rhs) emitStringRelease(rStr);
+                        // #1481 / §4.6 / §28.9: a STRING-typed RHS that is itself
+                        // a +1 PRODUCER (`i.ToString()`, a call returning string,
+                        // a nested `+`/interpolation, `string.Join`, a
+                        // `() -> string` closure call) has `rStr == rhs` and hands
+                        // us its single +1 reference; the concat above borrows it,
+                        // so release it or it leaks — unboundedly in a loop
+                        // (`while … do s += i.ToString(); end`). A borrow RHS (a
+                        // named local/field, §28.9) is not a producer and is left
+                        // untouched. (Mirrors the string `+` operand discipline.)
+                        else if (isPlusOneStringProducer(as->value.get()))
+                            emitStringRelease(rhs);
                         bool isLocal = localSlot(*as->target) &&
                                        elemTy->isPointerTy() &&
                                        !tgtTy->nullable &&

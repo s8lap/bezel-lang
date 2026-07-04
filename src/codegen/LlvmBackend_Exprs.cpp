@@ -114,11 +114,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // a named local/field, §28.9) and must NOT be released. A literal / "null"
         // sentinel has a sentinel rc, so the release is a harmless no-op. The rule
         // `pv != srcEv` distinguishes the fresh-render case from the borrow case.
-        auto appendPart = [&](llvm::Value* pv, llvm::Value* srcEv) {
+        auto appendPart = [&](llvm::Value* pv, llvm::Value* srcEv,
+                              const ast::Expr* srcExpr) {
             llvm::Value* prev = acc;
             acc = emitStringConcat(acc, pv);
             emitStringRelease(prev);
-            if (pv != srcEv) emitStringRelease(pv);
+            // #1482 / §4.6 / §28.9: a STRING-typed hole that is itself a +1
+            // PRODUCER (a call returning `string`, `i.ToString()`, a nested
+            // `+`/interpolation, `string.Join`, a `() -> string` closure call)
+            // is rendered with `pv == srcEv` — the renderer returns the lowered
+            // string unchanged (the borrow case at the `pv = ev` fall-through) —
+            // yet it still hands us its single +1 reference. The concat above
+            // borrows it (copies the bytes), so it must be released or it leaks,
+            // unboundedly in a loop. A string-typed BORROW hole (a named
+            // local/field per §28.9) is NOT a producer, so isPlusOneStringProducer
+            // is false and `pv` survives as the shared reference it is. A
+            // freshly-rendered non-string part keeps the original `pv != srcEv`
+            // release. (Mirrors the string `+` operand discipline, Exprs.cpp:6055.)
+            if (pv != srcEv ||
+                (srcExpr && isPlusOneStringProducer(srcExpr)))
+                emitStringRelease(pv);
         };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
@@ -211,12 +226,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         auto* phi = builder_.CreatePHI(ptrTy(), 2);
                         phi->addIncoming(vStr, valEnd);
                         phi->addIncoming(nStr, nullEnd);
-                        appendPart(phi, ev);
+                        appendPart(phi, ev, part.expr.get());
                         continue;
                     }
                     pv = emitWithFormatSpec(ev, part.formatSpec, frt);
                     if (pv) {
-                        appendPart(pv, ev);
+                        appendPart(pv, ev, part.expr.get());
                         continue;
                     }
                 }
@@ -418,7 +433,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                 }
             }
-            if (pv) appendPart(pv, ev);
+            if (pv) appendPart(pv, ev, part.expr.get());
         }
         return acc;
     }
