@@ -1082,6 +1082,113 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // §14.2 / §7.10 (#1469): re-type an inline `out var x` that is bound to
+        // a GENERIC method's `out T?` parameter where T is a value type. The
+        // out-var symbol was registered (visitChildren, ExprTypecheck_Exprs.cpp)
+        // from the callee's formal parameter type `T?` with the nullable flag
+        // stripped and the method type parameter LEFT UNRESOLVED (`T`). Stripping
+        // is representationally harmless for a reference type (`C?` and `C` share
+        // the ptr lowering), but for a value type it is wrong: `int?` is a tagged
+        // {i8 hasValue; i32} struct distinct from bare `int`, and codegen sizes
+        // the out slot from the SUBSTITUTED `int?` (a struct), so a local typed
+        // as the unresolved non-nullable `T` desyncs from the slot — the `b = 88`
+        // comparison then lowers as ICmp(struct, i32) and aborts (LLVM "both
+        // operands to ICmp not same type"). Substitute the method type parameter
+        // with the call's type argument and canonicalize the local to the value
+        // type's nullable companion (`int?`) — the exact representation a
+        // directly-declared `int?` carries — so the comparison / interpolation
+        // lowering takes the nullable-value path. Runs regardless of return type
+        // (SetIt<T> above has none). The static-interface `T.TryParse` shape
+        // (#807) has an empty md->genericParams and is handled separately in
+        // ExprTypecheck_Exprs.cpp, so it is untouched here.
+        if (md && !md->genericParams.empty()) {
+            bool hasOutVar = false;
+            for (const auto& a : ce.args)
+                if (a.modifier == "out var" && a.value) { hasOutVar = true; break; }
+            if (hasOutVar) {
+                // Build the method type-parameter substitution map: from
+                // explicit type args (`SetIt<int>`) when present, else infer it
+                // from the value arguments (`SetIt(88, …)` binds T=int).
+                std::unordered_map<std::string_view, TypeRef*> outSubst;
+                const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
+                    nullptr;
+                if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce.callee.get()))
+                    callTypeArgs = &cma->typeArgs;
+                else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                             ce.callee.get()))
+                    callTypeArgs = &cid->typeArgs;
+                if (callTypeArgs && !callTypeArgs->empty()) {
+                    for (std::size_t gi = 0;
+                         gi < md->genericParams.size() &&
+                         gi < callTypeArgs->size(); ++gi)
+                        if ((*callTypeArgs)[gi])
+                            if (TypeRef* ca =
+                                    ctx_.resolvedType(*(*callTypeArgs)[gi]))
+                                outSubst[md->genericParams[gi].name] = ca;
+                } else {
+                    std::unordered_set<std::string_view> paramNames;
+                    for (const auto& gp : md->genericParams)
+                        paramNames.insert(gp.name);
+                    for (std::size_t pi = 0;
+                         pi < md->params.size() && pi < ce.args.size(); ++pi) {
+                        std::string_view amod = ce.args[pi].modifier;
+                        // An inline out-var argument carries no type of its own
+                        // (its type is what we are inferring) — skip it, exactly
+                        // as the return-type inference below does (#1164).
+                        if (amod == "out var" || amod == "out using var" ||
+                            amod == "out owned var")
+                            continue;
+                        if (!md->params[pi].type || !ce.args[pi].value) continue;
+                        TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                        if (!argTy) continue;
+                        unifyArgSubst(md->params[pi].type.get(), argTy,
+                                      paramNames, outSubst, ctx_);
+                    }
+                }
+                if (!outSubst.empty()) {
+                    // A value type carries the tagged {i8,T} nullable
+                    // representation (§14.2 / §3): every primitive except the
+                    // reference primitives `string`/`Object`, plus records and
+                    // enums. Reference types keep the harmless stripped form.
+                    auto isNullableValueTy = [](const TypeRef* t) -> bool {
+                        if (!t || !t->nullable) return false;
+                        switch (t->kind) {
+                            case TypeRef::Kind::Primitive:
+                                return t->primitive != PrimitiveType::String &&
+                                       t->primitive != PrimitiveType::Object &&
+                                       t->primitive != PrimitiveType::None;
+                            case TypeRef::Kind::Named:
+                                return t->declaration &&
+                                       (t->declaration->kind ==
+                                            ast::TypeDeclKind::Record ||
+                                        t->declaration->kind ==
+                                            ast::TypeDeclKind::Enum);
+                            default:
+                                return false;
+                        }
+                    };
+                    std::size_t pos = 0;
+                    for (const auto& a : ce.args) {
+                        if (a.modifier == "out var" && a.value &&
+                            pos < md->params.size() && md->params[pos].type) {
+                            if (auto* loc = dynamic_cast<LocalSymbol*>(
+                                    ctx_.exprSymbol(*a.value))) {
+                                if (TypeRef* resolved = ctx_.resolvedType(
+                                        *md->params[pos].type)) {
+                                    TypeRef* concrete =
+                                        substituteReturnType(resolved, outSubst);
+                                    if (concrete && concrete != resolved &&
+                                        isNullableValueTy(concrete))
+                                        loc->declType = concrete;
+                                }
+                            }
+                        }
+                        pos++;
+                    }
+                }
+            }
+        }
         if (md && md->returnType) {
             if (auto* rt = ctx_.resolvedType(*md->returnType)) {
                 // per §14.1 (generics are monomorphized): a method whose

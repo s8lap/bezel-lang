@@ -1265,6 +1265,19 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             // (a `{i8,T}` wrapper where the callee writes the bare value).
             // Resolve the local's type through the active substitution.
             slotTy = lowerTypeRef(resolveTypeParamRef(loc->declType));
+        } else if (ms && loc && loc->declType &&
+                   isNullableValueTy(loc->declType)) {
+            // §14.2 / §7.10 (#1469): a GENERIC method's `out T?` value parameter.
+            // Sema (typeCall, ExprTypecheck_Calls.cpp) resolved the out-var local
+            // to the concrete nullable value companion (`long?`/`int?`/…) via the
+            // call's type argument. The formal parameter type `T?` would lower
+            // HERE with the i32 placeholder (genericSubst_ is not active during
+            // slot creation), sizing the slot as {i8,i32} — correct only when the
+            // instantiation is `int`; for `long?`/`bool?`/`double?`/an enum the
+            // specialized callee writes a wider/narrower {i8,T} struct into the
+            // undersized slot, dropping the value (garbage on read-back). Size the
+            // slot from the sema-resolved concrete local type instead.
+            slotTy = lowerTypeRef(loc->declType);
         } else if (ms) {
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
             if (md && pos < md->params.size() && md->params[pos].type) {
