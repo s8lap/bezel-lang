@@ -7,11 +7,11 @@
 | **Target module(s)** | A new `System.Testing` module — **explicitly imported, deliberately *not* auto-imported** (§5.6). Builds on `System` (`Exception`/`ExceptionInfo` §31.4, `Type` stdlib §2.13, `Task` §30) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #24 (P1, diagnostics), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) — the one wave-D3 item flagged "numbered proposal (RFC-track) … the `test` modifier is a language change — needs the RFC discipline, owner ruling." |
-| **Related** | [#1398](https://github.com/s8lap/bezel-lang/issues/1398) (the future build driver — the natural test *runner* host); [#1419](https://github.com/s8lap/bezel-lang/issues/1419)/§28.14 (call-bounded closures — `Assert.Throws`'s shape); gap item #23 (`Verify`/`Unreachable`/`Debug.Fail` — the *sibling* diagnostics item, and the release-elidable `Debug.Assert` §2.16 this proposal is careful **not** to be) |
+| **Related** | [#1398](https://github.com/s8lap/bezel-lang/issues/1398) (the future build driver — the natural test *runner* host); [#1419](https://github.com/s8lap/bezel-lang/issues/1419)/§28.14 (call-bounded closures — `Assert.Throws`'s shape); gap item #23 (`Verify`/`Unreachable`/`Debug.Fail` — the *sibling* diagnostics item, and the release-elidable `Debug.Assert` §8.2 this proposal is careful **not** to be) |
 
 ## 1. What is missing, and the shape of the answer
 
-Bezel has no way to write a test. There is `Debug.Assert(condition)` (stdlib §2.16), but that is a *release-elidable runtime invariant check* — "calls to `Debug.*` may be elided in release builds … side effects in `Debug.Assert` arguments are unspecified." A test assertion is the opposite: it must **never** be elided, must produce a structured pass/fail record, and must render *why* it failed. The conformance harness (`tests/conformance/run_conformance.sh`) tests the *compiler* by compiling `.bzl` cases and diffing output; it is not a way for a Bezel *program* to test itself. Nothing in the language or stdlib lets a `.bzl` library ship its own unit tests.
+Bezel has no way to write a test. There is `Debug.Assert(condition)` (stdlib §8.2), but that is a *release-elidable runtime invariant check* — "calls to `Debug.*` may be elided in release builds … side effects in `Debug.Assert` arguments are unspecified." A test assertion is the opposite: it must **never** be elided, must produce a structured pass/fail record, and must render *why* it failed. The conformance harness (`tests/conformance/run_conformance.sh`) tests the *compiler* by compiling `.bzl` cases and diffing output; it is not a way for a Bezel *program* to test itself. Nothing in the language or stdlib lets a `.bzl` library ship its own unit tests.
 
 This proposal has **two cleanly separable parts**, and the separation is the most important structural fact about it:
 
@@ -98,7 +98,7 @@ Everything from here (§5–§8) is part 1: **no language change, no ruling.** I
 
 ## 5. The `Assert` static class (design question 1)
 
-`Assert` is a static class in `System.Testing`. Failures are a typed `AssertionException` (§5.4). Assertions **never** elide (unlike `Debug.Assert` §2.16 — §5.5 draws the line).
+`Assert` is a static class in `System.Testing`. Failures are a typed `AssertionException` (§5.4). Assertions **never** elide (unlike `Debug.Assert` §8.2 — §5.5 draws the line).
 
 ### 5.1 `Equal` — built on §9.2 equality, with the §9.2 eligibility error
 
