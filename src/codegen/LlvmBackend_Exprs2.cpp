@@ -5888,10 +5888,21 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // scrutinee path is handled by the isNullableVal branch above
                 // and never reaches here.
                 if (rt->kind == sema::TypeRef::Kind::Primitive) {
+                    // §3.3 per-instantiation (#1473): inside a monomorphized
+                    // generic body a type-parameter scrutinee's exprType is
+                    // still the placeholder param ref (Kind::Named, no
+                    // declaration). Resolve it to the concrete substituted type
+                    // so the same-primitive test reflects the actual
+                    // instantiation — `var b: int` matches when T=int but not
+                    // when T=char. For a concrete scrutinee resolveTypeParamRef
+                    // is the identity, so this does not disturb the concrete
+                    // paths below.
+                    const sema::TypeRef* rScrutTy = resolveTypeParamRef(scrutTy);
                     bool scrutIsSamePrim =
-                        scrutTy &&
-                        scrutTy->kind == sema::TypeRef::Kind::Primitive &&
-                        scrutTy->primitive == rt->primitive && !scrutTy->nullable;
+                        rScrutTy &&
+                        rScrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                        rScrutTy->primitive == rt->primitive &&
+                        !rScrutTy->nullable;
                     // §19.5 (#856): `var n: string` against a string scrutinee
                     // that is NOT the statically-present non-nullable case — a
                     // `string?` (a possibly-null pointer, NOT the {i8,T} tagged
@@ -5978,7 +5989,20 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             phi->addIncoming(isa, isaEnd);
                             return phi;
                         }
-                    return builder_.getInt1(true);
+                    // §19.3/§19.5 (#1473): a typed binding `var x: P` where P is
+                    // a primitive is a type-test — it matches iff the
+                    // scrutinee's runtime type IS P. This unconditional return
+                    // was only sound for the statically-satisfied case (the
+                    // scrutinee's resolved static type already IS P). A
+                    // MISMATCHED value-type primitive (e.g. an `int` scrutinee
+                    // vs `var b: bool`, or a T=char instantiation vs `var b:
+                    // int`) can NEVER match; returning unconditional `true` here
+                    // bound the scrutinee's raw bits under the wrong type and
+                    // selected the wrong arm (unsound — wrong runtime value).
+                    // Gate on scrutIsSamePrim so the mismatch falls through to
+                    // the next / `_` arm, mirroring the bare type-pattern form
+                    // (`bool` over an `int` scrutinee already yields no match).
+                    return builder_.getInt1(scrutIsSamePrim);
                 }
             }
             return nullptr;  // type not found — deferred
