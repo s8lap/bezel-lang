@@ -443,6 +443,34 @@ inline TypeSymbol* SemaContext::builtinClassSym(std::string_view name) {
     return ts;
 }
 
+// #1463 / §4.2 / §14.4: returns true when `name` is a value-builtin whose
+// Named TypeRef intentionally carries `declaration=null` after TypeResolution
+// (DateTime/TimeSpan/DateOnly/TimeOnly/Guid/CancellationToken keep
+// declaration=null so that lowerNew()'s `!rt->declaration` gate fires for
+// `new T(...)`; see TypeResolution_Names.cpp ~line 1040).  The function
+// consolidates the authoritative value-builtin-name set so that callers such
+// as the owning-collection element-type check do not maintain separate hand-
+// lists that diverge as new value-builtins are added.  Range/Buffer/IntPtr/
+// UIntPtr/ReadOnlyStringSpan/Boolean/Span/ReadOnlyArraySpan/ArraySpan are
+// also value-or-record types that must be excluded from owning collections.
+inline bool isValueBuiltinByName(std::string_view n) {
+    // Primary: synthetic value-type builtins (isValueBuiltin=true in
+    // builtinClassSym) that reach TypeResolution checks with declaration=null.
+    if (n == "DateTime" || n == "TimeSpan" ||
+        n == "DateOnly" || n == "TimeOnly" ||
+        n == "Guid"     || n == "CancellationToken")
+        return true;
+    // Secondary: other non-class/non-interface builtins that have no
+    // disposal obligation (value records, FFI value types, span views).
+    if (n == "Range"    || n == "Buffer"   ||
+        n == "IntPtr"   || n == "UIntPtr"  ||
+        n == "ReadOnlyStringSpan" || n == "Boolean" ||
+        n == "Span"     || n == "ReadOnlySpan" ||
+        n == "ArraySpan" || n == "ReadOnlyArraySpan")
+        return true;
+    return false;
+}
+
 // #1115 / §2.8–§2.9 / #975 (stdlib §5): synthesize (and cache) a real Interface
 // TypeSymbol for the builtin generic interfaces IComparable<T> / IEquatable<T> /
 // IEqualityComparer<T>, mirroring the shape SymbolCollection produces for a user

@@ -970,20 +970,21 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                 // Class or Interface → admitted; badDesc empty.
                             } else {
                                 // No TypeSymbol: builtin type or generic param.
-                                // Reject the handful of known value-like builtin
-                                // names; admit all class/interface builtins and
-                                // generic type parameters.
+                                // DateTime/TimeSpan/DateOnly/TimeOnly/Guid/
+                                // CancellationToken intentionally keep
+                                // declaration=null (so lowerNew() fires for
+                                // `new T(...)`; see ~line 1040).  Use the shared
+                                // isValueBuiltinByName() predicate (#1463) so
+                                // the complete set is maintained in one place
+                                // and does not diverge here as new value-
+                                // builtins are added.  Class/interface builtins
+                                // and generic type parameters remain admitted
+                                // (declaration=null, name not in the predicate).
                                 if (el->astNode && el->astNode->name &&
                                     el->astNode->name->parts.size() == 1) {
                                     std::string_view nm =
                                         el->astNode->name->parts[0];
-                                    if (nm == "Range" || nm == "Buffer" ||
-                                        nm == "IntPtr" || nm == "UIntPtr" ||
-                                        nm == "ReadOnlyStringSpan" ||
-                                        nm == "Boolean" || nm == "Span" ||
-                                        nm == "ReadOnlySpan" ||
-                                        nm == "ArraySpan" ||
-                                        nm == "ReadOnlyArraySpan")
+                                    if (isValueBuiltinByName(nm))
                                         badDesc = "a value-type builtin";
                                 }
                             }
