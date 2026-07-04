@@ -2395,6 +2395,41 @@ private:
             builder_.CreateStore(raw, outAddr);
         }
     }
+    // §11.8 / stdlib §2.19 (#1470): store a TryParse out-result. The per-type
+    // CONCRETE member's out is a BARE value (stdlib §9.1: `out result: int`), so
+    // a direct `int.TryParse(s, out var b)` slot is a plain scalar and the bare
+    // store below is correct. Dispatch through IParsable<T> instead uses the
+    // INTERFACE member `out value: T?` (§2.19): when `T.TryParse(s, out v)`
+    // forwards its result into a generic `out T?` parameter monomorphized to a
+    // value type, the caller's out slot is the nullable companion struct
+    // `{i8 hasValue; T value}`. Detect that shape from the slot's element type
+    // and marshal the value into field 1 with hasValue = ok (the v0.171
+    // nullable-out convention: the false path reads as null). Without this the
+    // bare-value store landed at offset 0 — the hasValue byte + padding — leaving
+    // the value field at offset 4 uninitialized (garbage on force-unwrap).
+    void storeTryParseOut(llvm::Value* outAddr, llvm::Type* et,
+                          llvm::Value* value, llvm::Value* ok) {
+        if (auto* st = et ? llvm::dyn_cast<llvm::StructType>(et) : nullptr) {
+            if (st->getNumElements() == 2 &&
+                st->getElementType(0) == nullablePrimHasValTy()) {
+                llvm::Type* innerTy = st->getElementType(1);
+                // Layout-identical record/struct mismatch (monomorphized body)
+                // then any residual numeric-width mismatch — both no-ops when the
+                // parsed value already has the companion's inner type.
+                value = reinterpretToType(value, innerTy);
+                if (value->getType() != innerTy)
+                    value = coerceNumericToType(value, innerTy);
+                llvm::Value* hv =
+                    builder_.CreateZExt(ok, nullablePrimHasValTy(), "tryp.hv");
+                llvm::Value* nv = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(st), hv, {0u});
+                nv = builder_.CreateInsertValue(nv, value, {1u}, "tryp.nv");
+                builder_.CreateStore(nv, outAddr);
+                return;
+            }
+        }
+        builder_.CreateStore(value, outAddr);
+    }
     // Is the receiver's element/value sema type a nullable VALUE type? (i.e. a
     // `Stack<int>`/`Dictionary<K,int>`-style value instantiation whose `T?` out
     // slot is the tagged `{i8,T}` struct rather than a nullable pointer.)

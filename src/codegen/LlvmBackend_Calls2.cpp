@@ -319,7 +319,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* cp0 = loadCodePoint(s, builder_.getInt64(0));
         llvm::Value* sel = builder_.CreateSelect(
             ok, cp0, llvm::ConstantInt::get(cp0->getType(), 0), "chtp.sel");
-        builder_.CreateStore(sel, outAddr);
+        // §11.8 / §2.19 (#1470): nullable-companion aware store for `T.TryParse`
+        // dispatched through IParsable<char> into a generic `out T?`.
+        storeTryParseOut(outAddr, et, sel, ok);
         return ok;
     }
     // stdlib §9.3 / §2.19: decimal.TryParse(s, out result): bool — routes to
@@ -332,8 +334,32 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
         if (!outAddr) return nullptr;
         auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
-        llvm::Value* r = builder_.CreateCall(fn, {s, outAddr}, "dectp.r");
-        return builder_.CreateICmpNE(r, builder_.getInt32(0), "dectp.ok");
+        // §11.8 / §2.19 (#1470): the runtime writes a BARE decimal through the
+        // pointer it is given. When the out slot is a nullable companion `{i8,
+        // decimal}` (generic IParsable<decimal> dispatch into a `out T?`),
+        // let it write into a scratch bare-decimal slot, then marshal that into
+        // the companion with hasValue = ok. A direct `decimal.TryParse` slot is a
+        // bare decimal — write straight through it.
+        bool decNullable =
+            et && et->isStructTy() &&
+            llvm::cast<llvm::StructType>(et)->getNumElements() == 2 &&
+            llvm::cast<llvm::StructType>(et)->getElementType(0) ==
+                nullablePrimHasValTy();
+        llvm::Value* target = outAddr;
+        llvm::AllocaInst* decScratch = nullptr;
+        if (decNullable) {
+            decScratch = entryAlloca(decimalStructType());
+            target = decScratch;
+        }
+        llvm::Value* r = builder_.CreateCall(fn, {s, target}, "dectp.r");
+        llvm::Value* okDec =
+            builder_.CreateICmpNE(r, builder_.getInt32(0), "dectp.ok");
+        if (decScratch) {
+            llvm::Value* dv =
+                builder_.CreateLoad(decimalStructType(), decScratch, "dectp.v");
+            storeTryParseOut(outAddr, et, dv, okDec);
+        }
+        return okDec;
     }
 
     // §8.1 / §8.4 (#1119): Object.ReferenceEquals(a, b): bool — compares object
@@ -717,12 +743,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         auto* dblTy = llvm::Type::getDoubleTy(llvm_);
         llvm::Value* zeroD = llvm::ConstantFP::get(dblTy, 0.0);
         llvm::Value* selD = builder_.CreateSelect(okD, valD, zeroD, "tryp.sel");
+        // §11.8 / §2.19 (#1470): nullable-companion aware store (generic
+        // IParsable<double>/<float> dispatch into a `out T?`); bare otherwise.
         if (pt == P::Float) {
             auto* fltTy = llvm::Type::getFloatTy(llvm_);
-            builder_.CreateStore(
-                builder_.CreateFPTrunc(selD, fltTy), outAddr);
+            storeTryParseOut(outAddr, et,
+                             builder_.CreateFPTrunc(selD, fltTy), okD);
         } else {
-            builder_.CreateStore(selD, outAddr);
+            storeTryParseOut(outAddr, et, selD, okD);
         }
         return okD;
     }
@@ -781,7 +809,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             }
             llvm::Value* zero64 = builder_.getInt64(0);
             llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
-            builder_.CreateStore(sel64, outAddr);
+            // §11.8 / §2.19 (#1470): marshal into a nullable companion when the
+            // out slot is `T?` (generic IParsable dispatch); bare store otherwise.
+            storeTryParseOut(outAddr, et, sel64, ok);
         } else {
             // #1134 / stdlib §9.1: TryParse must return FALSE for an
             // out-of-range value, not silently wrap the low bits. strtoll on a
@@ -808,7 +838,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             llvm::Value* truncV = builder_.CreateTrunc(val64, tt);
             llvm::Value* zeroV = llvm::ConstantInt::get(tt, 0);
             llvm::Value* selV = builder_.CreateSelect(ok, truncV, zeroV, "tryp.sel");
-            builder_.CreateStore(selV, outAddr);
+            // §11.8 / §2.19 (#1470): nullable-companion aware store (see above).
+            storeTryParseOut(outAddr, et, selV, ok);
         }
         return ok;
     }
@@ -844,7 +875,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // ok = cmpTrue || cmpFalse
         llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "btp.ok");
         // result = cmpTrue (true iff "true"; false for "false" or garbage)
-        builder_.CreateStore(cmpTrue, outAddr);
+        // §11.8 / §2.19 (#1470): nullable-companion aware store for `T.TryParse`
+        // dispatched through IParsable<bool> into a generic `out T?`.
+        storeTryParseOut(outAddr, et, cmpTrue, ok);
         return ok;
     }
 
