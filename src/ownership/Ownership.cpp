@@ -1450,7 +1450,7 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
     if (!tt || tt->kind != sema::TypeRef::Kind::Named) return false;
     std::string_view head;
     if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
-        head = tt->astNode->name->parts.front();
+        head = tt->headName();
     else if (!tt->importedName.empty())
         head = tt->importedName;
     return head == "IOwningEnumerable" || head == "IOwningAsyncEnumerable";
@@ -1728,7 +1728,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     // type name from the ast::Type to recognise value builtins.
                     if (!rt->declaration && rt->astNode && rt->astNode->name &&
                         rt->astNode->name->parts.size() == 1) {
-                        std::string_view n = rt->astNode->name->parts[0];
+                        std::string_view n = rt->headName();
                         if (n == "DateTime" || n == "TimeSpan" ||
                             n == "Guid"     || n == "CancellationToken" ||
                             n == "DateOnly" || n == "TimeOnly")  // per §2.5 / #1357
@@ -1777,7 +1777,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             if (const sema::TypeRef* rt = ctx_.exprType(e))
                 if (rt->kind == sema::TypeRef::Kind::Named && rt->astNode &&
                     rt->astNode->name && !rt->astNode->name->parts.empty() &&
-                    isOwningCollectionNameHead(rt->astNode->name->parts.front()))
+                    isOwningCollectionNameHead(rt->headName()))
                     return OwnershipState::Owned;
         }
     }
@@ -1815,7 +1815,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
                     isOwningCollectionNameHead(
-                        rt->astNode->name->parts.front()))
+                        rt->headName()))
                     return OwnershipState::Borrowed;
             // Other non-`owned` user returns: fall through.
         }
@@ -1889,7 +1889,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             if (retTy->kind == sema::TypeRef::Kind::Named &&
                 retTy->astNode && retTy->astNode->name &&
                 !retTy->astNode->name->parts.empty()) {
-                std::string_view head = retTy->astNode->name->parts.front();
+                std::string_view head = retTy->headName();
                 if (head == "Shared"          || head == "Weak"            ||
                     head == "ChannelSender"    || head == "OwningTask"       ||
                     head == "OwningArray"       || head == "OwningDictionary" ||
@@ -2518,7 +2518,7 @@ void MethodOwnership::checkBorrowedOwningCollectionCapability(
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->astNode ||
         !rt->astNode->name || rt->astNode->name->parts.empty())
         return;
-    if (!isOwningCollectionNameHead(rt->astNode->name->parts.front())) return;
+    if (!isOwningCollectionNameHead(rt->headName())) return;
     // Owned by the current scope → full API.
     sema::Symbol* rsym = ctx_.exprSymbol(*recv);
     if (dynamic_cast<sema::FieldSymbol*>(rsym)) {

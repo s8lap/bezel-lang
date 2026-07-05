@@ -721,8 +721,8 @@ bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
     return t && t->kind == TypeRef::Kind::Named && !t->nullable &&
            t->astNode && t->astNode->name &&
            t->astNode->name->parts.size() == 1 &&
-           (t->astNode->name->parts.front() == "Task" ||
-            t->astNode->name->parts.front() == "OwningTask");
+           (t->headName() == "Task" ||
+            t->headName() == "OwningTask");
 }
 
 // stdlib §5 (#755): a BARE lazy GroupBy result — `IEnumerable<IGrouping<TKey,T>>`
@@ -741,7 +741,7 @@ static bool isBareLazyGroupingType(const TypeRef* t) {
     const TypeRef* elem = t->genericArgs[0];
     return elem && elem->astNode && elem->astNode->name &&
            !elem->astNode->name->parts.empty() &&
-           elem->astNode->name->parts.front() == "IGrouping";
+           elem->headName() == "IGrouping";
 }
 
 void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
@@ -754,7 +754,7 @@ void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
         !r->astNode->name || r->astNode->name->parts.size() != 1) {
         return;
     }
-    std::string_view head = r->astNode->name->parts.front();
+    std::string_view head = r->headName();
     if (head == "Task" && r->genericArgs.empty()) {
         // `Task` — no result value; void-method form rules.
         return;
@@ -2293,7 +2293,7 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
                     pt->declaration || pt->nullable || !pt->astNode ||
                     !pt->astNode->name ||
                     pt->astNode->name->parts.size() != 1 ||
-                    !ifaceParams.count(pt->astNode->name->parts[0])) {
+                    !ifaceParams.count(pt->headName())) {
                     bothRecur = false;
                     break;
                 }
@@ -3815,7 +3815,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     rt->astNode && rt->astNode->name &&
                                     !rt->astNode->name->parts.empty()) {
                                     std::string_view head =
-                                        rt->astNode->name->parts.front();
+                                        rt->headName();
                                     ownedProduced =
                                         head == "OwningArray" ||
                                         head == "OwningStack" ||
@@ -4014,9 +4014,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 !rt->declaration &&
                                 rt->astNode && rt->astNode->name &&
                                 !rt->astNode->name->parts.empty() &&
-                                (rt->astNode->name->parts[0] ==
+                                (rt->headName() ==
                                     "ReadOnlyArraySpan" ||
-                                 rt->astNode->name->parts[0] ==
+                                 rt->headName() ==
                                     "ReadOnlySpan")) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
@@ -4548,7 +4548,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         std::string_view colTypeName;
                         if (tt->astNode && tt->astNode->name &&
                             !tt->astNode->name->parts.empty())
-                            colTypeName = tt->astNode->name->parts[0];
+                            colTypeName = tt->headName();
                         else if (!tt->importedName.empty())
                             colTypeName = tt->importedName;
                         if ((colTypeName == "Dictionary" ||

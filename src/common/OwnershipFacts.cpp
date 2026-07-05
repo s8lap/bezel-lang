@@ -81,9 +81,16 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     std::string_view rcn;
     if (ma->target) {
         const sema::TypeRef* rt = ctx.exprType(*ma->target);
-        if (rt && rt->astNode && rt->astNode->name &&
-            !rt->astNode->name->parts.empty())
-            rcn = rt->astNode->name->parts[0];
+        // #1462 / §27.8: see through a transparent type alias
+        // (`type OA := OwningArray<R>`) — the alias-resolved TypeRef keeps the
+        // use-site astNode (`OA`) for diagnostics, so a bare astNode read would
+        // miss the owning-collection head and the popped element would never be
+        // tracked Owned (no §28.3 auto-drop → leak).
+        if (rt && !rt->aliasResolvedHead.empty())
+            rcn = rt->aliasResolvedHead;
+        else if (rt && rt->astNode && rt->astNode->name &&
+                 !rt->astNode->name->parts.empty())
+            rcn = rt->headName();
         else if (rt && !rt->importedName.empty())
             rcn = rt->importedName;
     }

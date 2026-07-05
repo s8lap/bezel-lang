@@ -101,7 +101,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
         !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        recvTy->astNode->name->parts[0] == "ReadOnlyStringSpan") {
+        recvTy->headName() == "ReadOnlyStringSpan") {
         llvm::Value* spanVal = lowerExpr(*ix.target);
         if (!spanVal) return nullptr;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
@@ -187,7 +187,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         bool isBuf = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                      !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
                      !recvTy->astNode->name->parts.empty() &&
-                     recvTy->astNode->name->parts[0] == "Buffer";
+                     recvTy->headName() == "Buffer";
         if (isBuf) {
             llvm::Value* buf = lowerExpr(*ix.target);
             if (!buf) return nullptr;
@@ -527,7 +527,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
             bool arrIsOwning =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+                common::isOwningPrefixedName(recvTy->headName());
             if (!elementPolicyFor(arrEl, arrIsOwning).disposerThunk) return nullptr;
         }
         llvm::Value* recv = lowerExpr(*ix.target);
@@ -577,7 +577,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     bool owningDict =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        recvTy->astNode->name->parts[0] == "OwningDictionary" &&
+        recvTy->headName() == "OwningDictionary" &&
         elementPolicyFor(dictMoveValTy, /*owningFamily=*/true).cat ==
             ElementPolicy::Category::ClassOwned;
     if (!owningDict) return nullptr;
@@ -656,7 +656,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (isSpanLikeTypeName(recvTy)) {
         std::string_view rcn = (recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty())
-            ? std::string_view(recvTy->astNode->name->parts[0]) : "";
+            ? std::string_view(recvTy->headName()) : "";
         if (rcn == "ReadOnlyArraySpan" || rcn == "ReadOnlySpan")
             return false;  // read-only: no setter
         llvm::Value* spanVal = lowerExpr(*ix.target);
@@ -715,7 +715,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         bool isBuf = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                      !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
                      !recvTy->astNode->name->parts.empty() &&
-                     recvTy->astNode->name->parts[0] == "Buffer";
+                     recvTy->headName() == "Buffer";
         if (isBuf) {
             llvm::Value* buf = lowerExpr(*ix.target);
             if (!buf) return false;
@@ -828,7 +828,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool arrIsOwning =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+                common::isOwningPrefixedName(recvTy->headName());
             ElementPolicy arrPol = elementPolicyFor(arrEl, arrIsOwning);
             bool isStrElemArr =
                 !arrIsOwning &&
@@ -839,7 +839,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
                 [](std::string_view n){return n=="Array"||n=="Stack"||n=="Queue";}(
-                    recvTy->astNode->name->parts[0]);
+                    recvTy->headName());
             if (isStrElemArr) {
                 if (!valueExpr || !isPlusOneStringProducer(valueExpr))
                     emitStringRetain(val);
@@ -871,7 +871,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             bool arrIsOwning2 =
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+                common::isOwningPrefixedName(recvTy->headName());
             llvm::Function* elemDisp =
                 elementPolicyFor(arrEl, arrIsOwning2).disposerThunk;
             if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
@@ -976,7 +976,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     bool dictIsOwning2 =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        recvTy->astNode->name->parts[0] == "OwningDictionary";
+        recvTy->headName() == "OwningDictionary";
     const sema::TypeRef* dictValTy2 =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                     : nullptr;
@@ -1061,7 +1061,7 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
         if (tt->kind == sema::TypeRef::Kind::Named && !tt->declaration &&
             tt->astNode && tt->astNode->name &&
             tt->astNode->name->parts.size() == 1) {
-            auto sit = genericSubstSemaTy_.find(tt->astNode->name->parts[0]);
+            auto sit = genericSubstSemaTy_.find(tt->headName());
             if (sit != genericSubstSemaTy_.end() && sit->second &&
                 sit->second->kind == sema::TypeRef::Kind::Named &&
                 sit->second->declaration)
@@ -1914,7 +1914,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         bool ixIsOwning =
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+            common::isOwningPrefixedName(recvTy->headName());
         llvm::Function* elemDisp =
             elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
         if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
@@ -2017,7 +2017,7 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
         bool ixIsOwning =
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+            common::isOwningPrefixedName(recvTy->headName());
         llvm::Function* elemDisp = elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
         if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
         if (elemDisp) {
@@ -2925,14 +2925,14 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
           targetTy->astNode->name && !targetTy->astNode->name->parts.empty() &&
-          targetTy->astNode->name->parts[0] == "IEnumerable"))
+          targetTy->headName() == "IEnumerable"))
         return v;
     sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
     std::string_view an;
     if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
         actualTy->astNode && actualTy->astNode->name &&
         !actualTy->astNode->name->parts.empty())
-        an = actualTy->astNode->name->parts[0];
+        an = actualTy->headName();
     bool actualIsArray =
         (an == "Array" || an == "OwningArray" || an == "OwningBuffer" ||
          an == "Stack" || an == "OwningStack" ||

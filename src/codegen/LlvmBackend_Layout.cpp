@@ -371,7 +371,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
     if (rt->nullable && rt->kind == sema::TypeRef::Kind::Named &&
         !rt->declaration && rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1 &&
-        !isBuiltinTypeRefName(rt->astNode->name->parts[0])) {
+        !isBuiltinTypeRefName(rt->headName())) {
         if (!genericSubstSemaTy_.empty()) {
             sema::TypeRef nv;
             if (nullableTypeParamConcrete(rt, nv)) {
@@ -415,7 +415,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             if (!rt->declaration && !genericSubst_.empty() &&
                 rt->astNode && rt->astNode->name &&
                 rt->astNode->name->parts.size() == 1) {
-                auto sit = genericSubst_.find(rt->astNode->name->parts[0]);
+                auto sit = genericSubst_.find(rt->headName());
                 if (sit != genericSubst_.end())
                     return sit->second;
             }
@@ -438,7 +438,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // opaque pointers at the C boundary (char*, wchar*, void*).
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
-                auto fn = rt->astNode->name->parts[0];
+                auto fn = rt->headName();
                 if (fn == "IntPtr" || fn == "UIntPtr")
                     return i64();  // per §32.7: pointer-sized integer (i64 host)
                 if (fn == "CString" || fn == "WString" || fn == "RawBytes")
@@ -451,7 +451,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // and the "builtinClassSym" (returned by Now/UtcNow/From*) shapes.
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
-                auto n0 = rt->astNode->name->parts[0];
+                auto n0 = rt->headName();
                 if (n0 == "DateTime" || n0 == "TimeSpan") return i64();
                 // per §2.5 / #1357: DateOnly and TimeOnly are i32 value types.
                 // DateOnly: day number since 0001-01-01; TimeOnly: ms since midnight.
@@ -486,7 +486,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // Unlike collections (heap pointers), a Guid lowers to the inline struct.
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty() &&
-                rt->astNode->name->parts[0] == "Guid") {
+                rt->headName() == "Guid") {
                 return guidStructType();
             }
             // §4.15 (#549) / §4.14 (#779): ArraySpan/ReadOnlyArraySpan (borrowing)
@@ -494,13 +494,13 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // { ptr source, i32 start, i32 length } — no heap pointer.
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty() &&
-                (rt->astNode->name->parts[0] == "ArraySpan" ||
-                 rt->astNode->name->parts[0] == "ReadOnlyArraySpan" ||
-                 rt->astNode->name->parts[0] == "Span" ||
-                 rt->astNode->name->parts[0] == "ReadOnlySpan" ||
+                (rt->headName() == "ArraySpan" ||
+                 rt->headName() == "ReadOnlyArraySpan" ||
+                 rt->headName() == "Span" ||
+                 rt->headName() == "ReadOnlySpan" ||
                  // §3.3 (#883): ReadOnlyStringSpan shares the {ptr,i32,i32} shape
                  // (field 0 is a string pointer, not an array pointer).
-                 rt->astNode->name->parts[0] == "ReadOnlyStringSpan")) {
+                 rt->headName() == "ReadOnlyStringSpan")) {
                 return arraySpanStructType();
             }
             // §2.15 / issue #687: JsonOptions is a compiler-known value record.
@@ -508,12 +508,12 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             //   i1 IgnoreUnknownFields, i32 MaxDepth }
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty() &&
-                rt->astNode->name->parts[0] == "JsonOptions") {
+                rt->headName() == "JsonOptions") {
                 return jsonOptionsStructType();
             }
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
-                auto n = rt->astNode->name->parts[0];
+                auto n = rt->headName();
                 // #1414 stage 3: the shared heap-pointer reference-builtin name
                 // set now lives in the registry (one home, snapshot-pinned).
                 // This is the miss-a-list class behind #1390 (serializer pointer
@@ -647,7 +647,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                             !arg->astNode || !arg->astNode->name ||
                             arg->astNode->name->parts.size() != 1 ||
                             !arg->genericArgs.empty() ||
-                            genericSubst_.count(arg->astNode->name->parts[0])) {
+                            genericSubst_.count(arg->headName())) {
                             allUnbound = false;
                             break;
                         }
@@ -881,7 +881,7 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
                     if (arg && arg->kind == sema::TypeRef::Kind::Named &&
                         !arg->declaration && arg->astNode && arg->astNode->name &&
                         arg->astNode->name->parts.size() == 1) {
-                        auto it = curArgs.find(arg->astNode->name->parts[0]);
+                        auto it = curArgs.find(arg->headName());
                         if (it != curArgs.end()) arg = it->second;
                     }
                     std::string_view pname = btd->genericParams[gi].name;
@@ -1150,7 +1150,7 @@ const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
     // Local generic record: type-param name is in astNode.
     if (declared->astNode && declared->astNode->name &&
         declared->astNode->name->parts.size() == 1) {
-        auto it = genericSubstSemaTy_.find(declared->astNode->name->parts[0]);
+        auto it = genericSubstSemaTy_.find(declared->headName());
         if (it != genericSubstSemaTy_.end() && it->second)
             return withNullability(it->second);
     }
@@ -2814,7 +2814,7 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             if (tt->kind == sema::TypeRef::Kind::Named && !tt->declaration &&
                 tt->astNode && tt->astNode->name &&
                 tt->astNode->name->parts.size() == 1) {
-                auto cit = genericSubstSemaTy_.find(tt->astNode->name->parts[0]);
+                auto cit = genericSubstSemaTy_.find(tt->headName());
                 if (cit != genericSubstSemaTy_.end() && cit->second &&
                     cit->second->kind == sema::TypeRef::Kind::Named &&
                     cit->second->declaration) {

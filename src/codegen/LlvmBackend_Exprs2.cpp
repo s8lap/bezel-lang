@@ -594,7 +594,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     !expRT->declaration && expRT->astNode &&
                     expRT->astNode->name &&
                     expRT->astNode->name->parts.size() == 1) {
-                    auto gsit = genericSubst_.find(expRT->astNode->name->parts[0]);
+                    auto gsit = genericSubst_.find(expRT->headName());
                     if (gsit != genericSubst_.end() && gsit->second != i32())
                         expected = gsit->second;
                 }
@@ -625,7 +625,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                             expRT->astNode->name->parts.size() == 1 &&
                             !genericSubstSemaTy_.empty()) {
                             auto sit = genericSubstSemaTy_.find(
-                                expRT->astNode->name->parts[0]);
+                                expRT->headName());
                             if (sit != genericSubstSemaTy_.end() &&
                                 sit->second)
                                 hintTy = const_cast<sema::TypeRef*>(sit->second);
@@ -786,7 +786,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
                 rt->astNode && rt->astNode->name &&
                 rt->astNode->name->parts.size() == 1) {
-                auto sit = genericSubst_.find(rt->astNode->name->parts[0]);
+                auto sit = genericSubst_.find(rt->headName());
                 if (sit != genericSubst_.end() && sit->second != i32()) {
                     retTy = sit->second;
                     // retSemaTy stays the unresolved generic ref — no
@@ -2285,7 +2285,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     if (!rt->declaration && rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1 &&
         !genericSubstSemaTy_.empty()) {
-        auto sit = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
+        auto sit = genericSubstSemaTy_.find(rt->headName());
         if (sit != genericSubstSemaTy_.end() && sit->second &&
             sit->second->kind == sema::TypeRef::Kind::Named &&
             sit->second->declaration) {
@@ -3309,7 +3309,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     arg->declaration || !arg->astNode || !arg->astNode->name ||
                     arg->astNode->name->parts.size() != 1 ||
                     !arg->genericArgs.empty() ||
-                    genericSubst_.count(arg->astNode->name->parts[0])) {
+                    genericSubst_.count(arg->headName())) {
                     allUnbound = false;
                     break;
                 }

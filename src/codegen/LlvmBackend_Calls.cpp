@@ -368,15 +368,20 @@ int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
 
 // §6.1 / §30.8: extract the builtin type name from a Named TypeRef with no
 // user TypeDecl.  Two shapes are possible:
-//   a) !rt->declaration: the name lives in rt->astNode->name->parts[0].
+//   a) !rt->declaration: the name lives in rt->headName().
 //   b) rt->declaration is a builtinClassSym (null decl): name = declaration->name.
 // Returns an empty string_view if the TypeRef is not in either shape.
 std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
     if (!rt->declaration) {
+        // #1462 / §27.8: see through a transparent type alias
+        // (`type OA := OwningArray<R>`) — the alias-resolved TypeRef keeps the
+        // use-site astNode (`OA`) for diagnostics, so a bare astNode read would
+        // mis-identify the builtin. aliasResolvedHead carries the underlying head.
+        if (!rt->aliasResolvedHead.empty()) return rt->aliasResolvedHead;
         if (rt->astNode && rt->astNode->name &&
             !rt->astNode->name->parts.empty())
-            return rt->astNode->name->parts[0];
+            return rt->headName();
         // #662 foundation B: for IMPORTED fields the TypeRef has no astNode;
         // the loader stores the raw type name in importedName when lookupNamed
         // returns null (see ModuleLoader.cpp convert(), §2.5).
@@ -435,7 +440,7 @@ bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
         return false;
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
-    auto n = rt->astNode->name->parts[0];
+    auto n = rt->headName();
     if (n == "IOwningList") { if (outOwning) *outOwning = true; return true; }
     return n == "IReadOnlyList" || n == "IList";
 }
@@ -698,7 +703,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // Check for StringBuilder
     bool isStrBld = (recvTy && recvTy->astNode && recvTy->astNode->name &&
                      !recvTy->astNode->name->parts.empty() &&
-                     recvTy->astNode->name->parts[0] == "StringBuilder");
+                     recvTy->headName() == "StringBuilder");
 
     // FINDING [5] / stdlib §5: an EAGER terminal LINQ operator (Count / Sum /
     // Aggregate / Any / All / First / …) chained DIRECTLY onto a LAZY pipeline
@@ -935,11 +940,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // (LINQ, set-algebra) are not wired in this slice and fall through.
         bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
                          !recvTy->astNode->name->parts.empty() &&
-                         (recvTy->astNode->name->parts[0] == "Set" ||
-                          recvTy->astNode->name->parts[0] == "OwningSet" ||
+                         (recvTy->headName() == "Set" ||
+                          recvTy->headName() == "OwningSet" ||
                           // stdlib §4.18 (#1426): SortedSet<T> shares the generic-key
                           // hash table backing of Set/OwningSet.
-                          recvTy->astNode->name->parts[0] == "SortedSet");
+                          recvTy->headName() == "SortedSet");
         if (isSetName) {
             if (const sema::TypeRef* elemTy =
                     genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
@@ -1107,7 +1112,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // InvalidOperationException on empty set (§4.18).
                 // Only available on SortedSet; not on Set/OwningSet.
                 bool isSortedSetRecv =
-                    recvTy->astNode->name->parts[0] == "SortedSet";
+                    recvTy->headName() == "SortedSet";
                 if (isSortedSetRecv &&
                     (m == "First" || m == "Last") && call.args.empty()) {
                     bool isMax = (m == "Last");
@@ -2776,7 +2781,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Reversed" && call.args.empty() &&
             recvTy && recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0] == "Array") {
+            recvTy->headName() == "Array") {
             llvm::Type* elemTy = getElemTy();
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
@@ -2824,7 +2829,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Sorted" && call.args.empty() &&
             recvTy && recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0] == "Array") {
+            recvTy->headName() == "Array") {
             llvm::Type* elemTy2 = getElemTy();
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
@@ -2940,7 +2945,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Sorted" && call.args.size() == 1 && call.args[0].value &&
             recvTy && recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->astNode->name->parts[0] == "Array") {
+            recvTy->headName() == "Array") {
             llvm::Type* elemTy2 = getElemTy();
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
@@ -3024,7 +3029,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                                      : nullptr;
         bool arrIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                            !recvTy->astNode->name->parts.empty() &&
-                           (common::isOwningPrefixedName(recvTy->astNode->name->parts[0]));
+                           (common::isOwningPrefixedName(recvTy->headName()));
         const ElementPolicy arrElemPol =
             elementPolicyFor(arrElemRef, arrIsOwning);
         // Convenience predicates derived from the policy (replacing the old
@@ -3163,7 +3168,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         {
             bool isOwnedSetRecv = recvTy && recvTy->astNode &&
                 recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
-                recvTy->astNode->name->parts[0] == "OwningSet";
+                recvTy->headName() == "OwningSet";
             if (m == "Add" && call.args.size() == 1 && call.args[0].value &&
                 isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -3380,8 +3385,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 bool isQueuePeek = recvTy && recvTy->astNode &&
                     recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->astNode->name->parts[0] == "Queue" ||
-                     recvTy->astNode->name->parts[0] == "OwningQueue");
+                    (recvTy->headName() == "Queue" ||
+                     recvTy->headName() == "OwningQueue");
                 if (isQueuePeek)
                     idx = builder_.getInt64(0);
                 else
@@ -3616,7 +3621,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             std::string_view cn =
                 (recvTy && recvTy->astNode && recvTy->astNode->name &&
                  !recvTy->astNode->name->parts.empty())
-                    ? recvTy->astNode->name->parts[0]
+                    ? recvTy->headName()
                     : std::string_view{};
             bool isStack = cn.find("Stack") != std::string_view::npos;
             bool front = (m == "TryDequeue") ? true
@@ -3961,7 +3966,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // keep dictValueBoxFreer calls unchanged (batch 3 / #602 follow-on).
         bool dictValIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                                !recvTy->astNode->name->parts.empty() &&
-                               (common::isOwningPrefixedName(recvTy->astNode->name->parts[0]));
+                               (common::isOwningPrefixedName(recvTy->headName()));
         const ElementPolicy dictValPol =
             elementPolicyFor(valTy, dictValIsOwning);
         // Convenience predicate: is this a borrowing Dictionary<K, string>?
@@ -4665,7 +4670,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // property and sema rejects it there.
         bool isSortedDictRecv = recvTy && recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0] == "SortedDictionary";
+                                recvTy->headName() == "SortedDictionary";
         if (isSortedDictRecv && (m == "FirstKey" || m == "LastKey") &&
             call.args.empty()) {
             bool isMax = (m == "LastKey");
@@ -5074,7 +5079,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             !igrpRecvTy->declaration &&
             igrpRecvTy->astNode && igrpRecvTy->astNode->name &&
             !igrpRecvTy->astNode->name->parts.empty() &&
-            igrpRecvTy->astNode->name->parts[0] == "IGrouping") {
+            igrpRecvTy->headName() == "IGrouping") {
             llvm::Value* grp = lowerExpr(*ma->target);
             if (!grp) return nullptr;
             const auto& mname = ma->member;
@@ -7658,7 +7663,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                     !recvTy->declaration && recvTy->astNode &&
                     recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
-                    recvTy->astNode->name->parts[0] == "Random") {
+                    recvTy->headName() == "Random") {
                     llvm::Value* rng = lowerExpr(*ma2->target);
                     if (!rng) return nullptr;
                     const auto& mname = ma2->member;

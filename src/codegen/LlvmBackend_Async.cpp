@@ -1385,7 +1385,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             std::string_view rn;
             if (retRef->astNode && retRef->astNode->name &&
                 !retRef->astNode->name->parts.empty())
-                rn = retRef->astNode->name->parts[0];
+                rn = retRef->headName();
             else if (!retRef->importedName.empty())
                 rn = retRef->importedName;
             isOwningIter = (rn == "IOwningAsyncEnumerable");
@@ -1896,7 +1896,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
         bool isOwnedTask = (taskTy && taskTy->kind == sema::TypeRef::Kind::Named &&
             !taskTy->declaration && taskTy->astNode && taskTy->astNode->name &&
             !taskTy->astNode->name->parts.empty() &&
-            taskTy->astNode->name->parts[0] == "OwningTask");
+            taskTy->headName() == "OwningTask");
         if (isOwnedTask && !freeTaskAfter) {
             markSpentAfter = true;
             if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0]) {

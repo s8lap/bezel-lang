@@ -87,7 +87,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         if (t->declaration) return false;
         if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
             return false;
-        auto n = t->astNode->name->parts[0];
+        auto n = t->headName();
         return n == "Shared" || n == "Weak";
     };
     // stdlib §5 (#651): IGrouping<TKey, T> elements are bz_grouping_t* pointers
@@ -99,7 +99,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         if (t->declaration) return false;
         if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
             return false;
-        return t->astNode->name->parts[0] == "IGrouping";
+        return t->headName() == "IGrouping";
     };
     if (isIGroupingElem(elemTy)) {
         // Use the cached groupingFreeThunk() (built once per module,
@@ -146,7 +146,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         if (t->declaration) return false;
         if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
             return false;
-        std::string_view n = t->astNode->name->parts[0];
+        std::string_view n = t->headName();
         return n == "OwningArray" || n == "OwningStack" || n == "OwningQueue" ||
                n == "OwningLinkedList" || n == "OwningDictionary" || n == "OwningSet";
     };
@@ -179,7 +179,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         if (t->declaration) return false;
         if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
             return false;
-        return t->astNode->name->parts[0] == "Weak";
+        return t->headName() == "Weak";
     };
     if (isSharedWeakElem ||
         (elemTy && elemTy->kind == sema::TypeRef::Kind::Named &&

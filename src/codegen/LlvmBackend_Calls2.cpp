@@ -1431,7 +1431,7 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
         !genericSubstSemaTy_.empty() && recvTy->astNode &&
         recvTy->astNode->name && recvTy->astNode->name->parts.size() == 1) {
-        auto sit = genericSubstSemaTy_.find(recvTy->astNode->name->parts[0]);
+        auto sit = genericSubstSemaTy_.find(recvTy->headName());
         if (sit != genericSubstSemaTy_.end() && sit->second) {
             const sema::TypeRef* concrete = sit->second;
             using K = sema::TypeRef::Kind;
@@ -1892,7 +1892,7 @@ bool Emitter::isIEventTypeName(const sema::TypeRef* rt) {
         return false;
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
-    const auto& n = rt->astNode->name->parts[0];
+    const auto& n = rt->headName();
     return n == "IEvent" || n == "IAsyncEvent";
 }
 
@@ -2031,7 +2031,7 @@ bool Emitter::isSubscriptionType(const sema::TypeRef* rt) {
         return false;
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
-    return rt->astNode->name->parts[0] == "Subscription";
+    return rt->headName() == "Subscription";
 }
 
 bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
@@ -2087,7 +2087,7 @@ void Emitter::unifyMethodReturnTypeArg(
     if (declRet->kind == sema::TypeRef::Kind::Named && !declRet->declaration &&
         declRet->astNode && declRet->astNode->name &&
         declRet->astNode->name->parts.size() == 1) {
-        std::string_view nm = declRet->astNode->name->parts[0];
+        std::string_view nm = declRet->headName();
         bool isParam = false;
         for (const auto& gp : genericParams)
             if (gp.name == nm) { isParam = true; break; }
@@ -2138,7 +2138,7 @@ void Emitter::unifyMethodReturnTypeArg(
                 std::string_view cn;
                 if (concreteTy->astNode && concreteTy->astNode->name &&
                     concreteTy->astNode->name->parts.size() == 1)
-                    cn = concreteTy->astNode->name->parts[0];
+                    cn = concreteTy->headName();
                 else if (!concreteTy->astNode && !concreteTy->importedName.empty())
                     cn = concreteTy->importedName;
                 if (cn.empty() || !isBuiltinTypeRefName(cn))
@@ -2174,7 +2174,7 @@ void Emitter::unifyMethodReturnTypeArg(
             std::string_view rn;
             if (resultTy->astNode && resultTy->astNode->name &&
                 !resultTy->astNode->name->parts.empty())
-                rn = resultTy->astNode->name->parts[0];
+                rn = resultTy->headName();
             else if (!resultTy->importedName.empty())
                 rn = resultTy->importedName;
             if (!rn.empty() && rn == nm) {
@@ -2265,7 +2265,7 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                     if (itTy && itTy->kind == sema::TypeRef::Kind::Named) {
                         if (itTy->astNode && itTy->astNode->name &&
                             !itTy->astNode->name->parts.empty())
-                            inm = itTy->astNode->name->parts[0];
+                            inm = itTy->headName();
                         else if (!itTy->importedName.empty())
                             inm = itTy->importedName;
                     }
@@ -2648,7 +2648,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             if (fr->kind == sema::TypeRef::Kind::Named && !fr->declaration &&
                 fr->astNode && fr->astNode->name &&
                 fr->astNode->name->parts.size() == 1) {
-                std::string_view paramName = fr->astNode->name->parts[0];
+                std::string_view paramName = fr->headName();
                 // Look up in the callee's localGenericSubst_.
                 sema::Symbol* calleeSym2 = ctx_.exprSymbol(*call.callee);
                 const ast::Node* decl = nullptr;
@@ -2706,7 +2706,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 if (fp->kind == sema::TypeRef::Kind::Named && !fp->declaration &&
                     fp->astNode && fp->astNode->name &&
                     fp->astNode->name->parts.size() == 1 && calleeSubst) {
-                    auto sit = calleeSubst->find(fp->astNode->name->parts[0]);
+                    auto sit = calleeSubst->find(fp->headName());
                     if (sit != calleeSubst->end() && sit->second != i32())
                         declared = sit->second;
                 }
@@ -2774,7 +2774,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             !rt->funcReturn->declaration &&
             rt->funcReturn->astNode && rt->funcReturn->astNode->name &&
             rt->funcReturn->astNode->name->parts.size() == 1) {
-            std::string_view retParamName = rt->funcReturn->astNode->name->parts[0];
+            std::string_view retParamName = rt->funcReturn->headName();
             // Check if any param has the same type parameter name.
             bool retMatchesParam = false;
             for (const auto& fp : rt->funcParams) {
@@ -2783,7 +2783,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !fp.type->declaration && fp.type->astNode &&
                     fp.type->astNode->name &&
                     fp.type->astNode->name->parts.size() == 1 &&
-                    fp.type->astNode->name->parts[0] == retParamName) {
+                    fp.type->headName() == retParamName) {
                     retMatchesParam = true; break;
                 }
             }
@@ -3146,7 +3146,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     recvTy->astNode->name &&
                     recvTy->astNode->name->parts.size() == 1) {
                     auto sit = genericSubstSemaTy_.find(
-                        recvTy->astNode->name->parts[0]);
+                        recvTy->headName());
                     if (sit != genericSubstSemaTy_.end() && sit->second &&
                         sit->second->declaration &&
                         (sit->second->declaration->kind ==
@@ -3197,7 +3197,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     recvTy->astNode && recvTy->astNode->name &&
                     recvTy->astNode->name->parts.size() == 1) {
                     std::string_view paramName =
-                        recvTy->astNode->name->parts[0];
+                        recvTy->headName();
                     auto sit = genericSubstSemaTy_.find(paramName);
                     if (sit != genericSubstSemaTy_.end() && sit->second) {
                         const sema::TypeRef* concreteTy = sit->second;
@@ -3582,8 +3582,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->astNode->name->parts[0] == "IEnumerator" ||
-                     recvTy->astNode->name->parts[0] == "IOwningEnumerator");
+                    (recvTy->headName() == "IEnumerator" ||
+                     recvTy->headName() == "IOwningEnumerator");
                 if (isBuiltinEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -3618,8 +3618,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->astNode->name->parts[0] == "IOwningEnumerator" ||
-                     recvTy->astNode->name->parts[0] == "IOwningAsyncEnumerator");
+                    (recvTy->headName() == "IOwningEnumerator" ||
+                     recvTy->headName() == "IOwningAsyncEnumerator");
                 if (isOwningEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -3660,7 +3660,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    recvTy->astNode->name->parts[0] == "IOwningEnumerable";
+                    recvTy->headName() == "IOwningEnumerable";
                 if (isOwnedEnumerable) {
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (src && src->getType()->isPointerTy()) {
@@ -3696,8 +3696,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->astNode->name->parts[0] == "IAsyncEnumerator" ||
-                     recvTy->astNode->name->parts[0] == "IOwningAsyncEnumerator");
+                    (recvTy->headName() == "IAsyncEnumerator" ||
+                     recvTy->headName() == "IOwningAsyncEnumerator");
                 if (isAsyncEnumerator) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
@@ -3733,8 +3733,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->declaration &&
                     recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    (recvTy->astNode->name->parts[0] == "IAsyncEnumerable" ||
-                     recvTy->astNode->name->parts[0] == "IOwningAsyncEnumerable");
+                    (recvTy->headName() == "IAsyncEnumerable" ||
+                     recvTy->headName() == "IOwningAsyncEnumerable");
                 if (isAsyncEnumerable) {
                     if (!call.args.empty() && call.args[0].value)
                         (void)lowerExpr(*call.args[0].value);
@@ -4114,8 +4114,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     bool isSetName = recvTy && recvTy->astNode &&
                         recvTy->astNode->name &&
                         !recvTy->astNode->name->parts.empty() &&
-                        (recvTy->astNode->name->parts[0] == "Set" ||
-                         recvTy->astNode->name->parts[0] == "OwningSet");
+                        (recvTy->headName() == "Set" ||
+                         recvTy->headName() == "OwningSet");
                     bool dictBackedSet = isSetName &&
                         genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
                             != nullptr;
@@ -4135,7 +4135,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool llIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+                                common::isOwningPrefixedName(recvTy->headName());
                             llvm::Function* elemDisp =
                                 elementPolicyFor(llElem, llIsOwning).disposerThunk;
                             llvm::Value* disp = elemDisp
@@ -4161,7 +4161,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool arrIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                common::isOwningPrefixedName(recvTy->astNode->name->parts[0]);
+                                common::isOwningPrefixedName(recvTy->headName());
                             llvm::Function* elemDisp =
                                 elementPolicyFor(arrElem, arrIsOwning).disposerThunk;
                             llvm::Value* disp = elemDisp
@@ -4204,7 +4204,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             bool dictIsOwning =
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
-                                recvTy->astNode->name->parts[0] == "OwningDictionary";
+                                recvTy->headName() == "OwningDictionary";
                             llvm::Function* valDisp =
                                 elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
                             if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
@@ -4440,7 +4440,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         recvTy->astNode->name &&
                         recvTy->astNode->name->parts.size() == 1) {
                         auto sit = genericSubstSemaTy_.find(
-                            recvTy->astNode->name->parts[0]);
+                            recvTy->headName());
                         if (sit != genericSubstSemaTy_.end() && sit->second)
                             concrete = sit->second;
                     }
@@ -5206,7 +5206,7 @@ bool Emitter::computeAncestorGenericSubst(
                 if (arg && arg->kind == sema::TypeRef::Kind::Named &&
                     !arg->declaration && arg->astNode && arg->astNode->name &&
                     arg->astNode->name->parts.size() == 1) {
-                    auto it = curArgs.find(arg->astNode->name->parts[0]);
+                    auto it = curArgs.find(arg->headName());
                     if (it != curArgs.end()) arg = it->second;
                 }
                 nextArgs[baseTd->genericParams[gi].name] = arg;

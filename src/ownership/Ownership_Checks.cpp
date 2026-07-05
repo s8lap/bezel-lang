@@ -92,7 +92,7 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
                 if (!rt->declaration && rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "Shared" &&
+                    rt->headName() == "Shared" &&
                     ne->args.size() == 1) {
                     isSharedNew = true;
                 }
@@ -2661,7 +2661,7 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
     if (!tt->declaration) {
         if (tt->astNode && tt->astNode->name &&
             !tt->astNode->name->parts.empty()) {
-            std::string_view cn = tt->astNode->name->parts[0];
+            std::string_view cn = tt->headName();
             if (cn != "OwningArray" && cn != "OwningDictionary" &&
                 cn != "OwningBuffer")
                 return false;
@@ -2740,7 +2740,7 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
     if (!tt->astNode || !tt->astNode->name ||
         tt->astNode->name->parts.empty())
         return false;
-    const std::string_view cn = tt->astNode->name->parts[0];
+    const std::string_view cn = tt->headName();
     // per §30.15 / §6.9 (#600, #692): ChannelSender<T>.Send(owned item) — and
     // v0.174 (#809) SendAsync(owned item) — transfer ownership only when T is a
     // class or interface type: the channel takes ownership of the heap object
@@ -2801,7 +2801,7 @@ bool MethodOwnership::builtinOutOwnedArg(const ast::Expr* callee,
     if (!tt->astNode || !tt->astNode->name ||
         tt->astNode->name->parts.empty())
         return false;
-    const std::string_view cn = tt->astNode->name->parts[0];
+    const std::string_view cn = tt->headName();
     const std::string_view m = ma->member;
     // Owning collections — `where T: class`, so the moved-out element is
     // always a disposable reference type (stdlib §4.5 / §4.7 / §4.9).
@@ -3393,7 +3393,7 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
     if (!ot->astNode || !ot->astNode->name ||
         ot->astNode->name->parts.size() != 1)
         return AwaitTaskKind::NotTask;
-    std::string_view head = ot->astNode->name->parts.front();
+    std::string_view head = ot->headName();
     // True when the result type argument T is a CLASS — the gate that selects
     // Pattern A/B over the no-obligation value/string/runtime-managed forms
     // (§30.5 producer-side rules). A null declaration (built-in / generic
@@ -3415,7 +3415,7 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
         // classified NotTask and the bound-local operand was not discharged.
         if (arg->astNode && arg->astNode->name &&
             arg->astNode->name->parts.size() == 1) {
-            std::string_view an = arg->astNode->name->parts.front();
+            std::string_view an = arg->headName();
             return an == "OwningArray" || an == "OwningStack" ||
                    an == "OwningQueue" || an == "OwningLinkedList" ||
                    an == "OwningDictionary" || an == "OwningSet";
@@ -3865,7 +3865,7 @@ bool MethodOwnership::operandIsOwnedTaskType(const ast::Expr& e) {
     std::string_view head;
     if (ot->astNode && ot->astNode->name &&
         ot->astNode->name->parts.size() == 1)
-        head = ot->astNode->name->parts.front();
+        head = ot->headName();
     else if (!ot->importedName.empty())
         head = ot->importedName;
     return head == "OwningTask";
@@ -4037,7 +4037,7 @@ bool MethodOwnership::typeRefIsTaskScope(const sema::TypeRef* rt) const {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     if (rt->declaration) return rt->declaration->name == "TaskScope";
     if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
-        return rt->astNode->name->parts[0] == "TaskScope";
+        return rt->headName() == "TaskScope";
     return rt->importedName == "TaskScope";
 }
 
@@ -4058,7 +4058,7 @@ std::string_view builtinTypeRefNameHead(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
     if (rt->declaration) return rt->declaration->name;
     if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
-        return rt->astNode->name->parts[0];
+        return rt->headName();
     return rt->importedName;
 }
 }  // namespace
@@ -5431,7 +5431,7 @@ bool MethodOwnership::builtinCollectionStoreCallee(const ast::Expr* callee) {
         return false;
     std::string_view cn;
     if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
-        cn = tt->astNode->name->parts[0];
+        cn = tt->headName();
     else
         cn = tt->importedName;
     return cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||

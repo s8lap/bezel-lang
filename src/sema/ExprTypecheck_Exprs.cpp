@@ -934,7 +934,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 else if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                          tt->astNode && tt->astNode->name &&
                          !tt->astNode->name->parts.empty()) {
-                    std::string_view cn = tt->astNode->name->parts[0];
+                    std::string_view cn = tt->headName();
                     // issue #545: Buffer<T>[i] → T (genericArgs[0]).
                     if (cn == "Buffer" && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
@@ -1376,7 +1376,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty()) {
-                    std::string_view colName = rt->astNode->name->parts[0];
+                    std::string_view colName = rt->headName();
                     bool isBuiltinColl =
                         colName == "Array"     || colName == "OwningArray"  ||
                         colName == "Stack"     || colName == "OwningStack"  ||
@@ -1417,7 +1417,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "Array" &&
+                    rt->headName() == "Array" &&
                     ne->args.size() == 2 &&
                     ne->args[0].value && ne->args[1].value &&
                     !rt->genericArgs.empty() && rt->genericArgs[0]) {
@@ -1492,7 +1492,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty()) {
-                    std::string_view shName = rt->astNode->name->parts[0];
+                    std::string_view shName = rt->headName();
                     if (shName == "Shared" || shName == "Weak") {
                         // Check the first generic argument for a proper class type.
                         bool argIsClass = false;
@@ -1514,7 +1514,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 // Accept all builtin named types here; the Shared<T> sendability
                                 // rule in isSendable (ExprTypecheck_Calls.cpp) further restricts
                                 // which of these are sendable across domains.
-                                std::string_view taname = ta->astNode->name->parts[0];
+                                std::string_view taname = ta->headName();
                                 // The full set of compiler-known class types (not value types,
                                 // not records/enums/interfaces): Mutex, Lock, Atomic<T>,
                                 // AtomicInteger<T>, Semaphore, Channel<T>, ChannelSender<T>,
@@ -1601,7 +1601,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty()) {
-                    std::string_view chName = rt->astNode->name->parts[0];
+                    std::string_view chName = rt->headName();
                     if (chName == "Channel" || chName == "ChannelSender") {
                         if (rt->genericArgs.empty() || !rt->genericArgs[0]) {
                             ctx_.diagnostics().report(
@@ -1618,7 +1618,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                         tName = std::string(elemTy->declaration->name);
                                     else if (elemTy->astNode && elemTy->astNode->name &&
                                              !elemTy->astNode->name->parts.empty())
-                                        tName = std::string(elemTy->astNode->name->parts[0]);
+                                        tName = std::string(elemTy->headName());
                                 } else if (elemTy->kind == TypeRef::Kind::Primitive) {
                                     using P = sema::PrimitiveType;
                                     switch (elemTy->primitive) {
@@ -1652,7 +1652,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "Lock") {
+                    rt->headName() == "Lock") {
                     ctx_.diagnostics().report(
                         Severity::Error, ne->span.begin,
                         "`Lock` has no public constructor: obtain a Lock via "
@@ -1665,7 +1665,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "SemaphoreToken") {
+                    rt->headName() == "SemaphoreToken") {
                     ctx_.diagnostics().report(
                         Severity::Error, ne->span.begin,
                         "`SemaphoreToken` has no public constructor: obtain a "
@@ -1684,7 +1684,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "Atomic") {
+                    rt->headName() == "Atomic") {
                     bool tOk = false;
                     if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
                         const TypeRef* ta = rt->genericArgs[0];
@@ -1702,7 +1702,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                    !ta->astNode->name->parts.empty()) {
                             // IntPtr and UIntPtr are registered as nullary builtin
                             // Named types (not PrimitiveType); accept them here.
-                            auto& tn = ta->astNode->name->parts[0];
+                            auto tn = ta->headName();
                             tOk = (tn == "IntPtr" || tn == "UIntPtr");
                         }
                     } else {
@@ -1729,7 +1729,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "AtomicInteger") {
+                    rt->headName() == "AtomicInteger") {
                     bool tOk = false;
                     if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
                         const TypeRef* ta = rt->genericArgs[0];
@@ -1766,7 +1766,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "Buffer") {
+                    rt->headName() == "Buffer") {
                     bool tOk = false;
                     if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
                         const TypeRef* ta = rt->genericArgs[0];
@@ -1799,14 +1799,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "BinaryDeserializer" &&
+                    rt->headName() == "BinaryDeserializer" &&
                     !ne->args.empty() && ne->args[0].value) {
                     const TypeRef* arg0 = ctx_.exprType(*ne->args[0].value);
                     if (arg0 && arg0->kind == TypeRef::Kind::Named &&
                         !arg0->declaration && arg0->astNode &&
                         arg0->astNode->name &&
                         !arg0->astNode->name->parts.empty() &&
-                        arg0->astNode->name->parts[0] == "OwningBuffer") {
+                        arg0->headName() == "OwningBuffer") {
                         ctx_.diagnostics().report(
                             Severity::Error, ne->args[0].value->span.begin,
                             "`new BinaryDeserializer(...)` expects "
@@ -2228,7 +2228,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     t->nullable || !t->astNode || !t->astNode->name ||
                     t->astNode->name->parts.size() != 1)
                     return {};
-                std::string_view n = t->astNode->name->parts[0];
+                std::string_view n = t->headName();
                 return isInScopeTypeParam(n) ? n : std::string_view{};
             };
             std::string_view lp = typeParamNameOf(be.left.get());
@@ -2889,7 +2889,7 @@ ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
     // typecheck on it. (`Array`/`OwningArray`/`OwningDictionary`/… are concrete
     // CLASSES, not interfaces, and are correctly NOT matched here.)
     if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty()) {
-        std::string_view cn = tt->astNode->name->parts[0];
+        std::string_view cn = tt->headName();
         if (cn == "IReadOnlyList" || cn == "IList" || cn == "IOwningList")
             return std::string(cn);
     }
@@ -2918,7 +2918,7 @@ ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
         name = tt->declaration->name;
     else if (tt->astNode && tt->astNode->name &&
              !tt->astNode->name->parts.empty())
-        name = tt->astNode->name->parts[0];
+        name = tt->headName();
     if (name == "ArraySpan" || name == "ReadOnlyArraySpan" ||
         name == "ReadOnlySpan" || name == "IReadOnlySpan" ||
         name == "ReadOnlyStringSpan" || name == "ReadOnlyAsciiByteSpan")
@@ -3028,7 +3028,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 if (tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
-                    tt->astNode->name->parts[0] == "Span") {
+                    tt->headName() == "Span") {
                     const TypeRef* el =
                         (!tt->genericArgs.empty()) ? tt->genericArgs[0] : nullptr;
                     bool elemIsClass = false;
@@ -3041,7 +3041,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                         else if (!el->declaration && el->astNode &&
                                  el->astNode->name &&
                                  !el->astNode->name->parts.empty()) {
-                            auto en = el->astNode->name->parts[0];
+                            auto en = el->headName();
                             if (en == "Shared" || en == "Weak")
                                 elemIsClass = true;
                         }
@@ -3129,7 +3129,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
             if (ot->kind == TypeRef::Kind::Named && !ot->nullable &&
                 ot->astNode && ot->astNode->name &&
                 ot->astNode->name->parts.size() == 1) {
-                std::string_view head = ot->astNode->name->parts.front();
+                std::string_view head = ot->headName();
                 isTaskType = (head == "Task" || head == "OwningTask");
             }
             if (!isTaskType) {
@@ -3143,7 +3143,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         if (ot && ot->kind == TypeRef::Kind::Named && !ot->nullable &&
             ot->astNode && ot->astNode->name &&
             ot->astNode->name->parts.size() == 1) {
-            std::string_view head = ot->astNode->name->parts.front();
+            std::string_view head = ot->headName();
             if (head == "Task") {
                 if (ot->genericArgs.empty()) {
                     // `await Task` → unit (no result value).
@@ -3278,7 +3278,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         rt->astNode->name &&
                                         !rt->astNode->name->parts.empty()) {
                                         const std::string_view cn =
-                                            rt->astNode->name->parts[0];
+                                            rt->headName();
                                         const std::string_view mn =
                                             maCallee->member;
                                         const TypeRef* elemT = nullptr;
@@ -3360,7 +3360,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         rt->astNode->name &&
                                         !rt->astNode->name->parts.empty()) {
                                         const std::string_view cn =
-                                            rt->astNode->name->parts[0];
+                                            rt->headName();
                                         const std::string_view mn =
                                             maCallee->member;
                                         // Owning-collection Try* methods —
@@ -3459,7 +3459,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                     rt->astNode->name &&
                                     !rt->astNode->name->parts.empty()) {
                                     const std::string_view cn =
-                                        rt->astNode->name->parts[0];
+                                        rt->headName();
                                     const std::string_view mn =
                                         maCallee->member;
 

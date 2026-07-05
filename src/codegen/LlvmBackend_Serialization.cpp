@@ -204,7 +204,7 @@ static bool isSharedOrWeakComponentType(const sema::TypeRef* tr) {
     if (t->kind != sema::TypeRef::Kind::Named || t->declaration) return false;
     std::string_view name;
     if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
-        name = t->astNode->name->parts[0];
+        name = t->headName();
     else if (!t->importedName.empty())
         name = t->importedName;
     return name == "Shared" || name == "Weak";
@@ -229,7 +229,7 @@ static const TypeSymbol* handledSharedElementClass(const sema::TypeRef* tr) {
     if (t->kind != sema::TypeRef::Kind::Named || t->declaration) return nullptr;
     std::string_view name;
     if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
-        name = t->astNode->name->parts[0];
+        name = t->headName();
     else if (!t->importedName.empty())
         name = t->importedName;
     if (name != "Shared") return nullptr;
@@ -257,7 +257,7 @@ static const TypeSymbol* handledWeakElementClass(const sema::TypeRef* tr) {
     if (t->kind != sema::TypeRef::Kind::Named || t->declaration) return nullptr;
     std::string_view name;
     if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
-        name = t->astNode->name->parts[0];
+        name = t->headName();
     else if (!t->importedName.empty())
         name = t->importedName;
     if (name != "Weak") return nullptr;
@@ -2701,7 +2701,7 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
     auto* recvTy = ctx_.exprType(*ma.target);
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty()) {
-        const std::string_view rcn = recvTy->astNode->name->parts[0];
+        const std::string_view rcn = recvTy->headName();
         if (rcn == "BinarySerializer" || rcn == "BinaryDeserializer") return true;
         // §2.15: JsonSerializer / JsonDeserializer instance methods.
         if (rcn == "JsonSerializer" || rcn == "JsonDeserializer") return true;
@@ -3033,7 +3033,7 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
         !recvTy->declaration &&
         recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty()) {
-        const std::string_view rcn = recvTy->astNode->name->parts[0];
+        const std::string_view rcn = recvTy->headName();
 
         if (rcn == "BinarySerializer") {
             llvm::Value* ser = lowerExpr(*ma->target);

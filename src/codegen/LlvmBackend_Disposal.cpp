@@ -215,7 +215,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             bool collIsOwning =
                 it->collTy->astNode && it->collTy->astNode->name &&
                 !it->collTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(it->collTy->astNode->name->parts[0]);
+                common::isOwningPrefixedName(it->collTy->headName());
             ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
             llvm::Function* elemDisp = fieldCollPol.disposerThunk;
             if (!elemDisp && !isDict &&
@@ -226,7 +226,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     it->collTy->astNode && it->collTy->astNode->name &&
                     !it->collTy->astNode->name->parts.empty() &&
                     [](std::string_view n){ return n == "Array" || n == "Stack" ||
-                        n == "Queue"; }(it->collTy->astNode->name->parts[0]))
+                        n == "Queue"; }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
@@ -1081,7 +1081,7 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
         !elemCollTy->declaration &&
         elemCollTy->astNode && elemCollTy->astNode->name &&
         !elemCollTy->astNode->name->parts.empty())
-        collName = elemCollTy->astNode->name->parts[0];
+        collName = elemCollTy->headName();
 
     bool isLL   = (collName == "OwningLinkedList");
     bool isDict = (collName == "OwningDictionary");
@@ -1261,7 +1261,7 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
         dictTy->astNode->name->parts.empty())
         return nullptr;
-    if (dictTy->astNode->name->parts[0] != "Dictionary") return nullptr;
+    if (dictTy->headName() != "Dictionary") return nullptr;
     if (dictTy->genericArgs.size() <= 1) return nullptr;
     const sema::TypeRef* valTy = dictTy->genericArgs[1];
     bool valIsRecord =

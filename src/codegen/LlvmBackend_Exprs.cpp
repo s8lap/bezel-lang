@@ -664,7 +664,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         tt->astNode && tt->astNode->name &&
                         tt->astNode->name->parts.size() == 1) {
                         auto it = genericSubstSemaTy_.find(
-                            tt->astNode->name->parts[0]);
+                            tt->headName());
                         if (it != genericSubstSemaTy_.end() && it->second &&
                             it->second->kind == sema::TypeRef::Kind::Primitive)
                             tt = const_cast<sema::TypeRef*>(it->second);
@@ -2029,7 +2029,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (!tt->astNode || !tt->astNode->name ||
                     tt->astNode->name->parts.empty())
                     return true;
-                std::string_view n = tt->astNode->name->parts[0];
+                std::string_view n = tt->headName();
                 if (n == "StringBuilder") return false;  // has own handler
                 if (n == "Buffer") return false;          // issue #545: own handler
                 // #1006(b): an array-backed collection (`Array<T>` etc.) has its
@@ -2525,7 +2525,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             bool isStrSpan = tt && tt->kind == sema::TypeRef::Kind::Named &&
                 !tt->declaration && tt->astNode && tt->astNode->name &&
                 !tt->astNode->name->parts.empty() &&
-                tt->astNode->name->parts[0] == "ReadOnlyStringSpan";
+                tt->headName() == "ReadOnlyStringSpan";
             if (isSpanLikeTypeName(tt) || isStrSpan) {
                 llvm::Value* sv = lowerExpr(*ma->target);
                 if (!sv) return nullptr;
@@ -2622,7 +2622,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                              !tt->declaration && tt->astNode &&
                              tt->astNode->name &&
                              !tt->astNode->name->parts.empty() &&
-                             tt->astNode->name->parts[0] == "Channel");
+                             tt->headName() == "Channel");
             if (isChProp) {
                 llvm::Value* ch = lowerExpr(*ma->target);
                 if (ch) {
@@ -2851,7 +2851,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         if (tt && tt->kind == sema::TypeRef::Kind::Named &&
                             !tt->declaration && tt->astNode && tt->astNode->name &&
                             !tt->astNode->name->parts.empty() &&
-                            tt->astNode->name->parts[0] == "OwningTask" &&
+                            tt->headName() == "OwningTask" &&
                             !tt->genericArgs.empty() && tt->genericArgs[0]) {
                             isOwnedClass =
                                 (elementPolicyFor(tt->genericArgs[0],
@@ -2880,8 +2880,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                           !tt->declaration && tt->astNode &&
                           tt->astNode->name &&
                           !tt->astNode->name->parts.empty() &&
-                          (tt->astNode->name->parts[0] == "TaskCompletionSource" ||
-                           tt->astNode->name->parts[0] == "OwningTaskCompletionSource"));
+                          (tt->headName() == "TaskCompletionSource" ||
+                           tt->headName() == "OwningTaskCompletionSource"));
             if (isTcs) {
                 llvm::Value* tcsPtr = lowerExpr(*ma->target);
                 if (tcsPtr) {
@@ -2901,7 +2901,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             bool isSB = (tt && tt->kind == sema::TypeRef::Kind::Named &&
                          !tt->declaration && tt->astNode && tt->astNode->name &&
                          !tt->astNode->name->parts.empty() &&
-                         tt->astNode->name->parts[0] == "StringBuilder");
+                         tt->headName() == "StringBuilder");
             if (isSB) {
                 llvm::Value* sb = lowerExpr(*ma->target);
                 if (sb) {
@@ -2949,7 +2949,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 bool isBuf = tt && tt->kind == sema::TypeRef::Kind::Named &&
                              !tt->declaration && tt->astNode && tt->astNode->name &&
                              !tt->astNode->name->parts.empty() &&
-                             tt->astNode->name->parts[0] == "Buffer";
+                             tt->headName() == "Buffer";
                 if (isBuf && ma->member == "Length") {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {
@@ -2970,7 +2970,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 bool isOB = tt && tt->kind == sema::TypeRef::Kind::Named &&
                             !tt->declaration && tt->astNode && tt->astNode->name &&
                             !tt->astNode->name->parts.empty() &&
-                            tt->astNode->name->parts[0] == "OwningBuffer";
+                            tt->headName() == "OwningBuffer";
                 if (isOB) {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {
@@ -2986,11 +2986,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // from bz_dict_count, not the array length.
                 bool isSetName = tt->astNode && tt->astNode->name &&
                                  !tt->astNode->name->parts.empty() &&
-                                 (tt->astNode->name->parts[0] == "Set" ||
-                                  tt->astNode->name->parts[0] == "OwningSet" ||
+                                 (tt->headName() == "Set" ||
+                                  tt->headName() == "OwningSet" ||
                                   // stdlib §4.18 (#1426): SortedSet<T> shares
                                   // the generic-key hash table (bz_dict_t*).
-                                  tt->astNode->name->parts[0] == "SortedSet");
+                                  tt->headName() == "SortedSet");
                 bool dictBacked = isSetName &&
                     genericBackingType(tt, 0, /*isSet=*/true, nullptr) != nullptr;
                 llvm::Value* obj = lowerExpr(*ma->target);
@@ -3115,7 +3115,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 auto* tt = ctx_.exprType(*ma->target);
                 if (tt && !tt->declaration && tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty()) {
-                    auto tyn = tt->astNode->name->parts[0];
+                    auto tyn = tt->headName();
                     bool isSortedSet  = isSortedSetMember  && tyn == "SortedSet";
                     bool isSortedDict = isSortedDictMember && tyn == "SortedDictionary";
                     if (isSortedSet || isSortedDict) {
@@ -3226,7 +3226,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             auto headName = [&](const sema::TypeRef* t) -> std::string_view {
                 return (t && t->astNode && t->astNode->name &&
                         !t->astNode->name->parts.empty())
-                           ? t->astNode->name->parts[0] : std::string_view{};
+                           ? t->headName() : std::string_view{};
             };
             std::string_view cn = headName(tt);
             bool isArrayBacked =
@@ -3348,7 +3348,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             bool isNode = (tt && tt->kind == sema::TypeRef::Kind::Named &&
                            !tt->declaration && tt->astNode && tt->astNode->name &&
                            !tt->astNode->name->parts.empty() &&
-                           tt->astNode->name->parts[0] == "LinkedListNode");
+                           tt->headName() == "LinkedListNode");
             if (isNode) {
                 llvm::Value* nodePtr = lowerExpr(*ma->target);
                 if (!nodePtr) return nullptr;
@@ -3728,7 +3728,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                              (!itt->declaration && itt->astNode &&
                               itt->astNode->name &&
                               !itt->astNode->name->parts.empty() &&
-                              itt->astNode->name->parts[0] ==
+                              itt->headName() ==
                                   "TypeInitializationException"));
                     }
                 }
@@ -3798,7 +3798,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                   tt->declaration->name == "TypeInitializationException") ||
                  (!tt->declaration && tt->astNode && tt->astNode->name &&
                   !tt->astNode->name->parts.empty() &&
-                  tt->astNode->name->parts[0] ==
+                  tt->headName() ==
                       "TypeInitializationException"));
             if (isTIE) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
@@ -3829,8 +3829,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 !recvTy->astNode->name->parts.empty() &&
                 // issue #759: async enumerators share the slot-3 layout.
                 // #1349: IOwningEnumerator/IOwningAsyncEnumerator excluded (TakeCurrent).
-                (recvTy->astNode->name->parts[0] == "IEnumerator" ||
-                 recvTy->astNode->name->parts[0] == "IAsyncEnumerator");
+                (recvTy->headName() == "IEnumerator" ||
+                 recvTy->headName() == "IAsyncEnumerator");
             if (isBuiltinEnumerator) {
                 llvm::Value* recv = lowerExpr(*ma->target);
                 if (recv && recv->getType()->isPointerTy()) {
@@ -4380,7 +4380,7 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
             recvTy->astNode->name &&
             recvTy->astNode->name->parts.size() == 1) {
             auto sit = genericSubstSemaTy_.find(
-                recvTy->astNode->name->parts[0]);
+                recvTy->headName());
             if (sit != genericSubstSemaTy_.end() && sit->second)
                 concrete = sit->second;
         }
@@ -4953,8 +4953,8 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                             !rTy->declaration && rTy->astNode &&
                             rTy->astNode->name &&
                             !rTy->astNode->name->parts.empty() &&
-                            (rTy->astNode->name->parts[0] == "Set" ||
-                             rTy->astNode->name->parts[0] == "OwningSet");
+                            (rTy->headName() == "Set" ||
+                             rTy->headName() == "OwningSet");
             if (isSetRHS) {
                 const sema::TypeRef* elemTy =
                     genericBackingType(rTy, 0, /*isSet=*/true, nullptr);
@@ -5918,7 +5918,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (rt->astNode && rt->astNode->name &&
                 rt->astNode->name->parts.size() == 1) {
                 auto sit = genericSubstSemaTy_.find(
-                    rt->astNode->name->parts[0]);
+                    rt->headName());
                 if (sit != genericSubstSemaTy_.end() && sit->second) {
                     auto* srt = sit->second;
                     return srt->kind == sema::TypeRef::Kind::Primitive &&

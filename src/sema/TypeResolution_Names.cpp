@@ -983,7 +983,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                 if (el->astNode && el->astNode->name &&
                                     el->astNode->name->parts.size() == 1) {
                                     std::string_view nm =
-                                        el->astNode->name->parts[0];
+                                        el->headName();
                                     if (isValueBuiltinByName(nm))
                                         badDesc = "a value-type builtin";
                                 }
@@ -1280,6 +1280,24 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     // alias declaration. If the use site wrote `Pred?`, honour it.
                     ref.astNode = savedAstNode;
                     ref.nullable = savedNullable || underlying->nullable;
+                    // #1462 / §27.8: restoring astNode to the use site hides the
+                    // underlying type's syntactic name-head from every check that
+                    // identifies a builtin collection/wrapper by head. Carry the
+                    // underlying head on the TypeRef itself so those checks (sema,
+                    // ownership, codegen — static or not) see through the alias.
+                    // `ref = *underlying` already copied underlying's own
+                    // aliasResolvedHead (non-empty for a CHAINED alias
+                    // `type A := B := OwningArray`); if it is empty (underlying is a
+                    // concrete type), take underlying's syntactic head, then its
+                    // importedName.
+                    if (ref.aliasResolvedHead.empty()) {
+                        if (underlying->astNode && underlying->astNode->name &&
+                            !underlying->astNode->name->parts.empty())
+                            ref.aliasResolvedHead =
+                                underlying->headName();
+                        else
+                            ref.aliasResolvedHead = underlying->importedName;
+                    }
                     return;
                 }
             }

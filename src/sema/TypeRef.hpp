@@ -59,6 +59,31 @@ struct TypeRef {
     // name information there).
     std::string_view importedName;
 
+    // #1462 / §27.8 / §578: a type alias (`type OA := OwningArray<R>`) resolves
+    // transparently by copying the underlying TypeRef into this one, then
+    // RESTORING astNode to the use-site node (the alias name `OA`) so
+    // diagnostics point to the use site. That restore hides the underlying
+    // type's syntactic name-head from every check that identifies a builtin
+    // collection/wrapper by head (they read `astNode->name->parts[0]`, which for
+    // an alias says `OA`). aliasResolvedHead carries the underlying builtin head
+    // (`OwningArray`) so those checks — in sema, ownership, AND codegen, static
+    // or not — see through the alias with no context threading. Empty for a
+    // non-alias TypeRef (readers then fall back to astNode/importedName).
+    std::string_view aliasResolvedHead;
+
+    // #1462: the alias-transparent syntactic name-head of a Named TypeRef — the
+    // ONE read every builtin-collection/wrapper identity check should use
+    // instead of `astNode->name->parts[0]`, so a type alias resolves correctly.
+    // Returns aliasResolvedHead (the underlying head, set at alias resolution)
+    // when present; otherwise the use-site syntactic head; otherwise the
+    // metadata importedName. Empty for a non-Named / headless TypeRef.
+    std::string_view headName() const {
+        if (!aliasResolvedHead.empty()) return aliasResolvedHead;
+        if (astNode && astNode->name && !astNode->name->parts.empty())
+            return astNode->name->parts[0];
+        return importedName;
+    }
+
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates
     // #734: the folded compile-time size (>= 0) when arraySize is a literal or a

@@ -1146,8 +1146,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         vt && vt->kind == sema::TypeRef::Kind::Named &&
                         !vt->nullable && vt->astNode && vt->astNode->name &&
                         !vt->astNode->name->parts.empty() &&
-                        (vt->astNode->name->parts[0] == "Task" ||
-                         vt->astNode->name->parts[0] == "OwningTask");
+                        (vt->headName() == "Task" ||
+                         vt->headName() == "OwningTask");
                     if (isTaskLocal) {
                         llvm::Type* sty = nullptr;
                         if (llvm::Value* slot = lvalueAddr(*id, sty))
@@ -3303,7 +3303,7 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
     if (!iterTy || !iterTy->astNode || !iterTy->astNode->name ||
         iterTy->astNode->name->parts.empty() || iterTy->declaration)
         return false;
-    auto n = iterTy->astNode->name->parts[0];
+    auto n = iterTy->headName();
     if (n != "Set" && n != "OwningSet" &&
         // stdlib §4.18 (#1426): SortedSet<T> uses the same generic-key hash table.
         // Route through emitGenericKeyTableFor with sorted=true so elements are
@@ -3716,7 +3716,7 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // enumeration (hash-backing limitation; ordered rep rides #545).
     if (dictTy && dictTy->astNode && dictTy->astNode->name &&
         !dictTy->astNode->name->parts.empty() &&
-        dictTy->astNode->name->parts[0] == "SortedDictionary") {
+        dictTy->headName() == "SortedDictionary") {
         if (useGen) {
             const sema::TypeRef* kTy =
                 genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);
@@ -4023,7 +4023,7 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     std::string_view iterName;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty())
-        iterName = iterTy->astNode->name->parts[0];
+        iterName = iterTy->headName();
     else if (!iterTy->importedName.empty())
         iterName = iterTy->importedName;
     if (iterName != "IOwningEnumerable") return false;
@@ -4047,7 +4047,7 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
                 if (ct && ct->kind == sema::TypeRef::Kind::Named) {
                     if (ct->astNode && ct->astNode->name &&
                         !ct->astNode->name->parts.empty())
-                        collName = ct->astNode->name->parts[0];
+                        collName = ct->headName();
                     else if (!ct->importedName.empty())
                         collName = ct->importedName;
                 }
@@ -4181,7 +4181,7 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
     std::string_view iterName;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty())
-        iterName = iterTy->astNode->name->parts[0];
+        iterName = iterTy->headName();
     else if (!iterTy->importedName.empty())
         iterName = iterTy->importedName;
     if (iterName != "IOwningEnumerable") return false;
@@ -4364,7 +4364,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     std::string_view n;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty()) {
-        n = iterTy->astNode->name->parts[0];
+        n = iterTy->headName();
     } else if (!iterTy->importedName.empty()) {
         n = iterTy->importedName;
     } else {
@@ -4433,7 +4433,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             if (!rt->astNode || !rt->astNode->name ||
                 rt->astNode->name->parts.empty())
                 return false;
-            return rt->astNode->name->parts[0] == "IEnumerable";
+            return rt->headName() == "IEnumerable";
         };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (par->declType) {

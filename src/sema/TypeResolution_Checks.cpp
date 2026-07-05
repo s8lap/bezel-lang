@@ -1321,7 +1321,7 @@ void Resolver::checkHashContainerKeys() {
             !s.keyRef->astNode->name ||
             s.keyRef->astNode->name->parts.size() != 1)
             continue;
-        std::string_view paramName = s.keyRef->astNode->name->parts.front();
+        std::string_view paramName = s.keyRef->headName();
         // Find the index of this parameter in the enclosing type's param list.
         std::size_t paramIdx = s.enclosingType->genericParams.size();
         for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
@@ -1534,7 +1534,7 @@ TypeRef* Resolver::applyGenericSubst(
         // Unresolved named type — might be a generic param.
         if (tr->astNode && tr->astNode->name &&
             tr->astNode->name->parts.size() == 1) {
-            auto it = genericSubst.find(tr->astNode->name->parts[0]);
+            auto it = genericSubst.find(tr->headName());
             if (it != genericSubst.end()) {
                 TypeRef* substituted = it->second;
                 // Preserve the nullable modifier from the generic type
@@ -2032,7 +2032,7 @@ void Resolver::checkStaticInterfaceConformance() {
         if (d->kind != TypeRef::Kind::Named) return d;
         if (!d->declaration && d->astNode && d->astNode->name &&
             d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
-            auto it = map.find(d->astNode->name->parts[0]);
+            auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 TypeRef* s = it->second;
                 if (d->nullable && !s->nullable) {
@@ -2329,7 +2329,7 @@ Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
             // isGenericParamRef before calling categorize.
             if (a->astNode && a->astNode->name &&
                 a->astNode->name->parts.size() == 1 &&
-                builtinTypeArity(a->astNode->name->parts.front()) !=
+                builtinTypeArity(a->headName()) !=
                     kNotBuiltin) {
                 return TypeCategory::Reference;
             }
@@ -3225,7 +3225,7 @@ static bool isSerializationEligibleType(
         std::string_view bname;
         if (tr->astNode && tr->astNode->name &&
             !tr->astNode->name->parts.empty()) {
-            bname = tr->astNode->name->parts[0];
+            bname = tr->headName();
         } else if (!tr->importedName.empty()) {
             bname = tr->importedName;
         }
@@ -3425,7 +3425,7 @@ void Resolver::checkSerializationEligibility() {
             // Shared<T>/Weak<T>: builtin Named (declaration null), name in astNode.
             if (!inner->declaration && inner->astNode && inner->astNode->name &&
                 !inner->astNode->name->parts.empty()) {
-                auto n = inner->astNode->name->parts[0];
+                auto n = inner->headName();
                 if (n == "Shared" || n == "Weak") { needsGraph = true; break; }
             }
             // Non-owned class-typed field = borrow back-edge.
@@ -4009,7 +4009,7 @@ static bool isInSynchronizedSet(const TypeRef* rt) {
     if (!rt->astNode || !rt->astNode->name ||
         rt->astNode->name->parts.empty())
         return false;
-    std::string_view n = rt->astNode->name->parts[0];
+    std::string_view n = rt->headName();
     return n == "Mutex" || n == "Semaphore" ||
            n == "Atomic" || n == "AtomicInteger" ||
            n == "Channel" || n == "ChannelSender";

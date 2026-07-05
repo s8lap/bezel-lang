@@ -660,7 +660,7 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                 if (arg->astNode && arg->astNode->name &&
                     arg->astNode->name->parts.size() == 1) {
                     auto it = genericSubstSemaTy_.find(
-                        arg->astNode->name->parts[0]);
+                        arg->headName());
                     if (it != genericSubstSemaTy_.end() && it->second)
                         return it->second;
                 }
@@ -3858,7 +3858,7 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                     std::string_view cn =
                         fieldRt->astNode && fieldRt->astNode->name &&
                         !fieldRt->astNode->name->parts.empty()
-                            ? fieldRt->astNode->name->parts[0]
+                            ? fieldRt->headName()
                             : std::string_view{};
                     if (cn == "Set" || cn == "OwningSet")
                         continue;  // safe no-op; sema already diagnosed the type
@@ -4713,7 +4713,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     std::string_view cn =
                         collTy->astNode && collTy->astNode->name &&
                         !collTy->astNode->name->parts.empty()
-                            ? collTy->astNode->name->parts[0]
+                            ? collTy->headName()
                             : std::string_view{};
                     if (cn == "Set" || cn == "OwningSet")
                         return;  // materialization failed; safe no-op
@@ -4804,7 +4804,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             !declTR->declaration &&
             declTR->astNode && declTR->astNode->name &&
             !declTR->astNode->name->parts.empty() &&
-            declTR->astNode->name->parts[0] == "IEnumerable") {
+            declTR->headName() == "IEnumerable") {
             const sema::TypeRef* initTR = ctx_.exprType(*init);
             // fix #747 R43 / §29.2: an Array<T> initializer assigned to an
             // IEnumerable<T> local must ALSO be wrapped in a vtable-backed
@@ -4833,13 +4833,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 initTR->kind == sema::TypeRef::Kind::Named &&
                 initTR->astNode && initTR->astNode->name &&
                 !initTR->astNode->name->parts.empty() &&
-                (initTR->astNode->name->parts[0] == "Array" ||
-                 initTR->astNode->name->parts[0] == "OwningArray" ||
-                 initTR->astNode->name->parts[0] == "OwningBuffer" ||
-                 initTR->astNode->name->parts[0] == "Stack" ||
-                 initTR->astNode->name->parts[0] == "OwningStack" ||
-                 initTR->astNode->name->parts[0] == "Queue" ||
-                 initTR->astNode->name->parts[0] == "OwningQueue");
+                (initTR->headName() == "Array" ||
+                 initTR->headName() == "OwningArray" ||
+                 initTR->headName() == "OwningBuffer" ||
+                 initTR->headName() == "Stack" ||
+                 initTR->headName() == "OwningStack" ||
+                 initTR->headName() == "Queue" ||
+                 initTR->headName() == "OwningQueue");
             if (initIsArray) {
                 v = wrapArrayAsIEnumerable(v, declTR);
             } else if (initTR && isLinkedListTypeName(initTR)) {
@@ -5306,7 +5306,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
         return false;
     std::string_view name;
     if (tr->astNode && tr->astNode->name && !tr->astNode->name->parts.empty())
-        name = tr->astNode->name->parts[0];
+        name = tr->headName();
     else if (!tr->importedName.empty())
         name = tr->importedName;
     if (name != "IEnumerable" && name != "IOwningEnumerable")
@@ -5328,12 +5328,12 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
         bool declIsPureIEnum = declTR && declTR->kind == sema::TypeRef::Kind::Named &&
             !declTR->declaration && declTR->astNode && declTR->astNode->name &&
             !declTR->astNode->name->parts.empty() &&
-            declTR->astNode->name->parts[0] == "IEnumerable";
+            declTR->headName() == "IEnumerable";
         if (declIsPureIEnum && initTR &&
             initTR->kind == sema::TypeRef::Kind::Named) {
             bool initIsArray = initTR->astNode && initTR->astNode->name &&
                 !initTR->astNode->name->parts.empty() &&
-                initTR->astNode->name->parts[0] == "Array";
+                initTR->headName() == "Array";
             // A user-class (declaration-carrying) init is wrapped (line 5413), as
             // is an Array init (line 5410). A declaration-less IEnumerable init is
             // NOT wrapped — it is a pre-existing IEnumerable value (an alias).
@@ -5383,16 +5383,16 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             lt && lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
             lt->astNode && lt->astNode->name &&
             !lt->astNode->name->parts.empty() &&
-            (lt->astNode->name->parts[0] == "IEnumerable" ||
-             lt->astNode->name->parts[0] == "IOwningEnumerable" ||
-             lt->astNode->name->parts[0] == "IEnumerator" ||
-             lt->astNode->name->parts[0] == "IOwningEnumerator");
+            (lt->headName() == "IEnumerable" ||
+             lt->headName() == "IOwningEnumerable" ||
+             lt->headName() == "IEnumerator" ||
+             lt->headName() == "IOwningEnumerator");
         if (isSyncIterEnum) {
             const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
             bool wrappedHere = initTR && initTR->kind == sema::TypeRef::Kind::Named &&
                 ((initTR->astNode && initTR->astNode->name &&
                   !initTR->astNode->name->parts.empty() &&
-                  initTR->astNode->name->parts[0] == "Array") ||
+                  initTR->headName() == "Array") ||
                  initTR->declaration != nullptr);
             bool ownsSource =
                 dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
@@ -5450,7 +5450,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                        rt->declaration->name == "TaskScope";
             if (rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty())
-                return rt->astNode->name->parts[0] == "TaskScope";
+                return rt->headName() == "TaskScope";
             return rt->importedName == "TaskScope";
         };
         bool isTS = false;
@@ -5501,8 +5501,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     lt->kind == sema::TypeRef::Kind::Named && !lt->declaration &&
                     lt->astNode && lt->astNode->name &&
                     !lt->astNode->name->parts.empty() &&
-                    (lt->astNode->name->parts[0] == "IAsyncEnumerator" ||
-                     lt->astNode->name->parts[0] == "IOwningAsyncEnumerator");
+                    (lt->headName() == "IAsyncEnumerator" ||
+                     lt->headName() == "IOwningAsyncEnumerator");
                 if (isAsyncIterEnum) {
                     Disposal d{it->second, nullptr};
                     d.iterEnumDispose = true;
@@ -5559,7 +5559,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == nm;
+                   rt->headName() == nm;
         };
         bool isBinSer = false, isBinDer = false;
         if (ld->type) {
@@ -5599,7 +5599,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == nm;
+                   rt->headName() == nm;
         };
         bool isJsonSer = false, isJsonDer = false;
         if (ld->type) {
@@ -5705,7 +5705,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             isCTS = rt && rt->kind == sema::TypeRef::Kind::Named &&
                     !rt->declaration && rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->astNode->name->parts[0] == "CancellationTokenSource";
+                    rt->headName() == "CancellationTokenSource";
         }
         if (!isCTS && ld->initializer) {
             if (auto* ne =
@@ -5738,7 +5738,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Mutex";
+                   rt->headName() == "Mutex";
         };
         if (ld->type)
             isMx = isMutexTypeName(ctx_.resolvedType(*ld->type));
@@ -5769,7 +5769,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Lock";
+                   rt->headName() == "Lock";
         };
         if (ld->type)
             isLk = isLockTypeName(ctx_.resolvedType(*ld->type));
@@ -5794,7 +5794,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Semaphore";
+                   rt->headName() == "Semaphore";
         };
         if (ld->type)
             isSem = isSemaphoreTypeName(ctx_.resolvedType(*ld->type));
@@ -5825,7 +5825,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "SemaphoreToken";
+                   rt->headName() == "SemaphoreToken";
         };
         if (ld->type)
             isTok = isSemTokenTypeName(ctx_.resolvedType(*ld->type));
@@ -5852,7 +5852,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Channel";
+                   rt->headName() == "Channel";
         };
         if (ld->type)
             isCh = isChannelTypeName(ctx_.resolvedType(*ld->type));
@@ -5882,7 +5882,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "ChannelSender";
+                   rt->headName() == "ChannelSender";
         };
         if (ld->type)
             isTx = isSenderTypeName(ctx_.resolvedType(*ld->type));
@@ -5909,7 +5909,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Shared";
+                   rt->headName() == "Shared";
         };
         if (ld->type)
             isShared = isSharedTypeName(ctx_.resolvedType(*ld->type));
@@ -5944,7 +5944,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Weak";
+                   rt->headName() == "Weak";
         };
         if (ld->type)
             isWeak = isWeakTypeName(ctx_.resolvedType(*ld->type));
@@ -5974,7 +5974,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->astNode->name->parts[0] == "Buffer";
+                   rt->headName() == "Buffer";
         };
         if (ld->type)
             isBuf = isBufferTypeName(ctx_.resolvedType(*ld->type));
@@ -6010,7 +6010,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             if (rt->declaration) return false;
             if (!rt->astNode || !rt->astNode->name ||
                 rt->astNode->name->parts.empty()) return false;
-            std::string_view n = rt->astNode->name->parts[0];
+            std::string_view n = rt->headName();
             return n == "TaskCompletionSource" ||
                    n == "OwningTaskCompletionSource";
         };
@@ -6052,7 +6052,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             if (!rt->declaration) {
                 if (rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty())
-                    return rt->astNode->name->parts[0];
+                    return rt->headName();
             } else if (!rt->declaration->decl) {
                 return rt->declaration->name;
             }
@@ -6087,7 +6087,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             bool llIsOwning =
                 llTy->astNode && llTy->astNode->name &&
                 !llTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(llTy->astNode->name->parts[0]);
+                common::isOwningPrefixedName(llTy->headName());
             d.collectionElemDisposer =
                 elementPolicyFor(llEl, llIsOwning).disposerThunk;
         }
@@ -6117,14 +6117,14 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             bool collIsOwning =
                 collTy->astNode && collTy->astNode->name &&
                 !collTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(collTy->astNode->name->parts[0]);
+                common::isOwningPrefixedName(collTy->headName());
             bool isSetName =
                 collTy->astNode && collTy->astNode->name &&
                 !collTy->astNode->name->parts.empty() &&
-                (collTy->astNode->name->parts[0] == "Set" ||
-                 collTy->astNode->name->parts[0] == "OwningSet" ||
+                (collTy->headName() == "Set" ||
+                 collTy->headName() == "OwningSet" ||
                  // stdlib §4.18 (#1426): SortedSet shares the bz_dict_t* rep.
-                 collTy->astNode->name->parts[0] == "SortedSet");
+                 collTy->headName() == "SortedSet");
             // #1012 / §4.10: a Set/OwningSet is DICT-BACKED whenever its element is
             // generic-dict-eligible (records, non-nullable primitives/enums, and —
             // for sets — strings; see genericBackingType / lowerNew). Such a Set
@@ -6199,11 +6199,11 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         bool dictIsOwning =
             dictTy->astNode && dictTy->astNode->name &&
             !dictTy->astNode->name->parts.empty() &&
-            dictTy->astNode->name->parts[0] == "OwningDictionary";
+            dictTy->headName() == "OwningDictionary";
         bool isSetNameD =
             dictTy->astNode && dictTy->astNode->name &&
             !dictTy->astNode->name->parts.empty() &&
-            dictTy->astNode->name->parts[0] == "Set";
+            dictTy->headName() == "Set";
         auto isStrKey = [&]() {
             if (dictTy->genericArgs.empty() || !dictTy->genericArgs[0]) return false;
             const sema::TypeRef* k = dictTy->genericArgs[0];
@@ -8245,7 +8245,7 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     bool collIsOwning =
         collTy && collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        common::isOwningPrefixedName(collTy->astNode->name->parts[0]);
+        common::isOwningPrefixedName(collTy->headName());
 
     ElementPolicy pol = elementPolicyFor(collElem, collIsOwning);
     llvm::Function* elemDisp = pol.disposerThunk;
@@ -8260,7 +8260,7 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             collTy && collTy->astNode && collTy->astNode->name &&
             !collTy->astNode->name->parts.empty() &&
             [](std::string_view n){ return n == "Array" || n == "Stack" ||
-                n == "Queue"; }(collTy->astNode->name->parts[0]))
+                n == "Queue"; }(collTy->headName()))
         elemDisp = stringElementReleaseThunk();
 
     llvm::Value* disp = elemDisp
@@ -10463,7 +10463,7 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     !targetTy->declaration && targetTy->astNode &&
                     targetTy->astNode->name &&
                     !targetTy->astNode->name->parts.empty() &&
-                    targetTy->astNode->name->parts[0] == "OwningTask" &&
+                    targetTy->headName() == "OwningTask" &&
                     !targetTy->genericArgs.empty() && targetTy->genericArgs[0]) {
                     const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
                     if (isClassOrInterfaceRef(initTy) ||
@@ -10520,7 +10520,7 @@ bool Emitter::usingVarIsMovedClassObject(const ast::LocalDecl* ld) {
         rt->declaration == nullptr && !genericSubstSemaTy_.empty() &&
         rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1) {
-        auto it = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
+        auto it = genericSubstSemaTy_.find(rt->headName());
         if (it != genericSubstSemaTy_.end())
             return isClassOrInterfaceRef(it->second);
     }
@@ -10558,7 +10558,7 @@ bool Emitter::usingVarIsDrainedOwningElement(const ast::LocalDecl* ld) {
     if (!ct || ct->kind != sema::TypeRef::Kind::Named) return false;
     std::string_view cn;
     if (ct->astNode && ct->astNode->name && !ct->astNode->name->parts.empty())
-        cn = ct->astNode->name->parts[0];
+        cn = ct->headName();
     else if (!ct->importedName.empty())
         cn = ct->importedName;
     return cn == "OwningArray" || cn == "OwningStack" ||
@@ -10673,7 +10673,7 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // bz_dict_alloc_generic + bz_dict_set_gen, not the array path below).
     std::string_view name = collTy->astNode && collTy->astNode->name &&
                             !collTy->astNode->name->parts.empty()
-                                ? collTy->astNode->name->parts[0]
+                                ? collTy->headName()
                                 : std::string_view{};
     if (name == "Set" || name == "OwningSet")
         return materializeHeapSetLiteral(cl, collTy);
@@ -10945,7 +10945,7 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     bool isOwning =
         collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        common::isOwningPrefixedName(collTy->astNode->name->parts[0]);
+        common::isOwningPrefixedName(collTy->headName());
     auto isStrElem = [&](const sema::TypeRef* el, bool owning) {
         if (!el || el->nullable) return false;
         ElementPolicy p = elementPolicyFor(el, owning);
@@ -10992,8 +10992,8 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     bool isSetName =
         collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        (collTy->astNode->name->parts[0] == "Set" ||
-         collTy->astNode->name->parts[0] == "OwningSet");
+        (collTy->headName() == "Set" ||
+         collTy->headName() == "OwningSet");
     bool setDictBacked = isSetName &&
         genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
     if (setDictBacked) {
@@ -11295,7 +11295,7 @@ bool Emitter::isTaskTypeName(const sema::TypeRef* rt) {
     if (!rt->declaration) {
         if (rt->astNode && rt->astNode->name &&
             !rt->astNode->name->parts.empty()) {
-            auto& n = rt->astNode->name->parts[0];
+            auto n = rt->headName();
             return n == "Task" || n == "OwningTask";
         }
         return false;
@@ -11356,7 +11356,7 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
                         rt->astNode->name &&
                         rt->astNode->name->parts.size() == 1) {
                         auto it = genericSubstSemaTy_.find(
-                            rt->astNode->name->parts[0]);
+                            rt->headName());
                         if (it != genericSubstSemaTy_.end() && it->second &&
                             it->second->kind == sema::TypeRef::Kind::Named)
                             return it->second->declaration;

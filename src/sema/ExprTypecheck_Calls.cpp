@@ -1877,7 +1877,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         recvTy->astNode->name &&
                         recvTy->astNode->name->parts.size() == 1) {
                     std::string_view paramName =
-                        recvTy->astNode->name->parts[0];
+                        recvTy->headName();
                     const auto& mbr = ma->member;
                     bool isObjectMember =
                         mbr == "ToString"    || mbr == "GetHashCode" ||
@@ -2005,7 +2005,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     !innerRecvTy->astNode->name->parts.empty() &&
                                     [&] {
                                         const auto& cn =
-                                            innerRecvTy->astNode->name->parts[0];
+                                            innerRecvTy->headName();
                                         return cn == "Array" || cn == "OwningArray" ||
                                                cn == "Stack" || cn == "OwningStack" ||
                                                cn == "Queue" || cn == "OwningQueue";
@@ -2049,8 +2049,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 auto colName = [&]() -> std::string_view {
                     if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                         !recvTy->declaration && recvTy->astNode &&
-                        recvTy->astNode->name && !recvTy->astNode->name->parts.empty())
-                        return recvTy->astNode->name->parts[0];
+                        recvTy->astNode->name && !recvTy->astNode->name->parts.empty()) {
+                        // #1462 / §27.8: see through a transparent type alias to the
+                        // underlying collection head (the alias-resolved TypeRef
+                        // keeps the use-site astNode for diagnostics). Without this a
+                        // method on an alias-typed collection (`a.PopLast()` where
+                        // `a: OA`, `type OA := OwningArray<R>`) is never typed and its
+                        // result carries no type → the owned element escapes the
+                        // §28.3 producer classification and leaks.
+                        if (!recvTy->aliasResolvedHead.empty())
+                            return recvTy->aliasResolvedHead;
+                        return recvTy->headName();
+                    }
                     // Builtin class identifiers (File, Directory, etc.) are given a
                     // symbol but no TypeRef; fall back to reading the identifier name.
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
@@ -2493,7 +2503,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     !recvTy->genericArgs.empty() && recvTy->astNode &&
                     recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    recvTy->astNode->name->parts[0] == "IEnumerable";
+                    recvTy->headName() == "IEnumerable";
                 if (ienumRecv) {
                     TypeRef* srcElem2 = recvTy->genericArgs[0];
                     if ((m == "ToArray" || m == "ToSet") && ce.args.empty())
@@ -4243,7 +4253,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         if (!elemTy->declaration && elemTy->astNode &&
                                             elemTy->astNode->name &&
                                             !elemTy->astNode->name->parts.empty())
-                                            ename = elemTy->astNode->name->parts[0];
+                                            ename = elemTy->headName();
                                         else if (elemTy->declaration && !elemTy->declaration->decl)
                                             ename = elemTy->declaration->name;
                                         if (ename == "Task" || ename == "OwningTask")
@@ -4365,7 +4375,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (!rt->declaration) {
                             if (rt->astNode && rt->astNode->name &&
                                 !rt->astNode->name->parts.empty())
-                                return rt->astNode->name->parts[0];
+                                return rt->headName();
                             return {};
                         }
                         if (!rt->declaration->decl) return rt->declaration->name;
@@ -4563,7 +4573,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             else if (!spEl->declaration && spEl->astNode &&
                                      spEl->astNode->name &&
                                      !spEl->astNode->name->parts.empty()) {
-                                auto en = spEl->astNode->name->parts[0];
+                                auto en = spEl->headName();
                                 if (en == "Shared" || en == "Weak")
                                     elemIsClass = true;
                             }
@@ -6408,7 +6418,7 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
         if (!recvTy->declaration && recvTy->astNode &&
             recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty())
-            return recvTy->astNode->name->parts[0];
+            return recvTy->headName();
         if (!recvTy->importedName.empty()) return recvTy->importedName;
         return {};
     }();
@@ -6757,7 +6767,7 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
                     if (arg && arg->kind == TypeRef::Kind::Named &&
                         !arg->declaration && arg->astNode && arg->astNode->name &&
                         arg->astNode->name->parts.size() == 1) {
-                        auto it = curArgs.find(arg->astNode->name->parts[0]);
+                        auto it = curArgs.find(arg->headName());
                         if (it != curArgs.end()) arg = it->second;
                     }
                     if (base->genericParams[gi])
@@ -6791,8 +6801,8 @@ static void collectReturnParamNames(
     if (!t) return;
     if (t->kind == TypeRef::Kind::Named && !t->declaration && t->astNode &&
         t->astNode->name && t->astNode->name->parts.size() == 1 &&
-        paramNames.count(t->astNode->name->parts[0]))
-        out.insert(t->astNode->name->parts[0]);
+        paramNames.count(t->headName()))
+        out.insert(t->headName());
     for (auto* ga : t->genericArgs)
         collectReturnParamNames(ga, paramNames, out);
 }
@@ -6812,7 +6822,7 @@ bool ExprTC::unifyReturnAgainstTarget(
     if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
         declared->astNode && declared->astNode->name &&
         declared->astNode->name->parts.size() == 1) {
-        std::string_view nm = declared->astNode->name->parts[0];
+        std::string_view nm = declared->headName();
         if (paramNames.count(nm)) {
             // `: T?` against a target T binds T to the target's non-nullable
             // form, mirroring how `T?` is the nullable companion of T (§14.2).
@@ -6876,7 +6886,7 @@ TypeRef* ExprTC::substituteReturnType(
         declared->genericArgs.empty()) {
         // Only a bare param reference has no genericArgs and no declaration.
         // Check if this name is a solved type parameter.
-        auto it = solved.find(declared->astNode->name->parts[0]);
+        auto it = solved.find(declared->headName());
         if (it != solved.end() && it->second) {
             TypeRef* sub = it->second;
             if (declared->nullable && !sub->nullable) {
@@ -7790,7 +7800,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
             tt->astNode && tt->astNode->name &&
             !tt->astNode->name->parts.empty() &&
-            tt->astNode->name->parts[0] == "IGrouping") {
+            tt->headName() == "IGrouping") {
             // Key: TKey (genericArgs[0]).
             if (ma.member == "Key" && !tt->genericArgs.empty() &&
                 tt->genericArgs[0]) {
@@ -7817,7 +7827,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // genericParams list).
             if (!targetType && tt->astNode && tt->astNode->name &&
                     tt->astNode->name->parts.size() == 1) {
-                std::string_view paramName = tt->astNode->name->parts[0];
+                std::string_view paramName = tt->headName();
                 // Collect applicable constraints from the method and the class.
                 // Method constraints come first so a method-level `where T: X`
                 // shadows a class-level `where T: Y` if both exist (unusual but
@@ -8153,8 +8163,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     !tt->astNode->name->parts.empty() &&
                     // issue #759: async enumerators also use Current: T.
                     // #1349: IOwningEnumerator/IOwningAsyncEnumerator excluded.
-                    (tt->astNode->name->parts[0] == "IEnumerator" ||
-                     tt->astNode->name->parts[0] == "IAsyncEnumerator");
+                    (tt->headName() == "IEnumerator" ||
+                     tt->headName() == "IAsyncEnumerator");
                 if (isBuiltinEnumerator && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                     ctx_.setExprType(&ma, tt->genericArgs[0]);
@@ -8225,8 +8235,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
-                    (tt->astNode->name->parts[0] == "Dictionary" ||
-                     tt->astNode->name->parts[0] == "OwningDictionary");
+                    (tt->headName() == "Dictionary" ||
+                     tt->headName() == "OwningDictionary");
                 std::size_t gi = ma.member == "Keys" ? 0 : 1;
                 if (isDict && tt->genericArgs.size() > gi && tt->genericArgs[gi]) {
                     // Static synthetic astNode for "Array" (program-lifetime).
@@ -8265,7 +8275,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty();
                 std::string_view cn = isBuiltinColl
-                    ? std::string_view(tt->astNode->name->parts[0])
+                    ? std::string_view(tt->headName())
                     : std::string_view();
                 bool hasCount =
                     cn == "Array" || cn == "OwningArray" ||
@@ -8295,12 +8305,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 bool isSpan = tt->kind == TypeRef::Kind::Named &&
                     !tt->declaration && tt->astNode && tt->astNode->name &&
                     !tt->astNode->name->parts.empty() &&
-                    (tt->astNode->name->parts[0] == "ArraySpan" ||
-                     tt->astNode->name->parts[0] == "ReadOnlyArraySpan" ||
-                     tt->astNode->name->parts[0] == "Span" ||
-                     tt->astNode->name->parts[0] == "ReadOnlySpan" ||
+                    (tt->headName() == "ArraySpan" ||
+                     tt->headName() == "ReadOnlyArraySpan" ||
+                     tt->headName() == "Span" ||
+                     tt->headName() == "ReadOnlySpan" ||
                      // §3.3 (#883): ReadOnlyStringSpan.Length / .IsEmpty
-                     tt->astNode->name->parts[0] == "ReadOnlyStringSpan");
+                     tt->headName() == "ReadOnlyStringSpan");
                 if (isSpan) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(
@@ -8320,7 +8330,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 !tt->declaration && tt->astNode && tt->astNode->name &&
                 !tt->astNode->name->parts.empty();
             std::string_view llcn = isBuiltinLL
-                ? std::string_view(tt->astNode->name->parts[0]) : std::string_view{};
+                ? std::string_view(tt->headName()) : std::string_view{};
 
             // LinkedList<T> / OwningLinkedList<T> node properties.
             if ((llcn == "LinkedList" || llcn == "OwningLinkedList") &&
@@ -8397,7 +8407,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             bool isBuffer = tt && tt->kind == TypeRef::Kind::Named &&
                 !tt->declaration && tt->astNode && tt->astNode->name &&
                 !tt->astNode->name->parts.empty() &&
-                tt->astNode->name->parts[0] == "Buffer";
+                tt->headName() == "Buffer";
             if (isBuffer && ma.member == "Length") {
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;
@@ -8440,8 +8450,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             bool isAtomicLike = tt && tt->kind == TypeRef::Kind::Named &&
                 !tt->declaration && tt->astNode && tt->astNode->name &&
                 !tt->astNode->name->parts.empty() &&
-                (tt->astNode->name->parts[0] == "Atomic" ||
-                 tt->astNode->name->parts[0] == "AtomicInteger");
+                (tt->headName() == "Atomic" ||
+                 tt->headName() == "AtomicInteger");
             if (isAtomicLike && ma.member == "Value") {
                 TypeRef* elemTy = (!tt->genericArgs.empty() && tt->genericArgs[0])
                     ? const_cast<TypeRef*>(tt->genericArgs[0])
@@ -8460,7 +8470,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (!rt->declaration) {
                     if (rt->astNode && rt->astNode->name &&
                         !rt->astNode->name->parts.empty())
-                        return rt->astNode->name->parts[0];
+                        return rt->headName();
                     return {};
                 }
                 if (!rt->declaration->decl) return rt->declaration->name;
@@ -8591,7 +8601,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (!rt->declaration) {
                     if (rt->astNode && rt->astNode->name &&
                         !rt->astNode->name->parts.empty())
-                        return rt->astNode->name->parts[0];
+                        return rt->headName();
                     return {};
                 }
                 if (!rt->declaration->decl) return rt->declaration->name;
@@ -8747,7 +8757,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (!rt->declaration) {
                     if (rt->astNode && rt->astNode->name &&
                         !rt->astNode->name->parts.empty())
-                        return rt->astNode->name->parts[0];
+                        return rt->headName();
                     return {};
                 }
                 if (!rt->declaration->decl) return rt->declaration->name;
@@ -8808,7 +8818,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return {};
                 if (tr->astNode && tr->astNode->name &&
                     !tr->astNode->name->parts.empty())
-                    return tr->astNode->name->parts[0];
+                    return tr->headName();
                 return {};
             };
             std::string_view tcsn = getTcsName(tt);
@@ -9993,7 +10003,7 @@ static std::string_view builtinTypeName(const TypeRef* rt) {
         return {};
     if (rt->astNode && rt->astNode->name &&
         !rt->astNode->name->parts.empty())
-        return rt->astNode->name->parts[0];
+        return rt->headName();
     return {};
 }
 

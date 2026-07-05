@@ -152,8 +152,8 @@ llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
     bool otherIsSet = otherTy && otherTy->astNode && otherTy->astNode->name &&
                       !otherTy->astNode->name->parts.empty() &&
                       !otherTy->declaration &&
-                      (otherTy->astNode->name->parts[0] == "Set" ||
-                       otherTy->astNode->name->parts[0] == "OwningSet") &&
+                      (otherTy->headName() == "Set" ||
+                       otherTy->headName() == "OwningSet") &&
                       genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
 
     const sema::TypeRef* otherElem =
@@ -678,7 +678,7 @@ llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
         callTy->genericArgs[0]->astNode &&
         callTy->genericArgs[0]->astNode->name &&
         !callTy->genericArgs[0]->astNode->name->parts.empty() &&
-        callTy->genericArgs[0]->astNode->name->parts[0] == "IGrouping" &&
+        callTy->genericArgs[0]->headName() == "IGrouping" &&
         callTy->genericArgs[0]->genericArgs.size() >= 1) {
         keyElemRef = callTy->genericArgs[0]->genericArgs[0];
     }
@@ -1159,8 +1159,8 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                                        : nullptr;
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        (recvTy->astNode->name->parts[0] == "Set" ||
-         recvTy->astNode->name->parts[0] == "OwningSet")) {
+        (recvTy->headName() == "Set" ||
+         recvTy->headName() == "OwningSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
@@ -1766,7 +1766,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     int64_t esz = collectionElemSize(recvTy);
     bool isOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    recvTy->astNode->name->parts[0] == "OwningLinkedList";
+                    recvTy->headName() == "OwningLinkedList";
 
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv) return nullptr;
@@ -2229,7 +2229,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     if (!recvTy->astNode || !recvTy->astNode->name ||
         recvTy->astNode->name->parts.empty())
         return nullptr;
-    std::string_view rcn = recvTy->astNode->name->parts[0];
+    std::string_view rcn = recvTy->headName();
 
     // §3.3 (#883): ReadOnlyStringSpan instance methods (call form). The struct is
     // {string-ptr, i32 start, i32 length}; Length/IsEmpty are field reads and

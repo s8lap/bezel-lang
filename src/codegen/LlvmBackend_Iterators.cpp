@@ -28,7 +28,7 @@ bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
     std::string_view n;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty()) {
-        n = iterTy->astNode->name->parts[0];
+        n = iterTy->headName();
     } else if (!iterTy->importedName.empty()) {
         n = iterTy->importedName;
     } else {
@@ -54,7 +54,7 @@ bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
             if (!rt->astNode || !rt->astNode->name ||
                 rt->astNode->name->parts.empty())
                 return false;
-            return rt->astNode->name->parts[0] == "IEnumerable";
+            return rt->headName() == "IEnumerable";
         };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (par->declType) {
@@ -499,7 +499,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         auto* retRef = ctx_.resolvedType(*ci.returnType);
         if (retRef && retRef->astNode && retRef->astNode->name &&
             !retRef->astNode->name->parts.empty())
-            retName = retRef->astNode->name->parts[0];
+            retName = retRef->headName();
         else if (retRef && !retRef->importedName.empty())
             retName = retRef->importedName;
         if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
