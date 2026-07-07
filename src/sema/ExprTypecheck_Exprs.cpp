@@ -2326,18 +2326,17 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         }
     }
     // per §3.5 (v0.182, #1574): a relational operator (`<`, `<=`, `>`, `>=`)
-    // is not defined on `bool` operands — no ordering of `false`/`true` was
-    // ever defined, the stdlib `Boolean` wrapper deliberately declares no
-    // `IComparable` (§4.1), and admitting one would be truthiness-shaped.
-    // Only `=`/`<>` are valid on bool (handled by the general primitive
-    // equality path below, unaffected by this check). Without this guard the
-    // expression fell through to the generic primitive result-type rule
-    // further down, which types `<`/`<=`/`>`/`>=` as `bool` regardless of
-    // operand type — matching no semantics (`true < false` compiled to
-    // `true`). §7.11's relational-lifting rule excludes `bool?` from lifting
-    // for the identical reason, so checking the primitive kind here (ignoring
-    // nullability) covers a `bool?` operand too.
+    // is not defined on `bool` operands, and per §4.6 (v0.182, #1575) it is
+    // not defined on a nullable-reference (`string?`) operand either — both
+    // fall through to the generic primitive result-type rule below (which
+    // types every relational as `bool` regardless of operand type) and were
+    // wrong: `true < false` compiled to `true`, and `string? < string?`
+    // segfaulted on a null operand. Reject both here. Only `=`/`<>` are valid
+    // on bool / `string?` (the general equality path below is unaffected).
     if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+        // #1574: bool ordering. §7.11's relational-lifting excludes `bool?`
+        // for the same reason, so checking the primitive kind here (ignoring
+        // nullability) covers a `bool?` operand too.
         auto isBool = [](const TypeRef* t) {
             return t && t->kind == TypeRef::Kind::Primitive &&
                    t->primitive == PrimitiveType::Bool;
@@ -2348,12 +2347,55 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 "operator `" + std::string(op) + "` is not defined for `bool` "
-                "operands (\xC2\xA7""3.5) — no ordering of `false`/`true` is "
+                "operands (\xC2\xA7""3.5) \xE2\x80\x94 no ordering of `false`/`true` is "
                 "defined; only `=`/`<>` are valid on bool. To order by a flag,"
                 " convert explicitly (`int(b)`).");
             ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
             return;
         }
+        // #1575: ordering on `string` requires non-nullable operands; a
+        // `string?` operand is a compile error (narrow first, §7.4) — the same
+        // use-requires-narrowing discipline as member access on a nullable
+        // reference. Distinct from §7.11 lifting, which is confined to nullable
+        // VALUE types and does NOT extend to `string`. Previously a `string?`
+        // operand fell through to ordinal-compare codegen and segfaulted on a
+        // null operand; `=`/`<>` stay null-safe (§8.4) and are unaffected.
+        auto nullableStringOperand = [&](const ast::Expr* operand) -> bool {
+            if (!operand) return false;
+            const TypeRef* t = ctx_.exprType(*operand);
+            if (!t || t->kind != TypeRef::Kind::Primitive ||
+                t->primitive != PrimitiveType::String || !t->nullable)
+                return false;
+            // §7.4: a null-narrowed (`x <> null`) simple local/parameter is
+            // known non-null even though exprType keeps the nullable flag
+            // (null-narrowing does not rewrite exprType). Mirror
+            // resolveMemberAccess's isKnownNonNull gate so a narrowed operand
+            // compares like a non-nullable `string`.
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(operand)) {
+                if (id->name != "this" && id->name != "base") {
+                    Symbol* sym = lookupName(id->name);
+                    if (sym && (dynamic_cast<LocalSymbol*>(sym) ||
+                                 dynamic_cast<ParameterSymbol*>(sym)) &&
+                        isKnownNonNull(sym))
+                        return false;
+                }
+            }
+            return true;
+        };
+        if (nullableStringOperand(be.left.get()) ||
+            nullableStringOperand(be.right.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` requires non-nullable "
+                "`string` operands (\xC2\xA7""4.6); a `string?` operand is a "
+                "compile error \xE2\x80\x94 narrow first (\xC2\xA7""7.4), the same "
+                "use-requires-narrowing discipline as member access on a "
+                "nullable reference. Equality (`=`/`<>`) stays null-safe "
+                "(\xC2\xA7""8.4) and is unaffected.");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+    }
     }
     // §25.1 (#1096): an arithmetic/bitwise/shift operator on a record/class
     // operand requires a matching user-defined overload whose parameters match
