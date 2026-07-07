@@ -503,6 +503,21 @@ private:
     // are deferred — the composition rules are sound but handled separately.
     void checkVariancePositions();
 
+    // §12.9 / §11.8 (v0.181, issue #1559): variance markers (`in`/`out`) are
+    // interface-only syntax — the shared `GenericParam` grammar (Appendix
+    // A.4) admits the marker on every generic-parameter list (classes,
+    // records, enums, methods, type aliases, extension methods), but only an
+    // interface's OWN type parameters may carry one; everywhere else it is a
+    // compile error. A method's type parameters are never variant, even
+    // inside an interface. Additionally, an interface that declares a static
+    // member (a `static` method, or an operator — implicitly static, §25)
+    // may not mark its own parameters variant either (§11.8). Driving loop
+    // over top-level declarations; recurses into nested types.
+    void checkVarianceMarkerScope();
+    void checkVarianceMarkerScopeForType(TypeSymbol& t);
+    void checkMethodGenericParamsNoVariance(Symbol* member);
+    static bool declaresStaticMember(TypeSymbol& t);
+
     // §32.5: validate that the AST type `t`, appearing in an `extern` method
     // signature, is an FFI-compatible type. `returnPosition` permits the unit
     // type `()` (valid as a return type only). `declSpelling` names the

@@ -222,6 +222,11 @@ void Resolver::run(const ast::SourceFile& src) {
     // §12.9 / issue #431: variance position enforcement on interface members.
     // `out T` must appear only in output positions; `in T` only in input.
     checkVariancePositions();
+    // §12.9 / §11.8 (v0.181, issue #1559): variance markers (`in`/`out`) are
+    // interface-only syntax — reject them on class/record/enum/method/alias
+    // parameters, and on an interface's parameters when it declares a
+    // static member.
+    checkVarianceMarkerScope();
     // §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains checks.
     // Rule 2 errors mutable static class/interface fields; rule 4 warns
     // static readonly class/interface fields. Runs after type resolution

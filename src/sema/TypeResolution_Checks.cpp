@@ -3159,6 +3159,127 @@ void Resolver::checkVariancePositions() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §12.9 / §11.8 (v0.181, issue #1559) — variance markers are interface-only.
+//
+// The shared `GenericParam` grammar (Appendix A.4) admits `in`/`out` on
+// every generic-parameter list — classes, records, enums, methods, type
+// aliases, extension methods — but only an interface's OWN type parameters
+// may legally carry one: variance is defined by instance-reference
+// assignability, and classes/records/concrete generic types are always
+// invariant (§12.9). A method's type parameters are never variant, even on
+// an interface's own methods — the position rules govern the *type's*
+// parameters, not a method's.
+//
+// Separately (§11.8), an interface that declares a static member (a
+// `static` method, or an operator — implicitly static, §25) may not mark
+// its own type parameters variant either: variance is defined over
+// instance references and static signatures have no recorded reading.
+// ---------------------------------------------------------------------------
+
+// True iff `t` declares at least one static member: an explicit `static`
+// method, or an operator overload (operators are implicitly static — A.4
+// `OperatorDecl ::= Visibility "static" "method" "operator" ...`). A member
+// function (not a free function) because it uses the private `hasMod` helper.
+bool Resolver::declaresStaticMember(TypeSymbol& t) {
+    for (Symbol* m : t.members) {
+        auto* ms = dynamic_cast<MethodSymbol*>(m);
+        if (!ms) continue;
+        if (ms->isOperator || hasMod(ms, "static")) return true;
+    }
+    return false;
+}
+
+// Reject a variance marker on `member`'s own generic parameters, if any —
+// a method's type parameters are never variant (§12.9), regardless of the
+// enclosing declaration's kind. Diagnostics anchor on the method's
+// declaration span (GenericParam itself carries no span, Appendix A.3).
+void Resolver::checkMethodGenericParamsNoVariance(Symbol* member) {
+    auto* ms = dynamic_cast<MethodSymbol*>(member);
+    if (!ms) return;
+    const SourceLocation at =
+        ms->decl ? ms->decl->span.begin : SourceLocation{};
+    for (Symbol* gp : ms->genericParams) {
+        auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+        if (!gps || gps->variance.empty()) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, at,
+            std::string("type parameter `") + std::string(gps->name) +
+            "` may not be marked `" + std::string(gps->variance) +
+            "` — variance markers are valid only on an interface's own "
+            "type parameters (§12.9), not on a method type parameter");
+    }
+}
+
+void Resolver::checkVarianceMarkerScopeForType(TypeSymbol& t) {
+    const SourceLocation at = t.decl ? t.decl->span.begin : SourceLocation{};
+    if (t.kind != ast::TypeDeclKind::Interface) {
+        std::string_view declKind =
+            t.kind == ast::TypeDeclKind::Record ? "a record type parameter" :
+            t.kind == ast::TypeDeclKind::Enum   ? "an enum type parameter" :
+                                                   "a class type parameter";
+        for (Symbol* gp : t.genericParams) {
+            auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+            if (!gps || gps->variance.empty()) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, at,
+                std::string("type parameter `") + std::string(gps->name) +
+                "` may not be marked `" + std::string(gps->variance) +
+                "` — variance markers are valid only on an interface's own "
+                "type parameters (§12.9), not on " + std::string(declKind));
+        }
+    } else if (declaresStaticMember(t)) {
+        for (Symbol* gp : t.genericParams) {
+            auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+            if (!gps || gps->variance.empty()) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, at,
+                std::string("interface `") + std::string(t.name) +
+                "` declares a static member, so its type parameter `" +
+                std::string(gps->name) + "` may not be marked `" +
+                std::string(gps->variance) + "` (§11.8)");
+        }
+    }
+    for (Symbol* m : t.members) {
+        checkMethodGenericParamsNoVariance(m);
+        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+            if (nt->type) checkVarianceMarkerScopeForType(*nt->type);
+        }
+    }
+}
+
+void Resolver::checkVarianceMarkerScope() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
+            checkVarianceMarkerScopeForType(*t);
+            continue;
+        }
+        if (auto* alias = dynamic_cast<TypeAliasSymbol*>(child)) {
+            const SourceLocation at =
+                alias->decl ? alias->decl->span.begin : SourceLocation{};
+            for (Symbol* gp : alias->genericParams) {
+                auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+                if (!gps || gps->variance.empty()) continue;
+                ctx_.diagnostics().report(
+                    Severity::Error, at,
+                    std::string("type parameter `") + std::string(gps->name) +
+                    "` may not be marked `" + std::string(gps->variance) +
+                    "` — variance markers are valid only on an interface's "
+                    "own type parameters (§12.9), not on a type alias "
+                    "parameter");
+            }
+            continue;
+        }
+        if (auto* ext = dynamic_cast<ExtensionSymbol*>(child)) {
+            for (Symbol* m : ext->members) {
+                checkMethodGenericParamsNoVariance(m);
+            }
+            continue;
+        }
+    }
+}
+
 // §9.8 (issue #550): serialization-eligibility check.
 //
 // A type that declares `: ISerializable` or `: IDeserializable` and is NOT

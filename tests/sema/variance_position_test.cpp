@@ -38,6 +38,16 @@ bool hasVarianceError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// True iff some diagnostic message contains `needle` (issue #1559 tests use
+// this to check for the specific "outside interface" / §11.8 wording rather
+// than the generic §12.9-position substring `hasVarianceError` looks for).
+bool hasErrorContaining(const bezel::test::SemaResult& r, std::string_view needle) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -183,9 +193,9 @@ BEZEL_TEST(sema_variance_position, spec_12_9_non_generic_interface_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// A class with `out`-annotated type param (variance annotation on classes
-// is rejected by the parser per §12.9 — classes are always invariant —
-// so we only test that invariant class generics compile fine).
+// A class with an `out`-annotated type param is rejected semantically
+// (issue #1559, Group F below) — classes are always invariant. Here we only
+// confirm an ordinary invariant class generic compiles fine.
 BEZEL_TEST(sema_variance_position, spec_12_9_class_invariant_accepted) {
     auto r = parseSemaAll(
         "module M; "
@@ -225,5 +235,152 @@ BEZEL_TEST(sema_variance_position, spec_12_9_event_out_T_nested_function_accepte
         "end IEvent;");
     // Nested position composition is deferred — must not false-positive.
     BEZEL_EXPECT_FALSE(hasVarianceError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// Group F (issue #1559, §12.9 v0.181): variance markers are interface-only
+// syntax. `in`/`out` on a class, record, enum, method, or type-alias generic
+// parameter is a compile error — the shared `GenericParam` grammar (Appendix
+// A.4) admits the marker everywhere, but outside an interface's own type
+// parameters it must be rejected semantically.
+// ---------------------------------------------------------------------------
+
+// §12.9: `class Box<out T>` — the spec's own counter-example — is rejected.
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_class_out_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box<out T> "
+        "  private _v: T; "
+        "  public method Get(): T => _v; "
+        "end Box;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "12.9"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "class type parameter"));
+}
+
+// §12.9: `in` is rejected on a class parameter exactly like `out`.
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_class_in_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Sink<in T> "
+        "  public method Consume(item: T) end Consume; "
+        "end Sink;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "12.9"));
+}
+
+// §12.9: a record's own type parameter may not be marked variant either.
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_record_out_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pair<out T>(a: T, b: T);");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "12.9"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "record type parameter"));
+}
+
+// §12.9: a method's own type parameter is never variant, even when the
+// method sits on an ordinary (non-generic) class.
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_method_out_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Util "
+        "  public static method Identity<out T>(x: T): T => x; "
+        "end Util;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "12.9"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "method type parameter"));
+}
+
+// §12.9: a method's own type parameter is rejected even INSIDE an interface
+// — the position rules govern the interface's own parameters, not a
+// method's (the interface's own `out T` on IHost is fine; the method-level
+// `out U` on MakeHandler is not).
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_method_out_rejected_inside_interface) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IHost<out T> "
+        "  method MakeHandler<out U>(seed: U): T; "
+        "end IHost;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "12.9"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "method type parameter"));
+}
+
+// §12.9 / §27.8: a type alias's own type parameter may not be marked
+// variant.
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_type_alias_out_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box<T> "
+        "  private _v: T; "
+        "  public method Get(): T => _v; "
+        "end Box; "
+        "type Alias<out T> = Box<T>;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "12.9"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "type alias parameter"));
+}
+
+// ---------------------------------------------------------------------------
+// Group G (issue #1559, §11.8 v0.181): an interface that declares a static
+// member may not mark its type parameters variant either — variance is
+// defined by instance-reference assignability, and static signatures have
+// no recorded reading.
+// ---------------------------------------------------------------------------
+
+// §11.8 worked example: `INumber<T>` declares `static method Zero(): T;` —
+// marking T covariant is rejected even though `Zero` alone is a pure output
+// position (the §12.9 position check would accept it; §11.8 forbids the
+// marker outright once any static member is present).
+BEZEL_TEST(sema_variance_marker_scope, spec_11_8_static_method_out_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface INumber<out T> where T: INumber<T> "
+        "  static method Zero(): T; "
+        "end INumber;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "11.8"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "static member"));
+}
+
+// §11.8: an operator overload is implicitly static (A.4 `OperatorDecl ::=
+// Visibility "static" "method" "operator" ...`), so it triggers the same
+// rejection as an explicit `static method`.
+BEZEL_TEST(sema_variance_marker_scope, spec_11_8_static_operator_out_rejected) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface INumber2<out T> where T: INumber2<T> "
+        "  static operator +(a: T, b: T): T; "
+        "end INumber2;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "11.8"));
+}
+
+// §11.8 regression: an interface with a static member but an INVARIANT type
+// parameter (no `in`/`out`) is unaffected — only the marker is forbidden.
+BEZEL_TEST(sema_variance_marker_scope, spec_11_8_static_method_invariant_accepted) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface INumber3<T> where T: INumber3<T> "
+        "  static method Zero(): T; "
+        "end INumber3;");
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "11.8"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §12.9 / §11.8 positive control (issue #1559): an interface with ONLY
+// instance members and a variant parameter still compiles — the rejection
+// is scoped to (a) non-interface declarations and (b) interfaces that
+// declare a static member, not to interface variance in general.
+BEZEL_TEST(sema_variance_marker_scope, spec_12_9_interface_instance_only_variance_still_accepted) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IProducer<out T> "
+        "  method Produce(): T; "
+        "end IProducer;");
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "12.9"));
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "11.8"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
