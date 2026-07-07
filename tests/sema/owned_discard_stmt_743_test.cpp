@@ -254,3 +254,103 @@ BEZEL_TEST(owned_discard_743, trivial_discard_not_task_error_1014) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasTaskDiscardError(r));
 }
+
+// ===========================================================================
+// §21.9 (#1497): a BARE `Task`/`Task<T>`/`OwningTask<T>` expression statement
+// — e.g. `Work();` where `Work(): Task` — must hard-error the same way the
+// `_ := Work();` discard form does above (#1014). Before this fix, the bare-
+// statement form fell through with NO diagnostic at all: the class arm
+// (§21.9 above, #743) is gated on `ownedProduced`, which a plain (non-`owned`)
+// async call never sets, so an unawaited task was silently dropped.
+// ===========================================================================
+
+namespace {
+// The bare-statement hard error names `await` and `Task.FireAndForget` before
+// `using var` (Appendix C.3, spec:8532: disposing/discarding a task abandons a
+// running operation, so those lead the remedy list — unlike the non-trivial-
+// dispose class arm, which offers `using var` first).
+bool hasTaskStatementDiscardError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("discards a `Task` result") != std::string::npos &&
+            d.message.find("FireAndForget") != std::string::npos &&
+            d.message.find("21.9") != std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// REJECT: bare `Work();` statement, `Work(): Task` (plain, no result) — #1497.
+BEZEL_TEST(owned_discard_743, task_void_bare_statement_is_error_1497) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task return; end Work; "
+        "  public static async method Caller(): Task "
+        "    Work(); "
+        "    return; "
+        "  end Caller; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasTaskStatementDiscardError(r));
+}
+
+// REJECT: bare `Work();` statement, `Work(): Task<int>` — #1497.
+BEZEL_TEST(owned_discard_743, task_generic_bare_statement_is_error_1497) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task<int> return 0; end Work; "
+        "  public static async method Caller(): Task "
+        "    Work(); "
+        "    return; "
+        "  end Caller; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasTaskStatementDiscardError(r));
+}
+
+// REJECT: bare `Make();` statement, `Make(): OwningTask<R>` (Pattern B) — #1497.
+BEZEL_TEST(owned_discard_743, owning_task_bare_statement_is_error_1497) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class R public _h: int := 0; destructor _h := 1; end destructor; end R; "
+        "class C "
+        "  public static async method Make(): OwningTask<R> return new R(); end Make; "
+        "  public static async method Caller(): Task "
+        "    Make(); "
+        "    return; "
+        "  end Caller; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasTaskStatementDiscardError(r));
+}
+
+// ACCEPT: `await Work();` as a bare statement — awaiting to settlement is
+// exactly the remedy §21.9 asks for; must NOT trip the bare-statement reject.
+BEZEL_TEST(owned_discard_743, task_awaited_bare_statement_ok_1497) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task return; end Work; "
+        "  public static async method Caller(): Task "
+        "    await Work(); "
+        "    return; "
+        "  end Caller; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasTaskStatementDiscardError(r));
+}
+
+// ACCEPT: `Task.FireAndForget(Work());` as a bare statement — the named
+// remedy itself returns `()`, so it must not re-trip the check.
+BEZEL_TEST(owned_discard_743, task_fire_and_forget_bare_statement_ok_1497) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Work(): Task return; end Work; "
+        "  public static async method Caller(): Task "
+        "    Task.FireAndForget(Work()); "
+        "    return; "
+        "  end Caller; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasTaskStatementDiscardError(r));
+}

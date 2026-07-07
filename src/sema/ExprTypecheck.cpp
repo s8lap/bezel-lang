@@ -3868,6 +3868,34 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // §21.9 (#1497): a bare `Task`/`Task<T>`/`OwningTask<T>` expression
+        // statement — e.g. `Work();` where `Work(): Task` — silently drops the
+        // task: no diagnostic at all, not even the generic §21.9 discard
+        // WARNING, because the "unowned, non-() result" warning path never
+        // matched Task in the first place. §21.9 says the warning is replaced
+        // by a hard error for Task, the same as the non-trivial-dispose class
+        // arm just above; that class arm is gated on `ownedProduced`, which a
+        // plain (non-`owned`) async call never sets, so Task fell through
+        // entirely. Checked directly on the statement's type so it fires
+        // regardless of how the Task was produced (call, await of a
+        // Task<Task<T>>, etc.). Remedy order follows Appendix C.3 (spec:8532)
+        // / §17.13's `_ := taskExpr;` hard error below (#1014): `await` or
+        // `Task.FireAndForget` lead, since discarding/disposing a task
+        // abandons a running operation — `using var` is the fallback, not the
+        // first-offered fix, unlike the class arm above.
+        if (es->expr) {
+            const TypeRef* taskStmtTy = ctx_.exprType(*es->expr);
+            if (isTaskShapedRef(taskStmtTy)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, es->expr->span.begin,
+                    "this expression statement discards a `Task` result — an "
+                    "unawaited task's exceptions and lifetime are silently "
+                    "dropped; `await` it, use `Task.FireAndForget(expression);` "
+                    "for supervised fire-and-forget, or bind it explicitly "
+                    "(`using var t := expression;`) to dispose it at scope end "
+                    "(§21.9)");
+            }
+        }
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         // §12.7: "Reassignment within the controlled block invalidates the
         // narrowing." If the assignment target is the narrowed variable, drop
