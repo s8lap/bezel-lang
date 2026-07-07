@@ -3248,7 +3248,27 @@ void ExprTC::visitMember(const ast::Member& m) {
             // → the runtime store is skipped → field stays zero.
             Scope* saveScope = currentScope_;
             if (!currentScope_) currentScope_ = moduleScope_.get();
+            // per §4.2 (v0.159/v0.182): a typed field initializer is an
+            // admitting typed context — an unsuffixed literal exceeding
+            // `int`'s range but fitting the field's declared wider integer
+            // type (long/ulong/uint) widens to it, mirroring the typed-local
+            // hint (#184) instead of being rejected for want of a suffix.
+            PrimitiveType savedFieldHint = currentLiteralWideningHint_;
+            if (fd->type) {
+                if (auto* frt = ctx_.resolvedType(*fd->type)) {
+                    if (frt->kind == TypeRef::Kind::Primitive) {
+                        using P = PrimitiveType;
+                        switch (frt->primitive) {
+                            case P::Long: case P::ULong: case P::UInt:
+                                currentLiteralWideningHint_ = frt->primitive;
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+            }
             visitExpr(*fd->initializer);
+            currentLiteralWideningHint_ = savedFieldHint;
             // §17.7 (#987, mirrors the LocalDecl fix #979): a typeless
             // `new(args)` shorthand field initializer takes its construction
             // target from the field's declared type. Record it as the NewExpr's
@@ -3914,7 +3934,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             currentScope_->names[lc->name] = lsym;
         }
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        // per §4.2 (v0.182): `return` in a method with a declared wider
+        // integer return type (long/ulong/uint) is an admitting typed
+        // context — an unsuffixed literal exceeding `int`'s range but
+        // fitting the return type widens to it, mirroring the typed-local
+        // hint (#184) instead of being rejected for want of a suffix. This
+        // context joined the admitting-context list in v0.182 alongside the
+        // assignment-target case below.
+        PrimitiveType savedRetHint = currentLiteralWideningHint_;
+        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
+            currentReturnType_->kind == TypeRef::Kind::Primitive) {
+            using P = PrimitiveType;
+            switch (currentReturnType_->primitive) {
+                case P::Long: case P::ULong: case P::UInt:
+                    currentLiteralWideningHint_ = currentReturnType_->primitive;
+                    break;
+                default: break;
+            }
+        }
         if (rs->value) visitExpr(*rs->value);
+        currentLiteralWideningHint_ = savedRetHint;
         // per §31.2: `return` inside a `finally` block is a compile error.
         // Appendix A: "`return` does not appear in `finally` blocks."
         if (finallyDepth_ > 0) {
@@ -4230,7 +4269,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (eventPayload &&
                 dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
                 pendingLambdaParamType_ = eventPayload;
+            // per §4.2 (v0.182): an assignment target whose declared type is
+            // a wider integer type (long/ulong/uint) is an admitting typed
+            // context — an unsuffixed literal exceeding `int`'s range but
+            // fitting the target's type widens to it, mirroring the typed-
+            // local hint (#184) instead of being rejected for want of a
+            // suffix. `as->target` was already visited above, so its
+            // exprType is available. This context joined the admitting-
+            // context list in v0.182 alongside the `return` case.
+            PrimitiveType savedAssignHint = currentLiteralWideningHint_;
+            if (as->target) {
+                if (TypeRef* tgtTy = ctx_.exprType(*as->target)) {
+                    if (tgtTy->kind == TypeRef::Kind::Primitive) {
+                        using P = PrimitiveType;
+                        switch (tgtTy->primitive) {
+                            case P::Long: case P::ULong: case P::UInt:
+                                currentLiteralWideningHint_ = tgtTy->primitive;
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+            }
             visitExpr(*as->value);
+            currentLiteralWideningHint_ = savedAssignHint;
             pendingLambdaParamType_ = savedPending;
         }
         // per §24.4: an event += / -= is not a real compound assignment, so

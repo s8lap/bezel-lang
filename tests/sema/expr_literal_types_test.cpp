@@ -246,3 +246,79 @@ BEZEL_TEST(sema_expr_lit, literal_too_large_for_generic_int_arg_rejected_1052) {
         "module M; record Box<T>(V: T); class C public static method Main(): int "
         "var b := new Box<int>(5000000000); return int(b.V); end Main; end C;"));
 }
+
+// issue #1576 / §4.2 (v0.182): "Typed-context widening" lists the admitting
+// contexts as a typed variable declaration, a typed field initializer, a
+// declared-integer-type parameter, an assignment target whose declared type
+// is an integer type, or a `return` in a method with a declared integer
+// return type. v0.182 corrected "decimal literal" to "integer literal" (hex/
+// binary spellings widen identically to decimal) and completed the context
+// list with the assignment-target and `return` cases. Each admitting context
+// below widens an unsuffixed literal exceeding `int`'s range to the target's
+// declared wider integer type (long/ulong/uint); an `int`-typed target in the
+// same position still rejects the literal (no accidental width).
+
+// A typed field initializer (already-admitting per v0.159's "codifying
+// implemented behavior," but the compiler had never actually threaded the
+// declared field type as a widening hint before this fix).
+BEZEL_TEST(sema_expr_lit, literal_widens_to_long_field_initializer_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public F: long := 3000000000; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+
+// The assignment-target context, added to the admitting list in v0.182.
+BEZEL_TEST(sema_expr_lit, literal_widens_to_long_assignment_target_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Main(): int "
+        "var x: long := 0; x := 3000000000; return 0; end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_widens_to_uint_assignment_target_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Main(): int "
+        "var x: uint := 0; x := 4000000000; return 0; end Main; end C;"));
+}
+// A compound assignment (`+=`) target is an assignment target too; its RHS
+// literal widens by the same rule.
+BEZEL_TEST(sema_expr_lit, literal_widens_to_long_compound_assignment_target_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Main(): int "
+        "var x: long := 1; x += 3000000000; return 0; end Main; end C;"));
+}
+// An `int`-typed assignment target still rejects — the widening only applies
+// when the declared target type is itself wider than `int`.
+BEZEL_TEST(sema_expr_lit, literal_too_large_for_int_assignment_target_rejected_1576) {
+    BEZEL_EXPECT_TRUE(semaHasErrors(
+        "module M; class C public static method Main(): int "
+        "var x: int := 0; x := 3000000000; return 0; end Main; end C;"));
+}
+
+// The `return` context, added to the admitting list in v0.182.
+BEZEL_TEST(sema_expr_lit, literal_widens_to_long_return_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Big(): long "
+        "return 3000000000; end Big; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+// An `int`-returning method still rejects a too-large literal `return`.
+BEZEL_TEST(sema_expr_lit, literal_too_large_for_int_return_rejected_1576) {
+    BEZEL_EXPECT_TRUE(semaHasErrors(
+        "module M; class C public static method Big(): int "
+        "return 3000000000; end Big; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+
+// v0.182's "decimal literal" -> "integer literal" correction: a hex or
+// binary spelling widens exactly like the decimal spelling in each admitting
+// context (the widening reads the literal's magnitude, not its base).
+BEZEL_TEST(sema_expr_lit, hex_literal_widens_to_long_assignment_target_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Main(): int "
+        "var x: long := 0; x := 0x100000000; return 0; end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, binary_literal_widens_to_ulong_return_1576) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public static method Big(): ulong "
+        "return 0b100000000000000000000000000000000; end Big; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
