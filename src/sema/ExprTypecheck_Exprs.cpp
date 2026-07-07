@@ -810,6 +810,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     }
     visitChildren(e);
     literalUnderUnaryMinus_ = savedNegLit;
+    // per §7.4 (v0.182, #1566): a call, a function-value invocation (`f?(…)`), or
+    // a constructor can transfer control to user code, which may run a closure
+    // that nulls a mutably-captured local — so after visiting one (its arguments
+    // are already checked under the pre-call narrowing), invalidate the narrowing
+    // of every mutably-captured local. (`await` is handled in typeUnary, and
+    // user-defined operators in typeBinary/typeUnary; the spec's remaining
+    // "accessor call" trigger — a user-defined property/indexer getter — is
+    // tracked separately as #1593.) A no-op unless the body has a lambda that
+    // mutates a captured local.
+    if (dynamic_cast<const ast::CallExpr*>(&e) ||
+        dynamic_cast<const ast::NullCondCallExpr*>(&e) ||
+        dynamic_cast<const ast::NewExpr*>(&e)) {
+        invalidateCapturedNarrowings();
+    }
     // Slice 3c: binary / unary operator result typing.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         typeBinary(*be);
@@ -2175,6 +2189,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     if (op != "and" && op != "or" && op != "in") {
         if (MethodSymbol* opm = findBinaryOperator(be)) {
             ctx_.setExprSymbol(&be, opm);
+            // per §7.4 (v0.182, #1566): a user-defined binary operator is a call
+            // that can transfer control to user code — invalidate mutably-
+            // captured narrowings (both operands were already visited under the
+            // prior narrowing). Built-in primitive operators do not reach here.
+            invalidateCapturedNarrowings();
             if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl)) {
                 if (od->returnType)
                     if (auto* rt = ctx_.resolvedType(*od->returnType)) {
@@ -3027,6 +3046,10 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
             if (auto* rt = ctx_.importedReturnType(opm))
                 ctx_.setExprType(&ue, rt);
         }
+        // per §7.4 (v0.182, #1566): a user-defined unary operator is a call that
+        // can transfer control to user code — invalidate mutably-captured
+        // narrowings (its operand was already visited under the prior narrowing).
+        invalidateCapturedNarrowings();
         return;
     }
     if (op == "not") {
@@ -3189,6 +3212,12 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     }
     // `await` — async-readiness 3b (§30.2 / §30.3 / §30.5).
     if (op == "await") {
+        // per §7.4 (v0.182, #1566): across an `await`, another continuation of
+        // the same domain may run a closure that nulls a mutably-captured local
+        // (§30.13), so the suspension invalidates such a local's narrowing. The
+        // operand was already visited (in visitChildren) under the pre-await
+        // narrowing, so this drops it for the code that resumes after the await.
+        invalidateCapturedNarrowings();
         // §30.2 / Appendix C.6: `await` is valid only inside an `async`
         // method, an `async` lambda, or the synchronous prefix of `await for`
         // (the latter is itself only reachable inside an async context). A

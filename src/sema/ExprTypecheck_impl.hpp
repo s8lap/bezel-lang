@@ -97,6 +97,20 @@ private:
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
 
+    // §7.4 (v0.182, #1566): the set of local/parameter NAMES that are "mutably
+    // captured" — assigned, or passed `ref`/`out`, anywhere inside ANY lambda of
+    // the enclosing method body. Computed once per body (computeMutablyCaptured)
+    // at the start of `runMethodBody`; the spec's rule is deliberately syntactic
+    // and conservative (any lambda in the body counts, whether or not it escapes,
+    // so no escape analysis is needed). While such a local is narrowed non-null,
+    // any operation inside the controlled block that can transfer control to user
+    // code — a call, a function-value invocation, a constructor, or an `await` —
+    // may run the capturing closure and null the local, so it drops the narrowing
+    // (invalidateCapturedNarrowings). Keyed by name (string_view into the stable
+    // source text); matched against a narrowed symbol's `name`. Empty in the
+    // common case, which makes the per-op invalidation a cheap no-op.
+    std::unordered_set<std::string_view> mutablyCapturedNames_;
+
     // §22.5 (issue #1160): while type-checking parameter i's default-value
     // expression, that parameter and every parameter declared AFTER it are out
     // of scope — a default may read only EARLIER parameters. This set holds the
@@ -572,6 +586,20 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
         const ast::Expr* exprBody,
         const std::vector<Symbol*>* paramSyms);
+
+    // §7.4 (v0.182, #1566): recompute `mutablyCapturedNames_` from a method body
+    // (its statements and/or expression body). Syntactic full-body scan: records
+    // the name of every local/parameter assigned or passed `ref`/`out` inside any
+    // lambda, excluding a lambda's own parameters (which shadow an outer name).
+    void computeMutablyCaptured(
+        const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+        const ast::Expr* exprBody);
+
+    // §7.4 (v0.182, #1566): drop the null-narrowing (and any §12.7 type-
+    // narrowing) of every currently-narrowed local whose name is in
+    // `mutablyCapturedNames_`. Called at each control-transfer operation inside a
+    // controlled block; a no-op when nothing in the body is mutably captured.
+    void invalidateCapturedNarrowings();
 
     void visitMember(const ast::Member& m);
 

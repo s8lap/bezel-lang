@@ -489,3 +489,223 @@ BEZEL_TEST(sema_null_narrow, byvalue_arg_keeps_narrowing_1188) {
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §7.4 (v0.182, #1566): closure-capture narrowing invalidation.
+//
+// A local narrowed non-null, then written to `null` by a lambda invoked
+// (directly or indirectly) inside the controlled block, is no longer non-null.
+// The spec rule is deliberately syntactic and conservative: a local is "mutably
+// captured" when it is assigned, or passed `ref`/`out`, ANYWHERE inside ANY
+// lambda of the enclosing function body; while such a local is narrowed, any
+// operation in the controlled block that can transfer control to user code — a
+// call, a function-value invocation, a constructor, or an `await` — invalidates
+// the narrowing (a closure invoked in between may have nulled it). Straight-line
+// check-then-use (no such operation BETWEEN the test and the use) stays accepted,
+// and a local that is NOT mutably captured keeps its narrowing across a call.
+// ===========================================================================
+
+// §7.4 (#1566): the probe. `s` is narrowed non-null, then nulled by a lambda
+// invoked inside the block, then dereferenced. Before the fix this compiled
+// clean and SIGSEGV'd at run time; it must now be rejected (re-narrow required).
+BEZEL_TEST(sema_null_narrow, closure_capture_mutation_invalidates_across_call_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      f(); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): the invalidation is not limited to invoking the capturing closure
+// itself — ANY control-transfer operation counts, because the closure could be
+// reached indirectly. A call to an unrelated method between the test and the use
+// invalidates a mutably-captured local just the same.
+BEZEL_TEST(sema_null_narrow, captured_local_invalidated_by_unrelated_call_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Touch() end Touch; "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      Touch(); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): a constructor (`new`) is likewise a control transfer, so it
+// invalidates a mutably-captured local's narrowing.
+BEZEL_TEST(sema_null_narrow, captured_local_invalidated_by_constructor_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Thing public constructor() end; end Thing; "
+        "class C "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      _ := new Thing(); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): a lambda that passes the local as a `ref` argument mutates it
+// (the callee may null it), so it is mutably captured — a call in the block
+// invalidates the narrowing exactly as a direct assignment inside the lambda.
+BEZEL_TEST(sema_null_narrow, ref_capture_in_lambda_invalidates_across_call_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Zap(ref u: string?) u := null; end Zap; "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do Zap(ref s); end; "
+        "    if s <> null then "
+        "      f(); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): the invalidation also applies to a narrowing established by an
+// early-exit guard at method-body scope, not only inside an `if` block. Here the
+// surviving path is narrowed by `if s = null then return; end;`, then a call
+// invalidates the mutably-captured local before the use.
+BEZEL_TEST(sema_null_narrow, early_exit_narrowing_invalidated_by_call_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Touch() end Touch; "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s = null then return -1; end; "
+        "    Touch(); "
+        "    return s.Length; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): NO over-invalidation. A closure that CAPTURES the local but only
+// READS it (never assigns / ref/out-passes it) does not make the local mutably
+// captured, so its narrowing survives a call — this must be ACCEPTED.
+BEZEL_TEST(sema_null_narrow, non_mutating_closure_keeps_narrowing_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do var z := s; end; "
+        "    if s <> null then "
+        "      f(); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): NO over-invalidation. A local that is NOT captured by any lambda
+// keeps its narrowing across a call (the by-value #1188 guarantee), even though
+// the body contains a lambda that mutates a DIFFERENT local.
+BEZEL_TEST(sema_null_narrow, uncaptured_local_keeps_narrowing_across_call_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Touch() end Touch; "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var other: string? := \"x\"; "
+        "    var f := () => do other := null; end; "
+        "    if s <> null then "
+        "      Touch(); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): straight-line check-then-use is preserved. Even for a mutably-
+// captured local, if there is no control-transfer operation BETWEEN the test and
+// the use, the narrowing holds — this must be ACCEPTED.
+BEZEL_TEST(sema_null_narrow, straight_line_use_of_captured_local_accepted_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): a use that PRECEDES the call is accepted — a call's arguments are
+// evaluated before control transfers, so a read before the invocation is under
+// the still-valid narrowing.
+BEZEL_TEST(sema_null_narrow, use_before_call_of_captured_local_accepted_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Sink(n: int) end Sink; "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      Sink(s.Length); "
+        "      f(); "
+        "    end; "
+        "    return 0; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1566): NO over-invalidation from shadowing. A lambda whose OWN parameter
+// shadows the outer name assigns only its parameter, not the outer local — so the
+// outer local is not mutably captured and its narrowing survives a call.
+BEZEL_TEST(sema_null_narrow, lambda_param_shadow_does_not_invalidate_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Run(): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := (s: string?) => do s := null; end; "
+        "    if s <> null then "
+        "      f(s); "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

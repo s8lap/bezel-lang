@@ -3165,6 +3165,220 @@ const std::vector<Symbol*>* ExprTC::paramSymbolsOf(const ast::Member& m) const {
     return nullptr;
 }
 
+namespace {
+
+// §7.4 (v0.182, #1566): syntactic scan collecting the names of enclosing-scope
+// locals/parameters that are mutated — assigned, or passed `ref`/`out` — inside
+// any lambda in a method body. The spec's mutably-captured rule is deliberately
+// conservative: any lambda in the body counts, whether or not it escapes, so no
+// escape or reachability analysis is needed. A lambda's own parameters shadow an
+// outer name for the whole lambda body, so they are excluded (a stack of active
+// lambda-parameter names). Lambda-local `var`s are NOT excluded — over-recording
+// is the sound direction (it can only invalidate a narrowing the spec would also
+// drop) and precise block-scope tracking of lambda locals is unnecessary here.
+struct MutablyCapturedScan {
+    explicit MutablyCapturedScan(std::unordered_set<std::string_view>& o)
+        : out(o) {}
+    std::unordered_set<std::string_view>& out;
+    int lambdaDepth = 0;
+    std::vector<std::string_view> shadowed;  // active lambda-parameter names
+
+    bool isShadowed(std::string_view n) const {
+        for (auto s : shadowed)
+            if (s == n) return true;
+        return false;
+    }
+    // Record a bare-identifier mutation target when inside a lambda and the name
+    // is not one of the enclosing lambdas' parameters.
+    void recordTarget(const ast::Expr* target) {
+        if (lambdaDepth == 0 || !target) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+            if (id->name.empty() || id->name == "_" || id->name == "this" ||
+                id->name == "base")
+                return;
+            if (!isShadowed(id->name)) out.insert(id->name);
+        }
+    }
+    void argList(const std::vector<ast::CallArgument>& as) {
+        for (const auto& a : as) {
+            // `ref` / `out` / `out owned` mutate an EXISTING variable → capture.
+            // The `out var` / `out using var` / `out owned var` forms declare a
+            // FRESH local (not a capture of an outer var), so they don't record.
+            if (a.modifier == "ref" || a.modifier == "out" ||
+                a.modifier == "out owned")
+                recordTarget(a.value.get());
+            if (a.value) expr(a.value.get());
+        }
+    }
+    void body(const std::vector<std::unique_ptr<ast::Stmt>>& b) {
+        for (const auto& s : b) stmt(s.get());
+    }
+    void expr(const ast::Expr* e);
+    void stmt(const ast::Stmt* s);
+};
+
+void MutablyCapturedScan::expr(const ast::Expr* e) {
+    if (!e) return;
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+        std::size_t mark = shadowed.size();
+        for (const auto& p : lam->params)
+            if (!p.name.empty()) shadowed.push_back(p.name);
+        ++lambdaDepth;
+        if (lam->exprBody) expr(lam->exprBody.get());
+        body(lam->stmts);
+        --lambdaDepth;
+        shadowed.resize(mark);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        expr(be->left.get());
+        expr(be->right.get());
+    } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        expr(ue->operand.get());
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        expr(ma->target.get());
+    } else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        expr(nm->target.get());
+    } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        expr(ce->callee.get());
+        argList(ce->args);
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        expr(nc->callee.get());
+        argList(nc->args);
+    } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        expr(ix->target.get());
+        argList(ix->indices);
+    } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        expr(pb->operand.get());
+    } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        argList(ne->args);
+    } else if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        expr(tt->operand.get());
+    } else if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        expr(co->thenValue.get());
+        expr(co->condition.get());
+        expr(co->elseValue.get());
+    } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        expr(th->operand.get());
+    } else if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+        expr(rg->lo.get());
+        expr(rg->hi.get());
+        expr(rg->step.get());
+    } else if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        expr(we->source.get());
+        for (const auto& ia : we->assigns) expr(ia.value.get());
+    } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys) expr(k.get());
+        for (const auto& v : cl->elements) expr(v.get());
+    } else if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& part : is->parts)
+            if (part.expr) expr(part.expr.get());
+    } else if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+        expr(cx->scrutinee.get());
+        for (const auto& arm : cx->arms) {
+            expr(arm.guard.get());
+            if (arm.exprBody) expr(arm.exprBody.get());
+            body(arm.stmts);
+        }
+    }
+    // Leaf / type-only exprs (identifiers, literals, typeof/nameof/default,
+    // unit) hold no sub-expression that can contain a lambda; nothing to do.
+}
+
+void MutablyCapturedScan::stmt(const ast::Stmt* s) {
+    if (!s) return;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+        expr(ld->initializer.get());
+    } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+        expr(lc->value.get());
+    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        expr(rs->value.get());
+    } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+        expr(es->expr.get());
+    } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+        recordTarget(as->target.get());  // `x := …` inside a lambda captures x
+        expr(as->target.get());
+        expr(as->value.get());
+    } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+        expr(ts->value.get());
+    } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+        expr(ifs->ifBranch.condition.get());
+        body(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches) {
+            expr(el.condition.get());
+            body(el.body);
+        }
+        body(ifs->elseBody);
+    } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        expr(ws->condition.get());
+        body(ws->body);
+    } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        expr(fs->iterable.get());
+        expr(fs->withExpr.get());
+        body(fs->body);
+    } else if (auto* de = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        body(de->body);
+    } else if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+        recordTarget(inc->target.get());  // `x++` / `x--` inside a lambda mutates x
+        expr(inc->target.get());
+    } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+        expr(ds->value.get());
+    } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+        expr(ys->value.get());
+    } else if (auto* trys = dynamic_cast<const ast::TryStmt*>(s)) {
+        body(trys->body);
+        for (const auto& c : trys->catches) {
+            expr(c.guard.get());
+            stmt(c.body.get());
+        }
+        body(trys->finallyBody);
+    } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        expr(cs->scrutinee.get());
+        for (const auto& arm : cs->arms) {
+            expr(arm.guard.get());
+            if (arm.exprBody) expr(arm.exprBody.get());
+            body(arm.stmts);
+        }
+    }
+    // BreakStmt / ContinueStmt carry no sub-nodes.
+}
+
+}  // namespace
+
+// §7.4 (v0.182, #1566): recompute the mutably-captured-name set for a body.
+void ExprTC::computeMutablyCaptured(
+    const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+    const ast::Expr* exprBody) {
+    mutablyCapturedNames_.clear();
+    MutablyCapturedScan scan{mutablyCapturedNames_};
+    if (exprBody) scan.expr(exprBody);
+    if (stmts) scan.body(*stmts);
+}
+
+// §7.4 (v0.182, #1566): drop the null-narrowing (and any §12.7 type-narrowing)
+// of every currently-narrowed local whose name is mutably captured. The narrowed
+// symbol is a local/parameter; a same-named write inside a lambda of this body
+// means a closure invoked by the control-transfer operation just executed could
+// have nulled it (the field paragraph's "a closure invoked in between"). No-op
+// when nothing is captured or nothing is narrowed.
+void ExprTC::invalidateCapturedNarrowings() {
+    if (mutablyCapturedNames_.empty()) return;
+    for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+        Symbol* s = *it;
+        if (s && mutablyCapturedNames_.count(s->name))
+            it = nullNarrowed_.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+        Symbol* s = it->first;
+        if (s && mutablyCapturedNames_.count(s->name))
+            it = narrowings_.erase(it);
+        else
+            ++it;
+    }
+}
+
 // Build a method scope (params on top of module scope), then visit
 // body. Locals are registered into this scope as visitStmt walks
 // LocalDecls.
@@ -3192,6 +3406,10 @@ void ExprTC::runMethodBody(
     narrowings_.clear();
     // §7.4 (issue #418): nullability narrowing is likewise method-local.
     nullNarrowed_.clear();
+    // §7.4 (v0.182, #1566): precompute which locals/params are mutably captured
+    // by a lambda anywhere in THIS body, so a control-transfer operation inside a
+    // controlled block can invalidate their narrowing (invalidateCapturedNarrowings).
+    computeMutablyCaptured(stmts, exprBody);
     // §22.5 (issue #1160): a default-value expression may read parameters
     // appearing EARLIER in the same parameter list; a reference to the
     // parameter itself or to a LATER one is a forward reference that would read
