@@ -177,7 +177,10 @@ BEZEL_TEST(move_bare_field_restoration_825, bare_local_move_unaffected) {
 // (move-and-restore with an intervening use of the moved-out value).
 BEZEL_TEST(move_bare_field_restoration_825, bare_rotate_pattern_accepted) {
     auto r = parseAndCheckOwnership(withField(
-        "class Logfile2 "
+        // per §13.3/§11.6 (v0.181, #1558): a nested type requires explicit
+        // visibility — Logfile2 is nested in Holder (withField wraps `method`
+        // inside class Holder), so `public` is now mandatory.
+        "public class Logfile2 "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end Logfile2; "
