@@ -2,6 +2,8 @@
 
 All grounding claims verified against current main (spec headings, grammar lines, checker symbols, §24/§30.11 text, `scoped` keyword availability). Composing the memo.
 
+> **Status: superseded.** Landed as spec §28.14 (v0.175, `scoped` parameters + storage-bounded capture) with the v0.177 call-bounded-default tightening; tracked residue #1432/#1425/#1427. Retained for the design record.
+
 # Capture mechanism recommendation (#808)
 
 Two independent designs for the deferred-callback capture mechanism were adversarially compared: **A** ("storage-bounded capture", lifetime-through-storage bias) and **B** ("anchored capture", declared-capability bias). Both propose the same surface — a `scoped` modifier on function-typed parameters plus a `scoped` field qualifier — and converge on nearly identical checker machinery. They differ in the *bounding-object rule*, the *trust posture* for quiescence, and the *migration story*. All factual claims below were re-verified against current main (spec v0.156-line numbering, `src/ownership/*`).
