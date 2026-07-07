@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.182 — July 2026**
+**Version 0.183 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -127,9 +127,9 @@ Multiple files with identical `module` declarations belong to the same module. F
 import System.Collections.Generic;
 ```
 
-`import` makes the public names of the named module visible in the current file. Imports are file-scoped: an import in one file has no effect on other files in the same module.
+`import` makes the public names of the named module visible in the current file. Imports are file-scoped: an import in one file has no effect on other files in the same module. Public `extern` methods ([§32](#sec-foreign-function-interface)) are **not** among the bare names an import makes visible: they are reachable only through a qualifier — the module name or an alias ([§32.2](#sec-scoping), v0.183, stated explicitly).
 
-**Aliases (v0.164).** An import may bind a file-scoped alias: `import BankingApp.Transactions as Tx;` — thereafter `Tx.Ledger` names that module's public `Ledger`. The alias is an additional *qualifier*, not a rename: the module's publics are still visible by bare name (subject to the collision rule below), and the full dotted module name also remains usable as a qualifier (`BankingApp.Transactions.Ledger`). An alias may not collide with another alias, an imported module's name segment in qualifier position, or a type declared in the file's module.
+**Aliases (v0.164).** An import may bind a file-scoped alias: `import BankingApp.Transactions as Tx;` — thereafter `Tx.Ledger` names that module's public `Ledger`. The alias is an additional *qualifier*, not a rename: the module's publics are still visible by bare name (subject to the collision rule below), and the full dotted module name also remains usable as a qualifier (`BankingApp.Transactions.Ledger`). An alias may not collide with another alias, an imported module's name segment in qualifier position, a type declared in the file's module, or an **unambiguously imported public bare name** (v0.183, #1515): [§2.7](#sec-name-resolution-order) rule 1 resolves imported bare names before aliases with no backtracking, so a same-named alias would be unreachable in every chain-head position — the collision is an error at the alias declaration rather than a silently dead alias.
 
 **Collisions (v0.164).** When two imported modules export the same public name, the **bare** name is ambiguous: using it unqualified is a compile error citing both origins; the fix is qualification (full module name or alias). Imports never shadow one another, and import order is immaterial. A declaration in the *current module* shadows any same-named import for bare-name purposes (the import stays reachable by qualifier) — the same shadowing already specified for auto-imported names ([§2.3](#sec-always-available-names)).
 
@@ -615,7 +615,7 @@ if user <> null then
 end;
 ```
 
-Narrowing also applies after early return, after `is not null`, and inside the controlled block of a successful `is` test ([§12.7](#sec-type-tests-is-is-not-as)).
+Narrowing also applies after early return, after `is not null`, inside the controlled block of a successful `is` test ([§12.7](#sec-type-tests-is-is-not-as)), and — for an `out` recipient — in the region where a call's `bool` result is known to equal the callee's declared nullability postcondition ([§22.4](#sec-out-nullability-postcondition), v0.183).
 
 **How narrowing is established (v0.182 — the enumeration was previously incomplete against the implementation).** Narrowing is flow-sensitive: at each program point the compiler tracks, per local, whether its value is known non-null. The knowledge is established by:
 
@@ -813,7 +813,7 @@ For classes, `=` always invokes `Equals`. Operator overloading of `=` and `<>` i
 - For classes: the type's qualified name.
 - For positional records: a representation of fields, e.g. `"Point(X: 10, Y: 20)"`.
 - For body records that satisfy the auto-equality conditions ([§9.2](#sec-body-records) — only auto-properties, no manually-declared `Equals` or `GetHashCode`): a representation of auto-properties, formatted as `"TypeName(Prop1: value1, Prop2: value2)"`. Auto-`ToString` accompanies the auto-equality members, with one asymmetry (v0.158): an `override ToString` replaces only the formatting — the record keeps auto-`Equals`/`GetHashCode`/`=` — while an `Equals`/`GetHashCode` override disqualifies the whole package ([§9.2](#sec-body-records)). This matches the analogous design in C# records and lets `Console.WriteLine(person)` produce useful output for auto-equality records without ceremony.
-- For body records that do not satisfy auto-equality conditions, and for enums: the type's qualified name.
+- For body records that do not satisfy auto-equality conditions, and for enums: the type's qualified name. An enum may replace its default by declaring a plain `ToString(): string` member ([§10.5](#sec-restrictions), v0.183); the replacement is used by every consumer, including interpolation and boxed dispatch.
 - For inline arrays (all forms, including move-only `[N owned]…` arrays, whose receiver is borrowed for the call) and for the unit type: the type's name — `"[3]int"`-style for an inline array, `"()"` for unit (v0.182 — previously unstated; element-listing output is deliberately not synthesized, since an inline array's elements may be class-typed borrows whose formatting is not the container's business).
 
 <a id="sec-boxing"></a>
@@ -1210,7 +1210,7 @@ The underlying type must be one of `byte`, `sbyte`, `short`, `ushort`, `int`, `u
 <a id="sec-methods-properties-static-members"></a>
 ### 10.4 Methods, properties, static members
 
-An enum may declare instance methods, expression-bodied read-only properties, static methods, static read-only fields (including `static owned readonly`, v0.181), and `const` members:
+An enum may declare instance methods, expression-bodied read-only properties, static methods, static read-only fields (including `static owned readonly`, v0.181), `const` members, and operator overloads ([§25](#sec-operator-overloading); grammar A.3 — v0.183, #1381):
 
 ```bezel
 enum Priority
@@ -1258,6 +1258,8 @@ An enum may not declare:
 - Inheritance from another type.
 
 Enum methods may not be declared `virtual`, `abstract`, `override`, or `sealed override`. Enums are implicitly sealed (no inheritance) and have no virtual-dispatch surface, so these modifiers carry no meaning on enum members and are rejected at compile time. Enum methods are always dispatched statically.
+
+Static dispatch does not orphan the `Object`-virtual surface (v0.183). An enum may declare, as plain (non-`override`) members, `Equals` taking the enum's own type (as [§25.2](#sec-operator-overloading-restrictions)'s co-declaration rule already requires alongside an `=` overload), `GetHashCode(): int`, and `ToString(): string`. Each **replaces the compiler-generated default for every consumer**: direct calls, hash containers (`Set<E>` and `Dictionary<E, V>` reach the user's `Equals`/`GetHashCode`), string interpolation ([§8.5](#sec-tostring)), and virtual dispatch through a boxed reference ([§8.6](#sec-boxing)) — the compiler populates the enum's box vtable with these members, a static wiring that is well-defined because enums are sealed. There is no override chain and no `base` access; the user member simply *is* the enum's implementation of that surface.
 
 An enum may implement one or more interfaces. The interface names appear after the underlying type (if any) following a colon. The enum must provide matching public members for every interface member:
 
@@ -2411,20 +2413,11 @@ The same termination rule applies to overflow of `T`'s representable range, even
 <a id="sec-iteration-over-rangechar"></a>
 #### Iteration over `Range<char>`
 
-For `T = char`, the validity of `T`'s range is itself non-contiguous: code points U+D800 through U+DFFF are surrogate code points and not valid `char` values ([§4.5](#sec-char)). `char` ranges follow the same termination rule as for numeric overflow — iteration stops when the next computed code point would be invalid.
+For `T = char`, the validity of `T`'s range is itself non-contiguous: code points U+D800 through U+DFFF are surrogate code points and not valid `char` values ([§4.5](#sec-char)). Iteration **steps across the gap** (v0.183, revising the v0.78 terminate-at-the-boundary rule): the successor of U+D7FF is U+E000 and the predecessor of U+E000 is U+D7FF; the surrogate block is simply not part of `char`'s value sequence.
 
-Concretely: a range from `'\u0000'` upward (whether closed at U+10FFFF, open-ended, or stepping to a value past U+D7FF) yields code points U+0000 through U+D7FF, then terminates. The surrogate range U+D800 through U+DFFF is not skipped over; iteration treats the surrogate boundary as the effective upper edge of `char`'s lower segment. Code that wants to iterate the full Unicode code point range, with the surrogate gap treated as a no-op, must iterate two ranges:
+Concretely: `'\u0000'..'\U0010FFFF'` yields every valid `char` — U+0000 through U+D7FF, then U+E000 through U+10FFFF; a descending range yields the same values in reverse. A stride of k is defined as k applications of the successor (or, descending, the predecessor) function, so a stepped range continues across the gap instead of stopping at it: `'\uD7F0'..'\uE010' step 4` yields U+D7F0, U+D7F4, U+D7F8, U+D7FC, then U+E000 (the fourth successor of U+D7FC), then U+E004, U+E008, U+E00C, U+E010. No surrogate is ever yielded and no exception is raised. Overflow of `char`'s outer bounds (below U+0000, above U+10FFFF) remains the silent termination condition, exactly as for the integer types. *(Through v0.182, iteration instead terminated at the surrogate boundary — a rule that silently truncated `'\u0000'..'\U0010FFFF'` to the lower ~55 K of the ~1.1 M valid code points and required a documented two-loop workaround. Both rules yield only valid `char` values, which was the recorded v0.78 reason; skipping additionally restores the natural reading that a forward range visits every valid value inside its extent — Rust's `char`-stepping precedent.)*
 
-```bezel
-for var c in '\u0000'..'\uD7FF' do Process(c); end;
-for var c in '\uE000'..'\U0010FFFF' do Process(c); end;
-```
-
-A range whose `Start` is U+E000 or higher iterates that upper segment without surrogate concerns; the surrogate-boundary rule applies only when iteration would cross from U+D7FF to U+D800. A descending range starting at U+10FFFF yields code points down through U+E000 and terminates when the next computed value would be U+DFFF.
-
-Step strides that would land within the surrogate range terminate at the same boundary. `'\uD7F0'..'\uE010' step 4` yields U+D7F0, U+D7F4, U+D7F8, U+D7FC, then would compute U+D800 — a surrogate — and terminates. No `InvalidOperationException` is raised; the surrogate boundary is iteration termination, not an error.
-
-Surrogate code points themselves cannot be written as `char` literals — `'\uD800'` and similar escapes are compile errors per [§18.3](#sec-character-literals) and [§18.8](#sec-escape-sequences-non-verbatim), and `char(0xD800)` raises `OverflowException` at runtime per [§5.2](#sec-explicit-conversions). Range endpoints, however, are integer-valued at construction; a `Range<char>` constructed from the integer endpoints by other means (e.g. by deserialization from a saved value) is bounded by `char`'s validity contract regardless of how the endpoints were spelled. The `Contains` operation uses the normative membership formula of [§16.3](#sec-range-operations) (below) and does not exclude surrogates from the within-extent test of a nonempty range — for a range `r` whose integer extent covers U+D800, the integer-level membership test for U+D800 returns `true`, but iteration of `r` will not yield that value. The asymmetry is deliberate: `Contains` answers a mathematical question about the range's extent, while iteration produces a sequence of valid `char` values.
+Surrogate code points themselves cannot be written as `char` literals — `'\uD800'` and similar escapes are compile errors per [§18.3](#sec-character-literals) and [§18.8](#sec-escape-sequences-non-verbatim), and `char(0xD800)` raises `OverflowException` at runtime per [§5.2](#sec-explicit-conversions). Range endpoints, however, are integer-valued at construction; a `Range<char>` constructed from the integer endpoints by other means (e.g. by deserialization from a saved value) is bounded by `char`'s validity contract regardless of how the endpoints were spelled. The `Contains` operation uses the normative membership formula of [§16.3](#sec-range-operations) (below) and does not exclude surrogates from the within-extent test of a nonempty range — for a range `r` whose integer extent covers U+D800, the integer-level membership test for U+D800 returns `true`, though iteration of `r` never yields it — U+D800 is not a `char` value. With gap-skipping iteration (v0.183) the asymmetry is confined to the surrogate block itself: iteration yields exactly the valid `char` values within the extent that `Contains` describes.
 
 `IsOpenEnded` is `true` when `Start` is `null` or `End` is `null`.
 
@@ -2625,6 +2618,8 @@ var hasChar := 'a' in "abcdef";
 ```
 
 `in` produces `bool`. If the left operand is nullable, it must be checked before use. `in` cannot be overloaded directly; types customize membership by providing `Contains`.
+
+Negated membership is written `not (x in c)` — the parentheses are required because unary `not` binds tighter than the relational `in` ([§17.1.1](#sec-precedence)), so `not x in c` parses as `(not x) in c`, a type error for a non-`bool` `x`. A two-token `not in` operator paralleling `is not` is **deliberately not provided** (v0.183, recorded decline): `in` desugars to a plain `bool`-returning `Contains` call, so negation composes with nothing lost but one pair of parentheses, and admitting `x not in c` would only half-serve the habit it targets — `not x in c` would still parse the other way. `is not` earns its two-token spelling as the negation of a type-classifying operator with narrowing semantics of its own ([§12.7](#sec-type-tests-is-is-not-as)); membership has no such semantics to protect.
 
 The `Contains` lookup is structural rather than interface-based: any accessible method named `Contains` taking one parameter of compatible type and returning `bool` qualifies, whether it is an instance member or an extension method ([§26](#sec-extension-blocks)). This is the only structural-dispatch rule in Bezel's expression surface (the iteration protocol of [§29.1](#sec-the-protocol) is interface-based by contrast; the user-defined collection-literal protocol of [§15.4.1](#sec-the-user-defined-sequence-literal-protocol) is name-based — it requires a method of one *exact* name, not any method of a matching shape, so it is recognition-by-declared-name rather than structural duck-typing). The structural form was chosen here because `Contains` predates `in` in many existing types — including `string`, `Range<T>`, `Array<T>`, `Set<T>`, and `Dictionary<K, V>` — and forcing them all through a common `IContainer<T>` interface would add a layer that callers never write or see.
 
@@ -3189,9 +3184,9 @@ Arms are comma-separated. A trailing comma after the last arm is optional.
 
 **Alternatives (v0.167, #1371):** `2 | 3 | 4 | 5` matches any of these. The alternative separator is `|` (grammar: `AltPattern`); the comma means exactly one thing in pattern context — the separator of arms and of positional slots — so no `=>` lookahead is needed to tell them apart. In `1 | 2 => "low", 3 => "high"`, the first arm matches 1 or 2; the second arm matches 3.
 
-In an alternative list, every member must resolve to a **constant** (a literal, an enum constant, or a named `const`); a member that resolves to a *type* is a compile error in a `case` pattern — grouped type tests are written as separate arms. (`catch` arms, whose members are exclusively types, use the same `|` spelling for their multi-type alternatives — [§31.2](#sec-try-catch-finally).)
+In an alternative list, every member must be **binding-free**: a constant (a literal, an enum constant, or a named `const`), a **range pattern**, or a **relational pattern** — ranges and relationals admitted in v0.183; like constants they bind nothing and contribute pure membership tests, so `1..5 | 10 => …` and `< 0 | > 100 => …` are single arms. A member that resolves to a *type* is a compile error in a `case` pattern — grouped type tests are written as separate arms; types alter exhaustiveness and binding analysis, which is exactly what the recorded constants-only reasoning targeted (rationale §3.8). Range and relational alternative members do not contribute to static exhaustiveness proofs ([§19.6](#sec-exhaustiveness) counts declared constants, not extents), and an alternative list binds nothing regardless of member kind. (`catch` arms, whose members are exclusively types, use the same `|` spelling for their multi-type alternatives — [§31.2](#sec-try-catch-finally).)
 
-Because the alternative separator no longer collides with the slot separator, alternatives are available **per slot** inside a positional destructuring pattern: `TwoColor(Color.Red | Color.Blue, var x)` is a two-slot pattern whose first position matches either color. Alternative members are constants per the rule above, so a binding (`var c`) cannot appear inside an alternative list.
+Because the alternative separator no longer collides with the slot separator, alternatives are available **per slot** inside a positional destructuring pattern: `TwoColor(Color.Red | Color.Blue, var x)` is a two-slot pattern whose first position matches either color. Alternative members are binding-free per the rule above, so a binding (`var c`) cannot appear inside an alternative list (constants, ranges, and relationals can — v0.183).
 
 **No collision with bitwise-or (normative note).** `|` is the bitwise-or operator in expressions, but the expression positions embedded in patterns — a relational pattern's operand and a range pattern's bounds — parse at the Shift level or tighter, *below* `|`, so a `|` at pattern level is always the alternative separator. A scrutinee-level `|` belongs to the scrutinee expression (delimited by `of`, [§19.1](#sec-forms)); the [§17.1.1](#sec-precedence) mandatory-parenthesization discipline covers any residual mixed reading.
 
@@ -3549,6 +3544,21 @@ factory.TryCreate(config, out using var conn);
 
 When a method parameter is declared `out owned`, the callee produces an owned value through the output parameter, and the caller's call-site syntax must reflect this. The accepted forms at the call site of an `out owned` parameter are `out using var x` (a scope-bound owned local) and `out owned var x` (an owned local with the standard owned-local discharge rules applying); both produce an owned location for the callee to write through. Plain `out var x` is **not** accepted at the call site of an `out owned` parameter — the resulting value's ownership would have nowhere to go. The full call-site / parameter-modifier compatibility rules are given in [§22.6](#sec-overloading).
 
+<a id="sec-out-nullability-postcondition"></a>
+#### Nullability postcondition on `out` parameters (v0.183)
+
+A `bool`-returning method may declare, on an `out` (or `out owned`) parameter of nullable type, the clause **`when true`** (or **`when false`**) after the parameter's type:
+
+```bezel
+public method TryGetCached(name: string, out conn: Connection? when true): bool;
+```
+
+The clause is a **compiler-checked postcondition**: on every path of the declaring body that returns the stated constant, the value assigned to the parameter must be provably non-null at the return ([§7](#sec-nullability)'s narrowing rules apply inside the callee); a violating path is a compile error in the declaring body. Paths returning the other constant carry no obligation (they typically assign `null`).
+
+At the call site, the compiler narrows the `out` recipient exactly as if the caller had performed an explicit null test: in any region where the call's `bool` result is statically known to equal the stated constant — the controlled branch of `if TryX(…, out var c) then`, an `and`-conjunct, an early-exit guard — the recipient is treated as non-null, so [§22.6](#sec-practical-pattern)'s `c!` becomes plain `c`. The narrowing is invalidated by the standard rules of [§7.4](#sec-member-access-on-nullable-values). The clause is admitted **only** on `out`/`out owned` parameters of nullable type in `bool`-returning methods; anywhere else it is a compile error. It is part of the method's contract like the other parameter modifiers — an override must repeat it ([§12](#sec-inheritance-and-dispatch)'s modifier-match rule) — and it does not create a distinct overload.
+
+This lands the flow-narrowing revision that [§22.6](#sec-practical-pattern) and the stdlib's Try convention (stdlib §1) previously deferred. The design is a *declared, checked* contract, not a structural inference over every `bool`-plus-nullable-out method: an undeclared method keeps requiring the explicit `!`, so no signature silently gains a postcondition its body was never checked against. (Bezel deliberately has no attribute system; this is a compiler-recognized declaration clause in the sense of rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)'s narrow-modifier escape hatch, like `serialized`.)
+
 <a id="sec-optional-parameters-and-named-arguments"></a>
 ### 22.5 Optional parameters and named arguments
 
@@ -3635,20 +3645,20 @@ The common use is a pair of "try" methods exposing borrow and take forms under *
 ```bezel
 public class ConnectionPool  // declaration sketch; method bodies elided
   // Borrow a cached connection; the pool retains ownership.
-  public method TryGetCached(name: string, out conn: Connection?): bool;
+  public method TryGetCached(name: string, out conn: Connection? when true): bool;
 
   // Take a cached connection out of the pool; the caller assumes ownership.
-  public method TryTakeCached(name: string, out owned conn: Connection?): bool;
+  public method TryTakeCached(name: string, out owned conn: Connection? when true): bool;
 end ConnectionPool;
 
 // Caller A: borrows a cached connection (pool retains it)
 if pool.TryGetCached("primary", out var c) then
-  UseConnection(c!);    // c is Connection?; the bool guard tells us non-null
+  UseConnection(c);     // narrowed non-null by the `when true` postcondition (§22.4)
 end;
 
 // Caller B: takes ownership of a cached connection (pool no longer holds it)
 if pool.TryTakeCached("primary", out using var c) then
-  UseConnection(c!);    // c is owned Connection?; disposed at scope end
+  UseConnection(c);     // owned, narrowed non-null; disposed at scope end
 end;
 ```
 
@@ -3659,7 +3669,7 @@ The implementation of the take-form (`TryTakeCached`) uses [§28.8.1](#sec-the-m
 ```bezel
 private owned _cache: OwningDictionary<string, Connection>;
 
-public method TryTakeCached(name: string, out owned conn: Connection?): bool
+public method TryTakeCached(name: string, out owned conn: Connection? when true): bool
   if not _cache.ContainsKey(name) then
     conn := null;
     return false;
@@ -3669,16 +3679,16 @@ public method TryTakeCached(name: string, out owned conn: Connection?): bool
 end TryTakeCached;
 ```
 
-The out parameter is typed `Connection?` (nullable) so that the false-return path can write `null` — `default(Connection)` is a compile error for a non-nullable reference type ([§17.11](#sec-the-default-operator)), and the type system requires every `out` parameter to be assigned on every return path. Callers consume with `out using var` and null-check after the bool guard:
+The out parameter is typed `Connection?` (nullable) so that the false-return path can write `null` — `default(Connection)` is a compile error for a non-nullable reference type ([§17.11](#sec-the-default-operator)), and the type system requires every `out` parameter to be assigned on every return path. Callers consume with `out using var`; the `when true` clause narrows the recipient after the bool guard:
 
 ```bezel
 if pool.TryTakeCached("primary", out using var c) then
-  // c is owned Connection? here — but the bool guard tells us it's non-null
-  UseConnection(c!);    // ! is fine; the API contract guarantees non-null on true return
+  // c is owned Connection? — narrowed non-null here by the `when true` postcondition
+  UseConnection(c);
 end;
 ```
 
-The `!` is the documentation point: the API contract is "true return implies c is non-null," and the caller asserts that explicitly. A future revision that adds *flow-sensitive nullability narrowing across `out` parameters* would let the caller write `UseConnection(c)` without the `!`, but in this version the explicit `!` is required.
+The `when true` clause on the declaration is the documentation point: the API contract — "true return implies `conn` is non-null" — is stated in the signature, checked in the callee's body, and consumed by the caller's flow analysis ([§22.4](#sec-out-nullability-postcondition), v0.183 — landing the flow-narrowing revision earlier versions deferred). Against a `Try` method *without* the clause, the explicit `!` remains required after the bool guard.
 
 The `PopValue` method on `OwningDictionary<K, V>` ([§28.11](#sec-collections-do-not-own-elements), std lib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)) removes the entry and returns ownership of the value. After the call, the pool no longer holds the connection; the `out owned` parameter `conn` carries the obligation to the caller.
 
@@ -4510,7 +4520,7 @@ The following operators are also not overloadable, for various reasons:
 
 When a record overloads `=` and `<>`, the overloaded operators are invoked for `a = b` and `a <> b` directly — they do not delegate to `Equals`. The auto-generated or user-supplied `Equals(Object?)` and `Equals(T)` methods continue to exist; they are reachable via `.Equals(...)` call syntax and are what collections and pattern matching use.
 
-**Co-declaration rule (added in v0.158, compiler-enforced).** A record or enum that overloads `=`/`<>` with **both operands of the declaring type** must also declare `Equals(T)` and `override GetHashCode` — the same discipline, and the same diagnostic style, as [§8.3](#sec-equals-and-gethashcode)'s Equals→GetHashCode pairing. The three surfaces (`=`, `Equals`, hashing) can otherwise silently diverge exactly where it hurts: `a = b` true while a `Set<T>` treats them as distinct. The rule does not force delegation (operator overloads admit heterogeneous operand types, so "the operator is the body of Equals" is ill-defined in general); it forces the author to *state* all three, so a divergence is a visible choice rather than an accident. Heterogeneous-operand overloads (`T = U`) carry no such obligation. (The compiler-intrinsic `IntPtr`/`UIntPtr` operator declarations in stdlib §10 predate and are exempt from the rule.)
+**Co-declaration rule (added in v0.158, compiler-enforced).** A record or enum that overloads `=`/`<>` with **both operands of the declaring type** must also declare `Equals(T)` and `GetHashCode` — on a record, `override GetHashCode`; on an enum, a plain `GetHashCode(): int`, since enum members never carry `override` ([§10.5](#sec-restrictions); v0.183, fixing the spelling this rule previously mandated, which §10.5 rejects on enums) — the same discipline, and the same diagnostic style, as [§8.3](#sec-equals-and-gethashcode)'s Equals→GetHashCode pairing. The three surfaces (`=`, `Equals`, hashing) can otherwise silently diverge exactly where it hurts: `a = b` true while a `Set<T>` treats them as distinct. The rule does not force delegation (operator overloads admit heterogeneous operand types, so "the operator is the body of Equals" is ill-defined in general); it forces the author to *state* all three, so a divergence is a visible choice rather than an accident. Heterogeneous-operand overloads (`T = U`) carry no such obligation. (The compiler-intrinsic `IntPtr`/`UIntPtr` operator declarations in stdlib §10 predate and are exempt from the rule.)
 
 <a id="sec-examples"></a>
 ### 25.3 Examples
@@ -4630,6 +4640,7 @@ What cannot be extended:
 - No fields, auto-properties, constructors, destructors, or `owned` fields.
 - No operator overloads.
 - No indexers.
+- No `static` members (v0.183): a `static` modifier inside an extension block is a compile error. An extension block adds receiver-directed members only; statics resolve against the extended type's own declarations ([§22.12](#sec-static-members)), and admitting extension statics would need its own resolution, merging, and ambiguity story for no recorded need. Write a module-level method or a static class instead.
 - No `virtual`, `override`, `abstract`, or `sealed` — extensions are statically dispatched.
 - Extension members must be declared `public` or `internal` (v0.160); `protected` and `private` are compile errors — an extension block has no declaring class and no inheritance, so [§13.1](#sec-levels)'s definitions for those levels do not apply. The member's effective visibility is the more restrictive of the block's reach and the member's own declaration (mirroring [§11.6](#sec-nested-types)'s nested-type rule).
 - Extension members see only the extended type's public API. From the same module, `internal` members are also visible.
@@ -4637,7 +4648,7 @@ What cannot be extended:
 <a id="sec-generic-extensions"></a>
 ### 26.4 Generic extensions
 
-**Type-parameter binding (v0.160, codifying implemented behavior).** In the extended type's argument positions, each **bare single-segment non-nullable identifier** introduces a fresh block-level type parameter — *always*, shadowing any same-named type in scope (the compiler warns on such shadowing). This is the only implicit type-parameter binding in the language, so the rule is stated exactly: multiple parameters are permitted (`extension Dictionary<K, V>`); a **concrete** instantiation is written with keyword/primitive types, qualified names, or generic instantiations (`extension IEnumerable<int>`, `extension IEnumerable<Array<byte>>`), none of which are bare single-segment identifiers. The alternative — resolving the identifier against scope and only binding when unresolved — is declined: it would let an unrelated type declaration elsewhere silently re-mean an extension block (action at a distance).
+**Type-parameter binding (v0.160, codifying implemented behavior).** In the extended type's argument positions, each **bare single-segment non-nullable identifier** introduces a fresh block-level type parameter — *always*, shadowing any same-named type in scope (the compiler warns on such shadowing). This is the only implicit type-parameter binding in the language, so the rule is stated exactly: multiple parameters are permitted (`extension Dictionary<K, V>`); a **concrete** instantiation is written with keyword/primitive types, qualified names, or generic instantiations (`extension IEnumerable<int>`, `extension IEnumerable<Array<byte>>`), none of which are bare single-segment identifiers. The alternative — resolving the identifier against scope and only binding when unresolved — is declined: it would let an unrelated type declaration elsewhere silently re-mean an extension block (action at a distance). The binding rule applies at **any nesting depth** of the extended type's argument positions (v0.183, codifying implemented behavior): `extension IEnumerable<Array<T>>` binds `T`, and `extension Dictionary<K, Array<V>>` binds `K` and `V`. A **nullable-marked** identifier in an argument position (`extension Array<T?>`) binds nothing and is a compile error naming this rule — only the bare non-nullable identifier introduces a parameter. Nothing is lost by the rejection: a bare `T` already unifies with nullable arguments (`extension Array<T>` applies to `Array<int?>` with `T = int?`); the only capability a `T?` head would add — constraining a block to *only* nullable instantiations — is deferred until a need is recorded.
 
 ```bezel
 extension IEnumerable<T> where T: IComparable<T>
@@ -4670,10 +4681,10 @@ A `where` clause on the block constrains which instantiations of the extended ty
 
 When the compiler encounters `x.Foo(args)`:
 
-1. **Instance members win.** If `x`'s declared type (or any base type) has a matching `Foo`, that is selected.
-2. **Extension members.** If no instance member matches, the compiler searches the current module and all imported modules for extension blocks on `x`'s type, base types, or implemented interfaces. When an extension block is declared on a generic type (e.g. `extension IEnumerable<T>`), the block-level type parameter is inferred from the receiver's type: if `x` has type `Array<int>` and `Array<int>` implements `IEnumerable<int>`, then `T` is inferred as `int`. The inference follows the same unification rules as generic method type inference.
+1. **Instance members win — by name (v0.183).** If `x`'s declared type (or any base type) *declares* any instance member named `Foo` — of any arity, applicability, or accessibility — instance resolution is committed and extension blocks are **never consulted** for that name on that receiver. If the committed instance lookup then fails (no applicable overload, [§22.5](#sec-optional-parameters-and-named-arguments)/[§22.6](#sec-overloading), or the member is inaccessible, [§13.1](#sec-levels)), the call is a compile error citing the instance member(s); it does not fall back to an extension (the diagnostic should note a same-named extension where one exists). Blocking by *name* rather than by applicability or accessibility keeps resolution predictable: whether a call reaches an instance member or an extension never depends on argument types or the caller's access level, so changing an overload's signature or a member's visibility cannot silently re-route a call across the instance/extension boundary.
+2. **Extension members.** If the receiver's type declares no instance member of that name, the compiler searches the current module and all imported modules for extension blocks on `x`'s type, base types, or implemented interfaces, considering only extension members visible at the call site ([§26.3](#sec-extension-blocks-restrictions)'s effective-visibility rule). When an extension block is declared on a generic type (e.g. `extension IEnumerable<T>`), the block-level type parameter is inferred from the receiver's type: if `x` has type `Array<int>` and `Array<int>` implements `IEnumerable<int>`, then `T` is inferred as `int`. The inference follows the same unification rules as generic method type inference.
 3. **Most specific type wins.** Extensions on the most specific type are preferred per the ordering below.
-4. **Ambiguity.** If two equally-specific extensions match, the call is a compile error; the programmer must remove or narrow a conflicting import (no call-site syntax qualifies an extension's defining type — extension blocks are nameless and extensions have no static-invocation form).
+4. **Ambiguity.** If two equally-specific extensions match, the call is a compile error. The remedies are the mechanisms that exist: remove or narrow a conflicting import, or hoist the intended behavior into a module-level helper (a plain method taking the receiver as a parameter) and call that — no call-site syntax qualifies an extension's defining type, because extension blocks are nameless and extensions have no static-invocation form. A first-class extension-disambiguation spelling is deferred, not designed here (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred), v0.183).
 
 Adding a real method to a type silently takes priority over an extension with the same name — by design.
 
@@ -4689,6 +4700,8 @@ For receiver type R, an extension on type E1 is **more specific** than an extens
 3. E1 has more constraints in its `where` clause than E2, and every constraint of E2 is implied by E1's constraints.
 
 If none of the above relations holds in either direction, the extensions are equally specific and rule 4 above produces an ambiguity error.
+
+**What each relation compares (v0.183).** Rule 1's subtype test is evaluated on the **receiver-substituted heads**: each candidate's declared extension head has its block-level type parameters replaced by the arguments inferred from the receiver (step 2 of [§26.5](#sec-resolution)) before the subtype test runs. Rule 2's more-concrete comparison is evaluated on the **declared, pre-substitution heads** — it exists precisely to order `extension IEnumerable<int>` above `extension IEnumerable<T>`, which are indistinguishable after substitution. So for a receiver of type `Array<int>`: `extension Array<T>` (substituted head `Array<int>`) is more specific than `extension IEnumerable<int>` by rule 1, because `Array<int>` is a subtype of `IEnumerable<int>` — even though the latter's declared head is the more concrete-looking spelling; and `extension IEnumerable<int>` is more specific than `extension IEnumerable<T>` by rule 2, as in the example below.
 
 ```bezel
 extension IEnumerable<T>
@@ -4819,7 +4832,11 @@ end;
 
 Inside a value-returning block-bodied lambda, `return` is required on every exit path.
 
-For procedure lambdas, the body is a single expression whose result is discarded:
+**Which block-bodied lambdas return a value (v0.183).** A block-bodied lambda is a **procedure lambda** — its type is `(…) -> ()` — exactly when no path through its body executes a value-carrying `return e;`: its exits are bare `return;` and falling off the end. A body where one path returns a value and another exits without one is a compile error, the same totality rule as for methods. A target type, when present, is checked against this classification — a procedure-bodied lambda does not convert to a value-returning function type, nor the reverse.
+
+**Return-type inference without a target (v0.183).** In a context with no target type, a value-returning block-bodied lambda's return type is inferred only when **every** `return e;` expression in the body has the *same* type; otherwise the lambda is a compile error asking for a target type or an ascribed variable type. The compiler does not unify divergent return types to a common supertype — an inference that silently computed `Animal` from `return dog;` and `return cat;` would make the lambda's type sensitive to distant hierarchy edits; the programmer states the intended type instead (the explicit-over-implicit stance of [§22.6](#sec-implicit-conversion-ranking)). Expression-bodied lambdas need no rule: the body expression's type is the return type, and a body of type `()` makes a procedure lambda.
+
+For procedure lambdas, the body may also be a single expression whose result is discarded:
 ```bezel
 var log := (msg: string) => Console.WriteLine(msg);
 ```
@@ -4835,6 +4852,24 @@ var positives := numbers.Where((x) => x > 0);
 ```
 
 In top-level contexts with no target type (`var f := (x) => x * 2;`), parameter types must be specified.
+
+<a id="sec-lambda-parameter-destructuring"></a>
+#### Lambda-parameter record destructuring (v0.183, #1408)
+
+A lambda parameter may be a positional record **destructuring** in place of an identifier:
+
+```bezel
+var labels := entries.Select((Entry(k, v)) => $"{k}: {v}");
+var positives := points.Where((Point(x, _)) => x > 0);
+```
+
+The form reuses [§19.3](#sec-patterns)'s positional-destructuring spelling with parameter-position restrictions. A destructuring parameter is a **binding form, not a test**, so only irrefutable elements are admitted:
+
+- The head must name a **positional record type**, and it must be *exactly* the parameter's type: when a target type supplies the parameter type, a head naming any other type is a compile error (no subtype test, nothing to fail at runtime); when no target type is available, the head *is* the annotation — `(Entry(k, v)) => …` alone types the parameter as `Entry`.
+- Each slot is a naked identifier binding, a discard `_`, or a nested destructuring meeting the same rules; the slot count must equal the record's positional-field count. Constants, ranges, relationals, type tests, `var`-form bindings, and alternatives are compile errors in parameter position — they are refutable, and a parameter list is not a `case`.
+- The destructuring parameter admits no modifiers (`ref`, `scoped`) and no separate type annotation — the head carries the type.
+
+Semantics are by desugaring: `(Entry(k, v)) => body` behaves exactly as `(p: Entry) => do var k := p.«first field»; var v := p.«second field»; …body… end` — each binding is an ordinary read of the corresponding positional field at body entry, with the standard ownership meaning ([§28.3](#sec-local-variables-ownership-and-borrows)): a copy for value-typed fields, a **borrow** of the argument's field for class-typed fields, a shared reference for runtime-managed fields. Nothing is consumed: the record argument is untouched, the bindings own nothing, and the lambda's function type is unchanged by the spelling (`(Entry) -> R`).
 
 <a id="sec-closures"></a>
 ### 27.5 Closures
@@ -4961,7 +4996,7 @@ record UserId(Value: int);
 record OrderId(Value: int);
 ```
 
-Type aliases may be declared at module level.
+Type aliases may be declared at module level. A module-level alias is always **module-internal** (v0.183): `TypeAliasDecl` admits no visibility keyword (Appendix [A.2](#sec-source-file)), the alias is never among the public names an `import` makes visible ([§2.2](#sec-imports)), and it is not recorded in the artifact's public-interface metadata — an importing module that wants the same shorthand declares its own alias (aliases are free; they create no type). Exportable aliases are deferred (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)).
 
 <a id="sec-generic-type-aliases"></a>
 #### Generic type aliases
@@ -5307,7 +5342,7 @@ The compiler must produce error messages that name the variable, its current own
 - *"Cannot move out of `using var` `x`; `using var` is scope-bound."* (When a `using var` is moved.)
 - *"Cannot consume `x` here: the borrow held by `b` (declared at line N) is still live."* (The consume-site freeze, v0.180.)
 
-These rules ensure that every owned class instance is disposed **exactly once** at runtime and that no owned reference is silently leaked (with drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields), the claim has no carve-outs). Borrow **liveness** is enforced statically for locals, returns, and captures *up to explicit disposal* (v0.180): the consume-site freeze rejects a move, transfer, or reassignment of a borrowed-from binding, and the scope rules reject every escape past the source's scope — but an **explicit `Dispose()`** of a borrowed-from source is deliberately not statically tracked (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)'s recorded trade-off; the one exception is a source frozen by a [§28.14](#sec-scoped-callback-parameters) storage admission, whose disposal *is* statically rejected for the bound's extent): use through a surviving borrow raises `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior unchecked. For *field-held* and *collection-held* borrows ([§28.11](#sec-borrowing-collections)'s store rule), liveness holds up to the caller-side lifetime obligations of the bullets above, backstopped by checked disposal mode.
+These rules ensure that every owned class instance is disposed **exactly once** at runtime and that no owned reference is silently leaked (with drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields), the claim has one recorded carve-out: whole-value reassignment of a **move-only inline array** does not dispose the displaced slots — [§15.3](#sec-move-only-value-types)'s warning-backed manual discipline, deferred with tracking issue #1385). Borrow **liveness** is enforced statically for locals, returns, and captures *up to explicit disposal* (v0.180): the consume-site freeze rejects a move, transfer, or reassignment of a borrowed-from binding, and the scope rules reject every escape past the source's scope — but an **explicit `Dispose()`** of a borrowed-from source is deliberately not statically tracked (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)'s recorded trade-off; the one exception is a source frozen by a [§28.14](#sec-scoped-callback-parameters) storage admission, whose disposal *is* statically rejected for the bound's extent): use through a surviving borrow raises `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior unchecked. For *field-held* and *collection-held* borrows ([§28.11](#sec-borrowing-collections)'s store rule), liveness holds up to the caller-side lifetime obligations of the bullets above, backstopped by checked disposal mode.
 
 <a id="sec-the-destructor"></a>
 ### 28.4 The `destructor`
@@ -5453,7 +5488,7 @@ When a chain originates from a `new` expression — `new StringBuilder().Append(
 <a id="sec-reassigning-owned-fields"></a>
 ### 28.7 Reassigning owned fields and locals — drop-on-overwrite
 
-**Assignment to an owned field or owned local disposes the displaced value (v0.161).** The right-hand side is evaluated first; then, if the previous value is live (non-null and not moved-from — the per-slot tracking [§28.11](#sec-collection-element-ownership)'s indexer-set rule already defines), it is disposed; then the new value is stored. The disposal is null-guarded and dynamic-dispatched, exactly the machinery scope-end disposal already uses. This completes the v0.150–v0.152 affine trajectory: with overwrite covered, the §28.3 claim — *every owned value is disposed exactly once on every path* — holds with no carve-outs. (Through v0.160, overwrite was a plain store with a should-level leak warning — the one place an owned value could be disposed zero times. The original v0.89 justification, "field assignment is a primitive operation with no method body," predates the affine model.)
+**Assignment to an owned field or owned local disposes the displaced value (v0.161).** The right-hand side is evaluated first; then, if the previous value is live (non-null and not moved-from — the per-slot tracking [§28.11](#sec-collection-element-ownership)'s indexer-set rule already defines), it is disposed; then the new value is stored. The disposal is null-guarded and dynamic-dispatched, exactly the machinery scope-end disposal already uses. This completes the v0.150–v0.152 affine trajectory: with overwrite covered, the §28.3 claim — *every owned value is disposed exactly once on every path* — holds with a single recorded carve-out: move-only inline-array *whole-value* reassignment ([§15.3](#sec-move-only-value-types)) remains a plain store whose non-empty slots leak with a warning; drop-on-overwrite for move-only slots is deferred with tracking issue #1385. (Through v0.160, overwrite was a plain store with a should-level leak warning — the one place an owned value could be disposed zero times. The original v0.89 justification, "field assignment is a primitive operation with no method body," predates the affine model.)
 
 ```bezel
 public method Resize(newSize: int)
@@ -7510,7 +7545,7 @@ end;
 
 The block opens with `extern` followed by a string-literal library name, optionally followed by a `convention` clause ([§32.4](#sec-calling-conventions)). The block ends with `end;`. Inside, each method declaration uses ordinary Bezel syntax — visibility, name, parameters, return type — followed by `;`. There is no body and no per-method `end`.
 
-`extern` declarations may be `public` or `internal`, following the rules for module-level declarations. They may not carry `static`, `virtual`, `override`, `abstract`, or `sealed`. They are always module-level — never members of classes.
+`extern` declarations may be `public` or `internal`, following the rules for module-level declarations; omitting the keyword defaults to `internal`, the module-level default ([§13.2](#sec-top-level-types)) (v0.183, stated explicitly). They may not carry `static`, `virtual`, `override`, `abstract`, or `sealed`. They are always module-level — never members of classes.
 
 Empty `extern` blocks are a compile error.
 
@@ -7816,7 +7851,7 @@ Three comment forms ([§1.5](#sec-comments)):
 - `/* ... */` block comment, does not nest.
 - `/// ...` documentation comment.
 
-Documentation comments use XML element syntax. Recognized tags include `<summary>`, `<param>`, `<returns>`, `<exception>`, `<remarks>`, `<example>`, `<see>`, `<seealso>`. The compiler preserves them in output metadata for documentation generators; it does not interpret tag content beyond preservation.
+Documentation comments use XML element syntax. Recognized tags include `<summary>`, `<param>`, `<paramref>`, `<typeparam>`, `<typeparamref>`, `<returns>`, `<exception>`, `<remarks>`, `<example>`, `<see>`, `<seealso>` (`<typeparam>`, `<typeparamref>`, and `<paramref>` added in v0.183 — generic declarations are documented like any other). The compiler preserves them in output metadata for documentation generators; it does not interpret tag content beyond preservation. Unrecognized tags are preserved verbatim in the same metadata: recognition affects only how documentation tooling may render a tag, never compilation.
 
 Documentation comments are meaningful only immediately before a declaration.
 
@@ -7899,7 +7934,9 @@ TopDecl         ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
 TypeAliasDecl   ::= "type" Identifier GenericParams? ":=" Type
                               /* v0.160: was `=` — the alias now binds with the
                                  same `:=` every other binding uses; "all
-                                 bindings introduce with `:=`" is exceptionless. */
+                                 bindings introduce with `:=`" is exceptionless.
+                                 No Visibility alternative: a module-level alias
+                                 is always module-internal (§27.8, v0.183). */
                     GenericConstraints* ";"
 ```
 
@@ -8030,6 +8067,9 @@ Member          ::= FieldDecl | MethodDecl | PropertyDecl | IndexerDecl
                   | OperatorDecl | NestedTypeDecl | ConstDecl
                   | PolymorphicMember
 ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
+                              /* `static` is rejected inside extension blocks
+                                 (§26.3, v0.183); MethodDecl's "static"?
+                                 alternative does not apply here. */
 
 InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer | IfaceEvent
                   | IfaceStaticMethod | IfaceStaticOperator
@@ -8182,6 +8222,15 @@ NestedTypeDecl  ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
 
 ParamList       ::= Param ("," Param)*
 Param           ::= ParamModifiers? Identifier ":" Type (":=" Expression)?
+                    OutNullPostcond?
+OutNullPostcond ::= "when" ("true" | "false")
+                              /* v0.183 (§22.4): admitted only on `out` /
+                                 `out owned` parameters of nullable type in
+                                 bool-returning methods — a checked non-null
+                                 postcondition tied to the stated result. No
+                                 parse ambiguity: out parameters never carry
+                                 defaults (§22.5), so the clause always
+                                 directly follows the Type. */
 ParamModifiers  ::= "ref"
                   | "out" "owned"?
                   | "owned"
@@ -8226,6 +8275,10 @@ ArgExpression   ::= Expression | "_"
 
 EnumMember      ::= MethodDecl | ExpressionPropertyDecl
                   | StaticReadonlyDecl | StaticConstDecl
+                  | OperatorDecl
+                              /* v0.183 (#1381): enums may overload operators
+                                 (§25, §10.4). OperatorDecl is `public static`
+                                 only, as everywhere. */
 ExpressionPropertyDecl ::= Visibility "readonly"? "property" Identifier ":" Type "=>" Expression ";"
                   /* "readonly" is redundant on expression-bodied properties (no setter exists);
                      it is permitted for consistency with block-form property syntax. */
@@ -8583,6 +8636,15 @@ InitAssign      ::= Identifier ":=" Expression
 LambdaExpr      ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody
 LambdaParams    ::= LambdaParam ("," LambdaParam)*
 LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
+                  | LambdaDestructure
+LambdaDestructure ::= QualifiedName "(" LambdaSlot ("," LambdaSlot)* ")"
+LambdaSlot      ::= Identifier | "_" | LambdaDestructure
+                              /* Positional-record destructuring in parameter
+                                 position (§27.4, v0.183, #1408): irrefutable
+                                 binding form only — the head names the
+                                 parameter's exact positional-record type; no
+                                 modifiers, no annotation, no refutable
+                                 pattern elements. */
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
@@ -8605,7 +8667,8 @@ AltPattern      ::= Pattern ("|" Pattern)*
                                  separator, so no `=>` lookahead is needed and
                                  alternatives are available per positional slot
                                  (see PositionalPattern). `|`-joined members must
-                                 be constants (§19.3). `|` never collides with
+                                 be binding-free: constants, ranges, or
+                                 relationals (§19.3, v0.183). `|` never collides with
                                  bitwise-or: pattern-embedded expressions parse
                                  at Shift level or tighter (§19.3). */
 WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"?
