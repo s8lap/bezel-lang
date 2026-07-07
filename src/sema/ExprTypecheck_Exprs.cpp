@@ -4103,6 +4103,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         TypeRef* saveRetTy = currentReturnType_;
         int saveLoop = loopDepth_;
         int saveCatch = catchDepth_;
+        // per §21.5/§31.2 (v0.182, #1578): a lambda is its own callable, so a
+        // `break`/`continue` inside it can only ever target a loop declared
+        // inside that same lambda (mirrors the `loopDepth_` reset above) —
+        // it is never subject to an enclosing method's `finally` boundary.
+        int saveFinallyLoopBoundary = finallyLoopBoundary_;
         // async-readiness 3b (§30.2 / §30.6): the lambda is its own async
         // boundary — `await` inside it is valid iff the lambda is `async`,
         // regardless of the enclosing method's async-ness.
@@ -4122,6 +4127,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentReturnType_ = nullptr;
         loopDepth_ = 0;
         catchDepth_ = 0;
+        finallyLoopBoundary_ = -1;
         if (lam->exprBody) visitExpr(*lam->exprBody);
         for (const auto& s : lam->stmts) if (s) visitStmt(*s);
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async
@@ -4149,6 +4155,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         inLambda_ = saveInLambda;
         loopDepth_ = saveLoop;
         catchDepth_ = saveCatch;
+        finallyLoopBoundary_ = saveFinallyLoopBoundary;
         // §A.7: set the lambda's exprType to a Function TypeRef so
         // that `var f := lam; f(...)` calls type-check correctly and
         // lowerCall can detect it as a function-typed local.

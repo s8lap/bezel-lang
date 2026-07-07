@@ -4706,12 +4706,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "`break` is not allowed outside a loop (§21.5)");
+        } else if (finallyLoopBoundary_ != -1 &&
+                   loopDepth_ <= finallyLoopBoundary_) {
+            // per §21.5/§31.2 (v0.182, #1578): a `break` inside a `finally`
+            // is a compile error when its target loop (the immediately
+            // enclosing loop) encloses the `finally` — it was already open
+            // when the `finally` was entered, so `loopDepth_` here has not
+            // grown past `finallyLoopBoundary_`. A loop opened wholly
+            // inside the `finally` is unaffected (§21.5).
+            ctx_.diagnostics().report(
+                Severity::Error, s.span.begin,
+                "`break` inside a `finally` block may not target a loop "
+                "that encloses the `finally` (§21.5/§31.2)");
         }
     } else if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
         if (loopDepth_ == 0) {
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "`continue` is not allowed outside a loop (§21.5)");
+        } else if (finallyLoopBoundary_ != -1 &&
+                   loopDepth_ <= finallyLoopBoundary_) {
+            // per §21.5/§31.2 (v0.182, #1578): same rule as `break` above.
+            ctx_.diagnostics().report(
+                Severity::Error, s.span.begin,
+                "`continue` inside a `finally` block may not target a loop "
+                "that encloses the `finally` (§21.5/§31.2)");
         }
     } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         // per §21.6 (#1242): a do…end block introduces a lexical scope;
@@ -4757,9 +4776,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         // per §31.2: `return` inside a `finally` block is a compile error.
         // Track finally-body nesting so the ReturnStmt handler can reject it.
+        // per §21.5/§31.2 (v0.182, #1578): also record `loopDepth_` as it
+        // stood at finally-entry, so BreakStmt/ContinueStmt can reject a
+        // jump whose target loop was already open at that point (i.e.
+        // encloses this `finally`). Saved/restored so nested try/finally
+        // (finally-within-finally) each check against their own boundary.
+        int savedFinallyLoopBoundary = finallyLoopBoundary_;
+        finallyLoopBoundary_ = loopDepth_;
         ++finallyDepth_;
         for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
         --finallyDepth_;
+        finallyLoopBoundary_ = savedFinallyLoopBoundary;
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         // §29.9: `yield` is a method-level construct only — `yield return` and
         // `yield break` are both forbidden inside a lambda. Without this the

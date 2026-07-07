@@ -183,6 +183,18 @@ private:
     // Appendix A grammar: "`return` does not appear in `finally` blocks."
     // Tracks finally-block nesting so visitStmt can reject ReturnStmt there.
     int finallyDepth_ = 0;
+    // per §21.5/§31.2 (v0.182, #1578): `loopDepth_` measured at the point
+    // the nearest enclosing `finally` body was entered. A `break`/`continue`
+    // whose target loop (the loop active at `loopDepth_` when the jump is
+    // visited) was already open at that boundary was opened *outside* the
+    // `finally` and therefore encloses it — such a jump would silently
+    // discard an in-flight exception when the `finally` runs during
+    // exception propagation. A target loop opened strictly after the
+    // boundary is wholly inside the `finally` and is unaffected. -1 means
+    // "not currently inside a finally"; also reset across a lambda boundary
+    // (a lambda is its own callable, unaffected by an enclosing method's
+    // `finally` — mirrors the `loopDepth_`/`catchDepth_` reset there).
+    int finallyLoopBoundary_ = -1;
     // Slice S29: true while walking a field/auto-property initializer,
     // for the §22.8 rule that initializers may not observe instance
     // state (`this`, `base`, instance members).
