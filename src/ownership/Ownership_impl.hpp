@@ -342,6 +342,48 @@ private:
 
     void handleAssignment(const ast::AssignmentStmt& as);
 
+    // §15.3 (#1549): a straight-line, program-order pre-pass (mirrors codegen's
+    // MoveOnlyArrayTransferWalker's borrow/transfer classification of an
+    // identifier occurrence, but for diagnostic purposes rather than
+    // disposal-eligibility) that tracks, per move-only inline-array LOCAL
+    // name, which slots are provably moved-from at each point in the body.
+    // At a whole-value reassignment `arr := newValue;` reachable while some
+    // slot is not provably moved-from, emits the §15.3-mandated warning
+    // naming the at-risk slots. Runs before the CFG dataflow, like the other
+    // syntactic pre-passes below (collectCatchBorrows etc.) — it does not
+    // participate in branch-join precision (a conditionally-executed
+    // `move arr[i]` is treated as if it always executes, the same
+    // conservative simplification codegen's walker already makes for
+    // disposal eligibility), so it may under- or over-warn on branchy code;
+    // the mandate is a best-effort warning, not a soundness-critical check
+    // (#1385 tracks the real fix: disposing the displaced slots so nothing
+    // leaks in the first place). // per §15.3
+    void moveOnlyArrayLeakScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void moveOnlyArrayLeakScanStmt(const ast::Stmt* s);
+    void moveOnlyArrayLeakScanExpr(const ast::Expr* e, bool borrow);
+    // `move arr[CONST_I]` with a compile-time-constant index proves slot
+    // CONST_I moved-from; a non-constant index proves nothing (conservative).
+    void moveOnlyArrayNoteSlotMoved(const ast::IndexExpr& ix);
+    // A slot store `arr[CONST_I] := RHS;`: `null` proves the slot empty (no
+    // owned value to leak — same standing as a proven-moved slot); any other
+    // RHS re-populates the slot with a live owned value (at risk again).
+    void moveOnlyArrayNoteSlotStore(const ast::AssignmentStmt& as);
+    // A bare array-local identifier read in a non-borrow (owned-consuming)
+    // position transfers the WHOLE array out of `name` — nothing is left in
+    // this binding to leak, so it drops out of tracking.
+    void moveOnlyArrayNoteWholeTransfer(std::string_view name);
+    // The check point: `arr := newValue;` where `arr` names a move-only
+    // inline-array local. Warns when some slot is provably still live, then
+    // resets tracking to reflect the fresh (fully-populated) RHS value.
+    void moveOnlyArrayCheckReassignment(const ast::AssignmentStmt& as);
+    bool isMoveOnlyInlineArrayType(const sema::TypeRef* rt,
+                                   long long& sizeOut) const;
+    struct MoveOnlyArraySlots {
+        long long size = 0;
+        std::unordered_set<long long> movedSlots;  // provably moved-from
+    };
+    std::unordered_map<std::string, MoveOnlyArraySlots> moveOnlyArrayLive_;
+
     void handleReturn(const ast::Expr& e);
 
     // §28.3 / §28.6 / §5.11 (#1007): reject returning a BORROW through an

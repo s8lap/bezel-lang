@@ -12,6 +12,7 @@
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
+#include "sema/ConstFold.hpp"   // §15.3 (#1549): fold a constant `move arr[i]` index
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
@@ -109,6 +110,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     scopedPreScan(body);
     scopedCalleeScan(body);
     checkTaskScopeConsumption(body);
+    // §15.3 (#1549): the move-only inline-array whole-value-reassignment leak
+    // warning. A syntactic pre-pass like the ones above — see the header
+    // comment on moveOnlyArrayLeakScan for why it runs outside the CFG
+    // dataflow. // per §15.3
+    moveOnlyArrayLeakScan(body);
     // Seed the dataflow entry state with `owned` / `out owned` parameters
     // (slice O10): each enters the method in the Owned state and must
     // reach a discharge point on every normal-exit path (§28.8).
@@ -2283,6 +2289,323 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             }
         }
     }
+}
+
+// §15.3 (#1549): `rt` is a move-only inline array (`[N owned]T` / `[N owned]T?`)
+// with a folded compile-time size. See the header comment on
+// moveOnlyArrayLeakScan for the overall design.
+bool MethodOwnership::isMoveOnlyInlineArrayType(const sema::TypeRef* rt,
+                                                long long& sizeOut) const {
+    if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray || !rt->arrayOwned)
+        return false;
+    if (rt->arraySizeValue < 0) return false;  // size not statically known
+    sizeOut = rt->arraySizeValue;
+    return true;
+}
+
+void MethodOwnership::moveOnlyArrayNoteWholeTransfer(std::string_view name) {
+    moveOnlyArrayLive_.erase(std::string(name));
+}
+
+void MethodOwnership::moveOnlyArrayNoteSlotMoved(const ast::IndexExpr& ix) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix.target.get());
+    if (!id || ix.indices.size() != 1 || !ix.indices[0].value) return;
+    auto it = moveOnlyArrayLive_.find(std::string(id->name));
+    if (it == moveOnlyArrayLive_.end()) return;
+    auto idx = sema::foldIntConst(
+        *ix.indices[0].value,
+        [](std::string_view, int) -> std::optional<long long> {
+            return std::nullopt;
+        });
+    if (!idx || *idx < 0 || *idx >= it->second.size) return;
+    it->second.movedSlots.insert(*idx);
+}
+
+void MethodOwnership::moveOnlyArrayNoteSlotStore(const ast::AssignmentStmt& as) {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
+    if (!ix) return;
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix->target.get());
+    if (!id || ix->indices.size() != 1 || !ix->indices[0].value) return;
+    auto it = moveOnlyArrayLive_.find(std::string(id->name));
+    if (it == moveOnlyArrayLive_.end()) return;
+    auto idx = sema::foldIntConst(
+        *ix->indices[0].value,
+        [](std::string_view, int) -> std::optional<long long> {
+            return std::nullopt;
+        });
+    if (!idx || *idx < 0 || *idx >= it->second.size) return;
+    // §15.3 field-restoration: `arr[i] := null;` empties the slot (nothing to
+    // leak — same standing as a proven-moved slot); any other RHS
+    // re-populates it with a live owned value, at risk again.
+    if (as.value && dynamic_cast<const ast::NullLiteralExpr*>(as.value.get()))
+        it->second.movedSlots.insert(*idx);
+    else
+        it->second.movedSlots.erase(*idx);
+}
+
+void MethodOwnership::moveOnlyArrayCheckReassignment(
+        const ast::AssignmentStmt& as) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+    if (!id) return;
+    long long size = 0;
+    if (!isMoveOnlyInlineArrayType(ctx_.exprType(*as.target), size)) return;
+    const std::string name(id->name);
+    auto it = moveOnlyArrayLive_.find(name);
+    if (it != moveOnlyArrayLive_.end() &&
+        static_cast<long long>(it->second.movedSlots.size()) < it->second.size) {
+        // §15.3: "The compiler emits a warning when reassignment is reachable
+        // from a state where some slot is provably non-moved-from; the
+        // warning identifies the slots at risk and points at the standard
+        // discharge mechanisms."
+        std::string atRisk;
+        for (long long i = 0; i < it->second.size; ++i) {
+            if (it->second.movedSlots.count(i)) continue;
+            if (!atRisk.empty()) atRisk += ", ";
+            atRisk += std::to_string(i);
+        }
+        report(Severity::Warning, as.target->span.begin,
+               std::string("whole-value reassignment of move-only array `") +
+                   name + "` may leak its non-moved-from slot(s) [" + atRisk +
+                   "] — `" + name + " := ...` is a plain store that does not "
+                   "dispose the displaced slots (§15.3); discharge each live "
+                   "slot first via `move " + name + "[i]` followed by "
+                   "`.Dispose()` / `using var` on the taken value (assigning "
+                   "`null` to restore a `[N owned]T?` slot), or hand the "
+                   "whole array to a method declared `(owned V)` that "
+                   "consumes it");
+    }
+    // The RHS supplies a fresh value occupying every slot (a collection
+    // literal or an owned producer always populates all N slots, §15.4) —
+    // track the rebound name as freshly live regardless of whether a warning
+    // fired, mirroring a LocalDecl's fresh binding.
+    moveOnlyArrayLive_[name] = MoveOnlyArraySlots{size, {}};
+}
+
+void MethodOwnership::moveOnlyArrayLeakScanExpr(const ast::Expr* e,
+                                                bool borrow) {
+    if (!e) return;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        // A bare array-local read in a non-borrow (owned-consuming) position
+        // — a plain-binding move-only-value move (§15.3 bullet 1), a return,
+        // a discard, an argument (move-only params always transfer, §15.3
+        // bullet 3) — transfers the whole array out; nothing is left in this
+        // name to leak. Borrow positions (indexing/member-access receiver,
+        // `is`/`as` operand, iteration source) leave the array right where it
+        // is.
+        if (!borrow) moveOnlyArrayNoteWholeTransfer(id->name);
+        return;
+    }
+    if (const auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(ix->target.get(), /*borrow=*/true);
+        for (auto& a : ix->indices) moveOnlyArrayLeakScanExpr(a.value.get(), false);
+        return;
+    }
+    if (const auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(m->target.get(), /*borrow=*/true);
+        return;
+    }
+    if (const auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(m->target.get(), /*borrow=*/true);
+        return;
+    }
+    if (const auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(p->operand.get(), borrow);
+        return;
+    }
+    if (const auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (u->op == "move") {
+            if (const auto* ix2 =
+                    dynamic_cast<const ast::IndexExpr*>(u->operand.get())) {
+                // `move arr[i]` — a slot move; `arr` itself is only borrowed
+                // by the receiver (the whole array is not transferred).
+                moveOnlyArrayNoteSlotMoved(*ix2);
+                moveOnlyArrayLeakScanExpr(ix2->target.get(), /*borrow=*/true);
+                for (auto& a : ix2->indices)
+                    moveOnlyArrayLeakScanExpr(a.value.get(), false);
+            } else {
+                moveOnlyArrayLeakScanExpr(u->operand.get(), /*borrow=*/false);
+            }
+        } else {
+            moveOnlyArrayLeakScanExpr(u->operand.get(), false);
+        }
+        return;
+    }
+    if (const auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(c->callee.get()))
+            moveOnlyArrayLeakScanExpr(ma->target.get(), /*borrow=*/true);
+        else
+            moveOnlyArrayLeakScanExpr(c->callee.get(), false);
+        for (auto& a : c->args) moveOnlyArrayLeakScanExpr(a.value.get(), false);
+        return;
+    }
+    if (const auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(c->callee.get()))
+            moveOnlyArrayLeakScanExpr(ma->target.get(), /*borrow=*/true);
+        else
+            moveOnlyArrayLeakScanExpr(c->callee.get(), false);
+        for (auto& a : c->args) moveOnlyArrayLeakScanExpr(a.value.get(), false);
+        return;
+    }
+    if (const auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(b->left.get(), false);
+        moveOnlyArrayLeakScanExpr(b->right.get(), false);
+        return;
+    }
+    if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(c->condition.get(), false);
+        moveOnlyArrayLeakScanExpr(c->thenValue.get(), borrow);
+        moveOnlyArrayLeakScanExpr(c->elseValue.get(), borrow);
+        return;
+    }
+    if (const auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(t->operand.get(), /*borrow=*/true);
+        return;
+    }
+    if (const auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(t->operand.get(), false);
+        return;
+    }
+    if (const auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (auto& a : n->args) moveOnlyArrayLeakScanExpr(a.value.get(), false);
+        return;
+    }
+    if (const auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(w->source.get(), false);
+        for (auto& a : w->assigns) moveOnlyArrayLeakScanExpr(a.value.get(), false);
+        return;
+    }
+    if (const auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (auto& el : cl->elements) moveOnlyArrayLeakScanExpr(el.get(), false);
+        for (auto& k : cl->keys) moveOnlyArrayLeakScanExpr(k.get(), false);
+        return;
+    }
+    if (const auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (auto& part : is->parts)
+            moveOnlyArrayLeakScanExpr(part.expr.get(), false);
+        return;
+    }
+    if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+        moveOnlyArrayLeakScanExpr(ce->scrutinee.get(), /*borrow=*/true);
+        for (auto& arm : ce->arms) {
+            moveOnlyArrayLeakScanExpr(arm.guard.get(), false);
+            moveOnlyArrayLeakScanExpr(arm.exprBody.get(), borrow);
+            for (auto& s : arm.stmts) moveOnlyArrayLeakScanStmt(s.get());
+        }
+        return;
+    }
+    // LambdaExpr and any other expression kind: §28.9 — a captured move-only
+    // local is always a BORROW (a closure can neither move the whole array,
+    // since the name stays in scope, nor `move arr[i]` through the captured
+    // borrow, which is rejected at typecheck). Nothing reachable only
+    // through a lambda body can transfer or slot-move an outer array, so no
+    // recursion is needed.
+}
+
+void MethodOwnership::moveOnlyArrayLeakScanStmt(const ast::Stmt* s) {
+    if (!s) return;
+    if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+        moveOnlyArrayLeakScanExpr(ld->initializer.get(), false);
+        long long size = 0;
+        const sema::TypeRef* rt = nullptr;
+        if (sema::LocalSymbol* lsym = findLocalSymbol(*ld)) rt = lsym->declType;
+        if (isMoveOnlyInlineArrayType(rt, size))
+            moveOnlyArrayLive_[std::string(ld->name)] =
+                MoveOnlyArraySlots{size, {}};
+        return;
+    }
+    if (const auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+        moveOnlyArrayLeakScanExpr(lc->value.get(), false);
+        return;
+    }
+    if (const auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(r->value.get(), false);
+        return;
+    }
+    if (const auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(es->expr.get(), false);
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(ts->value.get(), false);
+        return;
+    }
+    if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+        if (as->op == ":=" &&
+            dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
+            moveOnlyArrayNoteSlotStore(*as);
+            moveOnlyArrayLeakScanExpr(as->target.get(), /*borrow=*/true);
+        } else if (as->op == ":=" &&
+                   dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
+            // The check point: `arr := newValue;`. Warns (if warranted) and
+            // resets tracking; see moveOnlyArrayCheckReassignment.
+            moveOnlyArrayCheckReassignment(*as);
+        } else {
+            moveOnlyArrayLeakScanExpr(as->target.get(), /*borrow=*/true);
+        }
+        moveOnlyArrayLeakScanExpr(as->value.get(), false);
+        return;
+    }
+    if (const auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(ds->value.get(), false);
+        return;
+    }
+    if (const auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(ys->value.get(), false);
+        return;
+    }
+    if (const auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(is->ifBranch.condition.get(), false);
+        for (auto& b : is->ifBranch.body) moveOnlyArrayLeakScanStmt(b.get());
+        for (auto& br : is->elifBranches) {
+            moveOnlyArrayLeakScanExpr(br.condition.get(), false);
+            for (auto& b : br.body) moveOnlyArrayLeakScanStmt(b.get());
+        }
+        for (auto& b : is->elseBody) moveOnlyArrayLeakScanStmt(b.get());
+        return;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(ws->condition.get(), false);
+        for (auto& b : ws->body) moveOnlyArrayLeakScanStmt(b.get());
+        return;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(fs->iterable.get(), /*borrow=*/true);
+        moveOnlyArrayLeakScanExpr(fs->withExpr.get(), false);
+        for (auto& b : fs->body) moveOnlyArrayLeakScanStmt(b.get());
+        return;
+    }
+    if (const auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        for (auto& b : d->body) moveOnlyArrayLeakScanStmt(b.get());
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        for (auto& b : ts->body) moveOnlyArrayLeakScanStmt(b.get());
+        for (auto& c : ts->catches) {
+            moveOnlyArrayLeakScanExpr(c.guard.get(), false);
+            moveOnlyArrayLeakScanStmt(c.body.get());
+        }
+        for (auto& b : ts->finallyBody) moveOnlyArrayLeakScanStmt(b.get());
+        return;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        moveOnlyArrayLeakScanExpr(cs->scrutinee.get(), /*borrow=*/true);
+        for (auto& arm : cs->arms) {
+            moveOnlyArrayLeakScanExpr(arm.guard.get(), false);
+            moveOnlyArrayLeakScanExpr(arm.exprBody.get(), false);
+            for (auto& a : arm.stmts) moveOnlyArrayLeakScanStmt(a.get());
+        }
+        return;
+    }
+    // IncrementStmt / BreakStmt / ContinueStmt: no sub-expression can hold a
+    // move-only array reference relevant to this check.
+}
+
+void MethodOwnership::moveOnlyArrayLeakScan(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    moveOnlyArrayLive_.clear();
+    for (auto& s : body) moveOnlyArrayLeakScanStmt(s.get());
 }
 
 void MethodOwnership::handleReturn(const ast::Expr& e) {
