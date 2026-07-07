@@ -2325,6 +2325,36 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
         }
     }
+    // per §3.5 (v0.182, #1574): a relational operator (`<`, `<=`, `>`, `>=`)
+    // is not defined on `bool` operands — no ordering of `false`/`true` was
+    // ever defined, the stdlib `Boolean` wrapper deliberately declares no
+    // `IComparable` (§4.1), and admitting one would be truthiness-shaped.
+    // Only `=`/`<>` are valid on bool (handled by the general primitive
+    // equality path below, unaffected by this check). Without this guard the
+    // expression fell through to the generic primitive result-type rule
+    // further down, which types `<`/`<=`/`>`/`>=` as `bool` regardless of
+    // operand type — matching no semantics (`true < false` compiled to
+    // `true`). §7.11's relational-lifting rule excludes `bool?` from lifting
+    // for the identical reason, so checking the primitive kind here (ignoring
+    // nullability) covers a `bool?` operand too.
+    if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+        auto isBool = [](const TypeRef* t) {
+            return t && t->kind == TypeRef::Kind::Primitive &&
+                   t->primitive == PrimitiveType::Bool;
+        };
+        TypeRef* lt = be.left  ? ctx_.exprType(*be.left)  : nullptr;
+        TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        if (isBool(lt) || isBool(rt)) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` is not defined for `bool` "
+                "operands (\xC2\xA7""3.5) — no ordering of `false`/`true` is "
+                "defined; only `=`/`<>` are valid on bool. To order by a flag,"
+                " convert explicitly (`int(b)`).");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+    }
     // §25.1 (#1096): an arithmetic/bitwise/shift operator on a record/class
     // operand requires a matching user-defined overload whose parameters match
     // the operand ORDER (findBinaryOperator enforces the order; Bezel does not
@@ -3078,6 +3108,28 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                     std::string("operator `~` is not valid on ") + badKind +
                     " — the bitwise complement requires an integer operand "
                     "(§6.5)");
+                return;
+            }
+        }
+        // per §3.5 (v0.182, #1574): unary `+` is the identity, defined only
+        // on the numeric primitives (byte…decimal) — "previously grammatical
+        // but undefined... invalid on bool, char, and string." Before this
+        // check, `+boolExpr`/`+charExpr`/`+stringExpr` fell through to the
+        // generic pass-through below (the operand's own type, unchanged),
+        // silently admitting an operator the spec defines nowhere for these
+        // types. Primitive-only; a user type overloading `+` is resolved
+        // earlier via findUnaryOperator and never reaches here.
+        if (op == "+" && ot && ot->kind == TypeRef::Kind::Primitive) {
+            PrimitiveType p = ot->primitive;
+            const char* badKind =
+                (p == PrimitiveType::Bool) ? "`bool`"
+                : (p == PrimitiveType::Char) ? "`char`"
+                : (p == PrimitiveType::String) ? "`string`" : nullptr;
+            if (badKind) {
+                ctx_.diagnostics().report(Severity::Error, ue.span.begin,
+                    std::string("unary operator `+` is not valid on ") +
+                    badKind + " — unary `+` is the identity, defined only on "
+                    "numeric types (§3.5)");
                 return;
             }
         }
