@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.180 — July 2026**
+**Version 0.181 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -157,7 +157,7 @@ Only the primitive value-type keywords and their reserved PascalCase aliases (an
 
 The module is the unit of compilation. The compiler takes all source files belonging to a module, plus its dependencies, and produces a single native artifact:
 
-- An **executable** is a standalone native binary. It requires exactly one `Main` method as defined in [§33](#sec-program-entry-point).
+- An **executable** is a standalone native binary. Its **main module** — the module named as the executable target ([§33.1](#sec-the-main-method)) — must contain exactly one qualifying `Main` method as defined in [§33](#sec-program-entry-point), unless [§33.5](#sec-program-entry-point-resolution)'s `--main-class` disambiguation selects among several.
 - A **library** is a shared native library (`.so`, `.dylib`, or `.dll`). It exposes its `public` types and methods.
 
 <a id="sec-dependency-resolution"></a>
@@ -165,7 +165,7 @@ The module is the unit of compilation. The compiler takes all source files belon
 
 Dependencies are declared through `import` statements. In the acyclic case the compiler resolves each dependency by reading the imported module's compiled artifact, which embeds public-interface metadata (type signatures, method signatures, generic constraints).
 
-**Circular imports compile as one unit (v0.164 — previously this section permitted circularity while also requiring artifact-based resolution, which are jointly impossible: neither of two mutually-importing modules could be compiled first).** Modules whose imports form a cycle constitute a **strongly-connected component**, and an SCC is the unit of compilation: the build supplies the sources of all SCC members to one compiler invocation, which resolves their types against each other directly (no artifacts consumed within the SCC) and still emits one artifact per member module. A build that presents only part of an SCC is an error naming the missing members. Between SCCs, resolution is artifact-based as above; the module dependency graph condensed by SCCs is processed in topological order. Circular *static-initialization* dependencies remain rejected regardless of compilation grouping ([§22.13](#sec-static-initialization-order)).
+**Circular imports compile as one unit (v0.164 — previously this section permitted circularity while also requiring artifact-based resolution, which are jointly impossible: neither of two mutually-importing modules could be compiled first).** Modules whose imports form a cycle constitute a **strongly-connected component**, and an SCC is the unit of compilation: the build supplies the sources of all SCC members to one compiler invocation, which resolves their types against each other directly (no artifacts consumed within the SCC) and still emits one artifact per member module. A build that presents only part of an SCC is an error naming the missing members. Between SCCs, resolution is artifact-based as above; the module dependency graph condensed by SCCs is processed in topological order. Circular *static-initialization* dependencies are checked per [§22.13](#sec-static-initialization-order)'s two-part rule regardless of compilation grouping: the compile-time approximation rejects the cycles it can see, and the runtime re-entrancy backstop converts the rest into `TypeInitializationException` — never silent observation of partially-initialized statics (v0.181; this sentence previously asserted unconditional rejection).
 
 <a id="sec-build-phases"></a>
 ### 2.6 Build phases
@@ -1188,7 +1188,7 @@ The underlying type must be one of `byte`, `sbyte`, `short`, `ushort`, `int`, `u
 <a id="sec-methods-properties-static-members"></a>
 ### 10.4 Methods, properties, static members
 
-An enum may declare instance methods, expression-bodied read-only properties, static methods, and static read-only fields:
+An enum may declare instance methods, expression-bodied read-only properties, static methods, static read-only fields (including `static owned readonly`, v0.181), and `const` members:
 
 ```bezel
 enum Priority
@@ -1220,6 +1220,8 @@ Inside an instance method, `this` refers to the current enum value.
 The `Name` property's `case` lists only the declared constants. If an out-of-range enum value reaches the property — possible when an integer is cast to the enum type via `Priority(int)` and the integer is not one of `0`/`1`/`2` ([§5.4](#sec-enum-casts)) — the case expression raises `MatchFailureException` per the standard non-exhaustive-`case` rule ([§19.6](#sec-exhaustiveness)). Code that needs total coverage over the value space should add a discard arm (`_ => "Unknown"`) or use the integer-checked cast forms.
 
 Static readonly fields on enums are initialized lazily on first use, following the same rules as class static fields ([§22.13](#sec-static-initialization-order)). Enum constants are compile-time values and are available before any static readonly initializer runs; a static readonly field initializer on an enum may freely reference the enum's declared constants.
+
+Enum statics carry the full class-static surface rules (v0.181). A `const` member (grammar A.4 `StaticConstDecl`) follows [§22.12](#sec-static-members)'s class-level `const` rules: implicitly static, compile-time-constant initializer, primitive or `string` type. A static readonly field of class type may be marked `owned` — `public static owned readonly Cache: ConnectionPool := new ConnectionPool();` — enrolling it in [§22.13](#sec-static-initialization-order)'s program-exit disposal; without `owned`, [§22.13](#sec-static-initialization-order)'s resource-bearing-static warning and its add-`owned` remedy apply on enums exactly as on classes. (Before v0.181 the enum grammar had no `owned` slot, which made that remedy unwritable on enums; Appendix A.4 `StaticReadonlyDecl` now carries it.)
 
 <a id="sec-restrictions"></a>
 ### 10.5 Restrictions
@@ -1355,7 +1357,7 @@ A member **matches** an interface member when it is declared `public`, has the s
 1. **Nullability widening on parameters.** An implementation may declare a parameter as `T?` where the interface requires `T` (the implementation accepts more inputs than the interface promises to pass). The reverse — interface `T?`, implementation `T` — is rejected, because the implementation would refuse a `null` the interface promised to accept.
 2. **No widening elsewhere.** Parameter types other than the nullability case must match exactly. Return types must match exactly (no covariance in this version). Parameter modifiers must match exactly: an interface declaring `out T` requires the implementation to declare `out T`, and the same applies to `ref` and `owned`.
 
-The asymmetry on nullability mirrors the standard contravariant-parameter / covariant-return reasoning: implementations may accept more than they were asked to. Bezel admits the parameter-nullability case because it is the common one (most concrete `Equals` implementations want to accept `null` cleanly), and because the type system can verify it without further machinery.
+The asymmetry on nullability mirrors the standard contravariant-parameter / covariant-return reasoning: implementations may accept more than they were asked to. Bezel admits the parameter-nullability case because it is the common one (most concrete `Equals` implementations want to accept `null` cleanly), and because the type system can verify it without further machinery. The same allowance extends to `override` declarations ([§12.1](#sec-members-are-non-virtual-by-default), v0.181).
 
 <a id="sec-owned-in-interface-signatures"></a>
 #### `owned` in interface signatures
@@ -1394,7 +1396,7 @@ A class body may contain fields, methods, properties, indexers, events, construc
 
 Every class member must declare its visibility explicitly ([§13](#sec-visibility)). Interface members do not declare visibility (they are always public).
 
-A type may not declare two members that are not distinguishable from each other. Two members **clash** when they have the same name and the type system cannot tell them apart: two fields, properties, events, or nested types with the same name; or two methods, constructors, or operator overloads with the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)) — that is, that do not differ in number of parameters, parameter types, or the `ref`/`out` modifiers in a participating position. A non-overloadable member — a field, property, event, or nested type — additionally clashes with **any** other member of the type that shares its name, regardless of kind: within a type a given name belongs either to exactly one non-overloadable member or to a single overload family of methods, constructors, or operators. A clash is a compile error at the second declaration, reported at the type, and names the conflicting members. Legal overloads — members of the same name that *are* distinguishable per [§22.6](#sec-overloading) — are unaffected; this rule rejects only the duplicates that overloading does not admit. The same rule applies to interface members within an interface declaration.
+A type may not declare two members that are not distinguishable from each other. Two members **clash** when they have the same name and the type system cannot tell them apart: two fields, properties, events, or nested types with the same name; or two methods, constructors, or operator overloads with the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)) — that is, that do not differ in number of parameters, parameter types, or the `ref`/`out` modifiers in a participating position (`owned` — ordinary or on `out` — and `scoped` never distinguish overloads, [§22.6](#sec-overloading), v0.181). A non-overloadable member — a field, property, event, or nested type — additionally clashes with **any** other member of the type that shares its name, regardless of kind: within a type a given name belongs either to exactly one non-overloadable member or to a single overload family of methods, constructors, or operators. A clash is a compile error at the second declaration, reported at the type, and names the conflicting members. Legal overloads — members of the same name that *are* distinguishable per [§22.6](#sec-overloading) — are unaffected; this rule rejects only the duplicates that overloading does not admit. The same rule applies to interface members within an interface declaration.
 
 <a id="sec-block-endings"></a>
 ### 11.4 Block endings
@@ -1419,7 +1421,7 @@ For events, only `visibility`, `static`, and `async` are applicable. The compile
 <a id="sec-nested-types"></a>
 ### 11.6 Nested types
 
-A class body may declare nested classes, records, enums, and interfaces. Nested types may be `public`, `internal`, `protected`, or `private`. A nested type's effective visibility is the more restrictive of its declared visibility and its enclosing class's visibility.
+A class body may declare nested classes, records, enums, and interfaces. Nested types may be `public`, `internal`, `protected`, or `private`, and the visibility keyword is **required** (v0.181 states it explicitly): a nested type is a class member ([§11.3](#sec-member-body)), and [§13.3](#sec-class-members)'s explicit-visibility rule applies with no exception for nested types — omitting the keyword is a compile error, not a default. (The `Visibility?` in the reused type-declaration grammar productions serves [§13.2](#sec-top-level-types)'s default-`internal` rule for *top-level* declarations only; Appendix A.4 `NestedTypeDecl`.) A nested type's effective visibility is the more restrictive of its declared visibility and its enclosing class's visibility.
 
 ```bezel
 public class Parser
@@ -1446,7 +1448,7 @@ public static class Utils
 end Utils;
 ```
 
-A static class may not be instantiated: `new` on a static class is a compile error. A static class may not have instance fields, instance methods, instance properties, indexers, constructors (other than a static constructor), destructors, or `owned` fields. A static class may not be inherited from and does not implement interfaces.
+A static class may not be instantiated: `new` on a static class is a compile error. A static class may not have instance fields, instance methods, instance properties, indexers, constructors (other than a static constructor), or destructors. **Static `owned` fields are permitted (v0.181, lifting an unrecorded leftover of the v0.55 ban):** `static owned readonly` fields and static owning-inline-array fields participate in [§22.13](#sec-static-initialization-order)'s program-exit disposal exactly as on any other type — that mechanism is runtime-driven and independent of instance `Dispose()`, so the no-instantiation reasoning below never reached it, while the ban forced the canonical resource-holding static ([§11.5](#sec-modifier-order)'s `static owned readonly`) out of the one class kind designed to hold static state. A static class may not be inherited from and does not implement interfaces.
 
 Because a static class cannot be instantiated, it does not implement `IDisposable` — the compiler-generated `Dispose()` rule ([§8.7](#sec-dispose-is-not-on-object), [§28](#sec-resource-management)) applies only to non-static classes. The `abstract` and `static` modifiers are mutually exclusive, and `sealed` and `static` are mutually exclusive; combining either pair is a compile error. The combination `sealed abstract` is permitted and creates a **closed abstract class**: a class that cannot be instantiated directly and cannot be inherited from outside the declaring module. Classes derived from a `sealed abstract` base must be declared in the same module; the compiler rejects subclasses in other modules. This combination is the recommended way to define a closed hierarchy for exhaustive `case` matching ([§19.6](#sec-exhaustiveness)):
 
@@ -1489,7 +1491,7 @@ end INumber;
 
 **The recurrence constraint.** The self-referential form `where T: INumber<T>` is the ordinary generic-constraint machinery — no new syntax, no `Self` keyword (deliberately declined for v1: the recurrence is explicit and already expressible). A conforming type declares `class Meters: INumber<Meters>` and supplies the static members with exact signatures (the §11.2 matching rule, applied to statics).
 
-**Dispatch through the type parameter.** In a generic body whose parameter `T` carries a static-interface constraint, `T.Member(...)` calls the conforming type's static member, and an operator applied to `T`-typed operands resolves through the constraint's static operators. Resolution happens **at instantiation** (the compiler already specializes generics per concrete instantiation; static dispatch requires exactly the information that specialization has):
+**Dispatch through the type parameter.** In a generic body whose parameter `T` carries a static-interface constraint, `T.Member(...)` calls the conforming type's static member, and an operator applied to `T`-typed operands resolves through the constraint's static operators. Resolution happens **at instantiation** — a statement about *semantics*, not implementation strategy (v0.181): the binding of `T.Member(...)`, and of constraint-sourced operators ([§25.2](#sec-operator-overloading-restrictions)), is fixed per concrete type argument, exactly as if each instantiation were compiled separately. An implementation may realize this by per-instantiation specialization or by shared code carrying a per-instantiation dispatch table — rationale §10's recorded strategy does both, specializing value-type substitutions and sharing reference-type ones — so long as the observable binding is the conforming type's member:
 
 ```bezel
 public static method Sum<T>(items: Array<T>): T where T: INumber<T>
@@ -1498,6 +1500,8 @@ public static method Sum<T>(items: Array<T>): T where T: INumber<T>
   return total;
 end Sum;
 ```
+
+**Static-member interfaces as ordinary types (v0.181).** Declaring static members does not remove an interface from the ordinary type grammar: it remains usable as a variable, field, parameter, or return type, as a boxing target, and as an `is`/`is not`/`as` operand ([§12.7](#sec-type-tests-is-is-not-as)) — the tests behave as for any interface, since a runtime type conforms only by declaring the full member set, statics included, so there is no partial-conformance state to probe. Two consequences are normative. (1) Static interface members contribute **nothing to the instance surface**: through an interface-typed *value* only instance members are reachable, and calling a static member on the interface *name* (`INumber<int>.Zero()`) is a compile error — the interface declares no bodies to run. `T.Member(...)` dispatch requires a generic type **parameter** constrained by the interface: a value's static type names no single conforming type, so "static dispatch through a value" would be hidden dynamic dispatch, which Bezel declines. (2) An interface that declares static members may not mark its type parameters variant (`in`/`out`, [§12.9](#sec-variance)) — a compile error at the declaration: variance is defined by instance-reference assignability, the position rules have no recorded reading for static signatures, and invariance keeps the question closed until a use case arrives (recorded v1 bound, liftable).
 
 **Primitive conformances (compiler-provided).** The primitive numeric tower (`byte`…`ulong`, `float`, `double`, `decimal`) and `char` conform to the standard-library `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces (stdlib §2.19) **without declaring them**: primitive operators are compiler intrinsics (§3.5), so the compiler bridges the intrinsic/declared split by treating each primitive as conforming with its intrinsic operations as the member bodies. User code observes no difference from a declared conformance.
 
@@ -1511,7 +1515,7 @@ end Sum;
 <a id="sec-members-are-non-virtual-by-default"></a>
 ### 12.1 Members are non-virtual by default
 
-A method, property, or indexer is non-virtual unless marked `virtual`. To override a virtual member in a derived class, mark the matching member `override`. Visibility, return type, parameter types, and parameter modifiers must match the base member exactly.
+A method, property, or indexer is non-virtual unless marked `virtual`. To override a virtual member in a derived class, mark the matching member `override`. Visibility, return type, parameter types, and parameter modifiers must match the base member exactly, with one allowance (v0.181): an override may declare a parameter as `T?` where the overridden member declares `T` — the same contravariant nullability widening [§11.2](#sec-interface-declaration) grants interface implementations, admitted here for the same recorded reason (the override accepts more inputs than the virtual slot promises to pass; the reasoning applies verbatim, and the old asymmetry between the two positions was never recorded as intentional). Widening is **monotone down the chain**: an override matches against the *nearest* overridden declaration, so once a parameter is `T?` a further override must keep it `T?` — narrowing back would let a `null` admitted through an intermediate static type reach a non-nullable parameter. The reverse direction (overridden `T?`, override `T`) is rejected, as in §11.2. Return types must still match exactly (no covariance in this version).
 
 Parameter modifiers that must match: `ref`, `out`, `owned`. Return modifiers that must match: `owned`. A mismatch — for example, a base method declaring `Foo(owned x: T)` and the override declaring `Foo(x: T)` — is a compile error. The compiler does not infer or relax these modifiers across the override boundary, because they affect the method's contract rather than its implementation.
 
@@ -1520,7 +1524,9 @@ Fields, constructors, destructors, and static members may not be virtual.
 <a id="sec-hiding-is-not-allowed"></a>
 ### 12.2 Hiding is not allowed
 
-Declaring a member in a derived class with the same name as **any** inherited member is a compile error, unless the declaration is an `override` of a virtual member with an exactly-matching signature. This holds even when the signatures differ: a derived class cannot add an overload to an inherited method's name, and an inherited overload set does not extend across the inheritance boundary (Appendix C.1). To override a virtual base member, use `override`. To add a new member, choose a different name.
+Declaring a member in a derived class with the same name as **any** inherited member is a compile error, unless the declaration is an `override` of a virtual member with a matching signature per [§12.1](#sec-members-are-non-virtual-by-default) — exact, except for the parameter-nullability widening (`T` → `T?`) that §12.1 admits (v0.181). This holds even when the signatures differ: a derived class cannot add an overload to an inherited method's name, and an inherited overload set does not extend across the inheritance boundary (Appendix C.1). To override a virtual base member, use `override`. To add a new member, choose a different name.
+
+The rule is not limited to instance members (v0.181 states it explicitly). A static member's name is likewise unavailable for redeclaration in a derived class — static members cannot be virtual ([§12.1](#sec-members-are-non-virtual-by-default)), so no `override` escape exists for them. Operator declarations are covered **per operator token**: a derived class may not declare an `operator <op>` overload when any base class declares an overload of the same token, whatever the parameter types. This is what keeps [§25.2](#sec-operator-overloading-restrictions)'s inherited-operator candidate set (v0.181) duplicate-free within a single inheritance chain — a chain contributes at most one declaring type per operator token, so derived-operand resolution never faces a base-vs-derived intra-chain ambiguity.
 
 <a id="sec-base-member"></a>
 ### 12.3 `base.Member`
@@ -1658,7 +1664,7 @@ end IComparer;
 
 Position is composed across nested type constructors. A type parameter inside another generic type inherits position from that wrapper's variance: T inside `IEnumerator<T>` (where `IEnumerator` is `out T'`) has the same position the wrapper itself sits in. Function types are themselves variant (covariant in return, contravariant in parameter, see below), and the same composition rule applies. The practical consequence — relevant for event interfaces — is that T appearing inside the *parameter* of a function type that is itself the *parameter* of a method ends up in covariant position, because contravariant-of-contravariant is covariant. A concrete worked example: in `IEvent<out T>`, the method `Subscribe(scoped handler: (T) -> ())` places T inside `(T) -> ()` (contravariant in T) which is itself a parameter of `Subscribe` (an input, contravariant), giving T a covariant position overall — `out T` is sound.
 
-Type parameters without `out` or `in` are invariant. Classes, records, and concrete generic types are always invariant.
+Type parameters without `out` or `in` are invariant. Classes, records, and concrete generic types are always invariant — and the variance markers are **interface-only syntax**: `in`/`out` on a generic parameter of a class, record, method, or type alias ([§27.8](#sec-type-aliases)) is a **compile error** (v0.181 makes the rejection explicit; the shared `GenericParam` grammar admits the marker everywhere and outside interface declarations it is rejected semantically, Appendix A.4). A marker the language cannot honor must not parse as decoration — `class Box<out T>` silently accepted-and-ignored would promise an assignability the type does not have. Additionally, an interface declaring **static members** may not mark its parameters variant ([§11.8](#sec-static-interface-members), v0.181).
 
 Variance applies only when the type argument is a reference type. `IEnumerable<int>` is a perfectly valid type and is used pervasively; what is rejected is the *variant assignment* of `IEnumerable<int>` to `IEnumerable<Object>`, which would require per-element boxing at every access. For value-typed T, the only legal assignment of `IEnumerable<T>` is to another `IEnumerable<T>` (or to a non-variant supertype like `IEnumerable<T>` itself or `Object`). Reference-typed T admits the full covariant chain — `IEnumerable<Dog>` is assignable to `IEnumerable<Animal>` and to `IEnumerable<Object>` because the underlying references compose without conversion.
 
@@ -1844,11 +1850,11 @@ The `where` clause restricts the substitutions a type parameter accepts:
 | `where T: value` | Non-nullable value types — records, enums, primitives, inline arrays (all forms), the unit type. A nullable value type (e.g. `int?`) does **not** satisfy `value`. Generic body must use only move-compatible operations on T if T may be a move-only inline array ([§15.3](#sec-move-only-value-types)). |
 | `where T: SomeClass` | Non-nullable subtypes of `SomeClass` (the class itself and its descendants). Class types only; interfaces do not extend classes in Bezel. |
 | `where T: IFoo` | Non-nullable types conforming to `IFoo`: classes implementing it, records implementing it, and interfaces extending it. See "Interface conformance" below. |
-| `where T: new()` | Any type with an accessible parameterless constructor, or any positional record whose every field has a well-defined default value. |
+| `where T: new()` | Class types with a `public` parameterless constructor; value types (records, enums, primitives, inline arrays, the unit type) whose `default(T)` is well-defined ([§17.11](#sec-the-default-operator)). |
 
 Constraints may be combined: `where T: class, IDisposable, new()` requires a non-nullable reference type that implements `IDisposable` and has a public parameterless constructor.
 
-For `where T: new()`, the constraint is satisfied by a positional record `R(F1: T1, ..., Fn: Tn)` exactly when `default(R)` is well-defined per [§17.11](#sec-the-default-operator) — i.e., every Fi has a well-defined default. Inside a generic body, `new T()` for a *record* substitution is equivalent to `default(T)` — the parameterless constructor produces the zero-valued record. This admits records like `record Point(X: int, Y: int)` while rejecting records that contain non-nullable reference fields. For a *class* substitution, `new T()` produces an owned reference via the class's parameterless constructor under the standard ownership-discharge rules of [§28.3](#sec-local-variables-ownership-and-borrows).
+For `where T: new()` (wording settled in v0.181 — earlier revisions said "accessible" in the table, "public" in the combined example above, and placed no value types other than positional records): a **class** substitution satisfies the constraint exactly when the class declares a parameterless constructor that is `public` — not merely accessible from some scope. Constraint satisfaction is a property of the type alone, checked wherever an instantiation occurs; keying it to accessibility would let the same substitution satisfy the constraint in one module and fail it in another. A **value-type** substitution — record (positional or body), enum, primitive, inline array, the unit type — satisfies the constraint exactly when `default(T)` is well-defined per [§17.11](#sec-the-default-operator). Inside the generic body, `new T()` for a value substitution is equivalent to `default(T)`: for records this is the zero-valued record (admitting `record Point(X: int, Y: int)` while rejecting records with non-nullable reference fields); for enums it is the zero value, with [§17.11](#sec-the-default-operator)'s no-zero-constant warning applying. For a class substitution, `new T()` produces an owned reference via the class's parameterless constructor under the standard ownership-discharge rules of [§28.3](#sec-local-variables-ownership-and-borrows). Interface substitutions never satisfy `new()` — no constructor exists.
 
 A type-bound constraint — naming a class or interface — implies non-null T. The reasoning is that nullable types `MyClass?` and `IFoo?` are distinct from their non-nullable forms ([§7.1](#sec-non-nullable-and-nullable-types)) and do not themselves implement the interfaces of their non-nullable counterparts: a `null` value satisfies no interface contract. Constraining on a class or interface name therefore admits only non-nullable substitutions, the same way `where T: class` does. Inside the generic body, T is non-nullable; `T?` is its nullable companion.
 
@@ -3490,6 +3496,8 @@ var success := parser.TryParse("42", out var num);
 
 The variable's scope is the enclosing block, from the call onward. It is in scope in both branches of any surrounding `if` and after the call.
 
+**Scope is not definite assignment (v0.181).** The scope rule above says only where the name may appear; whether a read is *legal* follows the ordinary definite-assignment rules for locals ([§7.9](#sec-definite-assignment-for-non-nullable-fields), [§21.1](#sec-variable-declarations)), applied path-sensitively: an inline `out` variable counts as **assigned only on control-flow paths where the introducing call was actually evaluated**. Under short-circuit operators and conditional expressions the distinction is live. After `if flag and parser.TryParse(s, out var n) then ... end;`, the variable is definitely assigned *inside* the `then` branch — control reaches it only if the call ran (and returned `true`) — but not after the `if`, where a path exists on which `flag` was `false` and the call never executed. The analysis is required to honor the standard short-circuit facts (`A and Call(out var x)` assigns `x` when the whole expression is `true`; `A or Call(out var x)` assigns `x` when it is `false`), so the idiomatic guarded read stays accepted. On a path where the call may not have run, a read of a **non-nullable-reference-typed** out variable is a compile error, exactly as for any other unassigned non-nullable local; value-typed and nullable out variables follow [§7.9](#sec-default-initialization)'s default-initialization rules (the default value or `null` is what such a path observes). An `out using var` disposal obligation likewise attaches only on paths where the call executed.
+
 For disposal-aware inline declarations, use `out using var`:
 
 ```bezel
@@ -3514,6 +3522,8 @@ Log(level := "ERROR", message := "Failed");
 Named arguments may appear in any order after positional arguments. **The named form is for plain-value arguments only (v0.160):** a `ref`/`out`/`owned` argument is passed positionally — `M(out var result := n)` has no reading and does not parse (Appendix A.4 Argument).
 
 **Defaults and modifiers (v0.160).** A default value is permitted only on parameters with **no modifier or `owned`** (an `owned` default is the owned-allocation form this section already blesses, e.g. a factory-call default); `ref` and `out` parameters can never carry defaults — both require a caller-side location, which an omitted argument cannot supply. Every parameter after the first defaulted parameter must itself have a default.
+
+**Evaluation order (v0.181, codifying implemented behavior).** A call's **supplied** argument expressions are evaluated in **call-site textual order** — left to right as written, for positional and named arguments alike; naming an argument changes which parameter it binds to, never when it runs (`M(b := Next(), a := Next())` evaluates the `b` expression first). **Defaults for omitted parameters** are evaluated after all supplied arguments, in **parameter-list declaration order**; a default-value expression that reads an earlier parameter (below) observes that parameter's value for this call, whether supplied or itself just defaulted. The order is observable through side-effecting arguments and non-constant defaults (`DateTime.Now`, factory calls) and is normative; it matches C#'s treatment of supplied arguments.
 
 <a id="sec-evaluation-timing"></a>
 #### Evaluation timing
@@ -3558,40 +3568,35 @@ The C# choice was driven by ABI stability: the default value is encoded into the
 <a id="sec-overloading"></a>
 ### 22.6 Overloading
 
-Methods and constructors may be overloaded by parameter list. Overload resolution considers number, types, and the `ref`/`out` modifiers — overloads differing in any of these are distinguishable.
+Methods and constructors may be overloaded by parameter list. Overload resolution considers number, types, and the `ref`/`out` modifiers — overloads differing in any of these are distinguishable. `owned` — in any position, including on an `out` parameter — and `scoped` never distinguish overloads (v0.181; below).
 
 <a id="sec-owned-and-overload-resolution"></a>
 #### `owned` and overload resolution
 
 `owned` on an **ordinary parameter** (without `out`) does *not* participate in overload resolution. Two overloads that differ only by `owned` on a parameter — e.g. `M(t: T)` and `M(owned t: T)` — are a compile error. The reason is that ordinary `owned` describes a contract about the argument's lifetime rather than its type; the call-site syntax (`M(value)`) does not visibly distinguish the two forms, so permitting them as overloads would force the caller to know the resolution outcome to write a correct ownership transfer. APIs that need both ownership-transferring and borrowing forms must use distinct method names — `Append` versus `AppendOwned`, or the `FromResult` / `FromOwnedResult` pattern. *(v0.169 note: the call-site marker `M(owned x)` (§22.3, #1348) makes the two forms visibly distinct for named-binding arguments, satisfying this paragraph's own carve-out criterion — but the overload ban deliberately **stands** for now; lifting it drags stdlib renames and resolution rules with it and is recorded as a follow-on, not adopted here.)*
 
-`owned` on an **`out` parameter** is different: the call-site syntax visibly distinguishes the two cases. `out var x` produces a borrow location; `out using var x` (or the inline `out owned var x`, [§22.4](#sec-inline-out-declarations)) produces an owned location. The static distinction is observable at the call site, so resolution can proceed without ambiguity.
+`scoped` does not participate in overload resolution either (v0.181): two overloads differing only in `scoped` on a parameter — `M(cb: () -> ())` and `M(scoped cb: () -> ())` — are a compile error, for the same reason. A function-typed argument carries no call-site marker at all (admission is capture-based, [§28.14](#sec-scoped-callback-parameters)), so the caller could not select between the pair; a class- or interface-typed argument's `M(scoped x)` marker ([§22.3](#sec-parameter-modifiers)) announces the freeze to the reader but is deliberately not a resolution signal — v0.181 removes the language's one resolution-by-call-site-form rule (below) rather than adding a second. (`scoped` remains part of *function-type* identity, [§27.1](#sec-function-types): `(scoped () -> ()) -> ()` and `(() -> ()) -> ()` are distinct types. This rule is about selecting between same-name methods, not about type identity.)
 
-Therefore: **`out T` and `out owned T` are distinct overloads.** Two methods differing only in the `owned` qualifier on an `out` parameter are permitted, and overload resolution selects between them based on the call-site form:
+`owned` on an **`out` parameter** is no different (v0.181, withdrawing the v0.77 carve-out): **two methods differing only in the `owned` qualifier on an `out` parameter are a compile error**, exactly like the ordinary-parameter pair above. From v0.77 through v0.180 this pair was the language's one sanctioned overload distinction resolved by the *call-site binding form* (`out var x` selected `out T`; `out using var x`/`out owned var x` selected `out owned T`). The carve-out is withdrawn because it carried no weight and real cost: the standard library never declares the same-name pair — the borrow/take split is expressed with distinct names everywhere (`TryGetValue` vs `TryPopValue`, `TryPeek` vs `TryPop`) — while the rule required a dedicated `out _` ambiguity remedy and made `out` the only position where resolution consulted how the caller *binds* a result rather than what the caller *passes*. APIs expose borrowing and owning forms under distinct method names, the same remedy as for ordinary `owned`.
 
-- `M(out var x)` resolves to the `out T` overload.
-- `M(out using var x)` and `M(out owned var x)` resolve to the `out owned T` overload.
+The call-site form must still **match** the declaration ([§22.4](#sec-inline-out-declarations)): `out var x` produces a borrow location and is accepted only against a plain `out` parameter; `out using var x` (and the inline `out owned var x`) produce an owned location and are accepted only against `out owned`. A caller cannot write `out using var` against a plain `out` parameter (the result would have no owned source), nor plain `out var` against an `out owned` parameter (the resulting value's ownership would have nowhere to go). These are compatibility checks against the *resolved* signature, not resolution signals. (An explicit type annotation on the inline `out` declaration is not permitted — the type is inferred from the callee's parameter, [§22.4](#sec-inline-out-declarations). Overloads that differ in the out parameter's *type* remain legal; when the inline form's inference is ambiguous between them, disambiguate by pre-declaring a typed local and passing plain `out x`.)
 
-(An explicit type annotation on the inline `out` declaration is not permitted — the type is inferred from the callee's parameter, [§22.4](#sec-inline-out-declarations). Overloads that differ only in the out parameter's *type* are disambiguated by pre-declaring a typed local and passing plain `out x`.)
+**`out _` (v0.160; simplified v0.181).** The discard form applies to both parameter kinds: against `out T` the received value is simply dropped ([§17.13](#sec-the-discard-_)); against `out owned T` the discarded value is an unbound owned temporary disposed at the end of the full statement ([§28.3](#sec-unbound-owned-temporaries)). The pre-v0.181 ambiguity rule for `out _` against an out/out-owned pair is moot — the pair itself is no longer declarable.
 
-If only one overload exists, the call-site syntax must match it: a caller cannot write `out using var` to call a method whose `out` parameter is plain (the result wouldn't have an owned source), and a caller cannot write plain `out var` to call a method whose `out` parameter is `out owned` (the resulting value's ownership would have nowhere to go).
-
-**`out _` (v0.160).** The discard form applies to both parameter kinds: against `out T` the received value is simply dropped ([§17.13](#sec-the-discard-_)); against `out owned T` the discarded value is an unbound owned temporary disposed at the end of the full statement ([§28.3](#sec-unbound-owned-temporaries)). When *both* overloads of an out/out-owned pair exist, `out _` is ambiguous — a compile error citing both candidates, resolved by writing `out var x` or `out using var x` (the compiler declines to guess, as throughout this section).
-
-This carve-out exists for `out` specifically. `ref` parameters do not admit `owned` (a `ref` location is borrowed by definition); `in` parameters do not exist as a separate modifier in Bezel. The carve-out applies only where the call-site syntax visibly distinguishes the two forms.
+The stance is now uniform: **neither `owned` (in any position, including on `out`) nor `scoped` ever participates in overload resolution** — only arity, parameter types, and the `ref`/`out` modifiers distinguish overloads. `ref` parameters do not admit `owned` (a `ref` location is borrowed by definition); `in` parameters do not exist as a separate modifier in Bezel.
 
 <a id="sec-practical-pattern"></a>
 #### Practical pattern
 
-The common use is a "try" method that exposes both shapes:
+The common use is a pair of "try" methods exposing borrow and take forms under **distinct names** — the convention the standard library uses everywhere (`TryGetValue` vs `TryPopValue` on `OwningDictionary`, `TryPeek` vs `TryPop` on `OwningStack`):
 
 ```bezel
 public class ConnectionPool  // declaration sketch; method bodies elided
-  // Try to fetch a cached connection; caller borrows from the pool.
+  // Borrow a cached connection; the pool retains ownership.
   public method TryGetCached(name: string, out conn: Connection?): bool;
 
-  // Try to fetch and remove from the pool; caller takes ownership.
-  public method TryGetCached(name: string, out owned conn: Connection?): bool;
+  // Take a cached connection out of the pool; the caller assumes ownership.
+  public method TryTakeCached(name: string, out owned conn: Connection?): bool;
 end ConnectionPool;
 
 // Caller A: borrows a cached connection (pool retains it)
@@ -3600,32 +3605,32 @@ if pool.TryGetCached("primary", out var c) then
 end;
 
 // Caller B: takes ownership of a cached connection (pool no longer holds it)
-if pool.TryGetCached("primary", out using var c) then
+if pool.TryTakeCached("primary", out using var c) then
   UseConnection(c!);    // c is owned Connection?; disposed at scope end
 end;
 ```
 
-Both call sites are unambiguous; the resolution is by call-site syntax.
+Each name has one signature, and each call site's binding form matches its callee's declaration (v0.181 — the same-name pair differing only in `out` vs `out owned` is a compile error).
 
-The implementation of the take-form (the `out owned` overload) uses [§28.8.1](#sec-the-move-expression)'s `move` expression on the pool's internal owned-element collection to transfer ownership from pool to caller. A typical body using a `OwningDictionary<string, Connection>` for the pool storage has the shape:
+The implementation of the take-form (`TryTakeCached`) uses [§28.8.1](#sec-the-move-expression)'s `move` expression on the pool's internal owned-element collection to transfer ownership from pool to caller. A typical body using a `OwningDictionary<string, Connection>` for the pool storage has the shape:
 
 ```bezel
 private owned _cache: OwningDictionary<string, Connection>;
 
-public method TryGetCached(name: string, out owned conn: Connection?): bool
+public method TryTakeCached(name: string, out owned conn: Connection?): bool
   if not _cache.ContainsKey(name) then
     conn := null;
     return false;
   end;
   conn := _cache.PopValue(name);    // takes ownership, removes from dictionary
   return true;
-end TryGetCached;
+end TryTakeCached;
 ```
 
 The out parameter is typed `Connection?` (nullable) so that the false-return path can write `null` — `default(Connection)` is a compile error for a non-nullable reference type ([§17.11](#sec-the-default-operator)), and the type system requires every `out` parameter to be assigned on every return path. Callers consume with `out using var` and null-check after the bool guard:
 
 ```bezel
-if pool.TryGetCached("primary", out using var c) then
+if pool.TryTakeCached("primary", out using var c) then
   // c is owned Connection? here — but the bool guard tells us it's non-null
   UseConnection(c!);    // ! is fine; the API contract guarantees non-null on true return
 end;
@@ -3645,6 +3650,8 @@ The rules above (number, type, `ref`/`out`, and the `owned`-on-`out` carve-out) 
 For a single argument position, one candidate is **better** than another when the better candidate requires *no* implicit conversion (the argument's static type matches the parameter type exactly) and the other requires an implicit conversion. An exact match is the only relation that distinguishes one applicable candidate from another at an argument position; two candidates that both require an implicit conversion at the same position are **equally ranked** there, regardless of which conversion each uses. Bezel does not rank one built-in implicit conversion above another: §5.1 admits a conversion only when no programmer-visible information is lost (or, for the wide-integer-to-float cases, when an explicit cast would be unjustified noise), so all admitted implicit conversions are treated as co-equal for resolution purposes.
 
 A candidate is **unambiguously better** than another when it is better-or-equal on every argument position and strictly better (an exact match where the other converts) on at least one. The call resolves to a candidate that is unambiguously better than every other applicable candidate.
+
+**Defaulted-arity tie-break (v0.181).** When the applicable candidates differ in whether defaults must be filled for omitted optional parameters ([§22.5](#sec-optional-parameters-and-named-arguments)), one further comparison applies before declaring ambiguity: a candidate applicable **without filling any default** is preferred over a candidate that fills one or more, provided the no-defaults candidate is better-or-equal at every supplied-argument position under the ranking above. `M(5)` against `M(n: int)` and `M(n: int, m: int := 0)` resolves to `M(int)` — without this rule the call would be permanently ambiguous, and the explicit-cast remedy below cannot express "the fewer-parameter candidate". The tie-break distinguishes only all-arguments-supplied from some-defaults-filled; two candidates that both fill defaults remain subject to the ambiguity rule (the compiler declines to guess which omission the caller meant). This is C#'s rule, adopted with C#'s reasoning: adding an optional parameter to an overload set must not break existing calls that were exact against the shorter signature.
 
 If no candidate is unambiguously better — because each of two candidates is exact on a different argument, or because the remaining candidates all rely on implicit conversions that this rule treats as equally ranked — the call is **ambiguous** and is a compile error. The compiler reports the error and cites the candidate overloads; it never silently selects one. The caller resolves the ambiguity by adding an explicit cast ([§5.2](#sec-explicit-conversions)) to an argument so that exactly one candidate becomes an exact match (or so that all but one candidate become inapplicable).
 
@@ -3795,18 +3802,18 @@ end Utils;
 
 A static constructor body may use `try`/`catch`. An exception caught inside the body does not transition the type to the failed state — the constructor completes normally and static initialization is considered successful. The failed state is entered only when an exception escapes the static initializer entirely. If the static initializer (the static field initializers, the static constructor body, or both) throws an *uncaught* exception, the type is left in a permanently failed state:
 
-- Every subsequent access to a static member of the type — field read, field write, method call, property read or write, indexer, event subscription — raises `TypeInitializationException` whose `InnerException` is the original exception.
+- Every subsequent access to a static member of the type — field read, field write, method call, property read or write, indexer, event subscription — raises `TypeInitializationException` whose `InnerException` is the original exception (for the [§22.13](#sec-static-initialization-order) cycle backstop, the cached instance is the runtime-synthesized one and `InnerException` is `null`).
 - The state is not recoverable: re-running static initialization is not attempted.
 - Static fields whose initializers had not yet run remain at their default values, but those defaults are not observable: every access raises. For non-nullable reference fields, where no default value exists ([§7.9](#sec-definite-assignment-for-non-nullable-fields)), this rule is satisfied vacuously — every access to the type raises before any field read could occur, so the absence of a value is never observed. The compiler's definite-assignment analysis is not violated, because the failed-state machinery intercepts every access before any read of the field.
 - Static fields whose initializers completed successfully before the failing initializer have their values; if any such field is `owned`, its value will be disposed at program exit per [§22.13](#sec-static-initialization-order). The runtime makes no guarantee about ordering of disposal across types when one of the types is in a failed state.
 
-The exception thrown on first failure is the one cached and rethrown; multiple subsequent accesses see the same cached `TypeInitializationException` instance.
+The `TypeInitializationException` is constructed at the moment the exception escapes the initializer, and **the access that triggered initialization observes it too** (v0.181 — previously unstated): the original exception never propagates raw out of static initialization; it is observable only as `InnerException`. The instance constructed on first failure is the one cached and rethrown; the triggering access and every subsequent access see the same cached `TypeInitializationException` instance. (When the escaping exception is itself the `TypeInitializationException` synthesized by [§22.13](#sec-static-initialization-order)'s cycle backstop, that instance is cached directly — no double wrapping.)
 
 The rules above resolve into two scenarios:
 
 | Scenario | Outcome |
 |---|---|
-| Static initializer (field initializer or static constructor body) throws an exception that escapes the initializer. | Type enters permanently failed state. Every subsequent access raises `TypeInitializationException` whose `InnerException` is the original. Owned static fields whose initializers had already completed are disposed at program exit. |
+| Static initializer (field initializer or static constructor body) throws an exception that escapes the initializer. | Type enters permanently failed state. Every subsequent access raises `TypeInitializationException` whose `InnerException` is the original (`null` for the [§22.13](#sec-static-initialization-order) cycle-backstop instance, which has no original). Owned static fields whose initializers had already completed are disposed at program exit. |
 | Static initializer encounters an exception but catches it via `try`/`catch` inside the body (or the throwing field initializer is preceded by a successful one). | Type initializes normally. The caught exception did not escape; subsequent member access proceeds without raising. Remaining initializers and the constructor body run as usual. |
 
 <a id="sec-field-initializers"></a>
@@ -3827,9 +3834,11 @@ A field declared `readonly` may be assigned only in a field initializer or in a 
 Field initializers run as part of construction in textual declaration order. The full sequence for a constructor:
 
 0. Primary-constructor parameters ([§22.10](#sec-methods-and-constructors-primary-constructors)) that are referenced in body positions (method, property, constructor, or destructor bodies) are captured into their compiler-generated private fields; parameters referenced only in initializer positions are not captured ([§11.1](#sec-class-declaration)). This step is omitted for classes without a primary constructor.
-1. The base or chained constructor call (`base(...)`, `this(...)`, or implicit `base()`). For a `this(...)` chain, the chained constructor runs to completion (its own steps 0 through 3) before control returns here.
-2. Field initializers, in declaration order.
+1. The base or chained constructor call (`base(...)`, `this(...)`, or implicit `base()`). For a `this(...)` chain, the chained-to constructor runs to completion (its own steps of this sequence) before control returns here.
+2. Field initializers, in declaration order — executed **only** by a constructor whose step 1 is `base(...)` or the implicit `base()` (see below).
 3. The constructor body.
+
+**Field initializers run exactly once per instance construction (v0.181 — the rule the sequence always intended).** They execute as step 2 of the constructor whose chaining position holds `base(...)` or the implicit `base()` — the constructor at the end of any `this(...)` chain. A constructor that chains via `this(...)` **skips steps 0 and 2**: its effective sequence is the chained `this(...)` call, then its own body. (Step 0 is vacuous for such a constructor anyway: only non-primary constructors may chain via `this(...)` ([§22.7](#sec-constructors), [§22.10](#sec-methods-and-constructors-primary-constructors)), and primary-parameter capture happens inside the chained-to primary.) Read without this rule, step 1's run-to-completion parenthetical plus an unconditional step 2 would run every field initializer twice under `this(...)` chaining — repeating allocations and initializer side effects, assigning `readonly` fields twice, and, for `owned` fields, disposing and recreating each initializer's value under [§28.7](#sec-reassigning-owned-fields)'s drop-on-overwrite. The once-only rule matches C# and the reference implementation.
 
 Primary-constructor parameter capture occurs first so that the `base(...)`/`this(...)` argument expressions (step 1), field initializers (step 2), and the body (step 3) may reference the captured parameters by name. Step 0 is observable only through ordering: the captured fields are initialized before any user-written code runs.
 
@@ -3847,6 +3856,7 @@ When construction throws, the compiler unwinds the partially-constructed instanc
 - An exception during the **base or chained constructor call** (step 1) leaves no derived state to clean up — the base ctor's own exception-safety logic disposes whatever it had constructed of the base subobject. The exception propagates to the derived ctor's caller; the derived instance is never observable.
 - An exception during a **field initializer** (step 2) triggers disposal of any earlier derived owned fields whose initializers completed, in reverse declaration order, followed by the base subobject's `Dispose()` (which the runtime invokes because the base ctor completed successfully). The exception then propagates.
 - An exception in the **constructor body** (step 3) triggers disposal of every owned field assigned during initialization (step 2) and the base subobject. Owned fields assigned imperatively in the body are also disposed if assigned successfully before the throwing statement.
+- An exception in a **`this(...)`-chaining constructor** follows the same shape one level up (v0.181, completing the [§22.8](#sec-field-initializers) once-only rule). A throw during the chained call itself is the first case above, with one precision for the `this(...)` reading: the chained-to constructor's unwinding has by then disposed everything its steps initialized — *including derived fields*, since field initializers ran as its step 2 — so there is nothing further to dispose. If the chaining constructor's **body** throws, the chained-to construction completed and the instance is at that point fully initialized: the runtime disposes it through the normal generated-`Dispose()` path ([§28.4](#sec-the-destructor)) before the exception propagates — the same rule [§22.11](#sec-object-initializer-blocks) applies when an object-initializer setter throws.
 
 The compiler generates the necessary `try`/`finally` around each phase. The base-first construction order ([§22.8](#sec-field-initializers)) is what makes this story clean: by the time any derived state exists, the base subobject is fully constructed and its destructor can run cleanly during unwinding.
 
@@ -3955,12 +3965,12 @@ The semantics of object initialization (mutation through setters) does not apply
 <a id="sec-static-members"></a>
 ### 22.12 Static members
 
-**Statics and domains (v0.163, closing the #1363 gap).** Static state is **process-global** — one instance across all domains — which makes unrestricted static mutability a side door through [§30.14](#sec-sendable-types)'s no-shared-mutable-state discipline. The rules:
+**Statics and domains (v0.163; specified here — compiler/runtime enforcement tracked at #1363, #1391–#1393).** Static state is **process-global** — one instance across all domains — which makes unrestricted static mutability a side door through [§30.14](#sec-sendable-types)'s no-shared-mutable-state discipline. The rules:
 
 1. **Lazy static initialization is runtime-synchronized**: a type's static initializer runs exactly once process-wide; a domain touching a type mid-initialization by another domain blocks until initialization completes (or observes the failed state, [§22.7](#sec-constructors)). Exit disposal order ([§22.13](#sec-static-initialization-order)) is therefore well-defined: the runtime records the single global initialization order.
-2. A **mutable** (non-`readonly`, non-`const`) static field or auto-property is admitted **only** when its type is compiler-known internally-synchronized (`Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `Channel<T>`, `ChannelSender<T>` — stdlib §6); any other type is a **compile error** naming this rule. Unsynchronized cross-domain mutation is exactly the race §30.14 exists to exclude.
+2. A **mutable** (non-`readonly`, non-`const`) static field or auto-property is admitted in exactly **two forms** (v0.181, reconciling this rule with [§22.13](#sec-static-initialization-order)'s pattern (b)); any other mutable static is a **compile error** naming this rule — unsynchronized cross-domain mutation is exactly the race §30.14 exists to exclude. **(i) Internally-synchronized handle:** the field's type is compiler-known internally-synchronized *and safe to reach from every domain* — `Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `ChannelSender<T>` (stdlib §6). `Channel<T>` is **excluded** (v0.181): the channel object is the *receiving* end ([§30.15](#sec-channels)), single-consumer by ownership, and a process-global receiving end would readmit the multi-consumer receive that stdlib §6.9 explicitly defers — keep the `Channel<T>` domain-confined and publish a `ChannelSender<T>` static instead. **(ii) Lazy task cache:** a static whose declared type is `Task?` or `Task<T>?` — the admission is keyed to the declared type alone, so the check stays decidable at the declaration; the intended shape is [§22.13](#sec-static-initialization-order) pattern (b)'s `null`-initialized once-set cache of an asynchronous computation (Pattern A multi-await, [§30.5](#sec-result-lifetime-and-task-disposal)). `OwningTask<T>?` is *not* admitted here: it is single-await ([§30.5](#sec-result-lifetime-and-task-disposal)), useless as a shared cache, and a displaced owned task would strand its result. Three store semantics apply to every admitted mutable static (v0.181). **Atomicity:** stores are single pointer-word writes the runtime performs atomically (no torn reference is ever observed), but a check-then-store sequence is **not** atomic across domains: racing first uses of a task cache may each start the work and store, last store winning — every stored task remains independently awaitable, so the race duplicates work without unsoundness; when exactly-once matters, use eager startup assignment ([§22.13](#sec-static-initialization-order) pattern (a)) or a `Mutex`. **Ownership:** assigning a fresh owned value into an admitted mutable static discharges the producer — [§22.13](#sec-static-initialization-order)'s ownership-discharge exemption for non-`owned` statics extends to these fields; the referent becomes process-lived. **Overwrite:** overwriting an admitted mutable static never disposes the displaced referent — deliberately *not* [§28.7](#sec-reassigning-owned-fields)'s drop-on-overwrite, since a racing first use may still hold and await the displaced task; the displaced referent remains alive until process exit, an accepted bounded cost of the same kind as the [§22.13](#sec-static-initialization-order) exemption (displacement can occur only during first-use races). *(Compiler status: the current check under-enforces this rule — mutable statics of primitive/`string`/record and compiler-known stdlib class types are still admitted — tracked at #1393, pending the owner ruling recorded there.)*
 3. `static readonly` and `const` of **immutable content** — value types of sendable-value category, `string`, enums — are unrestricted (shared-immutable).
-4. A `static readonly` (including `owned`) field of **class type** is admitted with a **declaration-site warning** unless the class is in the synchronized set: the referenced instance is reachable from every domain, and confining its use to one domain — or ensuring its own internal synchronization — is the programmer's obligation (the checked-disposal backstop of [§28.2](#sec-the-idisposable-contract) applies; this is the singleton-with-resources pattern the warning text names). The warning is suppressed by the synchronized set.
+4. A `static readonly` (including `owned`) field of **class type** is admitted with a **declaration-site warning** unless the class is in rule 2's form-(i) synchronized set: the referenced instance is reachable from every domain, and confining its use to one domain — or ensuring its own internal synchronization — is the programmer's obligation (the checked-disposal backstop of [§28.2](#sec-the-idisposable-contract) applies; this is the singleton-with-resources pattern the warning text names). The warning is suppressed by the form-(i) set; a `static readonly Channel<T>` deliberately still warns — the warning is the reminder that the channel is the single-consumer *receiving* end and must stay confined to one consuming domain ([§30.15](#sec-channels)).
 5. **Static events are runtime-synchronized and capture-free** (v0.163; strengthened v0.180): the compiler-generated subscriber list of a `static event` uses synchronized operations, since subscribe/raise may arrive from any domain. Additionally (v0.180), a handler subscribed to a `static event` — through `+=`/`Add` or `Subscribe` — must be **capture-free**: a non-capturing lambda or a static method reference, the same admission as `Domain.Spawn` entries ([§30.14](#sec-spawning-domains)) and FFI callbacks. The process-global subscriber list transports the handler to whichever domain raises ([§24.5](#sec-raising-events): handlers execute on the raising domain), and a capture-bearing closure carries borrows of its origin domain's scopes — exactly what [§30.14](#sec-sendable-types)'s "function-typed values are never sendable" rule exists to exclude; a capture-bearing subscription to a static event is a compile error naming this rule. No payload-sendability check is imposed: under capture-freedom plus raising-domain execution the payload is constructed and consumed in one domain and never crosses a boundary. (Instance events remain unsynchronized and capture-admitting — domain-serial per [§24.6](#sec-thread-safety), captures per [§28.14](#sec-scoped-callback-parameters).)
 
 Static methods, properties, fields, events, and constructors are declared with `static`. A class-level `const` is implicitly static; writing `static const` is redundant but permitted for clarity — both forms declare the same constant.
@@ -3988,7 +3998,13 @@ A static constructor body may freely reference any of the type's static fields i
 
 Forward references between `const` declarations are not subject to this rule: a `const` initializer must be a compile-time-constant expression ([§22.12](#sec-static-members)), so forward references between consts are either resolved at compile time (the textual order doesn't matter — consts have no temporal initialization) or are themselves a compile error for non-constant operands.
 
-Cycles in static initialization across types are rejected by the compiler.
+**Cycles across types (v0.181 — replacing a bare "rejected by the compiler" sentence that named no dependency relation and promised more than any compiler can deliver).** Two rules, one compile-time and one runtime:
+
+1. **Compile-time rejection over a defined approximation.** The compiler builds a static-initialization dependency graph: type T depends on type U when T's static field initializers or static constructor body reference a static member of U — directly, or transitively through the bodies of **statically-resolvable calls** (static methods and static property getters reached by direct name within the compilation unit, [§2.5](#sec-dependency-resolution)). Calls through function values, virtual dispatch, and code outside the compilation unit contribute **no** edges. A cycle in this graph is a compile error naming the participating types. The check is a deliberate approximation: it rejects every cycle it can see and is **not a completeness guarantee** — a cycle routed through a function value, virtual dispatch, or a module boundary compiles.
+
+2. **Runtime backstop — re-entrancy raises, never observes.** A touch of a type whose static initialization is **in progress on the same thread** — the signature of a cycle the approximation missed, since a cross-domain touch blocks instead ([§22.12](#sec-static-members) rule 1; the backstop is deliberately same-thread-only — an undetected cycle spanning two concurrently-initializing domains deadlocks in that blocking rather than raising, an accepted bound: no cross-domain waits-for detection is promised) — raises a runtime-synthesized `TypeInitializationException` whose message names the re-entrant type and whose `InnerException` is `null` (there is no original exception; [§31.4](#sec-standard-exception-types)). Partially-initialized statics are **never observable**: silently proceeding on defaults would, for a non-nullable reference static, violate [§7.9](#sec-definite-assignment-for-non-nullable-fields)'s guarantee that no non-nullable field is ever observed unset. The synthesized exception then escapes the in-progress initializer it interrupted, and the ordinary [§22.7](#sec-constructors) failed-state machinery takes over — with one adjustment stated there: an escaping exception that is itself a `TypeInitializationException` is cached directly, not wrapped again.
+
+(Compiler status: through-method-body cycle detection is implemented; the function-value/virtual-dispatch routings — which the runtime backstop covers — and cross-module detection are tracked at #804.)
 
 Enum constants are compile-time values and may be referenced freely from static initializers without triggering initialization.
 
@@ -4013,7 +4029,7 @@ public static async method GetConfig(): Task<Config>
 end GetConfig;
 ```
 
-A non-`async` synchronous wrapper that blocks on the task is admitted **only** in code running outside any domain ([§30.3](#sec-the-task-and-taskt-types)) — startup code on the main thread — and never from a lazily-triggered initializer. *(The static cache in (b) is subject to the statics-and-domains rules tracked at #1363; the pattern is sound within a domain today.)*
+A non-`async` synchronous wrapper that blocks on the task is admitted **only** in code running outside any domain ([§30.3](#sec-the-task-and-taskt-types)) — startup code on the main thread — and never from a lazily-triggered initializer. *(The static cache in (b) is admitted by [§22.12](#sec-static-members) rule 2(ii), which also states the cross-domain first-use race and the exactly-once caveat; runtime enforcement of the statics-and-domains rules is tracked at #1363/#1391–#1393.)*
 
 <a id="sec-disposal-of-static-owned-fields"></a>
 #### Disposal of static `owned` fields
@@ -4031,7 +4047,7 @@ Disposal at program exit is largely cosmetic from the operating system's perspec
 <a id="sec-static-class-typed-fields-without-owned"></a>
 #### Static class-typed fields without `owned`
 
-A `static readonly` field of class type or interface type that is not marked `owned` is exempt from the [§28.8](#sec-ownership-transfer) ownership-discharge requirement. The value lives for the duration of the program; the runtime reclaims its memory at process exit. The field is not disposed at program exit and must not hold resources that require explicit cleanup.
+A `static readonly` field of class type or interface type that is not marked `owned` is exempt from the [§28.8](#sec-ownership-transfer) ownership-discharge requirement, and the same exemption covers every store into a **mutable** static [§22.12](#sec-static-members) rule 2 admits (v0.181 — previously this paragraph named only `static readonly`, leaving pattern (b)'s own `_cfg := LoadConfigAsync();` store formally undischarged): assigning a fresh owned value into such a field discharges the producer. The value lives for the duration of the program; the runtime reclaims its memory at process exit. The field is not disposed at program exit and must not hold resources that require explicit cleanup. Overwriting an admitted mutable static never disposes the displaced referent — deliberately *not* [§28.7](#sec-reassigning-owned-fields)'s drop-on-overwrite, because a racing first use may still hold and await a displaced task ([§22.12](#sec-static-members) rule 2(ii)); the displaced referent simply remains alive until process exit, an accepted bounded cost of the same kind as this exemption.
 
 This exemption exists because many static fields hold long-lived, resource-free objects — caches, registries, singleton configuration — whose only "resource" is heap memory. Requiring `owned` on every such field would force program-exit disposal ordering for objects that have no meaningful cleanup.
 
@@ -4442,7 +4458,9 @@ The following operators are also not overloadable, for various reasons:
 
 **Declaring-type operand (v0.160).** At least one parameter of an operator overload must be the declaring type; a binary overload may pair the declaring type with any other type in either position (as `DateTime.operator +(t: TimeSpan, d: DateTime)` does). An operator whose parameters never mention the declaring type would be unreachable by the resolution rule below.
 
-**Resolution (v0.160, codifying implemented behavior).** For `a <op> b` on non-primitive operands, the candidate set is the union of the `operator <op>` overloads declared on the **static types of both operands**; parameters match operands **in order** — there is no automatic commutation (`4 - v` is not matched against `operator -(v: V, n: int)`). If distinct applicable overloads are found on both operand types, the expression is a compile error citing the candidates (mirroring [§22.6](#sec-overloading)'s the-compiler-declines-to-guess stance). A unary operator consults the operand's type.
+**Resolution (v0.160, codifying implemented behavior; inheritance added v0.181).** For `a <op> b` on non-primitive operands, the candidate set is the union of the `operator <op>` overloads declared on the **static types of both operands, including declarations inherited from their base classes** (v0.181 — a derived-typed operand reaches its base's operators, as in C#: no user-facing upcast exists that could reach them otherwise, and [§12.2](#sec-hiding-is-not-allowed)'s no-hiding rule — which covers operator declarations per token, stated explicitly there in v0.181 — prevents a derived class from redeclaring an operator token its base declares, so one chain contributes no duplicate candidates). A derived-typed operand satisfies a base-typed parameter by the ordinary argument rules. Parameters match operands **in order** — there is no automatic commutation (`4 - v` is not matched against `operator -(v: V, n: int)`). If distinct applicable overloads are found on both operand types, the expression is a compile error citing the candidates (mirroring [§22.6](#sec-overloading)'s the-compiler-declines-to-guess stance). A unary operator consults the operand's type and its base classes, likewise.
+
+**Type-parameter operands (v0.181, connecting this section to [§11.8](#sec-static-interface-members)).** A generic type parameter declares no operators of its own; for an operand whose static type is a type parameter `T`, the candidate set is drawn from the **static-interface constraints** on `T` ([§11.8](#sec-static-interface-members)): the `static operator` members those interfaces declare, matched in order as above and bound at instantiation to the conforming type's own declarations. The complete-group rule below does double duty here: because every concrete type that declares one of `<`, `>`, `<=`, `>=` must declare all four, a constraint interface that declares any one of them (the stdlib `INumber<T>`/`ISteppable<T>` declare `<` alone) entitles the generic body to **all four** — each use still resolves at instantiation to the conforming type's *own* declaration of that operator, never by synthesizing `a > b` from `b < a`. The same holds for the `=`/`<>` pair. Primitive substitutions satisfy the entitlement through their intrinsic operator set ([§11.8](#sec-static-interface-members)'s compiler-provided conformances, §3.5).
 
 - `=` and `<>` may **not** be overloaded on classes or on inline arrays. For classes, `=` always invokes `Equals`. For inline arrays, the language-defined structural equality of [§8.3](#sec-equals-and-gethashcode) is the only `=` available; inline arrays cannot be extended ([§26.2](#sec-what-can-be-extended)), so the overload mechanism does not reach them. Records and enums may overload `=` and `<>`.
 - Comparison operators must be overloaded as a complete group: `<`, `>`, `<=`, `>=` together; `=` and `<>` together.
@@ -7385,7 +7403,7 @@ Exception
 ├─ IndexOutOfRangeException         — array or string index out of bounds.
 ├─ MatchFailureException            — case expression did not match.
 ├─ OperationCanceledException       — operation cancelled via CancellationToken.
-├─ TypeInitializationException      — static initialization failed; wraps the original.
+├─ TypeInitializationException      — static initialization failed; wraps the original (`InnerException` null for the §22.13 cycle backstop).
 ├─ FormatException                  — string does not conform to an expected format.
 └─ StackOverflowException           — call stack exhausted; cannot be caught; terminates the program.
 ```
@@ -7396,7 +7414,7 @@ All exceptions in the list above are catchable except `StackOverflowException`. 
 
 `DisposedAccessException` is raised only by implementations operating in checked disposal mode ([§28.2](#sec-checked-disposal)); in unchecked mode the same access is undefined behavior. Programs must not rely on it for control flow — it exists to convert a heisenbug into a deterministic fault during development, and a build is free to omit it.
 
-`TypeInitializationException` is the one built-in whose surface extends `Exception`'s: it exposes `public readonly property InnerException: Exception?`, carrying the original exception that escaped the static initializer ([§22.13](#sec-static-initialization-order); stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference)). **The cached `TypeInitializationException` and its `InnerException` are runtime-owned for the life of the process** (v0.162): they are exempt from [§31.1](#sec-throwing-and-catching)'s dispose-after-arm rule — the runtime does not dispose the cached instance when a catch arm completes, which is what makes re-raising the same instance on every subsequent touch of the failed type sound.
+`TypeInitializationException` is the one built-in whose surface extends `Exception`'s: it exposes `public readonly property InnerException: Exception?`, carrying the original exception that escaped the static initializer — or **`null`** for the instance the runtime synthesizes at [§22.13](#sec-static-initialization-order)'s same-thread re-entrancy backstop, where no original exception exists (v0.181) ([§22.13](#sec-static-initialization-order); stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference)). **The cached `TypeInitializationException` and its `InnerException` are runtime-owned for the life of the process** (v0.162): they are exempt from [§31.1](#sec-throwing-and-catching)'s dispose-after-arm rule — the runtime does not dispose the cached instance when a catch arm completes, which is what makes re-raising the same instance on every subsequent touch of the failed type sound.
 
 The principle behind the built-in list: an exception is built-in iff its only producer is a built-in operation (an array or string indexer, an integer arithmetic operation, the `case` construct, an async cancellation). Exceptions whose producer requires explicit `import` live alongside their producer in the standard library and require the same import.
 
@@ -7662,7 +7680,7 @@ Exporting Bezel methods to native callers, dynamic library loading at runtime, t
 <a id="sec-the-main-method"></a>
 ### 33.1 The `Main` method
 
-Every Bezel executable has exactly one entry point: a `public static method Main` declared on any class in the program's main module. The runtime locates this method and invokes it to start the program.
+Every Bezel executable has exactly one entry point: a `public static method Main` declared on a class in the program's **main module** — with several qualifying candidates permitted only under [§33.5](#sec-program-entry-point-resolution)'s explicit disambiguation. The **main module** is the module named as the build's executable target ([§2.4](#sec-compilation-unit)): the module for which the build requests an executable artifact (v0.181 — previously undefined). Only classes declared in the main module are searched for entry points: a qualifying signature in a dependency module — including a co-member of the main module's import SCC ([§2.5](#sec-dependency-resolution)), which is compiled *with* the main module but is not it — is an ordinary method, never an entry-point candidate. The runtime locates the entry point and invokes it to start the program.
 
 <a id="sec-accepted-signatures"></a>
 ### 33.2 Accepted signatures
@@ -8103,6 +8121,11 @@ OpToken         ::= "+" | "-" | "*" | "/" | "mod" | "&" | "|" | "^"
                   | "=" | "<>" | "~" | "++" | "--"
 
 NestedTypeDecl  ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
+                              /* The reused productions carry `Visibility?` for
+                                 the top-level default-internal rule (§13.2).
+                                 In nested position the visibility keyword is
+                                 required (§13.3, §11.6, v0.181); omission is
+                                 rejected semantically. */
 
 ParamList       ::= Param ("," Param)*
 Param           ::= ParamModifiers? Identifier ":" Type (":=" Expression)?
@@ -8153,7 +8176,10 @@ EnumMember      ::= MethodDecl | ExpressionPropertyDecl
 ExpressionPropertyDecl ::= Visibility "readonly"? "property" Identifier ":" Type "=>" Expression ";"
                   /* "readonly" is redundant on expression-bodied properties (no setter exists);
                      it is permitted for consistency with block-form property syntax. */
-StaticReadonlyDecl     ::= Visibility "static" "readonly" Identifier ":" Type ":=" Expression ";"
+StaticReadonlyDecl     ::= Visibility "static" "owned"? "readonly" Identifier ":" Type ":=" Expression ";"
+                  /* "owned" (v0.181): a static owned readonly field on an enum
+                     participates in §22.13's program-exit disposal exactly as on
+                     a class; modifier order per §11.5. */
 StaticConstDecl        ::= Visibility "const" Identifier (":" Type)? ":=" ConstExpr ";"
 
 Visibility      ::= "public" | "internal" | "protected" | "private"
@@ -8161,6 +8187,11 @@ Visibility      ::= "public" | "internal" | "protected" | "private"
 GenericParams   ::= "<" GenericParam ("," GenericParam)* ">"
 GenericParam    ::= Variance? Identifier
 Variance        ::= "in" | "out"
+                              /* Variance markers are semantically valid only on
+                                 interface type parameters (§12.9, v0.181; and not
+                                 on interfaces declaring static members, §11.8).
+                                 On class/record/method/alias parameters the
+                                 marker is rejected semantically. */
 GenericConstraints ::= "where" Identifier ":" Constraint ("," Constraint)*
                               /* The pre-v0.97 `where T is owned` modifier-
                                  constraint form is retired along with `<owned T>`
@@ -8687,7 +8718,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 
 - Every variable, field, parameter, and return value has a declared or inferred type.
 - Implicit conversions occur only as listed in [§5.1](#sec-implicit-conversions).
-- When more than one overload is applicable to a call only because arguments match through different implicit conversions ([§5.1](#sec-implicit-conversions)), the call resolves to the candidate that is unambiguously better — exact on every argument where another candidate converts, and never worse. An exact match is preferred over any implicit conversion; built-in implicit conversions are not ranked against one another. If no candidate is unambiguously better, the call is ambiguous and is a compile error citing the candidates ([§22.6](#sec-implicit-conversion-ranking)); the programmer disambiguates with an explicit cast. This mirrors overloaded method-reference resolution ([§27.6](#sec-method-references-to-overloaded-methods)).
+- When more than one overload is applicable to a call only because arguments match through different implicit conversions ([§5.1](#sec-implicit-conversions)), the call resolves to the candidate that is unambiguously better — exact on every argument where another candidate converts, and never worse. An exact match is preferred over any implicit conversion; built-in implicit conversions are not ranked against one another. If no candidate is unambiguously better, the call is ambiguous and is a compile error citing the candidates ([§22.6](#sec-implicit-conversion-ranking)); the programmer disambiguates with an explicit cast. This mirrors overloaded method-reference resolution ([§27.6](#sec-method-references-to-overloaded-methods)). A candidate applicable without filling any parameter default is preferred over one that fills defaults ([§22.6](#sec-implicit-conversion-ranking), v0.181).
 - A non-nullable reference may not be assigned `null`.
 - A nullable value may not be dereferenced without a null check or `!`.
 - Every non-nullable field is assigned in every constructor or has a field initializer.
@@ -8697,9 +8728,10 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A class with one or more `abstract` members must itself be `abstract`.
 - An abstract class cannot be instantiated with `new`.
 - Member hiding is forbidden: a derived class cannot reuse a base member's name unless overriding a virtual member.
-- An override must match the base member's visibility, return type, and parameter types exactly.
+- An override must match the base member's visibility, return type, and parameter types exactly, except that a parameter may widen `T` to `T?` ([§12.1](#sec-members-are-non-virtual-by-default), v0.181 — the same contravariant allowance as interface implementations); the widening is monotone down the override chain.
 - An inheritance cycle is rejected: no type may, directly or transitively, list itself among its base classes or extended interfaces ([§12.10](#sec-inheritance-cycles)).
 - A type may not declare two members that are indistinguishable: two fields, properties, events, or nested types of the same name, or two methods, constructors, or operator overloads of the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)), are a compile error; likewise a non-overloadable member (field, property, event, nested type) may not share its name with any other member regardless of kind. Legal overloads are unaffected ([§11.3](#sec-member-body)).
+- Neither `owned` (on an ordinary or `out` parameter) nor `scoped` distinguishes overloads: two members differing only in these modifiers clash ([§22.6](#sec-overloading), v0.181 — the v0.77 `out`/`out owned` carve-out is withdrawn).
 - Variant generic parameters (`in`, `out`) appear only in the appropriate position.
 - A variant assignment whose source has a value-type type argument is rejected; the type itself (e.g. `IEnumerable<int>`) is fully usable, only the variant conversion is forbidden ([§12.9](#sec-variance)).
 - Boxing a borrow-bearing record or a borrow-carrying inline array is subject to the same borrow-lifetime constraints as the unboxed value; the boxed value may not escape the source scope ([§8.6](#sec-boxing)). Move-only inline arrays (owning forms) cannot be boxed.
@@ -8756,6 +8788,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `where T: value` substitutions are non-nullable value types: records, enums, primitives, inline arrays (all forms, including owning `[N owned]…` forms — see [§15.3](#sec-move-only-value-types) for restrictions on copy operations in the generic body), the unit type. A nullable value type (e.g. `int?`) does not satisfy the constraint ([§14.2](#sec-constraints)).
 - `where T: SomeClass` substitutions are non-nullable subtypes of `SomeClass` — class types only (no interfaces, since interfaces do not extend classes).
 - `where T: IFoo` substitutions are non-nullable types conforming to `IFoo` per the [§14.2](#sec-constraints) conformance rule: classes implementing it (directly or by inheritance), records implementing it directly, and interfaces extending it (directly or transitively).
+- `where T: new()` substitutions are class types with a `public` parameterless constructor, or value types whose `default(T)` is well-defined; `new T()` for a value substitution is `default(T)` ([§14.2](#sec-constraints)).
 - Constraint combinations are checked for consistency (`class, value` is rejected).
 - Inside an unconstrained generic body, `T` is treated conservatively as possibly nullable.
 - `?` is idempotent under substitution: `T?` with T = `U?` denotes `U?` (no two-level optional; [§7.10](#sec-generics-and-nullability)).
@@ -8767,6 +8800,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 
 - Modifier order matches [§11.5](#sec-modifier-order).
 - A constructor's `base(...)` or `this(...)` call appears in the chain position before the body, not as a statement in the body (see [§12.8](#sec-constructor-chaining) and grammar A.4 `CtorChain`).
+- Field initializers run exactly once per instance construction — as step 2 of the constructor whose chain position holds `base(...)` or the implicit `base()`; a `this(...)`-chaining constructor skips them ([§22.8](#sec-field-initializers)).
 - A class with a primary constructor permits `base(...)` only on the primary constructor; non-primary constructors must chain with `this(...)`.
 - A static constructor takes no parameters and no access modifier.
 - A method declared `async` returns `Task`, `Task<T>`, `OwningTask<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningAsyncEnumerable<T>`, or `IOwningAsyncEnumerator<T>`.
@@ -8837,13 +8871,18 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 <a id="sec-static-initialization"></a>
 ### C.11 Static initialization
 
-- Cyclic static initialization across types is rejected.
+- Cyclic static initialization across types is rejected at compile time when visible to the [§22.13](#sec-static-initialization-order) dependency approximation (static-member references, followed transitively through statically-resolvable calls within the compilation unit); a cycle the approximation misses raises a runtime-synthesized `TypeInitializationException` (`InnerException` null) at the same-thread re-entrant touch — partially-initialized statics are never observed.
+- A type's static initializer runs exactly once process-wide; a cross-domain touch of a type mid-initialization blocks until initialization completes or observes the failed state ([§22.12](#sec-static-members) rule 1).
+- A mutable (non-`readonly`, non-`const`) static field or auto-property has one of [§22.12](#sec-static-members) rule 2's two admitted forms: an internally-synchronized handle type (`Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `ChannelSender<T>` — `Channel<T>` excluded) or a `Task?`/`Task<T>?` lazy cache; anything else is rejected.
+- `static readonly` and `const` of immutable content are unrestricted; a `static readonly` field of class or interface type outside the form-(i) synchronized set draws the [§22.12](#sec-static-members) rule 4 declaration-site warning.
+- A handler subscribed to a `static event` is capture-free; static-event subscriber lists are runtime-synchronized ([§22.12](#sec-static-members) rule 5).
+- The access that triggers a failing static initialization, and every subsequent access, observe the same cached `TypeInitializationException`; the original exception is observable only as its `InnerException` ([§22.7](#sec-constructors)).
 - A `const` declaration's initializer is a compile-time constant.
 
 <a id="sec-entry-point"></a>
 ### C.12 Entry point
 
-- A program defines exactly one qualifying `Main` method.
+- A program's main module ([§33.1](#sec-the-main-method)) defines exactly one qualifying `Main` method, or `--main-class` ([§33.5](#sec-program-entry-point-resolution)) selects one when several classes qualify; a qualifying `Main` in a dependency module is an ordinary method.
 - A class declares at most one qualifying `Main`; multiple qualifying overloads in the same class are rejected at compile time without flag-based override.
 - `Main` is `public static`. If `async`, its return type is `Task`, `Task<int>`, or one of the parameterized forms; otherwise it returns `()` or `int`.
 

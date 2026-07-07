@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.180 — July 2026**
+**Companion to the Bezel Language Specification, v0.181 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -853,11 +853,11 @@ One built-in carries surface beyond `Exception`'s and is recorded here for compl
 
 ```bezel
 public class TypeInitializationException: Exception
-  public readonly property InnerException: Exception?;   // the original initializer exception
+  public readonly property InnerException: Exception?;   // the original initializer exception (null for the spec §22.13 cycle backstop)
 end TypeInitializationException;
 ```
 
-Raised on access to a static member of a type whose static initialization failed; `InnerException` carries the original exception (language spec [§22.13](Bezel_Language_Spec.md#sec-static-initialization-order), [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)).
+Raised on access to a static member of a type whose static initialization failed; `InnerException` carries the original exception — `null` for the instance the runtime synthesizes at the static-init cycle backstop, where no original exists (language spec [§22.13](Bezel_Language_Spec.md#sec-static-initialization-order), [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)).
 
 ---
 
@@ -3348,7 +3348,7 @@ There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-
 <a id="sec-channel"></a>
 ### 6.9 `Channel<T>` and `ChannelSender<T>`
 
-Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex` ([§6.2](#sec-mutex-and-lock), v0.138) they are the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)).
+Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex` ([§6.2](#sec-mutex-and-lock), v0.138) they are the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's synchronized set).
 
 The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 
