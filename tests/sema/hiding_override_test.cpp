@@ -102,3 +102,23 @@ BEZEL_TEST(sema_hide, sealed_override_cannot_be_overridden_again) {
         "class C : B public override method M() _ := 3; end M; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §12.2 (v0.181, #1560): the hiding-escape clause reads "a matching
+// signature per §12.1" — which now admits the base-`T`/override-`T?`
+// nullability widening (§12.1) — so a widened `override` is recognized as a
+// legitimate override (escaping the hiding rule), not a same-name hiding
+// declaration. Regression coverage for #1090's overload-selection loop: the
+// hiding check picks a base candidate to validate the derived member
+// against BEFORE it can decide override-vs-hiding, and that selection must
+// use the SAME widening-aware predicate as the override-match check itself
+// (Resolver::overrideParamTypeMatches, shared via overrideParamsMatch), or
+// this widened member would be spuriously matched against the wrong
+// candidate and mis-diagnosed.
+BEZEL_TEST(sema_hide, widened_override_through_two_levels_ok) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class A public virtual method M(a: string) _ := 1; end M; end A; "
+        "class B : A public override method M(a: string?) _ := 2; end M; end B; "
+        "class C : B public override method M(a: string?) _ := 3; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

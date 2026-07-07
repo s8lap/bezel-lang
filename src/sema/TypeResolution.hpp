@@ -43,4 +43,12 @@ bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
 // other passes (e.g. §22.6 overload resolution).
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
+// Does a derived (override) parameter type MATCH a base parameter type —
+// exactly, or via the one nullability widening §12.1 admits (base `T`,
+// derived `T?`, v0.181, #1560)? The reverse (base `T?`, derived `T`) is NOT
+// a match. Exposes the resolver's override-match predicate for reuse by
+// other passes (e.g. §22.6's collectHierarchyOverloads, which must
+// recognize a widened override as shadowing — not overloading — its base).
+bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy);
+
 } // namespace bezel::sema

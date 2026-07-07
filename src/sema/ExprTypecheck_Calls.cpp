@@ -1,6 +1,6 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
-#include "sema/TypeResolution.hpp"  // typeRefEqual
+#include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 
 namespace bezel::sema {
 
@@ -395,11 +395,18 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                        std::vector<MethodSymbol*>& out) {
     if (!start) return;
     // Does an already-collected (more-derived) overload `d` shadow the base
-    // candidate `b`? An override re-declares the same signature in a derived
-    // class, so identical (arity + parameter types) means `b` is the method
-    // `d` overrides — keep only the most-derived one to avoid a spurious
-    // same-signature ambiguity. (A generic base param compares unequal to its
-    // concrete override and is left for §22.6 ranking to disambiguate.)
+    // candidate `b`? An override re-declares the base's signature in a
+    // derived class — exactly, or via §12.1's admitted parameter-nullability
+    // widening (base `T`, derived `T?`, v0.181, #1560) — so a matching
+    // signature (arity + per-parameter overrideParamTypeMatches) means `b`
+    // is the method `d` overrides: keep only the most-derived one so the
+    // widened override doesn't linger alongside its base declaration as a
+    // spurious second, separately-callable overload (which would leave a
+    // call resolved against the receiver's OWN (most-derived) declared type
+    // seeing two same-arity candidates and mis-classifying a `null` argument
+    // as inapplicable to both, per #22.6's exact/convert grid — #1560).
+    // (A generic base param compares unequal to its concrete override and is
+    // left for §22.6 ranking to disambiguate.)
     auto shadows = [&](MethodSymbol* d, MethodSymbol* b) -> bool {
         if (d->params.size() != b->params.size()) return false;
         for (std::size_t i = 0; i < d->params.size(); ++i) {
@@ -414,7 +421,7 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                        : dp->resolvedDeclType;
             TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
                                        : bp->resolvedDeclType;
-            if (!typeRefEqual(dt, bt)) return false;
+            if (!overrideParamTypeMatches(dt, bt)) return false;
         }
         return true;
     };

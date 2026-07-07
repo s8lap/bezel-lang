@@ -44,6 +44,18 @@ public:
     // wrapper `bezel::sema::typeRefEqual` in TypeResolution.hpp.
     static bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
+    // §12.1 (v0.181, #1560): does a derived (override) parameter type MATCH
+    // a base parameter type — exactly, or via the one admitted widening
+    // (base `T`, derived `T?`)? Mirrors §11.2's interface-implementation
+    // nullability allowance; the reverse (base `T?`, derived `T`) is NOT a
+    // match. Public so other passes (§22.6 overload-set dedup —
+    // ExprTC::collectHierarchyOverloads must recognize a widened override as
+    // shadowing its base declaration, not as a second, separately-callable
+    // overload) can reuse it via the free-function wrapper
+    // `bezel::sema::overrideParamTypeMatches` in TypeResolution.hpp.
+    static bool overrideParamTypeMatches(const TypeRef* derivedTy,
+                                         const TypeRef* baseTy);
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.

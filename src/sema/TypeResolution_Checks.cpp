@@ -57,6 +57,14 @@ bool typeRefEqual(const TypeRef* a, const TypeRef* b) {
     return Resolver::typeRefEqual(a, b);
 }
 
+// Free-function wrapper exposing §12.1's override parameter-nullability-
+// widening match predicate for reuse by other passes (§22.6 overload-set
+// dedup, #1560). Single source of truth: delegates to
+// Resolver::overrideParamTypeMatches.
+bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy) {
+    return Resolver::overrideParamTypeMatches(derivedTy, baseTy);
+}
+
 int Resolver::effVisRank(ast::Visibility v) {
     int r = visRank(v);
     return r == 0 ? 2 : r;  // None → internal
@@ -1584,6 +1592,78 @@ void Resolver::buildBaseGenericSubst(
     }
 }
 
+// §12.1 (v0.181, #1560) implementation note / #1592 follow-up: is `t` a
+// widening candidate whose nullable form is ABI-IDENTICAL to its non-null
+// form, so a vtable call built from an ancestor's narrower static type can
+// safely reach an override that widened this parameter?
+//
+// Reference types (class, interface, `string`, `Object`) always are: `T`
+// and `T?` both lower to a plain (possibly-null) pointer, so no thunk is
+// needed at the vtable slot regardless of which ancestor's declared type a
+// given call site used to build its call.
+//
+// VALUE types (numeric/bool primitives, enums, records — codegen's
+// isNullableValueTy) are NOT: `T?` lowers to a tagged `{i8 hasValue; T
+// value}` struct, a different runtime representation than the bare `T` the
+// original (un-widened) virtual declaration's ABI uses. §11.2's analogous
+// interface-implementation widening handles this with an adapter thunk
+// (ensureNullableWideningThunk, #1139/#1183) rewritten into every itable
+// slot; no equivalent thunk exists yet for virtual/override dispatch
+// (declareVtables installs the override's function pointer directly — CG35
+// Setup.cpp — so a slot reached through an ancestor's non-widened static
+// type would bitcast to the unboxed signature and pass a raw value where
+// the installed function expects the boxed struct, corrupting the call).
+// Until that vtable-thunk machinery exists, decline the widening for
+// value-typed parameters — see issue #1592.
+static bool overrideWideningIsAbiSafe(const TypeRef* t) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::Primitive) {
+        return t->primitive == PrimitiveType::Object ||
+               t->primitive == PrimitiveType::String;
+    }
+    if (t->kind == TypeRef::Kind::Named && t->declaration) {
+        return t->declaration->kind == ast::TypeDeclKind::Class ||
+               t->declaration->kind == ast::TypeDeclKind::Interface;
+    }
+    // Unresolved / declaration-less Named type (a generic type parameter, or
+    // a builtin whose concrete shape isn't visible here): the concrete
+    // instantiation could be a value type, so conservatively decline rather
+    // than risk the ABI corruption above.
+    return false;
+}
+
+// §12.1 (v0.181, #1560): does a derived (override) parameter type MATCH a
+// base parameter type — exactly, or via the one admitted widening (base `T`,
+// derived `T?`)? Mirrors §11.2's interface-implementation-matching
+// nullability allowance: "an implementation may declare a parameter as `T?`
+// where the interface requires `T`" — an override may likewise accept more
+// inputs than the virtual slot promises to pass. The reverse (base `T?`,
+// derived `T`) is NOT a match — a narrowing override would let a `null`
+// admitted through an intermediate static type reach a non-nullable
+// parameter. Widening is monotone down the chain because callers always
+// apply this predicate against the NEAREST overridden declaration: once a
+// parameter is `T?`, the next override's base type IS `T?`, so this
+// predicate demands the next override also declare `T?` (or narrower is
+// rejected, matching exactly is fine, but there is no "T?→T" widening case).
+// The widening is further restricted to ABI-safe (reference) types per
+// overrideWideningIsAbiSafe above — see issue #1592 for the value-type
+// follow-up (needs a vtable adapter thunk mirroring the itable one).
+bool Resolver::overrideParamTypeMatches(const TypeRef* derivedTy,
+                                        const TypeRef* baseTy) {
+    if (!derivedTy || !baseTy) return false;
+    if (typeRefEqual(derivedTy, baseTy)) return true;
+    // Only a base-non-nullable / derived-nullable pair can be a widening
+    // match; the reverse, or any other kind of mismatch, is rejected.
+    if (!derivedTy->nullable || baseTy->nullable) return false;
+    if (!overrideWideningIsAbiSafe(baseTy)) return false;
+    // Compare structurally with the derived type's `?` stripped — a plain
+    // stack copy is fine here, typeRefEqual only reads through the pointer
+    // for the duration of this call (no arena allocation needed).
+    TypeRef stripped = *derivedTy;
+    stripped.nullable = false;
+    return typeRefEqual(&stripped, baseTy);
+}
+
 bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
     if (!derived || !base) return false;
     if (derived->params.size() != base->params.size()) return false;
@@ -1600,7 +1680,7 @@ bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
         TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType) : nullptr;
         TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType) : nullptr;
         TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
-        if (!typeRefEqual(dt, btSubst)) return false;
+        if (!overrideParamTypeMatches(dt, btSubst)) return false;
     }
     return true;
 }
@@ -1660,9 +1740,12 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                    : nullptr;
         TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
                                    : nullptr;
-        // Apply substitution to base parameter type.
+        // Apply substitution to base parameter type. §12.1 (v0.181, #1560):
+        // a parameter may widen the base's `T` to `T?` (monotone down the
+        // chain — see overrideParamTypeMatches); every other mismatch,
+        // including the reverse `T?`→`T` narrowing, is rejected.
         TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
-        if (dt && btSubst && !typeRefEqual(dt, btSubst)) {
+        if (dt && btSubst && !overrideParamTypeMatches(dt, btSubst)) {
             err("parameter types");
             return;
         }
@@ -1745,10 +1828,26 @@ void Resolver::checkHidingAndOverride() {
             // single candidate use the most-derived (front) entry unchanged.
             MemberSymbol* base = bases.front();
             if (auto* dm = dynamic_cast<MethodSymbol*>(ms); dm && bases.size() > 1) {
+                // §12.1 (v0.181, #1560): pick the NEAREST ancestor class that
+                // declares an overload of this arity (bases is most-derived
+                // first), disambiguating same-arity candidates WITHIN that
+                // one class by full signature (#1090's original concern —
+                // several arities live across the chain). Once a nearer
+                // class has contributed an arity match, do NOT fall through
+                // to a farther ancestor even if it happens to signature-match
+                // better: matching anything but the nearest overridden
+                // declaration would let a derived override bypass an
+                // intermediate override's widened (`T?`) parameter and
+                // validate against the original (narrower) declaration
+                // instead — silently admitting a narrowing override and
+                // breaking the monotone-widening rule.
+                TypeSymbol* nearestClass = nullptr;
                 MemberSymbol* arityMatch = nullptr;
                 for (MemberSymbol* cand : bases) {
                     auto* bm = dynamic_cast<MethodSymbol*>(cand);
                     if (!bm || bm->params.size() != dm->params.size()) continue;
+                    if (nearestClass && cand->parent != nearestClass) break;
+                    nearestClass = cand->parent;
                     if (!arityMatch) arityMatch = cand;
                     if (overrideParamsMatch(dm, bm)) { arityMatch = cand; break; }
                 }
