@@ -913,9 +913,15 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
 }
 
 std::string_view Resolver::overloadModifier(std::string_view mod) {
-    if (mod == "owned" || mod.empty()) return "value";
-    if (mod == "out owned") return "out owned";
-    if (mod == "out") return "out";
+    // per §22.6 / §11.3 (v0.181): neither `owned` (ordinary or on an `out`
+    // parameter) nor `scoped` participates in overload resolution — only
+    // arity, parameter types, and the `ref`/`out` modifiers distinguish
+    // overloads. `owned` and `scoped` collapse to the plain form, and
+    // `out owned` collapses to `out` (the v0.77 `out`/`out owned` carve-out is
+    // withdrawn), so two members differing only in these markers are
+    // indistinguishable and clash.
+    if (mod == "owned" || mod == "scoped" || mod.empty()) return "value";
+    if (mod == "out owned" || mod == "out") return "out";
     if (mod == "ref") return "ref";
     return mod;
 }
@@ -963,8 +969,9 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
                         std::string("overload of ") + label +
                         " is indistinguishable from another overload "
                         "— overloads must differ in parameter count, "
-                        "types, or `ref`/`out` modifiers; ordinary "
-                        "`owned` does not distinguish (§22.6)");
+                        "types, or `ref`/`out` modifiers; neither `owned` "
+                        "(ordinary or on an `out` parameter) nor `scoped` "
+                        "distinguishes (§22.6/§11.3, v0.181)");
                 }
             }
         }
