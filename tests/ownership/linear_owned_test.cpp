@@ -61,6 +61,42 @@ BEZEL_TEST(own_linear, plain_var_with_explicit_dispose_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// §28.3 (#1500): the must-use auto-drop warning is suppressed "when it is
+// explicitly disposed or discarded — including through the null-conditional
+// and null-forgiving spellings `x?.Dispose()` / `x!.Dispose()`, required for
+// nullable owned locals." `x!.Dispose()` parses as a MemberAccessExpr whose
+// target is a PostfixBangExpr around the identifier; before the fix, only a
+// bare-IdentifierExpr receiver was recognized as the explicit-disposal
+// discharge, so this nullable-owned-local form (the repro from the issue:
+// `var t := move pool[0]; pool[0] := null; t!.Dispose();`) still warned.
+BEZEL_TEST(own_linear, nullable_var_with_bang_dispose_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x: T? := new T(); x!.Dispose();"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(bezel::test::hasAutoDropWarning(r, "x"));
+}
+
+// §28.3 (#1500): the null-conditional receiver spelling `x?.Dispose()` is the
+// other explicit-disposal form the spec names alongside `x!.Dispose()`; it
+// already worked (recognized via NullCondMemberExpr, #860) — pinned here as a
+// regression guard alongside the `!` fix above.
+BEZEL_TEST(own_linear, nullable_var_with_null_cond_dispose_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x: T? := new T(); x?.Dispose();"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(bezel::test::hasAutoDropWarning(r, "x"));
+}
+
+// §28.3 (#1500) NEGATIVE: a nullable owned local left undischarged must still
+// draw the must-use auto-drop warning — the `!`/`?` recognition above must not
+// over-suppress a genuinely undischarged local.
+BEZEL_TEST(own_linear, nullable_var_undischarged_still_diagnosed) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x: T? := new T();"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
+}
+
 BEZEL_TEST(own_linear, plain_var_with_move_clean) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); return move x;", "Make(): T"));

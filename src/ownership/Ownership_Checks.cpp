@@ -610,8 +610,16 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call->callee.get())) {
             if (ma->member == "Dispose") {
+                // §28.3 (#1500): the null-forgiving receiver spelling
+                // `x!.Dispose()` — required to discharge a NULLABLE owned
+                // local (e.g. the result of `move` on a `[N owned]T?` slot,
+                // §15.1.1) — parses as a MemberAccessExpr whose target is a
+                // PostfixBangExpr wrapping the identifier. Look through the
+                // `!` the same way `move x!` already does (lookThroughForce-
+                // Unwrap, #1125) so this counts as the explicit-disposal
+                // discharge just like the bare `x.Dispose()` form. // per §28.3
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        ma->target.get())) {
+                        lookThroughForceUnwrap(ma->target.get()))) {
                     markDisposedByName(id->name, id->span.begin);
                 }
             }
