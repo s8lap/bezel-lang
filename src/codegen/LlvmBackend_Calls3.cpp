@@ -3533,7 +3533,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                                 ptrTy(), envSlot, "spawn.lam.env");
 
                             // Invoke lambda: fn_ptr(env_ptr).
-                            builder_.CreateCall(lamFnTy, fnPtr, {envPtr});
+                            llvm::Value* lamRet =
+                                builder_.CreateCall(lamFnTy, fnPtr, {envPtr});
 
                             // Release closure cell in the spawned domain.
                             // Non-capturing lambda: rc=1→0, env=null, envdtor=null
@@ -3544,8 +3545,39 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(relFn, {cellArg});
 
-                            builder_.CreateRet(
-                                llvm::ConstantPointerNull::get(ptrTy()));
+                            // fix #1491: marshal the lambda's result into the
+                            // adapter's void* return, mirroring the static-method
+                            // adapter below. Per §30.14 / stdlib §6.8 a value entry
+                            // (`() -> R`) joins as a Task<R> whose result the runtime
+                            // reads back from these bytes; a class entry
+                            // (`() -> owned R`) crosses as the ptr; a unit entry
+                            // (`() -> ()`) crosses as null. Before this the adapter
+                            // always returned null, so `() => 42` joined to 0.
+                            // Async entries keep the null return here — the runtime
+                            // is meant to await the returned Task in-domain rather
+                            // than treat it as the result (#1490/#1492/#1493).
+                            if (lamExpr->isAsync ||
+                                lamRetTy->isVoidTy() ||
+                                lamRet->getType()->isVoidTy()) {
+                                builder_.CreateRet(
+                                    llvm::ConstantPointerNull::get(ptrTy()));
+                            } else if (lamRet->getType()->isPointerTy()) {
+                                builder_.CreateRet(lamRet);
+                            } else if (lamRet->getType()->isIntegerTy()) {
+                                llvm::Value* wide = lamRet;
+                                if (!wide->getType()->isIntegerTy(64))
+                                    wide = builder_.CreateZExt(wide, i64());
+                                builder_.CreateRet(
+                                    builder_.CreateIntToPtr(wide, ptrTy()));
+                            } else {
+                                // Floating-point / other value result: reinterpret
+                                // the bits as i64, then inttoptr (the join reads the
+                                // low bytes back out under the result type).
+                                llvm::Value* bits =
+                                    builder_.CreateBitCast(lamRet, i64());
+                                builder_.CreateRet(
+                                    builder_.CreateIntToPtr(bits, ptrTy()));
+                            }
 
                             currentFn_   = svFn;
                             currentThis_ = svThis;
