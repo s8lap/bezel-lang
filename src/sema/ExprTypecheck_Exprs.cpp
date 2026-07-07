@@ -2406,7 +2406,6 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return;
         }
     }
-    }
     // §25.1 (#1096): an arithmetic/bitwise/shift operator on a record/class
     // operand requires a matching user-defined overload whose parameters match
     // the operand ORDER (findBinaryOperator enforces the order; Bezel does not
