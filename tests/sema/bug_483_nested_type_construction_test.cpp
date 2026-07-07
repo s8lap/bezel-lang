@@ -186,7 +186,9 @@ BEZEL_TEST(sema_bug_483, new_nested_record_and_nested_enum_cast_accepted_955) {
     auto r = parseSemaAll(
         "module M; "
         "public class Outer public record Point(X: int, Y: int); "
-        "  enum E A, B; end E; end Outer; "
+        // per §13.3/§11.6 (v0.181, #1558): nested types require explicit
+        // visibility — no default.
+        "  public enum E A, B; end E; end Outer; "
         "public class Program public static method Main(): int "
         "  var p := new Outer.Point(10, 20); var e: Outer.E := Outer.E(1); "
         "  return p.X + int(e); "

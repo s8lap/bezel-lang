@@ -853,6 +853,18 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     // member-modifier set we already collected, so we hand them down.
     if (isKeyword("class") || isKeyword("interface") ||
         isKeyword("record") || isKeyword("enum")) {
+        // A nested type is a class member (§11.3) and is not one of §13.3's
+        // three no-visibility exceptions (static constructor, `polymorphic`
+        // registry, destructor); §11.6 states explicitly that its visibility
+        // keyword is required with no exception for nested types — omitting
+        // it is a compile error, not a default to §13.2's top-level
+        // default-internal.
+        if (visibility == ast::Visibility::None) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "nested type declarations require explicit visibility "
+                "(§13.3, §11.6)");
+        }
         // Modifiers that are valid on nested types are the same as on
         // top-level types per A.3 — `abstract`/`sealed`/`static`. The
         // member-modifier set is a superset; semantic validation belongs

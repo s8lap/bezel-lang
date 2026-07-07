@@ -128,3 +128,71 @@ BEZEL_TEST(parser_nested_type, mixed_members_with_nested) {
     BEZEL_EXPECT_EQ(ms.size(), std::size_t(3));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §13.3/§11.6 (v0.181, #1558): a nested type is a class member (§11.3), and
+// §13.3's explicit-visibility rule states no exception for nested types (the
+// three exceptions are the static constructor, the `polymorphic` registry
+// declaration, and the destructor — none of which is a nested type). Omitting
+// the visibility keyword on a nested `class` is a compile error, not a
+// default to §13.2's top-level default-internal.
+BEZEL_TEST(parser_nested_type,
+           nested_class_without_visibility_rejected_spec_13_3) {
+    auto r = parseAll(
+        "module M; class Outer "
+        "  class Inner end Inner; "
+        "end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool mentionsExplicitVisibility = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("explicit visibility") != std::string::npos) {
+            mentionsExplicitVisibility = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(mentionsExplicitVisibility);
+}
+
+// §13.3/§11.6: the rejection applies uniformly to every nested-type kind
+// admitted by A.4 NestedTypeDecl — record, enum, and interface, not just
+// class.
+BEZEL_TEST(parser_nested_type,
+           nested_record_without_visibility_rejected_spec_13_3) {
+    auto r = parseAll(
+        "module M; class Outer "
+        "  record Point(x: int, y: int); "
+        "end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(parser_nested_type,
+           nested_enum_without_visibility_rejected_spec_13_3) {
+    auto r = parseAll(
+        "module M; class Outer "
+        "  enum Color Red, Green, Blue; end Color; "
+        "end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(parser_nested_type,
+           nested_interface_without_visibility_rejected_spec_13_3) {
+    auto r = parseAll(
+        "module M; class Outer "
+        "  interface IThing method DoIt(): int; end IThing; "
+        "end Outer;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §13.3/§11.6: control — supplying the visibility keyword is accepted, with
+// no diagnostic (the positive counterpart to the four rejections above).
+BEZEL_TEST(parser_nested_type,
+           nested_class_with_explicit_visibility_accepted_spec_13_3) {
+    auto r = parseAll(
+        "module M; class Outer "
+        "  private class Inner end Inner; "
+        "end Outer;");
+    const auto ms = memberSummaries(r);
+    if (ms.size() == 1)
+        BEZEL_EXPECT_EQ(
+            ms[0], std::string("nested private class Inner"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
