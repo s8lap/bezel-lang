@@ -102,6 +102,81 @@ BEZEL_TEST(codegen_ffi_types, intptr_uintptr_resolve_32_7) {
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
 
+// §32.7 / stdlib §10.0 (#1512): `IntPtr.Zero` — the null-pointer const — as an
+// EXPRESSION head, and the `=` null test. This is the shape the spec's own
+// §32.6 `getenv` and §32.7 `dlopen` examples require (`if handle = IntPtr.Zero
+// then ...`). Before the fix, `IntPtr` errored "unresolved identifier" here.
+BEZEL_TEST(codegen_ffi_types, intptr_zero_expr_head_and_equality_32_7) {
+    // var p := IntPtr.Zero; if p = IntPtr.Zero then return 0; end; return 1;
+    auto r = runJit(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var p := IntPtr.Zero; "
+        "  if p = IntPtr.Zero then return 0; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §32.7 / §5.2 / stdlib §10.0 (#1512): the explicit conversion `IntPtr(long)`
+// as an expression head, and `<>`. `IntPtr(0L)` equals `IntPtr.Zero`; a
+// non-zero conversion does not. Mirrors §5.2's explicit-conversion syntax.
+BEZEL_TEST(codegen_ffi_types, intptr_long_conversion_32_7) {
+    auto r = runJit(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var p0 := IntPtr(0L); "
+        "  if p0 <> IntPtr.Zero then return 1; end; "
+        "  var p5 := IntPtr(5L); "
+        "  if p5 = IntPtr.Zero then return 2; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §32.7 / stdlib §10.0 (#1512): the UIntPtr counterparts — `UIntPtr.Zero`, the
+// `UIntPtr(ulong)` conversion, and `=`/`<>`.
+BEZEL_TEST(codegen_ffi_types, uintptr_zero_and_conversion_32_7) {
+    auto r = runJit(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var z := UIntPtr.Zero; "
+        "  if z <> UIntPtr.Zero then return 1; end; "
+        "  var u := UIntPtr(7UL); "
+        "  if u = UIntPtr.Zero then return 2; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §32.7 / §5.2 / stdlib §10.0 (#1512): the reverse conversion `long(IntPtr)`
+// round-trips a value through the pointer-sized integer.
+BEZEL_TEST(codegen_ffi_types, intptr_long_roundtrip_32_7) {
+    auto r = runJit(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var p := IntPtr(42L); "
+        "  return int(long(p)); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// §32.7 (#1512): a non-integer argument to the `IntPtr(...)` conversion is a
+// compile error (§32.7: conversions are to and from `long`/`ulong`).
+BEZEL_TEST(codegen_ffi_types, intptr_conversion_rejects_non_integer_32_7) {
+    auto r = runJit(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var p := IntPtr(\"hello\"); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
 // §32.5 / stdlib §10.1: CString resolves as an extern param + return type.
 BEZEL_TEST(codegen_ffi_types, cstring_resolve_32_5) {
     auto r = runJit(

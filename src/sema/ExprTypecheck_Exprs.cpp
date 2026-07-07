@@ -463,6 +463,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // §5.2: a primitive type name used in expression position is
             // a conversion callee (`int(x)`). It has no value symbol;
             // the enclosing call resolves the conversion (typeCall).
+        } else if (id->name == "IntPtr" || id->name == "UIntPtr") {
+            // §32.7 / stdlib §10 (#1512): IntPtr/UIntPtr are compiler-intrinsic
+            // value types (pointer-sized integers). In expression position the
+            // bare type name is the head of either the static const `.Zero`
+            // (`IntPtr.Zero`) or the explicit conversion `IntPtr(longValue)`
+            // (§5.2). Like a primitive type name, it carries NO value symbol;
+            // the enclosing member-access (resolveMemberAccess) or call
+            // (typeCall) resolves it. Silently pass so it is not reported as an
+            // "unresolved identifier" — the spec's own §32.6/§32.7 null-handle
+            // examples depend on `handle = IntPtr.Zero`.
         } else if (id->name == "Console" || id->name == "Math" ||
                    id->name == "Convert" || id->name == "Environment" ||
                    id->name == "Random" ||

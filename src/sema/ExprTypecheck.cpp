@@ -155,6 +155,23 @@ TypeSymbol* ExprTC::builtinClassSym(std::string_view name) {
     return ts;
 }
 
+// §32.7 / stdlib §10: a value-builtin (IntPtr/UIntPtr) resolved by NAME. The
+// TypeRef carries astNode (single-part name) with declaration=null, exactly the
+// shape produced by parsing a `: IntPtr` annotation, so codegen's layout lowers
+// it to a pointer-sized integer (i64 host). See LlvmBackend_Layout.cpp's FFI
+// value-type branch. Mirrors the `rb.Pointer` → IntPtr synthesis (fix #985).
+TypeRef* ExprTC::namedValueBuiltinRef(std::string_view name) {
+    auto* tr = ctx_.makeTypeRef();
+    tr->kind = TypeRef::Kind::Named;
+    auto* ann = new ast::Type();
+    ann->kind = ast::TypeKind::Named;
+    auto* nm = new ast::QualifiedName();
+    nm->parts.push_back(std::string(name));
+    ann->name.reset(nm);
+    tr->astNode = ann;
+    return tr;
+}
+
 // Slice S29: report when a bare identifier inside a field
 // initializer resolves to a non-static member of the current type
 // (an implicit-`this` reference, forbidden by §22.8). Static

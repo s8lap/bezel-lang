@@ -297,6 +297,14 @@ private:
     // Return (or lazily create) a synthetic TypeSymbol for a built-in class.
     TypeSymbol* builtinClassSym(std::string_view name);
 
+    // §32.7 / stdlib §10: build a Named TypeRef for a value-builtin resolved
+    // by NAME (declaration=null, astNode carries the single-part name). This is
+    // the shape codegen's layout keys off to lower IntPtr/UIntPtr to a
+    // pointer-sized integer (i64 on host) — a builtinClassSym (Class-kind)
+    // declaration would instead lower as a reference pointer. Mirrors the
+    // `rb.Pointer` → IntPtr synthesis (fix #985).
+    TypeRef* namedValueBuiltinRef(std::string_view name);
+
     // Slice S29: report when a bare identifier inside a field
     // initializer resolves to a non-static member of the current type
     // (an implicit-`this` reference, forbidden by §22.8). Static

@@ -1973,6 +1973,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     // tryLowerBuiltinClassCall (CallExpr path); but if accessed
                     // without () (not valid Bezel for factories), return nullptr.
                 }
+                // §32.7 / stdlib §10 (#1512): IntPtr.Zero / UIntPtr.Zero — the
+                // null pointer (integer 0). IntPtr/UIntPtr lower to a
+                // pointer-sized integer (i64 host), so the null value is i64 0.
+                if ((id->name == "IntPtr" || id->name == "UIntPtr") &&
+                    ma->member == "Zero")
+                    return builder_.getInt64(0LL);
                 if (id->name == "int") {
                     if (ma->member == "MaxValue")
                         return llvm::ConstantInt::getSigned(i32(), 2147483647);

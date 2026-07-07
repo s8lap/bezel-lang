@@ -2419,6 +2419,31 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             sema::PrimitiveType pt = sema::primitiveFromName(cid->name);
             if (pt != sema::PrimitiveType::None)
                 return lowerConversion(pt, call);
+            // §32.7 / §5.2 / stdlib §10 (#1512): the explicit conversion
+            // `IntPtr(longValue)` / `UIntPtr(ulongValue)`. IntPtr/UIntPtr are
+            // pointer-sized integers (i64 host), so the conversion is an integer
+            // width-adjustment of the argument to i64 (identity when the source
+            // is already `long`/`ulong`). Sign of any widening follows the
+            // source's signedness (sema restricts the argument to an integer).
+            if ((cid->name == "IntPtr" || cid->name == "UIntPtr") &&
+                call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                if (v->getType()->isIntegerTy()) {
+                    unsigned bw = v->getType()->getIntegerBitWidth();
+                    if (bw < 64) {
+                        bool srcUns = false;
+                        if (auto* at = ctx_.exprType(*call.args[0].value))
+                            if (at->kind == sema::TypeRef::Kind::Primitive)
+                                srcUns = isUnsignedPrim(at->primitive);
+                        v = srcUns ? builder_.CreateZExt(v, i64(), "intptr.zext")
+                                   : builder_.CreateSExt(v, i64(), "intptr.sext");
+                    } else if (bw > 64) {
+                        v = builder_.CreateTrunc(v, i64(), "intptr.trunc");
+                    }
+                }
+                return v;
+            }
         }
     }
     sema::Symbol* calleeSym = ctx_.exprSymbol(*call.callee);

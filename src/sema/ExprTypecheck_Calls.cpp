@@ -901,6 +901,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // §32.7 / §5.2 / stdlib §10 (#1512): the explicit conversion
+    // `IntPtr(longValue)` / `UIntPtr(ulongValue)` — the callee is the intrinsic
+    // FFI value-type name (no value symbol, silently passed at the identifier
+    // head). Per §32.7 these are compiler-intrinsic conversions using the
+    // standard explicit-conversion syntax, NOT `new`-constructions; type the
+    // call as IntPtr/UIntPtr. The single argument must be an integer primitive
+    // (§32.7: "conversions to and from `long`/`ulong`"; narrower integers widen
+    // to `long`). Result lowers to a pointer-sized integer (i64).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
+        if (!ctx_.exprSymbol(*ce.callee) &&
+            (id->name == "IntPtr" || id->name == "UIntPtr")) {
+            if (ce.args.size() == 1 && ce.args[0].value) {
+                const TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                auto isIntegerPrim = [](PrimitiveType p) {
+                    switch (p) {
+                        case PrimitiveType::Byte:  case PrimitiveType::SByte:
+                        case PrimitiveType::Short: case PrimitiveType::UShort:
+                        case PrimitiveType::Int:   case PrimitiveType::UInt:
+                        case PrimitiveType::Long:  case PrimitiveType::ULong:
+                            return true;
+                        default: return false;
+                    }
+                };
+                bool ok = argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                          !argTy->nullable && isIntegerPrim(argTy->primitive);
+                if (!ok) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "the argument to the `" + std::string(id->name) +
+                        "(...)` conversion must be an integer (§32.7/§5.2: "
+                        "`" + std::string(id->name) +
+                        "` converts to and from `long`/`ulong`)");
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "the `" + std::string(id->name) +
+                    "(...)` conversion takes exactly one integer argument "
+                    "(§32.7/§5.2)");
+            }
+            ctx_.setExprType(&ce, namedValueBuiltinRef(id->name));
+            return;
+        }
+    }
     Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
     // §5.4: an enum cast `E(i)` — the callee is an enum type name; the
     // call produces a value of that enum type. (Records are NOT
@@ -7729,6 +7773,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctTy->kind = TypeRef::Kind::Named;
                 ctTy->declaration = builtinClassSym("CancellationToken");
                 ctx_.setExprType(&ma, ctTy);
+                return;
+            }
+        }
+    }
+    // §32.7 / stdlib §10 (#1512): `IntPtr.Zero` / `UIntPtr.Zero` — the null
+    // pointer, a compiler-provided static `const` on the FFI value type. The
+    // target `IntPtr`/`UIntPtr` identifier carries no symbol (silently passed at
+    // the identifier head), so the ordinary member-lookup path finds nothing.
+    // Type the access as the value-builtin (declaration=null astNode shape) so
+    // it lowers to a pointer-sized integer (i64) and a downstream
+    // `handle = IntPtr.Zero` types as `bool` (both operands Named IntPtr, no
+    // declaration → no record-equality error). Codegen emits the i64 0.
+    if (ma.target) {
+        if (auto* pid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if ((pid->name == "IntPtr" || pid->name == "UIntPtr") &&
+                ma.member == "Zero") {
+                ctx_.setExprType(&ma, namedValueBuiltinRef(pid->name));
                 return;
             }
         }
