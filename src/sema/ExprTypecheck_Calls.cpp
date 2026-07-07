@@ -1,5 +1,7 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
+#include <algorithm>  // std::find (isCaptureFreeEntry's static-modifier check)
+
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 
 namespace bezel::sema {
@@ -5516,6 +5518,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // from the resolved entry expression's Function TypeRef.
                     const TypeRef* entryFnTy = entryExpr ? ctx_.exprType(*entryExpr)
                                                           : nullptr;
+                    // fix #1492: an UNQUALIFIED static method reference (a bare
+                    // IdentifierExpr, e.g. `Domain.Spawn(Compute, ...)` from
+                    // inside the declaring class) never gets a Function-typed
+                    // exprType set — resolveMemberAccess's MethodSymbol branch
+                    // (above) builds one only for the qualified `Type.Method`
+                    // spelling. That gap is deliberate elsewhere (codegen's
+                    // isPlusOneClosureProducer keys off the symbol kind rather
+                    // than exprType for a bare reference — see
+                    // LlvmBackend_Setup.cpp), so synthesize the Function
+                    // TypeRef locally here instead of widening that invariant
+                    // project-wide: without this, entryReturnTy stayed null
+                    // for the unqualified spelling and the spawn call was
+                    // mistyped as a bare (payload-less) OwningTask instead of
+                    // OwningTask<R>/Task<R>, corrupting the join's result.
+                    TypeRef* entrySynthFnTy = nullptr;
+                    if ((!entryFnTy || entryFnTy->kind != TypeRef::Kind::Function) &&
+                        entryExpr) {
+                        if (auto* entryMs = dynamic_cast<MethodSymbol*>(
+                                ctx_.exprSymbol(*entryExpr))) {
+                            entrySynthFnTy = ctx_.makeTypeRef();
+                            entrySynthFnTy->kind = TypeRef::Kind::Function;
+                            for (Symbol* psym : entryMs->params) {
+                                auto* par = dynamic_cast<ParameterSymbol*>(psym);
+                                if (!par) continue;
+                                TypeRef::FuncParam fp;
+                                fp.modifier = par->modifier;
+                                fp.name = par->name;
+                                if (par->declType)
+                                    fp.type = ctx_.resolvedType(*par->declType);
+                                entrySynthFnTy->funcParams.push_back(fp);
+                            }
+                            auto* md = dynamic_cast<const ast::MethodDecl*>(
+                                entryMs->decl);
+                            if (md && md->returnType) {
+                                entrySynthFnTy->funcReturn =
+                                    ctx_.resolvedType(*md->returnType);
+                                entrySynthFnTy->funcReturnOwned = md->returnOwned;
+                            } else {
+                                auto* unit = ctx_.makeTypeRef();
+                                unit->kind = TypeRef::Kind::Unit;
+                                entrySynthFnTy->funcReturn = unit;
+                            }
+                            entryFnTy = entrySynthFnTy;
+                        }
+                    }
                     const TypeRef* entryReturnTy = nullptr;
                     std::vector<const TypeRef*> entryParamTypes;
 
@@ -10516,10 +10563,16 @@ bool ExprTC::isSendable(const TypeRef* rt,
 }
 
 // ===========================================================================
-// §30.14 (#600): capture-free entry detection for Domain.Spawn.
+// §30.14 (#600, #1492): capture-free entry detection for Domain.Spawn.
 // A "capture-free" entry is either:
-//   (a) a static method reference `Type.Method` (MemberAccessExpr whose
-//       target resolves to a TypeSymbol), or
+//   (a) a static method reference, written either qualified `Type.Method`
+//       (MemberAccessExpr whose target resolves to a TypeSymbol) or
+//       unqualified `Method` (IdentifierExpr resolving directly to a static
+//       MethodSymbol) — both spellings name the same static method with no
+//       receiver, so both are capture-free (§27.6 method-reference
+//       resolution already accepts the unqualified spelling in ordinary
+//       function-value positions; the spawn classifier must accept it too),
+//       or
 //   (b) a non-capturing lambda (a LambdaExpr whose body does NOT reference
 //       any local or parameter from the enclosing scope).
 // ===========================================================================
@@ -10527,7 +10580,8 @@ bool ExprTC::isSendable(const TypeRef* rt,
 bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) const {
     if (!entryExpr) return false;
 
-    // (a) Static method reference: MemberAccessExpr whose target is a type.
+    // (a) Static method reference, qualified: MemberAccessExpr whose target
+    // is a type.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(entryExpr)) {
         // The target should resolve to a TypeSymbol for a static method ref.
         if (ma->target) {
@@ -10535,6 +10589,18 @@ bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) const {
             if (dynamic_cast<TypeSymbol*>(tgtSym)) return true; // static ref
         }
         return false; // instance method ref
+    }
+
+    // (a) Static method reference, unqualified: IdentifierExpr resolving
+    // directly to a static MethodSymbol of the enclosing class. per §30.14
+    if (dynamic_cast<const ast::IdentifierExpr*>(entryExpr)) {
+        Symbol* sym = ctx_.exprSymbol(*entryExpr);
+        if (auto* ms = dynamic_cast<MethodSymbol*>(sym)) {
+            return std::find(ms->modifiers.begin(), ms->modifiers.end(),
+                              std::string_view("static")) !=
+                   ms->modifiers.end();
+        }
+        return false; // not a method reference at all
     }
 
     // (b) Non-capturing lambda.

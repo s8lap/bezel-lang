@@ -104,6 +104,42 @@ BEZEL_TEST(send_600_spawn_callsite,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// fix #1492 / §30.14: an UNQUALIFIED static method reference (same class,
+// no receiver) as entry with no args → accepted, exactly like the qualified
+// `Type.Method` spelling above. In a static class no receiver can ever
+// exist, so an unqualified reference is exactly as capture-free as the
+// qualified one — the classifier previously recognized only the qualified
+// MemberAccessExpr form and wrongly rejected this bare IdentifierExpr form.
+BEZEL_TEST(send_600_spawn_callsite,
+           unqualified_static_method_ref_entry_accepted_1492) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Main "
+        "  public static method Run() end Run; "
+        "  public static async method Go(): Task "
+        "    using var t := Domain.Spawn(Run); "
+        "    await t; "
+        "  end Go; "
+        "end Main;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// fix #1492 / §30.14: an unqualified static method reference with a
+// sendable value-type arg → accepted.
+BEZEL_TEST(send_600_spawn_callsite,
+           unqualified_static_method_with_sendable_int_arg_accepted_1492) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Main "
+        "  public static method Run(n: int) end Run; "
+        "  public static async method Go(): Task "
+        "    using var t := Domain.Spawn(Run, 42); "
+        "    await t; "
+        "  end Go; "
+        "end Main;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // ---------------------------------------------------------------------------
 // Rejected forms: capturing lambda / instance method reference.
 // ---------------------------------------------------------------------------
@@ -143,6 +179,27 @@ BEZEL_TEST(send_600_spawn_callsite,
         "  end Go; "
         "end Main;");
     // Rejected: w.Run is an instance method reference (receiver is a borrow).
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// fix #1492 / §30.14: an unqualified reference to an INSTANCE method
+// (implicit `this` receiver) is still rejected — only a static method
+// qualifies as capture-free, whether written qualified or unqualified;
+// dropping the qualifier must not smuggle an instance method past the
+// classifier.
+BEZEL_TEST(send_600_spawn_callsite,
+           unqualified_instance_method_ref_entry_rejected_1492) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Worker "
+        "  public method Run() end Run; "
+        "  public async method Go(): Task "
+        "    using var t := Domain.Spawn(Run); "  // implicit this.Run
+        "    await t; "
+        "  end Go; "
+        "end Worker;");
+    // Rejected: bare `Run` here is an implicit this.Run instance method
+    // reference (receiver is a borrow of the origin domain).
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
