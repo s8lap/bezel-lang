@@ -81,10 +81,11 @@ Things this example is deliberately showing:
 
 ## 3. `Msg` and the honest sum-type gap
 
-Elm's `Msg` is a closed tagged union. Bezel has no unions; the spelling above — a marker interface + one record per kind + type/destructure patterns — is the idiomatic encoding, and it works today. Two honest costs, recorded rather than hidden:
+Elm's `Msg` is a closed tagged union. Bezel has no unions; the spelling above — a marker interface + one record (or, for collection payloads, one sealed sendable class — cost 3) per kind + type/destructure patterns — is the idiomatic encoding, and it works today. Three honest costs, recorded rather than hidden:
 
 1. **No static exhaustiveness**: an interface scrutinee is an open set (§19.6), so `update` needs the `_ => model` arm, and forgetting a new message kind is a silent no-op rather than a compile error. This is the strongest argument this proposal generates for a future **closed-set construct** (`sealed interface` / union) — noted as a language keep-in-mind, *not* proposed here.
 2. Message records with payloads are one line each (`record SetTo(Value: int): Msg;`) — mild ceremony, acceptable.
+3. **Collection payloads cannot be records.** A record with a class-typed field (an `Array<string>`, any collection) is *borrow-bearing* (§9.7) and therefore **not sendable** (§30.14's value rule), and records cannot declare `owned` fields (§14.4) — so no record can *own* a collection to carry it across a domain. A message whose payload is a collection must be a **sealed sendable class with an `owned` field** (§30.14 class rule 2), as `UsersLoaded` is in §4. Scalar / `string` / value payloads stay records; only collection-bearing messages pay this cost.
 
 ## 4. Control beyond clicks: async effects as messages
 
@@ -92,8 +93,11 @@ The Elm rule: `update` never performs effects; it *requests* them, and completio
 
 ```bezel
 record FetchUsers(): Msg;
-record UsersLoaded(Names: Array<string>): Msg;      // value payloads: sendable
-record FetchFailed(Reason: string): Msg;
+sealed class UsersLoaded: Msg                        // collection payload ⇒ sealed sendable CLASS with an owned field (§30.14), *not* a record — see §3, cost 3
+  public readonly property Names: Array<string>;    //   the message owns its collection and transfers it across the domain boundary
+  public constructor(owned names: Array<string>);
+end UsersLoaded;
+record FetchFailed(Reason: string): Msg;            // string payload: sendable
 
 public static method Update(model: AppModel, msg: Msg, fx: Effects): AppModel
   return case msg of
@@ -104,13 +108,13 @@ public static method Update(model: AppModel, msg: Msg, fx: Effects): AppModel
       fx.Run(async () => do
         try
           using var resp := await Http.Get("https://api.example.com/users");
-          return new UsersLoaded(await resp.Json<Array<string>>());
-        catch e: HttpError => return new FetchFailed(e.Message);
+          return new UsersLoaded(await resp.JsonOwned<Array<string>>());
+        catch var e: HttpException => return new FetchFailed(e.Message);
         end;
       end);
       return model with Loading := true;
     end,
-    UsersLoaded(var names) => model with Loading := false, Users := names,
+    var m: UsersLoaded => model with Loading := false, Users := m.Names,
     FetchFailed(var why)   => model with Loading := false, Error := why,
     _ => model
   end;

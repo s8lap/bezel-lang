@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Tracking issue** | [#1457](https://github.com/s8lap/bezel-lang/issues/1457) |
-| **Target module** | `System.Collections.Linq` (§5, auto-imported) |
+| **Target module** | `System.Collections.Linq` (§5; requires `import System.Collections.Linq` — not auto-imported, spec §2.3 auto-imports only System / System.Text, and the spec's own LINQ examples write the import) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Gap-review item** | #18 (P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Wave** | D3 — library breadth, per [stdlib-gap-design-plan-2026-07.md](stdlib-gap-design-plan-2026-07.md) |
@@ -24,7 +24,7 @@ public method Select<U>(selector: (T, int) -> U): IEnumerable<U>;
 public method Where(predicate: (T, int) -> bool): IEnumerable<T>;
 ```
 
-These are **lazy** and **single-consumption** (spec §29.11), exactly as the existing non-indexed forms (stdlib §5). The index is zero-based and increments by one per element in source order. Both overloads are additions alongside the existing `Select<U>((T) -> U)` and `Where((T) -> bool)`; they do not replace them. Bezel's overload resolution distinguishes the two by lambda arity — a one-argument lambda selects the existing form; a two-argument lambda selects the indexed form. The `owned` overload-ban (spec §22.3, v0.169) does not apply here because the parameter types differ structurally (`(T) -> U` vs `(T, int) -> U`).
+These are **lazy** and **single-consumption** (spec §29.11), exactly as the existing non-indexed forms (stdlib §5). The index is zero-based and increments by one per element in source order. Both overloads are additions alongside the existing `Select<U>((T) -> U)` and `Where((T) -> bool)`; they do not replace them. Bezel's overload resolution distinguishes the two by lambda arity — a one-argument lambda selects the existing form; a two-argument lambda selects the indexed form. The `owned` overload-ban (spec §22.6, v0.169) does not apply here because the parameter types differ structurally (`(T) -> U` vs `(T, int) -> U`).
 
 No alternative lambda-type conventions were considered; the `(T, int) -> U` form exactly matches the convention used by all other two-argument lambdas in the stdlib (e.g. `Aggregate`'s `(TAccum, T) -> TAccum`).
 
@@ -113,7 +113,7 @@ var longestOrNone := words.MaxByOrNull(w => w.Length);   // null if words is emp
 **`Chunk`.** Partitions the source into consecutive sub-arrays each of `size` elements; the final chunk contains the remainder elements when the source length does not divide evenly. Eager: all chunks are allocated before the method returns. The result is `owned OwningArray<Array<T>>` — the outer `OwningArray` owns and will dispose each inner `Array<T>` chunk container; the inner arrays hold borrowed (for class T) or copied (for value T) elements from the source, identically to `ToArray()`.
 
 ```bezel
-using var chunks := Enumerable.Range(1, 10).Chunk(3);
+using var chunks := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].Chunk(3);   // an Array<int> literal (§15.4) is IEnumerable<int>
 // chunks contains [1,2,3], [4,5,6], [7,8,9], [10]
 for var chunk in chunks do
   ProcessBatch(chunk);

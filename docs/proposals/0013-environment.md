@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System` (auto-imported): additions to `Environment` (§2.4) + new `OperatingSystem` static class |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1441](https://github.com/s8lap/bezel-lang/issues/1441) |
@@ -112,3 +112,12 @@ Console.WriteLine($"PID {Environment.ProcessId}: config dir = {configDir}");
 1. **`SetEnvironmentVariable` and §22.12.** `SetEnvironmentVariable(name, value)` already exists in §2.4 and is a process-global write of a `string?` value. Under §22.12 rule 2, a mutable static can only hold an internally-synchronized type; a method on a static class that *mutates* process-global state via a syscall is a grey area not covered by the rule as written. Should this be called out as an existing anomaly to resolve (e.g. restrict to the main domain only, or declare it "synchronized by the OS"), or left as-is?
 
 2. **`IsMacOS()` naming.** The gap review uses `IsMacOS`. Is the capital `OS` acceptable (matching `OSVersion` in §2.4 and the .NET spelling), or should it be `IsMacos()` following the non-.NET acronym rule (v0.165 rationale, #1359)?
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+The two §5 questions are resolved as follows; the additions (`CurrentDirectory`/`ProcessId` getters, `OperatingSystem`) land as §2.4/§2.5 amendments through the normal docs workflow.
+
+- **Q2 — spelling is `IsMacOS()`.** Capital `OS` matches `OSVersion` in §2.4 (an existing acronym-cased member) and the gap-review spelling; the non-.NET acronym rule (#1359) does not override an already-established local convention for `OS`.
+- **Q1 — `SetEnvironmentVariable` × §22.12: do not block this proposal; fold into the statics-×-domains ruling context (#1363).** The observation is genuine — a static method that mutates process-global `string?` state via a syscall is a grey area the §22.12 rule-2 wording (mutable-static admission restricted to internally-synchronized *types*) does not cleanly cover — but it concerns a *pre-existing* §2.4 member, not anything this proposal introduces. It is folded into the #1363 statics-×-domain-isolation work rather than opened as a new issue, with the likely resolution being to document `SetEnvironmentVariable` as **OS-synchronized** with an explanatory §22.12 note. This proposal's getters (`CurrentDirectory`, `ProcessId`) are race-free reads and are unaffected.
+
+Coordination note carried forward: the proposed `new §2.5` renumbering collides with 0012's insertions into the §2.5 cluster — the docs editor resolves the numbering at integration, as both proposals already state.

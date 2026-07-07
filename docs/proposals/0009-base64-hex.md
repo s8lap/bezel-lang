@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target modules** | `System.Text` (§3, auto-imported) · `System` / `Convert` (§2.3, auto-imported) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1434](https://github.com/s8lap/bezel-lang/issues/1434) |
@@ -169,3 +169,7 @@ var decoded := Convert.FromHexString(hexInput);   // FormatException if invalid
 ## 4. Open questions (none for v1)
 
 No open questions block this proposal. The design is fully specified above. If a future need arises for streaming encode/decode (e.g. for large binary blobs in HTTP bodies), that is a separate proposal building on the `Stream` gap (gap-review item #1) and the concrete stream family.
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+There are **no open owner questions** (§4): the design is fully settled — `Base64`/`Base64Url` in `System.Text` and hex on `Convert`; three-method Encode/Decode/TryDecode pairing (Try shape (a), `out owned result: Array<byte>?`); RFC 4648 §4 vs §5 alphabets with strict decode; lowercase hex output, mixed-case decode; `IReadOnlySpan<byte>` input, `owned Array<byte>` output; streaming deferred to v2. Acceptance carries the whole design as written. Docs-editor note at landing: fold in alongside the existing §2.3 `Convert` cleanup (the duplicated-members finding).

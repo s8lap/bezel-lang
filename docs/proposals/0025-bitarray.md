@@ -27,9 +27,11 @@ There is no bit-packed boolean collection in the stdlib today. The natural alter
 
 *Why a class, not a record.* `BitArray` is mutable (indexed set, in-place And/Or/Xor/Not, SetAll) and owns its backing storage — the same combination that motivates `Array<T>`, `Queue<T>`, and `OwningBuffer<T>` being classes. A mutable record would require value-receiver mutation (§9.4 explicitly calls mutable records "inadvisable"). The class shape provides the expected `using var`/`owned` ownership discipline and a proper destructor for the backing store.
 
-*Why §4, not a new module.* `BitArray` is a collection of booleans; it belongs beside `Array<T>` and `Queue<T>` in `System.Collections.Generic`, which is already auto-imported. No new `import` line is required.
+*Why `sealed`.* `BitArray` is declared `sealed`. Beyond the usual "no subclass needs to extend it" reasoning, `sealed` is what makes it **sendable** under §30.14 rule 1 (an open class is never sendable). With its single backing field an `owned Array<uint>`, the sendability derivation goes through — see §D9.
 
-*Internal representation.* The backing store is an internal `Array<uint>` with `(Length + 31) / 32` elements; bit `i` occupies bit position `i mod 32` of word `i / 32`. This is an implementation detail (the implementation may use `ulong` for performance or other packing strategies); it is not part of the contract. The spec says *class over an internal packed storage*; what the storage is remains internal.
+*Why §4, not a new module.* `BitArray` is a collection of booleans; it belongs beside `Array<T>` and `Queue<T>` in `System.Collections.Generic`. Note that `System.Collections.Generic` is **not** auto-imported — spec §2.3 auto-imports only `System` and `System.Text`, and stdlib §4 states "None are auto-imported except the iteration-interface family." A program using `BitArray` therefore writes `import System.Collections.Generic;`, exactly as it must for `Dictionary`/`Queue`.
+
+*Internal representation.* The backing store is an internal `owned Array<uint>` field (the `owned` marker matters for the §D9 sendability derivation) with `(Length + 31) / 32` elements; bit `i` occupies bit position `i mod 32` of word `i / 32`. This is an implementation detail (the implementation may use `ulong` for performance or other packing strategies); it is not part of the contract. The spec says *class over an internal packed storage*; what the storage is remains internal.
 
 ### D2 — `Length` property for the bit count
 
@@ -71,6 +73,14 @@ There is no bit-packed boolean collection in the stdlib today. The natural alter
 
 *Alternative: indexed-only access, no `IEnumerable<bool>`.* Declined. `IEnumerable<bool>` conformance unlocks LINQ (§5) and the `for`-loop without extra conversion cost. The precedent from §4.14 (OwningBuffer's class-T form implementing `IEnumerable<T?>`) confirms that direct iteration conformance is the expected style.
 
+### D9 — Sendable: a `sealed` bitmap with an `owned` backing store is transfer-closed
+
+**Decision.** `BitArray` is **sendable** across domains (§30.14). This corrects an earlier reading that treated "mutable in-place state" as disqualifying — §30.14 sendability governs *transfer* (a move across a domain boundary), not *sharing*, so mutability is irrelevant.
+
+*Derivation.* §30.14's class rule: rule 1 — the class is `sealed` (§D1); rule 2 — every field is sendable. `BitArray`'s single field is an `owned Array<uint>`, and `Array<uint>` is a borrowing collection whose element type (`uint`) is a sendable value type, which the §30.14 compiler-known list declares sendable. No function-typed, `Object`-typed, interface-typed, or non-`owned` class field appears (rule 3). Therefore `BitArray` is **transfer-closed** and moves whole across a domain boundary.
+
+*Why this is useful, not incidental.* A worker domain can compute a bitmap — graph reachability, a sieve, a Bloom filter — and **return it as an owned spawn result** to the parent, or receive one moved in as a spawn argument. The bitmap crosses the boundary by ownership transfer with no copy and no synchronization; the receiving domain is its sole owner thereafter. (Mutating a `BitArray` still requires the owning domain hold it exclusively — which transfer guarantees — and concurrent mutation within a domain still needs external synchronization, §3 semantics notes.)
+
 ---
 
 ## 3. Proposed stdlib addition (ready-to-land text)
@@ -83,8 +93,10 @@ There is no bit-packed boolean collection in the stdlib today. The natural alter
 // A fixed-length, bit-packed sequence of boolean values.
 // Length is immutable after construction.
 // Owned: caller is responsible for disposal (releasing backing storage).
-// Not sendable: mutable in-place state, not safe for cross-domain transfer (§30.14).
-public class BitArray: IEnumerable<bool>
+// Sendable: `sealed` (§30.14 rule 1) with a single `owned Array<uint>` backing
+// field (rule 2 — a borrowing collection of sendable value elements is sendable),
+// so a BitArray is transfer-closed and moves across a domain boundary. See §D9.
+public sealed class BitArray: IEnumerable<bool>
   // ── Construction ─────────────────────────────────────────────────────────
   // Create a BitArray of `length` bits, all initialised to false.
   // ArgumentOutOfRangeException if length < 0.
@@ -198,7 +210,7 @@ end;
 
 - **Resize** (`Length` setter) — fixed-length is the right first shape; resizing adds mutable-size semantics that belong to a separate design pass.
 - **`OwningBitArray` / bit-packed owning collection** — ownership over boolean values is not meaningful in the same sense as `OwningArray<T where T: class>`; this is a borrowing collection by nature.
-- **Sendability** — `BitArray` is mutable in-place state; it is not sendable across domains (§30.14). Sendable bit-set representations (e.g., an `Array<uint>` snapshot) should be used for cross-domain transfer.
+- **Shared (multi-domain concurrent) access** — `BitArray` is **sendable** (movable across a domain boundary by ownership transfer, §D9), but it is not a *shared* concurrent structure: two domains cannot hold and mutate one instance simultaneously. Cross-domain hand-off is by transfer (spawn argument or owned spawn result), not by sharing.
 - **`CopyFrom(Array<bool>)` constructor overload** — converting an `Array<bool>` into a `BitArray` is additive and deferred.
 - **`GetHashCode` / equality** — `BitArray` is a mutable class; reference equality is the default (§8.3). Structural equality is deferred (it requires iterating all bits and adds hash instability for mutable instances).
 
@@ -207,7 +219,7 @@ end;
 ## 6. Declined alternatives (register)
 
 1. **Value record instead of class** — `BitArray` is mutable and owns backing storage; value records with in-place mutation are "inadvisable" (§9.4). (§D1)
-2. **New module (e.g., `System.Collections`)** — `BitArray` is a collection; §4 is the natural home and is already auto-imported. No new module needed. (§D1)
+2. **New module (e.g., `System.Collections`)** — `BitArray` is a collection; §4 (`System.Collections.Generic`) is the natural home, beside `Array<T>`/`Queue<T>`. No new module needed. (Like the rest of §4 it requires an explicit `import System.Collections.Generic` — it is not auto-imported.) (§D1)
 3. **Count instead of Length** — `Count` signals resizable semantics; `Length` matches `OwningBuffer<T>` and the fixed-size convention. (§D2)
 4. **Return-new (non-mutating) And/Or/Xor** — allocates an intermediate per operation; in-place matches the collection mutation conventions of §4 (`Array<T>.Sort`, `Array<T>.Reverse`). `Clone` covers the non-destructive need. (§D3)
 5. **No `IEnumerable<bool>` (indexed-only)** — `BitArray` is concrete, not generic; the §4.14 conditional-interface limitation does not apply; direct conformance unlocks `for`-loops and LINQ at no extra cost. (§D8)

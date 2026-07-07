@@ -39,3 +39,15 @@ The lifetime taxonomy maps without a framework: *singleton* → composition-root
 ## Gap-review declines (2026-07)
 
 Eight further declined-with-reasons entries — metrics API (pending #1363), BigInteger (rides crypto), blocking process waits (§30 discipline), `CurrentDirectory` setter (fights domain isolation), `String.Format` (second format convention), compile-time platform branching (language change), overwrite-on-full ring buffer (inverts ownership legibility), implicit Unicode normalization in equality (§9.6 ordinal contract) — are recorded in [the gap review](stdlib-gap-review-2026-07.md) §"Declined".
+
+---
+
+## D-0003 — Unifying single-statement member/lambda bodies on `do … end` (#745)
+
+**Declined 2026-07-07 (delegated ruling, 2026-07 spec/design run; owner review pending).** The draft RFC (#745) proposed one uniform `do … end` spelling for every single-statement body position (members, lambdas, arms). Three grounds:
+
+1. **The load-bearing seam is already closed.** The v0.170 uniform-closer revision (#1374) fixed the actual inconsistency the RFC was written against — every block now closes with `end;` or a labelled repeat of its introducer. What remains is a *spelling triad* (`=> expr` arrows, `do … end` blocks, full member bodies) whose members are each locally consistent and non-overlapping; unifying them buys no rule deletions in the grammar, only migration.
+2. **The churn cost has inverted.** When the RFC was drafted the compiler was young; today ~10,500 tests, the conformance corpus, both guides, and every proposal encode the current spellings. A whole-corpus migration to retire zero rules is the definition of churn.
+3. **The surviving argument depends on a declined feature.** The RFC's strongest remaining case (arm bodies as uniform blocks) reads naturally only under block-*expressions*, which rationale §5.13 declines on recorded grounds; without them the unified form is strictly more ceremony in the common case.
+
+**What would reopen this:** block expressions being reopened first (their own register entry governs), or field evidence that the triad measurably confuses users — not re-asking.

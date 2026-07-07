@@ -145,7 +145,7 @@ method WriteBytes(value: ReadOnlySpan<byte>);
 
 // PROPOSED additions to IDeserializer:
 method ReadBytes(): owned Array<byte>;
-method TryReadBytes(out result: owned Array<byte>?): bool;  // v0.171 Try-convention; null on false
+method TryReadBytes(out owned result: Array<byte>?): bool;  // v0.171 Try-convention; null on false
 ```
 
 **Text wire (JSON):** `WriteBytes` encodes the span as RFC 4648 standard-alphabet base64 (padded). The concrete `JsonSerializer` calls `Base64.Encode` (proposal 0009) internally. `ReadBytes` / `TryReadBytes` call `Base64.Decode`; a malformed base64 value raises `SerializationException` (consistent with §2.15: structural input faults always raise `SerializationException`). `TryReadBytes` follows the v0.171 Try-convention — returns `bool`, assigns `out result` to `null` on `false`, does not throw.
@@ -176,11 +176,24 @@ end TimeSpan;
 
 ```bezel
 public record DateTime: IComparable<DateTime>, IEquatable<DateTime>, ISerializable, IDeserializable
-  // ... existing members unchanged ...
+  // ... existing members unchanged (including the existing Parse/TryParse) ...
+  //
+  // DateTime.Parse accepted grammar (PINNED by this proposal; the deserialize
+  //   factory below relies on exactly this contract). The grammar is the strict
+  //   two-case CIVIL form and nothing else:
+  //     "yyyy-MM-ddTHH:mm:ss[.fff]"    (no suffix)     -> Kind.Unspecified
+  //     "yyyy-MM-ddTHH:mm:ss[.fff]Z"   (trailing 'Z')  -> Kind.Utc
+  //   Any offset-bearing form (a trailing "±HH:MM") is REJECTED with
+  //   FormatException — DateTime.Parse never accepts an offset. Offset strings
+  //   belong to DateTimeOffset (proposal 0012, D7): the two parsers partition
+  //   the ISO 8601 space with no overlap. (On the deserialize path a
+  //   FormatException is re-raised as SerializationException, per §2.15.)
+  //
   // Wire form (compiler-provided): WriteString(conditional Z) / ReadString + Parse
   //   Kind.Utc          -> "yyyy-MM-ddTHH:mm:ss.fffZ"  (exact round-trip)
   //   Unspecified/Local -> "yyyy-MM-ddTHH:mm:ss.fff"   (no suffix)
-  //   Parse: strict two-case grammar (Z -> Kind.Utc, bare -> Kind.Unspecified, else SerializationException)
+  //   Parse: the two-case grammar above (Z -> Kind.Utc, bare -> Kind.Unspecified,
+  //          offset-bearing or otherwise malformed -> FormatException/SerializationException)
   // v1 limitation: Kind.Local round-trips as Kind.Unspecified (no encodable offset, §2.18)
 
 public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>, ISerializable, IDeserializable
@@ -214,7 +227,7 @@ end ISerializer;
 public interface IDeserializer
   // ... existing 15 tokens unchanged ...
   method ReadBytes(): owned Array<byte>;                // PROPOSED; SerializationException on malformed input
-  method TryReadBytes(out result: owned Array<byte>?): bool;  // PROPOSED; v0.171 Try-convention; null on false
+  method TryReadBytes(out owned result: Array<byte>?): bool;  // PROPOSED; v0.171 Try-convention; null on false
 end IDeserializer;
 ```
 

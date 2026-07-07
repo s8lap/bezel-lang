@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1458](https://github.com/s8lap/bezel-lang/issues/1458) |
 | **Target modules** | `System.Text` (§3, auto-imported): new `StringSplitCursor` class; `string` (§9.6): three new `SplitSpans` overloads |
 | **Written against** | spec v0.177 / stdlib v0.165 |
@@ -120,6 +120,10 @@ public method SplitSpans(separators: Array<char>): owned StringSplitCursor;
 The cursor emits the same sequence of token ranges that `Split` would produce as strings, including empty tokens from consecutive separators. Calling `s.AsSpan(range)` on each emitted `Range<int>` produces the equivalent zero-allocation `ReadOnlyStringSpan`.
 
 ---
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+No open owner questions; promoted as-is. The design is fully settled and spec-verified: the §29.2 span-enumerator bar forces a non-`IEnumerable` protocol; the `Range<int>`-emitting `StringSplitCursor` class (D1/D2) decouples cursor lifetime from span lifetime, so the cursor is not borrow-bearing (§9.7) and the caller materializes a `ReadOnlyStringSpan` on demand via the existing `string.AsSpan(r: Range<int>)` (§9.6); the three `SplitSpans` overloads mirror the `Split` family; empty tokens are included (`Range<int>.IsEmpty`, §16.3/stdlib §9.8). Lands in the d3-small-utilities batch (new §3.5 `StringSplitCursor` + three §9.6 `String` methods) through the normal docs workflow.
 
 ## 4. Declined alternatives
 

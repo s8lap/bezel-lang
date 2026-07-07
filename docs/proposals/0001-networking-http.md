@@ -3,14 +3,14 @@
 | | |
 |---|---|
 | **Status** | draft |
-| **Target modules** | `System.Net.Http` (this proposal), `System.Net` (substrate, sketched) |
-| **Written against** | spec/stdlib **v0.156** |
+| **Target modules** | `System.Net.Http` (this proposal); `System.Net` substrate specified in **proposal 0007** |
+| **Written against** | spec/stdlib **v0.179** (refreshed 2026-07-07 from the v0.156 draft) |
 | **Tracking issue** | [#1376](https://github.com/s8lap/bezel-lang/issues/1376) |
 | **Design influences** | JS `fetch` (WHATWG) for ergonomics; `ky`/`got` for the fixes to fetch's known traps; **not** .NET `HttpClient` |
 
 The stdlib already reserves the slot: *"`System.Net` and `System.Net.Http` — networking and HTTP. The language specification's async examples use a hypothetical `HttpClient`; a real one will live here."* (stdlib §11, L3808). This proposal fills that slot.
 
-This document was adversarially reviewed against the v0.156 docs before filing (citations, ownership/async soundness, and grammar legality of every snippet); the issues it depends on are listed in §9.
+This document was adversarially reviewed against the docs before filing and refreshed to v0.179 (citations, ownership/async soundness, and grammar legality of every snippet re-checked); the issues it depends on are listed in §9.
 
 ---
 
@@ -20,7 +20,7 @@ This document was adversarially reviewed against the v0.156 docs before filing (
 2. **Fix fetch's documented traps instead of inheriting them.** Built-in timeout with a default; a client-with-defaults that is *derivable*; one-line JSON POST; a real error taxonomy instead of one opaque failure; no silent `!res.ok` middle ground (see §4).
 3. **Bezel-native where Bezel is stronger.**
    - The options bag is **named defaulted parameters** (spec §22.5) — evaluated per call, no options object needed.
-   - The response is a **Pattern B owned resource** (`OwnedTask<HttpResponse>`, spec §30.5): `using var resp := await …` and disposal is connection hygiene, not folklore.
+   - The response is a **Pattern B owned resource** (`OwningTask<HttpResponse>`, spec §30.5): `using var resp := await …` and disposal is connection hygiene, not folklore.
    - The body is **single-consumption**, applying the rule the spec already states for streaming readers (§29.11): fetch's worst runtime surprise (`bodyUsed`) becomes a principled rule, enforced by `InvalidOperationException` at runtime (§4.3 discusses why compile-time flow enforcement would need new spec surface, and defers it).
    - HTTP **status codes are data**, matching the language's own error philosophy (Guide 2 §5: expected failures are values; exceptions are for the unexpected). Transport failures throw; a 404 does not. `EnsureSuccess()` is the explicit opt-in to throw-on-status.
 4. **Never sync-over-async.** No synchronous convenience wrappers, no `Wait()`/`Result` anywhere in examples or implementation — under the domain model that is a deterministic deadlock (issue #1362).
@@ -115,34 +115,34 @@ public static class Http
       redirect: RedirectPolicy := RedirectPolicy.Follow,
       maxRedirects: int := 20,
       token: CancellationToken := CancellationToken.None
-  ): OwnedTask<HttpResponse>;
+  ): OwningTask<HttpResponse>;
 
   // Per-method shorthands (the ky/got convenience fetch lacks). Same named
   // options as Fetch minus `verb`/`body` where implied.
-  public static async method Get(url: string, /* …same options… */): OwnedTask<HttpResponse>;
-  public static async method Head(url: string, /* … */): OwnedTask<HttpResponse>;
-  public static async method Delete(url: string, /* … */): OwnedTask<HttpResponse>;
-  public static async method Post(url: string, body: string, contentType: string := "text/plain; charset=utf-8", /* … */): OwnedTask<HttpResponse>;
-  public static async method Put(url: string, body: string, contentType: string := "text/plain; charset=utf-8", /* … */): OwnedTask<HttpResponse>;
-  public static async method Patch(url: string, body: string, contentType: string := "text/plain; charset=utf-8", /* … */): OwnedTask<HttpResponse>;
+  public static async method Get(url: string, /* …same options… */): OwningTask<HttpResponse>;
+  public static async method Head(url: string, /* … */): OwningTask<HttpResponse>;
+  public static async method Delete(url: string, /* … */): OwningTask<HttpResponse>;
+  public static async method Post(url: string, body: string, contentType: string := "text/plain; charset=utf-8", /* … */): OwningTask<HttpResponse>;
+  public static async method Put(url: string, body: string, contentType: string := "text/plain; charset=utf-8", /* … */): OwningTask<HttpResponse>;
+  public static async method Patch(url: string, body: string, contentType: string := "text/plain; charset=utf-8", /* … */): OwningTask<HttpResponse>;
 
   // JSON shorthands: serialize via JsonSerializer (stdlib §2.15), set
   // Content-Type: application/json. Serialization is declared conformance
   // (stdlib §2.14), so the constraint is real and checkable:
-  public static async method PostJson<T>(url: string, value: T, /* … */): OwnedTask<HttpResponse> where T: ISerializable;
-  public static async method PutJson<T>(url: string, value: T, /* … */): OwnedTask<HttpResponse> where T: ISerializable;
+  public static async method PostJson<T>(url: string, value: T, /* … */): OwningTask<HttpResponse> where T: ISerializable;
+  public static async method PutJson<T>(url: string, value: T, /* … */): OwningTask<HttpResponse> where T: ISerializable;
 
   // Binary bodies. Array<byte> follows the Stream async-I/O precedent
   // (stdlib §7.1); a span-taking variant is deliberately absent — a span is a
   // borrow-bearing record (§9.7) and no rule admits one across an async
   // suspension (§8 Q6).
-  public static async method PostBytes(url: string, body: Array<byte>, contentType: string := "application/octet-stream", /* … */): OwnedTask<HttpResponse>;
+  public static async method PostBytes(url: string, body: Array<byte>, contentType: string := "application/octet-stream", /* … */): OwningTask<HttpResponse>;
 end Http;
 ```
 
 Semantics: the module-level calls use an implicit **per-domain default client** (created lazily on first use; its teardown at domain completion is runtime-intrinsic behavior — no user-visible domain-exit hook exists today, see §5). They are exactly `defaultClientOfCurrentDomain.Fetch(…)`.
 
-**Why `OwnedTask<HttpResponse>` (Pattern B):** §30.5's producer rule verbatim — *"`OwnedTask<T>` is the right choice for resource acquisition — operations whose entire purpose is to produce a fresh, single-consumer resource."* A response holds a pooled connection until disposed; the caller must own it. The canonical call site is `using var resp := await …`, an abandoned task disposes its result automatically (§30.5), and a dropped response returns its connection to the pool.
+**Why `OwningTask<HttpResponse>` (Pattern B):** §30.5's producer rule verbatim — *"`OwningTask<T>` is the right choice for resource acquisition — operations whose entire purpose is to produce a fresh, single-consumer resource (a connection, a lock token, a parsed document)."* A response holds a pooled connection until disposed; the caller must own it. The canonical call site is `using var resp := await …`, an abandoned task disposes its result automatically (§30.5), and a dropped response returns its connection to the pool.
 
 ### 3.2 `HttpClient` — defaults, derivation, no lifecycle lore
 
@@ -193,9 +193,9 @@ public class HttpResponse
 
   // ── body accessors — SINGLE-CONSUMPTION (see §4.3) ──
   public async method Text(): Task<string>;                          // decodes per charset; default UTF-8
-  public async method Bytes(): OwnedTask<Array<byte>>;               // mirrors Stream.ReadAllAsync (stdlib §7.1)
+  public async method Bytes(): OwningTask<Array<byte>>;               // mirrors Stream.ReadAllAsync (stdlib §7.1)
   public async method Json<T>(): Task<T>;                            // T: IDeserializable-conforming record/value DTOs; compiler-known (see below)
-  public async method JsonOwned<T>(): OwnedTask<T> where T: class;   // class DTOs (FromResult/FromOwnedResult naming precedent, stdlib §6.7)
+  public async method JsonOwned<T>(): OwningTask<T> where T: class;   // class DTOs (FromResult/FromOwnedResult naming precedent, stdlib §6.7)
   public method TakeBodyStream(): owned HttpBodyStream;              // streaming take; caller disposes
 
   // Throw-on-status opt-in: raises HttpStatusException when not Ok,
@@ -213,11 +213,11 @@ public class HttpBodyStream: Stream                        // Stream per stdlib 
   // Chunked read with defined semantics (avoids the Array<byte>
   // Count-vs-Capacity trap in Stream.Read — §9): returns an owned array with
   // Count = bytes read (≤ max); Count = 0 signals end of body.
-  public async method ReadChunkAsync(max: int, token: CancellationToken := CancellationToken.None): OwnedTask<Array<byte>>;
+  public async method ReadChunkAsync(max: int, token: CancellationToken := CancellationToken.None): OwningTask<Array<byte>>;
   // Chunk iteration sugar over ReadChunkAsync (owning async enumeration,
   // stdlib §4.13): each iteration yields an owned Array<byte>, disposed at
   // iteration end. `await for var chunk in body.Chunks(64 * 1024) with token do … end;`
-  public method Chunks(max: int): OwnedAsyncEnumerable<Array<byte>>;
+  public method Chunks(max: int): IOwningAsyncEnumerable<Array<byte>>;
   destructor;   // closes/returns the underlying connection (no draining)
 end HttpBodyStream;
 ```
@@ -226,7 +226,7 @@ end HttpBodyStream;
 
 **On `Json<T>`:** the deserialization entry point is a static factory *recognized by name* (stdlib §2.14 — static interface members are deferred), so a generic body cannot invoke it via any existing constraint. `Json<T>`/`JsonOwned<T>` are therefore **compiler-known methods** in the same way `Task.FromResult<T>` is (its class-T rejection is compiler-special-cased, stdlib §6.7): `Json<T>` requires an `IDeserializable`-conforming record/value/`string` T and **rejects class T at compile time**, directing to `JsonOwned<T>` (which requires an `IDeserializable`-conforming class T). This keeps the Pattern A/B split invisible to users: values arrive as values, classes arrive owned.
 
-`Bytes(): OwnedTask<Array<byte>>` deliberately mirrors `Stream.ReadAllAsync` (stdlib §7.1) — same world, same shape. This sits on the `Array<byte>` side of the byte-worlds gap (issue #1358); when the bridge lands, spans slice over the result with no API change here.
+`Bytes(): OwningTask<Array<byte>>` deliberately mirrors `Stream.ReadAllAsync` (stdlib §7.1) — same world, same shape. This sits on the `Array<byte>` side of the byte-worlds gap (issue #1358); when the bridge lands, spans slice over the result with no API change here.
 
 ### 3.4 `HttpHeaders`
 
@@ -280,11 +280,11 @@ Timeout and cancellation stay **distinct** (the stdlib already draws this line, 
 
 ### 4.1 Pattern B end-to-end
 
-Every request method returns `OwnedTask<HttpResponse>`; the await must sit in an owned-consuming context (§30.5) — `using var resp := await …` is canonical, `await using var resp := …` when async disposal (remainder draining) is wanted. Response disposal returns the connection to the pool when the body was consumed and closes it otherwise; only `DisposeAsync` performs draining I/O (a synchronous destructor must not block the domain, §30.13).
+Every request method returns `OwningTask<HttpResponse>`; the await must sit in an owned-consuming context (§30.5) — `using var resp := await …` is canonical, `await using var resp := …` when async disposal (remainder draining) is wanted. Response disposal returns the connection to the pool when the body was consumed and closes it otherwise; only `DisposeAsync` performs draining I/O (a synchronous destructor must not block the domain, §30.13).
 
 ### 4.2 Concurrent requests
 
-Fan-out uses the existing aggregation surface (stdlib §6.7): `Task.WhenAllOwned<HttpResponse>(owned tasks: OwnedArray<OwnedTask<HttpResponse>>): OwnedTask<OwnedArray<HttpResponse>>`. No new machinery.
+Fan-out uses the existing aggregation surface (stdlib §6.7): `Task.WhenAllOwned<HttpResponse>(owned tasks: OwningArray<OwningTask<HttpResponse>>): OwningTask<OwningArray<HttpResponse>>`. No new machinery.
 
 ### 4.3 The single-consumption body
 
@@ -299,33 +299,25 @@ The spec already states the rule this design applies (§29.11): *"A lazy or sing
 
 Clients, responses, and body streams are domain-local (not sendable, §30.14). The per-domain default client means `Http.Get` works correctly in *any* domain with zero setup. Cross-domain patterns move **results** (records, strings, owned buffers, or the sendable `HttpHeaders` of §3.4) through channels, never live responses — consistent with the rest of the concurrency model.
 
-## 5. The substrate (`System.Net`, sketch — separate proposal to follow)
+## 5. The substrate (`System.Net`)
 
-This proposal's honest dependencies on runtime work, in one list:
+The transport layer this client sits on — nonblocking sockets, DNS, TLS, and
+the per-domain connection pool — is specified in its own document, **proposal
+0007 (`System.Net`)**. That proposal resolves the runtime dependencies this
+design once sketched here: async socket I/O over a runtime nonblocking-socket
+event loop (completing `OwningTaskCompletionSource`-backed tasks onto their
+domains), the per-domain pool and lazily-created default client, the TLS
+backend decision, the `TcpConnection` / `NetworkStream` / `TlsClientStream` /
+`Dns` surface, and the transport-level error roots. Two consequences for this
+proposal:
 
-1. **Async socket I/O.** The language currently has no async I/O facility and no blocking-offload primitive — a blocking `recv(2)` inside a continuation stalls the whole domain (run-to-completion, §30.13), and §32's FFI callback rules (method references only, no lambdas) make user-level completion plumbing impractical. The workable path mirrors `bz_task`: the **runtime** owns a nonblocking-socket event loop (epoll/kqueue/IOCP) on runtime threads and completes `OwnedTaskCompletionSource`-backed tasks onto their domains — no new *language* surface, only runtime intrinsics (`Task.Delay` already implies exactly this kind of runtime timer machinery).
-2. **The per-domain connection pool and default client** — runtime-owned, torn down when the domain completes. No user-visible domain-exit hook exists (§30.14 says only that a domain's resources are reclaimed when its last continuation completes); the pool/client teardown is part of that reclamation, as runtime behavior, not API.
-3. **TLS backend decision** (system library via FFI vs vendored) — deferred to the substrate proposal. This API is transport-version-agnostic (nothing above names an HTTP version).
-
-The visible `System.Net` layer, sketched:
-
-```bezel
-public class TcpConnection                                  // runtime-intrinsic-backed
-  public static async method Connect(host: string, port: int,
-      timeout: TimeSpan := TimeSpan.FromSeconds(30),
-      token: CancellationToken := CancellationToken.None): OwnedTask<TcpConnection>;
-  public method GetStream(): NetworkStream;                 // borrow; NetworkStream: Stream
-  public readonly property RemoteAddress: string;
-  destructor;   // close(2)
-end TcpConnection;
-
-public class NetworkStream: Stream  /* members elided */  end NetworkStream;
-public class TlsClientStream: Stream  /* wraps a NetworkStream; certificate validation on by default; members elided */  end TlsClientStream;
-
-public static class Dns
-  public static async method Resolve(host: string, token: CancellationToken := CancellationToken.None): OwnedTask<Array<string>>;
-end Dns;
-```
+- The per-domain default client and connection pool are runtime-owned and torn
+  down as part of a domain's ordinary resource reclamation (§30.14 says only
+  that a domain's resources are reclaimed when its last continuation completes) —
+  there is no user-visible domain-exit hook, and none is needed.
+- The transport error roots (`NameResolutionException`, `TlsException`, and the
+  socket-level failure that `HttpConnectException` wraps) are defined by
+  proposal 0007; the `Http*` taxonomy of §3.5 layers over them.
 
 ## 6. What we deliberately do not copy
 
@@ -351,7 +343,7 @@ Retry policy (ky's defaults are the model: idempotent methods, 408/429/5xx, `Ret
 
 - **#1362** (Wait/Result deadlock): this design has no sync surface; its docs must never suggest `Wait()` on a fetch task.
 - **#1358** (byte-worlds bridge): `Bytes()`/`PostBytes` live on the `Array<byte>` side (Stream precedent); the design benefits mechanically when the bridge lands.
-- **Stream read-contract gap** (filed with this proposal): `Stream.Read/ReadAsync(buffer: Array<byte>, offset, count)` has no defined contract against `Count` vs `Capacity`, and no stdlib API constructs a `Count = N` buffer — the canonical read-into-buffer loop is currently unwritable. `HttpBodyStream.ReadChunkAsync` (owned, sized result) sidesteps the trap; the underlying gap is filed as its own stdlib issue.
+- **Stream read-contract gap** (filed with this proposal; **resolved in stdlib §7.1, v0.165** — see proposal 0006 §7): `Stream.Read/ReadAsync(buffer: Array<byte>, offset, count)` originally had no defined contract against `Count` vs `Capacity`, and no stdlib API constructed a `Count = N` buffer, so the canonical read-into-buffer loop was unwritable. §7.1's read contract now defines it. `HttpBodyStream.ReadChunkAsync` (owned, sized result) sidesteps the question regardless by returning a correctly-sized owned array.
 - **#1226 / spec §29.11** (affine single-consumption): the body rule applies the already-normative streaming-reader clause (runtime enforcement; compile-time flow enforcement would need new spec surface — §4.3).
 - **#974** (TaskCompletionSource): the substrate's completion plumbing is the existing TCS machinery.
 - **Stdlib §11 L3808**: the reserved `System.Net(.Http)` slot this proposal fills.

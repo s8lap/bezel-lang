@@ -71,14 +71,21 @@ public class TempFile
   // Calling Persist() twice is idempotent.
   public method Persist(): string;
 
-  destructor;   // deletes the file unless Persist() was called;
-                // swallows FileNotFoundException (idempotent — per §28.2)
+  // Deletes the file NOW, at a named point, and surfaces any IOException to
+  // the caller. Idempotent (§28.2): a second Delete(), or the destructor
+  // firing after Delete(), is a no-op. Use this when a deletion failure must
+  // be observed; the destructor's best-effort delete never reports one.
+  public method Delete();
+
+  destructor;   // best-effort delete unless Persist()/Delete() already ran;
+                // swallows and LOGS all deletion failures — a destructor must
+                // not throw (§28.4)
 end TempFile;
 ```
 
 ### 2.2 Disposal posture: swallow, not fault, on missing file
 
-When the destructor fires and the file is already gone (deleted externally, or moved by the caller without calling `Persist()`), the destructor **swallows `FileNotFoundException`** rather than raising. Rationale: spec [§28.2](../Bezel_Language_Spec.md#sec-the-idisposable-contract) mandates that `Dispose()` is idempotent — the first call does the work, subsequent calls are no-ops. A file that is already absent represents a disposal that has already happened (by other means); raising in the destructor would violate idempotency's spirit and would make `using var` fragile in pipelines where the file might be consumed. Other IO errors (permissions, path too long) during deletion **do propagate** as `IOException`, because those indicate a genuine failure that the caller should know about.
+The destructor is **best-effort and never throws.** When it fires it attempts the deletion (unless `Persist()` or an explicit `Delete()` already ran), and it **swallows and logs every deletion failure** — the already-gone file (`FileNotFoundException`), a permission error, a path-too-long — rather than propagating any of them. Rationale: spec [§28.4](../Bezel_Language_Spec.md#sec-the-destructor) states that disposers are **expected not to throw**; a destructor that raised `IOException` would violate that no-throw discipline, and would make `using var` fragile in pipelines where the file might have been consumed (moved into place by an external tool, deleted by another process). This is the same best-effort posture 0006's `StreamWriter` takes on its sync-on-dispose path. §28.2 idempotency still holds — a deletion already performed (by `Delete()`, `Persist()`+external move, or another process) makes the destructor's attempt a no-op. A caller who **needs** a deletion failure surfaced calls the explicit `Delete()` method (§2.1), which raises `IOException` at a named point.
 
 ### 2.3 The "discharge by move" ruling — `Persist()`
 
@@ -86,7 +93,7 @@ The gap review explicitly called for a "discharge-by-move ruling": a way to esca
 
 ```bezel
 // Usage: keep the temp file after scope end
-let finalPath: string;
+var finalPath: string;             // non-nullable local, assigned below (definite assignment, §7.9)
 do
   using var tmp := TempFile.Create();
   WriteReport(tmp.Path);
@@ -109,10 +116,11 @@ ExternalTool(tmp.Path);
 // tmp.Dispose() fires at scope end, deletes the file
 
 // --- Pattern 2: keep the file (discharge-by-move ruling) ---
-let kept := do
+var kept: string;                  // assigned inside the scope below (§7.9)
+do
   using var tmp := TempFile.Create();
   File.WriteAllText(tmp.Path, BuildConfig());
-  tmp.Persist()   // disarms deletion, returns path
+  kept := tmp.Persist();           // disarms deletion, returns path
 end;
 // file at `kept` persists on disk
 
@@ -152,7 +160,7 @@ public static class Path
 end Path;
 ```
 
-**What is NOT proposed:** `GetRandomFileName()` (requires a random number source — propose separately if needed), `IsPathRooted()` (trivially expressible as `path.Length > 0 && (path[0] == '/' || ...)`).
+**What is NOT proposed:** `GetRandomFileName()` (requires a random number source — propose separately if needed), `IsPathRooted()` (trivially expressible as `path.Length > 0 and (path[0] = '/' or ...)`).
 
 **`GetExtension`, `GetFileNameWithoutExtension` already exist** (verified in §7.4). Not duplicated here.
 
@@ -209,9 +217,9 @@ end Directory;
 
 Records cannot have a `destructor`, `owned` fields, or implement `IDisposable` (spec [§9.7](../Bezel_Language_Spec.md#sec-records-and-disposal)). The deletion behavior requires a destructor. `TempFile` is therefore a class — an owned, disposable resource, exactly as `FileStream` is.
 
-### Q2 — Swallow vs fault on missing file in destructor
+### Q2 — Swallow vs fault on a deletion failure in the destructor
 
-Chosen: **swallow `FileNotFoundException`**, propagate other `IOException`. Rationale in §2.2 above. The alternative (always fault) was considered and rejected: it would make `TempFile` unusable in "create, write, hand path to tool, scope exit" patterns where the tool might consume the file (e.g., an installer that moves the temp file into place). Using `Persist()` is the correct signal for "I intend to keep this"; swallowing the deletion error is the fallback for "someone else cleaned it up" — a common, benign outcome.
+Chosen: the destructor is **best-effort and never throws** — it swallows and logs *every* deletion failure (`FileNotFoundException`, permission errors, path-too-long). Rationale in §2.2 above. The earlier draft's "swallow FileNotFound, propagate other `IOException`" is rejected: propagating *any* exception from a destructor conflicts with §28.4 ("disposers are expected not to throw"), and it would make `TempFile` fragile in "create, write, hand path to tool, scope exit" patterns where the tool might consume the file (e.g., an installer that moves the temp file into place). Using `Persist()` is the correct signal for "I intend to keep this"; swallowing the deletion error is the fallback for "someone else cleaned it up" — a common, benign outcome. Callers who must observe a deletion failure at a named point call the explicit `Delete()` method (§2.1), which *does* raise `IOException`.
 
 ### Q3 — `ChangeExtension` with an empty `extension`
 

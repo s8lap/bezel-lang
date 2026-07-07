@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1459](https://github.com/s8lap/bezel-lang/issues/1459) |
 | **Target module** | `System` (§2.7 `Random`, auto-imported) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
@@ -134,6 +134,10 @@ All new methods generate output via the same internal generator state as the exi
 For cryptographic randomness, §2.7 already defers to `System.Security.Cryptography` (a future module). This proposal does not add `SecureRandom` or any cryptographically secure surface.
 
 ---
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+No open owner questions; promoted as-is. The four additions are verified against stdlib §2.7 and carry as drafted: `NextFloat(): float` in `[0.0f, 1.0f)` (the float-width complement of `NextDouble`); the two `NextInt64` range overloads completing the three-form family (half-open `[min, max)`, `ArgumentException` on bad bounds); `NextBytes(Span<byte>)` — sound because `NextBytes` is *synchronous*, so the borrow-bearing span (§4.14) is bounded by the call frame and the #1438 async-span concern does not apply; and the Fisher-Yates `Shuffle<T>(Array<T>)` instance method on `Random` (RNG as the actor). The seeding/determinism contract is unchanged. `NextFloat` range overloads, `Shuffle<T>(OwningArray<T>)`, and `NextUInt64` are well-declined for v1. Lands in the d3-small-utilities batch as §2.7 additions through the normal docs workflow.
 
 ## 5. Declined alternatives
 

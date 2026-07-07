@@ -2,12 +2,26 @@
 
 | | |
 |---|---|
-| **Status** | draft (RFC — the engine-family choice is an owner ruling; do not treat as decided) |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.Text.RegularExpressions` (new; explicit `import`) |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |
 | **Tracking issue** | [#1449](https://github.com/s8lap/bezel-lang/issues/1449) |
 | **Gap-review item** | #19 (2026-07 ranking, wave D3) — *"Regex engine — P1; deferred in stdlib §11"* |
-| **Design character** | **RFC** — the load-bearing decision (engine family) is a language-values question, not a mechanical one. This proposal *frames the fork and recommends*; it does not rule. |
+| **Design character** | **RFC** — the load-bearing decision (engine family) is a language-values question, not a mechanical one. This proposal *frames the fork and recommends*; the fork is now resolved under delegated ruling authority (see "Rulings recorded at acceptance" below). |
+
+## Rulings recorded at acceptance
+
+Resolving §11's open questions under delegated ruling authority (2026-07-07; owner review pending). The recommendations were the proposal's own; the reasoning is one line each.
+
+1. **Engine family (Q1) → Option A, linear-time (RE2 / Thompson-NFA family).** It is the only choice consistent with Bezel's paid-for predictable-cost posture (§29.11 loud re-enumeration, §6.1 checked arithmetic, §2.18/§3.2 defined faults): a linear automaton makes ReDoS-immunity *structural*, not advisory. Backreferences/lookaround are recorded non-goals; any backtracking mode is a separate, explicitly-selected engine, never a silent default change.
+2. **Match shape (Q2) → 1a (owned `sealed` class, borrow-free, group-bearing).** Borrow-freedom (integer `Range<int>` coordinates only) is the decisive property — no §9.7 lifetime coupling, no #1438/#1448 async hazard, and `sealed` + wholly-owned value state makes it sendable (§30.14 rules 1–2). Groups ship in v1; the pure-value-record 1b is declined as too thin (extraction-with-groups is most of regex's value).
+3. **`\d \w \s` default (Q3) → ASCII by default, `\p{…}` for Unicode.** Bounds the shipped Unicode-table footprint (matching RE2/Rust-regex), with an explicit Unicode-aware growth seam.
+4. **`\p{…}` subset (Q4) → `L N Nd Lu Ll P Z`.** `Nd` (decimal digit) is added to the recommended subset because it is the workhorse category; the rest stay as proposed.
+5. **Named groups (Q5) → included in v1.** Cheap once the group-range array exists (§5) and high-value for extraction.
+6. **Module name (Q6) → `System.Text.RegularExpressions`.** A namespace named after the type would give `System.Text.Regex.Regex`; the stdlib §11 forward-reference is updated when this lands.
+7. **`RegexOptions` (Q7) → named-default bool constructor parameters, no flags enum.** Enums carry no `|` combination operator in v0.177 (§10.5; flags-enum operators are open RFC #1381), so a flags-style `RegexOptions` is inexpressible today; `ignoreCase`/`multiline`/`dotAll` bools (0019's Parse-knob pattern) combine freely. A flags model revisits if #1381 lands.
+
+---
 
 The stdlib names regex as a future addition (stdlib [§11](../Bezel_Standard_Library.md), "`System.Text.Json` and `System.Text.Regex` — a general JSON DOM/streaming API and regular expressions"). Nothing regex-shaped exists today. This proposal designs the v1 surface, but its centre of gravity is one owner question — **which engine family** — because that choice commits the language to a cost model, and cost predictability is a stated Bezel value (§29.11 made re-enumeration loud, checked arithmetic §6.1 refuses silent wraparound, stdlib §2.18/§3.2 make bad formats and bad encodings *fault* rather than paper over them). A regex engine is the first stdlib component where the "obvious" mainstream choice (backtracking) quietly imports a denial-of-service class the rest of the language went out of its way to design away.
 
@@ -119,11 +133,18 @@ All items below are **proposed** (nothing here exists in the current stdlib). Mo
 /// is released at scope end. Immutable and re-usable across many subjects.
 /// The compiled Regex holds NO borrow of any subject — subjects are supplied
 /// per call — so a Regex is not lifetime-coupled to any string.
-public class Regex
+public sealed class Regex
   /// Compiles `pattern`. Raises RegexParseException (with position) on a
-  /// malformed pattern — a defined fault at construction (§7).
-  public constructor(pattern: string);
-  public constructor(pattern: string, options: RegexOptions);
+  /// malformed pattern — a defined fault at construction (§7). Options are
+  /// named-default bool parameters (Q7) — enums carry no `|` combination
+  /// operator in v0.177 (§10.5; flags-enum operators are open RFC #1381), so a
+  /// flags-style RegexOptions is inexpressible; the bool knobs mirror 0019's
+  /// Parse-knob pattern and combine freely:
+  ///   new Regex(pat, ignoreCase := true, dotAll := true)
+  public constructor(pattern: string,
+                     ignoreCase: bool := false,   // (?i) — ordinal simple case folding, matching §9.6's ignoreCase model
+                     multiline: bool := false,    // (?m) — ^/$ match at line boundaries
+                     dotAll: bool := false);      // (?s) — `.` also matches the newline
 
   public readonly property Pattern: string;
   public readonly property GroupCount: int;               // number of capturing groups (excl. group 0)
@@ -165,9 +186,11 @@ end Regex;
 /// A single match. BORROW-FREE: carries only integer ranges into the subject's
 /// code-point coordinate system — no span, no string borrow (§5). Callers slice
 /// the subject themselves: `subject[m.Range]`. Owned because it holds a small
-/// owned Array<Range<int>> of group ranges (value elements). Sendable: its state
-/// is wholly-owned value data with no borrows (§30.14), unlike a span-carrier.
-public class Match
+/// owned Array<Range<int>> of group ranges (value elements). Sendable: `sealed`
+/// (so §30.14 rule 1 admits it) with wholly-owned value state and no borrows
+/// (rule 2 — a borrowing collection of sendable value elements), unlike a
+/// span-carrier.
+public sealed class Match
   public readonly property Range: Range<int>;             // group 0 — the whole match extent
   public readonly property GroupCount: int;               // capturing groups, excl. group 0
 
@@ -178,15 +201,10 @@ public class Match
   public method Group(name: string): Range<int>?;
 end Match;
 
-/// Compilation-time options. v1 keeps this small; inline flags (§7) cover the
-/// per-subpattern cases. Combined via the flags-style `|` where the enum
-/// supports it (kept minimal to avoid a flags-combination design question here).
-public enum RegexOptions
-  None,
-  IgnoreCase,       // (?i) — ordinal simple case folding, matching §9.6's ignoreCase model
-  Multiline,        // (?m) — ^/$ match at line boundaries
-  DotAll;           // (?s) — `.` also matches the newline
-end RegexOptions;
+/// Compilation-time options are the three named-default bool constructor
+/// parameters above (`ignoreCase`/`multiline`/`dotAll`); there is no
+/// RegexOptions flags enum, because enums carry no `|` in v0.177 (§10.5, open
+/// RFC #1381). Inline flags (§7) cover the per-subpattern cases.
 
 /// Malformed-pattern fault, raised at Regex construction. Lives in this module
 /// (its only producer is Regex construction — §31.4's import-with-producer rule)
@@ -291,7 +309,7 @@ v1 accepts the following constructs. A pattern using anything outside this set �
 | Alternation | `a|b|c` |
 | Grouping | capturing `(…)`, non-capturing `(?:…)`, named `(?<name>…)` (also accept `(?P<name>…)`) |
 | Inline flags | `(?i)`, `(?m)`, `(?s)` — scoped `(?i:…)` forms accepted |
-| Unicode property | `\p{L}`, `\p{N}`, `\p{Lu}`, `\p{Ll}`, `\p{P}`, `\p{Z}` (a **subset** of general categories — see §8) |
+| Unicode property | `\p{L}`, `\p{N}`, `\p{Nd}`, `\p{Lu}`, `\p{Ll}`, `\p{P}`, `\p{Z}` (a **subset** of general categories — see §8) |
 
 **Rejected in v1 (the Option-A non-goals, §2):** backreferences (`\1`, `\k<name>`), lookahead/lookbehind (`(?=)` `(?!)` `(?<=)` `(?<!)`), atomic groups / possessive quantifiers (`(?>…)`, `a++`). A pattern containing one of these is a `RegexParseException` naming the unsupported construct — not a silent mis-parse.
 
@@ -314,8 +332,8 @@ The one fact that makes this exact: a Bezel `string` is indexed by **code point*
 There is a genuine size/behavior decision here, the same one the gap review flags for item #31 (Unicode normalization — "Unicode-table size decision"):
 
 - **Recommend: `\d \w \s` are ASCII by default in v1.** `\d` = `[0-9]`, `\w` = `[A-Za-z0-9_]`, `\s` = `[ \t\n\r\f\v]`. Small, predictable, no large Unicode tables shipped in the compiler/runtime, and it is RE2's and Rust-`regex`'s well-trodden default (Unicode mode is opt-in there too).
-- **Unicode categories are the explicit path:** `\p{L}` (any letter), `\p{N}` (any number), `\p{Lu}`/`\p{Ll}` (upper/lower letter), `\p{P}` (punctuation), `\p{Z}` (separator) — a **subset** of the full general-category set, sized to a small table. This keeps the Unicode-data footprint bounded while giving a real Unicode-aware path for callers who need it.
-- A `(?u)` inline flag / `RegexOptions` bit that makes `\d \w \s` themselves Unicode-aware is a **recorded possible addition** (§10), gated on the same table-size decision as #31 — not v1.
+- **Unicode categories are the explicit path:** `\p{L}` (any letter), `\p{N}` (any number), `\p{Nd}` (decimal digit — the workhorse), `\p{Lu}`/`\p{Ll}` (upper/lower letter), `\p{P}` (punctuation), `\p{Z}` (separator) — a **subset** of the full general-category set, sized to a small table. This keeps the Unicode-data footprint bounded while giving a real Unicode-aware path for callers who need it.
+- A `(?u)` inline flag / a future Unicode-aware constructor bool that makes `\d \w \s` themselves Unicode-aware is a **recorded possible addition** (§10), gated on the same table-size decision as #31 — not v1.
 
 Recording this as an owner-visible decision (rather than silently choosing) is the point: the ASCII-default keeps v1 small and the `\p{…}` subset is the growth seam.
 
@@ -387,10 +405,10 @@ Kept explicitly out of v1 so the door is labelled:
 1. **Engine family (§2)** — confirm **Option A (linear-time / RE2)** for v1, with backreferences/lookaround as recorded non-goals and any backtracking mode as a separate explicit engine. *This is the load-bearing ruling; everything else is downstream.*
 2. **Match shape (§5)** — confirm **1a (owned, borrow-free, group-bearing)** over 1b (pure value record, no groups). Both are borrow-free; the choice is whether groups ship in v1.
 3. **`\d \w \s` default (§8)** — confirm **ASCII-by-default** with a `\p{…}` subset as the Unicode path (bounds the Unicode-table footprint), vs. Unicode-by-default from the start.
-4. **`\p{…}` category subset (§7/§8)** — confirm the small subset (`L N Lu Ll P Z`) is enough for v1, or name the categories that must be in the first cut.
+4. **`\p{…}` category subset (§7/§8)** — confirm the small subset (`L N Nd Lu Ll P Z`) is enough for v1, or name the categories that must be in the first cut.
 5. **Named groups in v1 (§7)** — confirm include (recommended) vs. defer for a smaller v1.
 6. **Module name** — the stdlib §11 forward-reference calls the feature "`System.Text.Regex`". This proposal uses **`System.Text.RegularExpressions`** (a namespace named after the *type* would give `System.Text.Regex.Regex`). Confirm the namespace; minor, but it fixes the `import`.
-7. **`RegexOptions` as a flags enum** — v1 keeps it minimal and leans on inline flags for combination; confirm that's acceptable or that a full flags-combination model is wanted now.
+7. **Options surface** — *resolved (ruling 7):* named-default bool constructor parameters (`ignoreCase`/`multiline`/`dotAll`), no flags enum, since enums carry no `|` in v0.177 (§10.5, open RFC #1381); inline flags (§7) cover per-subpattern combination. Revisit a flags-combination `RegexOptions` only if #1381 lands.
 
 ---
 

@@ -2,12 +2,22 @@
 
 | | |
 |---|---|
-| **Status** | Draft — **RFC-track** (the discovery fork §3 is a language question reserved for an owner ruling; the `Assert` library and library runner §5–§8 need no ruling) |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1453](https://github.com/s8lap/bezel-lang/issues/1453) |
 | **Target module(s)** | A new `System.Testing` module — **explicitly imported, deliberately *not* auto-imported** (§5.6). Builds on `System` (`Exception`/`ExceptionInfo` §31.4, `Type` stdlib §2.13, `Task` §30) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #24 (P1, diagnostics), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) — the one wave-D3 item flagged "numbered proposal (RFC-track) … the `test` modifier is a language change — needs the RFC discipline, owner ruling." |
 | **Related** | [#1398](https://github.com/s8lap/bezel-lang/issues/1398) (the future build driver — the natural test *runner* host); [#1419](https://github.com/s8lap/bezel-lang/issues/1419)/§28.14 (call-bounded closures — `Assert.Throws`'s shape); gap item #23 (`Verify`/`Unreachable`/`Debug.Fail` — the *sibling* diagnostics item, and the release-elidable `Debug.Assert` §8.2 this proposal is careful **not** to be) |
+
+## Rulings recorded at acceptance
+
+Resolving §10's open questions under delegated ruling authority (2026-07-07; owner review pending). The recommendations were the proposal's own; the reasoning is one line each.
+
+1. **Discovery fork (Q1) → approve (a) the `test` modifier as the discovery *endpoint*; ship the `Assert` library + (b) registration runner immediately; decline (c).** (b)'s silent-no-run is the CodingKeys footgun rationale §5.19 already ruled decisive, and (a) makes it structurally impossible in the identical per-declaration/total/closed/attribute-forward-compatible way `serialized` does — §18 sanctions exactly this narrow-modifier shape. The `Assert` library + runner (§5–§8) carry no language change and graduate now through the ordinary docs workflow; (a)'s grammar delta (§3.1) follows on the spec-amendment track, gated on the §3.4 evidence trigger. (c) is declined outright (stringly-typed, blocked on #1398, reintroduces the intentional-vs-accidental blur).
+2. **`Assert.Equal` eligibility (Q2) → compiler-known, carrying the equality-bearing derived-type-property constraint** — full §8.3 coverage and the actionable §9.2 use-site diagnostic, at parity with `Dictionary<K,V>`'s `K` and `HashCode.Add<T>`'s `T`; the pure-library `where T: IEquatable<T>` fallback is declined for excluding enums and un-declared auto-equality records.
+3. **`Throws` return (Q4) → `ExceptionInfo` snapshot**, consistent with §31.1 (the live caught instance cannot escape the arm), letting a test go on to assert on the message. (The exact/subtype discrimination additionally depends on the catch-generic-type-parameter ruling and #1505 — see §5.4.)
+4. **Module name (Q5) → `System.Testing`, explicit-import** — the shorter name; keeps the production namespace clean and marks test files.
+5. **`test` method shape (Q3) → settled when (a) is implemented on the spec track; this proposal's lean stands: static, parameterless, `()`-or-`Task`-returning, non-`virtual`, fixtures via inner `using var` (§7).** A `test skip` sub-clause is deferred until (a) itself lands.
 
 ## 1. What is missing, and the shape of the answer
 
@@ -64,8 +74,8 @@ But the precedent must be cited *honestly*, and the honest reading cuts one way 
 ```bezel
 // The test main — explicit, no compiler support.
 public static method Main(): Task<int>
-  var runner := new TestRunner();
-  runner.Add("ParsesEmptyInput", ParserTests.ParsesEmptyInput);   // §27.6 method reference
+  using var runner := new TestRunner();   // `using var` so a capture-bearing body may be Add'd (§28.14 bounding object)
+  runner.Add("ParsesEmptyInput", ParserTests.ParsesEmptyInput);   // §27.6 method reference (capture-free — admitted regardless)
   runner.Add("ParsesWhitespace",  ParserTests.ParsesWhitespace);
   return runner.RunAsync();
 end Main;
@@ -145,11 +155,11 @@ An `AssertionException` **cannot hold the live `expected`/`actual` values**: `T`
 public class AssertionException: Exception
   public readonly property Expected: string;   // rendered snapshot ("" for non-comparison asserts)
   public readonly property Actual: string;
-  public constructor(message: string) base(message)
+  public constructor(message: string) base(message);   // CtorChain ends with `;` (grammar A.4)
     Expected := "";
     Actual := "";
   end constructor;
-  public constructor(message: string, expected: string, actual: string) base(message)
+  public constructor(message: string, expected: string, actual: string) base(message);
     Expected := expected;
     Actual := actual;
   end constructor;
@@ -199,7 +209,9 @@ public static method Throws<TException>(action: () -> ()): ExceptionInfo
 end Throws;
 ```
 
-**Exact vs subtype — decided: two named methods, exact is the default `Throws`.** `Throws<T>` requires the **exact** dynamic type (`ex.GetType() = typeof(T)`, §5.18 type identity); `ThrowsAny<T>` allows subtypes (the bare-type match §31.2.1 already performs). Reasoning: the exact form catches the "expected `ArgumentNullException`, got its base `ArgumentException`" bug — the same specificity xUnit's `Throws` (exact) vs `ThrowsAny` (assignable) split exists to give — and the catch machinery already *is* the subtype form, so `ThrowsAny` is the thin one. Exact-by-default makes the stricter, bug-catching choice the one you reach for without thinking.
+**Dependency — catching a method type parameter.** The `catch … var ex: TException` arm above matches the caught exception against the method's *type parameter* `TException`. Whether a type-pattern arm may bind a method type parameter is **spec-silent** (§31.2.1 defines the bare-type match only for concrete named types), and the compiler currently mis-dispatches this shape (wrong-arm selection — tracked as compiler bug **#1505**). `Assert.Throws`/`ThrowsAny` therefore depend on the **catch-generic-type-parameter ruling** (lands with the v0.183 train, in flight) and the #1505 fix. Until both land, the two methods degrade to `ThrowsAny`-only semantics expressed with a concrete `catch var ex: Exception` arm plus an `is TException` runtime test (no exact-type discrimination); the exact/subtype split above is the intended surface once the ruling settles. Recorded as a dependency, not a blocker on the rest of the `Assert` library.
+
+**Exact vs subtype — decided: two named methods, exact is the default `Throws`.** `Throws<T>` requires the **exact** dynamic type (`ex.GetType() = typeof(T)` — `typeof` per spec §17.10, `Type` identity comparison per stdlib §2.13 "reference equality and `=` coincide"); `ThrowsAny<T>` allows subtypes (the bare-type match §31.2.1 already performs). Reasoning: the exact form catches the "expected `ArgumentNullException`, got its base `ArgumentException`" bug — the same specificity xUnit's `Throws` (exact) vs `ThrowsAny` (assignable) split exists to give — and the catch machinery already *is* the subtype form, so `ThrowsAny` is the thin one. Exact-by-default makes the stricter, bug-catching choice the one you reach for without thinking.
 
 ### 5.5 `Assert` is not `Debug.Assert` — the line, drawn explicitly
 
@@ -210,7 +222,7 @@ The stdlib already has `Debug.Assert(condition)` / `Debug.Assert(condition, mess
 | **Purpose** | runtime invariant check | test oracle |
 | **Elision** | may be elided in release builds | **never elided** |
 | **On failure** | implementation-defined (side effects unspecified) | throws typed `AssertionException` with rendered expected/actual |
-| **Import** | auto-imported | **explicit** `import System.Testing` |
+| **Import** | explicit `import System.Diagnostics` (not auto-imported — spec §2.3 auto-imports only System / System.Text) | **explicit** `import System.Testing` |
 
 No name collision arises: `Debug.Assert` is a method on class `Debug`; `Assert.Equal` is a method on class `Assert` — distinct qualifiers, and because `System.Testing` is not auto-imported, the bare name `Assert` never leaks into production code. (Gap item #23 — `Verify`/`Unreachable`/`Debug.Fail` — is the *invariant* side of the same diagnostics domain and is designed separately; it belongs with `Debug`, not here.)
 
@@ -264,15 +276,15 @@ v1 is a **library `Main`** — option (b)'s runner, needed under every fork.
 ```bezel
 public class TestRunner
   public constructor();
-  public method Add(name: string, body: () -> ());              // sync test
-  public method Add(name: string, body: () -> Task);            // async test (§6)
+  public method Add(name: string, scoped body: () -> ());       // sync test  (scoped: the runner stores the body until RunAsync, §28.14)
+  public method Add(name: string, scoped body: () -> Task);     // async test (§6)
   public method RunAsync(filter: string? := null): Task<int>;   // returns the failure count
 end TestRunner;
 ```
 
 ### 8.1 Execution and isolation
 
-`RunAsync` runs the added tests **serially in its own domain** (§6): for each, it invokes `body` (awaiting the `Task` form), scoring pass on normal completion and fail on a thrown exception. Each test's `using var` fixtures (§7) are disposed at that test's scope exit, so no state leaks between tests except a fixture *deliberately* shared by borrow from `Main` (§7). The `body` parameters are **call-bounded** function-typed parameters (§28.14) — the runner invokes each during `RunAsync` and never stores it past the call (it holds the `(name, body)` pairs only for the duration of the run, in its own local collection), so a capture-bearing test closure is admitted.
+`RunAsync` runs the added tests **serially in its own domain** (§6): for each, it invokes `body` (awaiting the `Task` form), scoring pass on normal completion and fail on a thrown exception. Each test's `using var` fixtures (§7) are disposed at that test's scope exit, so no state leaks between tests except a fixture *deliberately* shared by borrow from `Main` (§7). The `body` parameters are **`scoped`** (storage-bounded) function-typed parameters (§28.14): `Add` *stores* each body in the runner's own scoped collection from registration until `RunAsync` invokes it, which a plain call-bounded parameter forbids ("may **not** be stored in a field of any object"). The bounding object is the runner receiver, so a **capture-bearing** test closure is admitted iff the runner is a `using var`/`await using var` local and every captured source is declared before it (§28.14) — hence the `using var runner` in §3.2/§8; the runner drains and never invokes a stored body after its own disposal (quiescence, §28.14). **Capture-free method references** (the canonical `ClassTests.MethodName` registration) are admitted to the `scoped` parameter unconditionally, so the common path needs nothing extra.
 
 ### 8.2 Failure classification
 

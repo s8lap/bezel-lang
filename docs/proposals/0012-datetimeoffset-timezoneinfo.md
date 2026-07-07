@@ -2,12 +2,20 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1445](https://github.com/s8lap/bezel-lang/issues/1445) |
 | **Target module(s)** | `System` (§2.5 cluster, auto-imported) — new `DateTimeOffset` and `TimeZoneInfo` |
 | **Written against** | spec v0.177, stdlib v0.177 |
 | **Wave** | D2 (gap-review item #10) |
 | **Depends on** | Proposal 0010 (serialization value builtins — DateTimeOffset owns the offset-bearing wire form 0010's `DateTime` delegates to); the compiler-provided-conformance mechanism of §2.19 / §9.8 |
+
+## Rulings recorded at acceptance
+
+The three owner questions below are resolved as follows (delegated ruling, 2026-07-07; owner review pending). See "Open questions" for the full framing of each.
+
+1. **Q1 — instant-based equality on a value record: ACCEPTED as proposed.** `DateTimeOffset` defines `Equals`/hash/`CompareTo` over the *instant* and provides `EqualsExact` for the offset-sensitive case. This is not a stretch of the equality model: §25.2 explicitly admits that "Records and enums may overload `=` and `<>`," so a record diverging from structural equality via an `=`/`<>` overload is mechanically sanctioned. Instant order is the only total order consistent with "happened before," and it matches .NET. (Resolves D3.)
+2. **Q2 — `TimeZoneInfo` home / auto-import: auto-imported `System`, as proposed.** Symmetry with `DateTime` — "convert to local time" should be import-free just as `DateTime.Now` is. A UTC-only program never touches tzdata (`TimeZoneInfo.Utc` and `DateTimeOffset.UtcNow` need no database), so auto-import carries no filesystem-side-effect cost for the common case.
+3. **Q3 — defer the wall-clock → instant resolver to v2: CONFIRMED.** v1 ships only the total, always-well-defined operations plus the pure detection predicates (`IsAmbiguousTime`/`IsInvalidTime`); the one operation that must choose between two instants (or fault) is not shipped with a hidden default. The v2 resolver takes an explicit `AmbiguousTimeResolution` policy. (Resolves D5/D8.)
 
 ## Problem
 
@@ -58,7 +66,7 @@ These subsume the mission's "`ToUtcDateTime`/`ToLocalDateTime`" as properties, c
 
 **Decision.** `CompareTo`, the `<`/`>`/`<=`/`>=` operator group, `IEquatable<DateTimeOffset>.Equals`, and the derived hash are all defined over the **instant** (`UtcDateTime`), *not* the wall-clock reading. Two `DateTimeOffset` values that denote the same moment through different offsets — `2024-03-15T12:00:00+00:00` and `2024-03-15T13:00:00+01:00` — are **equal** and compare equal. A separate `EqualsExact(other)` returns `true` only when the instant **and** the offset both match.
 
-This is a **deliberate divergence from structural record equality** (§9.6): the default record `Equals` would compare both fields (wall reading *and* offset) and report the two examples above as unequal. The compiler-provided conformance overrides that with instant semantics, and the hash is taken over the instant so the equality/hash contract holds.
+This is a **deliberate divergence from structural record equality**, and it is one the language explicitly sanctions: §25.2 states "Records and enums may overload `=` and `<>`." The default record `Equals` would compare both fields (wall reading *and* offset) and report the two examples above as unequal; the compiler-provided conformance overrides that with an instant-based `=`/`<>` overload (§25.2), and the hash is taken over the instant so the equality/hash contract holds.
 
 **Rationale.** Instant order is the only total order that agrees with "happened before"; ordering by wall reading would put `13:00+01:00` after `12:00+00:00` despite being the same moment. This is the mission's "instant order, not civil," and matches .NET (`DateTimeOffset.Equals`/`CompareTo` are instant-based; `EqualsExact` is the offset-sensitive escape hatch). The divergence from structural equality is flagged as **owner open question Q1** because value records equating on a projection of their fields is unusual in the stdlib.
 
@@ -297,7 +305,7 @@ Add one specifier and one table row (the existing rows are unchanged):
 
 ## Open questions (owner ruling requested before landing)
 
-1. **Instant-based equality on a value record (D3).** `DateTimeOffset.Equals`/hash/`CompareTo` are defined over the *instant*, overriding the structural record equality of §9.6 (which would compare both the wall reading and the offset). This is the .NET shape (`Equals` instant-based, `EqualsExact` offset-sensitive) and is the only order consistent with "happened before," but it is the stdlib's first value record whose equality is a *projection* of its fields rather than structural. Confirm the divergence is acceptable, or prefer structural `Equals` + an `EqualsInstant`/`CompareTo`-only ordering.
+1. **Instant-based equality on a value record (D3).** `DateTimeOffset.Equals`/hash/`CompareTo` are defined over the *instant*, overriding the structural record equality (which would compare both the wall reading and the offset) via the `=`/`<>` overload §25.2 sanctions for records. This is the .NET shape (`Equals` instant-based, `EqualsExact` offset-sensitive) and is the only order consistent with "happened before," but it is the stdlib's first value record whose equality is a *projection* of its fields rather than structural. Confirm the divergence is acceptable, or prefer structural `Equals` + an `EqualsInstant`/`CompareTo`-only ordering.
 2. **`TimeZoneInfo` home / auto-import.** This proposal places `TimeZoneInfo` (and its two exceptions) in auto-imported `System`, so "convert to local time" is import-free like `DateTime.Now`. The alternative is a `System.` submodule requiring `import` (keeping the filesystem-touching tz surface behind an explicit import, and its exceptions off the auto-imported surface). Which posture is intended?
 3. **v2 scope for wall-clock → instant resolution (D5/D8).** Confirm that deferring the ambiguity-resolving constructor (with an explicit `AmbiguousTimeResolution` policy) to v2 — shipping only the detection predicates in v1 — is the right cut, versus shipping a policy-bearing resolver now.
 

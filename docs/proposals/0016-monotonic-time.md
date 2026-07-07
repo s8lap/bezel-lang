@@ -26,7 +26,7 @@ All items below are in the current stdlib; nothing is invented here.
 
 ## 2. Core design decision: resolution
 
-**Decision (settled by this proposal):** `Instant` stores its value in **nanoseconds** internally. The difference of two `Instant` values is returned as a `TimeSpan` — the normal stdlib duration type, in 100 ns ticks. A `TotalNanoseconds: double` escape is added to `TimeSpan` for callers that need sub-tick resolution. `TimeSpan.FromNanoseconds(ns: long): TimeSpan` is added to complete the round-trip; it **truncates** to the nearest tick (floors toward zero, discarding the sub-100 ns remainder).
+**Decision (settled by this proposal):** `Instant` stores its value in **nanoseconds** internally. The difference of two `Instant` values is returned as a `TimeSpan` — the normal stdlib duration type, which counts whole **100 ns ticks** (§2.5). The ns-resolution internal difference is therefore **truncated toward zero to the nearest tick** on the way into the `TimeSpan` (exactly as `FromNanoseconds` does below); a `TimeSpan` never carries a sub-tick component. A `TotalNanoseconds: double` view is added to `TimeSpan` — it is exactly `Ticks * 100.0`, so a duration can be read in nanoseconds without a manual multiply. Callers who need finer-than-tick platform resolution read `Stopwatch.ElapsedTicks`/`Frequency`, not `TimeSpan`. `TimeSpan.FromNanoseconds(ns: long): TimeSpan` completes the round-trip; it **truncates** to the nearest tick (floors toward zero, discarding the sub-100 ns remainder).
 
 Rationale for this layering:
 
@@ -108,18 +108,20 @@ end Stopwatch;
 public record TimeSpan
   // ... (existing members unchanged)
 
-  /// Total elapsed nanoseconds as a double. Sub-tick precision is preserved
-  /// (TotalNanoseconds = Ticks * 100.0 + sub-tick component stored internally
-  /// when the value was produced by Instant subtraction; for values produced
-  /// via FromTicks / FromMilliseconds etc. the sub-tick component is 0).
+  /// Total elapsed nanoseconds as a double: exactly Ticks * 100.0. TimeSpan
+  /// stores duration as whole 100 ns ticks (§2.5), so there is no sub-tick
+  /// component to preserve — an Instant difference is truncated toward zero to
+  /// the nearest tick just like FromNanoseconds, and every TimeSpan therefore
+  /// satisfies TotalNanoseconds = Ticks * 100.0 exactly. Callers who need
+  /// finer platform resolution read Stopwatch.ElapsedTicks / Frequency.
   public readonly property TotalNanoseconds: double;   // PROPOSED
 
   /// Construct a TimeSpan from a nanosecond count. Truncates toward zero to
   /// the nearest 100 ns tick: FromNanoseconds(150) → 1 tick (100 ns);
   /// FromNanoseconds(-150) → -1 tick (-100 ns). Sub-100 ns remainder is
-  /// discarded and unrecoverable. Use Instant arithmetic when sub-tick
-  /// precision matters — the resulting TimeSpan retains the sub-tick component
-  /// internally; only values constructed via this factory lose it.
+  /// discarded and unrecoverable. Instant subtraction truncates the same way,
+  /// so no TimeSpan carries sub-tick precision; when full hardware resolution
+  /// matters, use Stopwatch.ElapsedTicks / Frequency rather than a TimeSpan.
   public static method FromNanoseconds(ns: long): TimeSpan;   // PROPOSED
 end TimeSpan;
 ```
@@ -130,30 +132,31 @@ end TimeSpan;
 
 ```bezel
 // --- Pattern 1: elapsed time, no resource management ---
-let start := Instant.Now;
+var start := Instant.Now;
 DoWork();
-let elapsed := Instant.Now - start;   // TimeSpan
+var elapsed := Instant.Now - start;   // TimeSpan
 Console.WriteLine($"Work took {elapsed.TotalMilliseconds:F2} ms");
 
-// Sub-millisecond precision via TotalNanoseconds:
+// Nanosecond view via TotalNanoseconds (= Ticks * 100.0):
 Console.WriteLine($"Work took {elapsed.TotalNanoseconds:F0} ns");
 
 // --- Pattern 2: Stopwatch for repeated-lap profiling ---
 using var sw := Stopwatch.StartNew();
-for var i := 0 to 100 do
+for var i in 0..100 do
   Iteration();
-  Console.WriteLine($"Lap {i}: {sw.Elapsed.TotalMicroseconds:F1} µs");
+  Console.WriteLine($"Lap {i}: {sw.Elapsed.TotalMilliseconds:F3} ms");
   sw.Restart();
-end for;
+end;
 
 // --- Pattern 3: raw ticks for zero-overhead profiling ---
-let t0 := Stopwatch.ElapsedTicks;      // Stopwatch.Frequency is a compile-time-constant-like static
+using var prof := Stopwatch.StartNew();
+var t0 := prof.ElapsedTicks;      // ElapsedTicks is an instance property (§4.2); Frequency is a process-constant static
 // ... tight loop ...
-let dt := (Stopwatch.ElapsedTicks - t0) as double / Stopwatch.Frequency as double;
+var dt := double(prof.ElapsedTicks - t0) / double(Stopwatch.Frequency);
 // dt is seconds, full platform resolution
 
 // --- Pattern 4: TimeSpan.FromNanoseconds ---
-let delay := TimeSpan.FromNanoseconds(500_000);   // 500 µs = 5000 ticks, sub-tick remainder 0
+var delay := TimeSpan.FromNanoseconds(500_000);   // 500 µs = 5000 ticks, sub-tick remainder 0
 ```
 
 ---
@@ -178,7 +181,7 @@ A `double` has 53 bits of mantissa, which covers ~9 × 10^15 nanoseconds (about 
 
 ### Q5 — `Instant` comparison operators?
 
-`IComparable<Instant>` gives `<`, `>`, `<=`, `>=` through the standard operator group (spec §17, the IComparable convention). No separate `operator -` on `Instant + TimeSpan → Instant` (see Q2). `operator ==` / `!=` are synthesized from `IEquatable<Instant>` (spec §9.2).
+`IComparable<Instant>` gives `<`, `>`, `<=`, `>=` through the standard operator group (spec §17, the IComparable convention). No separate `operator -` on `Instant + TimeSpan → Instant` (see Q2). `=` / `<>` are synthesized from `IEquatable<Instant>` (spec §9.2).
 
 ---
 

@@ -95,6 +95,9 @@ public class PeriodicTimer: IDisposable
   // ArgumentOutOfRangeException if period <= TimeSpan.Zero.
   public constructor(period: TimeSpan);
 
+  // The configured tick interval (Q1 ruling: read-only, no setter in v1).
+  public readonly property Period: TimeSpan;
+
   // Await the next tick.
   //   Returns true  when a tick fires.
   //   Returns false when the timer has been disposed.
@@ -138,7 +141,7 @@ import System.Threading;
 
 public async method RunWithRefresh(): Task
   await using var scope := new TaskScope();
-  scope.Spawn(() -> async Task
+  scope.Spawn(async () => do
     using var timer := new PeriodicTimer(TimeSpan.FromMinutes(1.0));
     while await timer.WaitForTickAsync(scope.Token) do
       await RefreshCacheAsync();
@@ -150,6 +153,8 @@ end RunWithRefresh;
 ```
 
 When `scope.Cancel()` fires (due to a fault or signal), `scope.Token` is cancelled, `WaitForTickAsync` raises `OperationCanceledException`, and the Spawn body exits — cleanly completing the scope drain.
+
+> The Spawn body reads `scope.Token` — the body references its own bounding `TaskScope`. Capturing the bounding object inside a `scoped`-bounded `Spawn` body is admitted by the v0.180 capture train (the fourth bounding form / scoped-construction, #1439, in flight); this example lands with it.
 
 ---
 
@@ -163,5 +168,5 @@ When `scope.Cancel()` fires (due to a fault or signal), `scope.Token` is cancell
 
 ## 6. Open questions for the owner
 
-1. **`Period` property.** Should `PeriodicTimer` expose a readable `Period: TimeSpan` property? Useful for logging/diagnostics, costs nothing.
+1. **`Period` property — RESOLVED (delegated ruling, 2026-07-07; owner review pending): yes.** `PeriodicTimer` exposes a read-only `Period: TimeSpan` property (added to the §6.11 surface above). It is useful for logging/diagnostics and costs nothing; the *setter* is a separate question (Q2, deferred).
 2. **Period change after construction.** Should the caller be able to change the period after construction? A `Period` setter would allow adaptive intervals (e.g. exponential backoff). Deferred: the use case is real but adds concurrency surface (what happens to an outstanding await when the period changes?).

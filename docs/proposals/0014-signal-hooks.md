@@ -54,7 +54,7 @@ The pipe is the coalescing point as well: if it is full (signals arriving faster
 
 ### D5 — Bounded channel capacity; coalescing on full
 
-Each subscription channel is **bounded with a small internal capacity** (implementation default: 4). If the channel is full when a signal arrives, the delivery is **coalesced** (discarded silently). The signal handler catches `ChannelFullException` and suppresses it.
+Each subscription channel is **bounded with a small internal capacity** (implementation default: 4). If the channel is full when a signal arrives, the delivery is **coalesced** (discarded silently). It is the runtime **drain thread** (D4) that catches the `ChannelFullException` from `Send` and suppresses it — never the raw signal handler, which only performs the async-signal-safe `write(2)` and touches no channel.
 
 Rationale: POSIX signal semantics already permit coalescing — multiple identical signals pending to the same process may be merged to one delivery by the kernel before the handler runs. A Bezel program that has four unprocessed SIGINT messages has a slow signal consumer; the fifth is appropriately dropped rather than blocking the signal handler or growing an unbounded buffer. Lossy delivery of signals is the OS contract; this proposal makes it explicit.
 
@@ -126,11 +126,11 @@ public async method RunServer(token: CancellationToken): Task
   using var sigterm := Signals.Subscribe(SignalKind.Terminate);
   // Both channels receive independent deliveries; we merge via a helper task.
   await using var scope := new TaskScope();
-  scope.Spawn(() -> async Task
+  scope.Spawn(async () => do
     var kind := await sigint.Receive();
     scope.Cancel();    // cancel the scope's token → cooperative shutdown
   end);
-  scope.Spawn(() -> async Task
+  scope.Spawn(async () => do
     var kind := await sigterm.Receive();
     scope.Cancel();
   end);
@@ -141,11 +141,13 @@ public async method RunServer(token: CancellationToken): Task
 end RunServer;
 ```
 
+> Each spawned body references `scope` itself (`scope.Cancel()`) — a body capturing its own bounding `TaskScope`. Capturing the bounding object inside a `scoped`-bounded `Spawn` body is admitted by the v0.180 capture train (the fourth bounding form / scoped-construction, #1439, in flight); this example lands with it.
+
 ---
 
 ## 5. Declined alternatives
 
-1. **Callback-based subscription** (`Signals.Subscribe(kind, () -> ())`) — the callback runs on the signal thread, outside any domain; touching any Bezel state from it violates §30.14. Channel delivery is the only §30.14-sound shape.
+1. **Callback-based subscription** (`Signals.Subscribe(kind, () => ())`) — the callback runs on the signal thread, outside any domain; touching any Bezel state from it violates §30.14. Channel delivery is the only §30.14-sound shape.
 2. **`async` / `Task`-returning subscribe** (`Signals.WhenAsync(kind): Task<SignalKind>`) — returns a task that completes on the first signal. Cannot represent "receive every signal" without repeated calls; also raises the question of task ownership across domains. A channel is the right multi-delivery primitive.
 3. **A shared bus channel** (all subscribers share one `Channel<T>`) — fights the single-owner model; fan-out to independent channels is cleaner.
 4. **Unbounded internal buffer** — allows a slow-consumer backlog to grow without bound; against the defined-fault / no-silent-surprises discipline. Coalescing is the right behavior for signals, which POSIX itself coalesces under load.

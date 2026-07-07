@@ -12,6 +12,17 @@ against current docs before acting on it.
 
 ---
 
+> ⚠️ **PROVENANCE BANNER — mechanical refresh required before any run acts on this.**
+> This document's type names (`OwnedStack` / `OwnedBuffer` / `OwnedArray` /
+> `OwnedQueue` / `IOwnedCollection`, …) and its `src/` file:line anchors
+> **predate the v0.168 Owning-rename and the #1414 stage-3 registry work.** The
+> current family is `OwningStack` / `OwningBuffer` / `OwningArray` /
+> `OwningQueue` / `IOwningCollection` (spec §14.4, `Bezel_Language_Spec.md:143`
+> / `:1927`), and every quoted line number below has almost certainly drifted.
+> Before scheduling SH-1/SH-2/SH-3, do a mechanical rename pass and re-grep each
+> cited compiler anchor. The architecture and slice plan need no change — only
+> the names and line numbers do.
+
 ## 1. Current State
 
 ### 1.1 C++ Runtime Implementations

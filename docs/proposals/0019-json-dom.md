@@ -5,7 +5,7 @@
 | **Status** | draft |
 | **Tracking issue** | [#1461](https://github.com/s8lap/bezel-lang/issues/1461) |
 | **Target module(s)** | new `System.Text.Json` (the module named-but-deferred in stdlib §11); relates to §2.14/§2.15 (the serialization vocabulary + JSON format agent) without extending them |
-| **Written against** | spec/stdlib **v0.177** |
+| **Written against** | spec **v0.177** / stdlib **v0.165** |
 | **Wave** | D3 (gap-review item #21) |
 | **Depends on** | nothing to ship the parse/build/query core. The `WriteTo(TextWriter)` streaming-emit variant rides proposal 0006 (concrete `StreamWriter`/`TextWriter`); the embedded-field *read* round-trip rides an owner ruling (Open Question 1). |
 
@@ -27,7 +27,7 @@ Grep-verified against stdlib v0.177 / spec v0.177; cited, not invented:
 - **Exhaustive `case` over a sealed hierarchy** — spec §19.6: "when the scrutinee's static type is a `sealed abstract` class … and every leaf type … is matched by a type pattern … no `_` arm is required. **Class leaves are matched by type-test patterns** (`var c: Circle => …`); positional destructuring (§19.3) applies to record leaves, not to class leaves."
 - **Records cannot own, and cannot be leaves of a class hierarchy** — spec §9.6: "A record cannot derive from another record or from a class"; §28.5/§9.6: "Records cannot have destructors, `owned` fields, or implement `IDisposable`."
 - **Owned trees + cascade teardown** — spec §28.4 (destructor), §28.5 (owned fields: an owned field is disposed by the owner's cascade), §28.6 (leak prevention), §28.8 / §28.8.1 (ownership transfer via `move`-and-null). Precedent: proposal 0004's owned node trees (README: "owned node trees with cascade teardown").
-- **`OwningDictionary<K, V>` (§4.9)** — `where V: class`; get returns a **borrow**, `set(owned)` disposes the previous value; `PopValue(key): owned V` (the take-out), `Remove` disposes, `Add(key, owned value)`. **`OwningArray<T>` (§4.7)** — `where T: class`; indexer-get borrow, `set(owned)`; `Add(owned)`. Both require `T`/`V: class`, which `JsonValue` (a class) satisfies.
+- **`OwningDictionary<K, V>` (§4.9)** — `where V: class`; get returns a **borrow**, `set(owned)` disposes the previous value; `PopValue(key): owned V` (the take-out), `Remove` disposes, `Add(key, owned value)`. **`OwningArray<T>` (§4.5)** — `where T: class`; indexer-get borrow, `set(owned)`; `Add(owned)`. Both require `T`/`V: class`, which `JsonValue` (a class) satisfies.
 - **Owned-taking setters** — spec §23.3: `set(owned)` "takes ownership of the new value (and disposes the previous slot value)".
 - **Null-conditional access** — spec §7.5: `x?.M` short-circuits to `null`. **There is no `?[` null-conditional *indexer*** (grammar-verified: Appendix A has `?.` and `?(args)` only). This single fact drives the query-API shape below.
 - **`ISerializer`/`IDeserializer` token vocabulary (§2.14)** — `WriteInt`/`WriteUInt`/`WriteFloat`/`WriteDecimal`/`WriteBool`/`WriteString`/`WriteChar`/`WriteNull`/`BeginObject`/`WriteFieldName`/`EndObject`/`BeginArray`/`EndArray`; read duals. **Frozen** as of proposal 0010 (open-Q2 resolved 2026-07-04): "the token set is treated as **frozen**: any future token addition is a **breaking, rationale-recorded major event**."
@@ -110,7 +110,7 @@ public sealed class JsonObject: JsonValue
 end JsonObject;
 
 public sealed class JsonArray: JsonValue
-  private owned _items: OwningArray<JsonValue>;                  // §4.7; T: class ✓
+  private owned _items: OwningArray<JsonValue>;                  // §4.5; T: class ✓
   public constructor();
   public override readonly property Kind: JsonKind => JsonKind.Array;
 
@@ -124,7 +124,7 @@ end JsonArray;
 ```
 
 - **The tree is a single-owner spanning tree.** A `JsonObject` owns its `OwningDictionary`, which owns each child `JsonValue`, recursively. Dropping the root disposes everything beneath it through the standard owned-field cascade (§28.5) — no per-node teardown code, no `IDisposable` boilerplate on `JsonValue` itself beyond what the compiler generates for a class with owned fields (§28.4). This is exactly proposal 0004's owned-node-tree shape.
-- **Reads borrow (§28.6).** The navigation indexers (Q4) and `Keys`/`Values` hand back borrows of children the DOM still owns — the `OwningDictionary`/`OwningArray` indexer-get borrow semantics (§4.9/§4.7), lifted to the DOM surface.
+- **Reads borrow (§28.6).** The navigation indexers (Q4) and `Keys`/`Values` hand back borrows of children the DOM still owns — the `OwningDictionary`/`OwningArray` indexer-get borrow semantics (§4.9/§4.5), lifted to the DOM surface.
 - **Extraction transfers (§28.8).** `PopValue`/`PopAt` are the sanctioned take-out shapes, delegating to `OwningDictionary.PopValue` / `OwningArray` (`move`-and-null, §28.8.1). The caller receives an `owned JsonValue` and owns its subtree.
 - **`JsonNull` is an ordinary owned node**, not a shared singleton. An owned tree does not share nodes (that is `Shared<T>`, §28.13 — a separate opt-in not used here); each JSON `null` is its own `new JsonNull()`. This keeps teardown uniform and avoids a cross-tree alias.
 
@@ -166,11 +166,10 @@ public sealed class JsonNumber: JsonValue
   public static method FromDouble(value: double): owned JsonNumber;   // ArgumentException on NaN/±Inf
   public static method FromDecimal(value: decimal): owned JsonNumber;
 
-  // Read side — parse on demand from Raw (see AsInt/AsDouble/… under Q4):
-  public method AsInt(): int;         // FormatException if non-integral; OverflowException if out of range
-  public method AsLong(): long;
-  public method AsDouble(): double;
-  public method AsDecimal(): decimal; // OverflowException if the lexeme exceeds decimal range
+  // Read side: no leaf accessors. The numeric reads (AsInt/AsLong/AsDouble/AsDecimal)
+  // live once on the base JsonValue (Q4), which type-test-dispatches to a JsonNumber and
+  // parses Raw on demand. Redeclaring them here would hide the base members, which §12.2
+  // forbids; JsonNumber therefore adds only Raw + the From* factories.
 end JsonNumber;
 ```
 
@@ -255,7 +254,7 @@ end AsString;
 
 ### Decision — the DOM is **mutable** (build-then-serialize is a first-class use case), with a minimal, owned-discipline surface.
 
-Mutation is safe precisely because the tree is a single-owner owned tree (§28.5): `Add`/`Set`/`Insert`/`SetAt` are **owned-taking** (they consume an `owned JsonValue` and the backing `OwningDictionary`/`OwningArray` disposes any replaced child, §4.9/§4.7); `Remove`/`RemoveAt` dispose; `PopValue`/`PopAt` transfer ownership out. There is no aliasing to invalidate. Building a document:
+Mutation is safe precisely because the tree is a single-owner owned tree (§28.5): `Add`/`Set`/`Insert`/`SetAt` are **owned-taking** (they consume an `owned JsonValue` and the backing `OwningDictionary`/`OwningArray` disposes any replaced child, §4.9/§4.5); `Remove`/`RemoveAt` dispose; `PopValue`/`PopAt` transfer ownership out. There is no aliasing to invalidate. Building a document:
 
 ```bezel
 public method BuildGreeting(name: string): owned JsonValue
@@ -270,7 +269,7 @@ public method BuildGreeting(name: string): owned JsonValue
 end BuildGreeting;
 ```
 
-**Why no owned-taking indexer-set** (`root["k"] := v`): a read-write indexer on `JsonObject` would have to *hide* the base's get-only navigation indexer of the same signature (Q4), and member-hiding across the sealed hierarchy is a grammar subtlety not worth resolving in v1. `Set(key, owned value)` is the honest builder verb. (This is a deliberate, reasoned departure from the collections' "no `Set` method" convention of §4.7 — that convention applies to the collection family, and `JsonValue` is not in it; here the base indexer is read-only *by design*, so building cannot route through indexer-set.) An owned indexer-set is a candidate v2 nicety, noted, not shipped.
+**Why no owned-taking indexer-set** (`root["k"] := v`): a read-write indexer on `JsonObject` would have to *hide* the base's get-only navigation indexer of the same signature (Q4), and member-hiding across the sealed hierarchy is a grammar subtlety not worth resolving in v1. `Set(key, owned value)` is the honest builder verb. (This is a deliberate, reasoned departure from the collections' "no `Set` method" convention of §4.8 — that convention applies to the collection family, and `JsonValue` is not in it; here the base indexer is read-only *by design*, so building cannot route through indexer-set.) An owned indexer-set is a candidate v2 nicety, noted, not shipped.
 
 ---
 
@@ -310,16 +309,20 @@ end JsonValue;
 | `JsonNull`   | `WriteNull()` |
 | `JsonNumber` | one of `WriteInt`/`WriteUInt`/`WriteDecimal`/`WriteFloat` per the Q3 canonicalization |
 
-Because `JsonValue` is a class, an `owned JsonValue` field in a record/class is an **owning edge** (§9.8), and a class-typed component that is `: ISerializable` is serialization-eligible (§9.8). So a typed envelope with a schemaless tail is *write*-eligible today:
+Because `JsonValue` is a class, an `owned JsonValue` field is an **owning edge** (§9.8), and a class that declares `: ISerializable` and whose serialized components are each serialization-eligible has its `Serialize` synthesized (§9.8, class serialization synthesis). The envelope must therefore be a **sealed class**, not a record: a record **cannot hold an `owned` field** (§9.7), so the schemaless tail — an owned child tree — can only be owned by a class. So a typed envelope with a schemaless tail is *write*-eligible today:
 
 ```bezel
-public record Envelope(
-    Kind: string,
-    Payload: owned JsonValue          // the schemaless tail, quarantined behind JsonValue's typed surface
-): ISerializable;                     // eligible: string + an ISerializable owned class-typed edge (§9.8)
+public sealed class Envelope: ISerializable   // a class owns its fields (§9.8); serialized shape is read from the field types
+  public readonly property Kind: string;
+  private owned _payload: JsonValue;          // the schemaless tail, quarantined behind JsonValue's typed surface
+  public constructor(kind: string, owned payload: JsonValue);
+  public method Serialize(s: ISerializer);    // synthesized: a string component + an owned ISerializable class-typed edge (§9.8)
+end Envelope;
 ```
 
-**(d) The embedded-field *read* round-trip is deferred to an owner ruling (Open Question 1).** `JsonValue` does **not** implement `IDeserializable` in v1, for a structural reason: reconstructing a DOM from the abstract `IDeserializer` requires reading a value **of unknown kind** — but the vocabulary is *typed-pull* (`ReadInt` vs `ReadString`; the target type's `Deserialize` is expected to know its own shape) and has **no value-kind peek**. Adding one is a **breaking change to a frozen vocabulary** (proposal 0010 open-Q2). The whole-document schemaless case needs none of this — `JsonValue.Parse(text)` reads raw JSON directly. Only the *embedded field* case (a record with a `JsonValue` field declaring `: IDeserializable`) needs the peek, and it is scoped out of v1. Consequence, stated honestly: a record with a `JsonValue` field can declare `: ISerializable` (write) but **not** `: IDeserializable` in v1 (the conformance would be a compile error naming the field, §9.8).
+**Dependency — the §9.7/§9.8 contradiction (owner ruling).** §9.8's class-in-record paragraph states that when a class-typed component appears in a record "the record field must be `owned`", which directly contradicts §9.7's flat "Records cannot have … `owned` fields." The sealed-class envelope above sidesteps the contradiction (classes unambiguously own fields), so the *write* path ships regardless; but the record-envelope convenience form is blocked until that contradiction is ruled. This proposal takes the class form and records the dependency.
+
+**(d) The embedded-field *read* round-trip is deferred to an owner ruling (Open Question 1).** `JsonValue` does **not** implement `IDeserializable` in v1, for a structural reason: reconstructing a DOM from the abstract `IDeserializer` requires reading a value **of unknown kind** — but the vocabulary is *typed-pull* (`ReadInt` vs `ReadString`; the target type's `Deserialize` is expected to know its own shape) and has **no value-kind peek**. Adding one is a **breaking change to a frozen vocabulary** (proposal 0010 open-Q2). The whole-document schemaless case needs none of this — `JsonValue.Parse(text)` reads raw JSON directly. Only the *embedded field* case (an envelope type — the §6c sealed class — with an owned `JsonValue` field declaring `: IDeserializable`) needs the peek, and it is scoped out of v1. Consequence, stated honestly: an envelope with an owned `JsonValue` field can declare `: ISerializable` (write) but **not** `: IDeserializable` in v1 (the conformance would be a compile error naming the field, §9.8).
 
 ---
 
@@ -409,7 +412,7 @@ end JsonValue;
 
 ## Open questions (owner ruling requested before landing)
 
-1. **Embedded-field read round-trip vs the frozen vocabulary.** To let a record with a `JsonValue` field declare `: IDeserializable`, the DOM needs to read an unknown-kind value from `IDeserializer` — impossible without a value-kind peek, and the token set is **frozen** (proposal 0010). Options: **(a)** add a `PeekValueKind()` / `ReadDynamicValue()` token — a rationale-recorded *breaking major event*; **(b)** a §9.8 synthesis *special-case* recognizing `JsonValue` fields and bridging the concrete `JsonDeserializer` (works only for the JSON format, not `BinaryDeserializer`); **(c)** leave it write-only in v1 (this proposal's default). Recommend **(c) now, revisit (a) if real usage demands round-tripping schemaless tails** — the freeze is young and its stability is load-bearing for §2.14's "serialize once, serialize to every format" guarantee.
+1. **Embedded-field read round-trip vs the frozen vocabulary.** To let an envelope (the §6c sealed class) with an owned `JsonValue` field declare `: IDeserializable`, the DOM needs to read an unknown-kind value from `IDeserializer` — impossible without a value-kind peek, and the token set is **frozen** (proposal 0010). Options: **(a)** add a `PeekValueKind()` / `ReadDynamicValue()` token — a rationale-recorded *breaking major event*; **(b)** a §9.8 synthesis *special-case* recognizing `JsonValue` fields and bridging the concrete `JsonDeserializer` (works only for the JSON format, not `BinaryDeserializer`); **(c)** leave it write-only in v1 (this proposal's default). Recommend **(c) now, revisit (a) if real usage demands round-tripping schemaless tails** — the freeze is young and its stability is load-bearing for §2.14's "serialize once, serialize to every format" guarantee.
 2. **Duplicate object keys on parse.** RFC 8259 permits them and leaves behaviour to the implementation. Recommend **last-wins with a parse-time fault option**; simplest v1 is **fault** (`JsonParseException`) — strict-by-default, matching §2.15. Confirm.
 3. **`AsInt()` on `"1.0"`.** Is a fractional-notation-but-integral-value lexeme (`1.0`, `2e0`) an `int`? Recommend **`FormatException`** (strict: `AsInt` wants integral *syntax*; `AsDouble().RoundTo…` is the explicit path) — but a "numerically integral" leniency is defensible. Confirm the strict reading.
 

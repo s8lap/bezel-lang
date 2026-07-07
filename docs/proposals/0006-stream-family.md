@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.IO` (stdlib §7) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1433](https://github.com/s8lap/bezel-lang/issues/1433) |
@@ -310,6 +310,16 @@ Notes on the surface:
 3. **`CopyToAsync` on the abstract `Stream`.** It is a non-abstract method with a default body, so it does not break existing subclasses — but it is still an addition to a normative stdlib type. Confirm that lands as a §7.1 amendment (proposal-graduation workflow) rather than needing its own decision.
 4. **`AutoFlush` default.** Proposed `false` (buffered fast path). .NET's `StreamWriter` also defaults `false` but its `Console`-derived writers default `true`. Confirm `false`, or want line-durability by default?
 5. **`TakeBytes` return type.** `owned OwningBuffer<byte>` (the §4.14 primitive, matching the review sketch) vs `owned Array<byte>` (the everyday byte container, matching `ToArray`). The buffer is the zero-copy-honest type; the array is the more familiar one. The review says `OwningBuffer<byte>`; confirm.
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+The five §6 questions are resolved as follows; the graduating additions (`Stream.CopyToAsync`, the two concrete classes, `MemoryStream`) land as §7 amendments through the normal docs workflow.
+
+- **Q1 — borrowed-stream construction: already owner-resolved (2026-07-04, RFC #1439).** v1 ships owned-only; the borrowed form is unblocked by the scoped-construction rule (generalize §28.14 `scoped` to class/interface-typed borrow parameters) and lands later as a pure non-breaking second `constructor(scoped stream: Stream)` signature once the §28.14 amendment lands. Recorded in §6; no further action here.
+- **Q2 — `ReadLinesAsync` borrow-of-receiver across `await`: confirmed sound; keep the instance async-iterator.** v0.179 settled exactly this case: §28.3's "Deferred-activation callees" rule states that an iterator/async-iterator factory's returned frame **carries its arguments' (and receiver's) borrows** and is treated as a borrow-carrying value whose source is the receiver, and §29.3 restates it for the returned state machine. The `await for` desugaring binds the enumerator inside the reader's `using var` (§30.7), so the reader (the borrow source) provably outlives the enumeration and the borrow is **compiler-tracked**, not residual trust. No fallback to a receiver-owning free function is needed.
+- **Q3 — `CopyToAsync` on abstract `Stream`: confirmed as a §7.1 amendment through normal graduation.** It is a non-abstract method with a default body over the existing `ReadAsync`/`WriteAsync`, so it breaks no existing subclass; it needs no decision of its own beyond landing with this proposal.
+- **Q4 — `AutoFlush` default `false`.** Confirmed. The buffered fast path is the right default; line-durability is opt-in (`AutoFlush := true`), matching .NET's `StreamWriter` default.
+- **Q5 — `TakeBytes(): owned OwningBuffer<byte>`.** Confirmed. `OwningBuffer<byte>` (§4.14) is the zero-copy-honest drain type; `ToArray()` remains the everyday owned-`Array<byte>` copy.
 
 ## 7. Relationship to existing issues
 

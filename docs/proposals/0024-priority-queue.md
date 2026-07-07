@@ -60,7 +60,7 @@ This is the only shape consistent with §22.3: every out must be assigned on eve
 
 ### D6 — Auxiliary entry-type record
 
-**Decision.** A `PriorityQueueEntry<TElement, TPriority>` record is introduced as the iteration element type and as the return type of `TryPeek`/`TryDequeue` compound access. It carries both the element and its priority, matching the caller's natural need when iterating or doing a combined peek.
+**Decision.** A `PriorityQueueEntry<TElement, TPriority>` record is introduced as the **iteration element type** (`IReadOnlyCollection<PriorityQueueEntry<…>>`, §D5). It carries both the element and its priority, matching the caller's natural need when iterating. It is **not** the return type of `TryPeek`/`TryDequeue`: those follow the v0.171 two-nullable-out shape (§D4, `out element`/`out priority`), which is the standing Try convention for compound extraction — so `PriorityQueueEntry` serves iteration alone, not the Try surface.
 
 ### D7 — No DequeueEnqueue combined op in v1
 

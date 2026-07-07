@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1455](https://github.com/s8lap/bezel-lang/issues/1455) |
 | **Target module(s)** | `System.Text` (auto-imported, §3 of stdlib); adds two methods to `String` (§9.6) and a new `NormalizationForm` enum |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
@@ -66,8 +66,8 @@ Bundle the canonical forms (NFC and NFD) in the runtime from the start. Defer th
 **Justification for the deferral of NFKC/NFKD:**
 - NFC/NFD handle the primary use cases: text comparison, URL normalization, IDN hostname processing, and identifier canonicalization all use canonical forms.
 - NFKC/NFKD additionally collapse compatibility variants: ligatures (`ﬁ` → `fi`), width variants (fullwidth `Ａ` → `A`), and legacy compatibility characters. These are needed for legacy text migration, font engineering, and some IDN processing, but are niche compared to canonical normalization.
-- The compatibility mapping table (`CompatibilityDecomposition.txt`) is roughly twice the size of the canonical decomposition table — deferring it saves ~50 KB of static data in v1.
-- The `NormalizationForm` enum includes all four values from the start (so code written against v1 will not need changes when NFKC/NFKD land), but NFKC and NFKD raise `NotImplementedException` in v1 implementations. This is the same "surface-complete, implementation-staged" approach used in other proposals.
+- The compatibility mappings are roughly twice the size of the canonical decomposition data — deferring them saves ~50 KB of static data in v1. (These mappings are **not** a separate UCD file: they live in field 5 of `UnicodeData.txt`, prefixed with a compatibility tag such as `<compat>`/`<wide>`/`<fraction>`; the canonical decompositions are the *untagged* entries of the same field. There is no `CompatibilityDecomposition.txt`.)
+- The `NormalizationForm` enum ships **all four values from the start** — and this is *forced, not merely convenient*. Enum members are a public surface, and adding one later is a breaking change to exhaustive `case` matching: a `case form of` over `{NFC, NFD, NFKC, NFKD}` with no `_` arm is statically exhaustive (§19.6) *today*; had v1 shipped only `{NFC, NFD}`, every such match written against v1 would become non-exhaustive when the compatibility members land — silently faulting with `MatchFailureException` on the new value in expression position (§19.6, the enum-cast/out-of-range path). Shipping the members up front and staging only the *implementation* (NFKC/NFKD raise `NotImplementedException`, §31.4, until the tables are bundled) is the only sequence that avoids breaking downstream exhaustive matches — this is the strongest argument for surface-complete-implementation-staged, and it applies to any enum the stdlib exposes.
 
 **This proposal recommends option C.**
 
@@ -156,6 +156,10 @@ The `=` operator never normalizes implicitly. Any code that needs Unicode-equiva
 - Placing it in `System.Text` alongside `Encoding` keeps all the "bytes ↔ strings" and "string canonicalization" tools in one module, matching where callers will look.
 
 ---
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+The load-bearing design question (§3, data-table sourcing) is resolved as **Option C: bundle canonical NFC/NFD in the runtime now, defer compatibility NFKC/NFKD** to a later revision. The ICU-FFI route (Option B) is declined — dependency debt (~30 MB library, a §32 trusted surface, build/run version skew, unavailable in static/container-minimal deployments) is disproportionate to a data-table lookup, consistent with the project's dependency-debt posture. Two strengthening edits were applied at acceptance: (1) the §3 justification now states the *forcing* reason the enum ships all four members up front — later enum additions break statically-exhaustive `case` matches (§19.6), so surface-complete-implementation-staged is required, not merely convenient (NFKC/NFKD raise `NotImplementedException`, §31.4, until the tables land); (2) the erroneous `CompatibilityDecomposition.txt` reference is corrected — compatibility mappings live in field 5 of `UnicodeData.txt` (tagged), not a separate UCD file. The equality contract stays ordinal (§9.6/§4.6); `Normalize`/`IsNormalized` are the explicit counterpart to declined item #8, and never fault for NFC/NFD because every Bezel `string` is a valid Unicode scalar-value sequence (§4.6). Lands in the d3-small-utilities batch (self-contained Unicode-table packaging) as `System.Text` `NormalizationForm` + two §9.6 `String` methods.
 
 ## 8. Declined alternatives (register)
 

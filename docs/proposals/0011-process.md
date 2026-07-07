@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.Diagnostics` (stdlib §8; the type is `System.Diagnostics.Process`, the "open shape" deferred in stdlib [§11](../Bezel_Standard_Library.md#sec-modules-deferred-to-future-revisions)) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1440](https://github.com/s8lap/bezel-lang/issues/1440) |
@@ -362,6 +362,18 @@ Each with its one-line reason; none blocks v1's build-tool / test-runner accepta
 5. **Module placement.** Types are placed in `System.Diagnostics` (with `Stopwatch`), the qualified type being `System.Diagnostics.Process` as stdlib §11 names it. Confirm this over a dedicated `System.Diagnostics.Process` submodule.
 6. **The uninterruptible-sleep (`D`-state) reap edge (Q2).** A child wedged in `D` state does not die on `SIGKILL`, so the destructor's reap can briefly block. This is an unavoidable kernel pathology; confirm it is acceptable to document as a known limitation (the alternative — a fully non-blocking destructor that abandons the reap — would leak a zombie, which is worse).
 7. **`fileName` `PATH` resolution.** `execvp` semantics (search `PATH` when no separator) are chosen for ergonomics (`Start("git", …)`). Confirm, versus requiring an explicit path always (more predictable, less convenient) — .NET and Go both do the `PATH` search.
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+The seven §6 owner questions are resolved as follows; the §30.14 `Process`-not-sendable classification graduates into the compiler-known list when the type lands.
+
+- **Q1 — disposal kills a running child (the load-bearing one): YES, kill-on-dispose (SIGKILL + reap).** Detach-on-dispose is declined: letting disposal orphan a running child is a silent OS-process leak, which would make `using var Process` a lie and defeat the very leak-prevention discipline §28 exists for. Kill-on-dispose bounds the child's lifetime by the `Process` value's, which is what an owned handle means; and the destructor's reap is bounded (it runs *after* `SIGKILL`, on a guaranteed-dying child, so `waitpid` returns in O(1)) — it is the opposite of the declined unbounded blocking wait. Detach becomes an explicit, never-silent `Detach()` later (§5).
+- **Q2 — signal exit encoding `128 + N` on `Task<int>`: confirmed.** Keeps the return a plain `int`, matches .NET-on-Unix; a structured `{ code, signal }` record is deferred (§5).
+- **Q3 — `Take*(): owned Stream` (raw), not pre-wrapped `TakeStandardOutput(): owned StreamReader`: confirmed.** The raw owned stream lets the caller pick text (`StreamReader`), bytes (`CopyToAsync`), or memory (`MemoryStream`) via the 0006 family, at the cost of one `new StreamReader(...)`; it keeps the `Process` surface free of a text-vs-bytes commitment. (Transfer, not §28.6 borrow-out, because 0006's wrappers take the stream `owned`.)
+- **Q4 — `Process` is domain-local, not sendable: confirmed** (proposed §30.14 addition), mirroring 0007's `TcpConnection` precedent. The domain-affine ruling is the weaker, safer runtime contract; cross-domain process work uses worker domains that own their *own* `Process`es and send sendable results (exit codes, strings, `owned Array<byte>`) over channels.
+- **Q5 — module placement `System.Diagnostics`: confirmed** (with `Stopwatch`; qualified type `System.Diagnostics.Process` as stdlib §11 names it), not a dedicated submodule.
+- **Q6 — the uninterruptible-sleep (`D`-state) reap edge: documented as a known limitation.** A child wedged in `D` state does not die immediately even on `SIGKILL`, so the destructor's reap can briefly block; this is an unavoidable kernel pathology with no clean userspace remedy, and documenting it beats the alternative (a non-blocking destructor that abandons the reap and leaks a zombie).
+- **Q7 — `execvp` `PATH` resolution: confirmed.** `fileName` with no directory separator searches `PATH` (`"git"`); with a separator it is used as a path (`"./build.sh"`) — the ergonomic choice .NET and Go both make.
 
 ## 7. Relationship to existing work
 

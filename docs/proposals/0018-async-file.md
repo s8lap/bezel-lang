@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.IO` (extends stdlib §7.3 `File`) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1447](https://github.com/s8lap/bezel-lang/issues/1447) |
@@ -192,6 +192,12 @@ The sync `ReadAllText` has no explicit encoding parameter — it reads UTF-8 (ma
 Matches the sync `WriteAllLines(path, lines: IEnumerable<string>)` exactly. `IOwningEnumerable<string>` is unnecessary because `string` is runtime-managed and has no disposal obligation in collection slots.
 
 ---
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+This is a mechanical async-dual mirror of the §7.3 `File` surface; it was verified exact against v0.177. The §8 design decisions carry as drafted — Q1: `ReadAllBytesAsync`/`ReadAllLinesAsync` return `OwningTask<Array<byte>>`/`OwningTask<Array<string>>` (Pattern B, §30.5; `Array<T>` is a class), matching `Stream.ReadAllAsync`; Q2: no `encoding` parameter in v1 (mirrors sync `ReadAllText`; the composable non-UTF-8 path is `new StreamReader(FileStream, encoding).ReadToEndAsync()` once 0006 lands); Q3: `WriteAllLinesAsync` takes `IEnumerable<string>` (string is runtime-managed, no owning form needed). The `WriteAllBytes(ReadOnlySpan<byte>)` async form is correctly omitted per #1438 (borrow-bearing async parameters).
+
+- **Sync `AppendAllText` rides along (§5): confirmed.** `File.AppendAllText(path, contents)` is absent from §7.3 today and is tightly coupled to `AppendAllTextAsync`; land the sync companion in the same revision, tracked under **#1447** (no separate issue).
 
 ## 9. Relationship to existing issues and proposals
 

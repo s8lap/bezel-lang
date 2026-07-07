@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1454](https://github.com/s8lap/bezel-lang/issues/1454) |
 | **Target module(s)** | `System.IO.Hashing` (new module; requires `import System.IO.Hashing`) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
-| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #27 (P1), wave D2; depends on proposal 0008 (integer toolkit — [#1437](https://github.com/s8lap/bezel-lang/issues/1437)) |
+| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #27 (P1), wave D3 (the design plan lists #27 under wave D3); depends on proposal 0008 (integer toolkit — [#1437](https://github.com/s8lap/bezel-lang/issues/1437)) |
 
 ---
 
@@ -80,14 +80,14 @@ end XxHash64;
 
 ### 4.2 Incremental accumulator — the chaining-record shape
 
-The incremental form follows the `HashCode` immutable-chaining value record shape from proposal 0008 §5.3 exactly. This is deliberate: the structural analogy helps readers recognize the pattern, and the shape (one word of state, copy-free, no allocation) applies here for the same reasons it applied to `HashCode`.
+The incremental form follows the `HashCode` immutable-chaining value record shape from proposal 0008 §5.3 exactly. This is deliberate: the structural analogy helps readers recognize the pattern, and the shape (a small fixed state carried in the value, copy-free, no heap allocation) applies here for the same reasons it applied to `HashCode`. The state size is **not** always one word: `Crc32Hasher` is a single `uint`, but `XxHash64Hasher` carries **four `u64` accumulators plus an up-to-31-byte tail buffer** (the reference algorithm's block remainder) — still a fixed-size value expressible as a record with an inline-array field (`[32]byte` tail + a length), so it remains a stack value with no allocation; it is simply not one word.
 
 Key shape decisions (all identical to `HashCode`'s reasoning in 0008 §5.4):
 
-- **Immutable-chaining value record**: `Add(bytes)` returns a **new** record value; it does not mutate the receiver. This avoids the value-receiver-mutation question (spec §9.4 — see 0008 §5.4), is allocation-free (records are stack values), and is sendable (§29).
+- **Immutable-chaining value record**: `Add(bytes)` returns a **new** record value; it does not mutate the receiver. This avoids the value-receiver-mutation question (spec §9.4 — see 0008 §5.4), is allocation-free (records are stack values), and is sendable (§30.14 — a record of value-typed fields is a sendable value type).
 - **`Start()`** factory: the blessed entry point. `default(Crc32Hasher)` is the all-zero unseeded state and must **not** be used directly — document as a footgun, same note as 0008.
 - **`Value` property**: idempotent finalizer (re-readable; no "consume" semantics).
-- **`AddRange`**: streaming convenience for `IEnumerable<IReadOnlySpan<byte>>` when segments arrive as a sequence (e.g. reading a file in buffered chunks).
+- **No `AddRange(IEnumerable<IReadOnlySpan<byte>>)`**: a sequence-of-spans convenience is *inexpressible*. `IReadOnlySpan<byte>` is a borrow-bearing record (§9.7), and iterating a sequence of them requires the `IEnumerable<T>` enumerator path that spec §8.6 explicitly forbids for spans ("the contrasting *forbidden* case is the `IEnumerable<T>` enumerator path … which is why spans do not implement `IEnumerable<T?>`"). No caller could even construct such a sequence. Streaming is covered by per-chunk `h := h.Add(span)` in an ordinary read-into-buffer loop (§4.2 examples).
 
 ```bezel
 /// Incremental CRC-32 accumulator. Immutable-chaining value record.
@@ -99,10 +99,8 @@ public record Crc32Hasher
 
   // Fold bytes into the running CRC; returns a NEW Crc32Hasher value.
   // Equivalent to Crc32Hasher with all prior bytes followed by these bytes.
+  // Stream by calling Add once per buffer in a read loop (no span-sequence AddRange — §4.2).
   public method Add(bytes: IReadOnlySpan<byte>): Crc32Hasher;
-
-  // Convenience for a sequence of spans (e.g. buffered file reads).
-  public method AddRange(segments: IEnumerable<IReadOnlySpan<byte>>): Crc32Hasher;
 
   // Finalize: the CRC-32 of all bytes added so far. Idempotent; re-readable.
   // Note: this performs the final XOR with 0xFFFFFFFF per the CRC-32 spec;
@@ -117,10 +115,8 @@ public record XxHash64Hasher
   public static method Start(): XxHash64Hasher;
 
   // Fold bytes into the running hash; returns a NEW XxHash64Hasher value.
+  // Stream by calling Add once per buffer in a read loop (no span-sequence AddRange — §4.2).
   public method Add(bytes: IReadOnlySpan<byte>): XxHash64Hasher;
-
-  // Convenience for a sequence of spans.
-  public method AddRange(segments: IEnumerable<IReadOnlySpan<byte>>): XxHash64Hasher;
 
   // Finalize: the XxHash64 of all bytes added so far. Idempotent; re-readable.
   public readonly property Value: ulong;
@@ -130,25 +126,35 @@ end XxHash64Hasher;
 **Usage examples:**
 
 ```bezel
+import System.IO;              // FileStream, FileMode
 import System.IO.Hashing;
 
 // One-shot checksum of an in-memory buffer.
 var crc := Crc32.Compute(fileBytes.AsReadOnlySpan());      // fileBytes: Array<byte>
 
-// Incremental checksum across buffered reads.
+// Incremental checksum across buffered reads — the §7.1 canonical read loop.
+// Add is called once per filled buffer prefix; there is no span-sequence AddRange.
+using var stream := new FileStream(path, FileMode.Open);
+var buffer := new Array<byte>(64 * 1024, 0);               // sized buffer (§4.4)
 var h := Crc32Hasher.Start();
-for var chunk in reader.ReadChunks(bufferSize: 65536) do
-  h := h.Add(chunk);                                       // value reassignment per §25.3 Counter idiom
+var n := stream.Read(buffer, 0, buffer.Count);            // 0 at EOF
+while n > 0 do
+  h := h.Add(buffer.AsReadOnlySpan(0, n));                 // §4.15 view over the filled prefix; value reassignment (§25.3 Counter idiom)
+  n := stream.Read(buffer, 0, buffer.Count);
 end;
 var checksum := h.Value;
 
 // One-shot XxHash64 content fingerprint.
 var fp: ulong := XxHash64.Compute(payload.AsReadOnlySpan());
 
-// Incremental XxHash64 via value reassignment.
+// Incremental XxHash64 over the same read-loop shape.
+using var xstream := new FileStream(path, FileMode.Open);
+var xbuffer := new Array<byte>(64 * 1024, 0);
 var hx := XxHash64Hasher.Start();
-for var segment in segments do
-  hx := hx.Add(segment);
+var m := xstream.Read(xbuffer, 0, xbuffer.Count);
+while m > 0 do
+  hx := hx.Add(xbuffer.AsReadOnlySpan(0, m));
+  m := xstream.Read(xbuffer, 0, xbuffer.Count);
 end;
 var digest := hx.Value;
 ```
@@ -262,7 +268,10 @@ Known-answer test vectors:
 
 Incremental CRC-32 accumulator. An immutable-chaining value record: `Add` returns a
 new `Crc32Hasher` value rather than mutating the receiver, so no heap allocation
-occurs and the value is sendable (§29 of the language spec).
+occurs and the value is sendable (§30.14 of the language spec — a record of value-typed
+fields is a sendable value type). Stream by calling `Add` once per buffer in a read
+loop; there is no `AddRange(IEnumerable<IReadOnlySpan<byte>>)` — spans cannot be
+enumerated through `IEnumerable<T>` (spec §8.6).
 
 Entry point: `Crc32Hasher.Start()`.  Do NOT use `default(Crc32Hasher)` — it is the
 all-zero state, not the CRC-32 initial value; use `Start()` exclusively.
@@ -270,11 +279,9 @@ all-zero state, not the CRC-32 initial value; use `Start()` exclusively.
     public record Crc32Hasher
       public static method Start(): Crc32Hasher;
       public method Add(bytes: IReadOnlySpan<byte>): Crc32Hasher;
-      public method AddRange(segments: IEnumerable<IReadOnlySpan<byte>>): Crc32Hasher;
       public readonly property Value: uint;   // idempotent finalizer; re-readable
     end Crc32Hasher;
 
-`AddRange` is equivalent to calling `Add` for each segment in sequence.
 `Value` finalizes (applies the CRC-32 final XOR) on each read; the stored state
 is the pre-XOR running value.
 
@@ -306,7 +313,6 @@ Incremental XxHash64 accumulator.  Same immutable-chaining value record shape as
     public record XxHash64Hasher
       public static method Start(): XxHash64Hasher;
       public method Add(bytes: IReadOnlySpan<byte>): XxHash64Hasher;
-      public method AddRange(segments: IEnumerable<IReadOnlySpan<byte>>): XxHash64Hasher;
       public readonly property Value: ulong;  // idempotent finalizer; re-readable
     end XxHash64Hasher;
 ```

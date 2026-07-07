@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1450](https://github.com/s8lap/bezel-lang/issues/1450) |
 | **Target module(s)** | `System.Threading` (stdlib §6) — added as new members on the `Task` static class (§6.7) |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
@@ -48,7 +48,7 @@ The specific precedent is ruling #1226 (2026-07-01): a bound lazy LINQ query is 
 - **Use `TaskScope` when** you want structured fan-out with lifecycle management, cancellation propagation, and fault isolation.
 - **Use `WhenEach` when** you have an already-existing collection of tasks and want to process results as they arrive without structured scope.
 
-Calling `WhenEach` over tasks spawned by a `TaskScope` is valid: `WhenEach` observes their completions; `TaskScope` still owns their lifecycle. The caller is responsible for ensuring the tasks outlive the `await for` loop (the tasks are borrowed by `WhenEach`; they must not be disposed before the enumeration completes).
+Calling `WhenEach` over tasks spawned by a `TaskScope` is valid: `WhenEach` observes their completions; `TaskScope` still owns their lifecycle. The tasks-outlive-the-enumeration requirement is **compiler-tracked, not a programmer promise**: `WhenEach` borrows the input task array, and its returned `IAsyncEnumerable` is a deferred-activation frame that *carries that borrow* (spec §28.3 "Deferred-activation callees", v0.179 — the returned iterable is a borrow-carrying value whose source is the argument array). The borrow tracker therefore requires the task array (the borrow source) to outlive the `await for` loop, and rejects a program that would dispose it first, exactly as it rejects any borrow that outlives its source.
 
 ### D4 — Cancellation: stops enumeration, tasks keep running
 
@@ -159,6 +159,10 @@ end;
 ```
 
 ---
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+No open owner questions. The D1–D7 design decisions are accepted as drafted: `IAsyncEnumerable<Task<T>>` (not a channel — `Task<T>` is not sendable, §30.14); single-consumption/affine per §29.11 and ruling #1226; observer-not-lifecycle-owner split from `TaskScope`; cancellation stops enumeration but not the tasks; faulted tasks yielded not skipped; the `WhenEachOwned<T>` owning variant over `IOwningAsyncEnumerable`. One editorial fix was applied at acceptance (D3): the borrowed-tasks lifetime obligation is now stated as a **compiler-tracked borrow** (the returned iterable is a §28.3 deferred-activation frame carrying the task array's borrow, v0.179) rather than a programmer promise. The new members land as §6.7 `Task`-static-helper amendments through the normal docs workflow.
 
 ## 5. Declined alternatives (register)
 

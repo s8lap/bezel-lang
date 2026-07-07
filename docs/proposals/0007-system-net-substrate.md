@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target modules** | `System.Net` (this proposal). `System.Net.Http` (0001) and the `Http` server (0002) sit on top. |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1436](https://github.com/s8lap/bezel-lang/issues/1436) |
@@ -396,6 +396,20 @@ Composition seams left open on purpose: **0006's concrete stream family** (`Stre
 5. **`TlsClientStream` owns its transport (§4.3)** — owned-transport chosen over borrowing a `NetworkStream`. Confirm; the borrowing form is not offered in v1.
 6. **0001 taxonomy re-homing (§7)** — `NameResolutionException`/`TlsException` move to `System.Net`; `HttpConnectException` wraps `SocketException` via `CauseChain`. Confirm this is how 0001's §3.5 table should read once the substrate lands (an amendment to 0001, tracked separately).
 7. **Address strings vs. a type (§4.5)** — strings for v1, `IPAddress` deferred. Confirm strings are acceptable through the first real programs (the same evidence-first bar 0001 sets for `Uri`).
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+The §9 open questions are resolved as follows. The §3 domain-affinity classifications graduate into §30.14's compiler-known list when the substrate lands.
+
+- **Q1 — transport is domain-affine, `TcpListener` is sendable: confirmed.** `TcpConnection`/`NetworkStream`/`TlsClientStream` are domain-local (not sendable, §30.14), matching the live-async-resource family the section already excludes; `TcpListener` is compiler-known sendable and internally synchronized (kernel-serialized concurrent `Accept`, the `Channel<T>`-analogue). This is the weaker runtime contract and coheres with 0001 §4.4's domain-local layer above. The alternative (sendable connection + runtime completion re-homing) is declined — the listener-sendable route dissolves the one cross-domain need (accept here, handle there) with nothing moved.
+- **Q2 — non-seekable fault: already RESOLVED (owner, 2026-07-04) — keep `InvalidOperationException`; `NotSupportedException` declined.** Recorded in §4.2/§9.
+- **Q3 — span-across-`await`: inherit the `Stream` span overloads silently; do not override-to-reject.** The tension is inherited from §7.1, not introduced here, and it is owned by the Stream/0006 lane; v1 recommends the `Array<byte>` windowed form for all async socket I/O and adds no new span-async surface. The question is moot once the #1438 span-overload removal (ruled 2026-07-04) reaches the docs.
+- **Q4 — listener-sendability mechanism: acceptable, including the IOCP accept-pool shim.** epoll/kqueue give kernel-serialized concurrent accept directly; Windows IOCP `AcceptEx` needs a small runtime accept-pool shim, which is an acceptable implementation cost for the sendable-listener capability.
+- **Q5 — `TlsClientStream` owns its transport: confirmed.** Owned `TcpConnection` collapses the whole stack into one `using var` and removes the leave-open question; the borrowing form is not offered in v1.
+- **Q6 — 0001 taxonomy re-homing: confirmed.** `NameResolutionException`/`TlsException` are the `System.Net` types defined here, which the client lets propagate; 0001's `HttpConnectException` wraps `SocketException` through its `CauseChain` snapshot. 0001's §3.5 table cites `System.Net` for the two shared types once the substrate lands (an amendment to 0001, tracked separately).
+- **Q7 — address strings for v1: confirmed.** Strings (dotted-quad / textual IPv6, plus names) are sendable and sufficient; a dedicated `IPAddress`/`IPEndPoint` type is deferred with `Uri` (0001), to be revisited against the first real programs.
+
+**Supersession note.** #980 (the earlier standalone socket/DNS request) is **closed as superseded** by this networking stack (0001/0002/0007); this substrate is the settled answer it asked for.
 
 ## 10. Relationship to existing work
 

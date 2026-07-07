@@ -132,7 +132,7 @@ end;
 
 Because a log call can originate on any domain, the sink must be reachable from all of them. Two topologies, **both** buildable on today's primitives, both coding to `ILogger` so the application picks at its composition root:
 
-**(a) Direct, per-domain sink — `ConsoleLogger`.** The logger formats and writes inline, guarding the shared `TextWriter` with an internal `Mutex` (§6.2) so concurrent domains never interleave partial lines. `Mutex` is sendable and internally synchronized, so a `ConsoleLogger` is itself sendable and internally synchronized — usable per-domain or shared. Simple; correct for single-domain programs and low-volume logging; its cost is that formatting and the write happen *on the calling domain*, under a lock.
+**(a) Direct, per-domain sink — `ConsoleLogger`.** The logger formats and writes inline, guarding the shared console output with an internal `Mutex` (§6.2) so concurrent domains never interleave partial lines. `Mutex` is sendable and internally synchronized, so a `ConsoleLogger` is itself **sendable** — but "sendable" under §30.14 means *movable into any one domain*, not *shareable across domains simultaneously*. A distinct `ConsoleLogger` may therefore be moved into each domain that needs one; a single instance is reachable process-wide only via the D6 Fork-B `static readonly` (a §22.12 rule-4 interface-typed static, warned) or a `Shared<T>`-of-synchronized handle. For the sendability derivation to hold, `ConsoleLogger` must hold **no non-owned `TextWriter` field** — it reaches `Console.Out`/`Console.Error` (process statics) directly under its `Mutex`, rather than carrying a borrowed writer. Simple; correct for single-domain programs and low-volume logging; its cost is that formatting and the write happen *on the calling domain*, under a lock.
 
 **(b) One sink domain fed by a bounded `Channel<LogEvent>` — the scalable path.** Producers build a `LogEvent` and `Send` it; a single **sink domain** owns the receiving `Channel<LogEvent>`, loops `Receive()` → format → write, and is the *only* writer — so it needs **no** `Mutex` (the channel is the synchronization, and the sink domain is serial, §30.13). This is the actor idiom the language already blesses, and it moves all formatting/I/O off the hot path.
 
@@ -168,7 +168,7 @@ Should there be a `Log.Default` static so code can log without being handed a lo
 
 **Exception snapshot (§31.1/§31.4).** A `cause: Exception` reaches `Log` as a **borrow**, exactly like a `catch`-arm exception (§31.1): the sink may pass it around for the duration of the call but must not retain it. The sink immediately copies the fault into a sendable snapshot — an `Array<ExceptionInfo>` whose head is `new ExceptionInfo(cause.GetType().Name, cause.Message, cause.StackTrace)` (§8.2 `GetType()` and §31.4's `TypeName`/`Message`/`StackTrace` — all `string`s) followed by `cause.CauseChain` (already an `Array<ExceptionInfo>` snapshot, §31.4). The live `Exception` never enters a `LogEvent` and never crosses a domain (exception classes are not in general sendable, §30.14/§30.6). This is the same discipline 0002 §3.1 applies to its `OnError` hook.
 
-**Default text format.** A `LogFormat.Line(event)` helper renders one line, e.g.
+**Default text format.** A `LogFormat.Line(logEvent)` helper renders one line, e.g.
 
 ```
 2026-07-04T12:00:00.123 [INFO ] Http.Server: user logged in { user=alice, ip=10.0.0.4 }
@@ -231,7 +231,9 @@ end;
 // ---- Direct sinks (topology a) ----
 
 public sealed class ConsoleLogger: ILogger
-  // Internally synchronized: an internal Mutex guards the shared TextWriter, so
+  // Sendable (movable into any one domain) and internally synchronized: an internal
+  // Mutex guards writes to the Console statics (Console.Out / Console.Error) — it holds
+  // NO non-owned TextWriter field, which is what keeps the §30.14 derivation intact — so
   // concurrent domains never interleave partial lines. Error/Critical -> Console.Error.
   public constructor(category: string, minLevel: LogLevel := LogLevel.Info);
   public method IsEnabled(level: LogLevel): bool;
@@ -249,12 +251,12 @@ end NullLogger;
 // ---- Sink-domain routing (topology b) ----
 
 public interface ILogSink: IDisposable
-  method Emit(event: LogEvent);   // borrow; the sink formats + writes, the loop then disposes the event
+  method Emit(logEvent: LogEvent);   // borrow; the sink formats + writes, the loop then disposes it (`event` is a reserved keyword, Appendix B)
 end ILogSink;
 
 public sealed class ConsoleSink: ILogSink        // writes Console.Out / Console.Error
   public constructor();
-  public method Emit(event: LogEvent);
+  public method Emit(logEvent: LogEvent);
   destructor;
 end ConsoleSink;
 // A StreamSink(owned writer: TextWriter) — file logging — rides proposal 0006 (proposed dependency).
@@ -279,7 +281,7 @@ public sealed class LogHub: IAsyncDisposable
 end LogHub;
 
 public static class LogFormat
-  public static method Line(event: LogEvent): string;   // default single-line text rendering (§D7)
+  public static method Line(logEvent: LogEvent): string;   // default single-line text rendering (§D7)
 end LogFormat;
 ```
 
@@ -317,6 +319,9 @@ public static async method Main(): Task<int>
   // Each worker gets its own sendable logger, moved in at spawn (the sender travels;
   // the logger is domain-local thereafter — only the channel is shared, per §30.15).
   // Main itself holds NO logger, so the channel closes exactly when the workers finish.
+  // Worker.Run is an async (Task-returning) entry taking an owned arg; that shape is admitted
+  // by the stdlib §6.8 overload `Spawn<A>(entry: (owned A) -> Task, owned arg: A): owned Task`
+  // (the async Domain.Spawn entries landed v0.179, spec §30.14) — no sync-entry reshape needed.
   using var w1 := Domain.Spawn(Worker.Run, hub.NewLogger("Worker-1"));
   using var w2 := Domain.Spawn(Worker.Run, hub.NewLogger("Worker-2"));
   await w1;
@@ -339,6 +344,9 @@ end Run;                        // logger disposed ⇒ its sender closes
 The point this makes is the **wiring**: the server takes an `ILogger` by constructor from the composition root — no container, exactly the shape 0002 §2.1 already uses for its dependencies (D-0001).
 
 ```bezel
+import System.Diagnostics;
+import System.Collections.Generic;   // Dictionary is NOT auto-imported (spec §2.3 auto-imports only System / System.Text)
+
 public async method Main(): Task<int>
   await using var hub := new LogHub(new ConsoleSink(), minLevel := LogLevel.Info);
   var pump := hub.RunAsync();                       // the sink loop, concurrent with the server

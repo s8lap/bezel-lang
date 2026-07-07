@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1437](https://github.com/s8lap/bezel-lang/issues/1437) |
 | **Target module(s)** | `System` (auto-imported): the primitive-wrapper records (`Int32`/`UInt32`/`Int64`/`UInt64`, stdlib §9.1), a new `BitOperations` static class (sibling to `Math` §2.2 and `BitConverter` §2.12), a new `HashCode` value record |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
@@ -290,6 +290,10 @@ All four are resolved as follows (owner batch confirmations, 2026-07-04):
 2. **`HashCode` shape — DISSOLVED (value record, no ruling needed).** The former dichotomy (mutable-value-record-needs-a-ruling vs class) had a false gap: the **immutable-chaining** value record is a third option available *today* that touches neither the mutation-semantics problem nor §9.4's inadvisability. It is the chosen v1 shape (§5.3/§5.4). No value-type-receiver-mutation ruling is required. (The residual, narrower confirm — `Value` property vs a `ToHashCode()` finalizer, and `Start()` factory vs a public constructor — is a §5.3 surface detail, settled there as `Value` + `Start()`.)
 3. **v1 type coverage — CONFIRMED `int`/`uint`/`long`/`ulong` only.** `byte`/`short` arithmetic *does* exist (§6.2/§6.5), so restricting v1 to the 32/64-bit types is **scoping, not declining** — the narrow-type overloads are mechanical, additive, and deferred, not forbidden (§3.2).
 4. **`HashCode` seeding — CONFIRMED per-process randomization.** §8.3's auto-hash combining is implementation-defined and makes no cross-process stability promise, so a per-process randomized seed violates no stability contract while giving the standard hash-flood defense (§5.1). A stable seed is deliberately *not* adopted; determinism belongs to checksums (#27).
+
+## Rulings recorded at acceptance (2026-07-07, delegated ruling — owner review pending)
+
+All four owner questions were **already resolved in the owner batch of 2026-07-04** and are recorded verbatim in §8; acceptance carries them unchanged. In summary: (1) checked-op naming keeps the `Checked*` prefix (it names the semantics and stays parallel with `Wrapping*`/`Saturating*`; still shape-(b) Try behavior); (2) `HashCode` is the immutable-chaining value record of §5.3/§5.4 — the dichotomy dissolved, no value-receiver-mutation ruling is required; (3) v1 type coverage is `int`/`uint`/`long`/`ulong` only (scoping, not declining — the narrow-type overloads are mechanical and deferred); (4) `HashCode` uses per-process randomized seeding (§8.3 permits it, gives hash-flood defense; determinism belongs to checksums, #27). Nothing in §8 remained open at acceptance.
 
 ## 9. Relationship to existing work
 

@@ -201,7 +201,7 @@ The gap review groups `Debug.CaptureStackTrace` alongside `Verify` and `Debug.Fa
 
 ### 6.1 What the spec already provides
 
-Spec §31.4 defines `Exception.StackTrace: string` — a formatted stack-trace string, populated automatically when an exception is thrown and caught. Spec §6960: `DomainFaultedException.FaultStackTrace: string` carries the stack trace across a domain boundary as a plain string.
+Spec §31.4 defines `Exception.StackTrace: string` — a formatted stack-trace string, populated automatically when an exception is thrown and caught. Stdlib §6.8 (`Domain`): `DomainFaultedException.FaultStackTrace: string` carries the stack trace across a domain boundary as a plain string.
 
 Stack traces in Bezel are therefore **exception-attached**: they are produced automatically at throw time, accessible through the caught exception's `StackTrace` property, and copyable as `string` values for logging. The idiom for capturing a stack trace for logging is to catch an exception, copy its `StackTrace`, and rethrow:
 
