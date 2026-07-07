@@ -1614,6 +1614,11 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         // non-owned field. The throw escapes the catch arm, so ex may outlive
         // it after the runtime frees the caught exception. // per §31.1
         if (th->value) {
+            // §31.1 / §17.12 (v0.182, #1569): the operand must be an OWNED
+            // exception — a borrowed class reference (a catch-arm binding
+            // re-thrown, a borrowed param, a field read, `this`) is rejected
+            // here, before the discharge walk classifies it. // per §31.1
+            checkThrowOperandNotBorrowed(*th->value);
             if (const auto* ne =
                     dynamic_cast<const ast::NewExpr*>(th->value.get())) {
                 checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);

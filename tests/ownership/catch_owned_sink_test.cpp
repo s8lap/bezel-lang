@@ -239,16 +239,17 @@ BEZEL_TEST(catch_owned_sink, bare_rethrow_clean_31_2_4) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §17.12 / §31.5 — re-raising the SAME instance with `throw ex;` is a control
-// transfer back to the runtime, not a sink. ACCEPTED.
-BEZEL_TEST(catch_owned_sink, rethrow_same_instance_clean_31_5) {
+// §31.1 / §17.12 (v0.182, #1569) — re-raising the SAME instance with
+// `throw ex;` is a compile error: the caught binding is a borrow and the throw
+// operand must be OWNED. Use the bare re-raise `throw;` instead. REJECTED.
+BEZEL_TEST(catch_owned_sink, rethrow_borrowed_binding_rejected_31_1) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle() "
         "  try DoWork(); "
         "  catch var ex: Exception => throw ex; "
         "  end; "
         "end Handle;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §31.2.4 — wrapping: `throw new InvalidOperationException();` raises a fresh

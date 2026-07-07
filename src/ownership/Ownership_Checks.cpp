@@ -317,6 +317,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // calls this check explicitly; mirror it here so that expression-form arm
         // bodies (`=> throw new Wrap(ex)` without `;`) are also covered. per §31.1
         if (te->operand) {
+            // §31.1 / §17.12 (v0.182, #1569): the operand must be an OWNED
+            // exception in expression position too (`x ?? throw ex`, an arm's
+            // `=> throw ex`); reject a borrowed operand before the discharge
+            // walk. // per §31.1
+            checkThrowOperandNotBorrowed(*te->operand);
             if (const auto* ne =
                     dynamic_cast<const ast::NewExpr*>(te->operand.get())) {
                 checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
@@ -1958,6 +1963,49 @@ void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
         "completes), so the exception instance cannot escape the arm (§31.1; "
         "copy the data you need out of it — e.g. its message — into an owned "
         "value and return that, or re-raise with `throw;`)");
+}
+
+void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
+    // §31.1 / §17.12 (v0.182): "The operand is consumed as an owned value under
+    // the ownership rules below, so a *borrowed* class reference is not a valid
+    // operand." The throw operand is an owned sink exactly like an `owned`
+    // parameter / constructor argument (§28.8): a borrow flowing into it leaves
+    // the borrow's real owner to dispose the value while the runtime ALSO
+    // disposes it after the matching arm — a double-dispose / use-after-free.
+    // `ownedArgSourceIsBorrow` returns true for every borrow form a throw
+    // operand can take — a catch-arm binding (`throw ex;`), a non-`owned`
+    // parameter, a bare/owned field read, `this`, an indexer-get, a
+    // record-destructuring binding — and false for the owned producers §31.1
+    // admits (`new`, a call returning owned, an owned local/param transferred
+    // out, a `move`d owned value). A bare re-raise `throw;` (no operand, §31.2.4)
+    // never reaches here — its callers guard on a non-null operand. // per §31.1
+    //
+    // Gate to a CLASS-typed operand: a non-class operand (a primitive, `string`,
+    // `Object`, an interface, a record, an enum, an inline array, a function) is
+    // not throwable at all and is rejected by the sema type rule
+    // (`checkThrowableType`, §31.1) — running the borrowed-operand check on it
+    // too would double-report a misleading "borrowed exception" diagnostic (e.g.
+    // a `new`-constructed record local is Borrowed-state, having no disposal
+    // obligation). An imported builtin exception carries a null declaration and
+    // is admitted (conservatively class-like). // per §31.1
+    const sema::TypeRef* ot = ctx_.exprType(operand);
+    if (ot && !(ot->kind == sema::TypeRef::Kind::Named &&
+                (!ot->declaration ||
+                 (ot->declaration->kind == ast::TypeDeclKind::Class &&
+                  !ot->declaration->isValueBuiltin))))
+        return;
+    if (!ownedArgSourceIsBorrow(operand)) return;
+    report(
+        Severity::Error, operand.span.begin,
+        "the thrown value must be an OWNED exception — a fresh `new`, an owned "
+        "local or `owned` parameter, or a `move`d owned value (\xc2\xa7""31.1); "
+        "a borrowed exception cannot be thrown, because the operand is consumed "
+        "as an owned value transferred to the runtime while the borrow's owner "
+        "still owns it (a use-after-free / double-dispose). To re-raise the "
+        "exception being handled, use the bare re-raise `throw;` "
+        "(\xc2\xa7""31.2.4); to propagate a caught exception's information, chain "
+        "a fresh instance through its snapshot constructor \xe2\x80\x94 "
+        "`throw new Exception(ex.Message, ex)` (\xc2\xa7""31.4)");
 }
 
 // ---------------------------------------------------------------------------

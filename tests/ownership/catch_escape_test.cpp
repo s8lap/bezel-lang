@@ -27,9 +27,11 @@
 // accepted. Over-rejection is the cardinal sin, so each positive is paired
 // with negatives that guard the exact §31.1 boundary: passing `ex` as a borrow
 // argument, reading/copying a value projection out of it (`ex.Message`), using
-// it locally in the arm, the bare re-throw `throw;`, re-raising the same
-// instance `throw ex;`, wrapping it `throw new T(ex)`, and a closure that
-// captures `ex` but is invoked locally within the arm (does not escape).
+// it locally in the arm, the bare re-throw `throw;`, and wrapping it
+// `throw new T(ex)`, and a closure that captures `ex` but is invoked locally
+// within the arm (does not escape). Re-raising the same instance via
+// `throw ex;` is now itself a §31.1 error (v0.182, #1569: the borrowed operand
+// is rejected — use the bare `throw;`).
 
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -185,17 +187,20 @@ BEZEL_TEST(catch_escape_return, bare_rethrow_clean_31_2_4) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL (§17.12 / §31.5): re-raising the SAME instance with `throw ex;`
-// transfers it back to the runtime (a control transfer, like the bare
-// re-throw), not an escape into a field/return/closure. It must be accepted.
-BEZEL_TEST(catch_escape_return, rethrow_same_instance_clean_31_5) {
+// §31.1 / §17.12 (v0.182, #1569): re-raising the SAME instance with `throw ex;`
+// is now a compile error — the caught binding is a BORROW whose owner is the
+// runtime, and the `throw` operand is consumed as an OWNED value, so a borrowed
+// operand is rejected. To re-raise the in-flight exception, use the bare
+// re-raise `throw;` (§31.2.4). REJECTED. (Pre-v0.182 this form was accepted as
+// a control transfer; the operand rule now forbids the borrowed operand.)
+BEZEL_TEST(catch_escape_return, rethrow_borrowed_binding_rejected_31_1) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle() "
         "  try DoWork(); "
         "  catch var ex: Exception => throw ex; "
         "  end; "
         "end Handle;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // CONTROL (§31.2.4): wrapping the exception in a new one — `throw new

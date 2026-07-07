@@ -612,6 +612,21 @@ private:
     // `isEscapeBoundLocal` extend to recognize the catch binding as a source.
     void checkCatchBorrowEscapesOnReturn(const ast::Expr& e);
 
+    // §31.1 / §17.12 (issue #1569, v0.182): the `throw` operand is consumed as
+    // an OWNED value transferred to the runtime's exception machinery — so a
+    // BORROWED class reference is not a valid operand: a catch-arm binding
+    // re-thrown (`throw ex;`), a non-`owned` parameter, a field read, or `this`
+    // each still has a live owner, and letting the runtime dispose it after the
+    // arm is a use-after-free / double-dispose. `ownedArgSourceIsBorrow`
+    // classifies the operand exactly as for an `owned` sink; when it is a
+    // borrow, this diagnoses and directs to the bare re-raise `throw;`
+    // (§31.2.4) or a fresh cause-chained instance (§31.4). A `new`/call, an
+    // owned local/param transferred out, and a `move`d owned value are owned
+    // producers and are not flagged. Called from the ThrowStmt handler
+    // (`visitStmt`) and the ThrowExpr handler (`handleDischarge`), BEFORE the
+    // operand's own discharge walk. // per §31.1, §17.12
+    void checkThrowOperandNotBorrowed(const ast::Expr& operand);
+
     // §31.1 (issue #430): scan the constructor arguments of `ne` for a catch
     // borrow in a NON-OWNED parameter position. Returns the first catch-borrow
     // symbol found, or null. Only BARE identifier arguments are examined (value

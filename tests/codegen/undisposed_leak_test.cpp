@@ -331,10 +331,11 @@ const char* kRethrowChain =
 //       #397 the guard is replaced by the direct-re-throw check: Inner IS
 //       freed → Res._n == 1 (was 0 before #397). ASan/LSan-clean. (§31.1)
 //
-//   D — `throw ex;` (direct re-throw of the catch binding): the same exception
-//       object re-enters the unwind path. It must NOT be freed by the inner
-//       handler — the outer handler catches and frees it exactly once.
-//       Res._n == 1, no double-free. (§31.1 / §31.2.4)
+//   D — bare re-raise `throw;` (v0.182, #1569 — the direct `throw ex;` of the
+//       catch binding is now a §31.1 compile error, so the re-raise is the bare
+//       `throw;`): the same exception object re-enters the unwind path. It must
+//       NOT be freed by the inner handler — the outer handler catches and frees
+//       it exactly once. Res._n == 1, no double-free. (§31.1 / §31.2.4)
 //
 //   E — `throw new Wrap(e)` (catch borrow passed by reference): COMPILE ERROR
 //       (#430). #430's ownership diagnostic rejects programs that pass a catch
@@ -408,13 +409,16 @@ const char* kThrowNewValueRef_FreesCaught =
     "  return -1; "
     "end Main; end R;";
 
-// Case D — direct re-throw `throw ex;` (§31.1 / §31.2.4).
-// The inner arm re-throws the SAME caught Inner via a direct identifier
-// re-throw. The inner handler must NOT free Inner — the same object re-enters
-// the unwind path and is caught+freed by the outer handler exactly once.
-// The outer arm falls through (body = `()`), triggering the caughtException
-// disposal at arm-end. `return Res._n` is read AFTER the outer arm completes
-// so it sees 1 (Inner freed exactly once). No double-free.
+// Case D — bare re-raise `throw;` of the caught instance (§31.1 / §31.2.4).
+// The inner arm re-raises the SAME caught Inner via the bare re-throw. (v0.182,
+// #1569: the direct-identifier form `throw e;` re-raising a caught binding is
+// now a compile error — the borrowed operand is rejected; the bare `throw;` is
+// the runtime-equivalent re-raise and the correct source form.) The inner
+// handler must NOT free Inner — the same object re-enters the unwind path and is
+// caught+freed by the outer handler exactly once. The outer arm falls through
+// (body = `()`), triggering the caughtException disposal at arm-end.
+// `return Res._n` is read AFTER the outer arm completes so it sees 1 (Inner
+// freed exactly once). No double-free.
 const char* kDirectExplicitRethrow_FreeOnce =
     "module M; class Res "
     "  public static _n: int := 0; "
@@ -427,7 +431,7 @@ const char* kDirectExplicitRethrow_FreeOnce =
     "class R public static method Main(): int "
     "  try "
     "    try throw new Inner(); "
-    "    catch var e: Inner => throw e; end; "
+    "    catch Inner => throw; end; "
     "  catch Inner => (); end; "
     "  return Res._n; "
     "end Main; end R;";
@@ -512,10 +516,11 @@ BEZEL_TEST(codegen_throw_new_from_catch_397, value_proj_ref_frees_caught_31_1) {
 }
 
 BEZEL_TEST(codegen_throw_new_from_catch_397, direct_explicit_rethrow_no_double_free_31_1) {
-    // §31.1 / §31.2.4 / #397: `throw ex;` from a catch arm is a direct
-    // re-throw of the SAME caught exception object. The #397 relaxation must
-    // NOT free the caught object on a direct re-throw — the object re-enters
-    // the unwind path and is caught+freed by the outer handler exactly once.
+    // §31.1 / §31.2.4 / #397 (v0.182, #1569: the caught-binding re-throw is the
+    // bare `throw;` — `throw ex;` is now a compile error): the bare re-raise
+    // from a catch arm re-circulates the SAME caught exception object. The #397
+    // relaxation must NOT free the caught object on this re-raise — the object
+    // re-enters the unwind path and is caught+freed by the outer handler once.
     // The outer arm falls through; `return Res._n` reads the counter AFTER
     // the outer arm's caughtException disposal → Res._n == 1. ASan/LSan leg
     // verifies no double-free and no UAF — the cardinal risk of #397.

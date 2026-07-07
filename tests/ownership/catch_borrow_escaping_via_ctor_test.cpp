@@ -130,10 +130,11 @@ BEZEL_TEST(catch_borrow_via_ctor, local_wrap_not_escaping_clean_31_1) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL (§31.5 / §31.2.4): `throw ex;` is the bare re-throw — it transfers
-// the in-flight exception back to the runtime rather than capturing it. Not
-// an escape via a new object. ACCEPTED.
-BEZEL_TEST(catch_borrow_via_ctor, rethrow_same_instance_clean_31_5) {
+// §31.1 / §17.12 (v0.182, #1569): `throw ex;` re-raising the caught binding is
+// a compile error — the binding is a borrow and the throw operand must be
+// OWNED; the bare re-raise `throw;` is the correct form. REJECTED (not via the
+// new-object ctor path — directly as a borrowed operand).
+BEZEL_TEST(catch_borrow_via_ctor, rethrow_borrowed_binding_rejected_31_1) {
     auto r = parseAndCheckOwnership(wrapDecl() +
         "  public method Handle() "
         "    try DoWork(); "
@@ -141,7 +142,7 @@ BEZEL_TEST(catch_borrow_via_ctor, rethrow_same_instance_clean_31_5) {
         "    end; "
         "  end Handle; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // CONTROL (§31.1): reading `ex.Message` (a value/string projection) and

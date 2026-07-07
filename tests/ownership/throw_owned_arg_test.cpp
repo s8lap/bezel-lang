@@ -202,19 +202,20 @@ BEZEL_TEST(throw_owned_arg, plain_new_exception_literal_arg_clean_31_1) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §31.2.4 / §17.12 — the bare re-throw of the SAME instance, `throw e;`,
-// transfers the in-flight exception back to the runtime rather than capturing or
-// wrapping it ("the one exception to this rule", §31.1). The thrown expression
-// is a bare identifier, not a `new`/call, so there is no owned argument to check;
-// the re-throw must not be mistaken for an owned sink. ACCEPTED.
-BEZEL_TEST(throw_owned_arg, rethrow_caught_instance_clean_31_2_4) {
+// §31.1 / §17.12 (v0.182, #1569) — re-raising the SAME instance with `throw e;`
+// is a compile error: the caught binding `e` is a BORROW whose owner is the
+// runtime, and the throw operand is consumed as an OWNED value, so a borrowed
+// operand is rejected. The correct re-raise of the in-flight exception is the
+// bare `throw;` (§31.2.4). REJECTED. (Pre-v0.182 this bare-identifier re-throw
+// was accepted as a control transfer; the operand rule now forbids it.)
+BEZEL_TEST(throw_owned_arg, rethrow_borrowed_binding_rejected_31_1) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle() "
         "  try this.W(); "
         "  catch var e: Exception => throw e; "
         "  end; "
         "end Handle;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §31.2.4 — wrapping with a fresh no-arg exception: `throw new

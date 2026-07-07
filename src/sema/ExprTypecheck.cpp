@@ -2451,20 +2451,30 @@ Symbol* ExprTC::lookupName(std::string_view name) {
 void ExprTC::checkThrowableType(const ast::Expr& value) {
     TypeRef* vt = ctx_.exprType(value);
     if (!vt) return;  // unresolved type — don't false-positive
-    // Throwable = a CLASS instance (user or builtin exception). A Named type
+    // §31.1 (v0.182): the throw operand must be an instance of a CLASS type —
+    // any class, deliberately NOT restricted to `Exception`-derived (the #771
+    // ruling: a thrown class is caught by its own type or a base). A Named type
     // whose declaration is a RECORD or ENUM is a value type and not throwable;
-    // primitives, strings (Primitive::String), function values, and unit are
-    // likewise not Named-class and not throwable.
+    // an INTERFACE-typed operand is likewise rejected (its referent may be a
+    // boxed value, which is not throwable — narrow to the class first). A
+    // Named type with a null declaration (an imported builtin exception) is
+    // conservatively treated as throwable. `Object` (Primitive::Object),
+    // `string` (Primitive::String) and the other primitives, an inline array,
+    // a function value, and unit are not Named-class and not throwable.
+    // // per §31.1, §17.12
     bool throwable = vt->kind == TypeRef::Kind::Named &&
                      !(vt->declaration &&
                        (vt->declaration->kind == ast::TypeDeclKind::Record ||
-                        vt->declaration->kind == ast::TypeDeclKind::Enum));
+                        vt->declaration->kind == ast::TypeDeclKind::Enum ||
+                        vt->declaration->kind == ast::TypeDeclKind::Interface));
     if (!throwable)
         ctx_.diagnostics().report(
             Severity::Error, value.span.begin,
-            "the thrown value must be an exception (a class instance) — a "
-            "primitive, string, record, enum, or function value cannot be "
-            "thrown (§31.1)");
+            "the thrown value must be an exception — an instance of a class "
+            "type (\xc2\xa7""31.1): a primitive, `string`, `Object`, an "
+            "interface, a record, an enum, an inline array, or a function "
+            "value cannot be thrown (an `Object`- or interface-typed value "
+            "must be narrowed to its class type first)");
 }
 
 void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
