@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.165 — July 2026**
+**Companion to the Bezel Language Specification, v0.178 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -156,14 +156,12 @@ public static class Convert
   public static method ToBoolean(value: string): bool;
 
   public static method TryToInt32(value: string, out result: int): bool;
-  public static method TryToInt32(value: string, out result: int): bool;      // v0.165: elision expanded
   public static method TryToInt64(value: string, out result: long): bool;
   public static method TryToDouble(value: string, out result: double): bool;
   public static method TryToDecimal(value: string, out result: decimal): bool;
   public static method TryToBoolean(value: string, out result: bool): bool;
 
   public static method ToString(value: int): string;
-  public static method ToString(value: int, radix: int): string;   // 2, 8, 10, 16
   public static method ToString(value: long): string;                          // v0.165: elision expanded
   public static method ToString(value: double): string;
   public static method ToString(value: decimal): string;
@@ -596,7 +594,7 @@ public interface IDeserializable
 end IDeserializable;
 ```
 
-**`ISerializer` / `IDeserializer` are the format abstraction.** A concrete format implements them once; the standard library is expected to provide `JsonSerializer`/`JsonDeserializer` and a compact `BinarySerializer`/`BinaryDeserializer` pair (their full definitions are deferred — see rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection) and [§18](Bezel_Design_Rationale.md#sec-things-deferred)). The interfaces are format-agnostic by construction: they speak only of primitives (`WriteInt`, `WriteString`, …) and structure (`BeginObject`/`EndObject`, `BeginArray`/`EndArray`). They name no format. A type that serializes itself against `ISerializer` is automatically serializable to every format, present and future, without change — exactly the property reflection-based serializers achieve at the cost of runtime type inspection, achieved here with none.
+**`ISerializer` / `IDeserializer` are the format abstraction.** A concrete format implements them once; the standard library provides `JsonSerializer`/`JsonDeserializer` and a compact `BinarySerializer`/`BinaryDeserializer` pair (their concrete definitions are in [§2.15](#sec-concrete-serialization-formats); design rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). The interfaces are format-agnostic by construction: they speak only of primitives (`WriteInt`, `WriteString`, …) and structure (`BeginObject`/`EndObject`, `BeginArray`/`EndArray`). They name no format. A type that serializes itself against `ISerializer` is automatically serializable to every format, present and future, without change — exactly the property reflection-based serializers achieve at the cost of runtime type inspection, achieved here with none.
 
 **`ISerializable` is usable today, by hand.** `Serialize` is an ordinary instance method against an interface; nothing about it depends on a deferred feature. A type that wants to be serializable in this version writes the method explicitly:
 
@@ -613,7 +611,7 @@ end Point;
 
 (A positional record may add a body to supply method implementations; the positional parameters remain the auto-generated readonly properties of [§9.1](Bezel_Language_Spec.md#sec-positional-records).) Composition works through the same interface: a containing type's `Serialize` calls each serializable component's `Serialize`, passing the same `ISerializer` through. A serializable collection writes `BeginArray`, each element's `Serialize`, `EndArray`.
 
-**Why `IDeserializable` has no method in this version.** Serialization is an *instance* operation (an existing value writes itself); deserialization is a *static* one (a format reader produces a new value — there is no instance yet). A static entry point cannot be expressed as an interface method until static interface members exist (a separately deferred feature, rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)). Rather than block deserialization on that keystone, v0.114 recognizes the deserialization entry point **by name**, exactly as the user-defined collection-literal protocol recognizes `FromCollectionLiteral` ([§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol) of the language spec): a type that declares `: IDeserializable` and provides a static method of the shape
+**Why `IDeserializable` has no method in this version.** Serialization is an *instance* operation (an existing value writes itself); deserialization is a *static* one (a format reader produces a new value — there is no instance yet). A static entry point could not be expressed as an interface method until static interface members existed (added in v0.176 — language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)); this by-name protocol predates them. Rather than block deserialization on that keystone, v0.114 recognizes the deserialization entry point **by name**, exactly as the user-defined collection-literal protocol recognizes `FromCollectionLiteral` ([§15.4.1](Bezel_Language_Spec.md#sec-the-user-defined-sequence-literal-protocol) of the language spec): a type that declares `: IDeserializable` and provides a static method of the shape
 
 ```bezel
 public static method Deserialize(d: IDeserializer): T;          // value-type
@@ -864,6 +862,31 @@ Raised on access to a static member of a type whose static initialization failed
 ---
 
 <a id="sec-system-text-auto-imported"></a>
+<a id="sec-iformattable"></a>
+### 2.18 `IFormattable` and format specifiers (v0.172, #812/#1339)
+
+```bezel
+public interface IFormattable
+  method ToString(format: string): string;
+end IFormattable;
+```
+
+Auto-imported. String interpolation dispatches a hole's format spec here (language spec §18.5): `$"{money:C2}"` calls `money.ToString("C2")` when `money`'s type implements `IFormattable`. The primitive and temporal types are **intrinsically formattable** (they behave as conforming implementations without declaring the interface); a format spec on any other non-conforming operand is a compile error.
+
+**The specifier vocabulary is invariant-culture only** — Bezel has no culture machinery, and formatted output is identical on every platform. An unrecognized specifier raises `FormatException` (strict-fault, as everywhere).
+
+| Kind | Specifiers | Notes |
+|---|---|---|
+| Integers (`int`, `long`, `byte`, …) | `D`/`Dn` decimal (n = min digits, zero-padded) · `X`/`x` hex (upper/lower, `Xn` pads) · `B` binary | no grouping separators (no culture) |
+| Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals, default 2) · `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn` percent (×100, `%` suffix) · `R` round-trip | `R` and the **no-format `ToString()`** both produce the shortest string that parses back to the identical value (round-trip guarantee, v0.172) |
+| `decimal` | `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` | exact decimal semantics |
+| `DateTime`, `DateOnly`, `TimeOnly` | pattern strings of `yyyy` `MM` `dd` `HH` `mm` `ss` `fff` plus literal separators | e.g. `yyyy-MM-dd HH:mm:ss`; no-format `ToString()` is ISO 8601 |
+| `TimeSpan` | `c` (constant: `[-][d.]HH:mm:ss[.fffffff]`) | no-format = `c` |
+| `Guid` | `D` (hyphenated, lowercase), `N` (no hyphens) | no-format = `D` |
+| `bool`, `char`, `string` | *(none)* | a format spec on these is a compile error |
+
+`C` (currency) deliberately does not exist — currency formatting is culture by definition; format money explicitly (`$"{amount:F2} EUR"`).
+
 <a id="sec-static-abstractions"></a>
 ### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>` (v0.176, #807)
 
@@ -892,31 +915,6 @@ end IParsable;
 ```
 
 Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). The existing per-type `Parse`/`TryParse` members are the conformance witnesses — no signatures changed (`TryParse` follows the v0.171 nullable-out shape).
-
-<a id="sec-iformattable"></a>
-### 2.18 `IFormattable` and format specifiers (v0.172, #812/#1339)
-
-```bezel
-public interface IFormattable
-  method ToString(format: string): string;
-end IFormattable;
-```
-
-Auto-imported. String interpolation dispatches a hole's format spec here (language spec §18.5): `$"{money:C2}"` calls `money.ToString("C2")` when `money`'s type implements `IFormattable`. The primitive and temporal types are **intrinsically formattable** (they behave as conforming implementations without declaring the interface); a format spec on any other non-conforming operand is a compile error.
-
-**The specifier vocabulary is invariant-culture only** — Bezel has no culture machinery, and formatted output is identical on every platform. An unrecognized specifier raises `FormatException` (strict-fault, as everywhere).
-
-| Kind | Specifiers | Notes |
-|---|---|---|
-| Integers (`int`, `long`, `byte`, …) | `D`/`Dn` decimal (n = min digits, zero-padded) · `X`/`x` hex (upper/lower, `Xn` pads) · `B` binary | no grouping separators (no culture) |
-| Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals, default 2) · `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn` percent (×100, `%` suffix) · `R` round-trip | `R` and the **no-format `ToString()`** both produce the shortest string that parses back to the identical value (round-trip guarantee, v0.172) |
-| `decimal` | `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` | exact decimal semantics |
-| `DateTime`, `DateOnly`, `TimeOnly` | pattern strings of `yyyy` `MM` `dd` `HH` `mm` `ss` `fff` plus literal separators | e.g. `yyyy-MM-dd HH:mm:ss`; no-format `ToString()` is ISO 8601 |
-| `TimeSpan` | `c` (constant: `[-][d.]HH:mm:ss[.fffffff]`) | no-format = `c` |
-| `Guid` | `D` (hyphenated, lowercase), `N` (no hyphens) | no-format = `D` |
-| `bool`, `char`, `string` | *(none)* | a format spec on these is a compile error |
-
-`C` (currency) deliberately does not exist — currency formatting is culture by definition; format money explicitly (`$"{amount:F2} EUR"`).
 
 ## 3. `System.Text` (auto-imported)
 
@@ -2791,7 +2789,7 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 `ToArray()` returns a fresh `Array<T>` containing the materialized sequence. The return is `owned` — the caller is responsible for disposing it. There is no `ToList()` because Bezel does not have a dynamic-array type named `List<T>` (`Array<T>` is the resizable form; `LinkedList<T>` is the linked form; use `new LinkedList<T>(source)` if a linked list is wanted).
 
-`Sum` and `Average` are provided as per-type overloads rather than as a single generic constrained on a numeric interface. The reason is that a generic numeric constraint would require static interface members (so `Sum`'s body could reference `T.Zero` and `T.operator +`), and this version does not have that feature. The overload set covers the standard numeric primitives. Aggregating user-defined numeric types is done via `Aggregate(seed, fold)`.
+`Sum` and `Average` are provided as per-type overloads rather than as a single generic constrained on a numeric interface. The reason is historical: a generic numeric constraint requires static interface members (so `Sum`'s body could reference `T.Zero` and `T.operator +`), and these overloads predate the `INumber<T>` abstraction ([§2.19](#sec-static-abstractions)) that now provides them. The overload set covers the standard numeric primitives. Aggregating user-defined numeric types is done via `Aggregate(seed, fold)`.
 
 <a id="sec-no-selector-aggregation-overloads"></a>
 ### 5.1 No-selector aggregation overloads
@@ -3032,7 +3030,7 @@ public class AtomicInteger<T> where T: value
 end AtomicInteger;
 ```
 
-`AtomicInteger<T>` is *not* a subtype of `Atomic<T>` — it is a separate class with the same load/store/CAS surface plus the arithmetic methods. The duplication is deliberate: a generic method that wants "any primitive atomic" should accept the relevant interface (none currently exists, since static interface members are deferred) or be overloaded for both classes; promoting `AtomicInteger<T>` to a subtype would imply substitutability that the type system cannot otherwise express.
+`AtomicInteger<T>` is *not* a subtype of `Atomic<T>` — it is a separate class with the same load/store/CAS surface plus the arithmetic methods. The duplication is deliberate: a generic method that wants "any primitive atomic" should accept the relevant interface (no atomic-arithmetic interface currently exists) or be overloaded for both classes; promoting `AtomicInteger<T>` to a subtype would imply substitutability that the type system cannot otherwise express.
 
 `Increment`, `Decrement`, and `Add` perform the operation atomically and return the post-operation value. Overflow follows the standard integer-arithmetic rule ([§6.1](Bezel_Language_Spec.md#sec-integer-arithmetic) of the language spec): an operation whose mathematical result is not representable in `T` raises `OverflowException`.
 
@@ -3215,7 +3213,7 @@ public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray
   for var path in paths do
     tasks.Add(LoadConfigAsync(path));    // each task is OwningTask<Config>; transfers in
   end;
-  return await Task.WhenAllOwned(tasks); // tasks consumed; returned array owns the configs
+  return await Task.WhenAllOwned(owned tasks); // tasks consumed; returned array owns the configs
 end LoadAllConfigs;
 ```
 
@@ -3864,7 +3862,7 @@ Multi-dimensional arrays are deferred to a future revision; the current standard
 <a id="sec-ranget"></a>
 ### 9.8 `Range<T>`
 
-The type underlying range expressions (language spec [§16](Bezel_Language_Spec.md#sec-range-expressions)). `Range<T>` is a compiler-intrinsic record. `T` is restricted by the compiler to the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`) and `char`; this restriction cannot be expressed through a `where` clause in the current type system and is enforced as a compiler-intrinsic rule.
+The type underlying range expressions (language spec [§16](Bezel_Language_Spec.md#sec-range-expressions)). `Range<T>` is a compiler-intrinsic record. `T` is restricted by the compiler to the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`) and `char`. Static interface members now exist (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members), v0.176) and the standard library defines `ISteppable<T>` ([§2.19](#sec-static-abstractions)), so this restriction is now expressible as a `where` clause; the intrinsic enforcement is retained pending a recorded compiler follow-up.
 
 ```bezel
 /// Compiler-intrinsic; T restricted to integer types and char.
@@ -4026,8 +4024,7 @@ The following standard library modules are anticipated but not specified in this
 - `System.Text.Json` and `System.Text.Regex` — a general JSON DOM/streaming API and regular expressions. Note this is distinct from the serialization JSON *format agent* (`JsonSerializer`/`JsonDeserializer` in `System.Serialization`, [§2.15](#sec-concrete-serialization-formats)), which is provided: `System.Serialization` maps the [§2.14](#sec-serialization-vocabulary) token stream to and from JSON for whole-value (de)serialization, whereas a future `System.Text.Json` would offer document-tree navigation and ad-hoc querying of arbitrary JSON not driven by a target type. The two are complementary, as they are in other ecosystems that provide both a serializer and a document API.
 - `System.Security.Cryptography` — cryptographic primitives.
 - `System.Globalization` — culture-aware formatting and comparison.
-- `System.Reflection` — runtime metadata beyond `typeof` and `GetType`. Reserved pending design of the broader reflection model.
+- `System.Reflection` — runtime metadata beyond `typeof` and `GetType`. This splits three ways (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)): type-lattice metadata is **delivered** on the `Type` class ([§2.13](#sec-the-type-class), v0.113); member-access reflection is **declined, not deferred**; generic-instantiation decomposition remains deferred, pending an unbound-generic `typeof`.
 - `System.Diagnostics.Process` — child-process spawning and management.
-- `System.Threading.Channels` — channel-style producer/consumer queues for async coordination.
 
 The shape of these modules is open. Their inclusion in a future revision will be additive; nothing in this version will need to change to accommodate them.

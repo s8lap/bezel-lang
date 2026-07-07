@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.157.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.178.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -116,15 +116,21 @@ using var s := factory.CloneBuffer();   // caller now owns it, disposes it
 
 **When would you use `using var` here instead?** Not for this factory shape at all. `using var` means *scope-pinned*: its value is disposed at this block's end and can never be moved out — `using var fresh := new Buffer(); … return fresh;` is a compile error ("cannot move out of `using var`"; spec §28.3). The factory idiom is plain `var`, and it is already exception-safe as written: if `CopyFrom` throws, `fresh` is a live owned value on the unwinding path and the exception-path discharge (spec §28.3) disposes it during unwinding — you write no cleanup code. And if some normal path drops `fresh` without returning it, it auto-drops at scope end with the must-use warning rather than leaking. The division of labor is intent: `using var` when the value should live and die in this scope; plain `var` when ownership will move on.
 
-This is the one legal way to get an owned value past a method boundary. The compiler enforces the symmetry: an `owned` field cannot be returned through a non-`owned` return type (that would be a silent leak of the container's resource):
+This is the one legal way to *transfer* an owned value past a method boundary. A method may also hand out a **borrow** of an owned field: a *bare read* of the field, returned through a **non-`owned`** return type, borrows the field (spec §28.6, v0.151). The caller may read it but may not dispose it, store it as owned, or use it past the receiver's lifetime — the field's owner still disposes it. To hand the caller *ownership*, `move` the field out through an `owned` return type:
 
 ```bezel
 method GetTransactions(): Array<Transaction>
-  return _transactions;     // ERROR: cannot leak owned field through non-owned return
+  return _transactions;       // OK (v0.151): borrows the field — the caller may read
+                              //   it but not dispose or store it as owned.
 end GetTransactions;
+
+method TakeTransactions(): owned Array<Transaction>
+  return move _transactions;  // transfer: hand the caller ownership; the field is
+                              //   left moved-from and must be restored (next section).
+end TakeTransactions;
 ```
 
-If a caller needs to look at `_transactions` without taking it, return a borrow (non-`owned` return type) or expose a borrowing view; if a caller must take it, use `move` (next section).
+So a caller that needs to *look at* `_transactions` gets a borrow (the bare-field-read return above, or a dedicated borrowing view); a caller that must *take* it uses `move` with an `owned` return (next section).
 
 ---
 
