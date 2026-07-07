@@ -385,6 +385,80 @@ void collectEnumPatternNames(const ast::CaseArm& arm,
     }
 }
 
+// §10.2 (issue #1577): resolve every declared enum constant's underlying
+// value, honoring an explicit `:= N` initializer and auto-increment
+// continuation from the previous value — the same algorithm as the
+// underlying-type range check in TypeResolution_Checks.cpp's
+// checkEnumRestrictions, recomputed here because EnumConstantSymbol::value
+// (Symbol.hpp) is populated only for an IMPORTED enum (the cross-module
+// carrier); a LOCAL enum's values are always re-derived from its AST. A
+// value that fails to fold (a non-constant initializer — a separate,
+// already-diagnosed concern) falls back to the auto-increment default so
+// later siblings still continue correctly.
+std::unordered_map<std::string_view, long long> computeLocalEnumConstantValues(
+        const ast::TypeDecl& td) {
+    std::unordered_map<std::string_view, long long> values;
+    long long running = 0;
+    for (const auto& ec : td.enumConstants) {
+        long long val = running;
+        if (ec.value) {
+            auto resolve = [&](std::string_view name, int)
+                    -> std::optional<long long> {
+                auto it = values.find(name);
+                if (it != values.end()) return it->second;
+                return std::nullopt;
+            };
+            if (auto folded = foldIntConst(*ec.value, resolve)) val = *folded;
+        }
+        values[ec.name] = val;
+        running = val + 1;
+    }
+    return values;
+}
+
+// §10.2 (issue #1577): the enum-constant-name -> underlying-value map for
+// `sub`. Prefers the AST (local enum, full fidelity including auto-increment
+// continuation); falls back to the per-symbol `value` field for an imported
+// enum, which has no ast::TypeDecl (mirrors the fallback in the exhaustiveness
+// check just below).
+std::unordered_map<std::string_view, long long> enumConstantValues(
+        const TypeSymbol& sub) {
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(sub.decl))
+        return computeLocalEnumConstantValues(*td);
+    std::unordered_map<std::string_view, long long> values;
+    for (const Symbol* m : sub.members)
+        if (auto* ec = dynamic_cast<const EnumConstantSymbol*>(m))
+            values[ec->name] = ec->value;
+    return values;
+}
+
+// §10.2 (issue #1577): the last name part + source location of one
+// enum-constant reference inside a `case` pattern — either a bare
+// NamedPattern member or one entry of a ConstantPattern's `|` alternative
+// list (mirrors collectEnumPatternNames's two pattern shapes above).
+struct EnumPatternRef {
+    std::string_view name;
+    SourceLocation loc;
+};
+std::vector<EnumPatternRef> enumPatternRefs(const ast::CaseArm& arm) {
+    std::vector<EnumPatternRef> refs;
+    const ast::Pattern* p = arm.pattern.get();
+    if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
+        if (np->name && !np->name->parts.empty())
+            refs.push_back({np->name->parts.back(), np->span.begin});
+    } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+        for (const auto& c : cp->constants) {
+            if (!c) continue;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(c.get()))
+                refs.push_back({ma->member, c->span.begin});
+            else if (auto* id =
+                         dynamic_cast<const ast::IdentifierExpr*>(c.get()))
+                refs.push_back({id->name, c->span.begin});
+        }
+    }
+    return refs;
+}
+
 // §19.6: does any unguarded arm explicitly match `null` (NullPattern)?
 bool armsCoverNull(const ast::CaseExpr& ce) {
     for (const auto& arm : ce.arms) {
@@ -543,16 +617,37 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         // §19.6: every declared enum constant must have a matching pattern.
         std::unordered_set<std::string_view> covered;
         for (const auto& arm : ce.arms) collectEnumPatternNames(arm, covered);
+        // §10.2 (issue #1577): "exhaustiveness is over the set of distinct
+        // declared values, so an arm naming either alias covers both." Map
+        // covered NAMES to their underlying values so a covered alias also
+        // covers its same-valued siblings, instead of requiring every
+        // declared NAME to appear.
+        const std::unordered_map<std::string_view, long long> values =
+            enumConstantValues(*sub);
+        std::unordered_set<long long> coveredValues;
+        for (auto n : covered) {
+            auto it = values.find(n);
+            if (it != values.end()) coveredValues.insert(it->second);
+        }
         std::vector<std::string_view> missing;
+        std::unordered_set<long long> reportedMissingValues;
+        auto considerName = [&](std::string_view name) {
+            if (covered.count(name)) return;
+            auto it = values.find(name);
+            if (it != values.end()) {
+                if (coveredValues.count(it->second)) return;  // an alias covers it
+                if (!reportedMissingValues.insert(it->second).second)
+                    return;  // this value already reported via an earlier alias
+            }
+            missing.push_back(name);
+        };
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(sub->decl)) {
-            for (const auto& ec : td->enumConstants)
-                if (!covered.count(ec.name)) missing.push_back(ec.name);
+            for (const auto& ec : td->enumConstants) considerName(ec.name);
         } else {
             // No AST decl (e.g. imported enum): fall back to symbol members.
             for (const Symbol* m : sub->members)
-                if (dynamic_cast<const EnumConstantSymbol*>(m) &&
-                    !covered.count(m->name))
-                    missing.push_back(m->name);
+                if (dynamic_cast<const EnumConstantSymbol*>(m))
+                    considerName(m->name);
         }
         if (!missing.empty() || nullableUncovered) {
             std::string detail = "enum `" + std::string(sub->name) + "`";
@@ -2537,6 +2632,59 @@ void ExprTC::checkCasePatternConstantRanges(
         if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p))
             for (const auto& c : cp->constants)
                 rejectNonConstantPatternExpr(c.get());
+    }
+    // §10.2 (issue #1577): "under duplicate constant values, in a `case` over
+    // the enum, two arms — or two `|` alternatives — naming same-valued
+    // constants are a compile error, the later one being unreachable."
+    // Declaration-level aliasing itself stays legal and undiagnosed (§10.2);
+    // only a `case` naming the same value twice is rejected here, since the
+    // second reference can never be reached (or, within one `|` list, adds
+    // nothing — it is the exact same membership test repeated).
+    if (scrutTy && scrutTy->kind == TypeRef::Kind::Named && scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Enum) {
+        const std::unordered_map<std::string_view, long long> values =
+            enumConstantValues(*scrutTy->declaration);
+        // value -> name of the constant that first claimed it from an
+        // UNGUARDED arm/alternative; only an unguarded claim makes a later
+        // reference to the same value truly unreachable (a guarded arm may
+        // fall through to its guard failing, so it does not "consume" the
+        // value for arms that follow it).
+        std::unordered_map<long long, std::string_view> unguardedClaim;
+        for (const auto& arm : arms) {
+            std::unordered_map<long long, std::string_view> seenThisArm;
+            for (const auto& ref : enumPatternRefs(arm)) {
+                auto vit = values.find(ref.name);
+                if (vit == values.end()) continue;  // not this enum's own member
+                long long v = vit->second;
+                auto sit = seenThisArm.find(v);
+                if (sit != seenThisArm.end()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ref.loc,
+                        "`" + std::string(ref.name) + "` denotes the same "
+                        "underlying value as `" + std::string(sit->second) +
+                        "` in this `|` alternative list — duplicate enum "
+                        "constant values are the same value, not distinct "
+                        "alternatives (§10.2)");
+                    continue;
+                }
+                auto uit = unguardedClaim.find(v);
+                if (uit != unguardedClaim.end()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ref.loc,
+                        "this `case` arm is unreachable: `" +
+                        std::string(ref.name) + "` denotes the same "
+                        "underlying value as `" + std::string(uit->second) +
+                        "`, already matched by an earlier unguarded arm "
+                        "(§10.2)");
+                    continue;
+                }
+                seenThisArm.emplace(v, ref.name);
+            }
+            if (!arm.guard) {
+                for (const auto& [v, name] : seenThisArm)
+                    unguardedClaim.emplace(v, name);
+            }
+        }
     }
     // §19.3 (#1399): a Range<T> scrutinee is a struct value, not a scalar. A
     // RangePattern, RelOpPattern, or non-null ConstantPattern matched against a
