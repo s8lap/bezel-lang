@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.181 — July 2026**
+**Companion to the Bezel Language Specification, v0.182 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -326,6 +326,15 @@ end TimeOnly;
 ```
 
 `DateTime.Date: DateOnly` and `DateTime.TimeOfDay: TimeOnly` accessors decompose a `DateTime`.
+
+The `ArgumentOutOfRangeException` these constructors raise is declared here (v0.182 — previously referenced without a declaration anywhere), deriving from `ArgumentException` so that an `ArgumentException` catch arm covers the whole argument-validation family (language spec [§31.2.1](Bezel_Language_Spec.md#sec-arm-patterns)); it lives in the auto-imported `System` alongside its producers:
+
+```bezel
+public class ArgumentOutOfRangeException: ArgumentException
+  public constructor(message: string);
+  public constructor(message: string, paramName: string);
+end ArgumentOutOfRangeException;
+```
 
 The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` (e.g. `2024-03-15T00:00:00`); it is the value also used when a `DateTime` is interpolated into a string with no format specifier. `ToString(format)` selects an explicit format.
 
@@ -1264,6 +1273,10 @@ public class Array<T>: IList<T>
   public method AsReadOnlySpan(start: int): ReadOnlyArraySpan<T>;
   public method AsReadOnlySpan(start: int, length: int): ReadOnlyArraySpan<T>;
   public method AsReadOnlySpan(r: Range<int>): ReadOnlyArraySpan<T>;
+
+  // Range slicing (language spec §15.6): `arr[r]` — arr[a..b], arr[..b], arr[a..], arr[..] —
+  // is the compiler-recognized equivalent of this method (v0.182):
+  public method Slice(r: Range<int>): owned Array<T>;   // fresh array; the range's values, or copies of the element borrows
 end Array;
 
 public extension Array<T> where T: IComparable<T>
@@ -1571,7 +1584,14 @@ public interface IEqualityComparer<T>
 end IEqualityComparer;
 ```
 
-Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `TryGetValue` for safe lookup.
+Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `TryGetValue` for safe lookup. The exception is declared here (v0.182 — previously referenced without a declaration), in `System.Collections.Generic` per the producer-locality rule (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); it derives directly from `Exception` — deliberately not from `InvalidOperationException`, so that a state-fault catch arm does not silently swallow missing-key lookups:
+
+```bezel
+public class KeyNotFoundException: Exception
+  public constructor();
+  public constructor(message: string);
+end KeyNotFoundException;
+```
 
 The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwningDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member.
 

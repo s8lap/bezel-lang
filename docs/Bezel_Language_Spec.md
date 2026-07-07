@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.181 — July 2026**
+**Version 0.182 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -268,8 +268,8 @@ The arithmetic, comparison, bitwise, and shift operators on primitive numeric ty
 
 The intrinsic operators are:
 
-- **Arithmetic** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`: `+`, `-`, `*`, `/`, unary `-`. Plus `mod` on integer types and `decimal` ([§6.1](#sec-integer-arithmetic)).
-- **Comparison** on every primitive (including `bool`, `char`, `string`): `=`, `<>`, `<`, `<=`, `>`, `>=`.
+- **Arithmetic** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`: `+`, `-`, `*`, `/`, unary `-`, and unary `+` (v0.182 — previously grammatical but undefined: unary `+` is the identity, yielding its operand's value at its operand's type, defined exactly where a numeric operand is; it exists for symmetry with unary `-` and is invalid on `bool`, `char`, and `string`). Plus `mod` on integer types and `decimal` ([§6.1](#sec-integer-arithmetic)).
+- **Equality** on every primitive (including `bool`, `char`, `string`): `=`, `<>`. **Ordering** (`<`, `<=`, `>`, `>=`) on every primitive **except `bool`**: the ordering operators on `bool` operands are a compile error (v0.182 — no ordering of `false` and `true` was ever defined, the stdlib `Boolean` wrapper deliberately declares no `IComparable`, and admitting one would be truthiness-shaped, [§4.1](#sec-bool); to order by a flag, convert explicitly — `int(b)`, [§5.2](#sec-explicit-conversions)).
 - **Bitwise** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`: `&`, `|`, `^`, `~` (unary). Not valid on `bool`, `char`, or floating-point types ([§6.5](#sec-bitwise-operations)). Boolean operations use `and`/`or`/`not` (next bullet), which short-circuit and have boolean-only semantics.
 - **Shift** on the integer types: `<<`, `>>`.
 - **Logical** on `bool`: `and`, `or`, `not` (with short-circuit evaluation, [§17.2](#sec-notes-on-operators)).
@@ -338,7 +338,7 @@ An integer literal without a suffix has type `int` if it fits in `int`'s range; 
 
 **Boundary carve-out (v0.159).** The decimal literal of magnitude 2³¹ (unsuffixed) or 2⁶³ (`L`-suffixed) is admitted **only** as the immediate operand of unary `-`, denoting `int.MinValue` / `long.MinValue` respectively (`-2147483648`, `-9223372036854775808L`); anywhere else those magnitudes remain errors. Without this carve-out the most negative values would be unwritable as literals (the magnitude alone overflows before the `-` applies).
 
-**Typed-context widening (v0.159, codifying implemented behavior).** In a context whose target integer type is explicitly declared — a typed variable declaration (`var x: long := 3_000_000_000;`), a typed field initializer, or a parameter with a declared integer type — an unsuffixed decimal literal that exceeds `int`'s range but fits the declared target is admitted at the target type. The suffix discipline's purpose (no *accidental* width) is preserved: the wider type is taken only from an explicitly written target, and the value is range-checked against it. In an **untyped** context (`var x := 3_000_000_000;`) the literal remains a compile error directing to a suffix.
+**Typed-context widening (v0.159, codifying implemented behavior; v0.182 — "decimal literal" corrected to "integer literal" and the context list completed).** In a context whose target integer type is declared — a typed variable declaration (`var x: long := 3_000_000_000;`), a typed field initializer, a parameter with a declared integer type, an **assignment target** whose declared type is an integer type (`x := 3_000_000_000;` for `x: long`), or a **`return`** in a method with a declared integer return type — an unsuffixed integer literal (decimal, hexadecimal, or binary spelling alike) that exceeds `int`'s range but fits the declared target is admitted at the target type. The suffix discipline's purpose (no *accidental* width) is preserved: the wider type is taken only from a declared target, and the value is range-checked against it. The assignment and `return` contexts join in v0.182 — the declaration already announced the width, and accepting `var x: long := 3_000_000_000;` while rejecting the same value assigned on the next line was an inconsistency with no safety content. In an **untyped** context (`var x := 3_000_000_000;`) the literal remains a compile error directing to a suffix.
 
 <a id="sec-floating-point-types"></a>
 ### 4.3 Floating-point types
@@ -394,7 +394,7 @@ Operations:
 - `s[i]` returns the `char` at code-point position `i`, zero-indexed. O(1). Out-of-range raises `IndexOutOfRangeException`.
 - `s[r]` for a `Range<int>` value `r` returns the substring spanning `r`. O(k) for a result of length `k`. Endpoints follow the standard rules for `Range<int>` over `s`'s indices: a closed `s[a..b]` includes both ends, a half-open `s[a..<b]` excludes the upper, and the open-ended forms (`s[..b]`, `s[a..]`, `s[..]`) extend to the start or end of the string. Out-of-range endpoints raise `IndexOutOfRangeException`; an empty range produces the empty string. The result is a fresh `string`; mutating one does not affect the other (strings are immutable, so this is observably true regardless of representation).
 - `s = t` and `s <> t` compare by code-point sequence. O(min(|s|, |t|)).
-- `s < t`, `s > t`, `s <= t`, `s >= t` perform ordinal lexicographic comparison of the code-point sequence. Locale-aware comparison is provided by standard library methods.
+- `s < t`, `s > t`, `s <= t`, `s >= t` perform ordinal lexicographic comparison of the code-point sequence. Locale-aware comparison is provided by standard library methods. Ordering requires **non-nullable** operands (v0.182 — previously unstated): an operand of static type `string?` is a compile error — narrow first ([§7.4](#sec-member-access-on-nullable-values)) — the same use-requires-narrowing discipline as every other operation on a nullable reference; equality stays null-safe per [§8.4](#sec-=-and), and [§7.11](#sec-lifted-operators)'s relational lifting is a nullable-*value*-type rule that does not extend here.
 - `s + t` concatenates two strings. The compiler does not implicitly convert other types to `string`; use interpolation or `.ToString()`.
 - `c in s` tests whether the character `c` appears in `s` (equivalent to `s.Contains(c)`, [§17.5](#sec-the-in-operator)).
 
@@ -454,7 +454,7 @@ The following are **never implicit**:
 
 **Constant narrowing (codified in v0.159).** An expression of integer type that is a **compile-time constant** (A.8 ConstExpr) implicitly converts to any integer type whose range contains its value: `var b: byte := 50;`, `Set(level: byte)` called as `Set(3)`, and enum constants of the underlying type ([§10.2](#sec-explicit-values)) are all well-typed by this rule. A constant whose value does not fit the target's range is a **compile error** at the conversion site — never a silent truncation. The rule applies to constants only; a run-time `int` value still requires the explicit `byte(x)` narrowing of [§5.2](#sec-explicit-conversions). Collection-literal element typing ([§15.4](#sec-collection-literals)) and default-argument typing use this same rule.
 
-A non-nullable reference type implicitly converts to its nullable form ([§7](#sec-nullability-2)).
+**Nullable conversions (v0.182 — previously only the reference-type case was stated).** For any type `T`, `T` implicitly converts to `T?`: for a reference type, the same reference viewed as nullable ([§7.1](#sec-non-nullable-and-nullable-types)); for a value type, the present-value wrapping ([§7.2](#sec-nullable-value-types)). Each implicit conversion of this section also **lifts** to the nullable forms: `S?` implicitly converts to `T?` whenever `S` implicitly converts to `T` — a present value converts by the underlying conversion, `null` converts to `null` (`int?` → `long?`); constant narrowing (above) participates for a present constant value. The two rules compose through at most one `?` on each side ([§7.10](#sec-generics-and-nullability): `?` is idempotent): `S` converts to `T?` via `S → T → T?`, so an `int` is admissible where a `long?` is expected.
 
 <a id="sec-explicit-conversions"></a>
 ### 5.2 Explicit conversions
@@ -476,6 +476,8 @@ A conversion between a signed and an unsigned integer type of the *same width* (
 
 Casting an integer to `char` requires the integer to fall in U+0000–U+10FFFF excluding the surrogate range; otherwise `OverflowException`.
 
+**Floating-point, `decimal`, and `char` conversion semantics (v0.182 — previously unstated).** `double(m)` and `float(m)` for `decimal` `m` round to the nearest representable binary value and never fail (`float`'s and `double`'s finite ranges exceed `decimal`'s). `decimal(x)` for binary-float `x` yields the nearest representable `decimal` value; `NaN`, `±Infinity`, and magnitudes outside `decimal`'s range raise `OverflowException` (mirroring float-to-integer above — `decimal` has no non-finite values, [§6.4](#sec-decimal-arithmetic)). `float(d)` for `double` `d` rounds to the nearest `float`; a magnitude beyond `float`'s finite range yields `±Infinity` and never raises — floating-point narrowing follows floating-point arithmetic's own overflow behavior ([§6.3](#sec-floating-point-arithmetic): overflow produces `±Infinity`), exactly as integer narrowing's `OverflowException` follows checked integer arithmetic ([§6.1](#sec-integer-arithmetic)); `NaN` converts to `NaN`. The throw-vs-saturate split is therefore principled per target family, not an asymmetry. `I(c)` for `char` `c` and any integer type `I` converts the code-point value under the integer rules: the widening directions of [§5.1](#sec-implicit-conversions) always succeed, and narrower targets (`byte(c)`, `sbyte(c)`, `short(c)`) are checked narrowings raising `OverflowException` when the code point does not fit.
+
 <a id="sec-nullable-casts"></a>
 ### 5.3 Nullable casts
 
@@ -485,6 +487,8 @@ var m: int := int(n);                 // raises NullReferenceException if n is n
 ```
 
 Casting a nullable to its non-nullable form requires the value to be non-null at runtime. The safer forms are `n!` (assert non-null then cast, [§7.8](#sec-null-forgiving)) and `n ?? default` (substitute a default).
+
+**The general rule (v0.182 — previously stated only by example).** For a target type `T`, the nullable cast form `T?(x)` is admitted exactly when the corresponding non-nullable conversion `T(v)` is admitted from the non-nullable form of `x`'s type ([§5.2](#sec-explicit-conversions), [§5.4](#sec-enum-casts)). A `null` operand yields `null`; a present value `v` converts by `T(v)` under that conversion's own semantics, including its runtime checks (`OverflowException` on a non-fitting present value, and so on). The non-nullable form `T(x)` applied to a nullable operand first requires the value to be present — `null` raises `NullReferenceException`, as above — and then converts identically.
 
 <a id="sec-enum-casts"></a>
 ### 5.4 Enum casts
@@ -613,7 +617,20 @@ end;
 
 Narrowing also applies after early return, after `is not null`, and inside the controlled block of a successful `is` test ([§12.7](#sec-type-tests-is-is-not-as)).
 
-The narrowing of a variable is invalidated if the variable is reassigned within the controlled block, or if the variable is itself passed as a `ref` argument inside the controlled block (the callee may reassign it). The compiler does not attempt deeper analysis of which methods could reassign which variables transitively; only direct reassignment and direct `ref`-passing invalidate narrowing.
+**How narrowing is established (v0.182 — the enumeration was previously incomplete against the implementation).** Narrowing is flow-sensitive: at each program point the compiler tracks, per local, whether its value is known non-null. The knowledge is established by:
+
+- a null test — `x <> null` (narrowing the true branch), `x = null` (narrowing the *false* branch), `x is not null`, or a successful `is`/typed-pattern test ([§12.7](#sec-type-tests-is-is-not-as), [§19.3](#sec-patterns)) — in an `if`/`elif` condition, a `while` condition, or a `when` guard;
+- boolean composition of tests: in `A and B`, `B` (and the true branch) is checked under `A`'s true-facts; in `A or B`, `B` (and the false branch) sees `A`'s false-facts; `not` swaps the fact sets — the standard three-outcome flow analysis, so `x <> null and x.Length > 0` is well-typed;
+- an early exit: after `if x = null then return; end;` (or `throw`, `break`, `continue` in that branch), the surviving path is narrowed;
+- assignment: after `x := expr;` where `expr`'s static type is non-nullable — or `expr` is itself narrowed non-null at that point — `x` is narrowed until invalidated.
+
+**How narrowing is invalidated (v0.182 — the previous rule omitted `out` arguments and closure-capture mutation, the latter a probe-confirmed soundness hole).** The narrowing of a variable is invalidated when, within the controlled block:
+
+- the variable is reassigned from a nullable-typed expression; or
+- the variable is passed as a `ref` **or `out`** argument (the callee may — for `out`, must ([§22.3](#sec-parameter-modifiers)) — reassign it; the `out` case has been compiler-enforced since #1188 and is stated here for the record. The invalidation is deliberately **uniform over the parameter's declared nullability**: even a non-nullable `out T` parameter — whose mandatory assignment could soundly *re-establish* the fact — invalidates, one predictable rule rather than a nullability-dependent one; the sound non-nullable-`out` refinement is recorded as liftable, not implementation-optional — narrowing must not vary between conforming implementations); or
+- the variable is **mutably captured** — assigned, or passed as `ref`/`out`, anywhere inside any lambda of the enclosing function body ([§27.5](#sec-closures)) — and the block performs *any* operation that can transfer control to user code: a method, constructor, accessor, or user-defined-operator call, an invocation of a function value, or an `await` (across which another continuation of the domain may run the closure, [§30.13](#sec-runtime-model)). A mutably-captured local has exactly the unseen writer the field paragraph below names — "a closure invoked in between" — so after the first such operation the narrowing is gone; re-test, or copy to an uncaptured local (the same remedy as for fields). The rule is deliberately syntactic and conservative: any lambda in the body counts, whether or not it escapes, so the check needs no escape analysis. Straight-line check-then-use of a captured local (`if x <> null then x.M(); end;` — no call *between* the test and the use) remains accepted.
+
+The compiler does not attempt deeper analysis of which methods could reassign which variables transitively; beyond the forms above, nothing invalidates a local's narrowing.
 
 <a id="sec-narrowing-applies-to-locals-only"></a>
 #### Narrowing applies to locals only
@@ -659,7 +676,7 @@ The result type is nullable (or `()` for procedure-typed values).
 <a id="sec-null-coalescing-and-="></a>
 ### 7.7 Null-coalescing (`??` and `??=`)
 
-`a ?? b` returns `a` if non-null, else `b`. The right operand's type must be compatible with the non-nullable form of the left. When the operands are owned (or owned-nullable), `??` is a two-branch *expression* and its result ownership follows the same meet rule as an `if`/`else` join — see the producer table in [§28.3](#sec-local-variables-ownership-and-borrows): `owned ?? owned` is owned (the chosen value is discharged once), and an owned arm mixed with a borrowed arm is rejected.
+`a ?? b` returns `a` if non-null, else `b`. **Typing (v0.182, codifying implemented behavior — the previous sentence required the right operand to be non-nullable, rejecting the both-nullable idiom):** for a left operand of type `T?`, the right operand must be implicitly convertible ([§5.1](#sec-implicit-conversions)) to `T` or to `T?`; the result type is `T` when the right operand is non-nullable and `T?` when it is nullable — `user?.Name ?? "Anonymous"` is `string`, while `primary ?? fallback` over two `string?` values is `string?`; a right-associative chain stays nullable until a non-nullable operand terminates it (`a ?? b ?? ""` is `string`). When the operands are owned (or owned-nullable), `??` is a two-branch *expression* and its result ownership follows the same meet rule as an `if`/`else` join — see the producer table in [§28.3](#sec-local-variables-ownership-and-borrows): `owned ?? owned` is owned (the chosen value is discharged once), and an owned arm mixed with a borrowed arm is rejected.
 
 ```bezel
 var displayName: string := user?.Name ?? "Anonymous";
@@ -706,7 +723,7 @@ Inside an unconstrained generic body, `T` is treated conservatively as possibly 
 
 `where T: SomeClass` and `where T: IFoo` are *type-bound* constraints. They restrict T to non-nullable types conforming to the named type:
 - `where T: SomeClass` admits SomeClass and its subclasses. Interfaces do not extend classes in Bezel, so this constraint admits class types only.
-- `where T: IFoo` admits any non-nullable type that conforms to `IFoo`: classes that implement it (directly or by inheritance), records that implement it, and interfaces that extend it (directly or transitively). See [§14.2](#sec-constraints) for the conformance rule and worked examples.
+- `where T: IFoo` admits any non-nullable type that conforms to `IFoo`: classes that implement it (directly, by inheritance, or implicitly — `IDisposable`, [§28.2](#sec-the-idisposable-contract)), records and enums that implement it, interfaces that extend it (directly or transitively), and primitives with a compiler-provided conformance ([§11.8](#sec-static-interface-members), v0.176). See [§14.2](#sec-constraints) for the conformance rule and worked examples.
 
 Inside the generic body, T is non-nullable under any type-bound constraint.
 
@@ -719,9 +736,9 @@ Inside the generic body, T is non-nullable under any type-bound constraint.
 
 For a nullable value type `T?` whose underlying type `T` is a primitive on which a built-in operator ([§6](#sec-operators-on-primitive-types)) is defined, that operator **lifts** to the nullable form. Lifting is the natural completion of the null-safe equality already defined for `=`/`<>` ([§8.4](#sec-=-and)): the operators are defined on `T?` operands in terms of the underlying operator on `T`, with `null` handled uniformly. The rules differ by operator category.
 
-**Arithmetic, bitwise, and shift operators.** The binary operators `+`, `-`, `*`, `/`, `mod`, `&`, `|`, `^`, `<<`, `>>` and the unary operators `-` and `~` lift to yield `T?`. A lifted binary operator produces `null` if *either* operand is `null`; a lifted unary operator produces `null` if its operand is `null`. A mixed expression in which one operand is `T?` and the other is the non-nullable `T` lifts as well — the non-nullable operand is treated as present (never `null`), and the result is `T?`. The runtime checks each operator already performs — `OverflowException` on integer overflow ([§6.1](#sec-integer-arithmetic)), `DivideByZeroException` on integer or `decimal` division/`mod` by zero ([§6.1](#sec-integer-arithmetic)) — apply only when both operands are present (non-null); when the lifted result is `null` by reason of a null operand, no underlying operation runs and no check fires. As stated above, an operator lifts only where it is defined on the underlying type `T`: the bitwise and shift operators (`&`, `|`, `^`, `<<`, `>>`, `~`) therefore do **not** lift to `bool?` or `char?`, since they are not valid on `bool` or `char` ([§6.5](#sec-bitwise-operations)) — boolean combinations use `and`/`or`/`not`, which do not lift either (see *No three-valued logic* below).
+**Arithmetic, bitwise, and shift operators.** The binary operators `+`, `-`, `*`, `/`, `mod`, `&`, `|`, `^`, `<<`, `>>` and the unary operators `+`, `-`, and `~` lift to yield `T?` (unary `+` per its [§3.5](#sec-operators-on-primitive-types) identity semantics, v0.182). A lifted binary operator produces `null` if *either* operand is `null`; a lifted unary operator produces `null` if its operand is `null`. A mixed expression in which one operand is `T?` and the other is the non-nullable `T` lifts as well — the non-nullable operand is treated as present (never `null`), and the result is `T?`. The runtime checks each operator already performs — `OverflowException` on integer overflow ([§6.1](#sec-integer-arithmetic)), `DivideByZeroException` on integer or `decimal` division/`mod` by zero ([§6.1](#sec-integer-arithmetic)) — apply only when both operands are present (non-null); when the lifted result is `null` by reason of a null operand, no underlying operation runs and no check fires. As stated above, an operator lifts only where it is defined on the underlying type `T`: the bitwise and shift operators (`&`, `|`, `^`, `<<`, `>>`, `~`) therefore do **not** lift to `bool?` or `char?`, since they are not valid on `bool` or `char` ([§6.5](#sec-bitwise-operations)) — boolean combinations use `and`/`or`/`not`, which do not lift either (see *No three-valued logic* below).
 
-**Relational operators.** The relational operators `<`, `<=`, `>`, `>=` lift to yield **`bool`** — *not* `bool?`. A lifted relational comparison yields `false` if *either* operand is `null`. This mirrors the rule that a `null` participant in an ordering comparison is not "less than" or "greater than" anything; the result is simply `false`. (Equality `=` and `<>` are unchanged — they are already null-safe per [§8.4](#sec-=-and), where `null = null` is `true` and `null = nonNull` is `false`.)
+**Relational operators.** The relational operators `<`, `<=`, `>`, `>=` lift to yield **`bool`** — *not* `bool?`. A lifted relational comparison yields `false` if *either* operand is `null`. This mirrors the rule that a `null` participant in an ordering comparison is not "less than" or "greater than" anything; the result is simply `false`. (Equality `=` and `<>` are unchanged — they are already null-safe per [§8.4](#sec-=-and), where `null = null` is `true` and `null = nonNull` is `false`.) Two boundary notes (v0.182): lifted ordering deliberately breaks the usual `<=`-reflexivity-of-equality **on null** — `null = null` is `true` while `null <= null` is `false` — so code treating `a = b` as implying `a <= b` must narrow first (the recorded all-comparisons-false-on-null decision, #486, stands; this sentence is advisory, not a rule change). And the relational lifting is confined to nullable **value** types whose underlying type has an ordering: `bool?` operands do not lift ([§3.5](#sec-operators-on-primitive-types) defines no `bool` ordering, v0.182), and nullable *reference* operands (`string?`) are outside this section entirely — ordering them is a compile error ([§4.6](#sec-string)).
 
 **No three-valued logic.** Lifting does *not* introduce three-valued (`bool?`) logical operators. The boolean operators `and`, `or`, `not` ([§17.2](#sec-notes-on-operators)) operate only on `bool`; there is no lifted `and`/`or`/`not` over `bool?`, and a `bool?` operand to a boolean operator is a compile error. Code that needs to combine `bool?` values handles the `null` case explicitly (e.g. with `??` ([§7.7](#sec-null-coalescing-and-=)) or a narrowing check).
 
@@ -754,7 +771,7 @@ end Object;
 <a id="sec-gettype"></a>
 ### 8.2 `GetType`
 
-`v.GetType()` returns the `Type` value for the runtime type of `v`. For value types, the call boxes the value before reading its type tag.
+`v.GetType()` returns the `Type` value for the runtime type of `v`. For a value-typed `v` the answer is always the static type — value types have no derivation, so runtime and static type coincide — and the call is answered from the static type with no observable boxing (v0.182; the earlier text made boxing the defining mechanism, which left `GetType` undefined on move-only inline arrays ([§15.3](#sec-move-only-value-types)) — they cannot be boxed ([§8.6](#sec-boxing-of-inline-arrays)) but may be asked their type: the receiver is borrowed, not copied). An implementation remains free to box internally where the type admits it; the result is identical either way.
 
 `GetType` is non-virtual; runtime type identity is fixed at allocation and cannot be overridden.
 
@@ -775,7 +792,7 @@ end Object;
 | Inline array `[N]T`, `[N]T?` | Element-by-element value equality ([§15.1.2](#sec-inline-array-members)) | Hash combining element hashes in slot order |
 | Inline array `[N owned]T`, `[N owned]T?` | Element-by-element equality via borrow ([§15.3](#sec-move-only-value-types)) | Hash combining element hashes in slot order |
 
-`GetHashCode` must satisfy: if `a.Equals(b)` then `a.GetHashCode() = b.GetHashCode()`. Hash collisions on non-equal values are permitted. The auto-generated `GetHashCode` for positional records combines per-field hashes in declaration order; the combining function is order-dependent, so records with the same field types in different positions produce different hashes for different orderings (e.g. `Pair(1, 2)` and `Pair(2, 1)` have different hashes). The choice of combining algorithm is implementation-defined, subject to the satisfaction of the hash-equality invariant.
+`GetHashCode` must satisfy: if `a.Equals(b)` then `a.GetHashCode() = b.GetHashCode()`. Hash collisions on non-equal values are permitted. The auto-generated `GetHashCode` for positional records combines per-field hashes in declaration order; the combining function **must be order-sensitive** (v0.182 — previously the order-dependence was asserted as a fact while the algorithm was left fully implementation-defined, which a commutative combiner such as plain XOR would falsify): the hash of a sequence of component hashes must depend on their order, not only on their multiset, so `Pair(1, 2)` and `Pair(2, 1)` are not *systematically* hash-equal (incidental collisions remain permitted, as for any hash). The choice of combining algorithm is otherwise implementation-defined, subject to the hash-equality invariant and this order-sensitivity requirement.
 
 A type that overrides `Equals` must also override `GetHashCode`. The compiler enforces this.
 
@@ -786,7 +803,7 @@ A type that overrides `Equals` must also override `GetHashCode`. The compiler en
 
 For classes, `=` always invokes `Equals`. Operator overloading of `=` and `<>` is not permitted on classes; classes customize equality by overriding `Equals`. Records and enums may overload `=` and `<>`.
 
-`Object.ReferenceEquals(a, b)` compares object identity, ignoring any `Equals` override. Passing value-type arguments always returns `false` (each boxing creates a fresh object); the compiler warns.
+`Object.ReferenceEquals(a, b)` compares object identity, ignoring any `Equals` override. It is an ordinary static method with `Object?` parameters, so value-typed arguments are **boxed before the comparison** and the result is the identity of the boxes ([§8.6](#sec-boxing); v0.182 — this replaces an unconditional "always returns `false`" that contradicted the boxing rules): a non-null value-typed argument produces a fresh box and compares unequal to every other argument — except boxed `()`, which an implementation may intern ([§8.6](#sec-boxing-of-the-unit-value)), making that comparison unspecified — while a **null** nullable-value argument boxes to the null reference ([§8.6](#sec-nullable-value-type-boxing)), so `ReferenceEquals(x, null)` is `true` for a null `int?` `x`. The compiler warns on any value-typed argument: the question being answered is box identity, which is almost never what the caller means.
 
 <a id="sec-tostring"></a>
 ### 8.5 `ToString`
@@ -797,6 +814,7 @@ For classes, `=` always invokes `Equals`. Operator overloading of `=` and `<>` i
 - For positional records: a representation of fields, e.g. `"Point(X: 10, Y: 20)"`.
 - For body records that satisfy the auto-equality conditions ([§9.2](#sec-body-records) — only auto-properties, no manually-declared `Equals` or `GetHashCode`): a representation of auto-properties, formatted as `"TypeName(Prop1: value1, Prop2: value2)"`. Auto-`ToString` accompanies the auto-equality members, with one asymmetry (v0.158): an `override ToString` replaces only the formatting — the record keeps auto-`Equals`/`GetHashCode`/`=` — while an `Equals`/`GetHashCode` override disqualifies the whole package ([§9.2](#sec-body-records)). This matches the analogous design in C# records and lets `Console.WriteLine(person)` produce useful output for auto-equality records without ceremony.
 - For body records that do not satisfy auto-equality conditions, and for enums: the type's qualified name.
+- For inline arrays (all forms, including move-only `[N owned]…` arrays, whose receiver is borrowed for the call) and for the unit type: the type's name — `"[3]int"`-style for an inline array, `"()"` for unit (v0.182 — previously unstated; element-listing output is deliberately not synthesized, since an inline array's elements may be class-typed borrows whose formatting is not the container's business).
 
 <a id="sec-boxing"></a>
 ### 8.6 Boxing
@@ -891,12 +909,14 @@ end Rectangle;
 <a id="sec-auto-generated-equality"></a>
 #### Auto-generated equality
 
-A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToString` over its **auto-properties** (and only its auto-properties) when every member of the record is one of:
+A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToString` over its **auto-properties** (and only its auto-properties) when every **instance** member of the record is one of:
 
 - An auto-property whose type is an **admissible component type** (below).
-- A method or expression-bodied property whose value is a pure function of the record's auto-properties — these do not contribute storage, do not participate in equality, and do not disqualify the record from auto-equality.
+- A method or expression-bodied (computed) property — these contribute no storage and do not participate in equality. What their bodies compute is irrelevant to eligibility (v0.182: the former "pure function of the auto-properties" qualifier is dropped — equality, hashing, and `ToString` are defined over storage only, so no behavior of a computed member can affect their correctness).
 - An overload of a non-equality operator.
-- A constructor.
+- A constructor — regardless of what its body does (v0.182; see the eligibility note below).
+
+**Static members are ignored** (v0.182, codifying implemented behavior): `const` declarations, `static readonly` fields, and static methods and properties contribute no instance storage and neither qualify nor disqualify the record — a record may carry `Origin`-style constants and static factories without losing `=`. The same static-member exemption applies wherever this membership rule is reused ([§9.8](#sec-serialization-synthesis)).
 
 **Admissible component types** (one recursive rule, applied per storage component):
 
@@ -912,9 +932,9 @@ Such a record is said to be **auto-equality-bearing** — a derived type propert
 A body record is **not** auto-equality-bearing — and `=` on it without an explicit overload is a compile error — when it contains:
 
 - An explicit field declaration (storage that is not an auto-property).
-- A computed property whose getter has observable side effects, or whose value depends on state outside the record's auto-properties (an external clock, a global, a mutable field of a captured object).
-- A non-trivial constructor body that performs work other than property initialization.
 - An `override` of `Equals` or `GetHashCode`. Declaring either means the author has taken over equality, and the synthesized structural `=` would silently ignore the override; the record is therefore not auto-equality-bearing, and `=`/`<>` (and the direct `.Equals`/`.GetHashCode` calls above) are a compile error unless the author also declares the `operator =`/`<>` overloads. *(Narrowed in v0.158: an `override` of `ToString` alone suppresses only the auto-`ToString` — the author took over formatting, not equality; auto-`Equals`/auto-`GetHashCode`/`=` remain. Through v0.157 a `ToString` override disqualified the whole package; the v0.156 #1249-A reasoning — "the synthesized structural `=` would silently ignore the author's override" — never applied to formatting.)*
+
+*(Removed in v0.182: the former "computed property with observable side effects" and "non-trivial constructor body" disqualifiers. Both predicated eligibility on member *behavior*, but the generated members are defined over **storage** — auto-properties — only: no constructor body and no computed-property body can change what structural `=`, `GetHashCode`, or `ToString` mean, so the clauses protected no invariant while stripping `=` — and, through [§9.8](#sec-serialization-synthesis), serialization — from exactly the records [§9.5](#sec-non-destructive-update-with) recommends: those with validating constructors (`Width > 0 and Height > 0`). A validating or normalizing constructor is now fully compatible with auto-equality; `with` continues to bypass constructors per [§9.5](#sec-non-destructive-update-with), and the synthesized `Deserialize` now *does* run a matching declared constructor — see [§9.8](#sec-serialization-synthesis).)*
 
 Authors who want explicit equality on a record outside the auto-equality-bearing set declare `=` and `<>` overloads in the body, along with `Equals(Object?)`, `Equals(T)`, and `GetHashCode` overrides as needed.
 
@@ -1036,7 +1056,7 @@ A record or enum that declares conformance to `ISerializable` and/or `IDeseriali
 
 A type is **serialization-eligible** — a derived type property ([§3.6](#sec-derived-type-properties)) — when it is a record or an enum and every serialized component is itself serializable:
 
-- **Enums** are always serialization-eligible. The synthesized form writes the member *name* as a string (via `WriteString`) and reads it back by matching against the declared members; a value that is not a declared constant (a "raw" enum value, [§10](#sec-enums)) raises `SerializationException` on write and on read. Writing the name rather than the underlying integer makes the encoded form stable against reordering or renumbering of members and self-describing in text formats; programs that need the integer form serialize `int(e)` (or the underlying-typed cast) explicitly through a hand-written `Serialize`.
+- **Enums** are always serialization-eligible. The synthesized form writes the member *name* as a string (via `WriteString`) and reads it back by matching against the declared members; a value that is not a declared constant (a "raw" enum value, [§10](#sec-enums)) raises `SerializationException` on write and on read. When several constants share one underlying value ([§10.2](#sec-explicit-values), v0.182), the synthesized form writes the **first-declared** constant's name for that value and accepts every declared name on read (all denote the same value, so the round trip is stable). Writing the name rather than the underlying integer makes the encoded form stable against reordering or renumbering of members and self-describing in text formats; programs that need the integer form serialize `int(e)` (or the underlying-typed cast) explicitly through a hand-written `Serialize`.
 - **Positional records** ([§9.1](#sec-positional-records)) are serialization-eligible when every positional field's type is serialization-eligible. The synthesized form is an object whose field names are the positional-field names in declaration order.
 - **Body records** ([§9.2](#sec-body-records)) are serialization-eligible under exactly the auto-equality membership conditions of [§9.2](#sec-body-records) — the §9.2 member list and admissible-component rule are the single normative statement, applied here unchanged — *and* additionally every auto-property's type is serialization-eligible. The serialized components are the auto-properties in declaration order; computed (expression-bodied) properties are not serialized, exactly as they do not participate in equality or `ToString`.
 - A component type is **serialization-eligible** when it is: a primitive (`bool`, the integer types, `float`, `double`, `decimal`, `char`); `string`; an enum; another serialization-eligible record; a serialization-eligible **synthesized class** (a class that declares `ISerializable`/`IDeserializable` and whose serialized components are each serialization-eligible, below); a `Shared<T>` or `Weak<T>` whose `T` is a serialization-eligible class; a nullable `T?` whose `T` is serialization-eligible (encoded as the value or `WriteNull`/`TryReadNull`); or a standard sequence collection (`Array<T>`, `OwningArray<T>`, `LinkedList<T>`, etc., and inline arrays `[N]T`) whose element type is serialization-eligible (encoded with `BeginArray`/`EndArray`). A standard dictionary (`Dictionary<K, V>`, `OwningDictionary<K, V>`) is serialization-eligible when both `K` and `V` are serialization-eligible (encoded as an array of key/value pairs to admit non-string keys uniformly).
@@ -1050,7 +1070,7 @@ A class opts into serialization synthesis by declaring `: ISerializable` and/or 
 
 A class is serialization-eligible when every serialized component is itself serialization-eligible (recursively admitting other conforming classes, `Shared<T>`/`Weak<T>` of an eligible class `T`, and owned collections of eligible elements).
 
-When a class-typed component appears in a **record**, it participates only as an *owning* edge: the record field must be `owned` and its class type must be type-driven serialization-eligible (declare `: ISerializable`/`: IDeserializable`). A record cannot hold a back-reference — a `Shared<T>`, a `Weak<T>`, or a plain borrowing class-typed field — in its serialized set, because a record declares no owning spanning tree against which an identity participant or a back-edge could resolve; such a record is not serialization-eligible (a compile error at the conformance declaration, naming the field).
+A **record** cannot hold a class-typed component in its serialized set at all (v0.182 — this replaces an earlier owning-edge clause that required an `owned` record field, a thing [§9.7](#sec-records-and-disposal) categorically forbids, so the clause admitted nothing): a record's reference-typed fields are always borrows, and a borrow has no position in an owning spanning tree — there is no owner for an inline write to reconstruct against, and the synthesized `Deserialize` could not construct the record without binding a freshly-produced component to a borrowing field, which [§9.7](#sec-records-and-disposal)'s no-temporary-source rule rejects. The same holds for `Shared<T>`, `Weak<T>`, and interface-typed components: a record declares no owning spanning tree against which an identity participant or a back-edge could resolve. A record with a class-, interface-, `Shared<T>`-, or `Weak<T>`-typed serialized component is therefore not serialization-eligible — a compile error at the conformance declaration, naming the field. The remedy is an owning **class** envelope (a sealed class with an `owned` field serializes the same shape, above), or a hand-written `Serialize`/`Deserialize`. *(Whether a record's heap-collection components — admitted by the component list above — need the same treatment on the deserialization direction is a recorded open question in the v0.182 tracking set.)*
 
 The serialized components of a class are its `owned` and value-typed fields and auto-properties, its `Shared<T>` and `Weak<T>` fields, and its plain **borrowing** reference fields, in declaration order. The `owned`/value edges form the **owning spanning tree**; a `Shared<T>` field is an **identity participant** (an owned share of a value reachable elsewhere by another handle); `Weak<T>` fields and plain borrowing fields are **back-edges** into the graph. This partition is read directly from the field types the language already requires — it is not inferred and not guessed.
 
@@ -1058,7 +1078,7 @@ The serialized components of a class are its `owned` and value-typed fields and 
 
 **Synthesized `Deserialize`.** The synthesized factory reconstructs the owning spanning tree first, in **owner-before-borrower order**: each owned object is constructed by an ordinary call to its constructor. A `Shared<T>` component is reconstructed at its first (tagged) occurrence and registered in the tag→object table; each later `$ref` to that tag is bound by `Clone()`ing the registered handle (identity preserved, the shared count incremented). A plain borrowing field is supplied **as a constructor argument** resolved against the tag→object table — a directed acyclic graph admits an owner-before-borrower order, so the target precedes the borrower and [§7.9](#sec-definite-assignment-for-non-nullable-fields) is satisfied **unmodified**, with no observable intermediate state. A `Weak<T>` `$ref` is bound by `Downgrade()` from the reconstructed `Shared<T>` its tag resolves to; because a cycle-closing `Weak<T>` field is **nullable** (its target may be released), it is assigned after construction as ordinary mutation, so a cycle needs no two-phase window and [§7.9](#sec-definite-assignment-for-non-nullable-fields) is again satisfied — the null initializer discharges it, the later wiring is ordinary assignment. The class return shape is [§2.14](Bezel_Standard_Library.md#sec-serialization-vocabulary)'s: `owned C` for a class that *holds* shared/weak components, and `owned Shared<C>` when the class *is* a shared node (the co-owned entry); the choice is locally decidable from the entry type.
 
-**Constructor selection (clarified in v0.136).** When the class declares more than one constructor, the synthesized `Deserialize` uses the *unique* constructor whose parameter list binds exactly the owning-tree components and plain borrowing fields, matched by name (order-insensitive; `serialized "<name>"` renames do not affect the parameter-name match, which uses the declared identifiers). `Shared<T>` aliases and nullable `Weak<T>?` back-edges are bound after construction (identity-table `Clone()`/`Downgrade()`), so they are not part of the constructor parameter match. If no constructor matches, or more than one does, the conformance declaration is a compile error naming the candidate constructors — the same compile-error discipline as the eligibility rule, reported where the opt-in is declared.
+**Constructor selection (clarified in v0.136).** When the class declares more than one constructor, the synthesized `Deserialize` uses the *unique* constructor whose parameter list binds exactly the owning-tree components and plain borrowing fields, matched by name (order-insensitive and — clarified in v0.182 — compared case-insensitively, so the conventional camelCase constructor parameter matches its PascalCase component; `serialized "<name>"` renames do not affect the parameter-name match, which uses the declared identifiers). `Shared<T>` aliases and nullable `Weak<T>?` back-edges are bound after construction (identity-table `Clone()`/`Downgrade()`), so they are not part of the constructor parameter match. If no constructor matches, or more than one does, the conformance declaration is a compile error naming the candidate constructors — the same compile-error discipline as the eligibility rule, reported where the opt-in is declared.
 
 The synthesized deserializer preserves identity and enforces the one property the field types cannot decide:
 
@@ -1114,7 +1134,7 @@ For an eligible enum, the synthesized `Serialize` is `s.WriteString("<member-nam
 The synthesized recognized static factory has the value-type return shape of [§2.14](Bezel_Standard_Library.md#sec-serialization-vocabulary) — `Deserialize(d: IDeserializer): T` for a record or enum `T` (plain by-value; no `owned`, records and enums being value types). Its body:
 
 1. `d.BeginObject()`; then repeatedly `d.ReadFieldName()` and dispatch on the name, reading each recognized component with the mirror operation (`d.ReadInt`, the nested type's `Deserialize`, etc.) into a local. When a read field name matches no declared component, the synthesized code calls `d.SkipValue()` ([§2.14](Bezel_Standard_Library.md#sec-serialization-vocabulary)) — it does not itself decide whether an unknown field is an error. Whether reaching an unknown field is permitted is the *deserializer's* configured policy: a strict deserializer (the default) raises `SerializationException` from `ReadFieldName`/`SkipValue` on an unrecognized field; a deserializer configured to tolerate unknown fields skips the value and continues. Then `d.EndObject()`.
-2. Construct the result by calling the record's constructor with the read components in positional order (for a positional record, the primary constructor; for a body record, the constructor the auto-equality machinery already relies on). For an enum, read the name string and map it to the declared constant.
+2. Construct the result (v0.182 — this step previously referenced "the constructor the auto-equality machinery already relies on"; auto-equality relies on no constructor, and no selection rule existed for body records). If the record declares one or more **explicit constructors**, the synthesized `Deserialize` calls the *unique* explicit constructor whose parameter list binds exactly the serialized components, matched by name — compared **case-insensitively**, so the conventional camelCase parameter matches its PascalCase component (`constructor(width: decimal, height: decimal)` binds `Width`/`Height`); `serialized "<name>"` renames do not affect the match, which uses declared identifiers. If explicit constructors exist but none matches, more than one matches, or the case-insensitive comparison leaves a parameter ambiguous between two components, the conformance declaration is a compile error naming the candidates — the same discipline as the class rule above, whose matching this rule shares. A record that declares **no** explicit constructor is constructed directly from the read components at the storage level — the same constructor-bypassing construction that `with` ([§9.5](#sec-non-destructive-update-with)) and `default(T)` ([§17.11](#sec-the-default-operator)) already perform; for a purely positional record this coincides with calling the auto-generated primary constructor in positional order. For an enum, read the name string and map it to the declared constant (under duplicate constant values, every declared name maps to its value — [§10.2](#sec-explicit-values)).
 
 Field order in the input need not match declaration order — dispatch is by field name. A **missing** required component (one neither present nor `serialized optional`), a **duplicate** field name, a type mismatch, or a name not matching any enum constant raises `SerializationException` unconditionally — these are structural faults in the input regardless of policy. An **unknown** field (present in the input, matching no declared component) is the one case governed by *operation* policy rather than the synthesized code: it is an error by default and is skipped when the deserializer is configured to ignore unknown fields (stdlib [§2.15](Bezel_Standard_Library.md#sec-concrete-serialization-formats)). This policy is deliberately a property of the deserialization operation, not an annotation on the type — the same type may be read strictly in one context and leniently in another, a decision that belongs to the caller with the input, not to the type's contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). The synthesized code is identical regardless of policy: it always skips an unrecognized field via the deserializer; strictness lives entirely in the deserializer. The construction is an ordinary constructor call at a static program point, so a record's field types, nullability, and definite-assignment rules are checked normally; this is the structural reason synthesis is sound where reflection was not ([§5.18](Bezel_Design_Rationale.md#sec-type-identity-not-reflection)).
 
@@ -1170,6 +1190,8 @@ end HttpStatus;
 ```
 
 Values must be compile-time constants of the underlying type. Unspecified values continue from the previous explicit value, incrementing by 1.
+
+**Duplicate constant values (v0.182 — previously unspecified).** Two or more constants of one enum may share an underlying value, whether written explicitly (`Legacy := 1, Current := 1`) or produced by auto-increment continuation. Aliasing is legal and draws no diagnostic; but since an enum value *is* its underlying integer ([§10.3](#sec-underlying-type)), same-valued constants denote **one value**: `Legacy = Current` is `true`, and no construct can distinguish them at run time. Three consequences follow from that identity: in a `case` over the enum, two arms — or two `|` alternatives — naming same-valued constants are a **compile error**, the later one being unreachable; exhaustiveness ([§19.6](#sec-exhaustiveness)) is over the set of distinct declared *values*, so an arm naming either alias covers both; and serialization synthesis ([§9.8](#sec-serialization-synthesis)) writes the **first-declared** constant's name for a shared value and accepts every declared name on read.
 
 <a id="sec-underlying-type"></a>
 ### 10.3 Underlying type
@@ -1849,7 +1871,8 @@ The `where` clause restricts the substitutions a type parameter accepts:
 | `where T: class` | Non-nullable reference types only — classes (including `Array<T>`, `OwningArray<T>`, and other heap collection types), interfaces, `string`, function types. |
 | `where T: value` | Non-nullable value types — records, enums, primitives, inline arrays (all forms), the unit type. A nullable value type (e.g. `int?`) does **not** satisfy `value`. Generic body must use only move-compatible operations on T if T may be a move-only inline array ([§15.3](#sec-move-only-value-types)). |
 | `where T: SomeClass` | Non-nullable subtypes of `SomeClass` (the class itself and its descendants). Class types only; interfaces do not extend classes in Bezel. |
-| `where T: IFoo` | Non-nullable types conforming to `IFoo`: classes implementing it, records implementing it, and interfaces extending it. See "Interface conformance" below. |
+| `where T: IFoo` | Non-nullable types conforming to `IFoo`: classes implementing it, records and enums implementing it, interfaces extending it, and primitives with a compiler-provided conformance ([§11.8](#sec-static-interface-members)). See "Interface conformance" below. |
+| `where T: U` (U a type parameter) | Non-nullable types assignable to the substitution for `U`. See "Type-parameter bounds" below. |
 | `where T: new()` | Class types with a `public` parameterless constructor; value types (records, enums, primitives, inline arrays, the unit type) whose `default(T)` is well-defined ([§17.11](#sec-the-default-operator)). |
 
 Constraints may be combined: `where T: class, IDisposable, new()` requires a non-nullable reference type that implements `IDisposable` and has a public parameterless constructor.
@@ -1864,16 +1887,21 @@ A type-bound constraint — naming a class or interface — implies non-null T. 
 
 Contradictory constraint combinations (e.g. `class, value`) are compile errors.
 
+**Type-parameter bounds (`where T: U`).** A constraint whose bound is another type parameter — of the same declaration, or of the enclosing type — is grammatical and has subtype semantics (v0.182, codifying implemented behavior; previously the form parsed with no defined meaning): a substitution S for `T` satisfies `where T: U` exactly when S is non-nullable and is *assignable to* the substitution for `U` — identical to it, a subclass of a class substitution ([§12](#sec-inheritance-and-dispatch)), or a type conforming to an interface substitution (the conformance rule below). The check runs at instantiation, after both parameters are substituted. Inside the body, a `T`-typed value is usable in any `U`-typed position, and `T` conforms to every interface that `U`'s own constraints guarantee; an unconstrained `U` contributes only `Object`'s surface. Like every type-bound constraint, `where T: U` implies non-null `T` (`T?` is the nullable companion). A self-referential bound (`where T: T`) or a cycle among type-parameter bounds (`where T: U` together with `where U: T`) is a compile error at the declaration.
+
 <a id="sec-interface-conformance"></a>
 #### Interface conformance
 
-For an interface I and a candidate type T, T **conforms to** I exactly when one of the following holds:
+For an interface I and a candidate type T, T **conforms to** I exactly when one of the following holds (clauses 4–6 added in v0.182 — the list previously omitted three conformance sources the language had already defined, contradicting [§10.5](#sec-restrictions), [§11.8](#sec-static-interface-members), and [§28.2](#sec-the-idisposable-contract)):
 
-1. **T is a class** that lists I (or any interface extending I) in its inheritance clause, or that inherits from a class which conforms to I. Implementation may be direct (the class declares the matching members) or inherited (a base class declares them).
-2. **T is a record** that lists I (or any interface extending I) in its inheritance clause and declares matching members. Records are sealed ([§9.6](#sec-records-and-inheritance)), so conformance is always direct, never inherited.
+1. **T is a class** that lists I (or any interface extending I) in its inheritance clause, that inherits from a class which conforms to I, or that conforms **implicitly** — every class conforms to `IDisposable` without listing it ([§28.2](#sec-the-idisposable-contract)). Implementation may be direct (the class declares the matching members), inherited (a base class declares them), or compiler-generated (the implicit `Dispose`).
+2. **T is a record** that lists I (or any interface extending I) in its inheritance clause and declares matching members — auto-generated members count: the synthesized `Equals(T)` satisfies `IEquatable<T>` (stdlib §2.9's recorded convention — "Records implement this implicitly"). Records are sealed ([§9.6](#sec-records-and-inheritance)), so conformance is always direct, never inherited.
 3. **T is an interface** that has I in its extension chain — either I is named directly in T's inheritance clause, or T extends an interface that itself conforms to I.
+4. **T is an enum** that lists I (or any interface extending I) in its inheritance clause and declares the matching public members ([§10.5](#sec-restrictions)): `enum Priority: IComparable<Priority>` satisfies `where T: IComparable<T>` exactly as a record would — enum interface conformance exists precisely to make enums visible to interface-constrained generics (rationale §9.4, v0.61).
+5. **T is a primitive** with a **compiler-provided conformance** ([§11.8](#sec-static-interface-members), v0.176): the numeric tower and `char` conform to the stdlib §2.19 `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces without declaring them, the intrinsic operations serving as the member witnesses. (Primitives are not records — the wrapper records `Int32` etc. are separate types with their own clause-2 conformances — so this source needs its own clause.)
+6. **T is a type parameter** whose constraints guarantee conformance to I ("Type-parameter bounds" above): a type-bound constraint naming I or an interface extending I, directly or through a `where T: U` chain.
 
-`where T: IFoo` admits exactly the substitutions for which T conforms to `IFoo` per the rule above. Inside the generic body, T's surface includes IFoo's members, regardless of which conformance category T belongs to; the body cannot tell whether T was satisfied by a class, a record, or an interface, and does not need to.
+`where T: IFoo` admits exactly the substitutions for which T conforms to `IFoo` per the rule above. Inside the generic body, T's surface includes IFoo's members, regardless of which conformance category T belongs to; the body cannot tell whether T was satisfied by a class, a record, an enum, an interface, a primitive, or another type parameter, and does not need to.
 
 <a id="sec-worked-example-where-t-idisposable"></a>
 #### Worked example: `where T: IDisposable`
@@ -1897,6 +1925,11 @@ So `where T: IDisposable` admits the same *class* substitutions as `where T: cla
 - An interface `IIntComparable: IComparable<int>` (rule 3): conforms.
 
 `where T: IComparable<int>` therefore admits a mix of class, record, and interface substitutions — illustrating that interface constraints are not class-only, unlike the class-bound constraint `where T: SomeClass`.
+
+<a id="sec-constraints-on-overrides"></a>
+#### Constraints on overrides and interface implementations
+
+An `override` of a generic method, and a method implementing a generic interface member, **inherits the overridden or implemented declaration's constraints** (v0.182 — previously unspecified). Omitting the `where` clauses is the recommended spelling and means exactly the inherited set; the clauses may instead be restated in an equivalent form — the same constraint set per type parameter, compared **order-insensitively and after type-alias resolution** ([§27.8](#sec-type-aliases)): `where T: IFoo` and `where T: AliasOfIFoo` restate the same set — for readability. A **differing** clause — added, removed, narrowed, or widened relative to the inherited set — is a compile error naming the inherited constraints: dispatch flows through the base or interface signature, so its constraints are the only ones call sites are ever checked against — an *added* constraint on the override would go unenforced at every virtual call (unsound), and a *weakened* one would advertise admissions the dispatch surface never grants.
 
 <a id="sec-generics-variance"></a>
 ### 14.3 Variance
@@ -2298,7 +2331,7 @@ Heap arrays expose `.Count`. A heap array used in fixed-size discipline still ha
 <a id="sec-slicing"></a>
 ### 15.6 Slicing
 
-Range slicing `arr[a..b]`, `arr[..b]`, `arr[a..]`, `arr[..]` is supported on `Array<T>`. Slicing produces a new `Array<T>` containing copies of the references (or values) in the range; mutating the slice does not affect the original.
+Range slicing `arr[a..b]`, `arr[..b]`, `arr[a..]`, `arr[..]` is supported on `Array<T>`. Slicing produces a new `Array<T>` containing copies of the references (or values) in the range; mutating the slice does not affect the original. The produced array is **owned** by the caller (v0.182 — previously unstated; the slice is a fresh container, exactly like `ToArray()`, and stdlib §4.4 documents the form as the compiler-recognized equivalent of `Slice(r: Range<int>): owned Array<T>`): the standard discharge rules of [§28.3](#sec-local-variables-ownership-and-borrows) apply — bind it, transfer it, or let an unbound slice temporary be disposed at the end of the full expression. Element ownership is untouched: for class-typed `T` the fresh array holds copies of the element *borrows*, so disposing the slice never disposes elements.
 
 Out-of-bounds endpoints raise `IndexOutOfRangeException`. An empty range produces an empty array.
 
@@ -2395,7 +2428,7 @@ Surrogate code points themselves cannot be written as `char` literals — `'\uD8
 
 `IsOpenEnded` is `true` when `Start` is `null` or `End` is `null`.
 
-`IsEmpty` is `true` when **iteration of the range yields no values** (the lower bound exceeds the upper bound in the direction of iteration, or both endpoints are present and equal with an exclusive upper bound). `IsEmpty` and `Contains` agree (v0.162): an empty range contains nothing.
+`IsEmpty` is `true` when **iteration of the range yields no values** (the lower bound exceeds the upper bound in the direction of iteration, or both endpoints are present and equal with an exclusive upper bound). An **open-ended** range is never empty: `IsEmpty` is `false` whenever `Start` or `End` is `null` (v0.182 — emptiness is a property of the range's extent, and a missing endpoint imposes no bound, as the membership formula below already states; that open-ended ranges are not *iterable* is a separate fact). A runtime **step of zero** — admitted at construction, [§16.4](#sec-stride) — is direction-agreeing for `IsEmpty` and `Contains` (v0.182): it neither empties a range nor affects membership (`(0..10 step z)` with `z = 0` is nonempty and contains `3`), while `GetEnumerator()` on it raises `ArgumentException` ([§16.4](#sec-stride)). `IsEmpty` and `Contains` agree (v0.162): an empty range contains nothing.
 
 <a id="sec-range-operations"></a>
 
@@ -2419,7 +2452,7 @@ Rules:
 
 - Step's sign must agree with the range's direction. A range whose direction disagrees with its step's sign produces an empty iteration.
 - When the compiler can prove at compile time that a range's direction and step sign disagree (both endpoints and step are constants or constant after folding), it emits a warning: *"this range produces an empty iteration."* The warning is not produced for runtime-computed steps, where sign mismatches may be intentional.
-- A literal step of zero is a compile error; a computed step of zero is a runtime error (`ArgumentException`).
+- A literal step of zero is a compile error; a computed step of zero is admitted at construction and raises `ArgumentException` **at `GetEnumerator()`** (v0.182 — iteration is the operation a step parameterizes; `Contains` and `IsEmpty` on such a range are defined and treat the zero step as direction-agreeing, [§16.3](#sec-the-ranget-type)).
 - `step` may not be applied to open-ended ranges.
 - `step` is not legal in `case` patterns (patterns test the written bounds; stride has no meaning).
 
@@ -2505,7 +2538,7 @@ Operators are evaluated according to the following table, from highest to lowest
 | 12 | Null-coalescing | `??` | right-to-left |
 | 13 | Logical AND | `and` | left-to-right |
 | 14 | Logical OR | `or` | left-to-right |
-| 15 | Conditional | `expr if cond else expr`, `case ... end`, `throw expr` | right-to-left |
+| 15 | Conditional | `expr if cond else expr`, `throw expr` | right-to-left |
 | 16 | Assignment | `:=` `+=` `-=` `*=` `/=` `&=` `\|=` `^=` `<<=` `>>=` `??=` | right-to-left |
 
 <a id="sec-notes-on-operators"></a>
@@ -2514,7 +2547,7 @@ Operators are evaluated according to the following table, from highest to lowest
 - `and` and `or` short-circuit: the right operand is not evaluated if the result is determined by the left.
 - `??` is right-associative: `a ?? b ?? c` means `a ?? (b ?? c)`. `??` binds tighter than `and`/`or`, so `a ?? b or c` parses as `(a ?? b) or c`.
 - `?.`, `?(...)`, and `!` (postfix) are primary-level. They bind as tightly as `.` and `[ ]`.
-- `case ... end` and `throw expr` are listed at level 15 nominally; both are self-delimited (`case` by `end`, `throw` by being a transfer of control), so their precedence is rarely visible to readers.
+- `case … end` and `when … end` do not appear in the table (v0.182 — through v0.181 `case` was listed at level 15 nominally): they are self-delimited and parse as **primary atoms** (grammar A.7 `PrimaryAtom`), composable in any operand position without parentheses; the level-15 listing misstated the real grammar. `throw expr` genuinely belongs at level 15: its operand is a full `Expression`, so it extends maximally to the right — note that the conditional's *true* branch parses at a higher level and derives no bare `throw` ([§20](#sec-the-if-expression)).
 - Assignments and compound assignments are statements, not expressions; they produce no value.
 - `++` and `--` are statement-only ([§17.6](#sec-the-increment-and-decrement-operators)) and do not appear in the precedence table. They are not expression operators; they cannot be combined with other operators.
 - `mod` has no compound-assignment form; `mod=` is not valid syntax. The rare uses where it would apply (`x := x mod c`) are written explicitly by design — `mod` is uncommon in compound forms.
@@ -2788,7 +2821,7 @@ In a generic body:
 
 `throw` is an expression. Its operand is optional:
 
-- `throw expr` raises the supplied exception. Valid in any expression position.
+- `throw expr` raises the supplied exception — an owned instance of a class type (any class, not only `Exception`-derived; the operand rule is [§31.1](#sec-throwing)'s). Valid in any expression position.
 - `throw` (no operand) re-raises the currently-handled exception with its stack trace preserved. Valid only as an expression appearing inside a catch arm body ([§31.2.4](#sec-bare-re-raise)).
 
 Both forms have the bottom type — assignable to any expected type — because control transfers to the matching handler before any value is produced.
@@ -3170,6 +3203,8 @@ Because the alternative separator no longer collides with the slot separator, al
 
 **Type patterns with binding:** `var n: int`, `var d: Dog`. The bound name is in scope in that arm's `when` guard and body (matching the `catch`-arm rule, [§31.2](#sec-try-catch-finally)).
 
+**Type parameters as pattern types (v0.182):** in a generic body, a type parameter may be used as a pattern type — `var x: T` and bare `T` test against the **substituted** type argument, per instantiation, the same rule as catch arms ([§31.2.1](#sec-arm-patterns)); all type-pattern rules then apply to the substituted type, including the null rule ([§19.5](#sec-type-pattern-matching-never-matches-null)).
+
 **Record destructuring:** `Point(x, y)`, `MyRecord(a, b, c)`. The type name followed by parenthesized bindings matches the type and binds positional fields by position. The number of bindings must match the record's positional-field count. Individual positions may be discarded with `_`: `Point(_, y)`. Destructuring patterns compose with `when` guards and with subtype matching.
 
 Destructuring applies to records only — the positional binding is over a record's positional fields ([§9.1](#sec-positional-records)). Classes do not have a positional-destructuring surface, even when they declare a primary constructor ([§22.10](#sec-methods-and-constructors-primary-constructors)): primary-constructor parameters are not auto-promoted to public properties, and the positional shape is not part of the class's pattern-match surface. To match a class hierarchy, use a type-test pattern (`Dog`, `var d: Dog`) and access fields through the bound name. The [§19.6](#sec-exhaustiveness) exhaustive-match example over a `sealed abstract` class hierarchy uses this form.
@@ -3215,10 +3250,13 @@ A `when` construct is governed by the same no-match rule, but having no scrutine
 
 The compiler proves exhaustiveness statically in the following cases:
 
-- **Enum scrutinee:** every declared constant has a matching pattern (literal pattern, `var` binding, or `_`).
+- **Any scrutinee — irrefutable arm (v0.182; previously omitted though trivially total):** some arm is irrefutable — an unguarded `_`, or an unguarded untyped `var x` pattern (which binds any value, including `null`, [§19.5](#sec-type-pattern-matching-never-matches-null)).
+- **Enum scrutinee:** every declared constant has a matching pattern — a constant pattern naming it directly or as a member of a `|` alternative list (v0.182 wording fix: these are *constant* patterns, [§19.3](#sec-patterns), not literals), a `var` binding, or `_`. Coverage is by **value**: under duplicate constant values ([§10.2](#sec-explicit-values)), an arm naming either alias covers both.
 - **Bool scrutinee:** both `true` and `false` are covered.
 - **Sealed class hierarchy scrutinee:** when the scrutinee's static type is a `sealed abstract` class, or an `abstract` class whose only direct subclasses are themselves `sealed` or recursively form a closed set, and every leaf type in the closed hierarchy is matched by a type pattern (with or without binding), no `_` arm is required. The leaves may be matched in any order; the analysis is purely on type coverage. Class leaves are matched by type-test patterns (`var c: Circle => ...`); positional destructuring ([§19.3](#sec-patterns)) applies to record leaves, not to class leaves. A `sealed abstract` class ([§11.7](#sec-static-classes)) provides the strongest guarantee: no subclass outside the declaring module can exist, so exhaustiveness holds across module boundaries.
 - **Nullable scrutinee:** under the rules above plus an explicit `null` pattern.
+
+An arm carrying a `when` guard contributes **nothing** to static exhaustiveness (v0.182 — previously unstated; the compiler does not evaluate guards): the analysis considers only unguarded patterns. A match whose every arm is guarded is therefore never statically exhaustive — in expression position it draws the warning and raises `MatchFailureException` if every guard declines at run time.
 
 ```bezel
 public sealed abstract class Shape ... end Shape;
@@ -3296,6 +3334,8 @@ var grade := "A" if score >= 90 else
 For more than two or three branches, `case` is preferred.
 
 Precedence is level 15 ([§17.1](#sec-precedence)): `a ?? b if c else d` parses as `(a ?? b) if c else d`. When an `if` expression appears inside another expression with potentially-confusing grouping, parenthesize.
+
+One parse is subtle enough to state (v0.182): the rule above that a `throw` branch is bottom-typed and imposes no constraint reaches the **`else`** branch directly — `v if c else throw e` parses as intended, the `else` position deriving a full expression — but the *true*-branch position derives no bare `throw`: `throw a if c else b` parses as `throw (a if c else b)`, because `throw`'s operand is a full expression ([§17.12](#sec-the-throw-expression), grammar A.7). A conditional that throws on the true branch parenthesizes — `(throw e) if c else v` — or, usually clearer, inverts the condition.
 
 ---
 
@@ -3379,6 +3419,8 @@ For async iteration, see `await for` ([§30.7](#sec-asynchronous-programming-asy
 ### 21.5 `break` and `continue`
 
 `break` exits the immediately enclosing loop. `continue` skips the rest of the current iteration and advances to the next. Neither is legal outside a loop; doing so is a compile error.
+
+Neither may exit a `finally` block (v0.182): inside a `finally`, a `break` or `continue` whose target loop lies **outside** the `finally` is a compile error — the same rule as `return` in a `finally` ([§21.7](#sec-the-return-statement), [§31.2](#sec-try-catch-finally)). When the `finally` runs during exception propagation, such a jump would abandon the in-flight exception silently. Loops wholly inside the `finally` use `break`/`continue` normally.
 
 There are no labeled loops and no labeled `break`/`continue`. For multi-level exits, extract into a method and use `return`, or use a boolean flag.
 
@@ -5116,6 +5158,7 @@ The ownership state of an expression is determined by the expression form:
 | `move obj.f` where `f` is `owned` | Owned. Field is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression)). |
 | Field access `obj.f` where `f` is not `owned` | Borrowed (source: `obj`) |
 | Indexer access `coll[i]` | Borrowed (v0.180 — qualified by family, reconciling [§28.11](#sec-element-slot-policy)). Owning-family collection: source is `coll`, and the borrow is additionally valid only until the slot is mutated (an indexer-set, `Remove*`, or `Clear` disposes the referent — a mid-scope value kill not statically tracked per slot; checked-mode backstop, [§28.2](#sec-checked-disposal), stdlib §4.5). Borrowing-family collection: the true source is the element's original owner ([§28.11](#sec-element-slot-policy) — the collection is a transit point); the compiler cannot identify that owner structurally and enforces the collection binding as the proxy bound, the owner-outlives-use residual being the same trust regime as field-held borrows. |
+| Range slice `arr[r]` on `Array<T>` ([§15.6](#sec-slicing)) | Owned — a fresh `Array<T>`, the compiler-recognized `Slice(r: Range<int>): owned Array<T>` form (stdlib §4.4); **not** the indexer row above (v0.182). The container is owned by the caller and discharged under the standard rules; class-typed elements are borrows copied as borrows, their sources unchanged. |
 | Property access `obj.P` (instance getter) | Borrowed (source: `obj`). Getters are borrow-producing positions — a getter may not return a fresh owned value ([§28.6](#sec-leak-prevention)). |
 | Static property access `T.P` (class-typed result) | Borrowed (source: the declaring type's static storage — process-lived, so every intra-program liveness constraint is satisfied; static state is disposed only at program exit, [§22.13](#sec-static-initialization-order)). (v0.180) |
 | `move coll[i]` where `coll` is an owning collection that admits slot-move (heap: `OwningArray<T>`, `OwningDictionary<K, V>`, `OwningBuffer<T>` for class-typed T, or a `Span<T>` view into a class-typed `OwningBuffer<T>`; inline: `[N owned]T?`, `[N owned]T`) | Owned. Slot is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)). For `OwningBuffer<T>` / `Span<T>` with value-typed T, `move coll[i]` is not admitted (values have no ownership to transfer). `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan`, and `ReadOnlyAsciiByteSpan` do not admit `move` for any T (`ReadOnlySpan<T>` and the string-backed forms have no writable indexer; the `Array<T>`-backed spans have borrowed slots with no ownership to transfer). |
@@ -5243,7 +5286,7 @@ A user who wants to perform additional cleanup on the exception path (logging th
 <a id="sec-unbound-owned-temporaries"></a>
 #### Unbound owned temporaries
 
-The discharge requirement above governs *named* owned values — locals, fields, and parameters. An owned value may also be produced as an **unbound temporary**: the result of an `owned`-returning call (or other owned producer) that is not bound to any name, not `move`d, and not returned, but used only by *borrowing* operations within the expression — as the receiver of a further call, as a non-`owned` argument, or as a member or index access. Such a temporary is disposed at the **end of the full expression** in which it is produced, after every use of it within that expression has completed.
+The discharge requirement above governs *named* owned values — locals, fields, and parameters. An owned value may also be produced as an **unbound temporary**: the result of an `owned`-returning call (or other owned producer) that is not bound to any name, not `move`d, and not returned, but used only by *borrowing* operations within the expression — as the receiver of a further call, as a non-`owned` argument, or as a member or index access. Such a temporary is disposed at the **end of the full expression** in which it is produced, after every use of it within that expression has completed. The borrowing uses include (v0.182) serving as the operand of a Pattern A `await` or `.Result` read whose borrowed result is itself confined to the same full expression ([§30.5](#sec-result-lifetime-and-task-disposal), [§30.3](#sec-the-task-taskt-and-ownedtaskt-types)) — for such an operand the disposal is deferred to the end of the full expression rather than performed at the await, so the borrowed result outlives its uses.
 
 This is the unnamed-temporary counterpart of the discard contract ([§17.13](#sec-the-discard-_)) and the discharge requirement above: a *named* owned value must reach an owned slot, a `using var`, or an explicit `Dispose()`; an *unnamed* owned temporary — which none of those forms can name — is reclaimed automatically once the expression that produced it is finished with it. A temporary that is instead bound (to a `var`/`using var`), `move`d, returned, or transferred into an owning location is governed by the corresponding transfer or discharge rule and is **not** disposed under this rule (it would otherwise be disposed twice).
 
@@ -5758,7 +5801,7 @@ public method ProcessFile(filename: string)
 end ProcessFile;
 ```
 
-Disposal happens on every exit path: normal completion, `break`, `return`, or exception.
+Disposal happens on every exit path: normal completion, `break`, `return`, or exception. **Cleanup ordering is uniform across exit edges (v0.182, stated for the record):** `using var` compiles to `try`/`finally` ([§29.6](#sec-restrictions-inside-try-catch-finally)), so `using var` disposals and explicit `finally` clauses form one establishment-ordered stack — on *every* exit edge (normal, `return`, `break`/`continue`, exception, and an iterator's early disposal, [§29.7](#sec-disposal-of-partially-consumed-iterators)), pending cleanups run in reverse order of establishment. No edge runs the two kinds in separate category-ordered phases.
 
 `using var` is implicitly non-reassignable. Reassigning a `using var` variable is a compile error. To use a different resource later in the method, introduce a new `do ... end` block.
 
@@ -6314,8 +6357,7 @@ A method that uses `yield` cannot use plain `return`, including `return;`. Use `
 
 When a consumer stops iterating early — `break`, exception, or `using var` ending before exhaustion — the iterator is disposed. The state machine:
 
-- Calls `Dispose()` on every `using var` — and, via [§28.12](#sec-asynchronous-disposal)'s synchronous-fallback path, on every `await using var` (v0.179, #1351) — active at the point of suspension.
-- Runs `finally` clauses active at the point of suspension.
+- Runs the pending cleanup actions active at the point of suspension — `using var` disposals (including, via [§28.12](#sec-asynchronous-disposal)'s synchronous-fallback path, `await using var` disposals — v0.179, #1351) and `finally` clauses — **in reverse order of establishment, exactly as if the body had exited at the suspension point** (v0.182). This is the single reverse-nesting rule that already governs every other exit edge ([§28.10](#sec-using-var), [§29.6](#sec-restrictions-inside-try-catch-finally)'s `using var` ≡ `try`/`finally` equivalence): an inner `finally` established after an outer `using var` runs *before* that `using var`'s disposal, and vice versa. (Earlier revisions' two-bullet phrasing here read as "all `using var` disposals, then all `finally` clauses" — a category-ordered pass that was never the intent and, for a `finally` that touches a `using var` resource established after it, would be a use-after-dispose.)
 - Transitions to a completed state; subsequent `MoveNext()` returns `false`; second `Dispose()` is a no-op.
 
 <a id="sec-iterators-with-owned-parameters"></a>
@@ -6390,7 +6432,9 @@ Inside a callee, a plain `IEnumerable<T>` parameter is **statically untracked** 
 <a id="sec-concurrent-modification"></a>
 ### 29.12 Mutation during iteration
 
-Modifying a collection while iterating it invalidates the active enumerator. Standard collections detect this and throw `InvalidOperationException` on the next `MoveNext()`.
+Modifying a collection while iterating it invalidates the active enumerator. Standard collections detect this and throw `InvalidOperationException` on the next `MoveNext()` (or `MoveNextAsync()`).
+
+**What counts as modification (v0.182 — previously undefined).** *Structural* modification invalidates: any operation that adds, removes, or repositions entries or reallocates storage — `Add`, `AddRange`, `Insert`, `Remove`, `RemoveAt`, `Clear`, `Push`/`Pop`, `Enqueue`/`Dequeue`, a dictionary indexer-set that *inserts* a new key, and the in-place `Sort()`/`Reverse()` (they reposition), together with their owning-collection counterparts. An **element-level write that changes no structure** does not invalidate: assigning through the indexer to an existing position (`arr[i] := v`; `dict[existingKey] := v` updating a present key) leaves the enumerator valid, and a later visit of that position observes the new value — for an owning collection such a set still disposes the displaced element per [§28.11](#sec-element-slot-policy), which invalidates *borrows of that element*, not the enumerator. The [§29.2](#sec-desugaring-of-for) protocol-elision optimization must preserve these faults: a `for` loop the compiler lowers to direct indexing still raises `InvalidOperationException` at the iteration boundary following a structural modification, exactly as the enumerator path would.
 
 The standard pattern for removing during iteration:
 
@@ -6512,7 +6556,7 @@ end OwningTask;
 
 **Inside a domain continuation — equivalently, anywhere `await` is available or the caller was reached from one — a blocking wait on an incomplete task is an error (v0.162).** A domain executes its continuations serially to completion ([§30.13](#sec-runtime-model)); a continuation blocked in `Wait()`/`Result` freezes its domain, and any awaited chain whose completion routes through that domain can never finish: a deterministic deadlock, not a hazard. The compiler rejects `Wait()` and `Result` lexically inside `async` methods and `async` lambdas (there, `await` is strictly superior and always available). Where static rejection cannot see the call (a non-`async` helper invoked from a continuation), the runtime raises `InvalidOperationException` at the call site instead of parking: *"blocking wait inside a domain continuation; the domain can never advance — await the task, or query IsCompleted."* Reading `Result` on a **completed** task is always legal and non-blocking: on a faulted task it re-raises the exception; on a cancelled task it raises `OperationCanceledException`.
 
-Reading `Result` on a completed `Task<T>` whose `T` is a **class** type (Pattern A) is additionally subject to the same *syntactically-visible owning location* rule as `await` ([§30.5](#sec-result-lifetime-and-task-disposal) consumer-side rules, v0.179): the task expression must occupy an admitted owning position, and the read produces a **borrow whose source is that location**. `SomeProducer().Result` and other sourceless forms are a compile error, exactly as the corresponding `await` is.
+Reading `Result` on a completed `Task<T>` whose `T` is a **class** type (Pattern A) is additionally subject to the same owning-source rule as `await` ([§30.5](#sec-result-lifetime-and-task-disposal) consumer-side rules, v0.179; unified with [§28.3](#sec-unbound-owned-temporaries)'s temporary machinery in v0.182): the read produces a **borrow whose source is the task expression's location** — a named owning position bounds the borrow by that location's lifetime, and an unbound owned temporary (`SomeProducer().Result`) is admitted when the borrow is confined to the same full expression, the temporary being disposed at the expression's end exactly as for the corresponding `await`. A form whose borrow escapes a temporary read's full expression remains a compile error, exactly as the corresponding `await` is.
 
 `OwningTask<T>` exposes `Result` (v0.162, #1379): reading it on a **completed** task in an owned-consuming position transfers ownership of the result to the reader exactly as `await` does — the result buffer is consumed, and a second read or `await` raises `InvalidOperationException`. The same blocking-wait rules as `Task<T>.Result` apply (legal on an incomplete task only outside a domain). Awaiting an `OwningTask<T>` in an owned-consuming position remains the normal way to obtain the result (see [§30.5](#sec-result-lifetime-and-task-disposal) Pattern B).
 
@@ -6556,9 +6600,9 @@ var s := await FetchStringAsync(url);    // result is string
 
 For these forms, the awaited task expression may be a bare producer call (as above); the await operator is **owned-consuming with respect to its operand** when the operand is an **unbound owned temporary** ([§28.3](#sec-unbound-owned-temporaries)) — a bare producer call or other unnamed owned task expression. The implicit task-disposal performed by the runtime as part of the await satisfies the discharge requirement on the temporary — the user does not write a separate `using var` for the task. A **named** operand — a `using var` or plain owned local, an `owned` parameter, an `owned` field — is **borrow-awaited** (v0.179, clarifying the v0.162 wording): the await neither consumes nor disposes it, multiple awaits are permitted per [§30.4](#sec-multiple-awaiters), and an owned local operand keeps its ordinary [§28.3](#sec-local-variables-ownership-and-borrows) discharge (auto-drop at scope end). Named-operand consumption is the **Pattern B (`OwningTask<T>`) rule only** (below); it does not apply to `Task`/`Task<T>`.
 
-**`Task<T>` for class T (Pattern A):** the awaited task expression must have a *syntactically-visible owning location* whose lifetime the compiler can bound, so that the borrow produced by the await has a determinable lifetime. The general rule:
+**`Task<T>` for class T (Pattern A):** the borrow produced by the await must have a source whose lifetime the compiler can bound. That source is the awaited task expression's **own location** (v0.182, unifying the admission with [§28.3](#sec-local-variables-ownership-and-borrows)'s ordinary borrow machinery — a named location bounds the borrow by its scope; an unbound temporary bounds it by the full expression). The general rule:
 
-> The awaited task expression must be either (a) a *reference to* an owning location whose lifetime is visible at the await site (such locations include using-var-bound locals, owned parameters, owned fields of `this`, and owned-element collection slots), or (b) a producer call whose result is itself directly consumed by a Pattern A return in the enclosing async method. In all other positions — bare producer calls in argument, var-binding, or expression positions — the borrowed result would have no syntactically-visible source, and the await is a compile error.
+> The awaited task expression is one of: (a) a *reference to* a named owning location whose lifetime is visible at the await site (using-var-bound locals, owned parameters, owned fields of `this`, owned-element collection slots) — the borrow is valid within that location's lifetime; (b) an **unbound owned temporary** ([§28.3](#sec-unbound-owned-temporaries)) — a bare producer call or other unnamed owned task expression — *provided the borrowed result is used only within the same full expression*: the temporary is then disposed at the end of the full expression, after every use of the borrow, exactly like any other unbound owned temporary, and disposing the task disposes the borrowed result with it (v0.182; through v0.181 this form was rejected outright — the same naming-a-value-changes-legality asymmetry rationale §5.23 removed for owned locals in v0.150); or (c) a producer call whose result is directly consumed by a Pattern A return in the enclosing async method (the chained slot, above — a task *move*, not a borrow escape). A borrow that would **escape** the full expression of an unbound-temporary await — a `var` binding, a store, a non-chained return — has no source that survives the expression, and the await is a compile error; bind the task to a `using var` first.
 
 The principle resolves into the following examples of admitted task-expression positions; the list is not exhaustive but illustrates the rule:
 
@@ -6569,7 +6613,7 @@ The principle resolves into the following examples of admitted task-expression p
 - **An iteration variable** in `for var task in tasks do ... end` where `tasks` is `Array<Task<T>>` or `OwningArray<Task<T>>` (borrowing iteration, not Drain). Each `task` is a borrow whose source is `tasks`; the await within the loop body produces a borrow valid for the loop body.
 - **A producer call directly inside `return` of an async method whose return type is `Task<U>` for class U** (Pattern A) — i.e., `return await Producer();`. The producer's task is owned by the enclosing state machine; the borrow flows into the outer Pattern A task's result slot, whose lifetime is bounded by the outer task.
 
-The principle the list illustrates: any expression that produces an owned-task value (whether obtained directly or by borrowing into an owning slot) has a source the compiler can name. The principle also rejects: bare producer calls in argument or other expression positions, e.g. `Process(await Producer())` or `var x := await Producer();` without binding the task first. The borrowed result of these forms would have no syntactically-visible source whose lifetime the compiler can bound. The fix is to bind the producer's result to a `using var` first:
+The principle the list illustrates: the borrow's source is the awaited expression's location — named location ⇒ its scope; unbound temporary ⇒ the full expression. `Process(await Producer())` is therefore **admitted** (v0.182): the producer's task is an unbound owned temporary, its borrowed result is consumed by `Process` within the same full expression, and the task — and with it the result — is disposed at the end of the statement ([§28.3](#sec-unbound-owned-temporaries)); the disposal runs after the borrowing use, so the result is live for the call, exactly as in the `Folded(src).Sorted()` example there. What the principle rejects is a borrow that **outlives** an unbound temporary: `var x := await Producer();` binds the borrow to a local that survives the expression while the task that sources it dies with the expression. The fix is to bind the producer's result to a `using var` first:
 
 ```bezel
 using var task := Producer();
@@ -7196,6 +7240,13 @@ throw;          // re-throw the current exception (in a catch arm body only)
 
 The first form constructs and raises an exception. The second form preserves the original stack trace. The bare re-throw is also available as an expression — `throw` without the trailing semicolon — which composes naturally with arm bodies; see [§31.2.4](#sec-bare-re-raise) and [§17.12](#sec-the-throw-expression).
 
+<a id="sec-the-throw-operand"></a>
+#### The throw operand
+
+`throw expr` requires `expr` to be an **owned instance of a class type** — any class, deliberately *not* restricted to `Exception`-derived classes (v0.182, codifying the #771 ruling the compiler has enforced since then: Bezel allows throwing any class, caught by its own type or a base type). The operand's static type must be a class type; values of primitive, `string`, record, enum, inline-array, unit, or function type cannot be thrown — a compile error at the throw site — and an `Object`- or interface-typed operand is likewise rejected (its referent may be a boxed value, which is not throwable; narrow to the class first). The operand is consumed as an owned value under the ownership rules below, so a *borrowed* class reference is not a valid operand: to re-raise the exception being handled, use the bare re-raise ([§31.2.4](#sec-bare-re-raise)); to propagate a caught exception's information, chain a fresh instance through the snapshot constructor ([§31.4](#sec-standard-exception-types)). The consume composes with [§28.3](#sec-consume-site-freeze)'s recorded boundary on the **announced** side (v0.182, reason recorded): `throw x` is a source-visible kill — the keyword is itself the announcement, so no call-site `owned` marker is required, the same no-marker logic as an `owned` return — and the runtime's dispose-after-arm sets the disposed flag, so a borrow surviving the handler faults deterministically as `DisposedAccessException` in checked disposal mode ([§28.2](#sec-checked-disposal)); `throw` therefore deliberately joins no silent-kill freeze list — it has exactly the runtime backstop whose absence forced the freeze for transfers.
+
+Catch dispatch is purely by type ([§31.2.1](#sec-arm-patterns)): a thrown class that does not derive from `Exception` is caught by an arm naming its type or a base of its type, and propagates past a bare `Exception` arm ([§31.2.3](#sec-catch-ordering-and-exhaustiveness)). *(The `Exception` surface — `Message`, `StackTrace`, `CauseChain` ([§31.4](#sec-standard-exception-types)) — and the unhandled-exception report are defined for `Exception`-derived throwables; a non-`Exception` throwable participates in `try`/`catch`, disposal-after-arm, and supersession identically, but offers none of that reporting surface. Deriving from `Exception` is therefore the strongly recommended default; whether the language should eventually *require* it is flagged for owner review — see the v0.182 tracking set — and until re-ruled, #771 stands.)*
+
 <a id="sec-exception-ownership"></a>
 #### Exception ownership
 
@@ -7224,7 +7275,7 @@ The `catch` block contains comma-separated arms whose syntax mirrors `case` arms
 
 If no arm matches, the exception continues propagating to the enclosing handler — exactly as if the `try` statement had not been present for that exception. This is the behavior of an unmatched arm in statement-position pattern dispatch ([§19.6](#sec-exhaustiveness)); `catch` does not warn about non-exhaustiveness because letting non-matching exceptions propagate is the normal case.
 
-`finally` runs whether the protected block completed normally, was exited by an exception (caught or uncaught), or was exited by `return`. `return` inside a `finally` block is a compile error.
+`finally` runs whether the protected block completed normally, was exited by an exception (caught or uncaught), or was exited by `return` — or by a `break` or `continue` targeting an enclosing loop (v0.182; previously unlisted). `return` inside a `finally` block is a compile error; so are `break` and `continue` inside a `finally` when their target loop encloses the `finally` (v0.182 — on the exception edge such a jump would silently discard the in-flight exception; a loop wholly inside the `finally` is unaffected, [§21.5](#sec-break-and-continue)).
 
 **A throw escaping a `finally` supersedes the in-flight exception (v0.162 — the rule §31.2.1 has always cited, now stated here):** when a `finally` entered during exception propagation itself completes by throwing (directly, or via a call that propagates), the new exception replaces the one being handled; the superseded exception is **disposed by the runtime exactly once**, as if its handling had completed. The superseding exception then propagates from the `try` statement as usual.
 
@@ -7246,7 +7297,9 @@ A catch arm's pattern is one of:
 
 - A bare type: `IOException`. Matches any thrown exception that is an instance of the type, without binding.
 - A binding pattern: `var name: Type`. Matches and binds the exception to `name` for use in the arm's guard and body. The binding is in scope only within the arm.
-- A multi-type alternative, with or without binding: `Type1 | Type2 | ...` or `var name: Type1 | Type2 | ...` (the `|` alternatives spelling, v0.167 #1371 — the same separator as case-pattern alternatives). Matches if the thrown exception is an instance of any of the listed types. When binding, `name` has the static type of the **nearest common base** of the listed types (the most specific type that is a base of every listed type; `Exception` if no more specific common base exists).
+- A multi-type alternative, with or without binding: `Type1 | Type2 | ...` or `var name: Type1 | Type2 | ...` (the `|` alternatives spelling, v0.167 #1371 — the same separator as case-pattern alternatives). Matches if the thrown exception is an instance of any of the listed types. When binding, the listed types must share a common base class **more specific than `Object`** (v0.182 — with [§31.1](#sec-throwing) admitting any-class throwables, a mixed list such as `Dog | IOException` has no common base but the universal root, and the former unconditional `Exception` fallback contradicted its own most-specific-common-base definition: it would have typed a caught `Dog` as `Exception`; falling back to `Object` instead would bind a name with no usable surface, colliding with §31.1's rejection of `Object`-typed operands): if the listed types' nearest common base is `Object`, the *binding* form is a compile error directing to separate arms — the non-binding form `Type1 | Type2` needs no common type and is unrestricted. When the requirement is met, `name` has the static type of the **nearest common base** of the listed types (the most specific class that is a base of every listed type; for `Exception`-derived alternatives sharing nothing more specific, that is `Exception`, exactly as before — no previously-valid program changes).
+
+A **generic type parameter** is admissible as an arm's type (v0.182 — the surface previously compiled with no defined meaning): in a generic method or type, `var ex: TEx` (or bare `TEx`) matches exactly as the **substituted** type argument would — binding is fixed per instantiation, the [§11.8](#sec-static-interface-members) resolution vocabulary — so an `Assert.Throws<TEx>`-style helper matches the concrete exception type, subtypes included. The parameter must carry a **class-type bound** (`where TEx: C` for a class `C`; `where TEx: Exception` is the idiomatic form) so that every substitution is a throwable class ([§31.1](#sec-throwing)); a parameter that is unconstrained, value-constrained, or bounded only by `where TEx: class` (which admits `string` and function types) is a compile error at the arm, **checked at the generic declaration** — whether the parameter carries a class-type bound is decidable from the enclosing declaration's constraint set alone, including through `where TEx: U` chains ([§14.2](#sec-constraints)), so the arm's well-formedness never depends on an instantiation; only the *matching* is per instantiation, against the substituted type.
 
 Each pattern may be followed by an optional `when Expression` guard. The guard is evaluated only if the pattern matches; if the guard returns `false`, the arm is skipped and the next arm is considered. Inside the guard, the bound variable (if any) is in scope. The guard runs while the matched exception is in flight, but it evaluates as ordinary code — allocations, calls, and any other operations behave exactly as they would outside dispatch; the in-flight exception does not interfere with them. If the guard itself **throws**, that new exception *supersedes* the in-flight one — the superseded exception is **disposed by the runtime exactly once**, as if its handling had completed (v0.162; previously "abandoned" with the disposal unstated) — and propagates to the enclosing handler — it is not caught by a later arm of the same `try` and does not resume guard evaluation. This mirrors the rule for a `throw` in a `finally` ([§31.2](#sec-try-catch-finally)): an exception raised in a non-normal position replaces the one already propagating.
 
@@ -7282,14 +7335,14 @@ The example demonstrates: a binding arm with a guard, a no-binding arm, a multi-
 <a id="sec-catch-ordering-and-exhaustiveness"></a>
 #### 31.2.3 Catch ordering and exhaustiveness
 
-Arms are tried in order; the first match wins. The most specific exception types should appear first. A bare `Exception` arm at the end captures any exception not caught by earlier arms; this is the catch-all idiom.
+Arms are tried in order; the first match wins. The most specific exception types should appear first. A bare `Exception` arm at the end captures any thrown value whose type is or derives from `Exception` — for programs that throw only `Exception`-derived classes (the standard library and every built-in producer do), this is the catch-all idiom. A thrown class that does **not** derive from `Exception` — which [§31.1](#sec-throwing) admits — propagates past an `Exception` arm: there is no universal catch-all pattern (v0.182, correcting an overpromise); to catch a non-`Exception` class, name its type (or a base class of it) in an arm.
 
 ```bezel
 try
   DoWork();
 catch
   var ex: TimeoutException => RetryWithBackoff(ex),
-  var ex: Exception => do          // catch-all
+  var ex: Exception => do          // catch-all for Exception-derived throwables (§31.2.3)
     Log(ex);
     throw;
   end
@@ -7337,7 +7390,7 @@ end;
 <a id="sec-deliberate-suppression"></a>
 #### 31.2.5 Deliberate suppression
 
-To deliberately suppress all exceptions in a block — a pattern that should be rare and visible — use a catch-all arm whose body is the unit value `()`:
+To deliberately suppress all `Exception`-derived exceptions in a block — a pattern that should be rare and visible — use a bare-`Exception` arm whose body is the unit value `()` (a thrown non-`Exception` class propagates past it, [§31.2.3](#sec-catch-ordering-and-exhaustiveness) — there is no universal catch-all):
 
 ```bezel
 try
@@ -7418,14 +7471,14 @@ All exceptions in the list above are catchable except `StackOverflowException`. 
 
 The principle behind the built-in list: an exception is built-in iff its only producer is a built-in operation (an array or string indexer, an integer arithmetic operation, the `case` construct, an async cancellation). Exceptions whose producer requires explicit `import` live alongside their producer in the standard library and require the same import.
 
-Domain-specific exception types defined in the standard library include `KeyNotFoundException` (raised by `Dictionary<K, V>`'s indexer; in `System.Collections.Generic`), `FileNotFoundException`, `IOException`, and others. Each requires explicit `import` of its containing module.
+Domain-specific exception types defined in the standard library include `KeyNotFoundException` (raised by `Dictionary<K, V>`'s indexer; declared in `System.Collections.Generic`, stdlib §4.8), `ArgumentOutOfRangeException` (deriving from `ArgumentException`; raised by range-validating constructors such as `DateTime`'s; declared in the auto-imported `System`, stdlib §2.5 — both declarations added in v0.182, having previously been referenced without one), `FileNotFoundException`, `IOException`, and others. Outside the auto-imported `System`, each requires explicit `import` of its containing module.
 
 <a id="sec-throw-as-an-expression"></a>
 ### 31.5 `throw` as an expression
 
 `throw` may appear in any expression position. Its operand is optional:
 
-- `throw expr` — raises the supplied exception. Valid in any expression position.
+- `throw expr` — raises the supplied exception, an owned instance of a class type ([§31.1](#sec-throwing)). Valid in any expression position.
 - `throw` — bare re-raise. Valid only inside a catch arm body.
 
 Both forms have the bottom type. See [§17.12](#sec-the-throw-expression) for full semantics and [§31.2.4](#sec-bare-re-raise) for the bare re-raise's interaction with arm bodies.
@@ -8365,9 +8418,16 @@ The grammar shown here is informal: it lists the alternatives at each precedence
 ```
 Expression      ::= ConditionalExpr
 ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
-                  | CaseExpr
-                  | WhenExpr
                   | ThrowExpr
+                              /* CaseExpr and WhenExpr are PrimaryAtom forms
+                                 (self-delimited, usable in any operand
+                                 position); v0.182 removed their duplicate
+                                 listing here, which misread as a level-15
+                                 placement (§17.1). A bare ThrowExpr appears
+                                 only at top level or in the `else` branch:
+                                 the true branch is the LogicalOr prefix and
+                                 derives no ThrowExpr — `throw a if c else b`
+                                 parses as `throw (a if c else b)` (§20). */
 ThrowExpr       ::= "throw" Expression?
                               /* Bare "throw" (no operand) is valid only inside a
                                  catch arm body; outside a catch arm body, the
@@ -8787,7 +8847,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `where T: class` substitutions are non-nullable reference types: classes (including `Array<T>`, `OwningArray<T>`), interfaces, `string`, function types.
 - `where T: value` substitutions are non-nullable value types: records, enums, primitives, inline arrays (all forms, including owning `[N owned]…` forms — see [§15.3](#sec-move-only-value-types) for restrictions on copy operations in the generic body), the unit type. A nullable value type (e.g. `int?`) does not satisfy the constraint ([§14.2](#sec-constraints)).
 - `where T: SomeClass` substitutions are non-nullable subtypes of `SomeClass` — class types only (no interfaces, since interfaces do not extend classes).
-- `where T: IFoo` substitutions are non-nullable types conforming to `IFoo` per the [§14.2](#sec-constraints) conformance rule: classes implementing it (directly or by inheritance), records implementing it directly, and interfaces extending it (directly or transitively).
+- `where T: IFoo` substitutions are non-nullable types conforming to `IFoo` per the [§14.2](#sec-constraints) conformance rule: classes implementing it (directly, by inheritance, or implicitly — `IDisposable`), records and enums implementing it directly, interfaces extending it (directly or transitively), primitives with compiler-provided conformances ([§11.8](#sec-static-interface-members)), and type parameters whose constraints guarantee it (v0.182 — this bullet previously omitted the last three sources).
 - `where T: new()` substitutions are class types with a `public` parameterless constructor, or value types whose `default(T)` is well-defined; `new T()` for a value substitution is `default(T)` ([§14.2](#sec-constraints)).
 - Constraint combinations are checked for consistency (`class, value` is rejected).
 - Inside an unconstrained generic body, `T` is treated conservatively as possibly nullable.
@@ -8807,9 +8867,10 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A method using `yield return`/`yield break` does not also use plain `return`.
 - `yield` does not appear in lambdas, in `try` blocks whose surrounding statement has a `catch`, or in catch arm bodies or `finally` blocks.
 - `return` does not appear in `finally` blocks.
-- `break` and `continue` appear only inside loops.
+- `break` and `continue` appear only inside loops, and never exit a `finally` block (their target loop must not enclose the `finally` — [§21.5](#sec-break-and-continue), [§31.2](#sec-try-catch-finally)).
 - `++` and `--` appear only as statements.
 - Bare `throw` (the expression form without an operand, and equivalently the statement form `throw;`) appears only inside a catch arm body.
+- The operand of `throw expr` is an owned expression of class type — any class, not only `Exception`-derived; primitive, `string`, record, enum, inline-array, unit, function-typed, `Object`-typed, and interface-typed operands are rejected, as are borrowed class references ([§31.1](#sec-throwing)).
 - A field initializer does not reference `this`, instance members, or virtual methods.
 
 <a id="sec-async"></a>
@@ -8820,7 +8881,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `await` does not appear in static field initializers or static constructor bodies.
 - `await using` appears only inside async contexts.
 - The `with` clause in `await for ... with token` must be of type `CancellationToken`.
-- Awaiting a `Task<T>` for class T (Pattern A) requires the awaited task expression to occupy one of the admitted owning locations defined in [§30.5](#sec-result-lifetime-and-task-disposal), **including**: a reference to a `using var`/`await using var`-bound local of `Task<T>`, an `owned` parameter, an `owned` field of `this`, an indexer access on an owning collection of `Task<T>`, or an iteration variable from a borrowing iteration over an array of tasks. A producer call whose result is directly consumed by a Pattern A return in the enclosing async method is also admitted. A bare `var x := await Producer();` whose `Producer()` returns `Task<T>` for class T and whose result isn't in one of the admitted positions is rejected — the borrowed result would have no source.
+- Awaiting a `Task<T>` for class T (Pattern A) requires the awaited task expression to be an **admitted borrow source** per [§30.5](#sec-result-lifetime-and-task-disposal) (v0.182): a named owning location, or an unbound owned temporary whose borrowed result is confined to the full expression. The named owning locations **include**: a reference to a `using var`/`await using var`-bound local of `Task<T>`, an `owned` parameter, an `owned` field of `this`, an indexer access on an owning collection of `Task<T>`, or an iteration variable from a borrowing iteration over an array of tasks. A producer call whose result is directly consumed by a Pattern A return in the enclosing async method is also admitted, as is (v0.182) an **unbound owned temporary** task whose borrowed result is confined to the same full expression (`Process(await Producer())`) — disposed at the expression's end per [§28.3](#sec-unbound-owned-temporaries). A bare `var x := await Producer();` whose `Producer()` returns `Task<T>` for class T remains rejected — the borrow would outlive the temporary that sources it.
 - `await` on a `OwningTask<T>` (Pattern B) must appear in an owned-consuming context — a `using var` (or `await using var`) right-hand side, an `owned` parameter argument, an `owned` return expression, or any other position the type system requires the resulting value to be discharged. The first await spends an `OwningTask<T>` regardless of outcome (v0.162). When the operand is **owned**, the await consumes it on all edges and a second await is rejected at compile time as a moved-from read ([§28.3](#sec-local-variables-ownership-and-borrows)); when the operand is **borrowed** (e.g. a `using var`-bound task), the second await cannot be statically prevented and raises `InvalidOperationException` at runtime.
 - `OwningTask<T>` is a compile error when T's underlying (nullability-stripped) type is neither a class nor an interface type ([§14.4](#sec-owned-as-a-generic-argument)). The argument-type check is performed during type checking; the diagnostic identifies the rejected argument and points at [§14.4](#sec-owned-as-a-generic-argument).
 - An `async` method, `async` lambda, or async iterator declares no borrow-bearing-record parameter, result, or element type ([§30.1](#sec-async-methods), #1438); `CancellationToken` is the single stdlib-certified exception; for generic async methods the check re-applies after substitution.
@@ -8837,6 +8898,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A type-pattern matches only non-null values; `null` matches only the `null` literal pattern, the `var` pattern, and `_`.
 - `step` is not used in patterns; it is a range modifier only.
 - A record-destructuring pattern's positional-binding count matches the record's positional-field count.
+- Static exhaustiveness counts only **unguarded** arms; a `when`-guarded arm contributes nothing to the proof ([§19.6](#sec-exhaustiveness)).
 
 <a id="sec-appendix-c-serialization"></a>
 <a id="sec-appendix-c-serialization-synthesis"></a>
