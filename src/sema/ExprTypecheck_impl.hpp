@@ -655,12 +655,19 @@ private:
 
     // `paramTypes[i]` holds candidate i's ordered parameter TypeRefs (each
     // may be null when unresolved). `argTypes` holds the call's positional
-    // argument static types (null when unresolved). Emits the ambiguous /
-    // unreachable diagnostic itself when applicable. `candNames` supplies a
-    // display string per candidate for the ambiguous-case citation.
+    // argument static types (null when unresolved). `fillsDefault[i]` is
+    // true when candidate i's §22.5 binding left one or more of its
+    // parameters to be filled by their declared defaults — used by §22.6's
+    // defaulted-arity tie-break (v0.181): a candidate applicable without
+    // filling any default is preferred over one that fills one or more,
+    // provided it is better-or-equal at every supplied-argument position.
+    // Emits the ambiguous / unreachable diagnostic itself when applicable.
+    // `candNames` supplies a display string per candidate for the
+    // ambiguous-case citation.
     OverloadResult resolveOverload(
         const std::vector<std::vector<const TypeRef*>>& paramTypes,
         const std::vector<const TypeRef*>& argTypes,
+        const std::vector<bool>& fillsDefault,
         const std::vector<std::string>& candNames, SourceLocation loc,
         const std::string& calleeDesc);
 

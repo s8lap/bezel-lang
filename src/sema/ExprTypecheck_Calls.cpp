@@ -145,6 +145,7 @@ ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
 ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<std::vector<const TypeRef*>>& paramTypes,
     const std::vector<const TypeRef*>& argTypes,
+    const std::vector<bool>& fillsDefault,
     const std::vector<std::string>& candNames, SourceLocation loc,
     const std::string& calleeDesc) {
     OverloadResult res;
@@ -232,13 +233,24 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     auto strictlyBetterAt = [](ArgMatch x, ArgMatch y) {
         return x == ArgMatch::Exact && y == ArgMatch::Convert;
     };
+    // §22.6 defaulted-arity tie-break (v0.181, #1561): when the type-based
+    // comparison above is tied (x is better-or-equal at every position but
+    // strictly better at none), a candidate applicable without filling any
+    // default (fillsDefault[x] == false) is preferred over one that fills
+    // one or more (fillsDefault[y] == true) — `M(5)` against `M(n: int)` and
+    // `M(n: int, m: int := 0)` resolves to `M(int)`. Two candidates that
+    // both fill defaults are never distinguished by this rule and remain
+    // subject to the ambiguity check below. This only breaks a type-level
+    // tie: it never overrides a case where the type ranking already favors
+    // one side (x must still be better-or-equal at every position).
     auto unambiguouslyBetter = [&](std::size_t x, std::size_t y) {
         bool anyStrict = false;
         for (std::size_t i = 0; i < nArg; ++i) {
             if (!betterOrEqualAt(grid[x][i], grid[y][i])) return false;
             if (strictlyBetterAt(grid[x][i], grid[y][i])) anyStrict = true;
         }
-        return anyStrict;
+        if (anyStrict) return true;
+        return !fillsDefault[x] && fillsDefault[y];
     };
 
     for (std::size_t cx : appl) {
@@ -263,8 +275,24 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
         msg += "\n  ";
         msg += (c < candNames.size() ? candNames[c] : std::string("(overload)"));
     }
-    msg += "\nadd an explicit cast (§5.2) so exactly one candidate is an "
-           "exact match";
+    // §22.6 defaulted-arity tie-break (v0.181, #1561): when every remaining
+    // candidate fills one or more defaults, the tie is over which omitted
+    // parameter(s) the caller meant — an explicit cast at a supplied
+    // position cannot distinguish candidates that already agree there, so
+    // the remedy is to supply the disambiguating optional argument(s)
+    // explicitly (by position or by name, §22.5) instead of casting.
+    bool allFillDefaults = !appl.empty();
+    for (std::size_t c : appl)
+        if (!fillsDefault[c]) { allFillDefaults = false; break; }
+    if (allFillDefaults) {
+        msg += "\nsupply the omitted optional argument(s) explicitly (§22.5) "
+               "so only one candidate's defaults apply — an explicit cast "
+               "cannot resolve a tie between candidates that differ only in "
+               "which defaults are filled";
+    } else {
+        msg += "\nadd an explicit cast (§5.2) so exactly one candidate is an "
+               "exact match";
+    }
     ctx_.diagnostics().report(Severity::Error, loc, msg);
     res.outcome = OverloadOutcome::Ambiguous;
     return res;
@@ -582,11 +610,17 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     std::vector<std::vector<const TypeRef*>> argTypeRows(cands.size());
     std::vector<std::vector<int>> argIdxRows(cands.size());
     std::vector<std::string> candNames(cands.size());
+    // §22.6 defaulted-arity tie-break (v0.181, #1561): does candidate c's
+    // binding leave any parameter to be filled by its declared default?
+    std::vector<bool> fillsDefault(cands.size(), false);
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const auto& params = decls[c]->params;
         for (std::size_t j = 0; j < params.size(); ++j) {
             int ai = binds[c].paramToArg[j];
-            if (ai < 0) continue;  // defaulted slot — outside ranking.
+            if (ai < 0) {
+                fillsDefault[c] = true;  // defaulted slot — outside ranking.
+                continue;
+            }
             const TypeRef* pt = params[j].type
                                     ? ctx_.resolvedType(*params[j].type)
                                     : nullptr;
@@ -618,7 +652,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     }
 
     OverloadResult r = resolveOverload(
-        paramTypes, argTypes, candNames, ce.span.begin,
+        paramTypes, argTypes, fillsDefault, candNames, ce.span.begin,
         std::string("`") + std::string(initial->name) + "`");
     switch (r.outcome) {
         case OverloadOutcome::Resolved:
@@ -6113,11 +6147,17 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         std::vector<std::vector<const TypeRef*>> argTypeRows(decls.size());
         std::vector<std::vector<int>> argIdxRows(decls.size());
         std::vector<std::string> candNames(decls.size());
+        // §22.6 defaulted-arity tie-break (v0.181, #1561): does candidate c's
+        // binding leave any parameter to be filled by its declared default?
+        std::vector<bool> fillsDefault(decls.size(), false);
         for (std::size_t c = 0; c < decls.size(); ++c) {
             const auto& params = decls[c]->params;
             for (std::size_t j = 0; j < params.size(); ++j) {
                 int ai = binds[c].paramToArg[j];
-                if (ai < 0) continue;
+                if (ai < 0) {
+                    fillsDefault[c] = true;
+                    continue;
+                }
                 paramTypes[c].push_back(
                     params[j].type ? ctx_.resolvedType(*params[j].type)
                                    : nullptr);
@@ -6144,7 +6184,8 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // winner needs no further per-argument check (each arg is already
         // exact or §5.1-convertible). On Undecidable we defer (no check),
         // matching the prior "overloaded → skip" behavior.
-        resolveOverload(paramTypes, argTypes, candNames, ne.span.begin,
+        resolveOverload(paramTypes, argTypes, fillsDefault, candNames,
+                        ne.span.begin,
                         std::string("`new ") + std::string(t->name) + "`");
         return;
     }

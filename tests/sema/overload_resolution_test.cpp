@@ -232,3 +232,66 @@ BEZEL_TEST(sema_overload_22_6, ctor_no_reachable_candidate) {
         "class C public method M(n: float) _ := new T(n); end M; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §22.6 "Defaulted-arity tie-break" (v0.181, #1561) — a candidate applicable
+// WITHOUT filling any default is preferred over one that fills one or more,
+// provided it is better-or-equal at every supplied position. `Log(int, int
+// := 0)` is placed FIRST (so a first-wins/arity fallback would pick it, and
+// pre-fix the two were simply reported ambiguous) and returns bool;
+// `Log(int)` is placed second and returns int. `this.Log(5)` binds to `var
+// x: int`, which type-checks only if the no-defaults candidate — `Log(int)`
+// per the spec's own `M(5)` example — was selected.
+BEZEL_TEST(sema_overload_22_6, defaulted_arity_no_defaults_preferred) {
+    auto r = parseSemaAll(
+        "module M; class Foo "
+        "  public method Log(n: int, m: int := 0): bool => true; "
+        "  public method Log(n: int): int => n; "
+        "  public method Use() var x: int := this.Log(5); end Use; "
+        "end Foo;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §22.6 defaulted-arity tie-break — supplying the optional argument makes
+// only the two-parameter form applicable (arity alone excludes `Log(int)`),
+// so `Log(5, 7)` is unaffected by the tie-break and still resolves cleanly
+// to the two-parameter overload.
+BEZEL_TEST(sema_overload_22_6, defaulted_arity_full_arity_call_unaffected) {
+    auto r = parseSemaAll(
+        "module M; class Foo "
+        "  public method Log(n: int): bool => true; "
+        "  public method Log(n: int, m: int := 0): int => n + m; "
+        "  public method Use() var x: int := this.Log(5, 7); end Use; "
+        "end Foo;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §22.6 defaulted-arity tie-break — "two candidates that both fill defaults
+// remain subject to the ambiguity rule (the compiler declines to guess
+// which omission the caller meant)". `Log(a: int, b: int := 0)` and
+// `Log(a: int, c: string := "x")` both bind only `a` for `Log(5)`, so both
+// fill a default — the tie-break (which requires one side to fill NO
+// defaults) does not apply, and the call stays ambiguous.
+BEZEL_TEST(sema_overload_22_6, defaulted_arity_both_fill_defaults_still_ambiguous) {
+    auto r = parseSemaAll(
+        "module M; class Foo "
+        "  public method Log(a: int, b: int := 0): int => a + b; "
+        "  public method Log(a: int, c: string := \"x\"): int => a; "
+        "  public method Use() _ := this.Log(5); end Use; "
+        "end Foo;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §22.6 / §22.7 — the defaulted-arity tie-break applies identically to
+// constructor overload sets. `new T(5)` resolves to the no-defaults
+// `T(int)` constructor rather than being reported ambiguous against
+// `T(int, int := 0)`.
+BEZEL_TEST(sema_overload_22_6, ctor_defaulted_arity_no_defaults_preferred) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T "
+        "  public constructor(a: int, b: int := 0) end constructor; "
+        "  public constructor(a: int) end constructor; "
+        "end T; "
+        "class C public method M() _ := new T(5); end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
