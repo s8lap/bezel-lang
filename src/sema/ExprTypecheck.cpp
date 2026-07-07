@@ -2895,6 +2895,38 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     "`operator " + std::string(od->opToken) + "` (§26.3)");
                 continue;
             }
+            // §26.3 (v0.183, #1581): an extension block may not declare a
+            // `static` member. An extension block adds receiver-directed
+            // members only; statics resolve against the extended type's own
+            // declarations (§22.12), and admitting extension statics would
+            // need its own resolution/merging/ambiguity story for no
+            // recorded need. Write a module-level method or a static class
+            // instead.
+            {
+                const std::vector<std::string_view>* mods = nullptr;
+                SourceLocation loc{};
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                    mods = &md->modifiers; loc = md->span.begin;
+                } else if (auto* pd =
+                               dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                    mods = &pd->modifiers; loc = pd->span.begin;
+                }
+                bool isStaticMember = false;
+                if (mods) {
+                    for (auto mod : *mods) {
+                        if (mod == "static") { isStaticMember = true; break; }
+                    }
+                }
+                if (isStaticMember) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "extension blocks may not declare `static` members; "
+                        "statics resolve against the extended type's own "
+                        "declarations — write a module-level method or a "
+                        "static class instead (§26.3)");
+                    continue;
+                }
+            }
             // §26.3 (#1346, v0.160): extension members must be `public` or
             // `internal`; `protected` and `private` are compile errors — an
             // extension block has no declaring class and no inheritance, so
