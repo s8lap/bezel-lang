@@ -1,5 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include <limits>
+
 // §4.4 fix #521: decimal literal compile-time parse.
 // bz_decimal_parse_cstr is compiled into the same process (the runtime is linked
 // into bezel_tests and also available in the driver binary).  Calling it from the
@@ -689,29 +691,53 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             llvm::Value* xW   = x->getType() == i64()
                                                     ? x
                                                     : builder_.CreateSExt(x, i64(), "rc.xw");
+                            // §16.3 (v0.162, fix #1496): a null endpoint (flags bit
+                            // 1 = startOpen, bit 2 = endOpen) imposes NO bound on its
+                            // side. `st`/`en` hold a fake 0 sentinel on an open side
+                            // (see the RangeExpr-in-value-position lowering above),
+                            // so they must be excluded from the direction/extent
+                            // computation rather than compared as real bounds.
+                            auto* i8Ty      = llvm::Type::getInt8Ty(llvm_);
+                            llvm::Value* startOpen = builder_.CreateICmpNE(
+                                builder_.CreateAnd(flg, llvm::ConstantInt::get(i8Ty, 2)),
+                                llvm::ConstantInt::get(i8Ty, 0), "rc.sopen");
+                            llvm::Value* endOpen = builder_.CreateICmpNE(
+                                builder_.CreateAnd(flg, llvm::ConstantInt::get(i8Ty, 4)),
+                                llvm::ConstantInt::get(i8Ty, 0), "rc.eopen");
+                            llvm::Value* closedR = builder_.CreateAnd(
+                                builder_.CreateNot(startOpen),
+                                builder_.CreateNot(endOpen), "rc.closed");
                             llvm::Value* asc  = builder_.CreateICmpSLE(st, en, "rc.asc");
-                            llvm::Value* lo   = builder_.CreateSelect(asc, st, en, "rc.lo");
-                            llvm::Value* hi   = builder_.CreateSelect(asc, en, st, "rc.hi");
+                            llvm::Value* loClosed = builder_.CreateSelect(asc, st, en, "rc.loc");
+                            llvm::Value* hiClosed = builder_.CreateSelect(asc, en, st, "rc.hic");
+                            llvm::Value* negInf =
+                                builder_.getInt64(std::numeric_limits<int64_t>::min());
+                            llvm::Value* posInf =
+                                builder_.getInt64(std::numeric_limits<int64_t>::max());
+                            llvm::Value* lo = builder_.CreateSelect(
+                                startOpen, negInf,
+                                builder_.CreateSelect(closedR, loClosed, st), "rc.lo");
+                            llvm::Value* hi = builder_.CreateSelect(
+                                endOpen, posInf,
+                                builder_.CreateSelect(closedR, hiClosed, en), "rc.hi");
                             llvm::Value* ge   = builder_.CreateICmpSGE(xW, lo, "rc.ge");
                             llvm::Value* le   = builder_.CreateICmpSLE(xW, hi, "rc.le");
                             llvm::Value* inR  = builder_.CreateAnd(ge, le, "rc.in");
                             llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "rc.incl");
                             llvm::Value* notEnd =
                                 builder_.CreateICmpNE(xW, en, "rc.notEnd");
-                            // half-open (!incl) excludes the End point.
-                            llvm::Value* endOk =
-                                builder_.CreateOr(incl, notEnd, "rc.endOk");
+                            // half-open (!incl) excludes the End point — only when
+                            // End is actually present; an open End has no endpoint
+                            // to exclude.
+                            llvm::Value* endOk = builder_.CreateOr(
+                                endOpen,
+                                builder_.CreateOr(incl, notEnd), "rc.endOk");
                             // IsEmpty check (§16.3 v0.162): open-ended ranges never
                             // empty (flags bits 1/2); otherwise direction-dependent.
                             //   ascending (step >= 0): closed → st > en; half → st >= en
                             //   descending (step < 0):  closed → st < en; half → st <= en
-                            auto* i8Ty      = llvm::Type::getInt8Ty(llvm_);
-                            llvm::Value* openFlg =
-                                builder_.CreateAnd(flg,
-                                    llvm::ConstantInt::get(i8Ty, 6), "rc.oflg");
                             llvm::Value* isOE =
-                                builder_.CreateICmpNE(openFlg,
-                                    llvm::ConstantInt::get(i8Ty, 0), "rc.oe");
+                                builder_.CreateOr(startOpen, endOpen, "rc.oe");
                             llvm::Value* stepNeg =
                                 builder_.CreateICmpSLT(step,
                                     llvm::ConstantInt::get(i64(), 0), "rc.sneg");
@@ -2327,8 +2353,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         builder_.CreateSelect(incl, ascIncl, ascHalf, "r.ea");
                     llvm::Value* emptyDesc =
                         builder_.CreateSelect(incl, descIncl, descHalf, "r.ed");
-                    return builder_.CreateSelect(stepNeg, emptyDesc, emptyAsc,
-                                                 "r.empty");
+                    llvm::Value* dirEmpty = builder_.CreateSelect(
+                        stepNeg, emptyDesc, emptyAsc, "r.direm");
+                    // §16.3 (v0.162, fix #1496): an open-ended range (flags bit
+                    // 1 = startOpen, bit 2 = endOpen) is NEVER empty — a missing
+                    // endpoint imposes no bound, so the direction-based test
+                    // above (which reads a fake 0 sentinel on the open side) must
+                    // not decide emptiness for it. This mirrors the `notEmpty =
+                    // isOpenEnded || !dirEmpty` short-circuit already used by
+                    // Contains and the `in` operator lowerings.
+                    llvm::Value* openFlg = builder_.CreateAnd(
+                        flg, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 6),
+                        "r.oflg");
+                    llvm::Value* isOE = builder_.CreateICmpNE(
+                        openFlg,
+                        llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0),
+                        "r.oe");
+                    return builder_.CreateAnd(
+                        builder_.CreateNot(isOE), dirEmpty, "r.empty");
                 }
             }
         }
@@ -4821,12 +4863,14 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 notEmpty,
                 builder_.CreateAnd(inR, builder_.CreateICmpNE(x, en)), "ri.res");
         }
-        // fix #499 / §9.8: `x in r` where r is a Range-typed variable.
-        // Load the stored { i64 start, i64 end, i64 step, i8 flags } struct
-        // and compute Contains(x) per §16.3 v0.162: nonempty AND within-extent
-        // AND endOk. Step determines emptiness/direction; open-ended sides are
-        // never empty (flags bits 1/2).
-        if (bin.right && !range) {
+        // fix #499 / §9.8: `x in r` where r is a Range-typed variable, OR
+        // (fix #1496) a RangeExpr literal the closed-literal fast path above
+        // didn't handle (open-ended, or carrying a step). Load/construct the
+        // { i64 start, i64 end, i64 step, i8 flags } struct and compute
+        // Contains(x) per §16.3 v0.162: nonempty AND within-extent AND endOk.
+        // Step determines emptiness/direction; open-ended sides are never
+        // empty (flags bits 1/2).
+        if (bin.right && !(range && range->lo && range->hi && !range->step)) {
             auto* rTy = ctx_.exprType(*bin.right);
             if (isRangeType(rTy)) {
                 llvm::Value* x  = lowerExpr(*bin.left);
@@ -4840,26 +4884,50 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* xW = x->getType() == i64()
                                       ? x
                                       : builder_.CreateSExt(x, i64(), "r.xw");
+                // §16.3 (v0.162, fix #1496): a null endpoint (flags bit 1 =
+                // startOpen, bit 2 = endOpen) imposes NO bound on its side.
+                // `st`/`en` hold a fake 0 sentinel on an open side, so they
+                // must be excluded from the direction/extent computation
+                // rather than compared as real bounds.
+                auto* i8Ty       = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* startOpen = builder_.CreateICmpNE(
+                    builder_.CreateAnd(flg, llvm::ConstantInt::get(i8Ty, 2)),
+                    llvm::ConstantInt::get(i8Ty, 0), "r.sopen");
+                llvm::Value* endOpen = builder_.CreateICmpNE(
+                    builder_.CreateAnd(flg, llvm::ConstantInt::get(i8Ty, 4)),
+                    llvm::ConstantInt::get(i8Ty, 0), "r.eopen");
+                llvm::Value* closedR = builder_.CreateAnd(
+                    builder_.CreateNot(startOpen),
+                    builder_.CreateNot(endOpen), "r.closed");
                 // Extent: [min(Start,End), max(Start,End)]; End excluded when half-open.
                 llvm::Value* asc = builder_.CreateICmpSLE(st, en, "r.asc");
-                llvm::Value* lo  = builder_.CreateSelect(asc, st, en, "r.lo");
-                llvm::Value* hi  = builder_.CreateSelect(asc, en, st, "r.hi");
+                llvm::Value* loClosed = builder_.CreateSelect(asc, st, en, "r.loc");
+                llvm::Value* hiClosed = builder_.CreateSelect(asc, en, st, "r.hic");
+                llvm::Value* negInf =
+                    builder_.getInt64(std::numeric_limits<int64_t>::min());
+                llvm::Value* posInf =
+                    builder_.getInt64(std::numeric_limits<int64_t>::max());
+                llvm::Value* lo = builder_.CreateSelect(
+                    startOpen, negInf,
+                    builder_.CreateSelect(closedR, loClosed, st), "r.lo");
+                llvm::Value* hi = builder_.CreateSelect(
+                    endOpen, posInf,
+                    builder_.CreateSelect(closedR, hiClosed, en), "r.hi");
                 llvm::Value* inR = builder_.CreateAnd(
                     builder_.CreateICmpSGE(xW, lo, "r.ge"),
                     builder_.CreateICmpSLE(xW, hi, "r.le"), "r.inR");
                 llvm::Value* incl   = builder_.CreateTrunc(flg, i1(), "r.incl");
                 llvm::Value* notEnd = builder_.CreateICmpNE(xW, en, "r.notEnd");
-                llvm::Value* endOk  = builder_.CreateOr(incl, notEnd, "r.endOk");
+                // half-open (!incl) excludes the End point — only when End is
+                // actually present; an open End has no endpoint to exclude.
+                llvm::Value* endOk = builder_.CreateOr(
+                    endOpen,
+                    builder_.CreateOr(incl, notEnd), "r.endOk");
                 // IsEmpty check (§16.3 v0.162): open-ended ranges never empty.
                 //   ascending (step >= 0): closed → st > en; half-open → st >= en
                 //   descending (step < 0):  closed → st < en; half-open → st <= en
-                auto* i8Ty       = llvm::Type::getInt8Ty(llvm_);
-                llvm::Value* oflg =
-                    builder_.CreateAnd(flg,
-                        llvm::ConstantInt::get(i8Ty, 6), "r.oflg");
                 llvm::Value* isOE =
-                    builder_.CreateICmpNE(oflg,
-                        llvm::ConstantInt::get(i8Ty, 0), "r.oe");
+                    builder_.CreateOr(startOpen, endOpen, "r.oe");
                 llvm::Value* stepNeg =
                     builder_.CreateICmpSLT(step,
                         llvm::ConstantInt::get(i64(), 0), "r.sneg");
