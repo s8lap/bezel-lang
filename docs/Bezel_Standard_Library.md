@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.179 — July 2026**
+**Companion to the Bezel Language Specification, v0.180 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1655,14 +1655,14 @@ end DrainAndProcess;
 // Single-call drain — each entry owns its value:
 public method DrainAndProcess2(dict: OwningDictionary<string, Connection>)
   for var entry in dict.Drain() do
-    using var e := entry;                      // entry is owned; bind to discharge
+    using var e := owned entry;                // entry is owned; adopt to discharge (v0.180 marker)
     Process(e.Key, e.Value);                   // e.Value is the owned Connection
   end;
   // dict is now empty; each entry (and its Value) disposed at loop-body end
 end DrainAndProcess2;
 ```
 
-`Drain()` returns `IOwningEnumerable<DrainedEntry<K, V>>` ([§4.13](#sec-owning-enumeration-interfaces)). Iterating it transfers ownership of each `DrainedEntry<K, V>` to the consumer; the entry is a class that owns its `Value`, so binding the iteration variable with `using var` (or otherwise discharging it) disposes both the entry shell and, via the standard owned-field cascade (language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields)), the contained value. Partial iteration drains only the entries yielded; the rest remain in the dictionary. This is the single-call drain; no language feature beyond the existing owning-class and `IOwningEnumerable<T>` machinery is required — `DrainedEntry<K, V>` owns its `Value` exactly as any class owns an `owned` field. The `Key` is carried by value (or as a borrow for class-typed K, following the standard field rules).
+`Drain()` returns `IOwningEnumerable<DrainedEntry<K, V>>` ([§4.13](#sec-owning-enumeration-interfaces)). Iterating it transfers ownership of each `DrainedEntry<K, V>` to the consumer; the entry is a class that owns its `Value`, so adopting the iteration variable with `using var e := owned entry;` (the v0.180 transfer marker, language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) — or otherwise discharging it — disposes both the entry shell and, via the standard owned-field cascade (language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields)), the contained value. Partial iteration drains only the entries yielded; the rest remain in the dictionary. This is the single-call drain; no language feature beyond the existing owning-class and `IOwningEnumerable<T>` machinery is required — `DrainedEntry<K, V>` owns its `Value` exactly as any class owns an `owned` field. The `Key` is carried by value (or as a borrow for class-typed K, following the standard field rules).
 
 `GetOrAdd(key, factory)`'s factory produces an `owned V`; the dictionary stores the value (taking ownership) and the call returns a borrow of the now-stored value.
 
@@ -3059,8 +3059,8 @@ public class EventSource<T>: IEvent<T>
   public method Subscribe(scoped handler: (T) -> ()): owned Subscription;
   public method Raise(payload: T);
 
-  public method Add(handler: (T) -> ());
-  public method Remove(handler: (T) -> ());
+  public method Add(scoped handler: (T) -> ());         // scoped (v0.180): Add stores — spec §28.14
+  public method Remove(handler: (T) -> ());              // call-bounded: Remove only compares
 end EventSource;
 
 public class AsyncEventSource<T>: IAsyncEvent<T>
@@ -3068,12 +3068,14 @@ public class AsyncEventSource<T>: IAsyncEvent<T>
   public method Subscribe(scoped handler: (T) -> Task): owned Subscription;
   public async method RaiseAsync(payload: T): Task;
 
-  public method Add(handler: (T) -> Task);
-  public method Remove(handler: (T) -> Task);
+  public method Add(scoped handler: (T) -> Task);        // scoped (v0.180): Add stores — spec §28.14
+  public method Remove(handler: (T) -> Task);             // call-bounded: Remove only compares
 end AsyncEventSource;
 ```
 
 Outside the declaring class, the static type of an event member is `IEvent<T>` (sync) or `IAsyncEvent<T>` (async); `Raise`, `RaiseAsync`, `Add`, and `Remove` are not on the interface, leaving `Subscribe` as the only entry point. Inside the declaring class, the static type is `EventSource<T>` (or `AsyncEventSource<T>`), where `Add`, `Remove`, `Raise`, and `Subscribe` are all available. The compiler-recognized syntactic forms `event += handler` and `event -= handler` rewrite to `event.Add(handler)` and `event.Remove(handler)` respectively. See language spec [§24.3](Bezel_Language_Spec.md#sec-the-type-of-an-event-member) / [§24.4](Bezel_Language_Spec.md#sec-subscribing).
+
+`Add` is `scoped` (v0.180): it stores its handler in the subscriber list, whose lifetime is the event source's — which the compiler-generated `owned` backing field ties to the publisher. The caller-side capture admission is spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)'s (bounding object: the publisher instance, form 4 via the `+=` desugaring); the publisher's disposal severs the subscriber list before reclamation (quiescence, normative). `Remove` and `Subscribe`-returned `Subscription` disposal only compare/deregister and stay unmarked/call-bounded respectively; `Subscribe` was already `scoped` (v0.175).
 
 The `Add`, `Remove`, and `Raise` methods are declared `public` rather than `internal` because the visibility restriction is enforced by the **type fence**: an `EventSource<T>` reference is obtainable only inside the declaring class (the field type from outside is the interface, not the class). User code that smuggles an `EventSource<T>` reference out of the declaring class — for example, by exposing it through a public method or by reflection — gains the ability to call `Raise` directly, but doing so is a deliberate breach of the event-pattern contract that the language does not attempt to defend against. The conventional design is to never expose the `EventSource<T>` itself; the public surface is always the interface.
 
@@ -3235,7 +3237,7 @@ Implementation sketch (v0.179: the *behavior* shown — await in input order, fi
 public static async method WhenAllOwned<T>(
   owned tasks: OwningArray<OwningTask<T>>
 ): OwningTask<OwningArray<T>> where T: class
-  using var taskArray := tasks;                       // owned param to using var; disposes at end
+  using var taskArray := owned tasks;                 // owned param adopted (v0.180 marker); disposes at end
   var results := new OwningArray<T>(capacity := taskArray.Count);
   for var task in taskArray.Drain() do                // drain yields owned OwningTask<T>
     results.Add(await task);                          // await produces owned T (Pattern B);
@@ -3262,13 +3264,13 @@ end OpenFiles;
 // Consumer takes ownership of each FileStream:
 public async method ProcessAll(paths: Array<string>): Task
   await for var file in OpenFiles(paths) do
-    using var f := file;      // discharge on entry — covers all exit edges
+    using var f := owned file; // discharge on entry — covers all exit edges (v0.180 marker)
     await ProcessAsync(f);
   end;
 end ProcessAll;
 ```
 
-The `using var f := file;` shape on entry to the body is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
+The `using var f := owned file;` shape on entry to the body — the `owned` marker is the v0.180 binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding would only borrow-pin) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
 
 The async-iterator form is preferable when the consumer processes each result before requesting the next; `WhenAllOwned` is preferable when the consumer needs all results at once.
 
@@ -3425,6 +3427,7 @@ end TaskScope;
 - **Fault policy**: first fault wins and cancels siblings via the scope's token (cooperative, §30.8); later faults are swallowed (the recorded §13.5 no-aggregation posture).
 - **`Spawn` after close** (after `Join` returned or disposal began) raises `InvalidOperationException` — deterministic, never a silent extension of the drain.
 - **Quiescence (normative, §28.14)**: `DisposeAsync` completes only after every child task has completed and been reclaimed; no `scoped` callback runs after it returns.
+- **Self-capture (v0.180)**: a child body may capture the scope itself and values borrow-derived from it — `scope.Token` inline, or the bound intermediate `var tok := scope.Token;` — admitted by §28.14's self-capture rule. This is how children observe cooperative cancellation and how re-registration (`scope.Spawn` from inside a child) is expressed.
 - Intra-domain: `TaskScope` is not sendable; cross-domain fan-out remains channels + `Domain.Spawn`.
 
 <a id="sec-system-io"></a>

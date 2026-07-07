@@ -311,7 +311,7 @@ end;
 // An owned var still carries the disposal obligation; discharge it by
 // binding into a using var, returning it under an owned return type,
 // or storing it into an owned field:
-using var owned_x := x;           // adopt for scoped disposal
+using var owned_x := owned x;     // adopt for scoped disposal (v0.180 transfer marker)
 owned_x.Process();
 ```
 
