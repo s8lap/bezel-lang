@@ -3917,7 +3917,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // first-offered fix, unlike the class arm above.
         if (es->expr) {
             const TypeRef* taskStmtTy = ctx_.exprType(*es->expr);
-            if (isTaskShapedRef(taskStmtTy)) {
+            // A `move <task>;` statement is an explicit ownership transfer that
+            // DISCHARGES an owned Task binding (e.g. discharging an `owned t:
+            // Task<T>` parameter after `await`), governed by §28.6/§28.8 — not a
+            // silent drop. §21.9 targets the case where a Task result vanishes
+            // with no acknowledgement (a bare producing call, an identifier
+            // read, a task-typed property access); a `move` is the programmer
+            // acknowledging the transfer, so it is excluded here.
+            auto* moveExpr = dynamic_cast<const ast::UnaryExpr*>(es->expr.get());
+            bool isMove = moveExpr && moveExpr->op == "move";
+            if (isTaskShapedRef(taskStmtTy) && !isMove) {
                 ctx_.diagnostics().report(
                     Severity::Error, es->expr->span.begin,
                     "this expression statement discards a `Task` result — an "
