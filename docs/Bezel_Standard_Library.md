@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.178 — July 2026**
+**Companion to the Bezel Language Specification, v0.179 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2304,7 +2304,7 @@ A read-only counterpart to `Span<T>`. Mechanically, `ReadOnlySpan<T>` is the sam
 
 **Search and equality.** `IndexOf`, `Contains`, and `SequenceEqual` mirror `Span<T>`'s read-only methods. `SequenceEqual(other: ReadOnlySpan<T>)` compares two read-only spans element-by-element. To compare against a `Span<T>`, the caller converts the writable span via `.AsReadOnly()`.
 
-**Why not stack-allocated like C#'s `Span<T>`?** C#'s `Span<T>` is a `ref struct` — stack-only, cannot escape to the heap. This gives it the strongest possible lifetime guarantees but constrains where it can appear (no `Span<T>` fields in classes, no `Span<T>` in async state machines, no `Span<T>` returned across await points). Bezel's `Span<T>` is an ordinary record subject to borrow-bearing-record rules; it can be stored anywhere the borrow's lifetime allows, including as a class field when the field's enclosing class outlives the borrow source, or across `await` points in async methods when the underlying buffer's lifetime extends past the suspension. Programs whose buffer lifetimes cannot be statically proven sufficient are rejected by the borrow tracker. The Bezel choice trades the unconditional stack-only safety of C# for a much smaller language footprint — no new "ref struct" type kind is introduced. The lifetime tracker handles the common cases (parser scratch buffers, byte-buffer reads, slice-and-walk patterns, async pipelines whose buffer outlives the awaits) without a special type kind.
+**Why not stack-allocated like C#'s `Span<T>`?** C#'s `Span<T>` is a `ref struct` — stack-only, cannot escape to the heap. This gives it the strongest possible lifetime guarantees but constrains where it can appear (no `Span<T>` fields in classes, no `Span<T>` in async state machines, no `Span<T>` returned across await points). Bezel's `Span<T>` is an ordinary record subject to borrow-bearing-record rules; it can be stored anywhere the borrow's lifetime allows, including as a class field when the field's enclosing class outlives the borrow source, or, for a span *local* whose source is co-resident in the same async frame (an owned local, `using var`, or `owned` parameter of that method), across `await` points in that method. A span may **not** be an async method's parameter or result — a caller-side source cannot be shown to outlive the frame (spec §30.1, v0.179, #1438). Programs whose buffer lifetimes cannot be statically proven sufficient are rejected by the borrow tracker. The Bezel choice trades the unconditional stack-only safety of C# for a much smaller language footprint — no new "ref struct" type kind is introduced. The lifetime tracker handles the common cases (parser scratch buffers, byte-buffer reads, slice-and-walk patterns, async pipelines whose buffer outlives the awaits) without a special type kind.
 
 **Construction patterns.** A buffer's owner produces spans by handing out `new Span<T>(buf, start, length)` or `new ReadOnlySpan<T>(buf, start, length)` directly, or by exposing helper methods:
 
@@ -2950,6 +2950,8 @@ end;
 
 The nullable-result shape replaces the `out owned guard` form used in earlier versions: the `out` parameter contract ([§22.3](Bezel_Language_Spec.md#sec-parameter-modifiers) of the language spec) requires the parameter to be assigned on every exit path, but the failure path of `TryAcquire` has no meaningful value to assign. Returning `owned Lock?` resolves the contradiction — the `null` value is itself the failure signal — and produces simpler call sites.
 
+**Blocking discipline (v0.179; spec §30.12).** `Acquire()` and `TryAcquire(timeout)` block the calling thread. They are rejected at compile time inside `async` methods and `async` lambdas (use `AcquireAsync`/`TryAcquireAsync`); where a non-`async` helper reached from a domain continuation would actually park in them, the runtime raises `InvalidOperationException` instead. They remain fully legal on the startup thread and on FFI foreign threads (outside any domain), and when the mutex is immediately available.
+
 <a id="sec-semaphore"></a>
 ### 6.3 `Semaphore`
 
@@ -2968,6 +2970,8 @@ public class SemaphoreToken
   destructor;       // releases the held permit
 end SemaphoreToken;
 ```
+
+`Acquire()` and `TryAcquire(timeout)` follow the same blocking discipline as `Mutex`'s (v0.179; spec §30.12): compile error inside `async` bodies, runtime `InvalidOperationException` where a domain continuation would park in them, legal outside domains.
 
 `AcquireAsync` returns `OwningTask<SemaphoreToken>`; awaiters consume the task under Pattern B (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)) — the await must appear in an owned-consuming context. The natural call site:
 
@@ -3094,11 +3098,11 @@ public class TaskCompletionSource<T>
   public readonly property Task: Task<T>;
 
   public method SetResult(result: T);
-  public method SetException(exception: Exception);
+  public method SetException(owned exception: Exception);   // v0.179: the task owns its fault (spec §30.9)
   public method SetCancelled();
 
   public method TrySetResult(result: T): bool;
-  public method TrySetException(exception: Exception): bool;
+  public method TrySetException(owned exception: Exception): bool;
   public method TrySetCancelled(): bool;
 end TaskCompletionSource;
 
@@ -3108,11 +3112,11 @@ public class OwningTaskCompletionSource<T> where T: class
   public readonly property Task: OwningTask<T>;
 
   public method SetResult(owned result: T);
-  public method SetException(exception: Exception);
+  public method SetException(owned exception: Exception);   // v0.179: the task owns its fault (spec §30.9)
   public method SetCancelled();
 
   public method TrySetResult(owned result: T): bool;
-  public method TrySetException(exception: Exception): bool;
+  public method TrySetException(owned exception: Exception): bool;
   public method TrySetCancelled(): bool;
 end OwningTaskCompletionSource;
 
@@ -3121,13 +3125,15 @@ public class TaskCompletionSource
   public constructor();
   public readonly property Task: Task;
   public method SetResult();
-  public method SetException(exception: Exception);
+  public method SetException(owned exception: Exception);
   public method SetCancelled();
   public method TrySetResult(): bool;
-  public method TrySetException(exception: Exception): bool;
+  public method TrySetException(owned exception: Exception): bool;
   public method TrySetCancelled(): bool;
 end TaskCompletionSource;
 ```
+
+**Fault-path ownership (v0.179).** `SetException`/`TrySetException` (all forms) take the exception **`owned`**: the produced task becomes the single owner of its fault exception (spec §30.9 — awaiters borrow it on re-raise; it is disposed exactly once, at task disposal; a `TrySetException` returning `false` disposes the passed exception). A caller that holds only a caught borrow (spec §31.1) constructs a fresh cause-chained exception instead: `tcs.SetException(new Exception(ex.Message, ex));` — the `(message, cause)` constructor snapshots the chain (spec §31.4).
 
 <a id="sec-task-static-helpers"></a>
 ### 6.7 `Task` static helpers
@@ -3147,7 +3153,7 @@ public class Task
   // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
   // typed as Task<MyClass> even when MyClass is a class type — there is no value
   // to transfer ownership of, only an exception to re-raise on await.
-  public static method FromException<T>(exception: Exception): Task<T>;
+  public static method FromException<T>(owned exception: Exception): Task<T>;   // v0.179: the task owns its fault (spec §30.9)
   public static method FromCancelled<T>(): Task<T>;
 
   public static method Delay(milliseconds: int): Task;
@@ -3183,7 +3189,7 @@ Task.FireAndForget(DoTelemetryAsync());      // supervised; exceptions logged
 using var t := DoTelemetryAsync();           // unsupervised; disposed at scope end
 ```
 
-`FireAndForget` is the right choice when the task should run to completion and any exceptions it raises should be logged. The `using var` form binds the task to a scope; at scope end, the task's `Dispose()` runs but does not block waiting for completion ([§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The underlying operation continues to run in the background; the caller no longer observes its completion or exceptions. Use `using var` only when "fire and forget without supervision" is exactly what's wanted; for tasks whose failures should be surfaced, use `Task.FireAndForget` or hold the task and `await` it explicitly.
+`FireAndForget` is the right choice when the task should run to completion and any exceptions it raises should be logged. The `using var` form binds the task to a scope; at scope end, the task's `Dispose()` runs but does not block waiting for completion ([§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The underlying operation continues to run in the background; the caller no longer observes its completion or exceptions. (In checked disposal mode, a `DisposedAccessException` raised in such an abandoned continuation is reported through the diagnostic channel before being swallowed — spec §30.10, v0.179.) Use `using var` only when "fire and forget without supervision" is exactly what's wanted; for tasks whose failures should be surfaced, use `Task.FireAndForget` or hold the task and `await` it explicitly.
 
 The exception-logging mechanism for `FireAndForget` is implementation-defined; implementations may provide a global handler.
 
@@ -3223,7 +3229,7 @@ The caller's pattern matches `WhenAll`: build an array of tasks, await `WhenAllO
 - The input parameter is `owned OwningArray<...>`: the caller transfers ownership of the array (and its contents) to `WhenAllOwned`. After the call, the caller no longer holds the array.
 - The result is `OwningTask<OwningArray<Config>>`: a Pattern B task whose result is an owned array of owned configs. The caller awaits with `using var`, gaining scope-bound disposal of the whole structure.
 
-Implementation sketch (illustrative, not part of the public contract):
+Implementation sketch (v0.179: the *behavior* shown — await in input order, first-fault re-raise, disposal of already-produced and laggard results — is now contract, spec §30.10 "Aggregation contracts"; the code itself remains illustrative):
 
 ```bezel
 public static async method WhenAllOwned<T>(
@@ -3295,10 +3301,34 @@ public static class Domain
       where A: class, R: notnull;
   public static method Spawn<A, R>(entry: (A) -> R, arg: A): owned Task<R>
       where A: notnull, R: notnull;
+
+  // Async entries (v0.179; spec §30.14 "Async entries"): the runtime awaits the
+  // returned task inside the spawned domain; the join handle tracks that task.
+  public static method Spawn(entry: () -> Task): owned Task;
+  public static method Spawn<A>(entry: (owned A) -> Task, owned arg: A): owned Task
+      where A: class;
+  public static method Spawn<A>(entry: (A) -> Task, arg: A): owned Task
+      where A: notnull;
+
+  public static method Spawn<R>(entry: () -> OwningTask<R>): owned OwningTask<R>
+      where R: class;
+  public static method Spawn<A, R>(entry: (owned A) -> OwningTask<R>, owned arg: A): owned OwningTask<R>
+      where A: class, R: class;
+  public static method Spawn<A, R>(entry: (A) -> OwningTask<R>, arg: A): owned OwningTask<R>
+      where A: notnull, R: class;
+
+  public static method Spawn<R>(entry: () -> Task<R>): owned Task<R>
+      where R: notnull;
+  public static method Spawn<A, R>(entry: (owned A) -> Task<R>, owned arg: A): owned Task<R>
+      where A: class, R: notnull;
+  public static method Spawn<A, R>(entry: (A) -> Task<R>, arg: A): owned Task<R>
+      where A: notnull, R: notnull;
 end Domain;
 ```
 
 The `where` clauses above are the declared constraints; sendability is the stronger compiler-checked requirement and is diagnosed at the call site naming the failing rule (it is not expressible as a `where` constraint — it is a derived type property). For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
+
+**Async entries (v0.179).** The nine async rows mirror the nine synchronous rows. The entry is a capture-free `async` lambda or a static `async` method reference; the runtime runs it as the spawned domain's first continuation and awaits the returned task **within that domain** (the `async Main` analog, spec §33.2). The join handle completes when that task settles; a fault anywhere in the entry's async chain surfaces at the join as `DomainFaultedException`. The entry's task object never crosses the boundary; for the `OwningTask<R>` rows the runtime is the single Pattern B consumer, and only the sendable result crosses. Overload resolution prefers the async rows for any entry whose return type is in the `Task` family; the synchronous generic rows never bind `R` to a task type (spec §30.14).
 
 The join handle completes when the entry's task completes. A fault in the entry surfaces at the join as `DomainFaultedException`:
 
@@ -3354,6 +3384,7 @@ Semantics (normative statement: language spec [§30.15](Bezel_Language_Spec.md#s
 - `Channel<T>` and `ChannelSender<T>` are themselves sendable: each endpoint is an independently owned object and may be moved to another domain (as a spawn argument or through another channel). Typical use keeps the channel in the receiving domain and moves senders out.
 - **Closing.** Disposing the last sender closes the channel; buffered items remain receivable, and after the drain `Receive` raises `ChannelClosedException`. Disposing the `Channel<T>` closes it immediately and disposes every undelivered class-typed item in reverse insertion order; subsequent `Send` raises `ChannelClosedException`. `TryReceive` returns `false` for both empty-open and drained-closed; consult `IsClosed` to distinguish.
 - **Ordering.** Per-sender FIFO; cross-sender interleaving is an unspecified consistent total order; each item is received exactly once.
+- **Receive abandonment (v0.179).** Disposing a pending `Receive` task deregisters the waiter **without consuming an item** (normative statement: language spec §30.15); an item being handed off at the instant of disposal is returned to the channel's head. Applies to both the `OwningTask<T>` and `Task<T>` forms of `Receive`.
 
 ```bezel
 public class ChannelClosedException: Exception
@@ -3365,7 +3396,7 @@ end ChannelFullException;
 
 **Bounded channels (v0.174, #809).** `new Channel<T>(capacity)` creates a channel that buffers at most `capacity` items. `SendAsync` **awaits capacity**: the returned task completes when the item has been accepted (immediately when space is free, and always immediately on an unbounded channel). The synchronous `Send` keeps its never-blocks contract on every channel — on a *full* bounded channel it raises **`ChannelFullException`** (a defined fault, §30.3's no-blocking discipline: a producer that wants to wait says so with `await`). If the channel closes while a `SendAsync` is waiting, the pending item is **disposed by the channel** (exactly like buffered undelivered items) and the task faults with `ChannelClosedException`. Ordering and exactly-once delivery are unchanged.
 
-Deferred, each with its reason recorded in the v0.174 rationale entry: **capacity-zero rendezvous** (couples producer/consumer scheduling; addable later as `capacity: 0` without breaking), **`TrySend`** (the failure path would need to hand the owned item *back* — an ownership-protocol design of its own), **cancellation of a pending send** (same give-back protocol, plus it rides #1413's foundations), and **multi-consumer receiver cloning** (drags `Shared<T>`'s §28.13 domain-locality questions; worker pools compose today from N single-consumer channels).
+Deferred, each with its reason recorded in the v0.174 rationale entry: **capacity-zero rendezvous** (couples producer/consumer scheduling; addable later as `capacity: 0` without breaking), **`TrySend`** (the failure path would need to hand the owned item *back* — an ownership-protocol design of its own), **cancellation of a pending send** (same give-back protocol, plus it rides #1413's foundations), **cancellable and multi-source receive** (`Receive(token)`, select/`ReceiveAny` — the v0.179 dispose-deregistration rule defines *abandonment*; a first-class primitive needs the same hand-the-owned-item-back protocol and is deferred with the send-side family), and **multi-consumer receiver cloning** (drags `Shared<T>`'s §28.13 domain-locality questions; worker pools compose today from N single-consumer channels).
 
 ---
 
@@ -3414,8 +3445,6 @@ public abstract class Stream
   public abstract method Write(buffer: Array<byte>, offset: int, count: int);
   public method Read(buffer: Span<byte>): int;             // v0.165: span carries its own range
   public method Write(buffer: ReadOnlySpan<byte>);          //   (§4.14 convention: slice first)
-  public async method ReadAsync(buffer: Span<byte>, token: CancellationToken := CancellationToken.None): Task<int>;
-  public async method WriteAsync(buffer: ReadOnlySpan<byte>, token: CancellationToken := CancellationToken.None): Task;
   public abstract method Flush();
 
   public abstract method Seek(offset: long, origin: SeekOrigin): long;
@@ -3433,12 +3462,14 @@ public abstract class Stream
 end Stream;
 
 
-**Windowed-form contract (v0.165, #1375):** in `Read`/`Write(buffer, offset, count)` the window `[offset, offset+count)` ranges over the buffer's **`Count`** (like every other bounds rule in this library); out-of-range raises `IndexOutOfRangeException`. `Read` writes into *existing* elements and never grows the array — the canonical read loop allocates its buffer with the sized constructor (`new Array<byte>(64 * 1024, 0)`, §4.4) and passes `count := buffer.Count`. The span overloads carry their range in the value and are the preferred forms.
+**Windowed-form contract (v0.165, #1375):** in `Read`/`Write(buffer, offset, count)` the window `[offset, offset+count)` ranges over the buffer's **`Count`** (like every other bounds rule in this library); out-of-range raises `IndexOutOfRangeException`. `Read` writes into *existing* elements and never grows the array — the canonical read loop allocates its buffer with the sized constructor (`new Array<byte>(64 * 1024, 0)`, §4.4) and passes `count := buffer.Count`. The **synchronous** span overloads carry their range in the value and are the preferred forms for synchronous I/O; the asynchronous path uses the `Array<byte>` windowed form exclusively (the async span overloads were removed — see the changelog below, #1438).
 
 public enum SeekOrigin: byte
   Begin, Current, End;
 end SeekOrigin;
 ```
+
+> **Async span overloads removed (v0.179, #1438).** `Stream.ReadAsync(buffer: Span<byte>, token)` and `WriteAsync(buffer: ReadOnlySpan<byte>, token)` are removed. A span is a borrow-bearing record (§4.14, spec §9.7); an `async` method captures its parameters into a heap-allocated state-machine frame that outlives the synchronous call and lives until the task settles, so a span parameter would leave a caller-owned buffer borrowed inside a frame the caller is under no obligation to keep alive to settlement — a dangling borrow with no `DisposedAccessException` backstop on the raw buffer window (spec §30.1, the borrow-bearing-parameter prohibition). Asynchronous byte I/O therefore uses the heap-owned windowed form exclusively — `ReadAsync(buffer: Array<byte>, offset, count, token)` / `WriteAsync(buffer: Array<byte>, offset, count, token)` (already declared) — or the owned-result `ReadAllAsync(): OwningTask<Array<byte>>`. The **synchronous** span overloads `Read(buffer: Span<byte>)` / `Write(buffer: ReadOnlySpan<byte>)` are unaffected: a span across a synchronous call frame is sanctioned by spec §8.6. Callers holding a `Span<byte>`/`ReadOnlySpan<byte>` window over an `Array<byte>` pass the backing array with the window's `Start`/`Length` as `offset`/`count`; windows over an `OwningBuffer<byte>` copy into an `Array<byte>` for the async call, or use the synchronous overload where a synchronous write suffices.
 
 <a id="sec-filestream"></a>
 ### 7.2 `FileStream`
