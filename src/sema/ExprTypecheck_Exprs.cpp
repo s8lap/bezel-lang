@@ -51,6 +51,41 @@ bool isPromotablePrimitive(PrimitiveType p) {
     }
 }
 
+// §7.4 (v0.182, #1593): true iff ACCESSING this property/indexer can transfer
+// control to user code — the "accessor call" trigger of the mutably-captured-
+// narrowing invalidation rule (§7.4, #1566: while a mutably-captured local is
+// narrowed non-null, any operation in the controlled block that can run user
+// code — a method/constructor/accessor/operator call or an `await` — may reach
+// the capturing closure and null the local, so it drops the narrowing). A
+// compiler-generated backing-field load/store — a NON-virtual auto-property —
+// cannot run user code, so it does NOT invalidate; every other form can:
+//   - `=> e` expression body (a read-only getter) — user code;
+//   - a Block body — a user-written `get`/`set` arm, or an abstract arm that
+//     dispatches to a user override — user code;
+//   - an auto body that is virtual/abstract/override — the runtime accessor may
+//     be a user override with a computed body, so the access can dispatch to it.
+// Indexers are always Expression- or Block-bodied (never auto), so a user
+// indexer access always qualifies. Callers gate on a LOCAL PropertyDecl being
+// present (`ps->decl`): a builtin property (`.Length`/`.Count`, whose access is
+// typed by a dedicated path that sets no user PropertyDecl) and an imported
+// property (reconstructed without a decl, ModuleLoader §2.5) are conservatively
+// left alone — the common-auto-read exclusion the #1566 change reserved here.
+bool propertyAccessRunsUserCode(const ast::PropertyDecl* pd) {
+    if (!pd) return false;
+    switch (pd->bodyKind) {
+        case ast::PropertyBodyKind::Expression:
+            return true;
+        case ast::PropertyBodyKind::Block:
+            return !pd->accessors.empty();  // any get/set arm can run user code
+        case ast::PropertyBodyKind::Auto:
+            for (auto m : pd->modifiers)
+                if (m == "virtual" || m == "abstract" || m == "override")
+                    return true;
+            return false;  // a non-virtual auto-property is a pure field access
+    }
+    return false;
+}
+
 // §18.5 / stdlib §2.18 (v0.172, #812/#1339): the FORMAT portion of an encoded
 // InterpPart::formatSpec (the codegen encoding is `[","WIDTH][":"FORMAT]`). A
 // bare alignment (`,WIDTH` with no `:FORMAT`) carries no format and applies to
@@ -1265,6 +1300,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                             &e, substituteMemberType(
                                                     rt, ix->target.get(),
                                                     ps->parent));
+                                        // per §7.4 (v0.182, #1593): a `T[i]`
+                                        // indexer access resolved through a
+                                        // type-parameter constraint is an
+                                        // accessor call too — invalidate a
+                                        // mutably-captured local's narrowing
+                                        // (#1566).
+                                        if (propertyAccessRunsUserCode(pd))
+                                            invalidateCapturedNarrowings();
                                         return true;
                                     }
                                 }
@@ -1381,6 +1424,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                                 rt, ix->target.get(),
                                                 ps->parent));
                             }
+                            // per §7.4 (v0.182, #1593): a user-defined indexer
+                            // access `obj[i]` invokes an "accessor" (get/set)
+                            // that can run user code — invalidate a mutably-
+                            // captured local's narrowing exactly as a named-
+                            // property access or a call does (#1566). Indexers
+                            // are never auto, so any user indexer qualifies.
+                            if (propertyAccessRunsUserCode(pd))
+                                invalidateCapturedNarrowings();
                         }
                     } else if (anyIndexer && nargs > 0) {
                         // §23.4: the receiver declares indexer(s) but none has
@@ -1404,6 +1455,21 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // resolved member symbol and field/property type.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         resolveMemberAccess(*ma);
+        // per §7.4 (v0.182, #1593): a named-property access whose accessor can
+        // run user code (a user-defined getter/setter, or a virtual/abstract
+        // dispatch) is an "accessor call" — the control transfer may reach a
+        // closure that nulls a mutably-captured local, so it invalidates that
+        // local's narrowing exactly as a method/constructor call does (#1566;
+        // the target was already visited under the pre-access narrowing). A
+        // non-virtual auto-property is a pure field load and does NOT invalidate
+        // (propertyAccessRunsUserCode); indexers are handled at the IndexExpr
+        // sites. A no-op unless the body has a lambda that mutates a captured
+        // local.
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e))) {
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+                if (propertyAccessRunsUserCode(pd))
+                    invalidateCapturedNarrowings();
+        }
         // §22.12 (cf. C# CS0176): a static member must be accessed through the
         // type name (`C._x`), not through an instance (`c._x`). The latter was
         // silently accepted (and previously crashed codegen, #747). Reject it.

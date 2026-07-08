@@ -709,3 +709,129 @@ BEZEL_TEST(sema_null_narrow, lambda_param_shadow_does_not_invalidate_spec_7_4) {
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §7.4 (v0.182, #1593): the "accessor call" trigger of the mutably-captured-
+// narrowing invalidation rule (§7.4 line 631: "any operation that can transfer
+// control to user code: a method, constructor, ACCESSOR, or user-defined-
+// operator call…"). #1566 wired the method/constructor/operator/await triggers
+// but deferred the user-defined property/indexer getter — a call to a user
+// accessor whose body could reach the capturing closure and null the local.
+// These cases extend the #1566 tests to that trigger: a user accessor between
+// the null test and the use invalidates a mutably-captured local (REJECT); a
+// non-virtual auto-property (a pure backing-field load) and a builtin property
+// do NOT, and an uncaptured local keeps its narrowing (no over-rejection).
+// ===========================================================================
+
+// §7.4 (#1593): a user-defined expression-body property getter (`=> e`) between
+// the test and the use is an accessor call — it can transfer control to user
+// code, so it invalidates a mutably-captured local's narrowing. Before the fix
+// this compiled clean (the getter read was not a recognised control transfer).
+BEZEL_TEST(sema_null_narrow, expr_body_property_getter_invalidates_capture_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box public property Val: int => 42; end Box; "
+        "class C "
+        "  public static method Run(box: Box): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      _ := box.Val; "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1593): a block-body property with an explicit `get` (and `set`) arm is
+// likewise a user accessor — reading it invalidates a mutably-captured local.
+BEZEL_TEST(sema_null_narrow, block_body_property_getter_invalidates_capture_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box "
+        "  private _v: int := 0; "
+        "  public property Val: int "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end; "
+        "end Box; "
+        "class C "
+        "  public static method Run(box: Box): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      _ := box.Val; "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1593): a user-defined indexer access `g[i]` invokes the indexer getter
+// (also an "accessor" per §7.4) — it invalidates a mutably-captured local too.
+BEZEL_TEST(sema_null_narrow, user_indexer_getter_invalidates_capture_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Grid public property [i: int]: int get => i; end; end Grid; "
+        "class C "
+        "  public static method Run(g: Grid): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      _ := g[3]; "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1593): NO over-invalidation. A NON-virtual auto-property (`Val: int :=
+// 0;`) getter is a compiler-generated backing-field load — it cannot transfer
+// control to user code, so reading it does NOT drop a captured local's
+// narrowing. This is the "exclude common auto reads" boundary the #1566 change
+// reserved for #1593. Must be ACCEPTED.
+BEZEL_TEST(sema_null_narrow, auto_property_read_keeps_capture_narrowing_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box public property Val: int := 42; end Box; "
+        "class C "
+        "  public static method Run(box: Box): int "
+        "    var s: string? := \"hi\"; "
+        "    var f := () => do s := null; end; "
+        "    if s <> null then "
+        "      _ := box.Val; "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §7.4 (#1593): NO over-invalidation. A local that is NOT mutably captured keeps
+// its narrowing across a user accessor call, exactly as across an ordinary call
+// (#1188). The lambda here mutates a DIFFERENT local. Must be ACCEPTED.
+BEZEL_TEST(sema_null_narrow, uncaptured_local_keeps_narrowing_across_accessor_spec_7_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box public property Val: int => 42; end Box; "
+        "class C "
+        "  public static method Run(box: Box): int "
+        "    var s: string? := \"hi\"; "
+        "    var other: string? := \"x\"; "
+        "    var f := () => do other := null; end; "
+        "    if s <> null then "
+        "      _ := box.Val; "
+        "      return s.Length; "
+        "    end; "
+        "    return -1; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
