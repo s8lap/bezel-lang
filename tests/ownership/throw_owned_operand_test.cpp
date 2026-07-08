@@ -147,3 +147,45 @@ BEZEL_TEST(throw_owned_operand, throw_fresh_cause_chained_ok_31_4) {
         "end Handle;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ── §31.1 / §31.2.1 (issue #1591): the owned-operand rule inside a catch ──────
+// arm's `when` GUARD. A guard is an ordinary expression position, and §31.2.1
+// permits a guard to itself `throw` — diverging supersedes the in-flight
+// exception and propagates, exactly like a `throw` in any other expression
+// position (§31.1 states the operand rule for "any expression position" with
+// no guard carve-out). Before the fix, flow::CFG's `visitTry` built a catch
+// arm's CFG entry block from the arm's BODY only — the guard expression was
+// never represented in the CFG at all, so the ownership pass's per-block walk
+// never reached it and `checkThrowOperandNotBorrowed` never fired there, even
+// though the identical borrowed operand in the arm BODY was already rejected
+// (`rethrow_caught_binding_rejected_31_1` above). These pin the corrected
+// guard-position behavior to match body-position exactly: REJECT a borrowed
+// operand, ACCEPT an owned one.
+
+// REJECTED: `catch var e: Exception when throw e => ...` re-throws the
+// caught binding FROM THE GUARD — `e` is a borrow of the in-flight exception
+// (§31.1), whether thrown from the guard or the body. Before the fix this
+// compiled with no diagnostic (issue #1591's repro).
+BEZEL_TEST(throw_owned_operand, throw_borrowed_binding_in_guard_rejected_31_1_1591) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle() "
+        "  try W(); "
+        "  catch var e: Exception when throw e => return; "
+        "  end; "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// ACCEPTED: a fresh `new` thrown FROM THE GUARD is the canonical owned
+// producer (§31.1) — the guard diverges and supersedes the in-flight
+// exception (§31.2.1). Pins that closing the borrowed-operand gap does not
+// over-reject a spec-legal guard-position throw.
+BEZEL_TEST(throw_owned_operand, throw_fresh_new_in_guard_ok_31_1_1591) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle() "
+        "  try W(); "
+        "  catch var e: Exception when throw new AppError() => return; "
+        "  end; "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

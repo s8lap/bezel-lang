@@ -522,6 +522,11 @@ private:
         for (const auto& arm : s.catches) {
             CFGBlock* armEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
             cfg_.addEdge(catchDispatch, armEntry);
+            // #1591 (§31.1 / §31.2.1): record the arm's `when` guard (if any)
+            // on its entry block so the ownership pass's processBlock walks it
+            // through handleDischarge exactly like an if/while condition —
+            // see CFGBlock::catchGuard.
+            if (arm.guard) armEntry->catchGuard = arm.guard.get();
             // The arm's body is a single statement (DoEndBlock or any
             // other Stmt). Visit it with the outer (one-frame-popped)
             // try handler stack — a throw in a catch handler shouldn't

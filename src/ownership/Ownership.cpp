@@ -1474,6 +1474,25 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     for (const ast::Stmt* s : block.stmts) {
         if (s) visitStmt(*s);
     }
+    // §31.1 / §31.2.1 (#1591): a catch arm's `when` guard is an ordinary
+    // expression position and may itself embed a `throw` (§31.2.1: a guard
+    // that diverges supersedes the in-flight exception and propagates).
+    // §31.1's owned-operand rule applies to `throw expr` in ANY expression
+    // position, guards included — the spec carves out no guard exception.
+    // `visitTry` records the arm's guard on its entry block (CFGBlock::
+    // catchGuard) precisely so it reaches this walk: without it, a guard's
+    // throw operand was never checked at all (unlike the arm body, which
+    // already runs the same check via `handleDischarge`'s `ThrowExpr` case),
+    // so a borrowed operand — e.g. the arm's own bound catch variable
+    // (`catch ex: E1 when throw ex => ...`) — was silently accepted even
+    // though the identical `throw ex;` in the arm body is already rejected.
+    // Route the guard through the same `handleDischarge` walk used for every
+    // other expression position so the check (and the other owned-argument-
+    // transfer checks `handleDischarge` performs) fire identically in guard
+    // and body position. // per §31.1, §31.2.1
+    if (block.catchGuard) {
+        handleDischarge(*block.catchGuard);
+    }
     // §28.3 / #892: process the branch block's CONDITION expression through
     // handleDischarge so that out-owned argument marking (markOutOwnedArgs /
     // §28.3 §28.11 #860) and move recording (recordMovesIn) happen for a

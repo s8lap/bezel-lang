@@ -121,6 +121,20 @@ struct CFGBlock {
     // the CFG builder's visitBranch.
     const ast::Expr* condition = nullptr;
 
+    // #1591 (§31.1 / §31.2.1): for a catch arm's Linear entry block, the arm's
+    // optional `when` guard expression. A guard is an ordinary expression
+    // position and may itself embed a `throw` (§31.2.1: a guard that diverges
+    // supersedes the in-flight exception and propagates), so it must run
+    // through the same ownership transfer (`handleDischarge`, which enforces
+    // §31.1's throw-operand owned-value rule among other owned-argument-
+    // transfer checks) as every other expression position. Before this field
+    // existed the guard was never represented in the CFG at all — `visitTry`
+    // built the arm's entry block from `arm.body` only — so a guard's throw
+    // operand ownership went unchecked. Null when the arm has no guard, and
+    // for every non-catch-arm block. Additive; populated by the CFG builder's
+    // `visitTry`.
+    const ast::Expr* catchGuard = nullptr;
+
     // F2 / O11-real: successor targets reached only along an *exception*
     // (stack-unwinding) edge from this block — an explicit `throw`, or the
     // over-approximated "a throwable call inside the try body" edge from a
