@@ -4435,21 +4435,24 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             recv = currentThis_;
         }
         if (!recv) return nullptr;
-        // §14.2 (record-conforms-to-interface) + §9.4 (record = value type):
-        // when a generic method `M<T>(x: T) where T: IFoo` is monomorphized with
-        // T = a RECORD, the body's `x.Foo()` was resolved by sema to the
-        // INTERFACE method `IFoo.Foo` (member look-up went through the constraint
-        // — §14.2's "T's surface includes IFoo's members"). The receiver `x` is a
-        // record VALUE (a struct, not a pointer), so the itable-dispatch path in
+        // §14.2 (value-type-conforms-to-interface) + §9.4/§10.5 (record/enum =
+        // value type): when a generic method `M<T>(x: T) where T: IFoo` is
+        // monomorphized with T = a RECORD or an ENUM, the body's `x.Foo()` was
+        // resolved by sema to the INTERFACE method `IFoo.Foo` (member look-up
+        // went through the constraint — §14.2's "T's surface includes IFoo's
+        // members"). The receiver `x` is a value (a record struct, or an enum's
+        // underlying integer — not a pointer), so the itable-dispatch path in
         // emitMethodCall would either need a pointer receiver or hit the #484
         // non-pointer guard (returning nullptr → a malformed direct call to the
-        // i32-typed generic template). Since T is concretely known at this
-        // monomorphization, devirtualize: redirect `ms` to the record's own
-        // implementing method (records are sealed — §9.6 — so the implementation
-        // is exactly the one declared on the record). The receiver-shaping block
-        // below then spills the record value and the call becomes a direct call
-        // to `Point.Foo`, matching the non-generic `point.Foo()` path (control
-        // (f) of record_generic_constraint_test).
+        // i32-typed generic template, which for CompareTo/Equals silently yields
+        // the receiver-against-itself value, #1495). Since T is concretely known
+        // at this monomorphization, devirtualize: redirect `ms` to the concrete
+        // value type's own implementing method (records are sealed — §9.6 — and
+        // an enum's declared interface method — §10.5 — is likewise exactly the
+        // one declared). The receiver-shaping block below then spills a record
+        // value (matching `point.Foo()`) or passes an enum receiver as its
+        // underlying value (matching the direct `Priority.Low.CompareTo(...)`
+        // path — enum methods take `this` by value, not by pointer).
         if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface &&
             !recv->getType()->isPointerTy()) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -4458,7 +4461,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         ma->target ? ctx_.exprType(*ma->target) : nullptr) {
                     // Resolve a bare type-parameter receiver (`T`, no
                     // declaration) through the active substitution to its
-                    // concrete sema type, then take its record declaration.
+                    // concrete sema type, then take its record/enum declaration.
                     const sema::TypeRef* concrete = recvTy;
                     if (recvTy->kind == sema::TypeRef::Kind::Named &&
                         !recvTy->declaration && recvTy->astNode &&
@@ -4470,11 +4473,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             concrete = sit->second;
                     }
                     if (concrete && concrete->declaration &&
-                        concrete->declaration->kind ==
-                            ast::TypeDeclKind::Record) {
+                        (concrete->declaration->kind ==
+                             ast::TypeDeclKind::Record ||
+                         concrete->declaration->kind ==
+                             ast::TypeDeclKind::Enum)) {
                         if (sema::MethodSymbol* impl = findMethodByName(
                                 concrete->declaration, ms->name))
-                            ms = impl;  // devirtualize to the record's method
+                            ms = impl;  // devirtualize to the value type's method
                     }
                 }
             }
