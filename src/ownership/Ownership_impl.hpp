@@ -1276,6 +1276,11 @@ private:
     // for bounding forms 1 (constructor) and 2 (owned-return initializer).
     std::unordered_map<const ast::Expr*, const ast::LocalDecl*>
         scopedInitOfUsingLocal_;
+    // §28.14 form 3 (v0.180, #1541): the RHS call expression of a `:=` whose
+    // target is an `owned` field of `this` (`_sub := ticks.Subscribe(h)`). When
+    // such a call's return is owned, its stored callback is bounded by `this`
+    // (the owned field is disposed with `this`, severing the registration).
+    std::unordered_set<const ast::Expr*> scopedInitOfOwnedFieldOfThis_;
     // The enclosing method's own parameter symbols — distinguishes a real
     // capture of a method parameter from a lambda-internal parameter.
     std::unordered_set<sema::Symbol*> methodParamSet_;
@@ -1315,8 +1320,23 @@ private:
         const ast::Expr* callee;
         const ast::NewExpr* ne;
         const ast::Expr* arg;
+        // §28.14 form 4 (v0.180, #1541): non-null for an `event += handler`
+        // store — the event member-access expression whose chain head bounds
+        // the callback. When set, the bound is resolved by
+        // resolveChainHead(eventTarget) rather than the callee/using-var path.
+        const ast::Expr* eventTarget = nullptr;
     };
     std::vector<ScopedAdmission> scopedAdmissionQueue_;
+
+    // §28.14 (v0.180) bounding-object resolution result. The object whose
+    // teardown bounds a stored callback: a `using var`/`await using var` local
+    // (forms 1/2/5, and form 4 with a local chain head), or `this` (forms 3/4 —
+    // an `owned` field of `this`, or a `this`-rooted owned/event-backing member
+    // chain). None = no usable bound (capture-free callbacks only).
+    struct ScopedBound {
+        enum class Kind { None, UsingLocal, This } kind = Kind::None;
+        const ast::LocalDecl* local = nullptr;  // valid iff kind == UsingLocal
+    };
 
     // Walk the body once: assign scopedDeclOrder_, record using-var
     // initializer anchors, then check every call with a `scoped` formal
@@ -1339,9 +1359,11 @@ private:
     // `<token>.Register(callback)` (receiver type CancellationToken). Both
     // return `owned Subscription` (stdlib §2.11), so the §28.14 bounding
     // object resolves per form 2 (owned return initializing a `using var`) —
-    // see scopedBoundingLocal. The event `Add`/`Remove` (`+=`/`-=`) forms are
-    // NOT flipped: §24.3's normative signatures keep `Add(handler: (T) -> ())`
-    // plain, so they stay on the §28.14 stdlib-certified legacy path.
+    // see scopedBoundingLocal. As of v0.180 (#1541) `EventSource<T>.Add` /
+    // `AsyncEventSource<T>.Add` are `scoped` too (§24.3): a bare/qualified
+    // `<event>.Add(handler)` (and the `+=` desugaring) admits per §28.14
+    // bounding form 4 (the event's containing instance). `Remove` stays
+    // call-bounded.
     bool builtinScopedCallbackFormal(const ast::Expr* callee,
                                      std::size_t argPos);
     // Name-head matchers for the builtin receiver types above (the same three
@@ -1350,17 +1372,32 @@ private:
     bool typeRefIsCancellationToken(const sema::TypeRef* rt) const;
 
     // §28.14 call-site admission for one argument bound to a scoped formal.
-    // `callNode` is the CallExpr / NullCondCallExpr / NewExpr node.
+    // `callNode` is the CallExpr / NullCondCallExpr / NewExpr node; `eventTarget`
+    // is non-null only for the `event += handler` store (form 4).
     void checkScopedAdmission(const ast::Expr& callNode,
                               const ast::Expr* callee, const ast::NewExpr* ne,
-                              const ast::Expr& arg);
+                              const ast::Expr& arg,
+                              const ast::Expr* eventTarget = nullptr);
 
-    // Resolve the §28.14 bounding object of a call to a using/await-using
-    // LocalDecl, or null when the bounding object is not usable as a bound
-    // (plain expression receiver, field, non-initializer owned return, …).
-    const ast::LocalDecl* scopedBoundingLocal(const ast::Expr& callNode,
-                                              const ast::Expr* callee,
-                                              const ast::NewExpr* ne);
+    // Resolve the §28.14 bounding object of a call: forms 1/2 (using-var
+    // initializer), form 3 (owned-return → `owned` field of `this`), forms 4/5
+    // (the receiver's member-chain head). ScopedBound::None when no bound is
+    // usable (plain expression receiver, borrow-field hop, non-initializer
+    // owned return, …). // per §28.14
+    ScopedBound scopedBoundingLocal(const ast::Expr& callNode,
+                                    const ast::Expr* callee,
+                                    const ast::NewExpr* ne);
+
+    // §28.14 forms 4/5 (v0.180): resolve the chain head of a subscription
+    // receiver (`<recv>.Add`/`+=`, or the receiver of a scoped call). Every hop
+    // must be an `owned` field or a compiler-generated event backing member;
+    // the head is `this` (forms 3/4) or a `using var` local (form 4 with a
+    // local chain head / a form-5 receiver). A bare `this`/`base` *direct*
+    // receiver is form 5 and yields no bound (only forms 3/4 reach `this`,
+    // through a member hop). A borrow-field hop, an indexer, a getter, or a
+    // plain-local head yields None.
+    ScopedBound resolveChainHead(const ast::Expr* recv);
+    ScopedBound chainHeadRec(const ast::Expr* e);
 
     // COMPLETE capture enumeration for a lambda argument (statements,
     // expressions, patterns, nested lambdas; `this` is an IdentifierExpr and

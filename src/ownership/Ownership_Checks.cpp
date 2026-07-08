@@ -5318,24 +5318,28 @@ void MethodOwnership::walkSuspStmts(
 
 bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
                                                   std::size_t argPos) {
-    // #1420: builtin subscribe-and-store callees whose handler formal the
-    // stdlib declares `scoped` (stdlib §6.5 Subscribe, §6.1 Register; spec
-    // §24.3, v0.175). Enforcing here applies the §28.14 admission to their
-    // capture-bearing handler arguments. The event `Add`/`Remove` (`+=`/`-=`)
-    // producer-face forms are deliberately NOT included: §24.3's normative
-    // signatures keep them plain, so they remain stdlib-certified (§28.14
-    // v0.177 legacy path) until the spec migrates them.
+    // #1420 / #1541: builtin subscribe-and-store callees whose handler formal
+    // the stdlib declares `scoped` (stdlib §6.5 Subscribe/Add, §6.1 Register;
+    // spec §24.3, v0.175/v0.180). Enforcing here applies the §28.14 admission
+    // to their capture-bearing handler arguments. `EventSource<T>.Add` /
+    // `AsyncEventSource<T>.Add` became `scoped` (storing) in v0.180 (#1541 — the
+    // `event += handler` desugaring stores the handler in the subscriber list),
+    // so `<event>.Add(h)` (and the desugared `+=`) admit here too. `Remove`
+    // stays call-bounded (it only compares its argument during the call).
     if (argPos != 0) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
     if (!ma || !ma->target) return false;
-    if (ma->member == "Subscribe") {
-        // `<event>.Subscribe(h)` — the target is the event member itself
-        // (bare `Clicked` or qualified `btn.Clicked`, both resolving to the
-        // EventSymbol) …
+    if (ma->member == "Subscribe" || ma->member == "Add") {
+        // `<event>.Subscribe(h)` / `<event>.Add(h)` — the target is the event
+        // member itself (bare `Clicked` or qualified `btn.Clicked`, both
+        // resolving to the EventSymbol) …
         if (dynamic_cast<sema::EventSymbol*>(ctx_.exprSymbol(*ma->target)))
             return true;
-        // … or a VALUE whose static type is one of the event faces
-        // (`ev: IEvent<int>` parameter, an EventSource-typed borrow, …).
+        // … or a VALUE whose static type is one of the event faces (an
+        // `ev: IEvent<int>` parameter, an EventSource-typed borrow, …). `.Add`
+        // is producer-side, so a value receiver matches only the EventSource
+        // faces — the consumer interfaces (`IEvent`/`IAsyncEvent`) have no
+        // `Add`, and the typechecker rejects the access before this runs.
         return typeRefIsEventSourceLike(ctx_.exprType(*ma->target));
     }
     if (ma->member == "Register")
@@ -5354,7 +5358,8 @@ void MethodOwnership::scopedPreScan(
     // declaration-order comparisons are unaffected — see the queue's
     // declaration comment). // per §28.14
     for (const ScopedAdmission& wi : scopedAdmissionQueue_)
-        checkScopedAdmission(*wi.callNode, wi.callee, wi.ne, *wi.arg);
+        checkScopedAdmission(*wi.callNode, wi.callee, wi.ne, *wi.arg,
+                             wi.eventTarget);
     scopedAdmissionQueue_.clear();
 }
 
@@ -5400,6 +5405,23 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
             if (sema::Symbol* tsym = ctx_.exprSymbol(*tid))
                 scopedAssignedSyms_.insert(tsym);
         }
+        // §28.14 form 3 (v0.180, #1541): an owned-return scoped call directly
+        // assigned to an `owned` field of `this` (`_sub := ticks.Subscribe(h)`)
+        // bounds the stored callback by `this`. Record the RHS call node so
+        // scopedBoundingLocal resolves it to `this` (form 3).
+        if (as->op == ":=" && as->target && as->value &&
+            exprIsReceiverOwnedFieldBorrow(*as->target))
+            scopedInitOfOwnedFieldOfThis_.insert(as->value.get());
+        // §28.14 form 4 (v0.180, #1541): `event += handler` desugars to the
+        // `scoped` `Add` (§24.3). It is an AssignmentStmt (not a call), so
+        // queue the handler's admission explicitly, bounded by the event's
+        // containing instance (the chain head of the event target). `-=` is
+        // `Remove` (call-bounded) and is not admitted.
+        if (as->op == "+=" && as->target && as->value &&
+            dynamic_cast<sema::EventSymbol*>(ctx_.exprSymbol(*as->target)))
+            scopedAdmissionQueue_.push_back(
+                {as->target.get(), nullptr, nullptr, as->value.get(),
+                 as->target.get()});
         if (as->target) scopedPreScanExpr(*as->target);
         if (as->value) scopedPreScanExpr(*as->value);
         return;
@@ -5647,48 +5669,109 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
     return false;
 }
 
-const ast::LocalDecl* MethodOwnership::scopedBoundingLocal(
+namespace {
+// §28.14 chain-hop predicate (v0.180): an `owned` field is a hop the bounding
+// instance's teardown disposes (spec form 4's chain-hop restriction). A borrow
+// (non-`owned`) field hop resolves NO bound — across it the storing object is
+// externally owned and may outlive the chain head.
+bool symIsOwnedField(sema::Symbol* sym) {
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    for (std::string_view m : fs->modifiers)
+        if (m == "owned") return true;
+    return false;
+}
+}  // namespace
+
+MethodOwnership::ScopedBound MethodOwnership::chainHeadRec(const ast::Expr* e) {
+    using K = ScopedBound::Kind;
+    if (!e) return {};
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        // `this`/`base` reached at the chain head — form 4 head is `this`.
+        if (id->name == "this" || id->name == "base") return {K::This, nullptr};
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        // A bare event member (`Clicked`) or a bare `owned` field is an
+        // implicit `this.<member>` hop rooted at `this`.
+        if (dynamic_cast<sema::EventSymbol*>(sym)) return {K::This, nullptr};
+        if (symIsOwnedField(sym)) return {K::This, nullptr};
+        // A `using var`/`await using var` local chain head (form 4 with a
+        // local head, and the form-5 receiver).
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+            if (ls->isUsing)
+                if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                    return {K::UsingLocal, ld};
+        return {};  // plain local, parameter, static — no bound
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*ma);
+        // The hop must be an event backing member or an `owned` field; a
+        // borrow-field hop, property/getter, or method resolves NO bound.
+        if (dynamic_cast<sema::EventSymbol*>(sym))
+            return chainHeadRec(ma->target.get());
+        if (symIsOwnedField(sym)) return chainHeadRec(ma->target.get());
+        return {};
+    }
+    // Indexer, call result, `with`-expr, etc. — no bound.
+    return {};
+}
+
+MethodOwnership::ScopedBound MethodOwnership::resolveChainHead(
+    const ast::Expr* recv) {
+    // A bare `this`/`base` DIRECT receiver is form 5 (`this.scopedMethod(cb)`),
+    // not a bound: only forms 3/4 reach `this`, and both pass through a member
+    // hop (an `owned` field or an event backing member). Keep the direct-`this`
+    // receiver capture-free.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+        if (id->name == "this" || id->name == "base") return {};
+    return chainHeadRec(recv);
+}
+
+MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
     const ast::Expr& callNode, const ast::Expr* callee,
     const ast::NewExpr* ne) {
+    using K = ScopedBound::Kind;
     // Form 1 — constructor call: the constructed object. Usable as a bound
     // only when the NewExpr IS the initializer of a using/await-using local.
     if (ne) {
         auto it = scopedInitOfUsingLocal_.find(&callNode);
-        return it != scopedInitOfUsingLocal_.end() ? it->second : nullptr;
+        if (it != scopedInitOfUsingLocal_.end())
+            return {K::UsingLocal, it->second};
+        return {};
     }
-    if (!callee) return nullptr;
-    // Form 2 — a call whose return is `owned` AND is the initializer of a
-    // using/await-using local: the returned object.
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee))) {
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-            if (md->returnOwned) {
-                auto it = scopedInitOfUsingLocal_.find(&callNode);
-                if (it != scopedInitOfUsingLocal_.end()) return it->second;
-            }
-        }
-    }
-    // Form 2 (builtin, #1420): event `Subscribe` / CancellationToken
-    // `Register` return `owned Subscription` (stdlib §2.11 / §6.5 / §6.1) —
-    // when the call initializes a `using var`/`await using var` local, the
-    // returned Subscription is the bounding object; its disposal severs the
-    // registration (quiescence by removal, §28.14 / §24.6). // per §28.14
-    if (builtinScopedCallbackFormal(callee, 0)) {
+    if (!callee) return {};
+    // Does the call return `owned`? — needed for forms 2 and 3. User methods
+    // carry `returnOwned`; the builtin `Subscribe`/`Register` return
+    // `owned Subscription` (stdlib §2.11 / §6.5 / §6.1). `.Add` returns unit,
+    // so it never satisfies forms 2/3 and falls to form 4 below.
+    bool ownedReturn = false;
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee)))
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            ownedReturn = md->returnOwned;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        if ((ma->member == "Subscribe" || ma->member == "Register") &&
+            builtinScopedCallbackFormal(callee, 0))
+            ownedReturn = true;
+    // Form 2 — owned-return call initializing a using/await-using local: the
+    // returned object bounds the callback (its disposal severs the
+    // registration — quiescence by removal, §28.14 / §24.6).
+    if (ownedReturn) {
         auto it = scopedInitOfUsingLocal_.find(&callNode);
-        if (it != scopedInitOfUsingLocal_.end()) return it->second;
+        if (it != scopedInitOfUsingLocal_.end())
+            return {K::UsingLocal, it->second};
     }
-    // Form 3 — otherwise the receiver: admissible only when the receiver is a
-    // bare identifier naming a using/await-using local.
+    // Form 3 (v0.180) — owned-return call directly assigned to / initializing
+    // an `owned` field of `this`: the bounding object is `this`. Disposing
+    // `this` disposes the field, severing the registration before reclamation
+    // (§28.12). // per §28.14
+    if (ownedReturn && scopedInitOfOwnedFieldOfThis_.count(&callNode))
+        return {K::This, nullptr};
+    // Forms 4/5 — the receiver's member-chain head.
     const ast::Expr* recv = nullptr;
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
         recv = ma->target.get();
     else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
         recv = nm->target.get();
-    if (!recv) return nullptr;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv);
-    if (!id || id->name == "this" || id->name == "base") return nullptr;
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
-    if (!ls || !ls->isUsing) return nullptr;
-    return dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    return resolveChainHead(recv);
 }
 
 void MethodOwnership::scopedCollectCaptures(
@@ -5903,7 +5986,8 @@ void MethodOwnership::scopedCaptureWalkExpr(
 void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                                            const ast::Expr* callee,
                                            const ast::NewExpr* ne,
-                                           const ast::Expr& arg) {
+                                           const ast::Expr& arg,
+                                           const ast::Expr* eventTarget) {
     // Classify the argument form and enumerate its captures.
     std::vector<const ast::IdentifierExpr*> rawIds;
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
@@ -5998,6 +6082,12 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
         const ast::Node* declNode;  // null for params / this
     };
     std::vector<Source> sources;
+    // §28.14 forms 3/4 (v0.180): every captured LOCAL or PARAMETER — a
+    // non-`this` source. When the bounding object is `this` (forms 3/4), each
+    // such source is shorter-lived than the registration and is rejected: the
+    // handler could fire after it dangles (the #1541 p15 UAF). For a using-var
+    // bound these coincide with `sources` above and are order-checked instead.
+    std::vector<const ast::IdentifierExpr*> nonThisCaptures;
     bool anyCapture = false;
     std::unordered_set<sema::Symbol*> seen;
     for (const ast::IdentifierExpr* id : rawIds) {
@@ -6037,6 +6127,7 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                 return;
             }
             anyCapture = true;
+            nonThisCaptures.push_back(id);  // a param is not `this` (forms 3/4)
             // Parameters precede every local — declaration order holds. An
             // `owned` parameter is still a freezable source (it can be moved).
             if (ps->modifier == "owned")
@@ -6068,6 +6159,7 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             // conservative (treated as a reference).
             if (ls->declType && !isBorrowableType(ls->declType)) continue;
             anyCapture = true;
+            nonThisCaptures.push_back(id);  // a local is not `this` (forms 3/4)
             sources.push_back({id, sym, ls->decl});
             continue;
         }
@@ -6086,17 +6178,49 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
 
     if (!anyCapture) return;  // capture-free callbacks are always admitted
 
-    const ast::LocalDecl* bounding = scopedBoundingLocal(callNode, callee, ne);
-    if (!bounding) {
+    // §28.14 (v0.180): an `event += handler` store carries the event member-
+    // access as `eventTarget`; its chain head is the bounding object (form 4).
+    // Every other admission resolves through the call's callee/using-var path.
+    const ScopedBound bound =
+        eventTarget ? resolveChainHead(eventTarget)
+                    : scopedBoundingLocal(callNode, callee, ne);
+    if (bound.kind == ScopedBound::Kind::None) {
         report(Severity::Error, arg.span.begin,
                "a capture-bearing closure is not admitted here: the call's "
                "bounding object does not resolve to a `using var`/`await "
-               "using var` local (§28.14 — a plain expression, field, or "
-               "non-initializer receiver admits only capture-free "
-               "callbacks); bind the receiving object in a `using var` and "
-               "call through it");
+               "using var` local or to `this` (§28.14 — a plain expression, a "
+               "borrow-field hop, an indexer, a getter, or a non-initializer "
+               "receiver admits only capture-free callbacks); bind the "
+               "receiving object in a `using var`, store the owned handle in "
+               "an `owned` field of `this`, or subscribe through `this`");
         return;
     }
+    if (bound.kind == ScopedBound::Kind::This) {
+        // §28.14 forms 3/4 (v0.180): the bounding object is `this`. Every
+        // captured source must be `this` itself (or state reached through it —
+        // a field/method capture, classified as an implicit `this` capture
+        // above and never added to nonThisCaptures). A captured local or
+        // parameter is shorter-lived than the registration held by `this` (or
+        // its owned event backing member): a later raise would dangle. This is
+        // the #1541 p15 use-after-free — reject it at the subscription site.
+        if (!nonThisCaptures.empty()) {
+            const ast::IdentifierExpr* nt = nonThisCaptures.front();
+            report(Severity::Error, nt->span.begin,
+                   std::string("captured source `") + std::string(nt->name) +
+                   "` is not `this`: this subscription is bounded by `this` "
+                   "(§28.14 forms 3/4, v0.180) — its registration outlives `" +
+                   std::string(nt->name) + "`, so a later raise would use it "
+                   "after disposal. Capture only `this` (or state reached "
+                   "through it), or tie the subscription's lifetime to `" +
+                   std::string(nt->name) +
+                   "` with a `using var sub := ….Subscribe(…)`");
+            return;
+        }
+        return;  // only `this`/`this`-derived captures — admitted (`this`
+                 // outlives every invocation; no freeze needed)
+    }
+    // bound.kind == UsingLocal: the existing declared-before + freeze regime.
+    const ast::LocalDecl* bounding = bound.local;
     auto bIt = scopedDeclOrder_.find(bounding);
     const int boundIdx =
         bIt != scopedDeclOrder_.end() ? bIt->second : -1;

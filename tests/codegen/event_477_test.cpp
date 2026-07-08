@@ -92,26 +92,24 @@ BEZEL_TEST(codegen_events_477, static_event_dispose_unsubscribes_b6) {
 // §24.3 / §24.4: inside the declaring class, `event += handler` is the fixed
 // desugaring to Add on the EventSource<T> face. On a STATIC event the added
 // handler must fire on Raise. Hook is a static method; the static backing
-// source is shared with the static Raise.
+// source is shared with the static Raise. Per §24.5 (v0.180) a static-event
+// handler must be capture-free — the handler here mutates a static field
+// (globally live, not a capture), which is admitted (§28.14, #1541).
 BEZEL_TEST(codegen_events_477, static_event_plus_equals_inside_class_b6) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Box; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event Signal: Ev; "
-        "  public static method Hook(target: Box) "
-        "    Signal += (e) => target.Add(e.N); "          // += desugars to Add
+        "  public static method Hook() "
+        "    Signal += (e) => do Total := Total + e.N; end; "  // capture-free (static field)
         "  end Hook; "
         "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var box := new Box(); "
-        "  App.Hook(box); App.Fire(7); App.Fire(3); "
-        "  return box.V; "                                // expect 10
+        "  App.Hook(); App.Fire(7); App.Fire(3); "
+        "  return App.Total; "                            // expect 10
         "end Main; end C;"), 10);
 }
 

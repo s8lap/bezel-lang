@@ -12,10 +12,12 @@
 // handlers are always admitted. Disposing the Subscription severs the
 // registration — quiescence by removal (§28.14, §24.6).
 //
-// The event `Add`/`Remove` (`+=`/`-=`) producer-face forms are deliberately
-// NOT flipped: §24.3's normative signatures keep `Add(handler: (T) -> ())`
-// plain (the §28.14 v0.177 stdlib-certified legacy path), and §24.5's own
-// example passes a capture-bearing lambda through `+=`.
+// As of v0.180 (#1541) `EventSource<T>.Add` / `AsyncEventSource<T>.Add` (the
+// `event += handler` desugaring) ARE `scoped` too (§24.3): the stored handler
+// admits under §28.14 with the bounding object resolved to the event's
+// containing instance (form 4). §24.5's own capture-bearing `+=` example
+// captures `this`, which form 4 admits. `Remove` (`-=`) stays call-bounded.
+// The full forms-3/4 admission is exercised in event_add_scoped_1541_test.
 
 #include <string>
 
@@ -314,13 +316,15 @@ BEZEL_TEST(scoped_builtin_1420,
 }
 
 // ===========================================================================
-// The Add (`+=`) form stays on the certified plain path (§24.3, v0.177)
+// The Add (`+=`) form is `scoped` and admits a `this`-capture (§24.3, v0.180)
 // ===========================================================================
 
-// §24.3 / §24.5: `event += <capture-bearing handler>` inside the declaring
-// class is NOT subject to the §28.14 admission — Add's normative signature is
-// plain. (The spec's own §24.5 example is a capture-bearing `+=` handler.)
-BEZEL_TEST(scoped_builtin_1420, event_add_form_not_flipped) {
+// §24.3 / §24.5 / §28.14 form 4 (v0.180, #1541): `event += <handler>` inside
+// the declaring class IS subject to the §28.14 admission, bounded by the
+// publisher `this`. A handler that captures only `this` (here it mutates the
+// declaring class's own field) is admitted. (A capture of a shorter-lived
+// local/param is rejected — see event_add_scoped_1541_test.)
+BEZEL_TEST(scoped_builtin_1420, event_add_this_capture_admitted) {
     auto r = parseAndCheckOwnership(
         "module M; import System.Threading; "
         "class Counter "

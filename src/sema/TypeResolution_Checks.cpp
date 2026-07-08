@@ -429,6 +429,19 @@ void Resolver::checkEnumRestrictions() {
                 if (ps->isIndexer) bad("an indexer");
                 continue;
             }
+            // per §24.1 (v0.180): an event's compiler-generated `owned
+            // EventSource` backing field requires an owning, disposable
+            // container, which an enum is not (§9.7, Appendix C.3).
+            if (dynamic_cast<EventSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("enum `") + std::string(t->name) +
+                    "` may not declare an `event` member — an event's "
+                    "compiler-generated `owned EventSource` backing field "
+                    "requires an owning, disposable container, which an enum "
+                    "is not (§24.1, §9.7)");
+                continue;
+            }
             if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
                 if (hasMod(ms, "virtual") || hasMod(ms, "abstract") ||
                     hasMod(ms, "override")) {
@@ -733,6 +746,19 @@ void Resolver::checkRecordRestrictions() {
                     Severity::Error, m->declLoc,
                     std::string("record `") + std::string(t->name) +
                     "` may not declare a destructor (§9.7)");
+                continue;
+            }
+            // per §24.1 (v0.180): an event's compiler-generated `owned
+            // EventSource` backing field requires an owning, disposable
+            // container, which a record is not (§9.7, Appendix C.3).
+            if (dynamic_cast<EventSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record `") + std::string(t->name) +
+                    "` may not declare an `event` member — an event's "
+                    "compiler-generated `owned EventSource` backing field "
+                    "requires an owning, disposable container, which a record "
+                    "is not (§24.1, §9.7)");
                 continue;
             }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {

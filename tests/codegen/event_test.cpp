@@ -94,27 +94,29 @@ BEZEL_TEST(codegen_events_24, dispose_subscription_unsubscribes_handler) {
         "return box.V; ")), 5);
 }
 
-// §24.3 / §24.4: inside the declaring class, `event += handler` is the fixed
-// desugaring to Add (the EventSource<T> face). The added handler fires on Raise.
+// §24.3 / §24.4 / §28.14 form 4 (v0.180, #1541): inside the declaring class,
+// `event += handler` is the fixed desugaring to the `scoped` Add (the
+// EventSource<T> face). The added handler fires on Raise. The handler captures
+// only `this` (it mutates the declaring class's own field), which §28.14 form 4
+// admits — the subscription is bounded by the publisher `this`. (A handler
+// capturing a shorter-lived local/param is now rejected at the subscription
+// site — see the event_add_scoped_1541 ownership tests.)
 BEZEL_TEST(codegen_events_24, plus_equals_adds_handler_inside_class) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Box; "
         "class Button "
+        "  public V: int := 0; "
         "  public event Clicked: Ev; "
-        "  public method Hook(target: Box) "
-        "    Clicked += (e) => target.Add(e.N); "   // §24.4 += desugars to Add
+        "  public method Hook() "
+        "    Clicked += (e) => do V := V + e.N; end; "  // captures `this` (§28.14 form 4)
         "  end Hook; "
         "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
         "end Button; "
         "class C public static method Main(): int "
-        "  var box := new Box(); var b := new Button(); "
-        "  b.Hook(box); b.Fire(7); b.Fire(3); "
-        "  return box.V; "
+        "  var b := new Button(); "
+        "  b.Hook(); b.Fire(7); b.Fire(3); "
+        "  return b.V; "
         "end Main; end C;"), 10);  // 7 + 3
 }
 
