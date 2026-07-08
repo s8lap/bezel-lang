@@ -1472,6 +1472,83 @@ void  bz_task_fire_and_forget(void* tp) {
     }
 }
 
+// §30.10 (v0.179 / #1520): report+dispose a DisposedAccessException fault
+// raised in an ABANDONED continuation — the checked-disposal-mode backstop for
+// the `using var t := call();` "unsupervised" drop (spec §30.10: "any
+// exceptions [an abandoned task] raises are silently swallowed — except that
+// in checked disposal mode a DisposedAccessException raised in an abandoned
+// continuation is first reported ... then swallowed"). `disposedAccessVtable`
+// is null when the caller compiled without --checked-disposal (no report is
+// possible: an unchecked build never emits the guard that raises
+// DisposedAccessException, so `task->error_obj`, if any, cannot be one).
+//
+// Only ever called from bz_task_fire_and_forget_checked's SLOW path (task
+// still running at the moment of abandonment) — a task already faulted BY
+// scope-end is handled, silently, by codegen's scope-end error_obj disposal
+// which runs BEFORE bz_task_fire_and_forget_checked is even called (see
+// LlvmBackend_Disposal.cpp); that path already reclaims error_obj, so this
+// function must never run against an already-done task or it would inspect
+// (and double-dispose) a freed object.
+static void bz_task_faf_report_disposed_access(bz_task_t* task,
+                                                void* disposedAccessVtable) {
+    if (!disposedAccessVtable || !task->is_error || !task->error_obj) return;
+    void* vt = nullptr;
+    memcpy(&vt, task->error_obj, sizeof(void*));
+    if (vt != disposedAccessVtable) return;
+    // The implementation-defined diagnostic channel (§30.10): stderr, in the
+    // same spirit as the runtime's other exception-to-text renderer
+    // (bz_unhandled_exception, §33.3) but WITHOUT terminating the process —
+    // this backstop reports and continues; it does not fault the program.
+    fputs("DisposedAccessException: an abandoned continuation accessed "
+          "disposed state after its task was disposed without being awaited "
+          "(checked disposal mode, spec §30.10)\n", stderr);
+    fflush(stderr);
+    // §30.9: the task owns its fault exception, and — being abandoned — has
+    // no awaiter that will ever observe or dispose it. Dispose it here as the
+    // terminal act of the swallow (bz_dispose_class_obj, defined above:
+    // generic virtual Dispose() + reclaim, the same helper WhenAllOwned uses
+    // for its own input faults).
+    bz_dispose_class_obj(task->error_obj);
+    task->error_obj = nullptr;
+}
+
+// §30.10 (v0.179 / #1520): checked-disposal-mode entry point for the `using
+// var t := call();` scope-end drop of an unconsumed Task. Codegen selects
+// this over the plain bz_task_fire_and_forget only when compiled with
+// --checked-disposal (LlvmBackend_Disposal.cpp) — an unchecked build never
+// raises DisposedAccessException in the first place (the guard that raises it
+// is never emitted), so routing through the extra check there would only
+// ever no-op; keeping it out of the unchecked path matches the project's
+// zero-cost-when-off convention (§28.2).
+void  bz_task_fire_and_forget_checked(void* tp, void* disposedAccessVtable) {
+    if (!tp) return;
+    auto* task = (bz_task_t*)tp;
+    bool already_done;
+    { std::lock_guard<std::mutex> lk(task->mtx); already_done = task->done; }
+    if (already_done) {
+        // NOT an abandoned continuation: the task fully settled before this
+        // disposal ran (whether it succeeded, faulted synchronously, or was
+        // never suspended at all), so any fault it produced was already
+        // handled — silently, per the default swallow rule — by codegen's
+        // scope-end error_obj disposal that runs before this call. Touching
+        // error_obj here would read/double-dispose an object that disposal
+        // already reclaimed. Fall straight through to the ordinary free.
+        bz_task_free(tp);
+    } else {
+        // Slow path: task still running at the moment of abandonment — a
+        // genuinely abandoned continuation. Register a continuation that,
+        // when the task eventually settles, checks for the
+        // DisposedAccessException backstop before freeing the task struct.
+        bz_task_then(tp,
+            [](void* completedTask, void* state) {
+                bz_task_faf_report_disposed_access((bz_task_t*)completedTask,
+                                                    state);
+                bz_task_free(completedTask);
+            },
+            disposedAccessVtable);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CancellationToken / CancellationTokenSource — stdlib §6.1 / spec §30.8.
 //

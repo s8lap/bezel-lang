@@ -849,6 +849,19 @@ void* bz_task_when_all_owned(void* task_arr);
 // caller must not use or free the pointer again.
 void  bz_task_fire_and_forget(void* task);
 
+// §30.10 (v0.179 / #1520): checked-disposal-mode entry point for the `using
+// var t := call();` scope-end drop of an unconsumed Task (the "unsupervised"
+// abandonment idiom). Identical machinery to bz_task_fire_and_forget, plus a
+// backstop: if `task` is still running (genuinely abandoned — its continuation
+// resumes only after this disposing scope has already exited) and its
+// eventual fault is a DisposedAccessException (vtable == disposedAccessVtable),
+// the fault is first reported through the runtime's diagnostic channel (the
+// same one FireAndForget's own fault logging uses) and then swallowed — "the
+// backstop that catches a §30.1 source-outlives-settlement violation must
+// never itself be invisible." Codegen passes the compiled DisposedAccessException
+// vtable global; only emitted when compiled with --checked-disposal.
+void  bz_task_fire_and_forget_checked(void* task, void* disposedAccessVtable);
+
 // ---------------------------------------------------------------------------
 // stdlib §6.10 / spec §28.14 (v0.175, #808): TaskScope — the structured-
 // concurrency nursery. See the implementation block comment for the full

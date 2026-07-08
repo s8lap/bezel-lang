@@ -2141,9 +2141,34 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                            {ptrTy(), ptrTy()});
                 builder_.CreateCall(setDispFn, {t, it->taskOwnedResultDisposer});
             }
-            auto* fn = declareC("bz_task_fire_and_forget",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(fn, {t});
+            // §30.10 (v0.179 / #1520): in checked disposal mode, route this
+            // abandonment through bz_task_fire_and_forget_checked instead of
+            // the plain entry point. If the task is STILL RUNNING at this
+            // scope-end drop (the genuinely-abandoned-continuation case the
+            // scope-end error_obj handling above deliberately skips, per the
+            // #1021 comment), its eventual continuation may resume past this
+            // point and touch state this scope's OTHER disposals just tore
+            // down — the §30.1 source-outlives-settlement violation this
+            // whole backstop exists for. Spec §30.10: "a DisposedAccessException
+            // raised in an abandoned continuation is first reported through
+            // the same implementation-defined diagnostic channel as
+            // FireAndForget's logging, then swallowed." An unchecked build
+            // never emits the disposed-flag guard that raises
+            // DisposedAccessException in the first place, so the plain
+            // (unchanged) entry point is correct and zero-cost there.
+            if (checkedDisposal_) {
+                llvm::Value* daVt = llvm::ConstantPointerNull::get(ptrTy());
+                { auto vit = builtinVtable_.find("DisposedAccessException");
+                  if (vit != builtinVtable_.end()) daVt = vit->second; }
+                auto* fn = declareC("bz_task_fire_and_forget_checked",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {t, daVt});
+            } else {
+                auto* fn = declareC("bz_task_fire_and_forget",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {t});
+            }
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
