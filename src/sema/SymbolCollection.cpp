@@ -461,13 +461,25 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
 // and per the §9.2 "Authors who want explicit equality … declare `=` and `<>`"
 // clause a user `=`/`<>` overload opts out).
 //
-// The §9.2 "non-trivial constructor body" disqualifier IS now decided here
-// (#770): a constructor whose body does work beyond property initialization
-// (control flow, locals, throws, non-property-target assignments) opts the
-// record out of auto-equality. The "side-effecting computed property"
-// disqualifier remains out of scope; computed (expression-bodied / block)
-// properties are treated as non-disqualifying (the spec's stated default for
-// the trivial forms).
+// v0.182 (#1572): the former #770 "non-trivial constructor body" disqualifier
+// and the "side-effecting computed property" disqualifier are BOTH retired —
+// equality/hashing/ToString are defined over storage (auto-properties) only,
+// so no constructor-body or computed-property-body behavior can affect their
+// correctness (a validating or normalizing constructor, e.g. `Width > 0 and
+// Height > 0`, no longer opts a record out of `=`). A constructor — instance
+// or static, regardless of what its body does — is therefore unconditionally
+// non-disqualifying. Computed (expression-bodied / block) properties were
+// already treated as non-disqualifying regardless of body; that is unchanged.
+//
+// v0.182 also codifies (§9.2 "Static members are ignored"): `const`
+// declarations, `static readonly` fields, and static methods/properties
+// contribute no instance storage and neither qualify nor disqualify. Static
+// auto-properties and static methods already fell through as benign (the
+// PropertySymbol/MethodSymbol arms below do not distinguish static); a
+// `static readonly` FIELD (an explicit FieldDecl carrying the `static`
+// modifier — the FieldSymbol arm) did NOT get this exemption before v0.182
+// and was wrongly disqualifying a record for exactly the "Origin-style
+// constant" pattern §9.2 gives as the motivating example — fixed here.
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
                                      const SemaContext& ctx) {
     if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
@@ -488,9 +500,16 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
         // A non-auto property (expression-bodied or block-form) is a computed
         // member: it does not contribute storage and does not disqualify.
         if (dynamic_cast<const PropertySymbol*>(m)) continue;
-        // An explicit field declaration is storage that is not an
-        // auto-property → disqualifies (§9.2).
-        if (dynamic_cast<const FieldSymbol*>(m)) return false;
+        if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
+            // §9.2 v0.182: a `static` field (e.g. `static readonly`) carries no
+            // instance storage and is ignored. A non-static explicit field IS
+            // storage that is not an auto-property → still disqualifies.
+            bool isStatic = false;
+            for (auto mod : fs->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) continue;
+            return false;
+        }
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
             // A manually-declared equality member suppresses the auto package
             // (§9.2): an `Equals`/`GetHashCode` method, or an `=`/`<>` operator
@@ -510,39 +529,11 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
                 return false;
             continue;  // ordinary methods (and `ToString`) do not disqualify (§9.2)
         }
-        // §9.2 (#770): a constructor disqualifies auto-equality when its body
-        // "performs work other than property initialization." A TRIVIAL body is
-        // one whose every statement is a property-initialization assignment
-        // (`P := e` / `this.P := e`, op `:=`, target a bare name or `this.`
-        // member). Any other statement form — control flow (`if`/`while`/`for`/
-        // `case`/`try`), a `throw`, a local declaration, a compound or non-
-        // property-target assignment — is "other work" and opts the record out
-        // of auto-equality (the author must then declare explicit `=`/`<>`). A
-        // constructor-chain ExpressionStmt is conservatively treated as trivial
-        // (a residual leniency for a side-effecting bare call — far narrower
-        // than the prior blanket acceptance of every constructor body).
-        if (auto* cs = dynamic_cast<const ConstructorSymbol*>(m)) {
-            if (auto* cd =
-                    dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                for (const auto& st : cd->body) {
-                    if (!st) continue;
-                    if (auto* as =
-                            dynamic_cast<const ast::AssignmentStmt*>(st.get())) {
-                        if (as->op == ":=" && as->target &&
-                            (dynamic_cast<const ast::IdentifierExpr*>(
-                                 as->target.get()) ||
-                             dynamic_cast<const ast::MemberAccessExpr*>(
-                                 as->target.get())))
-                            continue;  // property-initialization — trivial
-                        return false;  // compound / other-target — non-trivial
-                    }
-                    if (dynamic_cast<const ast::ExpressionStmt*>(st.get()))
-                        continue;  // constructor-chain call — conservatively ok
-                    return false;  // any other statement kind — non-trivial
-                }
-            }
-            continue;
-        }
+        // §9.2 v0.182 (#1572): a constructor — instance or static, regardless
+        // of what its body does — never disqualifies auto-equality (the
+        // former #770 trivial-body check is retired; see the function
+        // comment above).
+        if (dynamic_cast<const ConstructorSymbol*>(m)) continue;
         // Const members and nested types carry no instance storage and do not
         // participate in equality; they are benign.
         if (dynamic_cast<const ConstMemberSymbol*>(m)) continue;
@@ -576,8 +567,15 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                         storageComponentType(m, ctx), ctx, 0))
                     return false;
             } else {
-                // Explicit body field declaration: disqualifying per §9.2.
-                return false;
+                // §9.2 v0.182 (#1572): a `static` body field (e.g. `static
+                // readonly`) carries no instance storage and is ignored —
+                // same static-member exemption as the body-record path
+                // (isAutoEqualityBearingBodyRecord above). A non-static
+                // explicit body field declaration remains disqualifying.
+                bool isStatic = false;
+                for (auto mod : fs->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (!isStatic) return false;
             }
             continue;
         }
@@ -601,30 +599,11 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                 return false;
             continue;  // ordinary methods and ToString override are benign
         }
-        if (auto* cs = dynamic_cast<const ConstructorSymbol*>(m)) {
-            // Same trivial-body check as body records (§9.3 → §9.2, #770).
-            if (auto* cd =
-                    dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                for (const auto& st : cd->body) {
-                    if (!st) continue;
-                    if (auto* as =
-                            dynamic_cast<const ast::AssignmentStmt*>(
-                                st.get())) {
-                        if (as->op == ":=" && as->target &&
-                            (dynamic_cast<const ast::IdentifierExpr*>(
-                                 as->target.get()) ||
-                             dynamic_cast<const ast::MemberAccessExpr*>(
-                                 as->target.get())))
-                            continue;
-                        return false;
-                    }
-                    if (dynamic_cast<const ast::ExpressionStmt*>(st.get()))
-                        continue;
-                    return false;
-                }
-            }
-            continue;
-        }
+        // §9.2 v0.182 (#1572, via §9.3): a constructor — instance or static,
+        // regardless of what its body does — never disqualifies auto-equality
+        // (the former #770 trivial-body check is retired; see
+        // isAutoEqualityBearingBodyRecord's function comment above).
+        if (dynamic_cast<const ConstructorSymbol*>(m)) continue;
         if (dynamic_cast<const ConstMemberSymbol*>(m)) continue;
         if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
         return false;

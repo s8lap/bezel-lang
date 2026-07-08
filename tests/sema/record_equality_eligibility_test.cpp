@@ -197,13 +197,19 @@ BEZEL_TEST(sema_record_equality, ineligible_user_operator_eq_accepted_spec_8_4) 
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// ─── #770: a NON-TRIVIAL constructor body disqualifies auto-equality ────────
+// ─── v0.182 (#1572): #770's "non-trivial constructor body" disqualifier is
+// ─── RETIRED — a constructor never disqualifies auto-equality, regardless of
+// ─── what its body does ──────────────────────────────────────────────────
 
-// §9.2: "A body record is not auto-equality-bearing … when it contains: A
-// non-trivial constructor body that performs work other than property
-// initialization." A constructor with control flow (`if … then … end`) is
-// non-trivial — `=` on the record is a compile error.
-BEZEL_TEST(sema_record_equality, nontrivial_ctor_eq_diagnosed_770) {
+// §9.2 v0.182 (#1572): "Removed in v0.182: the former … 'non-trivial
+// constructor body' disqualifier[]. … no constructor body … can change what
+// structural `=`, `GetHashCode`, or `ToString` mean." A constructor with
+// control flow (`if … then … end`) — the exact #770 example that used to be
+// rejected — no longer disqualifies: `=` compiles.
+// (Regression guard, superseding the retired #770
+// nontrivial_ctor_eq_diagnosed_770 test, which asserted the now-repealed
+// behavior.)
+BEZEL_TEST(sema_record_equality, nontrivial_ctor_eq_accepted_v0182_1572) {
     auto r = parseSema(
         "module M; "
         "record Clamped "
@@ -217,12 +223,14 @@ BEZEL_TEST(sema_record_equality, nontrivial_ctor_eq_diagnosed_770) {
         "  var a := new Clamped(5); var b := new Clamped(5); "
         "  _ := a = b; "
         "end M; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §9.2 / §8.3: `.Equals(...)` on the same non-trivial-ctor record is likewise a
-// compile error.
-BEZEL_TEST(sema_record_equality, nontrivial_ctor_equals_call_diagnosed_770) {
+// §9.2 v0.182 (#1572): `.Equals(...)` on the same record is likewise accepted
+// now that a non-trivial constructor body no longer disqualifies.
+// (Regression guard, superseding the retired #770
+// nontrivial_ctor_equals_call_diagnosed_770 test.)
+BEZEL_TEST(sema_record_equality, nontrivial_ctor_equals_call_accepted_v0182_1572) {
     auto r = parseSema(
         "module M; "
         "record Clamped "
@@ -235,6 +243,90 @@ BEZEL_TEST(sema_record_equality, nontrivial_ctor_equals_call_diagnosed_770) {
         "class C public method M() "
         "  var a := new Clamped(5); var b := new Clamped(5); "
         "  _ := a.Equals(b); "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.2 v0.182 (#1572): a VALIDATING constructor — the spec's own motivating
+// example ("Width > 0 and Height > 0"), which THROWS on invalid input rather
+// than merely clamping — is likewise fully compatible with auto-equality.
+BEZEL_TEST(sema_record_equality, validating_ctor_eq_accepted_v0182_1572) {
+    auto r = parseSema(
+        "module M; "
+        "record Rectangle "
+        "  public property Width: decimal; "
+        "  public property Height: decimal; "
+        "  public constructor(width: decimal, height: decimal) "
+        "    if width <= 0 or height <= 0 then "
+        "      throw new Exception(\"bad dims\"); "
+        "    end; "
+        "    Width := width; "
+        "    Height := height; "
+        "  end constructor; "
+        "end Rectangle; "
+        "class C public method M() "
+        "  var a := new Rectangle(3, 4); var b := new Rectangle(3, 4); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ─── v0.182 (#1572): static members are ignored — neither qualify nor
+// ─── disqualify auto-equality ───────────────────────────────────────────
+
+// §9.2 v0.182: "Static members are ignored … `static readonly` fields …
+// contribute no instance storage and neither qualify nor disqualify the
+// record — a record may carry `Origin`-style constants … without losing `=`."
+// A `static readonly` FIELD (an explicit FieldDecl, not an auto-property) must
+// NOT disqualify — before the fix, the FieldSymbol arm of
+// isAutoEqualityBearingBodyRecord rejected ANY explicit field unconditionally,
+// including static ones.
+BEZEL_TEST(sema_record_equality, static_readonly_field_ignored_eq_accepted_v0182_1572) {
+    auto r = parseSema(
+        "module M; "
+        "record Point "
+        "  public property X: int; "
+        "  public property Y: int; "
+        "  public static readonly Label: string := \"origin-family\"; "
+        "  public constructor(x: int, y: int) X := x; Y := y; end constructor; "
+        "end Point; "
+        "class C public method M() "
+        "  var a := new Point(1, 2); var b := new Point(1, 2); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.2 v0.182 (via §9.3's combined-form application of the same rule): a
+// static field is ignored on a COMBINED-form (positional + body) record too.
+BEZEL_TEST(sema_record_equality,
+           static_readonly_field_ignored_combined_form_eq_accepted_v0182_1572) {
+    auto r = parseSema(
+        "module M; "
+        "record Vec2(X: int, Y: int) "
+        "  public static readonly Label: string := \"vec2\"; "
+        "end Vec2; "
+        "class C public method M() "
+        "  var a := new Vec2(1, 2); var b := new Vec2(1, 2); "
+        "  _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Regression control: a NON-static explicit field still disqualifies (§9.2
+// unchanged) — only `static` fields get the v0.182 exemption.
+BEZEL_TEST(sema_record_equality,
+           non_static_field_still_disqualifies_control_v0182_1572) {
+    auto r = parseSema(
+        "module M; "
+        "record HasNonStaticField "
+        "  public property X: int; "
+        "  public Cache: int := 0; "
+        "  public constructor(x: int) X := x; end constructor; "
+        "end HasNonStaticField; "
+        "class C public method M() "
+        "  var a := new HasNonStaticField(1); var b := new HasNonStaticField(1); "
+        "  _ := a = b; "
         "end M; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }

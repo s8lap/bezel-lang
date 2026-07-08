@@ -2720,9 +2720,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     }
     // §9.2 (v0.156)/§8.3: `=` / `<>` on a body record that is not auto-equality-
     // bearing and that declares no explicit operator is a compile error at the
-    // use site.  Disqualifiers include an explicit field, a side-effecting
-    // computed property, a non-trivial constructor body, and — per §9.2 v0.156
-    // — an `override` of `Equals`, `GetHashCode`, or `ToString`.  A user
+    // use site.  Disqualifiers include a non-static explicit field and — per
+    // §9.2 v0.156 — an `override` of `Equals` or `GetHashCode`.  (v0.182,
+    // #1572: a computed-property body and a constructor body — however
+    // non-trivial — are NOT disqualifiers; equality/hashing/ToString are
+    // defined over storage only, so no member's body can affect them.)  A user
     // `=`/`<>` overload would already have been selected by findBinaryOperator
     // above (so we never reach here for those); recordHasUserDeclaredEquality
     // only returns true for operator overloads now (not bare Equals/GetHashCode

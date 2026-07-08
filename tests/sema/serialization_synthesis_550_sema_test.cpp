@@ -339,3 +339,122 @@ BEZEL_TEST(sema_serialization_550,
         "record R(X: int serialized \"myField\"): ISerializable, IDeserializable;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §9.8 v0.182 (#1572): record Deserialize CONSTRUCTOR SELECTION.
+//
+// "Construct the result (v0.182 …). If the record declares one or more
+// explicit constructors, the synthesized Deserialize calls the unique
+// explicit constructor whose parameter list binds exactly the serialized
+// components, matched by name — compared case-insensitively … If explicit
+// constructors exist but none matches, more than one matches, … the
+// conformance declaration is a compile error naming the candidates … A
+// record that declares no explicit constructor is constructed directly from
+// the read components at the storage level."
+// ===========================================================================
+
+// §9.8 v0.182: a body record with exactly ONE explicit constructor whose
+// parameters bijection-match the auto-properties by name (case-insensitive,
+// order-insensitive: ctor param `height` before `width`, properties declared
+// `Width` then `Height`) is accepted — no ambiguity, no error.
+BEZEL_TEST(sema_serialization_550,
+           record_unique_explicit_ctor_match_accepted_spec_9_8_v0182) {
+    auto r = parseSema(
+        "module M; "
+        "record Rectangle: ISerializable, IDeserializable "
+        "  public property Width: decimal; "
+        "  public property Height: decimal; "
+        "  public constructor(height: decimal, width: decimal) "
+        "    Width := width; "
+        "    Height := height; "
+        "  end constructor; "
+        "end Rectangle;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.8 v0.182: a body record with NO explicit constructor is unaffected by
+// the constructor-selection rule (storage-level construction applies) — no
+// error, regardless of how many auto-properties it has.
+BEZEL_TEST(sema_serialization_550,
+           record_no_explicit_ctor_storage_level_accepted_spec_9_8_v0182) {
+    auto r = parseSema(
+        "module M; "
+        "record Rectangle: ISerializable, IDeserializable "
+        "  public property Width: decimal; "
+        "  public property Height: decimal; "
+        "end Rectangle;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.8 v0.182: a purely positional record (§9.1) has no explicit constructor
+// (the auto-generated primary constructor is not "explicit") — the
+// constructor-selection rule does not apply, no error.
+BEZEL_TEST(sema_serialization_550,
+           record_positional_no_explicit_ctor_accepted_spec_9_8_v0182) {
+    auto r = parseSema(
+        "module M; "
+        "record Point(X: int, Y: int): ISerializable, IDeserializable;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.8 v0.182: a body record whose sole explicit constructor's parameter set
+// does NOT bijection-match the serialized components (an extra/mismatched
+// name) is a compile error naming the candidate — "no constructor has
+// parameter names matching the serialized component set."
+BEZEL_TEST(sema_serialization_550,
+           record_explicit_ctor_no_match_rejected_spec_9_8_v0182) {
+    auto r = parseSema(
+        "module M; "
+        "record Bad: ISerializable, IDeserializable "
+        "  public property N: int; "
+        "  public constructor(m: int) N := m + 1; end constructor; "
+        "end Bad;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("no explicit constructor has parameter names "
+                            "matching") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §9.8 v0.182: a body record with TWO explicit constructors that both
+// bijection-match the same component set (by name, ignoring parameter order)
+// is ambiguous — a compile error naming both candidates ("more than one …
+// matches … ambiguous").
+BEZEL_TEST(sema_serialization_550,
+           record_explicit_ctor_ambiguous_rejected_spec_9_8_v0182) {
+    auto r = parseSema(
+        "module M; "
+        "record Ambig: ISerializable, IDeserializable "
+        "  public property N: int; "
+        "  public property M: int; "
+        "  public constructor(n: int, m: int) N := n; M := m; end constructor; "
+        "  public constructor(m: int, n: int) N := n * 2; M := m * 2; "
+        "  end constructor; "
+        "end Ambig;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("more than one explicit constructor matches") !=
+                std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §9.8 v0.182 (via §9.3 combined form): a combined-form record's positional
+// fields count as storage components alongside body auto-properties for the
+// SAME constructor-selection rule — an explicit constructor bijection-matching
+// the positional fields by name is accepted.
+BEZEL_TEST(sema_serialization_550,
+           record_combined_form_explicit_ctor_match_accepted_spec_9_8_v0182) {
+    auto r = parseSema(
+        "module M; "
+        "record Vec2(X: int, Y: int): ISerializable, IDeserializable "
+        "  public constructor(x: int, y: int) "
+        "    X := x + 100; "
+        "    Y := y + 100; "
+        "  end constructor; "
+        "end Vec2;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

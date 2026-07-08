@@ -922,14 +922,125 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         builder_.SetInsertPoint(okBB);
     }
 
-    // Build result struct: insert all non-skip fields from their slots.
-    llvm::Value* result = builder_.CreateLoad(st, resultSlot, "deser.rec");
-    for (unsigned ci = 0; ci < components.size(); ++ci) {
-        if (components[ci].isSkip) continue;
-        if (!slots[ci]) continue;
-        if (ci >= st->getNumElements()) continue;
-        llvm::Value* fv = builder_.CreateLoad(st->getElementType(ci), slots[ci]);
-        result = builder_.CreateInsertValue(result, fv, {ci});
+    // §9.8 v0.182 (#1572): if the record declares an explicit (non-static)
+    // constructor, the synthesized Deserialize CALLS the unique constructor
+    // whose parameter list binds exactly the serialized components, matched
+    // by declared identifier, case-insensitively — sema (the record ctor-
+    // selection check, TypeResolution_Checks.cpp) already validated that
+    // exactly one such constructor exists whenever this codegen runs. A
+    // record with NO explicit constructor falls through to the pre-existing
+    // storage-level construction below ("A record that declares no explicit
+    // constructor is constructed directly from the read components at the
+    // storage level").
+    std::unordered_map<std::string, unsigned> compByNameLower;
+    for (unsigned ci = 0; ci < components.size(); ++ci)
+        compByNameLower[toLowerAscii(components[ci].declName)] = ci;
+
+    sema::ConstructorSymbol* matchedCtor = nullptr;
+    for (Symbol* m : ts->members) {
+        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) continue;
+        if (cd->params.size() != components.size()) continue;
+        bool allMatch = true;
+        for (const auto& p : cd->params) {
+            if (compByNameLower.find(toLowerAscii(p.name)) ==
+                    compByNameLower.end()) {
+                allMatch = false;
+                break;
+            }
+        }
+        if (allMatch) { matchedCtor = cs; break; }
+    }
+
+    llvm::Value* result = nullptr;
+    if (matchedCtor) {
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(matchedCtor->decl);
+        auto ctorIt = ctorFns_.find(matchedCtor);
+        if (cd && ctorIt != ctorFns_.end()) {
+            // Run storage-member default initializers first, mirroring
+            // ordinary record construction (buildRecordValue's explicit-
+            // constructor path, LlvmBackend_Exprs2.cpp): a component the
+            // constructor body does not itself assign keeps its own
+            // declared default, exactly as `new`/`with` construction would
+            // leave it.
+            for (const sema::Symbol* sm : storage) {
+                const ast::Expr* init = nullptr;
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(sm->decl))
+                    init = fd->initializer.get();
+                else if (auto* pd =
+                             dynamic_cast<const ast::PropertyDecl*>(sm->decl))
+                    init = pd->autoInitializer.get();
+                if (!init) continue;
+                auto fit = fieldIndex_.find(sm);
+                if (fit == fieldIndex_.end()) continue;
+                llvm::Value* v = lowerExpr(*init);
+                if (!v) continue;
+                const sema::TypeRef* fty = recordMemberType(sm);
+                if (isNullableValueTy(fty)) {
+                    auto* expectedSt = nullableValueStructTy(fty);
+                    if (v->getType() != expectedSt) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v))
+                            v = nullableValueNull(fty);
+                        else if (v->getType() == expectedSt->getElementType(1))
+                            v = wrapNullableValue(fty, v);
+                    }
+                }
+                builder_.CreateStore(
+                    v, builder_.CreateStructGEP(st, resultSlot, fit->second));
+            }
+
+            // Build the argument list IN CONSTRUCTOR PARAMETER ORDER, each
+            // pulled from its component's deserialized slot (or default(T)
+            // for a `serialized skip` component — §9.8).
+            std::vector<llvm::Value*> args;
+            args.push_back(resultSlot);  // `this` (a pointer to the record's
+                                          // own struct slot, §9.4)
+            auto* fnTy = ctorIt->second->getFunctionType();
+            bool ok = true;
+            for (std::size_t pi = 0; pi < cd->params.size(); ++pi) {
+                auto cit = compByNameLower.find(
+                    toLowerAscii(cd->params[pi].name));
+                if (cit == compByNameLower.end()) { ok = false; break; }
+                unsigned ci = cit->second;
+                if (!components[ci].ty) { ok = false; break; }
+                llvm::Type* lt = lowerTypeRef(components[ci].ty);
+                if (!lt) { ok = false; break; }
+                llvm::Value* fv;
+                if (components[ci].isSkip || !slots[ci])
+                    fv = llvm::Constant::getNullValue(lt);
+                else
+                    fv = builder_.CreateLoad(lt, slots[ci], "rdeser.arg");
+                if (pi + 1 < fnTy->getNumParams())
+                    fv = coerceNumericToType(fv, fnTy->getParamType(pi + 1),
+                                              false);
+                args.push_back(fv);
+            }
+            if (ok && args.size() == ctorIt->second->arg_size()) {
+                builder_.CreateCall(ctorIt->second, args);
+                // §28: a record constructor may throw (e.g. a validating
+                // constructor, §9.2's `Width > 0 and Height > 0` example).
+                emitPendingCheck();
+                result = builder_.CreateLoad(st, resultSlot, "deser.rec");
+            }
+        }
+    }
+
+    if (!result) {
+        // Build result struct: insert all non-skip fields from their slots
+        // (§9.8 v0.182: "A record that declares no explicit constructor is
+        // constructed directly from the read components at the storage
+        // level").
+        result = builder_.CreateLoad(st, resultSlot, "deser.rec");
+        for (unsigned ci = 0; ci < components.size(); ++ci) {
+            if (components[ci].isSkip) continue;
+            if (!slots[ci]) continue;
+            if (ci >= st->getNumElements()) continue;
+            llvm::Value* fv = builder_.CreateLoad(st->getElementType(ci), slots[ci]);
+            result = builder_.CreateInsertValue(result, fv, {ci});
+        }
     }
 
     return result;

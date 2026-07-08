@@ -4347,6 +4347,121 @@ void Resolver::checkSerializationEligibility() {
             }
         }
 
+        // §9.8 v0.182 (#1572): record constructor-selection check — the
+        // record-side counterpart to the class check above (same rule,
+        // written out at the top of this function's `else if (isClass)`
+        // branch). Applies only when Deserialize synthesis is actually
+        // needed and the record body declares one or more EXPLICIT
+        // constructors: "If the record declares one or more explicit
+        // constructors, the synthesized Deserialize calls the unique
+        // explicit constructor whose parameter list binds exactly the
+        // serialized components, matched by name — compared
+        // case-insensitively... If explicit constructors exist but none
+        // matches, more than one matches, ... the conformance declaration
+        // is a compile error naming the candidates." A record with NO
+        // explicit constructor (the common case — a purely positional
+        // record, or a body record with no author-declared constructor) is
+        // "constructed directly from the read components at the storage
+        // level" — no ambiguity is possible, so the check below is a no-op
+        // whenever `allCtors` comes back empty.
+        if (!foundError && needsDeserializeCheck) {
+            auto toLower = [](std::string_view sv) {
+                std::string r(sv);
+                for (char& c : r)
+                    c = (char)std::tolower((unsigned char)c);
+                return r;
+            };
+
+            // Collect the lowercased declared identifiers of ALL serialized
+            // components — including `serialized skip` ones, which still
+            // bind a constructor parameter (their value is default(T)).
+            std::unordered_set<std::string> compNamesLower;
+            std::vector<std::string> compNamesOrig;
+            if (td->hasPositionalFields) {
+                for (const auto& pf : td->positionalFields) {
+                    compNamesLower.insert(toLower(pf.name));
+                    compNamesOrig.push_back(std::string(pf.name));
+                }
+            } else {
+                for (const Symbol* m : t->members) {
+                    if (!isAutoPropertySymbol(m)) continue;
+                    compNamesLower.insert(toLower(m->name));
+                    compNamesOrig.push_back(std::string(m->name));
+                }
+            }
+
+            // Collect non-static explicit constructors and check which match.
+            std::vector<std::string> matchingCtors;
+            std::vector<std::string> allCtors;
+            for (const Symbol* m : t->members) {
+                auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                if (!cs || cs->isStatic) continue;
+                auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (!cd) continue;
+
+                std::string ctorDesc = "constructor(";
+                for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
+                    if (pi) ctorDesc += ", ";
+                    ctorDesc += std::string(cd->params[pi].name);
+                }
+                ctorDesc += ")";
+                allCtors.push_back(ctorDesc);
+
+                // Match: param count == component count AND every param name
+                // (lowered) appears among the component names (bijection).
+                if (cd->params.size() != compNamesLower.size()) continue;
+                bool allMatch = true;
+                for (const auto& p : cd->params) {
+                    if (compNamesLower.find(toLower(p.name)) ==
+                            compNamesLower.end()) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch) matchingCtors.push_back(ctorDesc);
+            }
+
+            // No explicit constructor at all: storage-level construction
+            // applies (§9.8 v0.182) — nothing to disambiguate, skip.
+            if (!allCtors.empty() && matchingCtors.size() != 1) {
+                std::string candidates;
+                for (const auto& c : allCtors) {
+                    if (!candidates.empty()) candidates += ", ";
+                    candidates += c;
+                }
+                std::string compSet;
+                for (const auto& n : compNamesOrig) {
+                    if (!compSet.empty()) compSet += ", ";
+                    compSet += n;
+                }
+                if (matchingCtors.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "` declares "
+                        "`IDeserializable`: no explicit constructor has "
+                        "parameter names matching the serialized component "
+                        "set {" + compSet + "} — candidates: " + candidates +
+                        " (§9.8 v0.182: constructor selection is by name, "
+                        "case-insensitive, order-insensitive)");
+                } else {
+                    std::string matchList;
+                    for (const auto& c : matchingCtors) {
+                        if (!matchList.empty()) matchList += ", ";
+                        matchList += c;
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "` declares "
+                        "`IDeserializable`: more than one explicit "
+                        "constructor matches the serialized component set — "
+                        "ambiguous: " + matchList +
+                        " (§9.8 v0.182: the unique matching constructor is "
+                        "required)");
+                }
+                foundError = true;
+            }
+        }
+
         (void)foundError;  // error was already reported if true
     }
 }

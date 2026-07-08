@@ -303,3 +303,108 @@ BEZEL_TEST(codegen_serialization_550,
         "  return 0; "
         "end Main; end C;"), 0);
 }
+
+// ===========================================================================
+// §9.8 v0.182 (#1572): record Deserialize CONSTRUCTOR SELECTION — the
+// synthesized Deserialize CALLS a record's unique explicit constructor with
+// the deserialized values as arguments (rather than the pre-v0.182 behavior
+// of always writing components directly at the storage level, bypassing any
+// explicit constructor entirely).
+// ===========================================================================
+
+// §9.8 v0.182: a body record with an explicit NORMALIZING constructor
+// (doubles its argument) — Deserialize re-runs the constructor against the
+// WIRE value, not against the pre-normalized original. original.N := 5*2=10
+// is what gets serialized; deserializing calls the constructor again with
+// n=10, which doubles again to 20. This directly distinguishes the v0.182
+// "call the constructor" model from the retired storage-level-always model
+// (which would have produced 10, an unchanged round-trip).
+BEZEL_TEST(codegen_serialization_550,
+           record_explicit_ctor_rerun_on_deserialize_spec_9_8_v0182) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Doubled: ISerializable, IDeserializable "
+        "  public readonly property N: int; "
+        "  public constructor(n: int) N := n * 2; end constructor; "
+        "end Doubled; "
+        "class C public static method Main(): int "
+        "  var original := new Doubled(5); "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Doubled.Deserialize(d); "
+        "  return back.N; "
+        "end Main; end C;"), 20);
+}
+
+// §9.8 v0.182: a COMBINED-form record (positional fields + an explicit body
+// constructor) round-trips through the same constructor-call model — the
+// positional fields count as storage components alongside any body
+// auto-properties (§9.3), and the sole explicit constructor is called with
+// the deserialized X value, which it offsets by +100. original.X = 1+100=101
+// is what's on the wire; deserializing re-runs the constructor with x=101,
+// giving 101+100=201 (NOT 101, which the retired storage-level-always model
+// would have produced).
+BEZEL_TEST(codegen_serialization_550,
+           record_combined_form_explicit_ctor_rerun_spec_9_8_v0182) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Vec2(X: int, Y: int): ISerializable, IDeserializable "
+        "  public constructor(x: int, y: int) "
+        "    X := x + 100; "
+        "    Y := y + 100; "
+        "  end constructor; "
+        "end Vec2; "
+        "class C public static method Main(): int "
+        "  var original := new Vec2(1, 2); "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Vec2.Deserialize(d); "
+        "  return back.X; "
+        "end Main; end C;"), 201);
+}
+
+// §9.8 v0.182: "A record that declares no explicit constructor is
+// constructed directly from the read components at the storage level" — a
+// purely positional record (no body, no explicit constructor) still
+// round-trips its exact field values unchanged (storage-level construction,
+// UNAFFECTED by the constructor-selection change above).
+BEZEL_TEST(codegen_serialization_550,
+           record_positional_no_ctor_storage_level_roundtrip_spec_9_8_v0182) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Point(X: int, Y: int): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var original := new Point(3, 4); "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Point.Deserialize(d); "
+        "  return back.X * 10 + back.Y; "
+        "end Main; end C;"), 34);
+}
+
+// §9.8 v0.182: a body record with NO explicit constructor also uses
+// storage-level construction (unaffected) — a plain auto-equality-style
+// record still round-trips its exact stored values.
+BEZEL_TEST(codegen_serialization_550,
+           record_body_no_ctor_storage_level_roundtrip_spec_9_8_v0182) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Plain: ISerializable, IDeserializable "
+        "  public property N: int; "
+        "end Plain; "
+        "class C public static method Main(): int "
+        "  var original := new Plain() with N := 7 end; "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Plain.Deserialize(d); "
+        "  return back.N; "
+        "end Main; end C;"), 7);
+}
