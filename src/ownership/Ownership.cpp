@@ -79,6 +79,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // borrow-store escape check can tell whether a closure assigned to a plain
     // local outlives the owned local it captures.
     collectLocalDepths(body);
+    // §28.3 (v0.180) consume-site freeze: precompute per-local read-use offsets
+    // and loop-body extents so the transfer functions can query borrow liveness
+    // at each consume site (`move` / `owned`-arg / drop-on-overwrite). Runs once,
+    // before the dataflow, so the query is stable across the fixpoint passes.
+    collectBorrowUses(body);
     // §28.14 (v0.175, #808): scoped callback parameters. Record the enclosing
     // method's parameter symbols (distinguishes real captures from lambda-
     // internal params), then run the three syntactic pre-passes: call-site
@@ -180,11 +185,26 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // normal-exit edge.
     //
     // §28.3 v0.150 (#1008 Part B): the set of locals reassigned or out-
-    // overwritten anywhere in the body — excluded from affine auto-drop below
-    // (auto-drop disposes only the final slot value; an overwritten local would
-    // leak its earlier value).
+    // overwritten anywhere in the body. Historically excluded WHOLESALE from
+    // affine auto-drop (auto-drop disposes only the final slot value; before
+    // §28.7 drop-on-overwrite an overwritten local would leak its earlier value).
+    // Since v0.161 codegen disposes the displaced value at each overwrite for
+    // plain owned class/interface locals, so those are re-admitted below via
+    // reassignedDropCovered_ (#1465); the rest keep the exclusion.
     std::unordered_set<const sema::Symbol*> reassignedLocals;
     scanReassignStmts(body, ctx_, reassignedLocals);
+    // §28.3 / §28.7 (v0.180, #1465): of those, the plain owned class/interface
+    // locals whose drop-on-overwrite codegen implements
+    // (disposeDisplacedOwnedClassLocal) — the displaced value is disposed at each
+    // overwrite, so the FINAL value is exactly-once-safe to auto-drop at scope
+    // end. These are NOT excluded from the affine auto-drop below (that exclusion,
+    // a pre-v0.161 conservatism, is what over-rejected owned-local reassignment).
+    // Owning collections / wrappers / tasks stay excluded (their overwrite does
+    // not dispose the displaced value), keeping the discharge error for them.
+    reassignedDropCovered_.clear();
+    for (const sema::Symbol* sym : reassignedLocals)
+        if (localDropOnOverwriteCovered(sym))
+            reassignedDropCovered_.insert(sym);
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
             // §29.8 (#945, #973b): an iterator method's `owned` parameter that the
@@ -274,7 +294,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // never-moved invariant as the sync-iterator-param case above.
             if (!isAsync_ && !sawYield_ && !isDestructor_ &&
                 everDischarged_.count(sym) == 0 &&
-                reassignedLocals.count(sym) == 0) {
+                (reassignedLocals.count(sym) == 0 ||
+                 reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
@@ -397,7 +418,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     if (!isAsync_ && !sawYield_ && !isDestructor_) {
         for (sema::Symbol* sym : everOwnedPlainLocals_) {
             if (everDischarged_.count(sym) != 0) continue;
-            if (reassignedLocals.count(sym) != 0) continue;
+            if (reassignedLocals.count(sym) != 0 &&
+                reassignedDropCovered_.count(sym) == 0) continue;
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
             if (!ls) continue;
             auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
@@ -2020,6 +2042,37 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     return OwnershipState::Borrowed;
 }
 
+bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
+    // §28.3 / §28.7 (v0.180, #1465): true when reassigning `sym` is a drop-on-
+    // overwrite that codegen actually implements — so the FINAL value is exactly-
+    // once-safe to auto-drop at scope end. Codegen's disposeDisplacedOwnedClassLocal
+    // (LlvmBackend_Disposal.cpp) disposes the displaced value only for a plain
+    // owned CLASS/INTERFACE local classified by unwindOwnedLocalClass: a `new
+    // ClassType` / owned-returning call / owned-operator / `??`-fresh producer.
+    // Owning collections, owning wrappers (OwningTask/Shared/Weak/…), the Task
+    // family, and subscription locals free through their own runtime calls, not
+    // class dispatch, so their overwrite does NOT dispose the displaced value —
+    // they must keep the discharge error. Mirror that coverage decidably here.
+    auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return false;
+    if (producerState(*ld->initializer) != OwnershipState::Owned) return false;
+    const sema::TypeRef* t = ctx_.exprType(*ld->initializer);
+    if (!isClassOrInterfaceResult(t)) return false;
+    // Positively confirm the value is NOT a collection / wrapper / task by name-
+    // head; if the head cannot be read, stay conservative (keep the error).
+    std::string_view head =
+        (t && t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+            ? t->headName()
+            : std::string_view{};
+    if (head.empty()) return false;
+    if (isOwningCollectionNameHead(head) || isOwningTypeNameHead(head))
+        return false;
+    if (head == "Task" || head == "OwningTask") return false;
+    return true;
+}
+
 void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // #1066 / §9.7 (v0.153): `var b := new Bag([…])` from a temporary is a
     // dangling borrow. Checked before the lsym early-return so it runs for a
@@ -2291,6 +2344,17 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                     return;
                 }
             }
+            // §28.3 / §28.7 (v0.180) consume-site freeze: reassigning an OWNED
+            // local is a drop-on-overwrite that silently disposes the displaced
+            // value. If a live local borrow of that value exists, the overwrite
+            // would leave the borrow dangling — reject (the borrowed case of
+            // §28.7 "Overwrite while borrowed"; the unborrowed case stays legal
+            // and is the #1465 drop-on-overwrite acceptance). Checked BEFORE the
+            // state is overwritten, and only when the displaced value is live-
+            // owned (a borrowed-state local has no disposal, so nothing is
+            // silently killed).
+            if (st.state == OwnershipState::Owned)
+                checkConsumeFreeze(id->name, as.target->span.begin);
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
             if (src && src != sym) {

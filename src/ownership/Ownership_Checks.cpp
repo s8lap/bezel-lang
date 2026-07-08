@@ -2572,6 +2572,268 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
         if (s->name == name) { everDischarged_.insert(s); break; }
 }
 
+// -------------------------------------------------------------------------
+// §28.3 (v0.180) consume-site freeze — borrow-liveness pre-pass + the query.
+// -------------------------------------------------------------------------
+
+void MethodOwnership::noteLoopScanOffset(std::uint32_t off) {
+    for (auto& lr : loopScanStack_) {
+        if (off < lr.first) lr.first = off;
+        if (off > lr.second) lr.second = off;
+    }
+}
+
+void MethodOwnership::recordBorrowUseExpr(const ast::Expr& e,
+                                          std::uint32_t attributeOffset) {
+    // A self-contained recursive read-collector for the freeze liveness pre-scan.
+    // Distinct from collectIdentifiersIn (which the capture analysis uses and
+    // which deliberately stops at interpolated-string nodes): here every read
+    // identifier — including those inside `$"..."` holes and lambda bodies —
+    // counts as a use, since a borrow read anywhere after a consume keeps it
+    // live. Under-approximation is the only failure mode (a missed use would
+    // miss a freeze, never manufacture a spurious one). // per §28.3
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        std::uint32_t off = attributeOffset ? attributeOffset
+                                            : id->span.begin.offset;
+        noteLoopScanOffset(off);
+        if (sema::Symbol* s = ctx_.exprSymbol(*id))
+            borrowUseOffsets_[s].push_back(off);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) recordBorrowUseExpr(*ma->target, attributeOffset);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) recordBorrowUseExpr(*nm->target, attributeOffset);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) recordBorrowUseExpr(*ce->callee, attributeOffset);
+        for (const auto& a : ce->args)
+            if (a.value) recordBorrowUseExpr(*a.value, attributeOffset);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) recordBorrowUseExpr(*nc->callee, attributeOffset);
+        for (const auto& a : nc->args)
+            if (a.value) recordBorrowUseExpr(*a.value, attributeOffset);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) recordBorrowUseExpr(*ix->target, attributeOffset);
+        for (const auto& a : ix->indices)
+            if (a.value) recordBorrowUseExpr(*a.value, attributeOffset);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) recordBorrowUseExpr(*be->left, attributeOffset);
+        if (be->right) recordBorrowUseExpr(*be->right, attributeOffset);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) recordBorrowUseExpr(*un->operand, attributeOffset);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) recordBorrowUseExpr(*pb->operand, attributeOffset);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) recordBorrowUseExpr(*tt->operand, attributeOffset);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) recordBorrowUseExpr(*cd->condition, attributeOffset);
+        if (cd->thenValue) recordBorrowUseExpr(*cd->thenValue, attributeOffset);
+        if (cd->elseValue) recordBorrowUseExpr(*cd->elseValue, attributeOffset);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) recordBorrowUseExpr(*a.value, attributeOffset);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) recordBorrowUseExpr(*th->operand, attributeOffset);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        // Interpolated-string holes are sub-parsed: their identifiers carry
+        // offset 0, so attribute every hole use to the enclosing `$"..."` node's
+        // real source offset (inheriting an already-set attribution when this
+        // interpolation is itself nested inside another hole).
+        std::uint32_t attr = attributeOffset ? attributeOffset
+                                             : isx->span.begin.offset;
+        for (const auto& part : isx->parts)
+            if (part.expr) recordBorrowUseExpr(*part.expr, attr);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // A borrow read inside a lambda body is still a use of that borrow when
+        // the lambda value is later invoked; descend so such reads are counted.
+        if (lam->exprBody) recordBorrowUseExpr(*lam->exprBody, attributeOffset);
+        for (const auto& st : lam->stmts)
+            if (st) {
+                std::vector<const ast::IdentifierExpr*> ids;
+                collectIdentifiersInStmt(*st, ids);
+                for (const ast::IdentifierExpr* id : ids) {
+                    std::uint32_t off = attributeOffset
+                                            ? attributeOffset
+                                            : id->span.begin.offset;
+                    noteLoopScanOffset(off);
+                    if (sema::Symbol* s = ctx_.exprSymbol(*id))
+                        borrowUseOffsets_[s].push_back(off);
+                }
+            }
+        return;
+    }
+}
+
+void MethodOwnership::collectBorrowUses(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body)
+        if (s) collectBorrowUsesStmt(*s);
+}
+
+void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value) recordBorrowUseExpr(*as->value);
+        if (as->target) {
+            // A bare-identifier target of a plain `:=` is a pure WRITE (rebind),
+            // not a read, so it must not count as a use of the holder — it would
+            // spuriously make a consumed binding look "used after". Compound
+            // assignments and field/index targets do read, so record those.
+            auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+            if (tid && as->op == ":=")
+                noteLoopScanOffset(tid->span.begin.offset);  // extent only
+            else
+                recordBorrowUseExpr(*as->target);
+        }
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) recordBorrowUseExpr(*is->target);
+        return;
+    }
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) recordBorrowUseExpr(*ld->initializer);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) recordBorrowUseExpr(*es->expr);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) recordBorrowUseExpr(*rs->value);
+        return;
+    }
+    if (auto* ths = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ths->value) recordBorrowUseExpr(*ths->value);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) recordBorrowUseExpr(*ds->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition) recordBorrowUseExpr(*ifs->ifBranch.condition);
+        collectBorrowUses(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) recordBorrowUseExpr(*el.condition);
+            collectBorrowUses(el.body);
+        }
+        collectBorrowUses(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        loopScanStack_.push_back({UINT32_MAX, 0});
+        if (ws->condition) recordBorrowUseExpr(*ws->condition);
+        collectBorrowUses(ws->body);
+        auto lr = loopScanStack_.back();
+        loopScanStack_.pop_back();
+        if (lr.first <= lr.second) {
+            noteLoopScanOffset(lr.first);
+            noteLoopScanOffset(lr.second);
+            loopBodySpans_.push_back(lr);
+        }
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        loopScanStack_.push_back({UINT32_MAX, 0});
+        if (fs->iterable) recordBorrowUseExpr(*fs->iterable);
+        if (fs->withExpr) recordBorrowUseExpr(*fs->withExpr);
+        collectBorrowUses(fs->body);
+        auto lr = loopScanStack_.back();
+        loopScanStack_.pop_back();
+        if (lr.first <= lr.second) {
+            noteLoopScanOffset(lr.first);
+            noteLoopScanOffset(lr.second);
+            loopBodySpans_.push_back(lr);
+        }
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        collectBorrowUses(dob->body);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        collectBorrowUses(ts->body);
+        for (const auto& arm : ts->catches)
+            if (arm.body) collectBorrowUsesStmt(*arm.body);
+        collectBorrowUses(ts->finallyBody);
+        return;
+    }
+}
+
+bool MethodOwnership::borrowHolderUsedAfter(const sema::Symbol* holder,
+                                            std::uint32_t consumeOffset) const {
+    auto it = borrowUseOffsets_.find(holder);
+    if (it == borrowUseOffsets_.end()) return false;
+    for (std::uint32_t off : it->second)
+        if (off > consumeOffset) return true;
+    // Loop back edge: a use textually BEFORE the consume but inside the same
+    // enclosing loop body re-executes AFTER the consume on the next iteration,
+    // so it keeps the borrow live. Sound closure of the textual query over loops.
+    for (const auto& lr : loopBodySpans_) {
+        if (consumeOffset < lr.first || consumeOffset > lr.second) continue;
+        for (std::uint32_t off : it->second)
+            if (off >= lr.first && off <= lr.second) return true;
+    }
+    return false;
+}
+
+void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
+                                         SourceLocation consumeLoc) {
+    // Resolve the consumed binding's symbol (the in-scope one of that name), so
+    // holders are matched by symbol identity, not just name.
+    const sema::Symbol* consumed = nullptr;
+    for (auto& [sym, st] : states_)
+        if (sym->name == consumedName) { consumed = sym; break; }
+    if (!consumed) return;
+    for (auto& [holder, st] : states_) {
+        if (holder == consumed) continue;
+        if (!st.source || st.source->sym != consumed) continue;
+        // A holder that is itself already consumed/dead cannot dangle.
+        if (st.state == OwnershipState::MovedFrom ||
+            st.state == OwnershipState::Disposed ||
+            st.state == OwnershipState::Poisoned)
+            continue;
+        // A `using var` borrow-pin keeps the borrow live to its scope end
+        // (§28.10); otherwise the borrow is live iff it has a reachable later
+        // use (directly, or through the closure value the holder names).
+        bool live = st.implicitDischarge ||
+                    borrowHolderUsedAfter(holder, consumeLoc.offset);
+        if (!live) continue;
+        report(Severity::Error, consumeLoc,
+               std::string("cannot consume `") + std::string(consumedName) +
+                   "` here: the borrow held by `" + std::string(holder->name) +
+                   "` is still live — its later use would read freed memory "
+                   "(consume-site freeze, §28.3/§28.7/§30.14 v0.180)");
+        return;  // one freeze diagnostic per consume site
+    }
+}
+
 void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc) {
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be moved from until the bounding scope exits.
@@ -2603,6 +2865,13 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         st->state = OwnershipState::Poisoned;
         return;
     }
+    // §28.3 (v0.180) consume-site freeze: this is the central consume of an owned
+    // LOCAL binding — a `move x`, an `owned`-argument transfer (`M(owned x)`,
+    // including `Domain.Spawn(owned c)` and channel `Send`, §30.14/§30.15), or a
+    // `using var y := x` adoption. Consuming while a LIVE local borrow of the
+    // binding's current value exists is a data race across a domain boundary and
+    // a use-after-free within one — reject before marking the binding moved-from.
+    checkConsumeFreeze(name, loc);
     st->state = OwnershipState::MovedFrom;
     // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
     // check skips a parameter the body moves out on some path.

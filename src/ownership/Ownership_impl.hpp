@@ -236,6 +236,34 @@ private:
     // catch arms; symbols are unique per arm, so the set is path-insensitive
     // (a catch binding only appears within its own arm body). // per §31.1
     std::unordered_set<sema::Symbol*> catchBorrows_;
+    // §28.3 (v0.180) consume-site freeze: per-local READ-use source offsets,
+    // precomputed once by collectBorrowUses before the dataflow. A borrow-holder
+    // is *live* at a consume site (a `move`, an `owned`-argument transfer, or a
+    // drop-on-overwrite reassignment) when it has a reachable later use; the
+    // freeze query looks for a use textually after the consume, plus the
+    // loop-back-edge cases below. Keyed by the read identifier's resolved symbol;
+    // SourceLocation::offset (0-based buffer index) is a total source order.
+    std::unordered_map<const sema::Symbol*, std::vector<std::uint32_t>>
+        borrowUseOffsets_;
+    // §28.3 (v0.180) consume-site freeze: the [lo, hi] source-offset extent of
+    // every `while` / `for` loop body (bounded by the identifier offsets it
+    // contains — loop-statement spans are not populated by the parser). A holder
+    // use textually *before* a consume but inside the SAME enclosing loop
+    // re-executes after the consume via the back edge, so it keeps the borrow
+    // live — the sound closure of the textual "used-after" query over loops.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> loopBodySpans_;
+    // Transient stack of the loop bodies currently being scanned by
+    // collectBorrowUses (innermost last); accumulates each loop's identifier
+    // extent. Populated and drained during the pre-pass only.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> loopScanStack_;
+    // §28.3 / §28.7 (v0.180, #1465): reassigned owned locals whose drop-on-
+    // overwrite codegen implements (disposeDisplacedOwnedClassLocal — plain owned
+    // class/interface locals; collections/wrappers/tasks excluded). For these the
+    // displaced value is disposed at each overwrite, so the FINAL value is safely
+    // auto-dropped at scope end (§28.3); they are NOT excluded from affine
+    // auto-drop the way other reassigned locals are. This closes the #1465
+    // over-rejection (reassigning an owned local and letting it auto-drop).
+    std::unordered_set<const sema::Symbol*> reassignedDropCovered_;
     // §28.3 / §28.9 (#861): block-nesting depth of each local's declaration,
     // keyed by its `LocalDecl` AST node (== `LocalSymbol::decl`). The method
     // body is depth 0; each nested do-end / if-branch / loop / try-arm body adds
@@ -606,6 +634,40 @@ private:
     // flagged. Conservative: returns null when it cannot prove an owned
     // source, so it never manufactures a false escape.
     sema::Symbol* borrowSourceForExpr(const ast::Expr& rhs);
+
+    // §28.3 (v0.180) consume-site freeze pre-pass. Walk the method body once,
+    // recording every READ-use of a local into borrowUseOffsets_ and the extent
+    // of every loop body into loopBodySpans_, so the freeze query can answer
+    // "is this borrow-holder still live at the consume site?" without a second
+    // dataflow. Called once at the start of run(). // per §28.3
+    void collectBorrowUses(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void collectBorrowUsesStmt(const ast::Stmt& s);
+    // Record each identifier read inside `e` into borrowUseOffsets_ (and into any
+    // enclosing loop's identifier extent). `attributeOffset` != 0 forces every
+    // recorded use to that source offset instead of the identifier's own — used
+    // for interpolated-string holes, whose sub-parsed identifiers carry offset 0
+    // (their real location is the enclosing `$"..."` node). // per §28.3
+    void recordBorrowUseExpr(const ast::Expr& e,
+                             std::uint32_t attributeOffset = 0);
+    // Extend every loop currently on loopScanStack_ to include `off`. // per §28.3
+    void noteLoopScanOffset(std::uint32_t off);
+    // True when the borrow-holder `holder` has a reachable use after the consume
+    // at `consumeOffset` — a use textually after it, or (loop back edge) a use
+    // inside a loop body that also contains the consume. // per §28.3
+    bool borrowHolderUsedAfter(const sema::Symbol* holder,
+                               std::uint32_t consumeOffset) const;
+    // §28.3 (v0.180) consume-site freeze: reject consuming the owned binding
+    // named `consumedName` at `consumeLoc` while a LIVE local borrow of its
+    // current value exists (a plain alias, a `using var` pin, or a closure that
+    // captured it). The diagnostic names the consumed binding, the borrow, and
+    // the borrow's surviving use. No-op when no live borrow exists (the
+    // unborrowed transfer / drop-on-overwrite stays legal). // per §28.3, §28.7, §30.14
+    void checkConsumeFreeze(std::string_view consumedName,
+                            SourceLocation consumeLoc);
+    // §28.3 / §28.7 (v0.180, #1465): true when the reassigned owned local `sym`
+    // is a plain owned class/interface local whose drop-on-overwrite codegen
+    // implements — so its FINAL value is safely auto-droppable at scope end.
+    bool localDropOnOverwriteCovered(const sema::Symbol* sym);
 
     // True when `sym` is a tracked local currently in the Owned state — the
     // scope-bound discharge obligation that a borrow may not outlive. Used by

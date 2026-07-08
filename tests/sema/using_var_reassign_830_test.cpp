@@ -122,14 +122,17 @@ BEZEL_TEST(using_var_reassign_830, plain_var_increment_not_flagged_913) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// fix #913 (plain-var slice) / §17.6 / §28.3: `var c := new T(); c++` where the
-// owned class operand's `operator ++` returns a NEW owned instance and the local
-// is left undischarged is REJECTED — `c++` is modelled as the reassignment
-// `c := operator++(c)` (it drops the previous owned value), so the local is
-// excluded from the §28.3 affine auto-drop and must be explicitly discharged,
-// exactly as a direct `c := new T()` already is. Before this it silently leaked
-// the old value with no diagnostic.
-BEZEL_TEST(using_var_reassign_830, plain_var_owned_increment_rejected_913) {
+// §17.6 / §28.7 drop-on-overwrite / §28.3 auto-drop (#913 updated by #1465):
+// `var c := new T(); c++` is modelled as the reassignment `c := operator++(c)`,
+// which drops the previous owned value. With §28.7 drop-on-overwrite now covering
+// plain owned class locals (including the increment target — codegen disposes the
+// displaced value at the `c++` store, LlvmBackend_Stmts.cpp), the reassignment is
+// ACCEPTED: the old Counter is disposed at the overwrite and the final Counter
+// auto-drops at scope end (each exactly once), with only the must-use warning.
+// This is the #1465 correction of #913's original blanket rejection — verified
+// runtime-sound (old value disposed, then new value, no double-free). A BORROWED
+// increment-reassignment is instead caught by the consume-site freeze (§28.3).
+BEZEL_TEST(using_var_reassign_830, plain_var_owned_increment_accepted_1465) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Counter public Value: int := 0; "
@@ -141,7 +144,8 @@ BEZEL_TEST(using_var_reassign_830, plain_var_owned_increment_rejected_913) {
         "class C public static method Main(): int "
         "  var c := new Counter(0); c++; return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "c"));
 }
 
 // fix #913: the same owned `c++` is ACCEPTED when the local IS discharged

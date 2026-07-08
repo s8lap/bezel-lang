@@ -44,15 +44,20 @@ BEZEL_TEST(own_linear, plain_var_undischarged_diagnosed) {
     BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
-// §28.3 v0.150 (#1008 Part B) SOUNDNESS: a REASSIGNED owned local is NOT auto-
-// dropped — auto-drop disposes only the final slot value, so the overwritten
-// first value would leak. Such a local keeps the discharge error (the
-// conservative pre-v0.150 behaviour), preventing a silent leak.
-BEZEL_TEST(own_linear, reassigned_owned_local_not_auto_dropped) {
+// §28.7 drop-on-overwrite (v0.161) composed with §28.3 affine auto-drop (#1465):
+// a REASSIGNED plain owned class local is now ACCEPTED, not rejected. Codegen
+// disposes the displaced first value at the overwrite and the final value auto-
+// drops at scope end (each exactly once), so only the must-use WARNING fires.
+// Historically this was rejected — auto-drop disposes only the final slot value,
+// and before drop-on-overwrite landed the first value would have leaked — the
+// pre-v0.161 conservatism the consume-site-freeze split (#1537) removed. The
+// BORROWED reassignment case is instead rejected by the consume-site freeze
+// (§28.3, see consume_site_freeze_1537_test).
+BEZEL_TEST(own_linear, reassigned_owned_local_auto_dropped_1465) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x := new T();"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(bezel::test::hasAutoDropWarning(r, "x"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));
 }
 
 BEZEL_TEST(own_linear, plain_var_with_explicit_dispose_clean) {
