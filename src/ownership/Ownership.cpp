@@ -207,6 +207,60 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             reassignedDropCovered_.insert(sym);
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
+            // §28.3 / §28.11 (#1466): a PRE-DECLARED nullable out-owned recipient
+            // (`var item: T? := null; coll.TryX(out item);`) that reaches a
+            // normal-exit scope end still Owned is given an AUTO-DROP — a
+            // null-guarded scope-end reclaim (a no-op when the slot is null) with
+            // the §28.3 must-use WARNING — NOT the hard discharge error. This is
+            // the affine-auto-drop rule (v0.150) applied to the recipient, and it
+            // is what makes the fix a REDO of the reverted attempt: the recipient
+            // is conservatively marked Owned on BOTH the true and false Try* paths
+            // (markOwnedByName), but on the FALSE path it is provably null and
+            // carries no disposal obligation, so demanding an explicit discharge
+            // on every path over-rejected the idiomatic empty/false pattern (e.g.
+            // `a.TryPopFirst(out got)` on an empty `a`, `got` left null). The
+            // scope-end reclaim is emitted by codegen (ensureOutVarSlots' bare-
+            // `out` arm → dynamicDispose, null-guarded), so the value is disposed
+            // exactly once — the destructor runs AND the heap block is reclaimed
+            // (the #1466 leak), or nothing runs when null. Unlike the plain-`var`
+            // auto-drop below, this is NOT gated on everDischarged_ /
+            // reassignedLocals: the out-write reassigns the slot, and a discharge
+            // may be conditional (`item?.Dispose()` inside the producing `if`),
+            // but the scope-end dispose is null-guarded and every discharge —
+            // explicit dispose (explicitDisposeOwnedReceiverSlot nulls the slot)
+            // and `move` (nulled below via the autoDropAtScopeEnd flag) — leaves
+            // the slot null, so the reclaim is exactly-once-safe regardless (the
+            // same argument as the §29.2 owned iter-var auto-drop). Gated to
+            // synchronous, non-iterator, non-destructor bodies (an async recipient
+            // crossing an await, or an iterator-frame recipient, is disposed by
+            // the state-machine completion edges — routing it through the scope-
+            // end dispose would double-dispose; those keep the existing handling).
+            // EXCLUDED: a recipient whose declaring Try* call is a WHILE-loop
+            // CONDITION (loopCondOutOwnedSyms_) shares its slot across every
+            // iteration — auto-drop covers only the FINAL value, so an
+            // intermediate iteration's undischarged value would leak. Those keep
+            // the hard §28.3 discharge error (the same rule the inline `out owned
+            // var` while-condition form follows, #892); this is not a regression —
+            // the pre-declared while-drain-without-dispose form was already
+            // rejected (marked Owned + in reassignedLocals + not drop-covered).
+            if (!isAsync_ && !sawYield_ && !isDestructor_ &&
+                preDeclaredOutOwnedRecipients_.count(sym) &&
+                loopCondOutOwnedSyms_.count(sym) == 0) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                    ls->autoDropAtScopeEnd = true;
+                    ctx_.diagnostics().report(
+                        Severity::Warning,
+                        st.obligationOrigin ? st.obligationOrigin->span.begin
+                                            : SourceLocation{},
+                        std::string("owned value in `") +
+                        std::string(sym->name) +
+                        "` is implicitly disposed at the end of its scope "
+                        "(§28.3 auto-drop); use `item?.Dispose()`, `move`, "
+                        "`using var _ := owned item`, or `return` to discharge "
+                        "it explicitly (§28.3/§28.11)");
+                    continue;
+                }
+            }
             // §29.8 (#945, #973b): an iterator method's `owned` parameter that the
             // body never moves out is disposed by the state machine at iterator-
             // Dispose. Suppress the §28.3 normal-exit drop reject and flag the
@@ -1447,6 +1501,11 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
             // values would leak. Track these symbols so the auto-drop check in
             // run() can exclude them (they keep the hard §28.3 discharge error).
             collectOutOwnedVarSyms(*block.condition, ctx_, loopCondOutOwnedSyms_);
+            // §28.3 / §28.11 (#1466): a PRE-DECLARED recipient in a while-loop
+            // condition shares its slot across iterations too — exclude it from
+            // the recipient auto-drop (it keeps the hard discharge error, sound
+            // because the intermediate-iteration value would otherwise leak).
+            collectCondOutOwnedRecipients(*block.condition, loopCondOutOwnedSyms_);
         } else {
             // §28.3 / #1407: for an if/elif condition (non-loop) that declares
             // `out owned var` locals, record the symbols so foldPred can demote
@@ -1458,6 +1517,10 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
             // // per §28.3, #1407
             std::unordered_set<sema::Symbol*> condSyms;
             collectOutOwnedVarSyms(*block.condition, ctx_, condSyms);
+            // §28.3 / §28.11 (#1466): also demote a PRE-DECLARED recipient
+            // (`if coll.TryX(out item) then item?.Dispose(); end`) to PolyNull on
+            // the false edge, so an in-`then` discharge is not falsely reported.
+            collectCondOutOwnedRecipients(*block.condition, condSyms);
             if (!condSyms.empty())
                 ifCondOutOwnedSyms_[&block] = std::move(condSyms);
         }

@@ -1086,6 +1086,60 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
 }
 
 
+// §28.3 / §28.11 / §22.4 (#1466). See the header for the full contract: mirrors
+// MethodOwnership::markOutOwnedArgs / builtinOutOwnedArg
+// (src/ownership/Ownership_Checks.cpp) so codegen agrees with the ownership pass
+// on which argument position is a genuine `out owned` transfer, rather than
+// trusting the plain "out" call-site modifier alone (a plain `out` argument
+// targets a plain borrowing `out` parameter far more often than an `out owned`
+// one).
+bool Emitter::isOutOwnedArgPosition(const ast::CallExpr& call, std::size_t pos) {
+    // A USER method whose formal at `pos` is declared `out owned`.
+    if (auto* calleeSym = ctx_.exprSymbol(*call.callee)) {
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym)) {
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                if (pos < md->params.size())
+                    return md->params[pos].modifier == "out owned";
+            }
+        }
+    }
+    // A builtin owned-OUT collection Try* method — no AST declaration, so
+    // recognize it by receiver type name + member name, exactly like
+    // MethodOwnership::builtinOutOwnedArg.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy) return false;
+    std::string_view cn = builtinTypeName(recvTy);
+    std::string_view m = ma->member;
+    if (cn == "OwningStack" && m == "TryPop") return pos == 0;
+    if (cn == "OwningQueue" && m == "TryDequeue") return pos == 0;
+    // stdlib §4.5 / §4.7 (v0.171 #1336): OwningArray<T> and OwningLinkedList<T>
+    // both declare TryPopFirst/TryPopLast(out owned item: T?) at arg 0 — the
+    // #1466 repro is OwningArray specifically.
+    if ((cn == "OwningLinkedList" || cn == "OwningArray") &&
+        (m == "TryPopFirst" || m == "TryPopLast")) return pos == 0;
+    // OwningSet<T>.TryTake(query, out owned removed: T?) — out-owned at arg 1.
+    if (cn == "OwningSet" && m == "TryTake") return pos == 1;
+    // OwningDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
+    if (cn == "OwningDictionary" && m == "TryPopValue") return pos == 1;
+    if (cn == "Weak" && m == "TryUpgrade") return pos == 0;
+    // Channel<T>.TryReceive(out owned item: T?) — arg 0, only when T is a
+    // class/interface (value-typed/string T drops the ownership modifiers,
+    // stdlib §6.9).
+    if (cn == "Channel" && m == "TryReceive" && pos == 0) {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+            const sema::TypeRef* elemT = recvTy->genericArgs[0];
+            return elemT->kind == sema::TypeRef::Kind::Named &&
+                   elemT->declaration &&
+                   (elemT->declaration->kind == ast::TypeDeclKind::Class ||
+                    elemT->declaration->kind == ast::TypeDeclKind::Interface);
+        }
+        return false;
+    }
+    return false;
+}
+
 void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
     // Try to resolve the called method so we know its parameter types.
     // For primitive static calls (int.TryParse, double.TryParse, etc.)
@@ -1184,7 +1238,20 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         // only dispatching the destructor (which leaks the block). The slot itself
         // is the pre-declared local's — already created by its LocalDecl; we only
         // record ownership here.
-        if (a.modifier == "out owned" && a.value) {
+        // §1466 fix: since v0.160 (§A.4) the parser never re-emits the literal
+        // "out owned" modifier for a call-site argument — bare `out owned x` was
+        // replaced by the inline `out owned var x` form — so the literal-string
+        // arm alone is unreachable for a pre-declared recipient. The form that
+        // actually reaches a PRE-DECLARED recipient at an `out owned` parameter is
+        // the bare `out item` (no `var`), carrying the plain "out" modifier —
+        // indistinguishable at the call site from an ordinary borrowing `out`
+        // argument. Recognize it via isOutOwnedArgPosition (the codegen mirror of
+        // MethodOwnership::builtinOutOwnedArg) so an ordinary `out` argument is
+        // not misregistered as an owned recipient. The literal "out owned" is
+        // kept for defensiveness.
+        if ((a.modifier == "out owned" ||
+             (a.modifier == "out" && isOutOwnedArgPosition(call, pos))) &&
+            a.value) {
             if (auto* idoo = dynamic_cast<const ast::IdentifierExpr*>(
                     a.value.get())) {
                 sema::Symbol* symoo = ctx_.exprSymbol(*idoo);
@@ -1192,21 +1259,33 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     if (locoo->decl) {
                         outOwnedRecipients_.insert(
                             static_cast<const void*>(locoo->decl));
-                        // §28.3 (#900): the recipient now SOLELY owns the
-                        // moved-out element and has NO scope-end auto-dispose, so
-                        // an exception propagating before its explicit discharge
-                        // leaked it. Register a null-guarded unwindOnly disposal
-                        // (the same mechanism as a plain owned local) so the
-                        // implicit unwind cleanup disposes the still-owned element
-                        // exactly once. Null-guarded: a failed TryPop leaves the
-                        // slot null (skip); an explicit `item?.Dispose()` /
-                        // transfer before the throw nulls the slot
-                        // (explicitDisposeOwnedReceiverSlot) → skip (no
-                        // double-free). Gated on unwindIneligible_ so a recipient
-                        // that is later moved/transferred out (whose slot a move
-                        // may not null) is excluded, and on the analyzed-body
-                        // guard (currentFn_ == unwindIneligibleFn_), mirroring
-                        // registerUnwindOwnedLocal.
+                        // §28.3 (#900 / #1466): the recipient SOLELY owns the
+                        // moved-out element. Register a null-guarded scope-end
+                        // disposal on its slot so the element is reclaimed exactly
+                        // once — the same two-way choice the inline `out owned var`
+                        // form makes (below):
+                        //   • autoDropAtScopeEnd (the ownership pass proved the
+                        //     recipient is never discharged on any path) →
+                        //     dynamicDispose, firing on BOTH the normal-exit and
+                        //     unwind edges. This is the §28.3 affine AUTO-DROP for
+                        //     the recipient — a no-op when the slot is null (a
+                        //     failed TryPop left it null on the false path), and it
+                        //     RECLAIMS the heap block (not just the destructor) when
+                        //     non-null, closing the #1466 leak. Never over-rejects:
+                        //     a program that only pops-then-drops is accepted and
+                        //     leak-free.
+                        //   • otherwise (the recipient is discharged on some path —
+                        //     `item?.Dispose()`, `move`, transfer) → unwindOnly, the
+                        //     exception-edge-only backstop; the normal path is
+                        //     covered by that explicit discharge (which nulls the
+                        //     slot, so no double-free).
+                        // Both are null-guarded (an explicit `item?.Dispose()` /
+                        // transfer before a throw nulls the slot →
+                        // explicitDisposeOwnedReceiverSlot). Gated on
+                        // unwindIneligible_ so a recipient later moved/transferred
+                        // out (whose plain-var slot a move may not null) registers
+                        // nothing — its owner disposes it — mirroring
+                        // registerUnwindOwnedLocal; and on the analyzed-body guard.
                         auto slotIt = locals_.find(locoo->decl);
                         if (slotIt != locals_.end() && !disposeStack_.empty() &&
                             currentFn_ == unwindIneligibleFn_ &&
@@ -1214,7 +1293,10 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                             !unwindIneligible_.count(
                                 static_cast<const void*>(locoo->decl))) {
                             Disposal d{slotIt->second, nullptr};
-                            d.unwindOnly = true;
+                            if (locoo->autoDropAtScopeEnd)
+                                d.dynamicDispose = true;
+                            else
+                                d.unwindOnly = true;
                             disposeStack_.back().push_back(d);
                         }
                     }
@@ -2208,6 +2290,19 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
     // one whose nulling suppresses the only other reclaim of the object — so the
     // explicit site can reclaim the block once and null the slot (no double-free
     // with a following auto-dispose). See the helper's declaration for the cases.
+    // §28.3 / §28.11 (#1466): `item!.Dispose()` — the null-forgiving `!` narrows
+    // nullability but does not change WHICH object the receiver denotes, so
+    // `item!` reclaims through the exact same slot as bare `item` / `item?`.
+    // Unwrap it here (a nullable owned local, and in particular a nullable
+    // out-owned recipient, is disposed via `!.`/`?.`) rather than requiring every
+    // caller to. Before this the PostfixBangExpr shape matched no case below and
+    // fell to the final `return nullptr`, so `item!.Dispose()` only DISPATCHED the
+    // destructor and never reclaimed the heap block.
+    if (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(&receiver)) {
+        if (bang->operand)
+            return explicitDisposeOwnedReceiverSlot(*bang->operand, slotTy);
+        return nullptr;
+    }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&receiver)) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         // #991 / §28.5 / §28.7: a bare-identifier reference to an `owned`

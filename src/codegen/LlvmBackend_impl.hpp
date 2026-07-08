@@ -6833,6 +6833,21 @@ private:
     // the call. Must be called at the start of lowerCall.
     void ensureOutVarSlots(const ast::CallExpr& call);
 
+    // §28.3 / §28.11 / §22.4 (#1466): is the argument at `pos` in `call` a
+    // genuine `out owned` transfer position — a USER method whose formal at
+    // `pos` is declared `out owned`, or one of the builtin owned-OUT collection
+    // Try* methods (OwningStack.TryPop, OwningQueue.TryDequeue, OwningArray/
+    // OwningLinkedList.TryPopFirst/TryPopLast, OwningSet.TryTake,
+    // OwningDictionary.TryPopValue, Weak.TryUpgrade, Channel<T>.TryReceive for
+    // class/interface T)? Mirrors MethodOwnership::builtinOutOwnedArg /
+    // markOutOwnedArgs (src/ownership/Ownership_Checks.cpp) so codegen recognizes
+    // the SAME positions the ownership pass marks Owned. Consulted so a PRE-
+    // DECLARED recipient passed via the reachable plain `out item` call-site form
+    // (v0.160 dropped the bare `out owned item` spelling; the parser emits the
+    // plain "out" modifier for it) is also registered in outOwnedRecipients_ and
+    // given a scope-end reclaim — distinct from an ordinary borrowing `out` arg.
+    bool isOutOwnedArgPosition(const ast::CallExpr& call, std::size_t pos);
+
     // §22.4 (#968): the constructor-call analogue of ensureOutVarSlots. Pre-
     // creates the `out var x` slot for a `new T(out var x)` argument (typed from
     // the matching constructor's out parameter) and registers it in locals_ so

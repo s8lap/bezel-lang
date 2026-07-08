@@ -218,6 +218,18 @@ private:
     // this set — they are written at most once, making auto-drop exactly-once-safe.
     // Monotone (grows only), fixpoint-safe.  // per §28.3, §22.4
     std::unordered_set<sema::Symbol*> loopCondOutOwnedSyms_;
+    // §28.3 / §28.11 (#1466): every PRE-DECLARED nullable out-owned recipient —
+    // `var item: T? := null; coll.TryX(out item);` — i.e. the reachable plain
+    // `out item` call-site form at an `out owned` parameter (distinct from the
+    // inline `out owned var` / `out using var` forms). markOutOwnedArgs marks
+    // such a local Owned unconditionally (conservative for the false path where
+    // TryX returned false and the local stays null). The end-of-scope check
+    // consults this set to give an undischarged recipient a null-guarded AUTO-
+    // DROP (§28.3 warning + scope-end reclaim) instead of the hard discharge
+    // error — a recipient is provably null on the Try* false path, so forcing an
+    // explicit discharge there would over-reject the idiomatic empty/false
+    // pattern (the #1466 REDO reason). Monotone (grows only), fixpoint-safe.
+    std::unordered_set<sema::Symbol*> preDeclaredOutOwnedRecipients_;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed
@@ -1110,6 +1122,22 @@ private:
     // // per §28.3, §28.11
     void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
                           const ast::Expr* callee);
+
+    // §28.3 / §28.11 (#1466, #1407): scan an if/elif CONDITION expression for
+    // PRE-DECLARED out-owned recipients (`if coll.TryX(out item) then …`) — a
+    // bare `out item` argument at an `out owned` position (userOutOwned /
+    // builtinOutOwnedArg) that resolves to an existing local — and insert each
+    // recipient symbol into `out`. Consulted by processBlock to extend
+    // ifCondOutOwnedSyms_ so foldPred demotes the recipient to PolyNull on the
+    // FALSE edge (TryX returned false → the local was NOT written and is null),
+    // exactly as it already does for the inline `out owned var` form. Without
+    // this a discharge inside the then-branch alone (`item?.Dispose()`) meets a
+    // spurious Owned on the false edge and the recipient is falsely reported
+    // dropped. The inline forms are handled by collectOutOwnedVarSyms; this is
+    // the pre-declared counterpart, which needs the callee param / builtin
+    // dispatch (a member) to tell an owned-out `out` from a borrowing `out`.
+    void collectCondOutOwnedRecipients(const ast::Expr& cond,
+                                       std::unordered_set<sema::Symbol*>& out);
 
     // -- Async-readiness 3c: at-await-site Pattern A / B enforcement -----------
     //

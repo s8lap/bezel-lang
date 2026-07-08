@@ -3134,7 +3134,13 @@ bool MethodOwnership::builtinOutOwnedArg(const ast::Expr* callee,
     // always a disposable reference type (stdlib §4.5 / §4.7 / §4.9).
     if (cn == "OwningStack"  && m == "TryPop")      return argPos == 0;
     if (cn == "OwningQueue"  && m == "TryDequeue")  return argPos == 0;
-    if (cn == "OwningLinkedList" &&
+    // stdlib §4.5 / §4.7 (v0.171 #1336): OwningArray<T> and OwningLinkedList<T>
+    // both declare TryPopFirst/TryPopLast(out owned item: T?) — out-owned at
+    // arg 0. Fix #1466: OwningArray was missing here, so a PRE-DECLARED recipient
+    // (`arr.TryPopLast(out item)`) was never marked Owned by markOutOwnedArgs
+    // below — no scope-end reclaim armed for it, and an explicit `item?.Dispose()`
+    // dispatched the destructor without reclaiming the heap block (a leak).
+    if ((cn == "OwningLinkedList" || cn == "OwningArray") &&
         (m == "TryPopFirst" || m == "TryPopLast")) return argPos == 0;
     // OwningSet<T>.TryTake(query, out owned removed: T?) — out-owned at arg 1.
     if (cn == "OwningSet"    && m == "TryTake")     return argPos == 1;
@@ -3214,7 +3220,63 @@ void MethodOwnership::markOutOwnedArgs(
                     // (implicitly discharged — markOwnedByName's
                     // implicitDischarge guard skips it safely): mark Owned.
                     markOwnedByName(id->name, id->span.begin, id);
+                    // §28.3 / §28.11 (#1466): record the pre-declared recipient
+                    // symbol so the end-of-scope check gives it an AUTO-DROP
+                    // (null-guarded scope-end reclaim, a no-op when null) rather
+                    // than the hard §28.3 discharge error — a Try* recipient is
+                    // null on the false path, so demanding an explicit discharge
+                    // there would over-reject the idiomatic empty/false pattern.
+                    // Excludes the implicitly-discharged `out using var` form
+                    // (markOwnedByName skipped it, so it never reaches the check
+                    // as Owned). Populated during the dataflow (idempotent set
+                    // insert; fixpoint-safe).
+                    if (a.modifier != "out using var")
+                        if (sema::Symbol* rsym = ctx_.exprSymbol(*id))
+                            preDeclaredOutOwnedRecipients_.insert(rsym);
                 }
+            }
+        }
+        ++pos;
+    }
+}
+
+// §28.3 / §28.11 (#1466, #1407). See the header for the contract.
+void MethodOwnership::collectCondOutOwnedRecipients(
+        const ast::Expr& cond, std::unordered_set<sema::Symbol*>& out) {
+    const std::vector<ast::CallArgument>* args = nullptr;
+    const ast::Expr* callee = nullptr;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&cond)) {
+        args = &ce->args;
+        callee = ce->callee.get();
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&cond)) {
+        args = &nc->args;
+        callee = nc->callee.get();
+    }
+    if (!args) return;
+    // Resolve the callee's parameter list (a USER `out owned` formal), mirroring
+    // markOutOwnedArgs; builtin owned-OUT collection methods are matched by
+    // builtinOutOwnedArg below.
+    const std::vector<ast::Param>* params = nullptr;
+    if (callee) {
+        sema::Symbol* sym = ctx_.exprSymbol(*callee);
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                params = &md->params;
+    }
+    std::size_t pos = 0;
+    for (const auto& a : *args) {
+        if (!a.value) { ++pos; continue; }
+        // Only the PRE-DECLARED form — a bare `out item` (modifier "out"). The
+        // inline `out owned var` / `out using var` forms are collected by
+        // collectOutOwnedVarSyms; an `out using var` is implicitly discharged.
+        if (a.modifier == "out") {
+            const bool userOutOwned = params && pos < params->size() &&
+                                      (*params)[pos].modifier == "out owned";
+            if (userOutOwned || builtinOutOwnedArg(callee, pos)) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                    if (sema::Symbol* rsym = ctx_.exprSymbol(*id))
+                        out.insert(rsym);
             }
         }
         ++pos;

@@ -428,7 +428,19 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                         return fs_node->ownedIterVarAutoDropAtBodyEnd;
                     return false;
                 }();
-                if (loc->isUsing || isIterVarAutoDrop) {
+                // (c) §28.3 / §28.11 (#1466): an out-owned recipient (inline
+                // `out owned var` or a pre-declared `out item`) whose scope-end
+                // reclaim the ownership pass armed as a null-guarded auto-drop
+                // (LocalSymbol::autoDropAtScopeEnd → dynamicDispose in
+                // ensureOutVarSlots). Nulling the slot on `move` keeps that
+                // reclaim a no-op after the value is transferred to a new owner —
+                // exactly-once-safe under a conditional discharge, the same
+                // reasoning as the iter-var case. (autoDropAtScopeEnd on a
+                // LocalSymbol is set ONLY for out-owned recipients — a regular
+                // plain `var`'s auto-drop lives on its LocalDecl — so this does
+                // not disturb the plain-`var` borrow-after-move idiom.)
+                if (loc->isUsing || isIterVarAutoDrop ||
+                    loc->autoDropAtScopeEnd) {
                     if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);

@@ -1666,4 +1666,171 @@ BEZEL_TEST(codegen_excdisp_1294, manual_getenumerator_on_temporary_still_dispose
         "end C;", 2);
 }
 
+// --------------------------------------------------------------------------
+// [1466] §28.3 / §28.11 / §22.4 — a PRE-DECLARED nullable out-owned recipient
+// (`var item: T? := null; coll.TryX(out item);` — the reachable plain `out
+// item` call-site form against an `out owned` parameter, v0.160 having dropped
+// the bare `out owned item` spelling; distinct from the inline `out owned var`
+// / `out using var` forms) must be RECLAIMED — the destructor runs AND the heap
+// block is freed, exactly once — whether it is discharged by a later explicit
+// `item?.Dispose()` / `item.Dispose()` / `item!.Dispose()` OR left to the §28.3
+// scope-end auto-drop. Before this fix the whole TryPop*/TryDequeue/TryReceive
+// family's pre-declared recipient dispatched the destructor but never reclaimed
+// the block (a leak): codegen's ensureOutVarSlots only registered the recipient
+// for the dead literal "out owned" modifier, and OwningArray was absent from the
+// ownership pass's builtinOutOwnedArg table.
+//
+// This is a REDO of a reverted attempt whose regression was OVER-REJECTION: it
+// demanded the recipient be discharged on EVERY path, rejecting the valid
+// empty/false Try* pattern (`got` is provably null on the false path — nothing
+// to dispose). The fix instead gives the recipient a null-guarded AUTO-DROP (a
+// §28.3 must-use WARNING, never a hard error), so the empty/false program still
+// compiles and runs leak-free. The must-use warning is emitted but does not
+// affect the exit code or leak-freeness these tests assert.
+// --------------------------------------------------------------------------
+
+// Pre-declared recipient of OwningArray<R>.TryPopLast discharged via
+// `item?.Dispose()` OUTSIDE the producing `if` — the reclaim now frees the
+// popped block (was leaked). One element popped + explicitly disposed (count 1),
+// the other disposed by the array's own `using var` scope-end cascade (count 1).
+const char* kArr1466OutRecipientQuestionDispose =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwningArray<R>(); "
+    "    a.Add(move (new R())); a.Add(move (new R())); "
+    "    var item: R? := null; "
+    "    if a.TryPopLast(out item) then end; "
+    "    item?.Dispose(); "
+    "  end; "
+    "  return R.count; "                 // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1466,
+           array_predeclared_out_recipient_question_dispose_reclaims_once) {
+    expectExitAndLeakFree(kArr1466OutRecipientQuestionDispose, 2);
+}
+
+// The idiomatic in-`then` discharge (`if coll.TryX(out item) then …
+// item?.Dispose(); end`) — the reverted attempt REJECTED this; here it compiles
+// (§28.3/#1407 demotes the recipient to PolyNull on the false edge, extended to
+// the pre-declared form) and is leak-free.
+const char* kArr1466OutRecipientDisposeInIf =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwningArray<R>(); "
+    "    a.Add(move (new R())); "
+    "    var item: R? := null; "
+    "    if a.TryPopLast(out item) then item?.Dispose(); end; "
+    "  end; "
+    "  return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1466,
+           array_predeclared_out_recipient_dispose_in_if_reclaims_once) {
+    expectExitAndLeakFree(kArr1466OutRecipientDisposeInIf, 1);
+}
+
+// The null-forgiving discharge `item!.Dispose()` — exercises
+// explicitDisposeOwnedReceiverSlot's PostfixBangExpr unwrap; `item!` reclaims
+// through the same slot as `item` / `item?`.
+const char* kArr1466OutRecipientBangDispose =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwningArray<R>(); "
+    "    a.Add(move (new R())); a.Add(move (new R())); "
+    "    var item: R? := null; "
+    "    if a.TryPopLast(out item) then end; "
+    "    item!.Dispose(); "
+    "  end; "
+    "  return R.count; "                 // 2
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1466,
+           array_predeclared_out_recipient_bang_dispose_reclaims_once) {
+    expectExitAndLeakFree(kArr1466OutRecipientBangDispose, 2);
+}
+
+// THE OVER-REJECTION REGRESSION GUARD (the reverted attempt's failure). A
+// pre-declared recipient popped from an EMPTY array — TryPopFirst returns false,
+// `got` stays null (§22.3), never discharged — must NOT be rejected: the §28.3
+// auto-drop is a null-guarded no-op, so the program compiles and runs leak-free.
+// The only object is the later-Added R, disposed once by the array cascade.
+const char* kArr1466OutRecipientEmptyNeverDischarged =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwningArray<R>(); "
+    "    var got: R? := null; var ok := a.TryPopFirst(out got); "
+    "    a.Add(move (new R())); "
+    "  end; "
+    "  return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1466,
+           array_predeclared_out_recipient_empty_false_never_rejected) {
+    expectExitAndLeakFree(kArr1466OutRecipientEmptyNeverDischarged, 1);
+}
+
+// A pre-declared recipient popped from a NON-empty array and left UNDISCHARGED —
+// the §28.3 affine auto-drop reclaims it at scope end (was over-rejected before,
+// and would leak without the reclaim). One popped element auto-dropped (count 1).
+const char* kArr1466OutRecipientPoppedAutoDrop =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var a := new OwningArray<R>(); "
+    "    a.Add(move (new R())); "
+    "    var got: R? := null; var ok := a.TryPopFirst(out got); "
+    "  end; "
+    "  return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1466,
+           array_predeclared_out_recipient_popped_undischarged_autodrops_once) {
+    expectExitAndLeakFree(kArr1466OutRecipientPoppedAutoDrop, 1);
+}
+
+// Family generalization: the same pre-declared-recipient reclaim gap affected
+// the whole out-owned Try* family. OwningStack<T>.TryPop was already classified
+// Owned by the ownership pass, so this exercises the codegen bare-`out` arm
+// (ensureOutVarSlots) independent of the OwningArray builtinOutOwnedArg addition.
+const char* kStack1466OutRecipientDispose =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  do "
+    "    using var s := new OwningStack<R>(); "
+    "    s.Push(move (new R())); "
+    "    var item: R? := null; "
+    "    if s.TryPop(out item) then end; "
+    "    item?.Dispose(); "
+    "  end; "
+    "  return R.count; "                 // 1
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1466,
+           stack_predeclared_out_recipient_dispose_reclaims_once) {
+    expectExitAndLeakFree(kStack1466OutRecipientDispose, 1);
+}
+
 }  // namespace
