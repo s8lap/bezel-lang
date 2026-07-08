@@ -6820,10 +6820,22 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // `out`/borrow params do not. (`out owned` is by-ref — the callee writes the
     // caller's storage and does not own at entry — and is excluded.)
     if (ps->modifier != "owned") return;
-    // Must be a class/interface type to have a Dispose to call.
+    // Must be a class/interface type to have a Dispose to call. fix #1483 /
+    // §28.3: `rt` alone misses an `owned t: T` parameter of a generic method,
+    // where T is a bare (erased) type parameter — rt->declaration is null and
+    // isClassOrInterfaceRef(rt) is false even though the ACTIVE substitution
+    // (genericSubst_/genericSubstSemaTy_) binds T to a concrete class/interface
+    // for this specialization. Fall back through resolveTypeParamRef, mirroring
+    // the other disposal-registration sites that already handle this case
+    // (usingVarOwnsClassObjectMoveInit and the local-variable tracking near
+    // line 6640). The Disposal below carries `cls = nullptr` regardless (the
+    // `dynamicDispose`/`unwindOnly` path already dispatches through the live
+    // object's own vtable, exactly as it does for an interface-typed slot), so
+    // no further plumbing of the resolved type is needed here.
     const sema::TypeRef* rt =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
-    if (!isClassOrInterfaceRef(rt)) return;
+    if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
+        return;
     Disposal d{slot, nullptr};
     if (ps->autoDropAtScopeEnd) {
         // §28.3 v0.152 (#1008 Part B): the ownership pass flagged this dropped

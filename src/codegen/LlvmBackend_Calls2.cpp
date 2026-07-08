@@ -5845,6 +5845,17 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     auto savedLoop = loopStack_;
     auto savedDispose = disposeStack_;
     llvm::Function* savedFn = currentFn_;
+    // fix #1483 / §28.3: registerUnwindOwnedParam (and the sibling unwind-local
+    // registration sites) gate on `currentFn_ == unwindIneligibleFn_`, consulting
+    // unwindIneligible_ for the symbols the walk proved are moved/disposed/
+    // reassigned (so registration should SKIP them). Both are per-function state
+    // set by the outer caller's own body lowering; save/restore them around this
+    // nested specialization build exactly like paramSlots_/disposeStack_ above,
+    // so a specialization built mid-emission of an outer body (or another
+    // specialization) doesn't clobber the outer's ineligible-set once emission
+    // returns to it.
+    auto savedUnwindIneligible = unwindIneligible_;
+    llvm::Function* savedUnwindIneligibleFn = unwindIneligibleFn_;
     // fix #568 / §8.6: the specialized body's ReturnStmt lowering consults
     // currentReturnTypeNode_ (return-value boxing, nullable-value coercion). It
     // must name THIS method's declared return type while the body is emitted —
@@ -5988,27 +5999,35 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     loopStack_.clear(); finallyStack_.clear();
     disposeStack_.clear();
 
-    // Bind `this` and params.
-    auto argIt = specFn->arg_begin();
-    if (!isStaticMethod(ms)) {
-        currentThis_ = &*argIt++;
-    } else {
-        currentThis_ = nullptr;
-    }
-    for (std::size_t pi = 0; pi < ms->params.size(); ++pi, ++argIt) {
-        sema::Symbol* psym = ms->params[pi];
-        auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
-        // CG50: ref/out params are passed as pointers; register in refParams_
-        // so reads/writes go through the pointer (same as non-spec methods).
-        if (ps && isByRefMod(ps->modifier)) {
-            llvm::Type* elemTy = ps->declType ? lowerType(ps->declType) : i32();
-            refParams_[psym] = {&*argIt, elemTy};
-        } else {
-            auto* slot = entryAlloca(argIt->getType());
-            builder_.CreateStore(&*argIt, slot);
-            paramSlots_[psym] = slot;
-        }
-    }
+    // fix #1483 / §28.3: populate unwindIneligible_ for THIS specialized
+    // function, mirroring the non-specialized method-body prolog
+    // (LlvmBackend_Setup.cpp ~line 2911-2965: `unwindIneligible_.clear();
+    // unwindIneligibleFn_ = fn; collectUnwindIneligible(*ci.stmts);`).
+    // registerUnwindOwnedParam refuses to register anything unless
+    // `currentFn_ == unwindIneligibleFn_`; specFn is a freshly-created
+    // llvm::Function, so without this the gate silently rejected owned-param
+    // unwind registration for every generic specialization (the walk itself is
+    // symbol-identity based — ms->params/locals are the same AST/sema symbols
+    // across every instantiation — so it needs no genericSubst_ awareness).
+    unwindIneligibleFn_ = specFn;
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
+        collectUnwindIneligible(*ci.stmts);
+    else
+        unwindIneligible_.clear();
+
+    // Bind `this` and params. fix #1483 / §28.3: route through bindParameters
+    // (the same helper the non-specialized method path uses, LlvmBackend_Setup.cpp
+    // ~line 3000) instead of a manual loop. bindParameters is the ONLY code path
+    // that populates pendingOwnedParams_ — the manual loop this replaces bound
+    // paramSlots_/refParams_ directly and never touched pendingOwnedParams_, so
+    // lowerScopedBlock's root-scope registration (line ~11725) saw an empty list
+    // and never called registerUnwindOwnedParam for a specialized method body. An
+    // `owned t: T` parameter of a generic method (T erased/substituted) was
+    // therefore never auto-dropped on normal exit or disposed on exception
+    // unwind. currentThis_ mirrors the manual loop's static-method reset;
+    // bindParameters sets it from arg 0 when hasThis is true.
+    currentThis_ = nullptr;
+    bindParameters(specFn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
 
     // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a
     // virtual generic method whose override is `=> $"..."` (an expression body)
@@ -6053,6 +6072,8 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     diverged_ = savedDiverged;
     loopStack_ = std::move(savedLoop);
     disposeStack_ = std::move(savedDispose);
+    unwindIneligible_ = std::move(savedUnwindIneligible);  // fix #1483
+    unwindIneligibleFn_ = savedUnwindIneligibleFn;          // fix #1483
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817
