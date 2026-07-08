@@ -1889,6 +1889,26 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                         methodReturnsOnlyWrapperReceiverBorrow(*md))
                         return OwnershipState::Borrowed;
                 }
+            // §28.3 "Factory methods and sourceless returns" / Appendix C.3
+            // (fix #1499): an unannotated STATIC method whose EVERY return is a
+            // fresh owned producer (`new T(...)` / an `owned`-returning call)
+            // has no structural borrow source — a static call has no receiver —
+            // so the caller must treat it as OWNED, exactly like `new` (§28.3
+            // discharge/auto-drop rules apply). Without this, `static method
+            // Make(): Res return new Res(3); end;` classified its call Borrowed
+            // (the final fall-through default), so `var m := Make();` carried no
+            // disposal obligation: no auto-drop warning, no scope-end dispose —
+            // Res(3) leaked silently. A BORROW-returning static method (e.g.
+            // `static method Get(): R => _shared;`, a static-field read) is
+            // DELIBERATELY excluded by staticFactoryReturnsFreshOwned's
+            // every-return-fresh check and stays Borrowed — classifying that
+            // owned would make `using var r := Get()` dispose a shared/borrowed
+            // object (a double-free, §28.10 — the prior fix's regression). Sema,
+            // running before monomorphization, supplies the identity resolver.
+            if (common::staticFactoryReturnsFreshOwned(
+                    *md, ctx_.exprType(e), ctx_,
+                    [](const sema::TypeRef* t) { return t; }))
+                return OwnershipState::Owned;
             // Other non-`owned` user returns: fall through.
         }
         // #1388 / §28.3 / §28.11 / §29.1: builtin owned-TRANSFER calls — Pop /

@@ -86,4 +86,34 @@ bool isFreshOwnedClassProducer(const ast::Expr* e,
 bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
                                 const sema::SemaContext& ctx);
 
+// §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
+// STATIC method returning a plain class/interface type with NO `owned`
+// annotation has no STRUCTURAL borrow source — a static call has no receiver —
+// so the CALLER must discharge its result (bind with `using var`, store in an
+// `owned` field, pass to an `owned` parameter, or dispose) exactly as for
+// `new`. This predicate is true ONLY when the callee genuinely PRODUCES a fresh
+// owned value: it fires when `md` is `static`, its resolved result `resultTy`
+// is a plain class/interface (NOT a value-builtin, NOT an owning-collection/
+// -wrapper head — those carry the more specific §28.6 documented-source rule),
+// AND EVERY return path of `md`'s body yields a fresh owned producer (`new
+// T(...)` or an `owned`-returning call — via isFreshOwnedClassProducer).
+//
+// A static method that returns a BORROW on ANY path is DELIBERATELY excluded:
+// a static/instance FIELD read (`_shared` — process-lived source, §28.3
+// producers "Static property access ... Borrowed"), a parameter, `this`, or a
+// plain local alias. Classifying such a borrow-return as owned would make
+// `using var r := Get()` DISPOSE a value the callee does not own — a
+// double-free of a shared/borrowed object (§28.10) — the exact soundness
+// regression this predicate must avoid (the caller-side owned-assumption is
+// sound only opposite the callee-side borrow-return prohibition, §28.3
+// "Factory methods" non-normative note / borrow-lifetime rules; #1499).
+//
+// Callers must have already established `md.returnOwned == false` (an explicit
+// `owned` return is owned directly, without this rule). `resolveParam` is the
+// shared type-parameter resolver hook, threaded into isFreshOwnedClassProducer.
+bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
+                                    const sema::TypeRef* resultTy,
+                                    const sema::SemaContext& ctx,
+                                    const TypeParamResolver& resolveParam);
+
 }  // namespace bezel::common

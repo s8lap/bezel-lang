@@ -121,4 +121,136 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     return false;
 }
 
+namespace {
+
+// Recursively scan every `return EXPR;` reachable in statement `s` (the same
+// statement forms that can carry a nested return as
+// MethodOwnership::scanReturnsForWrapperReceiverBorrow, Ownership_Checks.cpp —
+// a nested closure carries its body as an Expr, never spliced into the Stmt
+// list, so it is structurally never descended into here). `sawReturn` records
+// whether any return was seen at all; `allFresh` is cleared the moment a
+// return whose value is not a fresh owned producer is found. Once `allFresh`
+// is false the walk short-circuits. // fix #1499 (mirrors §28.3 callee scan)
+void scanReturnsAllFreshOwned(const ast::Stmt* s, const sema::SemaContext& ctx,
+                              const TypeParamResolver& resolveParam,
+                              bool& sawReturn, bool& allFresh) {
+    if (!s || !allFresh) return;
+    if (const auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        sawReturn = true;
+        // A borrow return (`return _shared;`, `return p;`, `return this;`,
+        // `return this.f;`, `return alias;`) is NOT a fresh owned producer, so
+        // it clears allFresh — the whole method is then not a fresh-owned
+        // factory and the call stays a borrow (§28.10; the #1499 regression).
+        if (!rs->value ||
+            !isFreshOwnedClassProducer(rs->value.get(), ctx, resolveParam))
+            allFresh = false;
+        return;
+    }
+    if (const auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+        for (auto& b : is->ifBranch.body)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        for (auto& br : is->elifBranches)
+            for (auto& b : br.body)
+                scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                         allFresh);
+        for (auto& b : is->elseBody)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        return;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        for (auto& b : ws->body)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        return;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        for (auto& b : fs->body)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        return;
+    }
+    if (const auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        for (auto& b : d->body)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        for (auto& b : ts->body)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        for (auto& c : ts->catches)
+            scanReturnsAllFreshOwned(c.body.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        for (auto& b : ts->finallyBody)
+            scanReturnsAllFreshOwned(b.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+        return;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        for (auto& arm : cs->arms)
+            for (auto& a : arm.stmts)
+                scanReturnsAllFreshOwned(a.get(), ctx, resolveParam, sawReturn,
+                                         allFresh);
+        return;
+    }
+    // ExpressionStmt / AssignmentStmt / DiscardStmt / YieldStmt (iterator
+    // methods are handled by the for-loop desugaring, not this rule) /
+    // IncrementStmt / BreakStmt / ContinueStmt / ThrowStmt / LocalDecl: none
+    // can carry a nested `return` of the enclosing method.
+}
+
+}  // namespace
+
+bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
+                                    const sema::TypeRef* resultTy,
+                                    const sema::SemaContext& ctx,
+                                    const TypeParamResolver& resolveParam) {
+    // (1) STATIC only. §28.3: an INSTANCE method's non-`owned` class return has
+    // a structural source (the receiver), so it is a borrow — never covered by
+    // the sourceless-return rule.
+    bool isStatic = false;
+    for (std::string_view mod : md.modifiers)
+        if (mod == "static") { isStatic = true; break; }
+    if (!isStatic) return false;
+    // (2) The resolved result must be a plain class/interface. A value-builtin
+    // (DateTime/Guid/TimeSpan/…) carries kind==Class but has no disposal
+    // obligation (mirrors the sibling isClassOrInterfaceResult guards).
+    if (!resultTy || resultTy->kind != sema::TypeRef::Kind::Named ||
+        !resultTy->declaration)
+        return false;
+    if (resultTy->declaration->isValueBuiltin) return false;
+    if (resultTy->declaration->kind != ast::TypeDeclKind::Class &&
+        resultTy->declaration->kind != ast::TypeDeclKind::Interface)
+        return false;
+    // §28.6 / §5.11: an owning-collection / owning-wrapper name-head result
+    // carries its OWN, more specific documented-source borrow assumption (the
+    // `Owning*` name denotes ELEMENT ownership, orthogonal to the container
+    // `owned` qualifier). Excluded here so the two rules never fight over the
+    // same call; a fresh owning value must be returned through an `owned`
+    // return type (§28.3 borrow-lifetime rules), enforced at the definition.
+    if (isOwningTypeHead(resultTy->headName())) return false;
+    // (3) The DISTINGUISHING check (the #1499 soundness core): classify owned
+    // ONLY when EVERY return path produces a fresh owned value. A borrow on any
+    // path (a field read like `_shared`, a parameter, `this`, a plain alias)
+    // leaves the call a borrow — never disposed by the caller (§28.10). An
+    // abstract/iterator/no-return body (sawReturn stays false) is likewise not
+    // a fresh-owned factory.
+    bool sawReturn = false;
+    bool allFresh = true;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        sawReturn = md.exprBody != nullptr;
+        allFresh = md.exprBody &&
+                   isFreshOwnedClassProducer(md.exprBody.get(), ctx,
+                                             resolveParam);
+    } else {
+        for (auto& s : md.stmts)
+            scanReturnsAllFreshOwned(s.get(), ctx, resolveParam, sawReturn,
+                                     allFresh);
+    }
+    return sawReturn && allFresh;
+}
+
 }  // namespace bezel::common

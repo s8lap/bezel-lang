@@ -6695,6 +6695,32 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                     // Interface return: dynamic dispatch with a null cls.
                     return reinterpret_cast<const sema::TypeSymbol*>(1);
                 }
+                // (b2u) §28.3 "Factory methods and sourceless returns" /
+                // Appendix C.3 (fix #1499): an unannotated STATIC method whose
+                // EVERY return is a fresh owned producer is treated as OWNED by
+                // the caller — mirrors the sema producerState classification
+                // and the usingVarOwnsClassObjectDynamically (b2u) mirror below.
+                // Covers the exception-unwind edge for a plain `var` bound to
+                // such a call and discharged on only SOME paths. A borrow-
+                // returning static method (`Get() => _shared`) fails the
+                // every-return-fresh check and is NOT disposed (§28.10).
+                if (md && !isOwned) {
+                    const sema::TypeRef* initTy =
+                        ctx_.exprType(*ld->initializer);
+                    if (common::staticFactoryReturnsFreshOwned(
+                            *md, initTy, ctx_,
+                            [this](const sema::TypeRef* t) {
+                                return resolveTypeParamRef(t);
+                            })) {
+                        if (initTy &&
+                            initTy->kind == sema::TypeRef::Kind::Named &&
+                            initTy->declaration &&
+                            initTy->declaration->kind ==
+                                ast::TypeDeclKind::Class)
+                            return initTy->declaration;
+                        return reinterpret_cast<const sema::TypeSymbol*>(1);
+                    }
+                }
             }
             // (b3) #1349 / #642 / §28.3 / §28.11: builtin owned-TRANSFER calls
             // (Pop/Dequeue on owning stacks/queues, PopLast/PopFirst/PopAt/
@@ -10597,6 +10623,28 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     if (isOwned &&
                         (isClassOrInterfaceRef(initTy) ||
                          isClassOrInterfaceRef(resolveTypeParamRef(initTy))))
+                        return true;
+                    // (b2u) §28.3 "Factory methods and sourceless returns" /
+                    // Appendix C.3 (fix #1499): an unannotated STATIC method
+                    // whose EVERY return is a fresh owned producer is treated as
+                    // OWNED by the caller — so a `using var x := Make();` (or a
+                    // plain `var` the ownership pass flagged autoDropAtScopeEnd)
+                    // actually disposes at codegen. Mirrors the sema
+                    // producerState classification (Ownership.cpp) exactly (same
+                    // callee AST, same expr-type map — only the ignored resolver
+                    // differs), so sema and codegen never diverge. Without this,
+                    // sema would classify the value Owned (auto-drop warning
+                    // fires) while codegen registered no disposal — a leak
+                    // surviving a sema-only fix. A borrow-returning static
+                    // method (`Get() => _shared`) fails the every-return-fresh
+                    // check → returns false → `using var r := Get()` disposes
+                    // NOTHING (§28.10; the prior fix's double-free regression).
+                    if (md && !isOwned &&
+                        common::staticFactoryReturnsFreshOwned(
+                            *md, initTy, ctx_,
+                            [this](const sema::TypeRef* t) {
+                                return resolveTypeParamRef(t);
+                            }))
                         return true;
                 }
                 // (b1f) #1290 / §27.1: the callee may be a FUNCTION-TYPED VALUE
