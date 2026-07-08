@@ -4581,6 +4581,48 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
 }
 
 
+// §8.5 (v0.182, #1579): spell a TypeRef the way an inline array's default
+// `ToString` names its element type — "int", "MyRecord", "MyRecord?", etc.
+// This is the SOURCE spelling (for the user-facing "[3]int" string), not a
+// mangled name fragment like the generic-instantiation `mangleTy` helper
+// (LlvmBackend_Setup.cpp).
+static std::string inlineArrayElemTypeName(const sema::TypeRef* t) {
+    if (!t) return "?";
+    std::string base;
+    if (t->kind == sema::TypeRef::Kind::Primitive) {
+        switch (t->primitive) {
+            case sema::PrimitiveType::Bool:    base = "bool";    break;
+            case sema::PrimitiveType::Char:    base = "char";    break;
+            case sema::PrimitiveType::String:  base = "string";  break;
+            case sema::PrimitiveType::Byte:    base = "byte";    break;
+            case sema::PrimitiveType::SByte:   base = "sbyte";   break;
+            case sema::PrimitiveType::Short:   base = "short";   break;
+            case sema::PrimitiveType::UShort:  base = "ushort";  break;
+            case sema::PrimitiveType::Int:     base = "int";     break;
+            case sema::PrimitiveType::UInt:    base = "uint";    break;
+            case sema::PrimitiveType::Long:    base = "long";    break;
+            case sema::PrimitiveType::ULong:   base = "ulong";   break;
+            case sema::PrimitiveType::Float:   base = "float";   break;
+            case sema::PrimitiveType::Double:  base = "double";  break;
+            case sema::PrimitiveType::Decimal: base = "decimal"; break;
+            case sema::PrimitiveType::Object:  base = "Object";  break;
+            default:                           base = "?";       break;
+        }
+    } else if (t->kind == sema::TypeRef::Kind::Named) {
+        if (t->declaration) base = std::string(t->declaration->name);
+        else if (t->astNode && t->astNode->name &&
+                 !t->astNode->name->parts.empty())
+            base = std::string(t->astNode->name->parts.back());
+        else base = "?";
+    } else if (t->kind == sema::TypeRef::Kind::Unit) {
+        base = "()";
+    } else {
+        base = "?";
+    }
+    if (t->nullable) base += "?";
+    return base;
+}
+
 // §15.1.2 / §17.5 / #1342: lower an inline-array `[N]T` built-in intrinsic:
 //   ToArray()    — copies all N slots into a fresh bz_array_t* (owned Array<T>).
 //                  String elements are +1 retained (bz_array_retain_strings).
@@ -4588,6 +4630,8 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
 //                  uses emitRemoveElementEquality (§9.2: value-eq for values,
 //                  content-eq for strings, identity/Equals for classes, structural
 //                  for records).
+//   ToString()   — (§8.5 v0.182, #1579) the compiler-generated default:
+//                  "[N]T"-style, the type's name — a compile-time constant.
 //
 // The receiver is an InlineArray-typed expression that lowers to an LLVM
 // `[N x elemTy]` value (usually an lvalue, but we spill to a temp alloca when
@@ -4598,13 +4642,31 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
     if (!ma || !ma->target) return nullptr;
 
     const std::string_view m = ma->member;
-    if (m != "ToArray" && m != "Contains") return nullptr;
+    if (m != "ToArray" && m != "Contains" && m != "ToString") return nullptr;
 
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
     if (!recvTy || recvTy->kind != sema::TypeRef::Kind::InlineArray) return nullptr;
 
     sema::TypeRef* elemRef = recvTy->arrayElement;
     int64_t N = recvTy->arraySizeValue;
+
+    // §8.5 (v0.182, #1579): the compiler-generated default `ToString` for an
+    // inline array is the type's name, "[3]int"-style — deliberately NOT an
+    // element listing (elements may be class-typed borrows whose formatting
+    // is not the container's business). N and the element type are both
+    // static, so the whole result is a compile-time string constant; the
+    // receiver's runtime value is never read. Handled here (rather than the
+    // general array-address path below) because it needs neither `arrAddr`
+    // nor `elemTy`/`esz`.
+    if (m == "ToString" && call.args.empty()) {
+        std::string name = "[" + std::to_string(N) + "]" +
+                            inlineArrayElemTypeName(elemRef);
+        // lowerStringLiteral expects Bezel string-literal SOURCE TEXT
+        // (including the surrounding quotes); a type name is always a plain
+        // identifier sequence (plus "[", "]", "?"), none of which need
+        // escaping for a non-verbatim literal.
+        return lowerStringLiteral("\"" + name + "\"", /*verbatim=*/false);
+    }
 
     llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : i64();
     if (!elemTy) elemTy = i64();

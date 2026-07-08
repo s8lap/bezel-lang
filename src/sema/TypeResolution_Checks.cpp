@@ -1762,6 +1762,44 @@ bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
     return true;
 }
 
+// per §14.2 (v0.182, #1579): "the same constraint set per type parameter,
+// compared order-insensitively and after type-alias resolution" — a null
+// constraint pointer means the type parameter carries no `where` clause at
+// all (the empty set, e.g. an omitted clause). Two same-`kind` "type" items
+// are equal when their resolved TypeRefs are equal (typeRefEqual already
+// looks through alias resolution, since ctx_.resolvedType resolves aliases
+// transparently the first time the Type node is resolved — TypeResolution_
+// Names.cpp's alias-copy-into-ref path).
+bool Resolver::constraintSetsEquivalent(const ast::GenericConstraint* a,
+                                        const ast::GenericConstraint* b) {
+    static const std::vector<ast::ConstraintItem> kEmpty;
+    const auto& ai = a ? a->items : kEmpty;
+    const auto& bi = b ? b->items : kEmpty;
+    std::string_view aMod = a ? a->modifierConstraint : std::string_view{};
+    std::string_view bMod = b ? b->modifierConstraint : std::string_view{};
+    if (aMod != bMod) return false;
+    if (ai.size() != bi.size()) return false;
+    std::vector<bool> used(bi.size(), false);
+    for (const auto& ia : ai) {
+        bool matched = false;
+        for (std::size_t j = 0; j < bi.size(); ++j) {
+            if (used[j]) continue;
+            const auto& ib = bi[j];
+            if (ia.kind != ib.kind) continue;
+            if (ia.kind == "type") {
+                TypeRef* ta = ia.typeArg ? ctx_.resolvedType(*ia.typeArg) : nullptr;
+                TypeRef* tb = ib.typeArg ? ctx_.resolvedType(*ib.typeArg) : nullptr;
+                if (!typeRefEqual(ta, tb)) continue;
+            }
+            used[j] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
 void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                            MemberSymbol* baseSym) {
     auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
@@ -1835,6 +1873,43 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                       isByRefParamModifier(dp->modifier))) {
             err("parameter types");
             return;
+        }
+    }
+    // per §14.2 (v0.182, #1579): "An `override` of a generic method ...
+    // inherits the overridden ... declaration's constraints. Omitting the
+    // `where` clauses is the recommended spelling and means exactly the
+    // inherited set; the clauses may instead be restated in an equivalent
+    // form ... A differing clause — added, removed, narrowed, or widened
+    // relative to the inherited set — is a compile error." Matched
+    // positionally by the METHOD's own generic-parameter list (the `T` in
+    // `method Foo<T>` on both sides), not the enclosing class's generic
+    // substitution — a method-level type parameter is fresh per declaration
+    // regardless of name reuse.
+    if (dDecl && bDecl &&
+        dDecl->genericParams.size() == bDecl->genericParams.size()) {
+        for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
+            std::string_view dName = dDecl->genericParams[gi].name;
+            std::string_view bName = bDecl->genericParams[gi].name;
+            const ast::GenericConstraint* dc = nullptr;
+            for (const auto& gc : dDecl->genericConstraints)
+                if (gc.typeParam == dName) { dc = &gc; break; }
+            // No `where` clause on the OVERRIDE for this type parameter at
+            // all means "exactly the inherited set" — always legal, the
+            // recommended spelling; nothing to compare.
+            if (!dc) continue;
+            const ast::GenericConstraint* bc = nullptr;
+            for (const auto& gc : bDecl->genericConstraints)
+                if (gc.typeParam == bName) { bc = &gc; break; }
+            if (!constraintSetsEquivalent(dc, bc)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, derived->declLoc,
+                    std::string("override of `") + std::string(derived->name) +
+                    "` restates a `where " + std::string(dName) +
+                    ": ...` clause that differs from the inherited "
+                    "constraint set — omit the clause to inherit it exactly, "
+                    "or restate the identical set (§14.2)");
+                return;
+            }
         }
     }
 }

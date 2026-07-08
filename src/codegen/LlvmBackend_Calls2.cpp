@@ -362,21 +362,56 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return okDec;
     }
 
-    // §8.1 / §8.4 (#1119): Object.ReferenceEquals(a, b): bool — compares object
-    // identity, ignoring any Equals override. Classes / interfaces / Object? all
-    // lower to a raw pointer, so the identity test is a pointer `icmp eq` (a null
-    // reference compares equal to another null, true). A value-type argument is
-    // boxed to a FRESH heap object per the spec, so it never aliases another box
-    // — when an operand is not a pointer (a value type), the result is always
-    // false (§8.4: "Passing value-type arguments always returns false").
+    // §8.1 / §8.4 / §8.6 (#1119; updated v0.182 / #1579): Object.ReferenceEquals
+    // (a, b): bool — compares object identity by boxing composition (§8.6).
+    // Classes / interfaces / Object? / a `null` literal all lower to a raw
+    // pointer already (their "box" is themselves), so the identity test is a
+    // pointer `icmp eq` (a null reference compares equal to another null,
+    // true). A NON-NULLABLE value-type argument boxes to a FRESH heap object
+    // per §8.6, so it never aliases anything else — including another
+    // occurrence of an equal-valued argument, since each occurrence boxes
+    // independently — so its mere presence forces the result to `false`
+    // without needing to actually allocate a box (no observable behavior
+    // depends on the box's identity beyond "it is fresh"). A NULLABLE
+    // value-type argument (`T?`) that is null is different (the v0.182 fix):
+    // it boxes to the null reference (§8.6 Nullable value-type boxing), not
+    // to "always false" as the pre-v0.182 wording said — so
+    // `ReferenceEquals(x, null)` is `true` for a null `int?` `x`. Each operand
+    // therefore reduces to (present: i1, identityPtr: ptr): a real
+    // pointer operand is never "present" in this sense (its identity IS the
+    // pointer, null or not); a nullable-value operand's `present` is its
+    // runtime has-value flag, which gates the whole comparison to `false`
+    // when set and contributes a null-pointer identity when clear.
     if (pt == P::Object && m == "ReferenceEquals" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
         llvm::Value* a = lowerExpr(*call.args[0].value);
         llvm::Value* b = lowerExpr(*call.args[1].value);
         if (!a || !b) return nullptr;
-        if (!a->getType()->isPointerTy() || !b->getType()->isPointerTy())
+        const sema::TypeRef* tyA = ctx_.exprType(*call.args[0].value);
+        const sema::TypeRef* tyB = ctx_.exprType(*call.args[1].value);
+        bool nullableValA = !a->getType()->isPointerTy() && isNullableValueTy(tyA);
+        bool nullableValB = !b->getType()->isPointerTy() && isNullableValueTy(tyB);
+        // A non-pointer operand that is NOT the nullable-value tagged struct
+        // is a plain non-nullable value type: always a fresh, never-aliasing
+        // box, so the result is unconditionally false.
+        if ((!a->getType()->isPointerTy() && !nullableValA) ||
+            (!b->getType()->isPointerTy() && !nullableValB))
             return builder_.getFalse();
-        return builder_.CreateICmpEQ(a, b, "refeq");
+        llvm::Value* presentA = nullableValA ? nullablePrimHasValue(a)
+                                              : builder_.getFalse();
+        llvm::Value* presentB = nullableValB ? nullablePrimHasValue(b)
+                                              : builder_.getFalse();
+        llvm::Value* ptrA = nullableValA
+            ? llvm::ConstantPointerNull::get(ptrTy())
+            : a;
+        llvm::Value* ptrB = nullableValB
+            ? llvm::ConstantPointerNull::get(ptrTy())
+            : b;
+        llvm::Value* neitherPresent = builder_.CreateAnd(
+            builder_.CreateNot(presentA), builder_.CreateNot(presentB),
+            "refeq.neitherpresent");
+        llvm::Value* ptrEq = builder_.CreateICmpEQ(ptrA, ptrB, "refeq.ptr");
+        return builder_.CreateAnd(neitherPresent, ptrEq, "refeq");
     }
 
     // §5: char static classification methods — char.IsDigit(c), etc.
@@ -2488,8 +2523,42 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> instance methods and
     // Array<T>.AsSpan()/AsReadOnlySpan() construction.
     if (auto* v = tryLowerArraySpanCall(call)) return v;
-    // §15.1.2 / #1342: inline-array `[N]T` built-in intrinsics ToArray / Contains.
+    // §15.1.2 / #1342: inline-array `[N]T` built-in intrinsics ToArray /
+    // Contains / (§8.5 v0.182) default ToString.
     if (auto* v = tryLowerInlineArrayCall(call)) return v;
+    // stdlib §4.4 / spec §16.3 (v0.182, #1579): `Array<T>.Slice(r: Range<int>):
+    // owned Array<T>` — shares codegen with `arr[r]` (the "compiler-
+    // recognized equivalent") via lowerArrayRangeSlice.
+    if (call.args.size() == 1 && call.args[0].value && call.callee) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma->member == "Slice" && ma->target) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
+                    if (builtinTypeName(rt) == "Array") {
+                        if (llvm::Value* recv = lowerExpr(*ma->target)) {
+                            if (auto* sliced = lowerArrayRangeSlice(
+                                    recv, rt, *call.args[0].value))
+                                return sliced;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // §8.5 (v0.182, #1579): the unit type's default `ToString` is the
+    // constant `"()"` — unit has exactly one value, so nothing about the
+    // receiver needs to be read. Handled here (rather than through the
+    // general class/interface/Object vtable-slot-3 ToString dispatch)
+    // because unit has no vtable to dispatch through.
+    if (call.args.empty() && call.callee) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma->member == "ToString" && ma->target) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
+                    if (rt->kind == sema::TypeRef::Kind::Unit)
+                        return lowerStringLiteral("\"()\"", /*verbatim=*/false);
+                }
+            }
+        }
+    }
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).

@@ -752,15 +752,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
-    // per §8.4 (#1126): `Object.ReferenceEquals(a, b)` on a VALUE-TYPE argument
-    // is almost always a mistake. Value types are compared by value; a value
-    // passed where an `Object?` is expected is boxed into a FRESH heap object,
-    // so the identity comparison is meaningless (always false). The result is
-    // already correct (#1119 lowers a pointer-identity compare); §8.4 states
-    // "the compiler warns". This is ADVISORY only — compilation still succeeds
-    // (DiagnosticEngine::hasErrors counts only errors). A value type is a
-    // non-`string`/non-`Object` primitive, a record, or an enum (§14.2 / §3).
-    // Args are typed post-order, so their resolved types are available here.
+    // per §8.4/§8.6 (#1126; updated v0.182, #1579): `Object.ReferenceEquals
+    // (a, b)` on a VALUE-TYPE argument is almost always a mistake. A NON-NULL
+    // value passed where an `Object?` is expected is boxed into a FRESH heap
+    // object on every call, so the identity comparison against it is always
+    // false — that part is unaffected by v0.182. A NULL nullable value (e.g.
+    // `int?` currently `null`) is the one exception: §8.6 boxes it to the
+    // null `Object` reference, so `ReferenceEquals(nullNullable, null)` is
+    // `true`, not false — the warning below is phrased to stay correct for
+    // both cases. The result is already correct (#1119/#1579 lower the
+    // matching pointer-identity compare); §8.4 states "the compiler warns".
+    // This is ADVISORY only — compilation still succeeds (DiagnosticEngine::
+    // hasErrors counts only errors). A value type is a non-`string`/non-
+    // `Object` primitive, a record, or an enum (§14.2 / §3); nullable forms
+    // of these also warn (the "usually false, except null-vs-null" case is
+    // still worth flagging). Args are typed post-order, so their resolved
+    // types are available here.
     if (auto* oma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
         if (oma->member == "ReferenceEquals" && oma->target) {
             if (auto* oid =
@@ -796,9 +803,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.diagnostics().report(
                             Severity::Warning, ce.span.begin,
                             "`Object.ReferenceEquals` is called with a value-type "
-                            "argument; reference equality on a value type is "
-                            "always false (each value is boxed into a fresh "
-                            "object) (\xC2\xA7""8.4)");
+                            "argument; a non-null value is boxed into a fresh "
+                            "object on every call, so the comparison is always "
+                            "false for it — a null nullable value boxes to a "
+                            "null reference instead and compares true only "
+                            "against another null (\xC2\xA7""8.4/\xC2\xA7""8.6)");
                 }
             }
         }
@@ -2263,8 +2272,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     bool isBuiltinExRecv =
                         recvTy->kind == TypeRef::Kind::Named &&
                         !recvTy->declaration;
+                    // §8.5 (v0.182, #1579): the unit type's default `ToString`
+                    // is its name, `"()"` — previously unstated, and this
+                    // universal-ToString dispatch had no case for a
+                    // Unit-kind receiver at all, so `().ToString()` typed to
+                    // nothing (same gap class as the inline-array case
+                    // below).
+                    bool isUnitRecv = recvTy->kind == TypeRef::Kind::Unit;
                     if (isObjectRecv || isIfaceRecv || isNamedClassRecv ||
-                            isBuiltinExRecv) {
+                            isBuiltinExRecv || isUnitRecv) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                         return;
                     }
@@ -3005,6 +3021,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "PopAt" || mm == "PopFirst" || mm == "PopLast" ||
                                 mm == "TryPopFirst" || mm == "TryPopLast" ||
                                 mm == "AsSpan" || mm == "AsReadOnlySpan" ||
+                                // stdlib §4.4 / §16.3 (v0.182, #1579): Array<T>.Slice(r).
+                                mm == "Slice" ||
                                 mm == "DisposeElements" ||
                                 // universal Object members (§8.1) + IDisposable.
                                 mm == "ToString" || mm == "Equals" ||
@@ -3663,6 +3681,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tr->kind = TypeRef::Kind::Named;
                         tr->declaration = nullptr;
                         tr->astNode = node;
+                        tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                        ctx_.setExprType(&ce, tr);
+                    }
+                    // stdlib §4.4 / spec §16.3 (v0.182, #1579): `Array<T>.Slice(r:
+                    // Range<int>): owned Array<T>` — a dedicated §28.3 producer
+                    // row (a METHOD, not an indexer, so §28.6's
+                    // getters-never-return-owned rule stays exceptionless);
+                    // `arr[r]` is the compiler-recognized equivalent (already
+                    // implemented, fix #682/#1079 — this gives the named
+                    // spelling the same return type). Only `Array<T>` exposes
+                    // it (not `OwningArray<T>`, whose elements are uniquely
+                    // owned and cannot be duplicated into a fresh array by a
+                    // borrowing slice).
+                    if (colName == "Array" &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0] &&
+                        m == "Slice" && ce.args.size() == 1 && ce.args[0].value) {
+                        static const ast::Type* kArraySliceNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("Array");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kArraySliceNode;
                         tr->genericArgs.push_back(recvTy->genericArgs[0]);
                         ctx_.setExprType(&ce, tr);
                     }
@@ -7651,6 +7697,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 } else if (mm == "Contains") {
                     // Return type: bool (per §15.1.2).
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                } else if (mm == "ToString") {
+                    // §8.5 (v0.182, #1579): the compiler-generated default
+                    // `ToString` for an inline array — "[3]int"-style, the
+                    // type's name — returns `string`. (Previously this fell
+                    // through the allow-list with no exprType set at all, so
+                    // the call typed to nothing and any consumer silently
+                    // dropped it.)
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                 }
             }
         }

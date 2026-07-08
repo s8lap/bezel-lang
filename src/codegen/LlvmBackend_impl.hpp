@@ -2721,6 +2721,20 @@ private:
     // built-in heap collection (the caller falls through to other paths).
     llvm::Value* lowerCollectionIndexerGet(const ast::IndexExpr& ix);
 
+    // fix #682/#1079 / stdlib §4.4 / spec §16.3 (v0.182, #1579): the shared
+    // Range-slice logic behind `arr[r]` (an Array<T> indexer get whose index
+    // is Range-typed) AND the named `Array<T>.Slice(r)` method — spec §16.3
+    // states the two are the compiler-recognized-equivalent forms of the
+    // same operation. `recv` is the already-lowered Array<T> pointer;
+    // `recvTy` its sema TypeRef (for the element size); `idxExpr` the
+    // Range-valued argument expression (either `ix.indices[0].value` or a
+    // `.Slice(...)` call's sole argument). Returns the sliced (fresh, owned)
+    // `bz_array_t*`, or null if `idxExpr` is not Range-typed (the scalar-
+    // index case; callers fall through to their own int-index path).
+    llvm::Value* lowerArrayRangeSlice(llvm::Value* recv,
+                                      const sema::TypeRef* recvTy,
+                                      const ast::Expr& idxExpr);
+
     // issue #409 / language spec §28.8.1 / §28.11: lower `move coll[i]` (the
     // slot-take) on an OWNING heap collection (OwningArray / OwningDictionary).
     // Reads the element out as owned AND leaves the slot moved-from (null) so the

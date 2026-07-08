@@ -339,6 +339,14 @@ private:
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym);
 
+    // §14.2 (v0.182, #1579): are two `where <T>: ...` clauses on a type
+    // parameter the SAME constraint set — compared order-insensitively and
+    // after type-alias resolution? A null pointer denotes the type parameter
+    // carrying no `where` clause at all (the empty set). Shared by
+    // checkOverrideSignatureMatch's override-constraint-inheritance check.
+    bool constraintSetsEquivalent(const ast::GenericConstraint* a,
+                                  const ast::GenericConstraint* b);
+
     // Build the base-class generic substitution map (base class T → the
     // concrete arg the derived class binds it to) for an override pair, e.g.
     // Container<T> base, IntBox : Container<int> → {T → int}. Shared by
