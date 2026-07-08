@@ -106,6 +106,65 @@ BEZEL_TEST(sema_enum, auto_increment_overflow_rejected) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
+// ── §10.4 / Appendix A.4 (v0.181, issue #1564): enum static owned surface ──
+
+// §10.4: "A static readonly field of class type may be marked `owned` …
+// enrolling it in §22.13's program-exit disposal." Before v0.181 the enum
+// grammar's StaticReadonlyDecl production had no `owned` slot; A.4 now
+// carries it. The parser already accepted `owned` generically (parseMember's
+// modifier loop is shared by class and enum bodies) and checkEnumRestrictions
+// never special-cased `owned`, so this was already accepted on HEAD — this
+// test locks the acceptance in as a spec-derived regression guard.
+BEZEL_TEST(sema_enum, static_owned_readonly_field_ok_1564) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Held end Held; "
+        "enum Kind A, B; "
+        "  public static owned readonly Cache: Held := new Held(); "
+        "end Kind;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ── §10.4 / §22.12 (issue #1564): enum `const` follows class-level rules ──
+//
+// §10.4: "A `const` member (grammar A.4 `StaticConstDecl`) follows §22.12's
+// class-level `const` rules: implicitly static, compile-time-constant
+// initializer, primitive or `string` type." checkConstTypes (Slice S30)
+// iterates every TypeSymbol in the module uninformed by TypeDeclKind, so it
+// already applies uniformly to enums — these tests are the conformance
+// check §1564 asked for; they confirm the existing behavior rather than
+// changing it.
+
+// A primitive-typed enum const is accepted, exactly as on a class.
+BEZEL_TEST(sema_enum, const_member_primitive_ok_1564_22_12) {
+    auto r = parseSemaAll(
+        "module M; enum Kind A, B; "
+        "  public const Limit: int := 42; "
+        "end Kind;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A `string`-typed enum const is accepted.
+BEZEL_TEST(sema_enum, const_member_string_ok_1564_22_12) {
+    auto r = parseSemaAll(
+        "module M; enum Kind A, B; "
+        "  public const Label: string := \"k\"; "
+        "end Kind;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A class-typed enum const is rejected — §22.12's "primitive or `string`"
+// restriction, same as on a class.
+BEZEL_TEST(sema_enum, const_member_non_primitive_rejected_1564_22_12) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Widget end Widget; "
+        "enum Kind A, B; "
+        "  public const Bad: Widget := new Widget(); "
+        "end Kind;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
 // ── #1137 / §8.4 / §10: enum comparison operand type-checking ─────────────────
 // An enum may be compared (=/<>/</<=/>/>=) only with a value of the SAME enum;
 // the operands are reduced to their underlying integers, so without an operand

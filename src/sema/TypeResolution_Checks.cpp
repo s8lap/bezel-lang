@@ -1400,14 +1400,17 @@ void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
         if (!hasMod(fs, "static")) {
             reportInstance("field", fs->name);
-        } else if (hasMod(fs, "owned")) {
-            // §11.7: a static class may not have owned fields at all.
-            ctx_.diagnostics().report(
-                Severity::Error, m->declLoc,
-                std::string("static class `") + std::string(t->name) +
-                "` may not declare an owned field `" +
-                std::string(fs->name) + "` (§11.7)");
         }
+        // §11.7 (v0.181, lifting an unrecorded leftover of the v0.55 ban):
+        // a static class MAY declare `static owned readonly` fields (and
+        // static owning-inline-array fields — those never carried the
+        // field-level `owned` modifier this check inspects; `owned` there is
+        // part of the inline-array TYPE, `[N owned]T`, so they were never
+        // rejected here). Such fields participate in §22.13 program-exit
+        // disposal exactly as on any other type: that mechanism is
+        // runtime-driven and independent of instance `Dispose()`, so the
+        // no-instantiation reasoning behind this function's other
+        // rejections never reached it. No rejection belongs here anymore.
         return;
     }
     if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
