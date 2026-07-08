@@ -89,21 +89,30 @@ public:
     // checks (§30.5) and the across-suspend SuspendLocal annotation — all of
     // which fire ONLY on async bodies, so a non-async body's diagnostics are
     // byte-for-byte unchanged. // per §30.5, §30.1
+    //
+    // §28.3 (v0.180, #1547): `isStatic` is true when the enclosing method is
+    // declared `static`. It gates checkStaticBorrowReturn, which rejects a
+    // static method returning a borrow with no receiver to source it from
+    // (a static method has no `this`). False (the default) for constructors/
+    // destructors/operators, where the check does not apply.
     void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
              const std::vector<sema::Symbol*>* paramSyms = nullptr,
              bool isAsync = false, bool isDestructor = false,
-             const ast::Type* returnType = nullptr, bool returnOwned = false);
+             const ast::Type* returnType = nullptr, bool returnOwned = false,
+             bool isStatic = false);
 
     // §28.3 / §5.11 (#1007): apply ONLY the borrow-returned-through-owning-type
     // check to an expression-bodied method `M(): T => exprBody` (which the full
     // block dataflow above is not run on). Seeds the parameters so a borrowed
     // param is classified correctly, then runs `checkBorrowReturnedThroughOwning
-    // Type(exprBody)` — nothing else, so no unrelated diagnostics are introduced
-    // on expression bodies. // per §28.3, §5.11
+    // Type(exprBody)` and — v0.180, #1547 — `checkStaticBorrowReturn(exprBody)`
+    // when `isStatic` — nothing else, so no unrelated diagnostics are
+    // introduced on expression bodies. // per §28.3, §5.11
     void runExprBodyOwningReturnCheck(
         const ast::Expr& exprBody,
         const std::vector<sema::Symbol*>* paramSyms,
-        const ast::Type* returnType, bool returnOwned);
+        const ast::Type* returnType, bool returnOwned,
+        bool isStatic = false);
 
     // #926 / §28.6 (v0.153): a property/indexer GETTER may not return a freshly-
     // produced owned value — a getter is a borrow-producing position (properties
@@ -175,6 +184,18 @@ private:
     // // per §28.3, §28.6, §5.11
     const ast::Type* returnType_ = nullptr;
     bool returnOwned_ = false;
+    // §28.3 (v0.180, #1547): true when the enclosing method is `static` (and
+    // therefore has no `this` / receiver). A static method's borrow-return
+    // options are strictly narrower than an instance method's: the borrow-
+    // lifetime rule admits only a receiver-sourced borrow (an instance
+    // method's `this`/its fields) or an extension method's receiver-parameter
+    // borrow — neither of which a static method has. checkStaticBorrowReturn
+    // consults this flag. Extension methods are never `static` (§26.3 rejects
+    // a `static` modifier inside an extension block), so `isStatic_` unambigu-
+    // ously means "no receiver at all," not merely "no `this`-keyword access."
+    // False for constructors/destructors/operators (no return-borrow rule
+    // applies to them here) and for instance methods. // per §28.3
+    bool isStatic_ = false;
     // §29.3 / §29.8 (#945): true when this method's body uses `yield` (it is an
     // iterator method). A SYNC iterator (sawYield_ && !isAsync_) whose `owned`
     // parameter is never moved out gets §29.8 state-machine auto-dispose instead
@@ -436,6 +457,51 @@ private:
     // local/param being transferred out) is Owned, not a borrow, and is
     // unaffected. Fires from handleReturn; a no-op for non-owning return types.
     void checkBorrowReturnedThroughOwningType(const ast::Expr& e);
+
+    // §28.3 (v0.180, #1547): reject a BORROW returned from a STATIC method
+    // through a plain (non-owning) class/interface return type declared
+    // WITHOUT `owned`. The borrow-lifetime rule admits only two forms of
+    // borrow-returning source: a receiver-sourced borrow from an INSTANCE
+    // method (`this`, a bare owned-field read, or a borrow reached through
+    // the receiver's fields/indexers), or an extension method's receiver-
+    // parameter borrow — a static method has neither. The spec's own
+    // canonical example is `static method Pick(a: Res, b: Res): Res return
+    // a;`: `a` is a borrowed parameter (source: the caller's frame) with no
+    // source proven to outlive the call, so returning it must be rejected;
+    // this callee-side prohibition is what makes the caller-side sourceless-
+    // return owned-assumption (*Factory methods*, §28.3) sound. Scoped to
+    // plain return types only: an owning-collection / owning-wrapper return
+    // (`OwningArray<T>`, `Shared<T>`, …) is already rejected uniformly for
+    // both static and instance methods by
+    // checkBorrowReturnedThroughOwningType above, so this does not re-check
+    // those (isOwningTypeNameHead heads are skipped to avoid double-
+    // reporting). Gated on isStatic_ — a no-op for instance/extension
+    // methods, constructors, destructors, and operators. Uses
+    // ownedArgSourceIsBorrow to classify the returned expression: a fresh
+    // producer (`new`, an owned-returning call, a `move`), a static property
+    // read (process-lived storage, §28.3 producers table), or anything the
+    // classifier cannot positively identify as a borrow is left unflagged —
+    // conservative, so a legal factory return is never over-rejected. A
+    // STATIC FIELD read (`exprIsStaticMemberRead`) is exempted the same way a
+    // static PROPERTY read already is (§28.3 #1499 regression guard,
+    // `borrow_field_return_stays_borrowed`): both are the declaring type's own
+    // static storage, process-lived, so every intra-program liveness
+    // constraint is satisfied — the same reasoning the producers table states
+    // for "Static property access". Fires from handleReturn (block bodies)
+    // and runExprBodyOwningReturnCheck (`=>` expression bodies). // per §28.3
+    void checkStaticBorrowReturn(const ast::Expr& e);
+
+    // §28.3 (v0.180, #1547): true when `e` is a bare identifier or member
+    // access resolving to a STATIC field or property member (a `modifiers`
+    // list containing "static" on the resolved MemberSymbol). Used by
+    // checkStaticBorrowReturn to exempt a static method's read of its own (or
+    // another type's) static storage — process-lived, so it always outlives
+    // the call, the same "Static property access" exception the §28.3
+    // producers table states explicitly for properties; a static FIELD read
+    // (`_shared` in the #1499 regression-guard test) carries the identical
+    // process-lived-storage reasoning, so it is exempted here rather than
+    // rejected as an ordinary borrowed-field read.
+    bool exprIsStaticMemberRead(const ast::Expr& e) const;
 
     // §28.6 *Borrowed owning collections* (#1008 Part C): reject an ownership-
     // transferring / disposing operation (Dispose / Drain / Pop* / Dequeue /
