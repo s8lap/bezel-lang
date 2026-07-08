@@ -1374,11 +1374,25 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
 }
 
 bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
+    std::unordered_set<const ast::TypeDecl*> seen;
+    return isBorrowBearingRecordImpl(rt, seen);
+}
+
+// per §9.7, #1611: see header for the visited-set rationale.
+bool MethodOwnership::isBorrowBearingRecordImpl(
+        const sema::TypeRef* rt,
+        std::unordered_set<const ast::TypeDecl*>& seen) const {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
     const auto* decl =
         dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
     if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+    // #1611: a record already being visited on this call chain (reached only
+    // through a self- or mutually-referential STATIC field, since an
+    // instance-field cycle is already rejected earlier by
+    // Resolver::recordValueContainsSelf) contributes no new information —
+    // stop here rather than recurse without bound. // per §9.7
+    if (!seen.insert(decl).second) return false;
 
     // §9.7: a record is borrow-bearing when it holds at least one
     // borrow-carrying field of a non-runtime-managed type: a class/
@@ -1398,7 +1412,7 @@ bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
                     ft->declaration->kind == ast::TypeDeclKind::Interface)
                     return true;
                 if (ft->declaration->kind == ast::TypeDeclKind::Record)
-                    return isBorrowBearingRecord(ft);  // transitive
+                    return isBorrowBearingRecordImpl(ft, seen);  // transitive
                 return false;  // enum
             }
             case sema::TypeRef::Kind::InlineArray:
@@ -1415,14 +1429,27 @@ bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
         }
     };
 
-    // Positional record fields (§9.1).
+    // Positional record fields (§9.1) — never static, so no exclusion needed.
     for (const ast::Param& f : decl->positionalFields) {
         if (!f.type) continue;
         if (fieldIsBorrowCarrying(ctx_.resolvedType(*f.type))) return true;
     }
-    // Body-record reference fields / auto-properties (§9.2).
+    // Body-record reference fields (§9.2).
     for (const auto& m : decl->members) {
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+            // §9.2 (v0.182) / #1611: "Static members are ignored... The same
+            // static-member exemption applies wherever this membership rule
+            // is reused" — a static field is per-TYPE storage, not part of
+            // any instance's own layout, so it neither qualifies nor
+            // disqualifies a record's borrow-bearing-ness (and, being
+            // legally self- or mutually-referential per the §9.2 `Origin`
+            // pattern, must not be walked as if it were instance storage).
+            // Mirrors Resolver::recordValueContainsSelf's own static
+            // exclusion (TypeResolution_Checks.cpp). // per §9.2, §9.7
+            bool isStatic = false;
+            for (std::string_view mod : fd->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) continue;
             if (fd->type &&
                 fieldIsBorrowCarrying(ctx_.resolvedType(*fd->type)))
                 return true;

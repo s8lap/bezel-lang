@@ -850,8 +850,20 @@ private:
     // borrow-carrying field of a non-runtime-managed type (a class/
     // interface reference field, an inline array of reference elements,
     // or another borrow-bearing record). String/function/boxed and
-    // value-typed fields do not make a record borrow-bearing.
+    // value-typed fields do not make a record borrow-bearing. STATIC
+    // fields are excluded (§9.2's "static members are ignored" exemption,
+    // reused here) and delegates to isBorrowBearingRecordImpl with a fresh
+    // visited set. // per §9.7, #1611
     bool isBorrowBearingRecord(const sema::TypeRef* rt) const;
+
+    // Recursive worker for isBorrowBearingRecord (#1611). `seen` accumulates
+    // the record TypeDecls already being visited on this call chain so a
+    // self- or mutually-referential record type (e.g. a legal §9.2
+    // `Origin`-style static field whose type is the enclosing record) is
+    // visited at most once instead of recursing without bound. // per §9.7
+    bool isBorrowBearingRecordImpl(
+        const sema::TypeRef* rt,
+        std::unordered_set<const ast::TypeDecl*>& seen) const;
 
     // §30.1 / §9.7 (v0.179, #1438/#1448): true when `rt` is borrow-bearing for
     // the async-signature and across-suspension rules — a user borrow-bearing
