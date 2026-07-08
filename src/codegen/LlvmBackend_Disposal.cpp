@@ -101,9 +101,24 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // #383 / §28.8.1: suppress dynamic disposal of `using var u := move
         // this._f;` inside the destructor — the auto field-dispose below would
         // dispose the same (moved-from) field, double-freeing it.
+        //
+        // fix #1468 / §28.3 "Exception-path discharge" / §28.4: capture bz_exc as
+        // it stands at disposer entry. When this destructor runs as an owned
+        // local/field is disposed DURING stack unwinding, bz_exc already holds the
+        // PROPAGATING exception here. The body's pending-checks (emitPendingCheck)
+        // compare against this captured value so they fire only for a NEW
+        // exception the body itself threw — not the pre-existing propagating one,
+        // which would otherwise misfire, abandon the rest of the destructor, and
+        // leak the object plus its whole owned subtree. The load sits in the entry
+        // block (the current insert point), so it dominates every body block. On
+        // the normal, non-unwind disposal path this value is null at runtime, so
+        // the comparison in emitPendingCheck reduces to the plain `exc != null`.
+        disposerEntryExc_ =
+            builder_.CreateLoad(ptrTy(), emitExcSlot(), "disposer.entry.exc");
         emittingDisposerBody_ = true;
         terminated = lowerScopedBlock(dd->body);
         emittingDisposerBody_ = false;
+        disposerEntryExc_ = nullptr;
     }
     // §28.4: after the destructor body, dispose owned fields (reverse
     // declaration order), then chain to the base class's CORE disposer.
@@ -734,6 +749,29 @@ void Emitter::emitPendingCheck() {
     llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
     llvm::Value* pending = builder_.CreateICmpNE(
         exc, llvm::ConstantPointerNull::get(ptrTy()));
+    // fix #1468 / §28.3 "Exception-path discharge" / §28.4: inside a USER
+    // destructor body that runs while an exception unwinds the stack, bz_exc
+    // ALREADY holds the propagating exception when the body begins (§28.3: an
+    // owned local/field live at the throw is disposed during unwinding). A
+    // pending-check for an operation in the body — most commonly the §22.13
+    // static-init guard emitted when the destructor touches a user static member
+    // — must fire ONLY for a NEW exception that this operation itself threw, never
+    // for the pre-existing propagating one. Firing on the pre-existing exception
+    // branches straight to the enclosing unwind/return, abandoning the rest of
+    // the destructor body, its owned-field auto-dispose (§28.4 step 2) and its
+    // base chain — leaking the object and its whole owned subtree (the reported
+    // unsound leak). So AND in "different from the exception captured at disposer
+    // entry": the check fires iff in-flight AND new. When the entry value is null
+    // (the normal, non-unwind disposal path — always the case for a destructor-
+    // less type or a scope that exits without a throw) this reduces exactly to
+    // the plain `exc != null`, so this path is behaviour-identical there. The
+    // gate is emittingDisposerBody_, so ONLY user destructor-body emission is
+    // affected — the general dispatch and every built-in/runtime disposer (e.g.
+    // event-subscription and CancellationTokenSource cleanup) are untouched.
+    if (emittingDisposerBody_ && disposerEntryExc_) {
+        llvm::Value* isNew = builder_.CreateICmpNE(exc, disposerEntryExc_);
+        pending = builder_.CreateAnd(pending, isNew);
+    }
     auto* unwind =
         llvm::BasicBlock::Create(llvm_, "call.unwind", currentFn_);
     auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);

@@ -1172,6 +1172,22 @@ private:
     // and field disposal is null-safe).
     bool emittingDisposerBody_ = false;
 
+    // fix #1468 / §28.3 "Exception-path discharge" / §28.4: the in-flight
+    // exception value captured at the entry of the CURRENT user destructor body
+    // (null outside a destructor body, and null at runtime on the normal — non-
+    // unwind — disposal path). When a destructor runs as an owned local/field is
+    // disposed during stack unwinding, bz_exc already holds the PROPAGATING
+    // exception before the body executes. A pending-check for an operation inside
+    // the body (e.g. the §22.13 static-init guard emitted for a user static-
+    // member touch) must fire only for a NEW exception that operation itself
+    // threw — never for the pre-existing propagating one, which would abandon the
+    // rest of the destructor and leak the object plus its whole owned subtree.
+    // emitPendingCheck compares against this value (only while
+    // emittingDisposerBody_) to make that distinction. Set/cleared around the
+    // destructor body in emitDisposerCore; the load lives in the disposer's entry
+    // block so it dominates every body block.
+    llvm::Value* disposerEntryExc_ = nullptr;
+
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
     // multiple access sites (non-generic; generic getters are specialised).

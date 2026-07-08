@@ -1832,5 +1832,148 @@ BEZEL_TEST(codegen_excdisp_1466,
            stack_predeclared_out_recipient_dispose_reclaims_once) {
     expectExitAndLeakFree(kStack1466OutRecipientDispose, 1);
 }
+// #1468 §28.3 "Exception-path discharge" / §28.4 — a destructor that touches a
+// (different type's) PUBLIC static member was silently SKIPPED during exception
+// unwinding, leaking the object and its whole owned subtree.
+//
+// Root cause: a destructor is CLEANUP code (§28.3: an owned local/field live
+// when an exception propagates out of its block is disposed during stack
+// unwinding), so when it runs on the unwind path the propagating exception is
+// ALREADY in the thread-local bz_exc slot. A user static-member touch inside the
+// destructor emits a §22.13 static-init guard whose emitPendingCheck() reads
+// bz_exc; seeing the pre-existing propagating exception, it misread it as "this
+// operation just threw" and branched to the enclosing unwind/return — abandoning
+// the rest of the destructor body, its owned-field auto-dispose (§28.4 step 2)
+// and its base chain. §28.4: the destructor's body "runs exactly once, the first
+// time Dispose() is called" — which never held if the body never ran.
+//
+// Fix (narrow): a pending-check inside a USER destructor body now fires only for
+// an exception DIFFERENT from the one captured at disposer entry, so the pre-
+// existing propagating exception no longer misfires the check. Only a PUBLIC
+// static type gets a static-init guard at all (#798), so a touch of a PUBLIC
+// static member is what surfaces the misfire — hence `S` is `public` below.
+// --------------------------------------------------------------------------
+
+// Direct repro from issue #1468: `using var r`'s destructor increments a PUBLIC
+// static field on a different type (S.x) as its only side effect. The `throw`
+// inside the `try` unwinds through r's scope before being caught; per §28.3 r is
+// disposed on that unwind, so S.x must read 1 afterward. The bug left it at 0
+// (the destructor's static-touching body never executed).
+const char* kDtorStaticMemberTouchUnwind_1468 =
+    "module M; "
+    "public static class S "
+    "  public static x: int := 0; "
+    "end S; "
+    "public class R "
+    "  public constructor() end constructor; "
+    "  destructor S.x := S.x + 1; end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => var dummy := 0; end; "
+    "    return S.x; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1468, dtor_static_member_touch_disposed_on_unwind) {
+    BEZEL_EXPECT_EQ(run(kDtorStaticMemberTouchUnwind_1468), 1);
+}
+
+// Sanity companion: the SAME destructor with no throw (normal scope exit) must
+// still read S.x == 1 — confirms the fix is transparent on the already-working
+// normal-disposal path (the entry exception is null there, so the pending-check
+// comparison reduces to the plain `exc != null`).
+const char* kDtorStaticMemberTouchNormalExit_1468 =
+    "module M; "
+    "public static class S "
+    "  public static x: int := 0; "
+    "end S; "
+    "public class R "
+    "  public constructor() end constructor; "
+    "  destructor S.x := S.x + 1; end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    do "
+    "      using var r := new R(); "
+    "    end; "
+    "    return S.x; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1468, dtor_static_member_touch_disposed_on_normal_exit) {
+    BEZEL_EXPECT_EQ(run(kDtorStaticMemberTouchNormalExit_1468), 1);
+}
+
+// Compounding case (issue finding (e)): a destructor that touches a public
+// static ALSO abandoned its owned-field auto-dispose pass (§28.4 step 2) on the
+// unwind path, since the whole disposer-core body returned early before reaching
+// it. Outer owns `_inner: Inner`; Outer's destructor increments the public
+// static S.x (triggering the guard). On unwind, Outer must be disposed
+// (S.x == 1) AND its owned field Inner disposed transitively (Inner._n == 1) —
+// both were 0 pre-fix. Return S.x*10 + Inner._n == 11.
+const char* kDtorStaticTouchOwnedFieldTransitive_1468 =
+    "module M; "
+    "public static class S "
+    "  public static x: int := 0; "
+    "end S; "
+    "public class Inner "
+    "  public static _n: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor _n := _n + 1; end destructor; "
+    "end Inner; "
+    "public class Outer "
+    "  public owned _inner: Inner; "
+    "  public constructor(owned inner: Inner) _inner := inner; end constructor; "
+    "  destructor S.x := S.x + 1; end destructor; "
+    "end Outer; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    try "
+    "      using var o := new Outer(new Inner()); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => var dummy := 0; end; "
+    "    return S.x * 10 + Inner._n; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1468, dtor_static_touch_owned_field_transitively_disposed) {
+    BEZEL_EXPECT_EQ(run(kDtorStaticTouchOwnedFieldTransitive_1468), 11);
+}
+
+// Discriminator that the narrow fix STILL handles: a destructor that calls a
+// user static METHOD whose body does NOT itself touch a user static (here the
+// method only writes a builtin Console line). The static-init guard for the
+// call target and the post-call pending-check both sit in the destructor body,
+// so both are covered; the destructor then increments S.x itself. (The distinct,
+// deferred manifestation — a called method that ITSELF touches a user static and
+// misfires in its own body, since it is not compiled as a disposer body — is
+// tracked in a follow-up issue, not asserted here.)
+const char* kDtorStaticCallNoStaticTouch_1468 =
+    "module M; "
+    "public static class S "
+    "  public static x: int := 0; "
+    "  public static method Noop() Console.WriteLine(\"d\"); end Noop; "
+    "end S; "
+    "public class R "
+    "  public constructor() end constructor; "
+    "  destructor S.Noop(); S.x := S.x + 1; end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => var dummy := 0; end; "
+    "    return S.x; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1468, dtor_static_call_without_callee_static_touch_disposed) {
+    BEZEL_EXPECT_EQ(run(kDtorStaticCallNoStaticTouch_1468), 1);
+}
 
 }  // namespace
