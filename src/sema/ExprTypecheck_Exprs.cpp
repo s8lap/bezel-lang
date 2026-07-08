@@ -3427,6 +3427,31 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 return;
             }
         }
+        // per §3.5 (#1588): unary `-` (negation), like unary `+`, is grouped
+        // under "Arithmetic" and defined only on the numeric primitives
+        // (byte…decimal) — "invalid on bool, char, and string." Before this
+        // check, sema never inspected `-`'s operand kind at all (only `~` had
+        // a bad-kind check), so `-boolExpr`/`-charExpr` silently type-checked
+        // as an identity pass-through (the generic fall-through below), and
+        // `-stringExpr` reached codegen, which emitted an integer `sub` on a
+        // string's ptr representation and crashed on LLVM IR verification
+        // instead of raising a clean diagnostic. Primitive-only; a user type
+        // overloading `-` is resolved earlier via findUnaryOperator and never
+        // reaches here.
+        if (op == "-" && ot && ot->kind == TypeRef::Kind::Primitive) {
+            PrimitiveType p = ot->primitive;
+            const char* badKind =
+                (p == PrimitiveType::Bool) ? "`bool`"
+                : (p == PrimitiveType::Char) ? "`char`"
+                : (p == PrimitiveType::String) ? "`string`" : nullptr;
+            if (badKind) {
+                ctx_.diagnostics().report(Severity::Error, ue.span.begin,
+                    std::string("unary operator `-` is not valid on ") +
+                    badKind + " — unary `-` (negation) is defined only on "
+                    "numeric types (§3.5)");
+                return;
+            }
+        }
         if (ot) ctx_.setExprType(&ue, ot);
         return;
     }
