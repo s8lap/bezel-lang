@@ -3927,7 +3927,33 @@ void ExprTC::visitMember(const ast::Member& m) {
             // no name resolution, which is why it worked.)
             Scope* saveScope = currentScope_;
             if (!currentScope_) currentScope_ = moduleScope_.get();
+            // per §4.2 (v0.159/v0.182, #1590): an auto-property default
+            // initializer initializes the compiler-generated backing field
+            // (§23.1) at the same construction-time step §22.8 governs for
+            // an explicit field initializer — §11.1 and the design
+            // rationale's cyclic-serialization rule both speak of "field and
+            // property initializers" together as one construction-time
+            // concept. It is therefore an admitting typed context: an
+            // unsuffixed literal exceeding `int`'s range but fitting the
+            // property's declared wider integer type (long/ulong/uint)
+            // widens to it, mirroring the FieldDecl fix (#1576) instead of
+            // being rejected for want of a suffix.
+            PrimitiveType savedPropHint = currentLiteralWideningHint_;
+            if (pd->type) {
+                if (auto* prt = ctx_.resolvedType(*pd->type)) {
+                    if (prt->kind == TypeRef::Kind::Primitive) {
+                        using P = PrimitiveType;
+                        switch (prt->primitive) {
+                            case P::Long: case P::ULong: case P::UInt:
+                                currentLiteralWideningHint_ = prt->primitive;
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+            }
             visitExpr(*pd->autoInitializer);
+            currentLiteralWideningHint_ = savedPropHint;
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
         }

@@ -322,3 +322,55 @@ BEZEL_TEST(sema_expr_lit, binary_literal_widens_to_ulong_return_1576) {
         "return 0b100000000000000000000000000000000; end Big; "
         "public static method Main(): int return 0; end Main; end C;"));
 }
+
+// issue #1590 / §4.2 (v0.159/v0.182): an auto-property default initializer
+// (`property P: T := …;`, §23.1) initializes the compiler-generated backing
+// field at the same construction-time step §22.8 governs for an explicit
+// field initializer -- §11.1 and the design rationale's cyclic-serialization
+// rule both speak of "field and property initializers" together as one
+// construction-time concept, so the property-initializer form is the same
+// admitting typed context §4.2 names for a field initializer, even though
+// it is a distinct AST shape (ast::PropertyDecl::autoInitializer rather than
+// ast::FieldDecl::initializer). #1576 fixed the field-initializer,
+// assignment-target, and return-target gaps but explicitly left this one
+// unfixed pending this ruling.
+BEZEL_TEST(sema_expr_lit, literal_widens_to_long_property_initializer_1590) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public property P: long := 3000000000; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_widens_to_uint_property_initializer_1590) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public property P: uint := 4000000000; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+BEZEL_TEST(sema_expr_lit, literal_widens_to_ulong_property_initializer_1590) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public property P: ulong := 10000000000; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+// Hex/binary spellings widen identically to decimal in this context too,
+// mirroring the #1576 field-initializer/assignment/return coverage.
+BEZEL_TEST(sema_expr_lit, hex_literal_widens_to_long_property_initializer_1590) {
+    BEZEL_EXPECT_FALSE(semaHasErrors(
+        "module M; class C public property P: long := 0x100000000; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+// An `int`-typed auto-property still rejects -- the widening only applies
+// when the declared property type is itself wider than `int` (no accidental
+// width).
+BEZEL_TEST(sema_expr_lit,
+           literal_too_large_for_int_property_initializer_rejected_1590) {
+    BEZEL_EXPECT_TRUE(semaHasErrors(
+        "module M; class C public property P: int := 3000000000; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
+// A magnitude exceeding even the wider declared target's range still
+// rejects -- widening admits the value only when it actually fits.
+BEZEL_TEST(sema_expr_lit,
+           literal_too_large_for_long_property_initializer_rejected_1590) {
+    BEZEL_EXPECT_TRUE(semaHasErrors(
+        "module M; class C public property P: long := "
+        "99999999999999999999999999; "
+        "public static method Main(): int return 0; end Main; end C;"));
+}
