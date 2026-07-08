@@ -5477,6 +5477,21 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             }
         }
     }
+    // #1619 / §4.7: the unit type `()` has exactly one value and lowers to
+    // LLVM `void` (lowerTypeRef's Kind::Unit case, LlvmBackend_Layout.cpp) —
+    // correct when `void` names a function's RETURN type, but `void` is not
+    // a valid `alloca` operand: LLVM's DataLayout has no size/alignment case
+    // for it, so IRBuilder::CreateAlloca(void) hits an internal
+    // `llvm_unreachable` that this libLLVM build compiles to a hardware trap
+    // (SIGILL) rather than an assertion message. `slotTy` reaches here as
+    // `void` whenever a local is declared with unit type — explicitly
+    // (`var u: () := ();`) or via type inference from a unit-typed
+    // initializer (the `!v && !declaredTy` branch above re-derives `void`
+    // from the initializer's sema type). A unit-typed local has no data to
+    // store — substitute a one-byte placeholder slot; its contents are never
+    // meaningfully read (there is only one unit value, so nothing
+    // distinguishes one placeholder byte pattern from another).
+    if (slotTy->isVoidTy()) slotTy = i8();
     // §29.3: in an iterator MoveNext body, map locals to state-struct fields
     // so they persist across yield returns.
     llvm::AllocaInst* slot = nullptr;
