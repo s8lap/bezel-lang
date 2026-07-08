@@ -179,18 +179,21 @@ BEZEL_TEST(array_sized_fill_1375, size_one_single_element) {
         "end Main; end C;"), 107);
 }
 
-// A negative size produces an empty array (Count = 0). The stdlib §4.4 text
-// states no fault for a negative size argument (it defines only Count = size /
-// every slot = fill); the runtime treats a non-positive size like size 0. See
-// the lane report / follow-up issue: the negative-size behavior is doc-unstated.
-BEZEL_TEST(array_sized_fill_1375, negative_size_empty_no_fault) {
-    // per stdlib §4.4 v0.165 (#1375): doc-unstated negative-size → empty here.
+// A negative size raises ArgumentOutOfRangeException (stdlib §1/§4.4 v0.183,
+// #1396 — the doc now defines the fault; this supersedes the earlier v0.165
+// empty-fallback that treated a non-positive size like size 0).
+BEZEL_TEST(array_sized_fill_1375, negative_size_raises_aoor_1396) {
+    // stdlib §1/§4.4 (v0.183, #1396): a negative size now raises
+    // ArgumentOutOfRangeException (supersedes the v0.165 empty-fallback this
+    // test formerly asserted, which #1586 changed).
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
-        "  using var arr := new Array<int>(-1, 5); "
-        "  return arr.Count; "
-        "end Main; end C;"), 0);
+        "  try "
+        "    using var arr := new Array<int>(-1, 5); "
+        "    return arr.Count; "
+        "  catch ArgumentOutOfRangeException => return 42; end; "
+        "end Main; end C;"), 42);
 }
 
 // ── Slots are ordinary array slots afterwards ─────────────────────────────────
