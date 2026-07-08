@@ -2006,8 +2006,20 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         for (const auto& ty : arm.types) {
             if (!ty) continue;
             sema::TypeRef* rt = ctx_.resolvedType(*ty);
+            // §31.2.1 (v0.182 / #1505): a generic type parameter is admissible
+            // as an arm type and matches against its SUBSTITUTED type argument
+            // per instantiation. Inside a monomorphized body resolveTypeParamRef
+            // maps the placeholder (`TException`) to the concrete bound type
+            // (`MyFault`). Without it the placeholder ref has no `declaration`
+            // and no builtin-name entry, so descriptorForTypeName returns null,
+            // the arm's type test is skipped, and dispatch silently falls
+            // through to a later `Exception` arm (wrong-arm selection).
+            const sema::TypeRef* resolved = resolveTypeParamRef(rt);
+            const ast::Type* descNode = ty.get();
+            if (resolved && resolved != rt && resolved->astNode)
+                descNode = resolved->astNode;
             llvm::GlobalVariable* desc =
-                descriptorForTypeName(rt, ty.get());
+                descriptorForTypeName(resolved, descNode);
             if (!desc) continue;
             matched = builder_.CreateOr(matched, emitIsA(exc, desc));
         }
