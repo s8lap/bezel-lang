@@ -4487,6 +4487,18 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                             v = coerceNumericToType(
                                 v, st->getElementType(pit->second),
                                 isUnsignedTargetExpr(*call->args[pi].value));
+                            // #1605 / §4.6 / §28.9: same STRING positional-ctor-
+                            // param field gap as the `new C(args)` site
+                            // (LlvmBackend_Exprs2.cpp) — this `this(args)`
+                            // delegation to the primary ctor stores straight into
+                            // the same disposed FieldSymbol, so it needs the same
+                            // independent +1 (retain unless the arg is a fresh
+                            // +1 producer, transferred instead). Field is
+                            // calloc-zeroed — no old value to release here.
+                            if (v->getType()->isPointerTy() &&
+                                isStringStorageMember(fs) &&
+                                !isPlusOneStringProducer(call->args[pi].value.get()))
+                                emitStringRetain(v);
                             builder_.CreateStore(
                                 v, builder_.CreateStructGEP(st, currentThis_,
                                                             pit->second));

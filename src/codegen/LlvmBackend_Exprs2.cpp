@@ -3598,6 +3598,27 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         v = coerceNumericToType(
                             v, fieldTy,
                             isUnsignedTargetExpr(*ne.args[pi].value));
+                        // #1605 / §4.6 / §28.9: `fs` is a genuine class
+                        // FieldSymbol (disposed by the generated DisposeCore /
+                        // emitOwnedFieldDisposals like any other string field,
+                        // whether or not the parameter is also read from a body
+                        // position) — so a STRING positional-ctor-param field
+                        // needs its own independent +1 here, exactly like
+                        // lowerStringFieldStore / emitOwnFieldInit give any other
+                        // string field store. Without this, the field ALIASES
+                        // the caller's argument with no reference of its own: if
+                        // the caller later releases its local (e.g. `x += ...`'s
+                        // release-old, or scope-end), the field dangles and
+                        // Dispose() reads/frees already-freed memory (#1605). The
+                        // field is calloc-zeroed (null) before this — no old
+                        // value to release. A fresh +1 producer argument
+                        // (`new Box(a + b)`) is TRANSFERRED (no retain); anything
+                        // else (identifier / field / call) is RETAINED so the
+                        // field's count is independent of the source's.
+                        if (v->getType()->isPointerTy() &&
+                            isStringStorageMember(fs) &&
+                            !isPlusOneStringProducer(ne.args[pi].value.get()))
+                            emitStringRetain(v);
                         builder_.CreateStore(
                             v, builder_.CreateStructGEP(
                                    st, obj, idxIt->second));
