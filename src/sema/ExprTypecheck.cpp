@@ -2248,18 +2248,27 @@ Symbol* ExprTC::lookupExtensionMember(
         std::unordered_set<std::string_view> freeVars;
         for (const auto& gc : decl->genericConstraints)
             freeVars.insert(gc.typeParam);
-        // §26.5 (#714): for BUILTIN extension targets (null-declaration, e.g.
-        // `IEnumerable<T>` without a where clause), the generic args are type
-        // params scoped by TypeResolution (null-decl Named refs with empty
-        // genericArgs) that aren't already in freeVars via genericConstraints.
-        // Collect them so the extension matches correctly. This is ONLY safe for
-        // builtin targets: for a user-declared target like `Box<W>`, `W` becomes
-        // null-decl because TypeResolution treats all single-part bare names in
-        // extension generic args as type params (even if a class named W exists),
-        // but the matching semantics are different there — freeVars from
-        // genericConstraints only is the correct #773 behavior for that case.
-        if (target && target->kind == TypeRef::Kind::Named &&
-            !target->declaration) {
+        // §26.4/§26.5 (#714/#1276): for an extension target without a `where`
+        // clause (e.g. `IEnumerable<T>` or a user-declared `IBox<T>`), the
+        // generic args are type params scoped by TypeResolution (null-decl
+        // Named refs with empty genericArgs, resolveTopDecl's extScope
+        // binding) that aren't already in freeVars via genericConstraints.
+        // Collect them so the extension matches correctly. Per §26.4, "each
+        // bare single-segment non-nullable identifier introduces a fresh
+        // block-level type parameter — always" — this holds for BOTH
+        // builtin (null-declaration) and user-declared (non-null-declaration)
+        // target types; TypeResolution already resolves such an identifier
+        // to a null-decl placeholder Named ref unconditionally (it does not
+        // special-case user-declared targets — TypeResolution_Names.cpp
+        // resolveTopDecl), so the free-var scan below must not special-case
+        // them either. Previously gated to `!target->declaration` only
+        // (builtin targets), which left a plain `extension SomeUserGeneric<T>`
+        // (no `where` clause) unmatched against every receiver — #1276's
+        // generic-interface extension via an interface-typed receiver is one
+        // instance (silently unresolved -> codegen emitted no dispatch and
+        // the call returned garbage); the same gap also FALSE_REJECTed the
+        // identical shape called directly on a class receiver.
+        if (target && target->kind == TypeRef::Kind::Named) {
             std::function<void(const TypeRef*)> scanFreeVars =
                 [&](const TypeRef* tr) {
                 if (!tr) return;

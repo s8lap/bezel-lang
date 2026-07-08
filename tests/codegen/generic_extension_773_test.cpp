@@ -12,6 +12,11 @@
 // diagnostic) rather than matched into a type-mismatched call (IR_FAIL). A
 // method that uses T only via the receiver's own members (`IsEmpty(): bool`) is
 // fully supported.
+//
+// #1276 update: `concrete_generic_extension_not_misapplied` below was
+// corrected — its original `extension Box<W>` example is actually a free
+// (shadowing) type parameter per §26.4, not a concrete reference to the
+// class `W`; see that test's comment.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -81,15 +86,31 @@ BEZEL_TEST(generic_extension_773, free_var_in_signature_rejected_cleanly) {
 }
 
 // §26.5 safety: a CONCRETE generic extension does not apply to a different
-// instantiation — `extension Box<W>` is not seen on a `Box<A>` receiver.
+// instantiation — `extension Box<int>` is not seen on a `Box<A>` receiver.
+//
+// #1276 correction: this test previously used `extension Box<W>` (where `W`
+// is also the name of an in-scope class) as its "concrete" example and
+// asserted it must NOT match `Box<A>`. That was wrong: per §26.4, "each bare
+// single-segment non-nullable identifier [in an extension target's
+// generic-arg position] introduces a fresh block-level type parameter —
+// always, shadowing any same-named type in scope" — so `extension Box<W>`
+// is exactly `extension Box<T>` with the parameter spelled `W`, not a
+// reference to the class `W` (TypeResolution_Names.cpp resolveTopDecl emits
+// a §26.4 shadow WARNING and always binds it as the parameter, never as the
+// class). It DOES match `Box<A>`; #1276's fix corrected
+// lookupExtensionMember to recognize that free variable (see
+// generic_interface_extension_dispatch_1276_test.cpp for the corresponding
+// coverage of the now-correct match). A genuinely CONCRETE, non-matching
+// target — per §26.4 written with a keyword/primitive type, a qualified
+// name, or a generic instantiation, never a bare single-segment identifier —
+// is `extension Box<int>`, which this test now uses.
 BEZEL_TEST(generic_extension_773, concrete_generic_extension_not_misapplied) {
     BEZEL_EXPECT_TRUE(rejected(
         "module M; "
-        "class Box<T> where T: class public _v: T; "
+        "class Box<T> public _v: T; "
         "  public constructor(v: T) _v := v; end; end Box; "
-        "class W public v: int; public constructor(n: int) v := n; end; end W; "
         "class A public n: int := 0; end A; "
-        "public extension Box<W> "
+        "public extension Box<int> "
         "  public method Tag(): int => 7; "
         "end; "
         "public static class P public static method Main(): int "
