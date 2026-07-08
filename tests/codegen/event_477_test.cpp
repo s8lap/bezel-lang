@@ -20,9 +20,14 @@
 //   for the concrete subscription, never the interface one.
 //
 // Scope: synchronous events only (async deferred, as in event_test.cpp).
-// Observation: handlers mutate a shared class instance captured by value
-// (the pointer is shared, §28), read back by Main as the int exit code, so
-// the asserted value proves WHICH source actually fired and HOW MANY times.
+// Observation (B7 instance events): handlers mutate a shared class instance
+// captured by value (the pointer is shared, §28), read back by Main as the int
+// exit code, so the asserted value proves WHICH source fired and HOW MANY times.
+// Observation (B6 static events, §22.12 rule 5 v0.180, #1542): a handler
+// subscribed to a `static event` must be capture-free, so the B6 handlers mutate
+// a public static field on the declaring class (no local/parameter/`this`
+// capture) — read back as the exit code identically. Instance-event handlers
+// (B7) remain capture-admitting per the rule's own final sentence.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -45,47 +50,44 @@ int run(const std::string& program) {
 // §24.1 / §24.4 / §24.5: a STATIC no-payload event. Subscribe from outside the
 // declaring class (IEvent<()>.Subscribe), Raise twice from inside — the handler
 // runs once per Raise (n == 2). Repro shape from issue #477 B6.
+// §22.12 rule 5 (v0.180, #1542): the handler must be capture-free, so it mutates
+// a public static field on App (no local/parameter/`this` capture) instead of a
+// captured Box instance.
 BEZEL_TEST(codegen_events_477, static_event_subscribe_then_raise_twice_b6) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event Signal; "
         "  public static method Raise() Signal.Raise(); end Raise; "
         "end App; "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Bump() V := V + 1; end Bump; "
-        "end Box; "
         "class C public static method Main(): int "
-        "  var box := new Box(); "
-        "  var sub := App.Signal.Subscribe(() => do box.Bump(); end); "
+        "  var sub := App.Signal.Subscribe(() => do App.Total := App.Total + 1; end); "
         "  App.Raise(); App.Raise(); "
         "  sub.Dispose(); "
-        "  return box.V; "                                // expect 2
+        "  return App.Total; "                            // expect 2
         "end Main; end C;"), 2);
 }
 
 // §24.1 / §2.11: disposing the static-event Subscription unsubscribes — a Raise
 // after Dispose is a no-op. Proves the static source is a real shared source
 // (not a fresh one per access) and that Dispose reaches it.
+// §22.12 rule 5 (v0.180, #1542): the handler is capture-free — it mutates a
+// public static field on App, not a captured Box instance.
 BEZEL_TEST(codegen_events_477, static_event_dispose_unsubscribes_b6) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event Signal; "
         "  public static method Fire() Signal.Raise(); end Fire; "
         "end App; "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Bump() V := V + 1; end Bump; "
-        "end Box; "
         "class C public static method Main(): int "
-        "  var box := new Box(); "
-        "  var sub := App.Signal.Subscribe(() => do box.Bump(); end); "
-        "  App.Fire(); "                                  // box.V = 1
+        "  var sub := App.Signal.Subscribe(() => do App.Total := App.Total + 1; end); "
+        "  App.Fire(); "                                  // Total = 1
         "  sub.Dispose(); "
         "  App.Fire(); "                                  // handler gone — no-op
-        "  return box.V; "                                // expect 1
+        "  return App.Total; "                            // expect 1
         "end Main; end C;"), 1);
 }
 
@@ -116,47 +118,45 @@ BEZEL_TEST(codegen_events_477, static_event_plus_equals_inside_class_b6) {
 // §24.1 / §24.2 / §24.5: a STATIC event WITH a payload record. The handler
 // reads payload fields; two raises accumulate. Proves payload threading works
 // for the static-backing path too.
+// §22.12 rule 5 (v0.180, #1542): the handler is capture-free — it accumulates
+// into a public static field on App (reading its own payload parameter `e`),
+// not a captured Box instance.
 BEZEL_TEST(codegen_events_477, static_event_with_payload_b6) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Box; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event Signal: Ev; "
         "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var box := new Box(); "
-        "  var sub := App.Signal.Subscribe((e) => do box.Add(e.N); end); "
+        "  var sub := App.Signal.Subscribe((e) => do App.Total := App.Total + e.N; end); "
         "  App.Fire(5); App.Fire(7); "
-        "  return box.V; "                                // expect 12
+        "  return App.Total; "                            // expect 12
         "end Main; end C;"), 12);
 }
 
 // §24.1: a static event's subscriber list is shared across all access points —
 // two separate Subscribe calls both fire on a single Raise (a static source is
 // program-wide, not per-access).
+// §22.12 rule 5 (v0.180, #1542): both handlers are capture-free — they
+// accumulate (with distinct multipliers) into a public static field on App, not
+// a captured Box instance.
 BEZEL_TEST(codegen_events_477, static_event_multiple_subscribers_b6) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Box; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event Signal: Ev; "
         "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var box := new Box(); "
-        "  var s1 := App.Signal.Subscribe((e) => do box.Add(e.N); end); "
-        "  var s2 := App.Signal.Subscribe((e) => do box.Add(e.N * 10); end); "
+        "  var s1 := App.Signal.Subscribe((e) => do App.Total := App.Total + e.N; end); "
+        "  var s2 := App.Signal.Subscribe((e) => do App.Total := App.Total + e.N * 10; end); "
         "  App.Fire(2); "
-        "  return box.V; "                                // expect 22 (2 + 20)
+        "  return App.Total; "                            // expect 22 (2 + 20)
         "end Main; end C;"), 22);
 }
 

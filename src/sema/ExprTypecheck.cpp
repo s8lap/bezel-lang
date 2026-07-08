@@ -5089,6 +5089,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // handler lambda's param as the event payload `T` (these forms desugar
         // to Add/Remove; they are not real compound assignments).
         TypeRef* eventPayload = nullptr;
+        // per §22.12 rule 5 (v0.180, #1542): `+=` on a `static event` requires
+        // a capture-free handler. Remember whether the target is a static
+        // event here (target's symbol is available now); the actual
+        // capture-freedom check runs below, after `as->value` is visited, so
+        // isCaptureFreeEntry can see the visited lambda's captures.
+        bool assignTargetIsStaticEvent = false;
         if ((as->op == "+=" || as->op == "-=") && as->target) {
             if (auto* es = dynamic_cast<EventSymbol*>(
                     ctx_.exprSymbol(*as->target))) {
@@ -5098,8 +5104,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // `protected` event). Outside, the event is IEvent<T>, which
                 // has no Add / Remove.
                 checkEventVisibilityFence(es, as->op, as->span.begin);
-                if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+                if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
                     if (ed->type) eventPayload = ctx_.resolvedType(*ed->type);
+                    // per §22.12 rule 5 (v0.180, #1542): staticness lives on
+                    // ast::EventDecl::isStatic directly — unlike
+                    // Field/Property/MethodDecl, EventDecl has no generic
+                    // `modifiers` string list (Appendix A.4), and
+                    // SymbolCollection.cpp never populates EventSymbol's
+                    // inherited (always-empty) `modifiers` field for events.
+                    assignTargetIsStaticEvent = ed->isStatic;
+                }
             }
         }
         if (as->value) {
@@ -5130,6 +5144,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
             visitExpr(*as->value);
+            // per §22.12 rule 5 (v0.180, #1542): a handler subscribed to a
+            // `static event` — the rule names `+=`/`Add`/`Subscribe`, not
+            // `-=`/`Remove` — must be capture-free: a non-capturing lambda or
+            // a static method reference, the same admission as a
+            // Domain.Spawn entry (§30.14, #600). The process-global
+            // subscriber list transports the handler to whichever domain
+            // raises, and a capture-bearing closure carries borrows of its
+            // origin domain's scopes.
+            if (as->op == "+=" && assignTargetIsStaticEvent &&
+                !isCaptureFreeEntry(as->value.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, as->value->span.begin,
+                    "handler subscribed to a `static event` must be capture-"
+                    "free: a non-capturing lambda or a static method "
+                    "reference — a capturing lambda is rejected because the "
+                    "process-global subscriber list transports it to "
+                    "whichever domain raises, and its captures are borrows "
+                    "of the origin domain (\xC2\xA7""22.12 rule 5, #1542)");
+            }
             currentLiteralWideningHint_ = savedAssignHint;
             pendingLambdaParamType_ = savedPending;
         }

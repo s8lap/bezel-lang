@@ -280,6 +280,10 @@ BEZEL_TEST(codegen_events_479, two_events_different_payload_types_479e) {
 // §24.1 / §22.13: static events each get their own bz$Class$name$evt global.
 // If they alias, subscribing the second static event adds to the first's
 // source, so raising the second fires the first's handlers.
+// §22.12 rule 5 (v0.180, #1542): the static-event handlers are capture-free —
+// they accumulate (with distinct multipliers) into a public static field on App,
+// not a captured Acc instance. Distinct multipliers still expose an alias: if
+// Y's source aliased X's, each Fire would run BOTH handlers.
 // =====================================================================
 BEZEL_TEST(codegen_events_479, two_static_events_independent_479f) {
     // Static event X and Y on App. Subscribe X (+N) and Y (+N*10).
@@ -287,76 +291,68 @@ BEZEL_TEST(codegen_events_479, two_static_events_independent_479f) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Acc "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Acc; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event X: Ev; "
         "  public static event Y: Ev; "
         "  public static method FireX(n: int) X.Raise(new Ev(n)); end FireX; "
         "  public static method FireY(n: int) Y.Raise(new Ev(n)); end FireY; "
         "end App; "
         "class C public static method Main(): int "
-        "  var acc := new Acc(); "
-        "  var sx := App.X.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sy := App.Y.Subscribe((e) => do acc.Add(e.N * 10); end); "
+        "  var sx := App.X.Subscribe((e) => do App.Total := App.Total + e.N; end); "
+        "  var sy := App.Y.Subscribe((e) => do App.Total := App.Total + e.N * 10; end); "
         "  App.FireX(1); "   // X fires → +1
         "  App.FireY(1); "   // Y fires → +10
-        "  return acc.V; "   // expect 11
+        "  return App.Total; "   // expect 11
         "end Main; end C;"), 11);
 }
 
 // §24.1: subscribing only the second static event; the first has no handlers.
+// §22.12 rule 5 (v0.180, #1542): capture-free handler mutating a public static
+// field on App.
 BEZEL_TEST(codegen_events_479, two_static_events_only_y_subscribed_479f2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Acc "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Acc; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event X: Ev; "
         "  public static event Y: Ev; "
         "  public static method FireX(n: int) X.Raise(new Ev(n)); end FireX; "
         "  public static method FireY(n: int) Y.Raise(new Ev(n)); end FireY; "
         "end App; "
         "class C public static method Main(): int "
-        "  var acc := new Acc(); "
-        "  var sy := App.Y.Subscribe((e) => do acc.Add(e.N); end); "
+        "  var sy := App.Y.Subscribe((e) => do App.Total := App.Total + e.N; end); "
         "  App.FireX(99); "  // X has no subscriber → no-op
         "  App.FireY(5); "   // Y fires → +5
-        "  return acc.V; "   // expect 5
+        "  return App.Total; "   // expect 5
         "end Main; end C;"), 5);
 }
 
 // §24.1: disposing the second static event's subscription unsubscribes it,
 // while the first's is unaffected.
+// §22.12 rule 5 (v0.180, #1542): both handlers are capture-free, accumulating
+// (with distinct multipliers) into a public static field on App.
 BEZEL_TEST(codegen_events_479, two_static_events_dispose_y_does_not_affect_x_479f3) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Acc "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Acc; "
         "class App "
+        "  public static Total: int := 0; "
         "  public static event X: Ev; "
         "  public static event Y: Ev; "
         "  public static method FireX(n: int) X.Raise(new Ev(n)); end FireX; "
         "  public static method FireY(n: int) Y.Raise(new Ev(n)); end FireY; "
         "end App; "
         "class C public static method Main(): int "
-        "  var acc := new Acc(); "
-        "  var sx := App.X.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sy := App.Y.Subscribe((e) => do acc.Add(e.N * 10); end); "
+        "  var sx := App.X.Subscribe((e) => do App.Total := App.Total + e.N; end); "
+        "  var sy := App.Y.Subscribe((e) => do App.Total := App.Total + e.N * 10; end); "
         "  App.FireX(1); "   // X: +1
-        "  App.FireY(1); "   // Y: +10 → acc.V = 11
+        "  App.FireY(1); "   // Y: +10 → Total = 11
         "  sy.Dispose(); "   // unsubscribe Y only
-        "  App.FireX(2); "   // X still live: +2 → acc.V = 13
+        "  App.FireX(2); "   // X still live: +2 → Total = 13
         "  App.FireY(2); "   // Y disposed: no-op
-        "  return acc.V; "   // expect 13
+        "  return App.Total; "   // expect 13
         "end Main; end C;"), 13);
 }
 

@@ -3641,6 +3641,31 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // parameter is typed as `T`, letting its body resolve `e.Field`.
         TypeRef* eventPayload = ce->callee
             ? eventHandlerPayloadType(ce->callee.get()) : nullptr;
+        // per §22.12 rule 5 (v0.180, #1542): if callee is `<static event>
+        // .Subscribe(...)` / `.Add(...)`, the handler argument (arg 0) must
+        // be capture-free — the rule names `+=`/`Add`/`Subscribe`, not
+        // `Remove`. Determine this now (the target's EventSymbol is already
+        // resolved); the actual capture-freedom check runs in the arg-
+        // visiting loop below, once the handler argument has itself been
+        // visited (so isCaptureFreeEntry can see a lambda's captures).
+        bool subscribeArgNeedsCaptureFree = false;
+        if (auto* maCallee = ce->callee
+                ? dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get())
+                : nullptr) {
+            if (maCallee->target &&
+                (maCallee->member == "Subscribe" || maCallee->member == "Add")) {
+                if (auto* es = dynamic_cast<EventSymbol*>(
+                        ctx_.exprSymbol(*maCallee->target))) {
+                    // per §22.12 rule 5 (v0.180, #1542): staticness lives on
+                    // ast::EventDecl::isStatic directly — EventSymbol's
+                    // inherited `modifiers` field is never populated for
+                    // events (SymbolCollection.cpp), unlike Field/Property/
+                    // MethodDecl, which carry a generic modifiers list.
+                    if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+                        subscribeArgNeedsCaptureFree = ed->isStatic;
+                }
+            }
+        }
         // stdlib §5 (D7): for a LINQ operator/aggregate over a collection or
         // lazy receiver, the lambda argument is `(T) -> …` over the source
         // element type T. Seed an untyped single-param lambda's parameter with
@@ -4196,6 +4221,25 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     }
                 }
                 visitExpr(*a.value);
+                // per §22.12 rule 5 (v0.180, #1542): the handler argument
+                // (arg 0) of a `<static event>.Subscribe(...)` / `.Add(...)`
+                // call must be capture-free — a non-capturing lambda or a
+                // static method reference, the same admission as a
+                // Domain.Spawn entry (§30.14, #600). Checked here, after
+                // visiting the argument, so isCaptureFreeEntry can see a
+                // lambda's captures.
+                if (pos2 == 0 && subscribeArgNeedsCaptureFree &&
+                    !isCaptureFreeEntry(a.value.get())) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, a.value->span.begin,
+                        "handler subscribed to a `static event` must be "
+                        "capture-free: a non-capturing lambda or a static "
+                        "method reference — a capturing lambda is rejected "
+                        "because the process-global subscriber list "
+                        "transports it to whichever domain raises, and its "
+                        "captures are borrows of the origin domain "
+                        "(\xC2\xA7""22.12 rule 5, #1542)");
+                }
                 currentLiteralWideningHint_ = savedArgHint;
                 pendingLambdaParamType_ = savedPending;
                 pendingLambdaReturnType_ = savedLamRet;
