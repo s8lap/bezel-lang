@@ -276,6 +276,109 @@ int Resolver::builtinTypeArity(std::string_view n) {
     return kNotBuiltin;
 }
 
+// §26.4/§26.5 (#1599): recursively walk `target`'s generic-argument list,
+// binding each bare single-segment non-nullable identifier as a block-level
+// type parameter of the enclosing extension — at any nesting depth (v0.183:
+// "The binding rule applies at any nesting depth of the extended type's
+// argument positions... `extension IEnumerable<Array<T>>` binds T").
+//
+// A generic arg that is a `Named` type carrying its own non-empty
+// `genericArgs` (e.g. `Array<byte>` or `Array<T>`) is itself a generic
+// instantiation — per §26.4 "a concrete instantiation is written with...
+// generic instantiations (`extension IEnumerable<int>`, `extension
+// IEnumerable<Array<byte>>`)". Its head name (`Array`) is therefore NEVER a
+// free type parameter, even though the name is a bare single segment and
+// non-nullable — only recurse into ITS generic args to find any nested bare
+// identifiers to bind. This is the #1599 fix: previously the single,
+// non-recursive top-level loop treated any bare single-segment name as a
+// type-parameter head regardless of whether it carried its own generic args,
+// so `Array<byte>`'s own head `Array` was wrongly bound as a fresh free type
+// parameter (silently discarding the `<byte>` argument) and the extension
+// target unified with any `IEnumerable<X>` receiver.
+void Resolver::bindExtensionTargetTypeParams(const ast::Type& target,
+                                              Scope& extScope,
+                                              Scope* parent) {
+    for (const auto& ga : target.genericArgs) {
+        if (!ga) continue;
+        if (ga->kind == ast::TypeKind::Named && ga->name &&
+            ga->name->parts.size() == 1 && !ga->genericArgs.empty()) {
+            // Concrete generic-instantiation head (e.g. `Array` in
+            // `Array<byte>` / `Array<T>`): not a free type parameter.
+            // Recurse to bind any nested bare identifiers in its own args.
+            bindExtensionTargetTypeParams(*ga, extScope, parent);
+            continue;
+        }
+        if (ga->kind == ast::TypeKind::Named &&
+            ga->name && ga->name->parts.size() == 1 &&
+            ga->nullable) {
+            // §26.4 (v0.183): "A nullable-marked identifier in an
+            // argument position (`extension Array<T?>`) binds
+            // nothing and is a compile error naming this rule —
+            // only the bare non-nullable identifier introduces a
+            // parameter." Report THIS specific rule here, at the
+            // declaration, rather than falling through to ordinary
+            // name resolution on `T` below: (1) the generic
+            // "unresolved type name" fallback is actively
+            // misleading here — `T` is not a typo, it is written
+            // in exactly the position a type-parameter head would
+            // occupy, just illegally nullable-marked; and (2) if an
+            // unrelated type happened to be named `T` in enclosing
+            // scope, ordinary name resolution would silently bind
+            // to it instead of erroring — precisely the
+            // action-at-a-distance hazard this rule exists to rule
+            // out (mirroring the non-nullable binding rule's
+            // "always, shadowing any same-named type in scope").
+            std::string_view paramName = ga->name->parts[0];
+            ctx_.diagnostics().report(
+                Severity::Error, ga->span.begin,
+                "nullable-marked type-parameter head `" +
+                std::string(paramName) +
+                "?` is not permitted in an extension's target type "
+                "(§26.4): only a bare, non-nullable identifier "
+                "introduces a block-level type parameter — write `" +
+                std::string(paramName) + "` (a bare `" +
+                std::string(paramName) + "` already unifies with a "
+                "nullable receiver argument, e.g. `Array<int?>`)");
+            // Register the (unbound) name anyway so the recursive
+            // resolution of this same argument just below does not
+            // cascade a second, redundant "unresolved type name"
+            // diagnostic over the identical span — the rule above
+            // is the diagnostic of record for this declaration.
+            extScope.names[paramName] = nullptr;
+            continue;
+        }
+        if (ga->kind == ast::TypeKind::Named &&
+            ga->name && ga->name->parts.size() == 1 &&
+            !ga->nullable) {
+            // Single-part bare name with no generic args of its own: treat
+            // as a type parameter.
+            std::string_view paramName = ga->name->parts[0];
+            // §26.4 (#1346, v0.160): warn when the bare identifier that
+            // becomes a block-level type parameter shadows a same-named
+            // type already in scope. The binding is always the extension's
+            // type parameter (action-at-a-distance would silently re-mean
+            // the block if we fell back to the scope-found type), but a
+            // shadowing author may not have intended the override.
+            for (Scope* s = parent; s; s = s->parent) {
+                auto it = s->names.find(paramName);
+                if (it != s->names.end()) {
+                    if (it->second != nullptr) {
+                        ctx_.diagnostics().report(
+                            Severity::Warning, ga->span.begin,
+                            "type parameter `" + std::string(paramName) +
+                            "` in this extension block shadows the type `" +
+                            std::string(it->second->name) +
+                            "` that is in scope (§26.4); the extension "
+                            "type parameter always takes precedence");
+                    }
+                    break;
+                }
+            }
+            extScope.names[paramName] = nullptr;
+        }
+    }
+}
+
 void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&decl)) {
         resolveTypeDecl(*td, parent);
@@ -312,77 +415,15 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
         // This must be done BEFORE resolving the target type so that T is
         // already in scope when the targetType itself is processed (e.g.
         // `IEnumerable<T>` must not error on T while resolving the `T` arg).
+        //
+        // §26.4/§26.5 (#1599): the walk must recurse into any generic arg
+        // that is ITSELF a generic instantiation (e.g. `Array<byte>` or
+        // `Array<T>` inside `IEnumerable<Array<byte>>` / `IEnumerable<Array<T>>`)
+        // — such an arg's own head name (`Array`) is a CONCRETE instantiation
+        // head, not a free type parameter, even though it is a bare
+        // single-segment non-nullable name. See bindExtensionTargetTypeParams.
         if (ext->targetType) {
-            for (const auto& ga : ext->targetType->genericArgs) {
-                if (!ga) continue;
-                if (ga->kind == ast::TypeKind::Named &&
-                    ga->name && ga->name->parts.size() == 1 &&
-                    ga->nullable) {
-                    // §26.4 (v0.183): "A nullable-marked identifier in an
-                    // argument position (`extension Array<T?>`) binds
-                    // nothing and is a compile error naming this rule —
-                    // only the bare non-nullable identifier introduces a
-                    // parameter." Report THIS specific rule here, at the
-                    // declaration, rather than falling through to ordinary
-                    // name resolution on `T` below: (1) the generic
-                    // "unresolved type name" fallback is actively
-                    // misleading here — `T` is not a typo, it is written
-                    // in exactly the position a type-parameter head would
-                    // occupy, just illegally nullable-marked; and (2) if an
-                    // unrelated type happened to be named `T` in enclosing
-                    // scope, ordinary name resolution would silently bind
-                    // to it instead of erroring — precisely the
-                    // action-at-a-distance hazard this rule exists to rule
-                    // out (mirroring the non-nullable binding rule's
-                    // "always, shadowing any same-named type in scope").
-                    std::string_view paramName = ga->name->parts[0];
-                    ctx_.diagnostics().report(
-                        Severity::Error, ga->span.begin,
-                        "nullable-marked type-parameter head `" +
-                        std::string(paramName) +
-                        "?` is not permitted in an extension's target type "
-                        "(§26.4): only a bare, non-nullable identifier "
-                        "introduces a block-level type parameter — write `" +
-                        std::string(paramName) + "` (a bare `" +
-                        std::string(paramName) + "` already unifies with a "
-                        "nullable receiver argument, e.g. `Array<int?>`)");
-                    // Register the (unbound) name anyway so the recursive
-                    // resolution of this same argument just below does not
-                    // cascade a second, redundant "unresolved type name"
-                    // diagnostic over the identical span — the rule above
-                    // is the diagnostic of record for this declaration.
-                    extScope.names[paramName] = nullptr;
-                    continue;
-                }
-                if (ga->kind == ast::TypeKind::Named &&
-                    ga->name && ga->name->parts.size() == 1 &&
-                    !ga->nullable) {
-                    // Single-part bare name: treat as a type parameter.
-                    std::string_view paramName = ga->name->parts[0];
-                    // §26.4 (#1346, v0.160): warn when the bare identifier that
-                    // becomes a block-level type parameter shadows a same-named
-                    // type already in scope. The binding is always the extension's
-                    // type parameter (action-at-a-distance would silently re-mean
-                    // the block if we fell back to the scope-found type), but a
-                    // shadowing author may not have intended the override.
-                    for (Scope* s = parent; s; s = s->parent) {
-                        auto it = s->names.find(paramName);
-                        if (it != s->names.end()) {
-                            if (it->second != nullptr) {
-                                ctx_.diagnostics().report(
-                                    Severity::Warning, ga->span.begin,
-                                    "type parameter `" + std::string(paramName) +
-                                    "` in this extension block shadows the type `" +
-                                    std::string(it->second->name) +
-                                    "` that is in scope (§26.4); the extension "
-                                    "type parameter always takes precedence");
-                            }
-                            break;
-                        }
-                    }
-                    extScope.names[paramName] = nullptr;
-                }
-            }
+            bindExtensionTargetTypeParams(*ext->targetType, extScope, parent);
         }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
         for (const auto& gc : ext->genericConstraints) {

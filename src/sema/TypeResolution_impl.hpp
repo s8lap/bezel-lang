@@ -374,6 +374,18 @@ private:
 
     void resolveTopDecl(const ast::TopDecl& decl, Scope* parent);
 
+    // §26.4/§26.5 (#1599): recursively walks an extension target type's
+    // generic-argument tree, binding each bare single-segment non-nullable
+    // identifier as a block-level type parameter — at ANY nesting depth
+    // (v0.183: `extension IEnumerable<Array<T>>` binds `T`). A generic arg
+    // that is itself a generic instantiation (carries its own non-empty
+    // genericArgs, e.g. `Array<byte>` or `Array<T>`) is a CONCRETE
+    // instantiation head per §26.4 — that head name (`Array`) must NOT be
+    // bound as a free type parameter; instead we recurse into its own
+    // generic args to find any nested bare identifiers.
+    void bindExtensionTargetTypeParams(const ast::Type& target,
+                                        Scope& extScope, Scope* parent);
+
     void resolveTypeDecl(const ast::TypeDecl& td, Scope* parent);
 
     void resolveMember(const ast::Member& m, Scope* parent);
