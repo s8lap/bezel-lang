@@ -135,6 +135,22 @@ struct FieldSymbol : MemberSymbol {
     // such a symbol is the owning TypeDecl, not a FieldDecl). Null for
     // ordinary body fields.
     const ast::Param* posParam = nullptr;
+    // §22.10 (v0.180): for a CLASS primary-constructor parameter (posParam !=
+    // null, parent kind == Class) the typechecker records whether the parameter
+    // is referenced in a *body* position (method / property-accessor /
+    // constructor / destructor body) versus an *initializer* position (field or
+    // property initializer, or the inheritance clause's base call — tracked via
+    // ExprTC::inFieldInitializer_). An `owned` such parameter referenced in a
+    // body position and NOT in any initializer position is captured into an
+    // `owned` private field disposed by the generated `Dispose()` (§28.4). The
+    // "not in any initializer" side is intentionally conservative: a parameter
+    // that also appears in an initializer might be consumed there (the §11.1
+    // `ResourceHolder` pattern moves it into an explicit owned field), and
+    // disposing the capture slot on top of that owner would double-free — so the
+    // capture slot is disposed only when the parameter is used solely in bodies.
+    // Both default false and are meaningful only for class posParam fields.
+    bool posParamBodyRef = false;
+    bool posParamInitRef = false;
 };
 
 struct MethodSymbol : MemberSymbol {

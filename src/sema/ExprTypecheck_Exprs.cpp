@@ -344,6 +344,23 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // Slice S29 (§22.8): a field initializer may not observe
             // an instance member (implicit-`this` reference).
             if (inFieldInitializer_) checkNotInstanceMember(*id, sym);
+            // per §22.10 (v0.180): record where a CLASS primary-constructor
+            // parameter is referenced. A parameter resolves to a FieldSymbol
+            // whose `posParam` is non-null and whose parent is a class. Its
+            // reference is in an *initializer* position when inFieldInitializer_
+            // is set (a field/property initializer, or the inheritance clause's
+            // base call — all visited with that flag), otherwise in a *body*
+            // position (method / property-accessor / constructor / destructor
+            // body). An `owned` such parameter used only in bodies is captured
+            // as an owned field disposed by the generated Dispose (§28.4); this
+            // classification drives that decision in codegen.
+            if (auto* pfs = dynamic_cast<FieldSymbol*>(sym)) {
+                if (pfs->posParam && pfs->parent &&
+                    pfs->parent->kind == ast::TypeDeclKind::Class) {
+                    if (inFieldInitializer_) pfs->posParamInitRef = true;
+                    else                     pfs->posParamBodyRef = true;
+                }
+            }
             // per §14.1 / §22.12 (issue #520): when the identifier is a
             // generic class name with explicit type args (`Registry<int>`),
             // build an instantiated TypeRef (kind=Named, declaration=TypeSymbol,

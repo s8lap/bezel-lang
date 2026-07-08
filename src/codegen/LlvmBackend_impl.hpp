@@ -4142,7 +4142,39 @@ private:
     // from the AST. The declaration pointer on the TypeRef is the TypeSymbol*
     // resolved at load time; importedName covers the case where lookupNamed
     // returned null (generic-param fields and builtin types — §2.5).
+    // §22.10 (v0.180): an `owned` CLASS primary-constructor parameter captured
+    // into a compiler-generated `owned` private field. The `owned` modifier
+    // rides `posParam->modifier` (not `fs->modifiers`), and disposal applies
+    // only to a *captured* parameter — one referenced in a body position and
+    // NOT in any initializer position (posParamBodyRef && !posParamInitRef). A
+    // parameter consumed by an owned-field initializer (the §11.1
+    // `ResourceHolder` pattern) is disposed by that explicit field, so disposing
+    // the capture slot too would double-free; the conservative "no initializer
+    // reference" gate keeps the capture slot the sole owner. The typechecker
+    // sets the two flags (ExprTypecheck_Exprs.cpp).
+    static bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
+        return fs->posParam && fs->parent &&
+               fs->parent->kind == ast::TypeDeclKind::Class &&
+               fs->posParam->modifier == "owned" &&
+               fs->posParamBodyRef && !fs->posParamInitRef;
+    }
+
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
+        // §22.10 (v0.180): a captured `owned` primary-ctor parameter. Its type
+        // rides `posParam->type` (fs->decl is the owning TypeDecl, not a
+        // FieldDecl), so the FieldDecl-based extraction below never matches it.
+        if (fs->posParam) {
+            if (!isCapturedOwnedPrimaryParam(fs) || !fs->posParam->type)
+                return false;
+            const sema::TypeRef* pt = ctx_.resolvedType(*fs->posParam->type);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Named || !pt->declaration)
+                return false;  // (generic-param / Shared / collection params: a
+                               // narrower obligation left to a follow-up — never
+                               // a double-free, at worst the pre-v0.180 leak)
+            auto pk = pt->declaration->kind;
+            return pk == ast::TypeDeclKind::Class ||
+                   pk == ast::TypeDeclKind::Interface;
+        }
         if (!hasOwnedModifier(fs)) return false;
         const sema::TypeRef* rt = nullptr;
         // #662 foundation B: imported field — type from importedMemberType.
