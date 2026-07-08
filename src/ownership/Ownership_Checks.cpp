@@ -3525,6 +3525,38 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
 //   them). For the ownership pass itself it is informational — the
 //   diagnostics flow from the unchanged lattice plus the completion edges.
 
+// True when a Task-family generic argument type `arg` is a CLASS — the gate
+// that selects Pattern A/B obligations over the no-obligation value/string/
+// runtime-managed forms (§30.5 producer-side rules). A null declaration
+// (built-in / generic argument) is conservatively treated as NOT a class, so
+// the site rule is not over-applied to an instantiation the pass cannot
+// resolve. Shared by `awaitTaskKind` (the `await` site, §30.5) and #1530's
+// `.Result` site check (`checkResultSitesExpr`, §30.3) so both apply
+// IDENTICAL class-detection logic to the two Pattern A sibling forms.
+// // per §30.5, §30.3
+static bool taskResultArgIsClass(const sema::TypeRef* arg) {
+    if (!arg) return false;
+    if (arg->kind != sema::TypeRef::Kind::Named) return false;
+    if (arg->declaration)
+        return arg->declaration->kind == ast::TypeDeclKind::Class;
+    // §30.5 / stdlib §3.1 (#1122): a built-in OWNING collection result
+    // (`OwningArray<T>` etc. — the result type of `Task.WhenAllOwned`) is a
+    // heap/reference type that carries a disposal obligation, so an
+    // `OwningTask<OwningArray<T>>` is a valid Pattern B: its awaited result
+    // must be `using var`-bound and the awaited operand consumed. These
+    // resolve to a Named TypeRef with a NULL declaration (built-in), which
+    // the declaration-based check above misses — so the await was wrongly
+    // classified NotTask and the bound-local operand was not discharged.
+    if (arg->astNode && arg->astNode->name &&
+        arg->astNode->name->parts.size() == 1) {
+        std::string_view an = arg->headName();
+        return an == "OwningArray" || an == "OwningStack" ||
+               an == "OwningQueue" || an == "OwningLinkedList" ||
+               an == "OwningDictionary" || an == "OwningSet";
+    }
+    return false;
+}
+
 MethodOwnership::AwaitTaskKind
 MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
     if (!await.operand) return AwaitTaskKind::NotTask;
@@ -3538,33 +3570,9 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
         ot->astNode->name->parts.size() != 1)
         return AwaitTaskKind::NotTask;
     std::string_view head = ot->headName();
-    // True when the result type argument T is a CLASS — the gate that selects
-    // Pattern A/B over the no-obligation value/string/runtime-managed forms
-    // (§30.5 producer-side rules). A null declaration (built-in / generic
-    // argument) is conservatively treated as NOT a class, so the site rule is
-    // not over-applied to an instantiation the pass cannot resolve. // per §30.5
     auto resultIsClass = [&]() -> bool {
         if (ot->genericArgs.empty() || !ot->genericArgs.front()) return false;
-        const sema::TypeRef* arg = ot->genericArgs.front();
-        if (arg->kind != sema::TypeRef::Kind::Named) return false;
-        if (arg->declaration)
-            return arg->declaration->kind == ast::TypeDeclKind::Class;
-        // §30.5 / stdlib §3.1 (#1122): a built-in OWNING collection result
-        // (`OwningArray<T>` etc. — the result type of `Task.WhenAllOwned`) is a
-        // heap/reference type that carries a disposal obligation, so an
-        // `OwningTask<OwningArray<T>>` is a valid Pattern B: its awaited result
-        // must be `using var`-bound and the awaited operand consumed. These
-        // resolve to a Named TypeRef with a NULL declaration (built-in), which
-        // the declaration-based check above misses — so the await was wrongly
-        // classified NotTask and the bound-local operand was not discharged.
-        if (arg->astNode && arg->astNode->name &&
-            arg->astNode->name->parts.size() == 1) {
-            std::string_view an = arg->headName();
-            return an == "OwningArray" || an == "OwningStack" ||
-                   an == "OwningQueue" || an == "OwningLinkedList" ||
-                   an == "OwningDictionary" || an == "OwningSet";
-        }
-        return false;
+        return taskResultArgIsClass(ot->genericArgs.front());
     };
     if (head == "Task") {
         if (ot->genericArgs.empty()) return AwaitTaskKind::UnitTask;
@@ -3635,6 +3643,181 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
     // Anything else — a bare producer call, an arbitrary expression — is NOT
     // a syntactically-visible owning location. // per §30.5
     return false;
+}
+
+// #1530 (§30.3 / §30.5, v0.179): `Task<T>.Result` (Pattern A, class T)
+// owning-location check. The v0.162 `OwningTask<T>.Result` amendment left
+// this Pattern A sibling gap: reading `.Result` on a completed `Task<T>`
+// whose T is a class is a borrow whose source must be the task expression's
+// own syntactically-visible owning location, exactly as the corresponding
+// `await` requires (§30.3: "additionally subject to the same owning-source
+// rule as `await`"). Drives a single syntactic walk over the WHOLE method
+// body (sync or async — `.Result` is the synchronous escape hatch, so unlike
+// the at-await-site checks this is not gated on `isAsync_`). // per §30.3, §30.5
+void MethodOwnership::checkResultSites(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body)
+        if (s) checkResultSitesStmt(*s);
+}
+
+void MethodOwnership::checkResultSitesStmt(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) checkResultSitesExpr(*ld->initializer);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) checkResultSitesExpr(*es->expr);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) checkResultSitesExpr(*ds->value);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value) checkResultSitesExpr(*as->value);
+        if (as->target) checkResultSitesExpr(*as->target);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) checkResultSitesExpr(*rs->value);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value) checkResultSitesExpr(*th->value);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) checkResultSitesExpr(*ys->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            checkResultSitesExpr(*ifs->ifBranch.condition);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) checkResultSitesStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) checkResultSitesExpr(*el.condition);
+            for (const auto& bs : el.body)
+                if (bs) checkResultSitesStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) checkResultSitesStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) checkResultSitesExpr(*ws->condition);
+        for (const auto& bs : ws->body)
+            if (bs) checkResultSitesStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) checkResultSitesExpr(*fs->iterable);
+        for (const auto& bs : fs->body)
+            if (bs) checkResultSitesStmt(*bs);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) checkResultSitesStmt(*bs);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body)
+            if (bs) checkResultSitesStmt(*bs);
+        for (const auto& arm : ts->catches)
+            if (arm.body) checkResultSitesStmt(*arm.body);
+        for (const auto& bs : ts->finallyBody)
+            if (bs) checkResultSitesStmt(*bs);
+        return;
+    }
+}
+
+void MethodOwnership::checkResultSitesExpr(const ast::Expr& e) {
+    // Diagnose a `.Result` member access here (if this expr is one), then
+    // recurse into sub-expressions so a nested read (`Process(t.Result)`,
+    // `a + t.Result`) is examined too.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->member == "Result" && ma->target) {
+            const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+            // A `Task<T>` (not `OwningTask<T>` — that sibling form transfers
+            // ownership under a separate rule, §30.3) whose single-part name
+            // head is literally "Task". Mirrors the detection `awaitTaskKind`
+            // uses for the await operand. // per §30.3
+            if (tt && tt->kind == sema::TypeRef::Kind::Named && !tt->nullable &&
+                tt->astNode && tt->astNode->name &&
+                tt->astNode->name->parts.size() == 1 &&
+                tt->headName() == "Task" && !tt->genericArgs.empty() &&
+                taskResultArgIsClass(tt->genericArgs.front())) {
+                if (!awaitOperandIsOwningLocation(*ma->target)) {
+                    report(
+                        Severity::Error, ma->span.begin,
+                        "reading `.Result` on a class-typed `Task<T>` "
+                        "(Pattern A) requires the task expression to occupy "
+                        "a syntactically-visible owning location — a `using "
+                        "var`-bound task local, an `owned` parameter, an "
+                        "`owned` field, or an owning-collection slot — so "
+                        "the borrowed result has a source (§30.3 / §30.5; "
+                        "bind the producer first: `using var t := "
+                        "Producer(); var r := t.Result;`)");
+                }
+            }
+        }
+        checkResultSitesExpr(*ma->target);
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->operand) checkResultSitesExpr(*ue->operand);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) checkResultSitesExpr(*be->left);
+        if (be->right) checkResultSitesExpr(*be->right);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) checkResultSitesExpr(*nm->target);
+        return;
+    }
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (call->callee) checkResultSitesExpr(*call->callee);
+        for (const auto& a : call->args)
+            if (a.value) checkResultSitesExpr(*a.value);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) checkResultSitesExpr(*nc->callee);
+        for (const auto& a : nc->args)
+            if (a.value) checkResultSitesExpr(*a.value);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) checkResultSitesExpr(*ix->target);
+        for (const auto& a : ix->indices)
+            if (a.value) checkResultSitesExpr(*a.value);
+        return;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (bg->operand) checkResultSitesExpr(*bg->operand);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) checkResultSitesExpr(*a.value);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) checkResultSitesExpr(*cd->condition);
+        if (cd->thenValue) checkResultSitesExpr(*cd->thenValue);
+        if (cd->elseValue) checkResultSitesExpr(*cd->elseValue);
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (te->operand) checkResultSitesExpr(*te->operand);
+        return;
+    }
+    // A LambdaExpr is its own scope — its `.Result` reads are checked when
+    // its body is analysed as a method-like unit, not here. Other leaf
+    // expressions hold no member access.
 }
 
 const ast::UnaryExpr* MethodOwnership::awaitRoot(const ast::Expr& e) {

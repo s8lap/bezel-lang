@@ -463,6 +463,13 @@ BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_success_raises_ioe
 //
 // Fast-path variant: MakeBox is synchronous (no delay) → takes the already-done
 // fast path through emitAwaitSuspend (no real thread suspension).
+//
+// #1530 (§30.3 / §30.5, v0.179): `.Result` on a class-typed `Task<T>` (Pattern
+// A) is a borrow whose source must be a syntactically-visible owning
+// location — the same rule `await` enforces (§30.5 Consumer-side rules). A
+// bare `C.ChainBox(77).Result` is a sourceless read and is now rejected, so
+// the producer is bound to a `using var` first; the chained-slot mechanics
+// and result value under test are unchanged.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_fast_path_1332) {
     expectValue941(
@@ -481,7 +488,8 @@ BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_fast_path_13
         "    return await C.MakeBox(x); "      // Pattern A chained return
         "  end ChainBox; "
         "  public static method Main(): int "
-        "    var b: Box := C.ChainBox(77).Result; "
+        "    using var t := C.ChainBox(77); "  // #1530: owning location for .Result
+        "    var b: Box := t.Result; "
         "    return b.X; "
         "  end Main; "
         "end C;",
@@ -492,6 +500,9 @@ BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_fast_path_13
 // the real suspension path (bz_task_then + Resume) is exercised.
 // bz_task_set_chained must be called in the Resume function (state 1) after
 // the source task completes, before bz_task_complete on the outer task.
+//
+// #1530 (§30.3 / §30.5, v0.179): same owning-location rule as the fast-path
+// variant above — the producer is bound to a `using var` before `.Result`.
 BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_slow_path_1332) {
     expectValue941(
         "module M; "
@@ -510,7 +521,8 @@ BEZEL_TEST(async_sync_wait_941, pattern_a_chained_slot_class_result_slow_path_13
         "    return await C.MakeBoxDelayed(x); "   // Pattern A chained return (slow)
         "  end ChainBoxDelayed; "
         "  public static method Main(): int "
-        "    var b: Box := C.ChainBoxDelayed(55).Result; "
+        "    using var t := C.ChainBoxDelayed(55); "  // #1530: owning location for .Result
+        "    var b: Box := t.Result; "
         "    return b.X; "
         "  end Main; "
         "end C;",

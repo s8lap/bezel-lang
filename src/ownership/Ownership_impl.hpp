@@ -1046,6 +1046,29 @@ private:
     // (the immediate-value form an owned-consuming position admits), else null.
     static const ast::UnaryExpr* awaitRoot(const ast::Expr& e);
 
+    // -- #1530 (§30.3 / §30.5, v0.179): `Task<T>.Result` (Pattern A, class T)
+    // owning-location check ------------------------------------------------
+    //
+    // Reading `.Result` on a completed `Task<T>` whose T is a class is
+    // additionally subject to the SAME owning-source rule as `await Task<T>`
+    // (§30.3): the read produces a borrow whose source is the task
+    // expression's own location, so the receiver must occupy a syntactically-
+    // visible owning location exactly as an awaited Pattern A operand must
+    // (`awaitOperandIsOwningLocation`, reused verbatim — a `.Result` receiver
+    // and an `await` operand are the same "task expression" shape). Unlike
+    // `await`, there is no chained-slot admission for a bare producer call
+    // (`return await Producer()`'s exception): `.Result` is a synchronous
+    // read, not part of an async state machine's return-await chain, so a
+    // bare-producer receiver (`SomeProducer().Result`) is unconditionally
+    // rejected. Runs UNCONDITIONALLY over every method body (sync and async)
+    // — unlike the at-await-site checks above, which are gated on `isAsync_`
+    // because `await` only appears in async bodies, `.Result` is the
+    // synchronous escape hatch and is typically read from ordinary
+    // (non-async) code. // per §30.3, §30.5
+    void checkResultSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkResultSitesStmt(const ast::Stmt& s);
+    void checkResultSitesExpr(const ast::Expr& e);
+
     // -- Async-readiness 3c: SuspendLocal annotation + completion edges --------
     //
     // §30.5 / §30.9. Classify each owned local as suspend-local (live range

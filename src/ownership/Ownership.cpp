@@ -469,6 +469,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     if (isAsync_) {
         checkAwaitSites(body);
     }
+    // #1530 (§30.3 / §30.5, v0.179): the `Task<T>.Result` (Pattern A, class T)
+    // owning-location check — the SAME borrow-source rule as the Pattern A
+    // `await` site above, applied to the synchronous `.Result` escape hatch.
+    // NOT gated on `isAsync_`: `.Result` is read from ordinary synchronous
+    // code (`await` is unavailable there), so this must run over every
+    // method body. // per §30.3, §30.5
+    checkResultSites(body);
 }
 
 void MethodOwnership::runExprBodyOwningReturnCheck(
@@ -498,6 +505,11 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
     // legal). // per §28.6
     checkOwnedFieldReturn(exprBody);
+    // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
+    // — an expression-bodied method's `=>` body can read `.Result` on a
+    // class-typed `Task<T>` (`M(): Conn => t.Result;`) just as a block body
+    // can, so it is subject to the same owning-location rule. // per §30.3
+    checkResultSitesExpr(exprBody);
     // §28.14 v0.177 (#1419): the expression body IS the return value — a
     // call-bounded parameter (or a closure capturing one) returned through
     // `=> f` escapes exactly as `return f;` does. // per §28.14
