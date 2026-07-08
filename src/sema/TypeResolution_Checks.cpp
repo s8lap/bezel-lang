@@ -1221,14 +1221,22 @@ void Resolver::checkEqualsHashCodePairing() {
     }
 }
 
-// §25.2 (v0.158, #1338): "A record or enum that overloads `=`/`<>` with both
-// operands of the declaring type must also declare `Equals(T)` and
-// `override GetHashCode` — the same discipline, and the same diagnostic style,
-// as §8.3's Equals→GetHashCode pairing." The three surfaces (`=`, `Equals`,
-// hashing) can otherwise silently diverge exactly where it hurts: `a = b` true
-// while a `Set<T>` treats them as distinct. Heterogeneous-operand overloads
-// (`T = U`) carry no such obligation. The compiler-intrinsic IntPtr/UIntPtr
-// operator declarations predate and are exempt.
+// §25.2 (v0.158, #1338; enum spelling corrected v0.183, #1381/#1582): "A record
+// or enum that overloads `=`/`<>` with both operands of the declaring type must
+// also declare `Equals(T)` and — on a record, `override GetHashCode`; on an
+// enum, a plain `GetHashCode(): int`, since enum members never carry `override`
+// (§10.5) — the same discipline, and the same diagnostic style, as §8.3's
+// Equals→GetHashCode pairing." The three surfaces (`=`, `Equals`, hashing) can
+// otherwise silently diverge exactly where it hurts: `a = b` true while a
+// `Set<T>` treats them as distinct. Heterogeneous-operand overloads (`T = U`)
+// carry no such obligation. The compiler-intrinsic IntPtr/UIntPtr operator
+// declarations predate and are exempt.
+//
+// v0.183 fix: the diagnostic text below previously said `` `override
+// GetHashCode` `` unconditionally, including for enums — but §10.5 REJECTS
+// `override` on any enum method, so an enum author following that diagnostic
+// literally hit a second compile error. The message now spells the requirement
+// the way each `t->kind` actually accepts it.
 void Resolver::checkEqualityCoDeclaration() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
@@ -1270,12 +1278,16 @@ void Resolver::checkEqualityCoDeclaration() {
             }
         }
         if (homoOp && !(hasEquals && hasGetHashCode)) {
-            std::string kind = (t->kind == ast::TypeDeclKind::Enum)
-                ? "an enum" : "a record";
+            bool isEnum = t->kind == ast::TypeDeclKind::Enum;
+            std::string kind = isEnum ? "an enum" : "a record";
+            // §10.5: enum members never carry `override` — a plain
+            // `GetHashCode(): int` is the enum spelling (v0.183 fix, #1582).
+            std::string hashSpelling =
+                isEnum ? "`GetHashCode`" : "`override GetHashCode`";
             ctx_.diagnostics().report(
                 Severity::Error, homoOp->declLoc,
                 kind + " that overloads `=` must also declare `Equals(T)` and "
-                "`override GetHashCode` (\xC2\xA7""25.2)");
+                + hashSpelling + " (\xC2\xA7""25.2)");
         }
     }
 }

@@ -7,9 +7,11 @@
 //    admissible element) and the ToString narrowing (an `override ToString`
 //    alone no longer disqualifies auto-equality; `override Equals`/`GetHashCode`
 //    still do).
-//  - §25.2 (v0.158) co-declaration rule — a record/enum overloading `=`/`<>`
-//    with both operands the declaring type must also declare `Equals(T)` and
-//    `override GetHashCode`.
+//  - §25.2 (v0.158, enum spelling corrected v0.183 #1381/#1582) co-declaration
+//    rule — a record/enum overloading `=`/`<>` with both operands the
+//    declaring type must also declare `Equals(T)` and — on a record,
+//    `override GetHashCode`; on an enum, a plain `GetHashCode` (§10.5: enum
+//    members never carry `override`).
 //  - §3.6 / §8.3 (v0.158) equality-bearing — a `Dictionary<K,V>` key and a
 //    `Set<T>` element must be equality-bearing; enforced at the instantiation
 //    site (§3.6 rule 2).
@@ -254,6 +256,70 @@ BEZEL_TEST(equality_v0158, codecl_enum_missing_pair_rejected_spec_25_2) {
         "  public static method operator <>(a: Color, b: Color): bool => false; "
         "end Color; class F public static method Main(): int return 0; end Main; end F;");
     BEZEL_EXPECT_TRUE(hasCoDeclError(r));
+}
+
+// §25.2 (v0.183, #1381/#1582): on an enum, the co-declaration diagnostic must
+// instruct a PLAIN `GetHashCode`, not `override GetHashCode` — §10.5 rejects
+// `override` on any enum method (enums dispatch statically, no override
+// chain), so telling an enum author to write `override GetHashCode` sends
+// them straight into a second, unrelated compile error. Before the v0.183 fix
+// this message hardcoded "override GetHashCode" for every `t->kind`.
+BEZEL_TEST(equality_v0158,
+           codecl_enum_message_says_plain_gethashcode_spec_25_2_v0_183) {
+    auto r = parseSema(
+        "module M; "
+        "enum Color Red, Green; "
+        "  public static method operator =(a: Color, b: Color): bool => true; "
+        "  public static method operator <>(a: Color, b: Color): bool => false; "
+        "end Color; class F public static method Main(): int return 0; end Main; end F;");
+    bool sawPlainSpelling = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("must also declare `Equals(T)`") == std::string::npos)
+            continue;
+        // Must name the enum's own spelling ...
+        sawPlainSpelling = d.message.find("`GetHashCode`") != std::string::npos;
+        // ... and must NOT tell the author to write `override GetHashCode`,
+        // which §10.5 would then reject.
+        BEZEL_EXPECT_TRUE(
+            d.message.find("override GetHashCode") == std::string::npos);
+    }
+    BEZEL_EXPECT_TRUE(sawPlainSpelling);
+}
+
+// §25.2 (v0.183): the record spelling is unchanged — still `override
+// GetHashCode` — so a record author is not affected by the enum-specific fix.
+BEZEL_TEST(equality_v0158,
+           codecl_record_message_still_says_override_gethashcode_spec_25_2) {
+    auto r = parseSema(
+        "module M; "
+        "record V(n: int) "
+        "  public static method operator =(a: V, b: V): bool => a.n = b.n; "
+        "  public static method operator <>(a: V, b: V): bool => a.n <> b.n; "
+        "end V; class F public static method Main(): int return 0; end Main; end F;");
+    bool sawOverrideSpelling = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("must also declare `Equals(T)`") == std::string::npos)
+            continue;
+        sawOverrideSpelling =
+            d.message.find("`override GetHashCode`") != std::string::npos;
+    }
+    BEZEL_EXPECT_TRUE(sawOverrideSpelling);
+}
+
+// §25.2 / §10.5: an enum WITH the co-declared members — a plain (non-`override`)
+// `Equals(T)` + `GetHashCode` — satisfies the rule; the enum's own spelling
+// (§10.5: enum members never carry `override`) is exactly what the compiler
+// accepts, not just what it now recommends.
+BEZEL_TEST(equality_v0158, codecl_enum_satisfied_with_plain_gethashcode_spec_25_2) {
+    auto r = parseSema(
+        "module M; "
+        "enum Color Red, Green; "
+        "  public static method operator =(a: Color, b: Color): bool => int(a) = int(b); "
+        "  public static method operator <>(a: Color, b: Color): bool => int(a) <> int(b); "
+        "  public method Equals(other: Color): bool => int(this) = int(other); "
+        "  public method GetHashCode(): int => int(this); "
+        "end Color; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_FALSE(hasCoDeclError(r));
 }
 
 // ─── §3.6 / §8.3 v0.158: equality-bearing hash-container keys (#1338) ────────
