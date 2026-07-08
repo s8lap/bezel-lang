@@ -1610,6 +1610,22 @@ private:
                                     const ast::Expr* callee,
                                     const ast::NewExpr* ne);
 
+    // §28.14 (v0.180, #1439/#1545 "scoped construction"): true when `e`'s
+    // resolved static type is a non-value-builtin class or interface — the
+    // type category `checkScopedIsFunctionTyped` admits alongside function
+    // types (TypeResolution_Names.cpp). Used to route a `scoped` call-site
+    // argument to the single-source borrow-admission path below instead of
+    // the closure-capture path above.
+    bool scopedArgIsClassBorrow(const ast::Expr& e) const;
+
+    // §28.14 (v0.180, #1439/#1545): true when `target` is `this.<field>` (or
+    // the bare implicit-`this` field spelling) resolving to a FieldSymbol
+    // that is NOT `owned` — the admitted storage slot for a class/interface-
+    // typed `scoped` parameter (an ORDINARY non-owned back-reference field,
+    // §28.5/§28.3 — no `scoped` field marker is used or required for this
+    // shape, unlike the function-typed case's `scoped` field).
+    bool exprIsReceiverPlainFieldOfThis(const ast::Expr& target) const;
+
     // §28.14 forms 4/5 (v0.180): resolve the chain head of a subscription
     // receiver (`<recv>.Add`/`+=`, or the receiver of a scoped call). Every hop
     // must be an `owned` field or a compiler-generated event backing member;

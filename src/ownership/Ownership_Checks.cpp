@@ -6324,6 +6324,46 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
     return false;
 }
 
+// §28.14 (v0.180, #1439/#1545): mirrors checkScopedIsFunctionTyped's admitted
+// type set (TypeResolution_Names.cpp) — a non-value-builtin class or
+// interface. An argument of this static type binds to a "scoped
+// construction" parameter (a passive borrow), not a callback, so it is
+// routed to the single-source admission path in checkScopedAdmission rather
+// than the closure-capture path.
+bool MethodOwnership::scopedArgIsClassBorrow(const ast::Expr& e) const {
+    const sema::TypeRef* t = ctx_.exprType(e);
+    if (!t || t->kind != sema::TypeRef::Kind::Named || !t->declaration)
+        return false;
+    if (t->declaration->isValueBuiltin) return false;
+    return t->declaration->kind == ast::TypeDeclKind::Class ||
+           t->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
+// §28.14 (v0.180, #1439/#1545). See the header for the full contract: the
+// admitted storage slot for a class/interface-typed `scoped` parameter is a
+// PLAIN (non-`owned`) field of `this` — mirrors exprIsOwnedFieldRead's two
+// receiver spellings (bare implicit-`this` identifier, explicit `this.f`)
+// but requires the ABSENCE of the `owned` modifier (a borrow store, not an
+// ownership transfer).
+bool MethodOwnership::exprIsReceiverPlainFieldOfThis(
+    const ast::Expr& target) const {
+    auto isPlainField = [](sema::Symbol* sym) -> bool {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+        if (!fs) return false;
+        for (std::string_view m : fs->modifiers)
+            if (m == "owned") return false;
+        return true;
+    };
+    if (dynamic_cast<const ast::IdentifierExpr*>(&target))  // implicit this.f
+        return isPlainField(ctx_.exprSymbol(target));
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid || tid->name != "this") return false;
+        return isPlainField(ctx_.exprSymbol(target));
+    }
+    return false;
+}
+
 namespace {
 // §28.14 chain-hop predicate (v0.180): an `owned` field is a hop the bounding
 // instance's teardown disposes (spec form 4's chain-hop restriction). A borrow
@@ -6645,7 +6685,37 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                                            const ast::Expr* eventTarget) {
     // Classify the argument form and enumerate its captures.
     std::vector<const ast::IdentifierExpr*> rawIds;
-    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
+    // §28.14 (v0.180, #1439/#1545) "scoped construction": a class/interface-
+    // typed `scoped` argument is a passive BORROW, not a function value —
+    // it has exactly ONE source (not an enumerated capture set). Reduce it
+    // to that source's root identifier (`identifierRoot` peels member/index
+    // chains, e.g. `this.field`, down to the root) and feed it into the
+    // SAME reduction/bound/freeze machinery below via a one-element capture
+    // list — "the argument's borrow source... reuses everything downstream"
+    // (#1439). An argument with NO root identifier — a `new` expression or
+    // any other call/temporary result — is a fresh producer: the unbound
+    // owned temporary dies at the end of the full expression, exactly
+    // §9.7's no-temporary-source rule.
+    if (!dynamic_cast<const ast::NullLiteralExpr*>(&arg) &&
+        scopedArgIsClassBorrow(arg)) {
+        const ast::IdentifierExpr* root = identifierRoot(arg);
+        if (!root) {
+            report(Severity::Error, arg.span.begin,
+                   "a fresh producer cannot source a `scoped` borrow "
+                   "parameter — the unbound owned temporary dies at the end "
+                   "of the full expression (§9.7's no-temporary-source rule, "
+                   "extended to class/interface-typed `scoped` parameters by "
+                   "§28.14 v0.180); bind the source to a named local first");
+            return;
+        }
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                ctx_.exprSymbol(*root))) {
+            if (ps->modifier == "scoped" &&
+                methodParamSet_.count(ctx_.exprSymbol(*root)))
+                return;  // forwarding a scoped param — callee-side rule checks it
+        }
+        rawIds.push_back(root);
+    } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
         scopedCollectCaptures(*lam, rawIds);
     } else if (dynamic_cast<const ast::NullLiteralExpr*>(&arg)) {
         return;  // clearing a nullable scoped position — nothing captured
@@ -6951,7 +7021,14 @@ int MethodOwnership::scopedUseKind(const ast::Expr& e,
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (ps->modifier == "scoped" && methodParamSet_.count(sym)) {
                 if (nameOut) *nameOut = id->name;
-                return 1;
+                // §28.14 (v0.180, #1439/#1545): a class/interface-typed
+                // `scoped` parameter is "scoped construction" — a passive
+                // BORROW, not a callback. Its admitted-use universe is kind
+                // 3 (below), distinct from the function-typed kind 1: it
+                // stores into a PLAIN field of `this` (no `scoped` field
+                // marker — "no new field kind is introduced"), not a
+                // `scoped` field, and it is not invocable.
+                return scopedArgIsClassBorrow(e) ? 3 : 1;
             }
         }
         if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) {
@@ -6993,6 +7070,19 @@ bool MethodOwnership::scopedRestrictedUse(const ast::Expr& e,
                    "stored into a `scoped` field of `this`, or forwarded to "
                    "a `scoped` parameter of a call on `this`; it may not " +
                    std::string(context) + " (§28.14, v0.175)");
+    } else if (kind == 3) {
+        // §28.14 (v0.180, #1439/#1545) "scoped construction": a class/
+        // interface-typed scoped parameter's admitted uses are storing it
+        // into a plain (non-owned) field of the bounding object `this`
+        // itself, or forwarding it to another `scoped` parameter of a call
+        // on `this` — spec: "may not return it or store it anywhere else."
+        report(Severity::Error, e.span.begin,
+               std::string("`") + std::string(name) +
+                   "` is a `scoped` borrow parameter — it may only be "
+                   "stored into a plain field of the bounding object `this` "
+                   "itself, or forwarded to a `scoped` parameter of a call "
+                   "on `this`; it may not " + std::string(context) +
+                   " (§28.14, v0.180)");
     } else {
         report(Severity::Error, e.span.begin,
                std::string("`") + std::string(name) +
@@ -7012,6 +7102,23 @@ void MethodOwnership::scopedCalleeScan(
 
 void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // §28.14 (v0.180, #1439/#1545) "scoped construction": storing a
+        // CLASS/INTERFACE-typed `scoped` parameter (kind 3) into a PLAIN
+        // (non-owned) field of `this` is the admitted storage shape — the
+        // ordinary back-reference field of §28.5/§28.3, not a `scoped`
+        // field (spec: "No new field kind is introduced"). Any other
+        // target — another object's field, a local, an unrelated slot —
+        // is the "may not … store it anywhere else" rejection.
+        if (as->op == ":=" && as->target && as->value &&
+            scopedUseKind(*as->value) == 3) {
+            if (exprIsReceiverPlainFieldOfThis(*as->target)) return;
+            report(Severity::Error, as->target->span.begin,
+                   "a `scoped` borrow parameter may be stored only into a "
+                   "plain (non-owned) field of the bounding object `this` "
+                   "itself — storing it elsewhere extends the borrow past "
+                   "its bound (§28.14, v0.180)");
+            return;
+        }
         // Store INTO a scoped field of `this`: RHS must be a scoped parameter
         // of this method, or the null literal (clear). // per §28.14
         if (as->target && scopedUseKind(*as->target) == 2) {
@@ -7056,11 +7163,14 @@ void MethodOwnership::scopedCalleeWalkStmt(const ast::Stmt& s) {
                 }
             }
         }
-        // A scoped PARAMETER as assignment target (reassignment).
-        if (as->target && scopedUseKind(*as->target) == 1) {
+        // A scoped PARAMETER as assignment target (reassignment) — function-
+        // typed (kind 1) or class/interface-typed (kind 3, v0.180).
+        if (as->target &&
+            (scopedUseKind(*as->target) == 1 ||
+             scopedUseKind(*as->target) == 3)) {
             report(Severity::Error, as->target->span.begin,
                    "a `scoped` parameter may not be reassigned (§28.14, "
-                   "v0.175)");
+                   "v0.175/v0.180)");
             return;
         }
         if (as->target) scopedCalleeWalkExpr(*as->target);
@@ -7179,9 +7289,13 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
             if (!a.value) continue;
             std::string_view name;
             int kind = scopedUseKind(*a.value, &name);
-            if (kind == 1) {
+            if (kind == 1 || kind == 3) {
                 // Admitted context 3: FORWARDING to a scoped parameter of a
                 // call whose bounding object is the same object (`this`).
+                // Applies equally to function-typed (kind 1) and class/
+                // interface-typed (kind 3, v0.180 — §28.14 "scoped
+                // construction": "may forward it only to another `scoped`
+                // parameter with the same bounding object") forwards.
                 bool formalScoped =
                     scopedFormalAt(ce->callee.get(), nullptr, i);
                 bool onThis = false;
@@ -7203,6 +7317,15 @@ void MethodOwnership::scopedCalleeWalkExpr(const ast::Expr& e) {
                     }
                 }
                 if (formalScoped && onThis) continue;  // admitted forward
+                if (kind == 3) {
+                    report(Severity::Error, a.value->span.begin,
+                           std::string("`") + std::string(name) +
+                               "` is a `scoped` borrow parameter — it may be "
+                               "forwarded only to another `scoped` parameter "
+                               "of a call on the same bounding object "
+                               "(`this`) (§28.14, v0.180)");
+                    continue;
+                }
                 report(Severity::Error, a.value->span.begin,
                        std::string("`") + std::string(name) +
                            "` is a `scoped` parameter — it may be forwarded "

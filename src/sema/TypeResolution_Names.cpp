@@ -894,12 +894,19 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
     return ref;
 }
 
-// §28.14 / §22.3 (v0.175): `scoped` is valid only on a FUNCTION-typed
-// parameter / field. The check runs on the RESOLVED type so a type alias to a
-// function type is admitted transparently. A nullable function type
-// (`(() -> ())?`) is admitted — the natural shape of a clearable `scoped`
-// field. An unresolved (Error) type stays silent (the resolution error was
-// already reported; no cascade).
+// §28.14 / §22.3 (v0.175; extended v0.180 #1439/#1545): `scoped` is valid on
+// a FUNCTION-typed parameter/field (the original storage-bounded-capture
+// form) OR a CLASS- or INTERFACE-typed parameter (v0.180's "scoped
+// construction": the callee stores the *borrow* in a direct non-owned field
+// instead of storing a callback in a `scoped` field — §28.14 "Class- and
+// interface-typed `scoped` parameters"). A value-typed builtin (DateTime,
+// TimeSpan, Guid, CancellationToken — TypeDeclKind::Class with
+// isValueBuiltin) is excluded: those are copied, not borrowed, so `scoped`
+// on one is vacuous. The check runs on the RESOLVED type so a type alias is
+// admitted transparently. A nullable function type (`(() -> ())?`) or
+// nullable class/interface type (`Stream?`) is admitted — the natural shape
+// of a clearable `scoped` field. An unresolved (Error) type stays silent
+// (the resolution error was already reported; no cascade).
 void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
                                           Scope* scope, std::string_view name,
                                           std::string_view what,
@@ -909,11 +916,17 @@ void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
     if (!rt) rt = resolveType(*declaredType, scope);
     if (!rt || rt->kind == TypeRef::Kind::Error) return;
     if (rt->kind == TypeRef::Kind::Function) return;
+    if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+        !rt->declaration->isValueBuiltin &&
+        (rt->declaration->kind == ast::TypeDeclKind::Class ||
+         rt->declaration->kind == ast::TypeDeclKind::Interface))
+        return;
     ctx_.diagnostics().report(
         Severity::Error, loc,
-        std::string("`scoped` is valid only on a function-typed ") +
-        std::string(what) + " (§22.3, §28.14 v0.175); `" + std::string(name) +
-        "` does not have a function type");
+        std::string("`scoped` is valid only on a function-typed, class-"
+                     "typed, or interface-typed ") +
+        std::string(what) + " (§22.3, §28.14 v0.175/v0.180); `" +
+        std::string(name) + "` does not have any of those types");
 }
 
 // §28.14 (v0.180, #1606): a `scoped` parameter on a STATIC method is admitted

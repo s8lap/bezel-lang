@@ -2019,9 +2019,15 @@ std::vector<ast::Param> Parser::parseParamList() {
 std::vector<ast::CallArgument> Parser::parseArgList() {
     // A.4 ArgList ::= Argument ("," Argument)*
     // Argument    ::= ArgModifiers? (Identifier ":=")? ArgExpression
-    // ArgModifiers ∈ { ref | out var? | out using var | out owned var | owned }
+    // ArgModifiers ∈ { ref | out var? | out using var | out owned var | owned
+    //                   | scoped }
     // per §A.4 / v0.160: the former bare `out owned` form now requires "var"
-    // (an inline owned-local declaration). ArgExpression ::= Expression | "_"
+    // (an inline owned-local declaration). §22.3/§28.14 (v0.180, #1439): the
+    // `scoped` call-site marker parallels bare `owned` — it marks a class/
+    // interface-typed borrow argument to a `scoped` parameter (`M(scoped x)`).
+    // Positional-only like the other modified forms; fresh-producer /
+    // declared-before/freeze admission is checked semantically in ownership
+    // (§28.14 "scoped construction"). ArgExpression ::= Expression | "_"
     std::vector<ast::CallArgument> args;
     if (isPunctuator(")")) return args;
     auto parseOne = [&]() -> ast::CallArgument {
@@ -2054,11 +2060,35 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
             }
         } else if (consumeKeyword("owned")) {
             a.modifier = "owned";
+        } else if (current_.kind == TokenKind::Identifier &&
+                   current_.text == "scoped" &&
+                   (peekAt(1).kind == TokenKind::Identifier ||
+                    (peekAt(1).kind == TokenKind::Keyword &&
+                     (peekAt(1).text == "this" || peekAt(1).text == "base" ||
+                      // per §9.7 / §28.14 (v0.180): the canonical FRESH-
+                      // PRODUCER shape `scoped new X(...)` — semantically
+                      // rejected (checkScopedAdmission, ownership pass), but
+                      // must still PARSE so that rejection can fire instead
+                      // of a confusing syntax error.
+                      peekAt(1).text == "new")))) {
+            // §22.3/§28.14 (v0.180, #1439): `scoped` is a CONTEXTUAL call-site
+            // argument marker (lexed as Identifier, like the parameter/field/
+            // FuncParamType `scoped` modifiers above) on a class/interface-
+            // typed borrow argument — `M(scoped x)`. It is the modifier
+            // exactly when the next token can begin the borrowed value's
+            // expression: a bare identifier/member-access root, `this` /
+            // `base`, or a `new` expression (the fresh-producer shape, §9.7).
+            // A bare argument whose value IS a variable literally named
+            // `scoped` is followed by `,` / `)` / a binary operator — none of
+            // which are Identifier/`this`/`base`/`new` — and is not matched
+            // here (parsed as an ordinary unmodified argument).
+            a.modifier = "scoped";
+            advance();
         }
         // Named-arg prefix `Identifier :=`. peekAt(1) distinguishes from
         // a bare-Identifier expression argument.
-        // per §22.5 / v0.160: `ref`/`out`/`owned` arguments are positional-only;
-        // the named form is for plain-value arguments only.
+        // per §22.5 / v0.160: `ref`/`out`/`owned`/`scoped` arguments are
+        // positional-only; the named form is for plain-value arguments only.
         if (!a.modifier.empty()) {
             // Modified arg: named form is not permitted; parse no prefix here.
             // We do NOT look for `Identifier :=` — the expression parsing below
