@@ -239,3 +239,29 @@ BEZEL_TEST(codegen_cg35_itable, nullable_widening_param_various_values_1139) {
         "  end Main; "
         "end App;"), 42);
 }
+
+// fix #1613 / §11.2 (interface nullability-widening on parameters, "an
+// implementation may declare a parameter as T? where the interface requires
+// T"): the same adapter thunk from #1139/#1183 above (ensureNullableWideningThunk)
+// must also handle a VOID-returning interface method. The thunk's forwarding
+// call was unconditionally named ("nw.ret"), and naming a void-typed Value
+// trips the LLVM IR verifier ("Instruction has a name, but provides a void
+// value!") — reproduced pre-fix via build/bezelc on a program shaped exactly
+// like this one. ip.Handle(42) must land 42 (not the has-value tag 1) into
+// the static field via the impl's widened int? parameter.
+BEZEL_TEST(codegen_cg35_itable, nullable_widening_param_void_return_1613) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IProc method Handle(x: int); end IProc; "
+        "class P: IProc "
+        "  public static _last: int := 0; "
+        "  public method Handle(x: int?) _last := x ?? -1; end Handle; "
+        "end P; "
+        "class App "
+        "  public static method Main(): int "
+        "    using var p := new P(); var ip: IProc := p; "
+        "    ip.Handle(42); "
+        "    return P._last; "
+        "  end Main; "
+        "end App;"), 42);
+}

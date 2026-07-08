@@ -1495,9 +1495,15 @@ llvm::Function* Emitter::ensureNullableWideningThunk(
         ++paramIdx;
     }
 
-    llvm::Value* result = builder_.CreateCall(implTy, implFn, implArgs,
-                                              "nw.ret");
-    if (ifaceTy->getReturnType()->isVoidTy())
+    // per §11.2 (#1613): a void-returning interface method still reaches
+    // this thunk when a param is nullability-widened — CreateCall must not
+    // name a void-typed Value (the LLVM verifier rejects "Instruction has a
+    // name, but provides a void value!"). Mirrors ensureVtableWideningThunk's
+    // isVoidRet guard (#1592, §12.1).
+    bool isVoidRet = ifaceTy->getReturnType()->isVoidTy();
+    llvm::Value* result = builder_.CreateCall(
+        implTy, implFn, implArgs, isVoidRet ? llvm::Twine() : "nw.ret");
+    if (isVoidRet)
         builder_.CreateRetVoid();
     else
         builder_.CreateRet(result);
