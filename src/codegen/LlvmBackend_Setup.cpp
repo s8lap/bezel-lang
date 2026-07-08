@@ -8052,8 +8052,35 @@ struct StringEscapeWalker {
             expr(ts->value.get(), /*safeRead=*/false); return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            // The target being the local itself is a reassignment → escape
-            // (overwrite handling is out of this increment). The RHS escapes.
+            // §4.6 / §28.9 (#1486): a string compound-assign `X += Y` (the only
+            // valid compound on a `string`) is a CONCAT. It borrow-reads Y into a
+            // FRESH buffer — it never retains Y into a slot — and maintains the
+            // target slot's independent +1 (the `+=` lowering releases the old
+            // value and stores a fresh +1 concat result; a +1-producer RHS is
+            // released after the concat borrows it). So neither operand becomes a
+            // lasting alias:
+            //   * the TARGET (if it is our local) is a reassignment, NOT an escape
+            //     — the slot still owns exactly one reference at scope end, which
+            //     the scope-end release drops soundly (no other alias exists once
+            //     the escape walk is otherwise clean).
+            //   * a bare-identifier RHS OPERAND (if it is our local) is a SAFE READ
+            //     (borrow-read by the concat), so being a `+=` operand does not
+            //     taint it. Nested-call args in the RHS still ESCAPE via the
+            //     CallExpr case (walkCallArgs), so `X += f(s)` still taints s.
+            // Both directions were previously over-approximated as escapes, so a
+            // non-escaping accumulator / operand leaked its final +1 at scope end
+            // (bounded 1-block leak). Restricted to `+=`; a plain `:=` keeps the
+            // conservative treatment below (its RHS RETAINS a borrow into the slot,
+            // so scope-end eligibility there needs a separate soundness argument).
+            if (as->op == "+=") {
+                if (!isTargetIdent(as->target.get()))
+                    expr(as->target.get(), /*safeRead=*/false);
+                expr(as->value.get(), /*safeRead=*/true);
+                return;
+            }
+            // Plain `:=` (or any other assignment): the target being the local
+            // itself is a reassignment → escape (overwrite handling for `:=` is
+            // out of this fix). The RHS escapes.
             if (isTargetIdent(as->target.get())) { escaped = true; return; }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
