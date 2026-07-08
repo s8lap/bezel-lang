@@ -2971,6 +2971,94 @@ bool MethodOwnership::exprIsOwnedFieldRead(const ast::Expr& e) const {
     return false;
 }
 
+// §28.6 / §5.11 (#1493). See the header for the full contract: an owned-field
+// read whose receiver is `this` — restricted the same way
+// `checkBorrowReturnedThroughOwningType`'s two borrow carve-outs restrict
+// `exprIsOwnedFieldRead` inline (a bare identifier is an implicit `this.f`;
+// an explicit `obj.f` only counts when `obj` is literally the `this`
+// identifier).
+bool MethodOwnership::exprIsReceiverOwnedFieldBorrow(const ast::Expr& e) const {
+    if (!exprIsOwnedFieldRead(e)) return false;
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e)) return true;  // implicit this.f
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+            if (tid->name == "this") return true;  // this.f
+    return false;
+}
+
+// §28.6 / §5.11 (#1493). See the header for the full contract. Statement
+// coverage mirrors `moveOnlyArrayLeakScanStmt` (this file): If/While/For/
+// DoEndBlock/Try/Case are the forms that can carry a nested `return`; a
+// nested closure expression is never descended into (`ReturnStmt` inside a
+// lambda body is unreachable from a `Stmt*` walk — lambdas carry their body
+// as an `Expr`, not spliced into the enclosing statement list — so the "never
+// descend into nested closures" header note is upheld structurally, not by an
+// explicit skip here).
+void MethodOwnership::scanReturnsForWrapperReceiverBorrow(
+        const ast::Stmt* s, bool& sawReturn, bool& allBorrow) const {
+    if (!s || !allBorrow) return;  // null body slot, or already disproved
+    if (const auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        sawReturn = true;
+        if (!rs->value || !exprIsReceiverOwnedFieldBorrow(*rs->value))
+            allBorrow = false;
+        return;
+    }
+    if (const auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+        for (auto& b : is->ifBranch.body)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        for (auto& br : is->elifBranches)
+            for (auto& b : br.body)
+                scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        for (auto& b : is->elseBody)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        for (auto& b : ws->body)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        for (auto& b : fs->body)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        for (auto& b : d->body)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        for (auto& b : ts->body)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        for (auto& c : ts->catches)
+            scanReturnsForWrapperReceiverBorrow(c.body.get(), sawReturn, allBorrow);
+        for (auto& b : ts->finallyBody)
+            scanReturnsForWrapperReceiverBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        for (auto& arm : cs->arms)
+            for (auto& a : arm.stmts)
+                scanReturnsForWrapperReceiverBorrow(a.get(), sawReturn, allBorrow);
+        return;
+    }
+    // ExpressionStmt / AssignmentStmt / DiscardStmt / YieldStmt /
+    // IncrementStmt / BreakStmt / ContinueStmt / ThrowStmt: none can carry a
+    // nested `return` of the enclosing method.
+}
+
+bool MethodOwnership::methodReturnsOnlyWrapperReceiverBorrow(
+        const ast::MethodDecl& md) const {
+    if (md.bodyKind == ast::MethodBodyKind::Expression)
+        return md.exprBody && exprIsReceiverOwnedFieldBorrow(*md.exprBody);
+    bool sawReturn = false;
+    bool allBorrow = true;
+    for (auto& s : md.stmts)
+        scanReturnsForWrapperReceiverBorrow(s.get(), sawReturn, allBorrow);
+    return sawReturn && allBorrow;
+}
+
 // §28.8 owned-sink check (issue #395). See the header for the full contract.
 bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     const ast::Expr* e = &argValue;

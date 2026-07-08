@@ -868,6 +868,47 @@ private:
     // read flowing into an owned sink. // per §28.3, §28.8.1
     bool exprIsOwnedFieldRead(const ast::Expr& e) const;
 
+    // §28.6 / §5.11 (#1493): true when `e` is an `owned`-field read AND the
+    // receiver is `this` — a bare identifier (implicit `this.f`) or an
+    // explicit `this.f`, never another object's field. This is the exact
+    // shape `checkBorrowReturnedThroughOwningType`'s owning-WRAPPER branch
+    // admits as a borrow (mirroring the owning-collection branch's identical
+    // receiver restriction, inlined there); factored out here so the caller-
+    // side classifier below (`methodReturnsOnlyWrapperReceiverBorrow`) can
+    // reuse the exact same test. // per §28.6, §28.3, §5.11
+    bool exprIsReceiverOwnedFieldBorrow(const ast::Expr& e) const;
+
+    // §28.6 / §5.11 (#1493): does every reachable `return` under `s` return
+    // the wrapper-receiver-field-borrow shape above? Sets `sawReturn` when at
+    // least one `return <expr>;` was visited, and clears `allBorrow` on the
+    // first one that is `return;` (no value) or returns anything else. Does
+    // NOT descend into nested closures — a lambda's `return` belongs to the
+    // lambda, not the enclosing method. Statement coverage mirrors
+    // `moveOnlyArrayLeakScanStmt`'s control-flow walk (§17 statement forms
+    // that can carry a nested `return`). // per §28.6, §28.3, §5.11
+    void scanReturnsForWrapperReceiverBorrow(const ast::Stmt* s,
+                                              bool& sawReturn,
+                                              bool& allBorrow) const;
+
+    // §28.6 / §5.11 (#1493): true when EVERY return path of `md`'s body is the
+    // wrapper-receiver-field-borrow shape (an expression body counts as its
+    // single implicit return). `checkBorrowReturnedThroughOwningType`
+    // guarantees this is the ONLY borrow shape it admits for a non-`owned`
+    // owning-WRAPPER return type (Shared, Weak, ChannelSender, OwningTask,
+    // IOwningEnumerable, CancellationTokenSource) — every other admitted
+    // return there (`new`, `move`, an owned-returning call, a transferred
+    // owned local/param) is a genuine owned producer the caller must still
+    // discharge. So "every return matches" is a sound, purely structural test
+    // for classifying a CALL to `md` as Borrowed rather than the wrapper's
+    // default Owned (consumer-owns) classification in `producerState` below —
+    // without it, a legitimate borrow-return (the shape #1493 fixed at the
+    // definition site) was still tracked Owned at every call site, triggering
+    // a spurious §28.3 auto-drop warning (memory-safe only by Dispose()'s
+    // idempotency, §28.2 — not a double-free, but a wrong classification). A
+    // body with no return in the walk is conservatively NOT classified
+    // Borrowed (returns false). // per §28.6, §28.3, §5.11
+    bool methodReturnsOnlyWrapperReceiverBorrow(const ast::MethodDecl& md) const;
+
     // §28.8: report the owned-sink violation for `argValue` (at `loc`) when
     // `ownedArgSourceIsBorrow` holds. Returns true when it reported (the
     // caller then skips the bogus `markMovedByName` that would silently treat

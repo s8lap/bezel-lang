@@ -1818,16 +1818,28 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             // return is a genuine borrow (a bare receiver-field
             // read), never a fresh/`move`d/owned value, so this never
             // under-disposes an owned result. Owning WRAPPERS
-            // (OwningTask, Shared, …) keep consumer-owns semantics —
-            // they fall through to the name-head fallback (Owned),
-            // and a borrow through them stays the #1007 reject.
+            // (OwningTask, Shared, …) mostly keep consumer-owns semantics —
+            // they fall through to the name-head fallback (Owned), and a
+            // non-borrow return through them stays Owned — EXCEPT for the one
+            // borrow shape #1493 admitted at the definition site (a bare
+            // receiver owned-field read, e.g. `owned _tx: ChannelSender<T>` /
+            // `return _tx;`): checkBorrowReturnedThroughOwningType guarantees
+            // that when EVERY return of `md` takes that shape, the callee
+            // never hands the caller a fresh owned value, so it is sound to
+            // classify the call Borrowed here too — otherwise the caller
+            // tracked a receiver-sourced borrow as Owned and warned to
+            // auto-drop it (§28.3), memory-safe only via `Dispose()`'s
+            // idempotency (§28.2), never the actual classification. // #1493
             if (const sema::TypeRef* rt = ctx_.exprType(e))
                 if (rt->kind == sema::TypeRef::Kind::Named &&
                     rt->astNode && rt->astNode->name &&
-                    !rt->astNode->name->parts.empty() &&
-                    isOwningCollectionNameHead(
-                        rt->headName()))
-                    return OwnershipState::Borrowed;
+                    !rt->astNode->name->parts.empty()) {
+                    if (isOwningCollectionNameHead(rt->headName()))
+                        return OwnershipState::Borrowed;
+                    if (isOwningTypeNameHead(rt->headName()) &&
+                        methodReturnsOnlyWrapperReceiverBorrow(*md))
+                        return OwnershipState::Borrowed;
+                }
             // Other non-`owned` user returns: fall through.
         }
         // #1388 / §28.3 / §28.11 / §29.1: builtin owned-TRANSFER calls — Pop /
@@ -2736,7 +2748,21 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         // (the caller disposes it), and a BORROW returned that way is laundered
         // into a second owner (the #1007 double-free). Reject the borrow; allow
         // every genuine owned producer (`new`, `move`, a call returning owned).
-        // This is the pre-Part-C #1007 behaviour, retained for the wrappers.
+        // This is the pre-Part-C #1007 behaviour, retained for the wrappers —
+        // EXCEPT for the one admissible borrow form §28.6 bullet 1 grants any
+        // class-typed owned field: a bare read of an `owned` field of THE
+        // RECEIVER (`this`). Its source is the receiver, which the caller holds
+        // across the call, so there is no laundering — the same dispensation the
+        // owning-collection branch below grants, applied "uniformly to a
+        // class-typed owned field" per the bullet's text (#1493: this carve-out
+        // was missing here, so a bare `owned _tx: ChannelSender<T>` read was
+        // rejected while the identical shape on a user class or an
+        // owning-collection field was accepted). exprIsReceiverOwnedFieldBorrow
+        // is the shared this-restricted test (also used by producerState's
+        // methodReturnsOnlyWrapperReceiverBorrow call-site classification below)
+        // — a field of another object does not match and falls through to the
+        // borrow rejection. // per §28.6, §28.3, §5.11
+        if (exprIsReceiverOwnedFieldBorrow(e)) return;
         bool isBorrow = ownedArgSourceIsBorrow(e);
         if (!isBorrow) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
