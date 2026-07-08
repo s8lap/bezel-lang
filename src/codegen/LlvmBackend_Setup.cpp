@@ -3934,13 +3934,37 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
             }
         }
     }
-    if (hasOwnedToClean || baseClassOf(cs->parent)) {
+    // §22.9 (v0.181): a `this(...)`-chaining constructor's BODY throw is a
+    // different case from the ordinary base-anchored one this block otherwise
+    // handles. By the time control can reach here for a this(...)-chaining
+    // ctor, the chained-to constructor (this class's own base(...)-anchored
+    // steps 0-2, including field initializers) has already run to completion
+    // — "the instance is at that point fully initialized" — so the spec calls
+    // for disposing it through the normal generated-Dispose() path (destructor
+    // body + owned fields + base chain), not the narrower assigned-fields-only
+    // cleanup an ordinary constructor body throw uses (the `else` branch
+    // below, unchanged, per bullet 3, which does not run the destructor). We
+    // call this class's own CORE disposer (disposerCoreFns_, NOT the public,
+    // vtable-dispatched Dispose): a dynamic dispatch would resolve through the
+    // actual most-derived vtable, which — when this constructor is itself
+    // reached as a `base(...)` target from a more-derived class's constructor
+    // (step 1 above) — would incorrectly run the more-derived class's
+    // not-yet-initialized destructor over still-zeroed fields. The
+    // statically-resolved core, scoped to exactly this class and its own real
+    // base chain, is safe at every chain depth (mirrors emitBaseDisposeChain's
+    // own use of the base's core for the identical reason).
+    if (hasOwnedToClean || baseClassOf(cs->parent) ||
+        (isThis && findDestructor(cs->parent))) {
         auto* savedInsert = builder_.GetInsertBlock();
         auto* cleanupBB =
             llvm::BasicBlock::Create(llvm_, "ctor.cleanup", currentFn_);
         builder_.SetInsertPoint(cleanupBB);
-        emitOwnedFieldDisposals(cs->parent);   // assigned owned fields (reverse)
-        emitBaseDisposeChain(cs->parent);      // the base subobject
+        if (isThis) {
+            builder_.CreateCall(disposerCoreFns_[cs->parent], {currentThis_});
+        } else {
+            emitOwnedFieldDisposals(cs->parent);   // assigned owned fields (reverse)
+            emitBaseDisposeChain(cs->parent);      // the base subobject
+        }
         builder_.CreateRetVoid();              // exc stays set; `new` site frees
         if (savedInsert) builder_.SetInsertPoint(savedInsert);
         // Route the body's exception edges to the cleanup block. The bare
@@ -4632,32 +4656,34 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
 // with the active generic substitution. `obj` is `this` (already the correct
 // subobject), and the ctor's parameters must already be bound in paramSlots_.
 // Runs the leading constructor chain (an explicit `base(...)`/`this(...)`, else
-// the implicit base), then the remaining body statements. A constructor-cleanup
-// block (assigned owned fields + base subobject + free, routed to the enclosing
-// unwind) guards the inlined body's exception edges, mirroring lowerNew's
-// inline path and emitConstructorBody.
+// the implicit base) FIRST, with no derived cleanup installed (§22.9 bullet 1:
+// a chain-call throw is entirely the chained-to/base ctor's own responsibility
+// — see #1555), then installs a constructor-cleanup block — routed to the
+// enclosing unwind — as the propagate target for the remaining body/field-init
+// steps only. For an ordinary (base-anchored) ctor the cleanup disposes
+// assigned owned fields + the base subobject + frees `obj` (mirroring
+// lowerNew's inline path and emitConstructorBody); for a `this(...)`-chaining
+// ctor (§22.9 v0.181) it instead runs the fully-initialized instance's own
+// generated-Dispose() core (destructor + owned fields + base chain) before
+// freeing `obj`.
 void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) return;
     currentThis_ = obj;
 
-    // Build the cleanup block first, capturing the enclosing unwind target.
-    auto* savedInsert = builder_.GetInsertBlock();
-    llvm::BasicBlock* enclosingUnwind = unwindBB();
-    auto* cleanupBB =
-        llvm::BasicBlock::Create(llvm_, "ctor.inline.cleanup", currentFn_);
-    builder_.SetInsertPoint(cleanupBB);
-    emitOwnedFieldDisposals(cs->parent);
-    emitBaseDisposeChain(cs->parent);
-    builder_.CreateCall(freeFn(), {obj});
-    builder_.CreateBr(enclosingUnwind);
-    if (savedInsert) builder_.SetInsertPoint(savedInsert);
-    unwindTarget_ = cleanupBB;
-    unwindScopeDepth_ = disposeStack_.size();
-
-    // Run the leading chain (base/this) — recursively inlining a generic base
-    // ctor — then lower the rest of the body. With neither written, the
-    // implicit base ctor runs (chaining further up).
+    // §22.9 step 1 (v0.181): run the leading chain (base/this) — recursively
+    // inlining a generic base/sibling ctor — BEFORE installing this class's
+    // own cleanup block below. An exception during the chain call itself
+    // "leaves no derived state to clean up" (§22.9 bullet 1): the chained-
+    // to/base ctor's own exception-safety logic (its own inlineCtorBody frame,
+    // or its compiled ctor's own cleanup) has already disposed and freed
+    // whatever IT constructed, so this class must not repeat that disposal.
+    // (Previously the cleanup block below was installed as unwindTarget_
+    // BEFORE this call, so a `this(...)`-chain-call throw ALSO ran this
+    // class's cleanup over the same object a second time — confirmed via a
+    // `this()`-chaining generic ctor whose target threw during its own field
+    // initializer: double free, since the target's own cleanup had already
+    // freed `obj` and this class's cleanup unconditionally freed it again.)
     bool isThis = false;
     std::size_t startIdx = 0;
     if (!cd->body.empty()) {
@@ -4670,6 +4696,44 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     } else {
         emitImplicitBase(cs->parent, currentThis_);
     }
+
+    // Build the cleanup block now (after the chain call has completed),
+    // capturing the enclosing unwind target, and install it as the propagate
+    // target for the REST of construction — this class's own field
+    // initializers (if any) and its body (§22.9 steps 2/3). `unwindTarget_` is
+    // unchanged across the chain call above (any nested inlineCtorBody frame
+    // saves/restores it), so capturing `enclosingUnwind` here is equivalent to
+    // capturing it before the call.
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "ctor.inline.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    if (isThis) {
+        // §22.8/§22.9 (v0.181): a `this(...)`-chaining constructor skips its
+        // own field initializers (the chained-to ctor already ran them as its
+        // step 2) — by the time ITS OWN body can throw, "the instance is at
+        // that point fully initialized," so it is disposed through the normal
+        // generated-Dispose() core (destructor body + owned fields + base
+        // chain), not the narrower assigned-fields-only cleanup the `else`
+        // branch below uses for an ordinary (base-anchored) ctor's field-init
+        // or body throw. specializedDisposerCoreFor builds (cached) a core
+        // disposer under the ACTIVE generic substitution: the shared,
+        // unspecialized disposerCoreFns_[cs->parent] template has the wrong
+        // field layout for a non-template-compatible T — the same reason
+        // ctorFns_ isn't called directly here (see the #585 comment above) —
+        // and mirrors emitBaseDisposeChain's own specialized-core use.
+        builder_.CreateCall(specializedDisposerCoreFor(cs->parent), {obj});
+    } else {
+        emitOwnedFieldDisposals(cs->parent);
+        emitBaseDisposeChain(cs->parent);
+    }
+    builder_.CreateCall(freeFn(), {obj});
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    unwindTarget_ = cleanupBB;
+    unwindScopeDepth_ = disposeStack_.size();
+
     // §22.8 step 2 (#929/#930): own field initializers after the base chain,
     // before the body (mirrors emitConstructorBody). The inline cleanup block
     // installed above routes a throwing field initializer to owned-field + base
