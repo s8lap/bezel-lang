@@ -1,5 +1,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include "common/BuiltinRegistry.hpp"
+
 #include "sema/ConstFold.hpp"
 
 #include "sema/TypeResolution.hpp"
@@ -4324,29 +4326,47 @@ void Resolver::checkSerializationEligibility() {
 }
 
 // ---------------------------------------------------------------------------
-// §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains checks.
+// §22.12 rules 2 and 4 (v0.163, #1363; two-form admission v0.181, #1556):
+// statics-and-domains checks.
 // ---------------------------------------------------------------------------
 
-// True when `rt` is a compiler-known internally-synchronized type per §22.12:
-//   Mutex, Semaphore, Atomic<T>, AtomicInteger<T>, Channel<T>, ChannelSender<T>
-// These are the only class-typed mutable static fields the spec admits (rule 2)
-// and the types for which the rule 4 warning is suppressed.
+// §22.12 rule 2 form (i) (v0.181): the compiler-known internally-synchronized
+// handle set — a class-typed mutable static is admitted when its type is one of
+//   Mutex, Semaphore, Atomic<T>, AtomicInteger<T>, ChannelSender<T>
+// `Channel<T>` is EXCLUDED (v0.181, #1556): the channel object is the *receiving*
+// end (§30.15), single-consumer by ownership, and a process-global receiving end
+// would readmit the deferred multi-consumer receive (stdlib §6.9) — publish a
+// `ChannelSender<T>` static instead. These builtins have a null `declaration`
+// (their names resolve to a Named TypeRef with no user TypeSymbol), so the set is
+// keyed on the syntactic head name. The rule 4 warning is suppressed for exactly
+// this set (a `static readonly Channel<T>` therefore still warns).
 static bool isInSynchronizedSet(const TypeRef* rt) {
     if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration)
         return false;
-    if (!rt->astNode || !rt->astNode->name ||
-        rt->astNode->name->parts.empty())
-        return false;
     std::string_view n = rt->headName();
+    if (n.empty()) return false;
     return n == "Mutex" || n == "Semaphore" ||
            n == "Atomic" || n == "AtomicInteger" ||
-           n == "Channel" || n == "ChannelSender";
+           n == "ChannelSender";
+}
+
+// §22.12 rule 2 form (ii) (v0.181, #1556): the lazy task cache. A mutable static
+// whose DECLARED type is `Task?` or `Task<T>?` is admitted — the intended
+// null-initialized once-set cache of an asynchronous computation (§22.13 pattern
+// (b), Pattern A multi-await §30.5). The admission is keyed to the declared type
+// alone (nullable + head `Task`), so it stays decidable at the declaration.
+// `OwningTask<T>?` is NOT admitted: it is single-await (§30.5), useless as a
+// shared cache, and a displaced owned task would strand its result — its head is
+// `OwningTask`, not `Task`, so it is correctly excluded here. A non-nullable
+// `Task`/`Task<T>` is likewise not admitted (the cache is null-initialized).
+static bool isAdmittedTaskCache(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->nullable) return false;
+    return rt->headName() == "Task";
 }
 
 // True when `rt` is a user-declared class or interface type (possibly nullable).
-// These are the reference types targeted by §22.12 rules 2 and 4.
-// Excludes primitives, enums, records, and value-builtin types (all covered by
-// Rule 3's "unrestricted" grant).
 static bool isUserClassOrInterface(const TypeRef* rt) {
     if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
         return false;
@@ -4355,7 +4375,90 @@ static bool isUserClassOrInterface(const TypeRef* rt) {
            k == ast::TypeDeclKind::Interface;
 }
 
+// True when `rt` is a compiler-known builtin *reference* (heap-pointer) type —
+// `Task`, `OwningTask`, `Channel`, `ChannelSender`, the collections, the sync
+// handles, etc. (the set codegen lowers to `ptr`). These builtins resolve to a
+// Named TypeRef with a null `declaration`, so they are keyed on the head name via
+// the shared registry. A bare generic parameter (`static x: T`) is also
+// Named+null-declaration but its head is not a registered builtin, so it is
+// correctly excluded. Value builtins (DateTime, Guid, Range, spans, …) and
+// `string`/primitives/records/enums are NOT reference builtins and are left to
+// §22.12 rule 3 / the #1393 primitive-string-record residual.
+static bool isBuiltinReferenceType(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration)
+        return false;
+    return common::isHeapPointerReferenceBuiltin(rt->headName());
+}
+
+// §22.12 rules 2 and 4 govern reference (class/interface) types: user-declared
+// classes/interfaces AND compiler-known builtin reference types. The v0.163 check
+// narrowed to user types only, which silently admitted every builtin class type
+// as a mutable static (the #1556 bug: `Channel<T>`, `OwningTask<T>?`). string,
+// primitives, records, enums, value builtins, and function types are NOT governed
+// here (rule 3 / the #1393 residual).
+static bool isRule2GovernedReference(const TypeRef* rt) {
+    return isUserClassOrInterface(rt) || isBuiltinReferenceType(rt);
+}
+
+// §22.12 rule 4 (v0.181, #1556): the readonly-static declaration-site warning is
+// emitted for user-declared class/interface types (as in v0.163) AND for the
+// builtin `Channel<T>` — the case the v0.181 rule 4 text explicitly calls out (a
+// `static readonly Channel<T>` still warns: the reminder that the channel is the
+// single-consumer *receiving* end and must stay confined to one consuming
+// domain, §30.15). The broader builtin-collection readonly warnings (a
+// `static readonly Array<T>` / `List<T>`, a widespread and idiomatic form) remain
+// deferred with the #1393 residual to avoid warning-spamming that idiom; only the
+// Channel case is added here per the issue.
+static bool isRule4GovernedReference(const TypeRef* rt) {
+    if (isUserClassOrInterface(rt)) return true;
+    return rt && rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+           rt->headName() == "Channel";
+}
+
+// Display spelling of a static field/property's reference type for a diagnostic:
+// the user TypeSymbol's name when declared, else the builtin syntactic head.
+static std::string staticRefTypeName(const TypeRef* rt) {
+    if (rt && rt->declaration) return std::string(rt->declaration->name);
+    return rt ? std::string(rt->headName()) : std::string();
+}
+
 void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
+    // §22.12 rule 2 (v0.181, #1556): a mutable static reference field/property is
+    // a compile error unless its type is a form-(i) synchronized handle or a
+    // form-(ii) `Task?`/`Task<T>?` lazy cache. `what` is the member wording.
+    auto reportRule2 = [&](const TypeRef* rt, std::string_view name,
+                           std::string_view what, SourceLocation loc) {
+        if (!isRule2GovernedReference(rt) || isInSynchronizedSet(rt) ||
+            isAdmittedTaskCache(rt))
+            return;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("mutable static ") + std::string(what) + " `" +
+            std::string(name) + "` has type `" + staticRefTypeName(rt) +
+            "`, which §22.12 rule 2 does not admit as a mutable static; a "
+            "mutable static of class or interface type must be an internally-"
+            "synchronized handle (Mutex, Semaphore, Atomic<T>, "
+            "AtomicInteger<T>, ChannelSender<T> — form (i); Channel<T> is "
+            "excluded, publish a ChannelSender<T> instead) or a `Task?` / "
+            "`Task<T>?` lazy cache (form (ii); OwningTask<T>? is not admitted) "
+            "(§22.12 rule 2, v0.181, #1556)");
+    };
+    // §22.12 rule 4 (v0.181, #1556): a static readonly reference field/property
+    // draws a declaration-site warning unless its type is in the form-(i)
+    // synchronized set — the referenced instance is process-global and reachable
+    // from every domain.
+    auto reportRule4 = [&](const TypeRef* rt, std::string_view name,
+                           std::string_view what, SourceLocation loc) {
+        if (!isRule4GovernedReference(rt) || isInSynchronizedSet(rt)) return;
+        ctx_.diagnostics().report(
+            Severity::Warning, loc,
+            std::string("static readonly ") + std::string(what) + " `" +
+            std::string(name) + "` has class type `" + staticRefTypeName(rt) +
+            "` which is reachable from every domain; confine its use to one "
+            "domain or ensure its own internal synchronization "
+            "(§22.12 rule 4, #1363)");
+    };
+
     for (Symbol* m : t->members) {
         // Check FieldSymbol (body fields, not positional record fields).
         if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
@@ -4366,41 +4469,10 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*fd->type);
             if (!rt) continue;
 
-            bool isReadonly = hasMod(fs, "readonly");
-
-            if (!isReadonly) {
-                // §22.12 rule 2 (v0.163, #1363): a mutable static field of a
-                // user-declared class or interface type is a compile error unless
-                // the type is in the compiler-known internally-synchronized set.
-                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("mutable static field `") +
-                        std::string(fs->name) + "` has type `" +
-                        std::string(rt->declaration->name) +
-                        "` which is not in the compiler-known internally-"
-                        "synchronized set; a mutable static field of class or "
-                        "interface type must be Mutex, Semaphore, Atomic<T>, "
-                        "AtomicInteger<T>, Channel<T>, or ChannelSender<T> "
-                        "(§22.12 rule 2, #1363)");
-                }
-            } else {
-                // §22.12 rule 4 (v0.163, #1363): a static readonly field of
-                // user-declared class or interface type is admitted with a
-                // declaration-site warning unless the type is in the synchronized
-                // set — the referenced instance is process-global and reachable
-                // from every domain.
-                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
-                    ctx_.diagnostics().report(
-                        Severity::Warning, m->declLoc,
-                        std::string("static readonly field `") +
-                        std::string(fs->name) + "` has class type `" +
-                        std::string(rt->declaration->name) +
-                        "` which is reachable from every domain; confine its "
-                        "use to one domain or ensure its own internal "
-                        "synchronization (§22.12 rule 4, #1363)");
-                }
-            }
+            if (!hasMod(fs, "readonly"))
+                reportRule2(rt, fs->name, "field", m->declLoc);
+            else
+                reportRule4(rt, fs->name, "field", m->declLoc);
             continue;
         }
 
@@ -4416,37 +4488,10 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*pd->type);
             if (!rt) continue;
 
-            bool isReadonly = hasMod(ps, "readonly");
-
-            if (!isReadonly) {
-                // §22.12 rule 2: mutable static auto-property of user
-                // class/interface type.
-                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, m->declLoc,
-                        std::string("mutable static property `") +
-                        std::string(ps->name) + "` has type `" +
-                        std::string(rt->declaration->name) +
-                        "` which is not in the compiler-known internally-"
-                        "synchronized set; a mutable static auto-property of "
-                        "class or interface type must be Mutex, Semaphore, "
-                        "Atomic<T>, AtomicInteger<T>, Channel<T>, or "
-                        "ChannelSender<T> (§22.12 rule 2, #1363)");
-                }
-            } else {
-                // §22.12 rule 4: static readonly auto-property of user
-                // class/interface type.
-                if (isUserClassOrInterface(rt) && !isInSynchronizedSet(rt)) {
-                    ctx_.diagnostics().report(
-                        Severity::Warning, m->declLoc,
-                        std::string("static readonly property `") +
-                        std::string(ps->name) + "` has class type `" +
-                        std::string(rt->declaration->name) +
-                        "` which is reachable from every domain; confine its "
-                        "use to one domain or ensure its own internal "
-                        "synchronization (§22.12 rule 4, #1363)");
-                }
-            }
+            if (!hasMod(ps, "readonly"))
+                reportRule2(rt, ps->name, "property", m->declLoc);
+            else
+                reportRule4(rt, ps->name, "property", m->declLoc);
         }
     }
 }

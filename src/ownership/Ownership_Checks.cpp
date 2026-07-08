@@ -3512,6 +3512,18 @@ bool MethodOwnership::targetIsNonOwnedField(const ast::Expr& target) const {
     if (!fs) return false;
     for (std::string_view m : fs->modifiers)
         if (m == "owned") return false;  // owned field → §28.5 path, not here
+    // §22.12/§22.13 (v0.181, #1556): a STATIC field follows the static-init
+    // model, not the §28.6 instance-field leak rule. Every store into a non-
+    // `owned` static field DISCHARGES its producer — the §28.8 ownership-
+    // discharge exemption for non-`owned` statics (spec §22.13 "Static class-
+    // typed fields without owned") covers both a `static readonly` class field
+    // AND every store a §22.12 rule 2 admitted mutable static receives (the
+    // §22.13 pattern (b) `_cfg := LoadConfigAsync();` cache, and a synchronized-
+    // handle publish `_tx := ch.NewSender();`). The value lives for the program
+    // and is reclaimed at exit, so it does not leak. This mirrors the static
+    // exemption checkFieldInitializer already applies to the initializer form.
+    for (std::string_view m : fs->modifiers)
+        if (m == "static") return false;
     return true;
 }
 

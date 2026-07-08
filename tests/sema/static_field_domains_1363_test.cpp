@@ -2,13 +2,21 @@
 // (v0.163, issue #1363). Authority: §22.12 "Statics and domains" rules 1–5
 // (v0.163).
 //
-// Rule 2: a mutable (non-readonly, non-const) static field or static
-//   auto-property whose type is a user-declared class or interface is a
-//   compile error unless the type is in the compiler-known internally-
-//   synchronized set (Mutex, Semaphore, Atomic<T>, AtomicInteger<T>,
-//   Channel<T>, ChannelSender<T>).  Any other class/interface type is
-//   rejected at the declaration site.  [Primitive value types are not yet
-//   checked: #1363-followup.]
+// Rule 2 (two-form admission, v0.181, #1556): a mutable (non-readonly,
+//   non-const) static field or static auto-property of REFERENCE type — a
+//   user-declared class/interface OR a compiler-known builtin reference type
+//   (Channel, OwningTask, the collections, …) — is a compile error unless it is
+//   one of exactly two admitted forms:
+//     (i)  an internally-synchronized handle: Mutex, Semaphore, Atomic<T>,
+//          AtomicInteger<T>, ChannelSender<T>.  Channel<T> is EXCLUDED (v0.181)
+//          — it is the single-consumer receiving end; publish a ChannelSender<T>
+//          static instead.
+//     (ii) a lazy task cache whose declared type is `Task?` or `Task<T>?`.
+//          OwningTask<T>? is NOT admitted (single-await, would strand its
+//          result); a non-nullable Task is not admitted (the cache is
+//          null-initialized).
+//   Primitive value types, string, records, and enums are NOT checked here (the
+//   primitive/string/record residual is tracked at #1393; rule 3 grants them).
 //
 // Rule 3 (pin): static readonly and const of immutable content (value types,
 //   string, enums) are unrestricted — no errors or warnings.
@@ -143,17 +151,23 @@ BEZEL_TEST(sema_static_domains_1363,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// (7) §22.12 rule 2 positive: Channel<int> is in the synchronized set — admitted.
+// (7) §22.12 rule 2 (v0.181, #1556): Channel<int> is EXCLUDED from the
+//   synchronized set — a mutable static Channel<T> is now REJECTED.  (This test
+//   asserted admission under v0.163, when Channel was in the form-(i) set; the
+//   v0.181 revision removes it — the channel object is the single-consumer
+//   receiving end (§30.15) and a process-global receiving end would readmit the
+//   deferred multi-consumer receive (stdlib §6.9).  Publish a ChannelSender<T>
+//   static instead.)  Legitimate test update for a spec revision, per the
+//   milestone workflow.
 BEZEL_TEST(sema_static_domains_1363,
-           rule2_mutable_static_channel_admitted) {
+           rule2_mutable_static_channel_rejected_v0181) {
     auto r = parseSema(
         "module M; "
         "class App "
-        "  public static _ch: Channel<int> := new Channel<int>(0); "
+        "  public static _ch: Channel<int>; "
         "  public static method Main(): int => 0; "
         "end App;");
-    BEZEL_EXPECT_FALSE(hasMutableStaticError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMutableStaticError(r));
 }
 
 // ---------------------------------------------------------------------------
@@ -325,4 +339,117 @@ BEZEL_TEST(sema_static_domains_1363,
         "  public static method Main(): int => 0; "
         "end App;");
     BEZEL_EXPECT_FALSE(hasMutableStaticError(r));
+}
+
+// ---------------------------------------------------------------------------
+// §22.12 rule 2 two-form admission (v0.181, #1556): builtin reference types.
+// The v0.163 check narrowed to user classes only, silently admitting every
+// compiler-known builtin class type (Channel, OwningTask, …) as a mutable
+// static.  These tests pin the v0.181 shape for the builtin-reference surface.
+// ---------------------------------------------------------------------------
+
+// (20) §22.12 rule 2 form (i): ChannelSender<T> IS in the synchronized set —
+//   a mutable static ChannelSender<int>? is admitted (the sanctioned
+//   process-global send endpoint that replaces a static Channel<T>).
+BEZEL_TEST(sema_static_domains_1363,
+           rule2_mutable_static_channelsender_admitted) {
+    auto r = parseSema(
+        "module M; "
+        "class App "
+        "  public static _tx: ChannelSender<int>?; "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_FALSE(hasMutableStaticError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (21) §22.12 rule 2 form (ii): a mutable static `Task<T>?` lazy cache is
+//   admitted (the §22.13 pattern (b) null-initialized once-set cache).
+BEZEL_TEST(sema_static_domains_1363,
+           rule2_mutable_static_task_generic_cache_admitted) {
+    auto r = parseSema(
+        "module M; "
+        "class Cfg public X: int := 0; end Cfg; "
+        "class App "
+        "  private static _cfg: Task<Cfg>? := null; "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_FALSE(hasMutableStaticError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (22) §22.12 rule 2 form (ii): the non-generic `Task?` cache is likewise
+//   admitted (the admission is keyed to the declared type alone).
+BEZEL_TEST(sema_static_domains_1363,
+           rule2_mutable_static_task_bare_cache_admitted) {
+    auto r = parseSema(
+        "module M; "
+        "class App "
+        "  private static _work: Task? := null; "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_FALSE(hasMutableStaticError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (23) §22.12 rule 2: `OwningTask<T>?` is NOT admitted (form (ii) is `Task?` /
+//   `Task<T>?` only — an owning task is single-await and would strand its
+//   result as a shared cache).  A mutable static OwningTask<T>? is rejected.
+BEZEL_TEST(sema_static_domains_1363,
+           rule2_mutable_static_owningtask_rejected) {
+    auto r = parseSema(
+        "module M; "
+        "class Doc public X: int := 0; end Doc; "
+        "class App "
+        "  private static _doc: OwningTask<Doc>? := null; "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_TRUE(hasMutableStaticError(r));
+}
+
+// (24) §22.12 rule 2 form (ii) is nullable-keyed: a NON-nullable mutable static
+//   `Task<T>` is rejected — the sanctioned cache is null-initialized (`Task?` /
+//   `Task<T>?`), so a non-nullable Task is not one of the two admitted forms.
+BEZEL_TEST(sema_static_domains_1363,
+           rule2_mutable_static_nonnullable_task_rejected) {
+    auto r = parseSema(
+        "module M; "
+        "class Cfg public X: int := 0; end Cfg; "
+        "class App "
+        "  private static _cfg: Task<Cfg>; "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_TRUE(hasMutableStaticError(r));
+}
+
+// (25) §22.12 rule 4 (v0.181, #1556): a `static readonly Channel<T>` still draws
+//   the declaration-site warning (Channel is excluded from the form-(i) set, so
+//   the warning is not suppressed) — the reminder that the channel is the
+//   single-consumer receiving end and must stay confined to one domain (§30.15).
+//   It is a warning, not an error.
+BEZEL_TEST(sema_static_domains_1363,
+           rule4_static_readonly_channel_warns) {
+    auto r = parseSema(
+        "module M; "
+        "class App "
+        "  public static readonly _ch: Channel<int> := new Channel<int>(1); "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticReadonlyWarning(r));
+}
+
+// (26) §22.12 rule 4 (v0.181, #1556): a mutable static ChannelSender<T> in the
+//   synchronized set draws NO rule-4 warning and NO rule-2 error — the form-(i)
+//   suppression applies to the send endpoint.
+BEZEL_TEST(sema_static_domains_1363,
+           rule2_readonly_channelsender_no_warning) {
+    auto r = parseSema(
+        "module M; "
+        "class App "
+        "  public static readonly _tx: ChannelSender<int>?; "
+        "  public static method Main(): int => 0; "
+        "end App;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasStaticReadonlyWarning(r));
 }

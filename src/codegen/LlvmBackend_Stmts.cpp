@@ -508,7 +508,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // struct to its value. No-op for a nullable target (elemTy is
                     // the struct, not its value element).
                     rhs = unwrapNarrowedNullable(rhs, elemTy);
-                    builder_.CreateStore(rhs, addr);
+                    llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
+                    // §22.12 rule 2 store atomicity (v0.181, #1556): a store into
+                    // a static REFERENCE field is a single pointer-word write the
+                    // runtime performs atomically — no torn reference is ever
+                    // observed by a racing first-use on another domain (the check-
+                    // then-store sequence itself is deliberately NOT atomic;
+                    // §22.12). Emit it as an aligned atomic monotonic pointer store
+                    // (relaxed: the spec promises no-tearing, not cross-domain
+                    // ordering). Scope: any pointer-typed static field — the
+                    // admitted mutable statics rule 2 targets, and incidentally the
+                    // write-once readonly/owned reference statics (harmless, a
+                    // single-word aligned atomic store is functionally identical).
+                    // Primitive-scalar statics and every non-static target (locals,
+                    // instance/record fields, ref params) keep the plain store.
+                    if (rhs->getType()->isPointerTy() &&
+                        staticFieldGlobal(*as->target)) {
+                        si->setAlignment(module_->getDataLayout().getABITypeAlign(
+                            rhs->getType()));
+                        si->setAtomic(llvm::AtomicOrdering::Monotonic);
+                    }
                     // §27.5 / #673: guarded-boxed (non-for-var) locals keep the
                     // original pre-boxing alloca in sync so pre-emitted code that
                     // loads from it (e.g. a while-loop condition) sees the update.
