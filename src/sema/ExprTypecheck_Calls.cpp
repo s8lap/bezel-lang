@@ -1202,6 +1202,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
                         ce.callee.get()))
                     callTypeArgs = &cma->typeArgs;
+                else if (auto* cncm =
+                             dynamic_cast<const ast::NullCondMemberExpr*>(
+                                 ce.callee.get()))
+                    // per §7.5/§1278: `recv?.Method<T>(...)` carries its
+                    // explicit type args the same way `recv.Method<T>(...)` does.
+                    callTypeArgs = &cncm->typeArgs;
                 else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
                              ce.callee.get()))
                     callTypeArgs = &cid->typeArgs;
@@ -1524,11 +1530,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     };
                 bool hadExplicitTypeArgs = false;
                 if (!md->genericParams.empty()) {
-                    // per §14.1 (issue #509/#561): explicit type args may
-                    // appear on a MemberAccessExpr callee (`obj.Method<T>(...)`)
-                    // OR on a bare IdentifierExpr callee (`Id<T>(...)` — a
-                    // same-class or in-scope generic call without a dot).  Both
-                    // AST node types carry a `typeArgs` vector populated by the
+                    // per §14.1 (issue #509/#561) + §7.5/§1278: explicit type
+                    // args may appear on a MemberAccessExpr callee
+                    // (`obj.Method<T>(...)`), a NullCondMemberExpr callee
+                    // (`obj?.Method<T>(...)` — the null-conditional form is
+                    // typed identically apart from the §7.5 nullable lift
+                    // applied to the result afterward), OR on a bare
+                    // IdentifierExpr callee (`Id<T>(...)` — a same-class or
+                    // in-scope generic call without a dot).  All three AST
+                    // node types carry a `typeArgs` vector populated by the
                     // parser when it confirms `< TypeArgList > (`.
                     const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
                         nullptr;
@@ -1536,6 +1546,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             dynamic_cast<const ast::MemberAccessExpr*>(
                                 ce.callee.get()))
                         callTypeArgs = &callMa->typeArgs;
+                    else if (auto* callNcm =
+                                 dynamic_cast<const ast::NullCondMemberExpr*>(
+                                     ce.callee.get()))
+                        callTypeArgs = &callNcm->typeArgs;
                     else if (auto* callId =
                                  dynamic_cast<const ast::IdentifierExpr*>(
                                      ce.callee.get()))
@@ -7129,6 +7143,10 @@ bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
     if (auto* callMa =
             dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
         callTypeArgs = &callMa->typeArgs;
+    else if (auto* callNcm =
+                 dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()))
+        // §7.5/§1278: `recv?.Method<T>(...)` — same short-circuit as `.`.
+        callTypeArgs = &callNcm->typeArgs;
     else if (auto* callId =
                  dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
         callTypeArgs = &callId->typeArgs;

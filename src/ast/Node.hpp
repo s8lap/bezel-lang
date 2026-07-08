@@ -720,13 +720,20 @@ struct CallExpr : Expr {
 };
 
 // A.5 / §17.1 level 1 postfix forms beyond `.` and `(`:
-//   `expr "?." Identifier`    — null-conditional member access (`?.`)
+//   `expr "?." Identifier GenericArgs?` — null-conditional member access (`?.`)
 //   `expr "?(" ArgList? ")"`  — null-conditional invocation (`?(`)
 //   `expr "[" IndexList "]"`  — indexing (multi-dim via comma list)
 //   `expr "!"`                — postfix null-forgiving operator
+// per §17 / Appendix A.7 PrimarySuffix (issue #1278): the optional `typeArgs`
+// mirrors MemberAccessExpr::typeArgs above — explicit method-level type
+// arguments on a null-conditional call, `obj?.Method<T>(...)`. Populated by
+// the parser under the SAME `< TypeArgList > (` disambiguating scan used for
+// the `.` form (§22.12's generics-vs-less-than rule applies identically to
+// `?.`).
 struct NullCondMemberExpr : Expr {
     std::unique_ptr<Expr> target;
     std::string_view member;
+    std::vector<std::unique_ptr<Type>> typeArgs;
 };
 struct NullCondCallExpr : Expr {
     std::unique_ptr<Expr> callee;

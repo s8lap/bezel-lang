@@ -6708,6 +6708,25 @@ private:
         std::unordered_map<std::string_view, const sema::TypeRef*>& semaTy,
         bool& added);
 
+    // per §14.1/§14.2 + §26.5/§7.5 (issue #1278): compute and INSTALL (into
+    // genericSubst_/genericSubstSemaTy_) the method-level generic-parameter
+    // substitution for a call to generic method `ms` — from argument-type
+    // structural unification (#785), explicit call-site type args on the
+    // callee (`obj.Method<T>(...)` MemberAccessExpr, `obj?.Method<T>(...)`
+    // NullCondMemberExpr, or a bare `Id<T>(...)` IdentifierExpr — #509/#561),
+    // and finally the call's own (possibly target-inferred, #391) result type.
+    // A no-op when `ms->decl` has no method-level generic params. Builds on
+    // top of whatever genericSubst_/genericSubstSemaTy_ the caller already
+    // has active (e.g. a receiver-class substitution) — the caller is
+    // responsible for saving/restoring those maps around the call.
+    // Factored out of lowerCall (the `.` call path) so lowerNullCondCall
+    // (`?.`) drives the SAME monomorphization trigger — previously only the
+    // `.` path installed this substitution, so an explicit-type-arg `?.`
+    // generic call reached emitMethodCall with an empty genericSubst_ and
+    // called the unspecialized i32-placeholder body (malformed IR).
+    void applyMethodGenericSubst(const ast::CallExpr& call,
+                                 sema::MethodSymbol* ms);
+
     // per §24: events. `eventSourcePtr` lowers an event-access expression
     // (a bare `Clicked` implicit-`this` identifier, or `obj.Clicked` /
     // `this.Clicked` member access whose symbol is an EventSymbol) to the

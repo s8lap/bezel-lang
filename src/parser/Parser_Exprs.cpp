@@ -1401,6 +1401,25 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             a->target = std::move(head);
             a->member = current_.text;
             advance();
+            // per §14.1/§22.12 (issue #1278): optional explicit method-level
+            // type arguments `<T1, T2, ...>` following the member name on a
+            // null-conditional access — `obj?.Method<T>(...)`. Mirrors the
+            // `.` branch above verbatim: only parsed when the disambiguating
+            // scan confirms the `<` closes with `>` followed by `(`, not a
+            // relational `<` operator (§22.12's generics-vs-less-than rule,
+            // which the grammar states applies identically to `?.`).
+            if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
+                advance(); // past `<`
+                a->typeArgs.push_back(parseType());
+                while (isPunctuator(",")) {
+                    advance(); // past `,`
+                    a->typeArgs.push_back(parseType());
+                }
+                if (!consumeClosingAngle()) {
+                    diagnostics_.report(Severity::Error, current_.location,
+                        "expected '>' to close method type-argument list");
+                }
+            }
             head = std::unique_ptr<ast::Expr>(a.release());
         } else if (consumePunctuator("(")) {
             auto call = std::make_unique<ast::CallExpr>();

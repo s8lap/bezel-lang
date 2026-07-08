@@ -4972,123 +4972,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
-    // per §14.1/§14.2: a generic *method* (its own `<T>` params, e.g.
-    // `static method Clone<T>(proto: T): T where T: class, new()`) is
-    // monomorphized by inferring each method type parameter from the actual
-    // argument types. Without this, a `new T()` in the body has no
-    // substitution and constructs nothing (issue #361 / D12). This handles
-    // both static and instance generic methods; the receiver-class path above
-    // covers class-level params and runs first, so this only adds the
-    // method-level params it left unset.
-    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (!md->genericParams.empty()) {
-            std::unordered_map<std::string_view, llvm::Type*> newSubst =
-                genericSubst_;
-            std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
-                genericSubstSemaTy_;
-            // §14.1 (#785): bind each method type parameter by STRUCTURALLY
-            // unifying every value parameter's declared type against the call
-            // argument's type — so a generic-typed parameter `p: Pair<A, B>`
-            // binds A and B from a `Pair<int, string>` argument, not only a
-            // top-level bare `p: T`. Reuses the same recursive unification the
-            // return-type inference uses (unifyMethodReturnTypeArg); the helper
-            // skips any param already bound (genericSubst_ from the receiver, or
-            // an earlier parameter).
-            for (std::size_t pi = 0; pi < md->params.size() &&
-                 pi < call.args.size(); ++pi) {
-                if (!md->params[pi].type || !call.args[pi].value) continue;
-                // §14.1 / #885 #886: a `null` literal carries no concrete type
-                // information — it is typed by sema as Object (the root reference
-                // type) or as the declared param type T?, neither of which reveals
-                // T's concrete binding. Binding T → Object here blocks the correct
-                // binding from a subsequent concrete argument or explicit type arg,
-                // causing nullableTypeParamConcrete to fail → null not wrapped →
-                // PHI/ICmp type-mismatch crash in the specialized body. Skip null
-                // literals during type-param inference. per §14.1/§14.2, #885/#886.
-                if (dynamic_cast<const ast::NullLiteralExpr*>(
-                        call.args[pi].value.get()))
-                    continue;
-                const sema::TypeRef* declPt =
-                    ctx_.resolvedType(*md->params[pi].type);
-                sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
-                if (!declPt || !at) continue;
-                bool added = false;
-                unifyMethodReturnTypeArg(declPt, at, md->genericParams,
-                                         newSubst, newSema, added);
-            }
-            // per §14.1 (issues #515/#516/#561): a generic method whose type
-            // param appears ONLY in lambda param/return positions (not in any
-            // non-lambda param's declared type) leaves the param unbound by
-            // the arg-inference loop above. When the call site supplies
-            // explicit type arguments (`Transform<int>`), use them to bind
-            // any still-unbound method generic params before the body is
-            // emitted. This complements the pre-pass (which seeds the binding
-            // for lowerLambda) and ensures the MAIN substitution (which drives
-            // emitInlineGenericMethod / emitGenericSpecialization) also has
-            // the correct binding, so that body-level dispatch (v.ToString()
-            // on a U-typed receiver) resolves via genericSubstSemaTy_.
-            // The callee may be a MemberAccessExpr (`obj.Method<T>(...)`) or
-            // a bare IdentifierExpr (`Id<T>(...)` — in-scope call without dot).
-            {
-            const std::vector<std::unique_ptr<ast::Type>>* callTAs = nullptr;
-            if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
-                    call.callee.get()))
-                callTAs = &callMa->typeArgs;
-            else if (auto* callId = dynamic_cast<const ast::IdentifierExpr*>(
-                         call.callee.get()))
-                callTAs = &callId->typeArgs;
-            if (callTAs) {
-                for (std::size_t gi = 0;
-                     gi < md->genericParams.size() &&
-                     gi < callTAs->size(); ++gi) {
-                    std::string_view pname = md->genericParams[gi].name;
-                    if (newSubst.count(pname)) continue;
-                    if (!(*callTAs)[gi]) continue;
-                    sema::TypeRef* concreteArg =
-                        ctx_.resolvedType(*(*callTAs)[gi]);
-                    if (!concreteArg) continue;
-                    newSubst[pname] = lowerTypeRef(concreteArg);
-                    newSema[pname] = concreteArg;
-                }
-            }
-            }
-            genericSubst_ = std::move(newSubst);
-            genericSubstSemaTy_ = std::move(newSema);
-            // per §14.1/§14.2 + §26.5 (issue #391): a method type parameter
-            // that appears *only* in the return type — `Create<T>(): T` — is
-            // bound by no argument, so the loop above leaves it unset and
-            // `new T()` in the body would lower `T` to the i32 fallback (a
-            // miscompile that constructs nothing). Bezel has no call-site
-            // type-argument syntax (§A.7), so sema solves such a parameter from
-            // the call's *target* type and re-types the call to the substituted
-            // return type (recorded on the call's exprType). Recover the
-            // parameter here by unifying the method's *declared* return type
-            // against that concrete result type, then prime the substitution
-            // before the body is emitted.
-            sema::TypeRef* resultTy = ctx_.exprType(call);
-            sema::TypeRef* declRet = md->returnType
-                                         ? ctx_.resolvedType(*md->returnType)
-                                         : nullptr;
-            if (resultTy && declRet) {
-                std::unordered_map<std::string_view, llvm::Type*> retSubst =
-                    genericSubst_;
-                std::unordered_map<std::string_view, const sema::TypeRef*>
-                    retSema = genericSubstSemaTy_;
-                bool added = false;
-                // Unify the declared return TypeRef against the concrete result
-                // TypeRef, binding any still-unbound method type parameter to
-                // the matching concrete component. Handles a bare `T` return as
-                // well as a constructed `Box<T>` whose nested parameter is
-                // solved from the result's generic argument (§26.5).
-                unifyMethodReturnTypeArg(declRet, resultTy, md->genericParams,
-                                         retSubst, retSema, added);
-                if (added) {
-                    genericSubst_ = std::move(retSubst);
-                    genericSubstSemaTy_ = std::move(retSema);
-                }
-            }
-        }
-    }
+    // per §14.1/§14.2 (issue #1278): a generic *method* (its own `<T>`
+    // params, e.g. `static method Clone<T>(proto: T): T where T: class,
+    // new()`) is monomorphized by inferring each method type parameter from
+    // the actual argument types, explicit call-site type args, or the call's
+    // target-inferred result type. Factored into applyMethodGenericSubst so
+    // lowerNullCondCall (`?.`) shares the exact same trigger.
+    applyMethodGenericSubst(call, ms);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
     // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
@@ -5182,6 +5072,126 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     return result;
 }
 
+// per §14.1/§14.2 + §26.5/§7.5 (issue #1278): see the header comment in
+// LlvmBackend_impl.hpp. Extracted verbatim from lowerCall's inline block so
+// lowerNullCondCall (`?.`) drives the identical method-generic substitution
+// trigger as lowerCall (`.`) — previously only `.` installed this, so an
+// explicit-type-arg `?.` generic call reached emitMethodCall with an empty
+// genericSubst_ and called the unspecialized i32-placeholder body.
+void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
+                                      sema::MethodSymbol* ms) {
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || md->genericParams.empty()) return;
+    std::unordered_map<std::string_view, llvm::Type*> newSubst =
+        genericSubst_;
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
+        genericSubstSemaTy_;
+    // §14.1 (#785): bind each method type parameter by STRUCTURALLY
+    // unifying every value parameter's declared type against the call
+    // argument's type — so a generic-typed parameter `p: Pair<A, B>`
+    // binds A and B from a `Pair<int, string>` argument, not only a
+    // top-level bare `p: T`. Reuses the same recursive unification the
+    // return-type inference uses (unifyMethodReturnTypeArg); the helper
+    // skips any param already bound (genericSubst_ from the receiver, or
+    // an earlier parameter).
+    for (std::size_t pi = 0; pi < md->params.size() &&
+         pi < call.args.size(); ++pi) {
+        if (!md->params[pi].type || !call.args[pi].value) continue;
+        // §14.1 / #885 #886: a `null` literal carries no concrete type
+        // information — it is typed by sema as Object (the root reference
+        // type) or as the declared param type T?, neither of which reveals
+        // T's concrete binding. Binding T → Object here blocks the correct
+        // binding from a subsequent concrete argument or explicit type arg,
+        // causing nullableTypeParamConcrete to fail → null not wrapped →
+        // PHI/ICmp type-mismatch crash in the specialized body. Skip null
+        // literals during type-param inference. per §14.1/§14.2, #885/#886.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(
+                call.args[pi].value.get()))
+            continue;
+        const sema::TypeRef* declPt =
+            ctx_.resolvedType(*md->params[pi].type);
+        sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
+        if (!declPt || !at) continue;
+        bool added = false;
+        unifyMethodReturnTypeArg(declPt, at, md->genericParams,
+                                 newSubst, newSema, added);
+    }
+    // per §14.1 (issues #515/#516/#561): a generic method whose type
+    // param appears ONLY in lambda param/return positions (not in any
+    // non-lambda param's declared type) leaves the param unbound by
+    // the arg-inference loop above. When the call site supplies
+    // explicit type arguments (`Transform<int>`), use them to bind
+    // any still-unbound method generic params before the body is
+    // emitted. This complements the pre-pass (which seeds the binding
+    // for lowerLambda) and ensures the MAIN substitution (which drives
+    // emitInlineGenericMethod / emitGenericSpecialization) also has
+    // the correct binding, so that body-level dispatch (v.ToString()
+    // on a U-typed receiver) resolves via genericSubstSemaTy_.
+    // The callee may be a MemberAccessExpr (`obj.Method<T>(...)`), a
+    // NullCondMemberExpr (`obj?.Method<T>(...)` — §7.5/#1278), or a bare
+    // IdentifierExpr (`Id<T>(...)` — in-scope call without dot).
+    {
+    const std::vector<std::unique_ptr<ast::Type>>* callTAs = nullptr;
+    if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+            call.callee.get()))
+        callTAs = &callMa->typeArgs;
+    else if (auto* callNcm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                 call.callee.get()))
+        callTAs = &callNcm->typeArgs;
+    else if (auto* callId = dynamic_cast<const ast::IdentifierExpr*>(
+                 call.callee.get()))
+        callTAs = &callId->typeArgs;
+    if (callTAs) {
+        for (std::size_t gi = 0;
+             gi < md->genericParams.size() &&
+             gi < callTAs->size(); ++gi) {
+            std::string_view pname = md->genericParams[gi].name;
+            if (newSubst.count(pname)) continue;
+            if (!(*callTAs)[gi]) continue;
+            sema::TypeRef* concreteArg =
+                ctx_.resolvedType(*(*callTAs)[gi]);
+            if (!concreteArg) continue;
+            newSubst[pname] = lowerTypeRef(concreteArg);
+            newSema[pname] = concreteArg;
+        }
+    }
+    }
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
+    // per §14.1/§14.2 + §26.5 (issue #391): a method type parameter
+    // that appears *only* in the return type — `Create<T>(): T` — is
+    // bound by no argument, so the loop above leaves it unset and
+    // `new T()` in the body would lower `T` to the i32 fallback (a
+    // miscompile that constructs nothing). Bezel has no call-site
+    // type-argument syntax (§A.7), so sema solves such a parameter from
+    // the call's *target* type and re-types the call to the substituted
+    // return type (recorded on the call's exprType). Recover the
+    // parameter here by unifying the method's *declared* return type
+    // against that concrete result type, then prime the substitution
+    // before the body is emitted.
+    sema::TypeRef* resultTy = ctx_.exprType(call);
+    sema::TypeRef* declRet = md->returnType
+                                 ? ctx_.resolvedType(*md->returnType)
+                                 : nullptr;
+    if (resultTy && declRet) {
+        std::unordered_map<std::string_view, llvm::Type*> retSubst =
+            genericSubst_;
+        std::unordered_map<std::string_view, const sema::TypeRef*>
+            retSema = genericSubstSemaTy_;
+        bool added = false;
+        // Unify the declared return TypeRef against the concrete result
+        // TypeRef, binding any still-unbound method type parameter to
+        // the matching concrete component. Handles a bare `T` return as
+        // well as a constructed `Box<T>` whose nested parameter is
+        // solved from the result's generic argument (§26.5).
+        unifyMethodReturnTypeArg(declRet, resultTy, md->genericParams,
+                                 retSubst, retSema, added);
+        if (added) {
+            genericSubst_ = std::move(retSubst);
+            genericSubstSemaTy_ = std::move(retSema);
+        }
+    }
+}
 
 // §12 / §14 (issue #585): see the header comment in LlvmBackend_impl.hpp. Walk
 // the base-class chain from `recvTy`'s declaration up to `ancestor`, resolving
@@ -6363,6 +6373,26 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     llvm::FunctionType* fnTy = methodFnType(ms);
     if (!fnTy) return nullptr;
     llvm::Type* retTy = fnTy->getReturnType();
+    // §14.1/§7.5 (issue #1278): for a GENERIC method reached via `?.`
+    // (`recv?.Method<T>(...)`), the unspecialized methodFnType return is the
+    // i32 type-parameter placeholder — so the ref-vs-value result-shape
+    // decision (and the {i8,T} wrap width) below would be computed from `i32`
+    // even though the specialized call actually returns, e.g., a `ptr` for a
+    // reference T.  Re-derive `retTy` by lowering the return type under the
+    // call's method-generic substitution (methodFnType uses lowerType, which
+    // honours genericSubst_).  Localized save/restore — the real call below
+    // re-installs the same substitution around emitMethodCall.
+    if (auto* md0 = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (!md0->genericParams.empty()) {
+            auto savedShapeSubst = genericSubst_;
+            auto savedShapeSema = genericSubstSemaTy_;
+            applyMethodGenericSubst(call, ms);
+            if (auto* specFnTy = methodFnType(ms))
+                retTy = specFnTy->getReturnType();
+            genericSubst_ = std::move(savedShapeSubst);
+            genericSubstSemaTy_ = std::move(savedShapeSema);
+        }
+    }
     bool refResult = retTy->isPointerTy();
     bool voidResult = retTy->isVoidTy();
     // §7.5 / FINDING [3] ADDENDUM: a value-typed return (`int`, `bool`, an enum,
@@ -6441,7 +6471,20 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         args.push_back(v);
         argExprs.push_back(a.value.get());
     }
+    // per §14.1/§14.2 + §7.5 (issue #1278): install the method-level generic
+    // substitution BEFORE calling emitMethodCall, exactly as lowerCall does
+    // for the `.` form — otherwise a generic method reached only via `?.`
+    // (with or without an explicit `<T>`) hits emitMethodCall with an empty
+    // genericSubst_ and calls the unspecialized i32-placeholder body,
+    // producing malformed IR (`Call parameter type does not match function
+    // signature`) for a reference-typed T. Save/restore mirrors lowerCall's
+    // discipline so this call's substitution never leaks to sibling code.
+    auto savedNcSubst = genericSubst_;
+    auto savedNcSemaTy = genericSubstSemaTy_;
+    applyMethodGenericSubst(call, ms);
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs);
+    genericSubst_ = std::move(savedNcSubst);
+    genericSubstSemaTy_ = std::move(savedNcSemaTy);
     if (!r && (refResult || valueResult)) return nullptr;
     // Lift the call result to the §7.5 result form. A value-typed return wraps
     // into {i8 1, r}; an already-nullable return passes its own hasValue through.
