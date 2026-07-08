@@ -54,9 +54,17 @@ run=(systemd-run --user --scope -q
 # BEZEL_SHARD_*/TMPDIR/ASAN_OPTIONS — unusable for the suite; `--scope` keeps CWD
 # and the full environment.) Verified: two `dev_heavy build sleep 5` take ~10s
 # (serial) with this form vs ~5s (concurrent) with `flock <file> <cmd>`.
-if [ "$lock" = 1 ]; then
+# RE-ENTRANCY: the lock must be re-entrant across nested dev_heavy calls, or a
+# `dev_heavy suite <x>` whose <x> itself calls `dev_heavy build` (e.g.
+# asan_sweep.sh builds its ASan tree via dev_heavy) DEADLOCKS: the outer holds
+# the lock and waits for <x>; the inner blocks forever on `flock -x 9`. We mark
+# the environment when we take the lock; a nested call sees the mark and runs
+# without re-acquiring (still caged by its own systemd-run scope). systemd-run
+# --scope inherits the caller's env, so the mark propagates to grandchildren.
+if [ "$lock" = 1 ] && [ -z "${BEZEL_HEAVY_LOCK_HELD:-}" ]; then
   exec 9>/var/tmp/bezel-heavy.lock
   flock -x 9
+  export BEZEL_HEAVY_LOCK_HELD=1
   "${run[@]}"
 else
   "${run[@]}"
