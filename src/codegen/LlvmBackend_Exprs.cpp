@@ -4693,13 +4693,20 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             bin.left ? ctx_.exprType(*bin.left) : nullptr;
         const sema::TypeRef* concrete = resolveTypeParamRef(lt);
         sema::MethodSymbol* impl = nullptr;
+        // §25.2 (v0.181, #1498): resolve by the ACTUAL operator token used at
+        // this call site (`bin.op`), NOT the witness member's token. Under the
+        // complete-group entitlement sema may bind `a > b` to the constraint's
+        // `<` witness (INumber<T> declares `<` alone but entitles all four of
+        // `<`,`>`,`<=`,`>=`); the conforming type declares the full group, so
+        // dispatch to ITS `>` — matching on `opm->operatorToken` (`<`) would
+        // mis-route to the wrong member.
         if (concrete && concrete != lt &&
             concrete->kind == sema::TypeRef::Kind::Named &&
             concrete->declaration) {
             for (sema::Symbol* m : concrete->declaration->members) {
                 auto* cand = dynamic_cast<sema::MethodSymbol*>(m);
                 if (cand && cand->isOperator &&
-                    cand->operatorToken == opm->operatorToken &&
+                    cand->operatorToken == bin.op &&
                     cand->params.size() == 2) {
                     impl = cand;
                     break;

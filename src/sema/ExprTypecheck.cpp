@@ -2421,10 +2421,33 @@ bool ExprTC::forEachConstraintBound(
 // op on `paramName`-typed operands. The interface member must carry the op's
 // token with two parameters of the interface's own recurrence parameter (the
 // §2.19 shape `static operator +(a: T, b: T): T`).
+//
+// §25.2 (v0.181, #1498) complete-group entitlement. A constraint interface
+// that declares ANY ONE of the comparison group `<`,`>`,`<=`,`>=` entitles the
+// generic body to ALL FOUR — the stdlib `INumber<T>`/`ISteppable<T>` declare
+// `<` alone, yet `a > b`, `a <= b`, `a >= b` are all admissible on `T`-typed
+// operands (§25.2: "a constraint interface that declares any one of them …
+// entitles the generic body to all four"). The same holds for the `=`/`<>`
+// pair. So when `op` is a member of a complete group and no exact-token member
+// exists on the constraint, ANY sibling operator serves as the witness: it
+// shares the (T,T):bool signature that drives result typing, and each use is
+// bound at instantiation to the conforming type's OWN declaration of `op`
+// (codegen resolves the concrete member by the ACTUAL operator token, never by
+// synthesizing `a > b` from `b < a`). An exact-token member is preferred when
+// present.
 MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
                                                    std::string_view op,
                                                    TypeRef** outBound) {
-    MethodSymbol* found = nullptr;
+    auto isRel = [](std::string_view s) {
+        return s == "<" || s == ">" || s == "<=" || s == ">=";
+    };
+    auto isEq = [](std::string_view s) { return s == "=" || s == "<>"; };
+    auto sameGroup = [&](std::string_view a, std::string_view b) {
+        return (isRel(a) && isRel(b)) || (isEq(a) && isEq(b));
+    };
+    MethodSymbol* found = nullptr;          // exact-token witness (preferred)
+    MethodSymbol* groupWitness = nullptr;   // complete-group sibling witness
+    TypeRef* groupBound = nullptr;
     forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
         TypeSymbol* iface = ctr->declaration;
         if (iface->kind != ast::TypeDeclKind::Interface) return false;
@@ -2434,7 +2457,10 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
             if (gp) ifaceParams.insert(gp->name);
         for (Symbol* m : iface->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
-            if (!ms || !ms->isOperator || ms->operatorToken != op) continue;
+            if (!ms || !ms->isOperator) continue;
+            bool exact = ms->operatorToken == op;
+            bool group = !exact && sameGroup(op, ms->operatorToken);
+            if (!exact && !group) continue;
             if (ms->params.size() != 2) continue;
             // Both parameters must be the recurrence parameter itself so the
             // substituted signature is (paramName, paramName).
@@ -2454,13 +2480,19 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
                 }
             }
             if (!bothRecur) continue;
-            found = ms;
-            if (outBound) *outBound = ctr;
-            return true;
+            if (exact) {
+                found = ms;
+                if (outBound) *outBound = ctr;
+                return true;  // exact token wins — stop scanning
+            }
+            // Remember the first group sibling; keep scanning for an exact hit.
+            if (!groupWitness) { groupWitness = ms; groupBound = ctr; }
         }
         return false;
     });
-    return found;
+    if (found) return found;
+    if (groupWitness && outBound) *outBound = groupBound;
+    return groupWitness;
 }
 
 Symbol* ExprTC::lookupName(std::string_view name) {

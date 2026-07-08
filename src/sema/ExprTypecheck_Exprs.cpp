@@ -2431,6 +2431,34 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     if (resTy) ctx_.setExprType(&be, resTy);
                     return;
                 }
+                // §25.2 (v0.181, #1498): the candidate set for an operator on a
+                // type parameter is drawn SOLELY from its static-interface
+                // constraints (§11.8) — a type parameter declares no operators
+                // of its own. When an ORDERING operator does not resolve through
+                // any constraint (none declares a comparison-group operator, so
+                // the complete-group entitlement above found nothing), the
+                // candidate set is empty: reject cleanly here. Falling through to
+                // the built-in relational result-type rule below would type the
+                // expression `bool` with no operator symbol, and codegen would
+                // then emit a primitive `icmp`/`fcmp` on the instantiated
+                // operands — a crash on any non-primitive instantiation (the
+                // LLVM ICmp assertion of #1498). `=`/`<>` are NOT rejected here:
+                // reference/structural equality is always available (§8.3).
+                if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        "operator `" + std::string(op) + "` is not available on "
+                        "type parameter `" + std::string(lp) + "` — a type "
+                        "parameter declares no operators of its own, and none of "
+                        "its constraints declares a comparison operator; add a "
+                        "`where " + std::string(lp) + ": INumber<" +
+                        std::string(lp) + ">` (or `ISteppable<" +
+                        std::string(lp) + ">`) bound (\xC2\xA7""25.2/\xC2\xA7"
+                        "11.8)");
+                    ctx_.setExprType(
+                        &be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
             }
         }
         // §7.11 (#1132): user-defined operator lifting over nullable operands is

@@ -194,6 +194,88 @@ BEZEL_TEST(static_iface_dispatch_807, min_user_type) {
         "end Main; end C;"), 4);
 }
 
+// ── §25.2 complete-group entitlement (#1498): `>`,`<=`,`>=` on a `T`-typed
+//    operand though the constraint (INumber<T>/ISteppable<T>) declares `<`
+//    ALONE. Each use binds at instantiation to the conforming type's OWN
+//    declaration of that operator; a primitive T uses its intrinsic set. The
+//    repro `a > b` in a `Max2<Meters>` body previously emitted a primitive
+//    `icmp` on the aggregate operands and aborted the LLVM verifier. ──────────
+
+BEZEL_TEST(static_iface_dispatch_807, max_via_group_gt_user_type_1498) {
+    // per §25.2 (v0.181): `a > b` routes to Meters.operator> even though
+    // INumber<T> declares only `<`. The exact #1498 crash repro.
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kMeters +
+        "static class F "
+        "  public static method Max2<T>(a: T, b: T): T where T: INumber<T> "
+        "    if a > b then return a; end; return b; "
+        "  end Max2; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  using var a := new Meters(3); "
+        "  using var b := new Meters(4); "
+        "  var m := F.Max2(a, b); "
+        "  return m.Value; "
+        "end Main; end C;"), 4);
+}
+
+BEZEL_TEST(static_iface_dispatch_807, all_four_relations_user_type_1498) {
+    // per §25.2: all of `<`,`>`,`<=`,`>=` route to Meters's own declarations
+    // through the single `<`-declaring INumber<Meters> constraint. Encodes the
+    // six expected bools (a=3,b=4,c=4) as a bitmask; every bit must be set → 63.
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kMeters +
+        "static class F "
+        "  public static method Lt<T>(a: T, b: T): bool where T: INumber<T> => a < b; "
+        "  public static method Gt<T>(a: T, b: T): bool where T: INumber<T> => a > b; "
+        "  public static method Le<T>(a: T, b: T): bool where T: INumber<T> => a <= b; "
+        "  public static method Ge<T>(a: T, b: T): bool where T: INumber<T> => a >= b; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  using var a := new Meters(3); "
+        "  using var b := new Meters(4); "
+        "  using var c := new Meters(4); "
+        "  var r := 0; "
+        "  if F.Lt(a, b) then r := r + 1; end; "        // 3 < 4  → true
+        "  if not F.Gt(a, b) then r := r + 2; end; "    // 3 > 4  → false
+        "  if F.Le(a, b) then r := r + 4; end; "        // 3 <= 4 → true
+        "  if not F.Ge(a, b) then r := r + 8; end; "    // 3 >= 4 → false
+        "  if F.Le(b, c) then r := r + 16; end; "       // 4 <= 4 → true
+        "  if F.Ge(b, c) then r := r + 32; end; "       // 4 >= 4 → true
+        "  return r; "
+        "end Main; end C;"), 63);
+}
+
+BEZEL_TEST(static_iface_dispatch_807, group_gt_int_bridge_1498) {
+    // per §25.2/§3.5: the complete-group entitlement over a PRIMITIVE T — `>`
+    // resolves to int's intrinsic relational (the compiler-provided §2.19
+    // conformance). `Max2(9, 4)` → 9.
+    BEZEL_EXPECT_EQ(run(
+        "module M; static class F "
+        "  public static method Max2<T>(a: T, b: T): T where T: INumber<T> "
+        "    if a > b then return a; end; return b; "
+        "  end Max2; "
+        "end F; "
+        "class C public static method Main(): int "
+        "  return F.Max2(9, 4); "
+        "end Main; end C;"), 9);
+}
+
+BEZEL_TEST(static_iface_dispatch_807, ordering_without_comparison_constraint_rejected_1498) {
+    // per §25.2: a type parameter declares no operators of its own, and its
+    // candidate set is drawn ONLY from its static-interface constraints. A
+    // constraint (IParsable<T>) that declares no comparison operator entitles
+    // `>` to NOTHING — a clean compile error, NOT a fall-through to a primitive
+    // `icmp` that crashes on a non-primitive instantiation (the #1498 abort).
+    BEZEL_EXPECT_TRUE(rejects(
+        "module M; static class F "
+        "  public static method Gt<T>(a: T, b: T): bool where T: IParsable<T> "
+        "    return a > b; "
+        "  end Gt; "
+        "end F; "
+        "class C public static method Main(): int return 0; end Main; end C;"));
+}
+
 // ── §11.8 / §2.19: the primitive bridge, member by member ───────────────────
 
 BEZEL_TEST(static_iface_dispatch_807, zero_one_bridge_int_double) {
