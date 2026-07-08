@@ -902,6 +902,23 @@ struct ConstantPattern : Pattern {                  // literal alternatives
     std::vector<std::unique_ptr<Expr>> constants;
 };
 
+// §19.3 (v0.183, #1584): a heterogeneous `|` alternative list — a binding-free
+// set of membership tests in which at least one member is a RANGE or RELATIONAL
+// pattern (`1..5 | 10`, `< 0 | > 100`). A pure-constants alternative list is
+// still collapsed by the parser into a single ConstantPattern (the v0.167
+// form), so this node appears ONLY when a range/relational member is present.
+// Every member is one of three binding-free kinds the downstream passes handle
+// uniformly: a single-constant ConstantPattern (the parser folds a NamedPattern
+// enum constant and `null` into this form), a RangePattern, or a RelOpPattern;
+// a binding or a type member is rejected — the list binds nothing regardless of
+// member kind. Matching is the OR of the members'
+// individual tests; the list contributes only its constant members to
+// exhaustiveness (§19.6 counts declared constants, not range/relational
+// extents).
+struct AltPattern : Pattern {
+    std::vector<std::unique_ptr<Pattern>> members;
+};
+
 struct NamedPattern : Pattern {                     // QualifiedName as pattern
     std::unique_ptr<QualifiedName> name;
 };

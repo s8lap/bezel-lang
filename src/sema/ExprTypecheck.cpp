@@ -369,20 +369,30 @@ bool isUnguardedCatchAll(const ast::CaseArm& arm) {
 void collectEnumPatternNames(const ast::CaseArm& arm,
                              std::unordered_set<std::string_view>& covered) {
     if (arm.guard) return;  // a guarded arm cannot be relied on for coverage
-    const ast::Pattern* p = arm.pattern.get();
-    if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
-        if (np->name && !np->name->parts.empty())
-            covered.insert(np->name->parts.back());
-    } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
-        for (const auto& c : cp->constants) {
-            if (!c) continue;
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(c.get()))
-                covered.insert(ma->member);
-            else if (auto* id =
-                         dynamic_cast<const ast::IdentifierExpr*>(c.get()))
-                covered.insert(id->name);
+    // §19.3 (v0.183, #1584): an AltPattern's constant/named members contribute
+    // their enum-constant coverage the same as a ConstantPattern's; its range
+    // and relational members do not (§19.6 counts declared constants, not
+    // extents). Recurse into members, then fall through for the leaf kinds.
+    std::function<void(const ast::Pattern*)> collect =
+        [&](const ast::Pattern* p) {
+        if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
+            if (np->name && !np->name->parts.empty())
+                covered.insert(np->name->parts.back());
+        } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+            for (const auto& c : cp->constants) {
+                if (!c) continue;
+                if (auto* ma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(c.get()))
+                    covered.insert(ma->member);
+                else if (auto* id =
+                             dynamic_cast<const ast::IdentifierExpr*>(c.get()))
+                    covered.insert(id->name);
+            }
+        } else if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+            for (const auto& m : ap->members) collect(m.get());
         }
-    }
+    };
+    collect(arm.pattern.get());
 }
 
 // §10.2 (issue #1577): resolve every declared enum constant's underlying
@@ -442,20 +452,28 @@ struct EnumPatternRef {
 };
 std::vector<EnumPatternRef> enumPatternRefs(const ast::CaseArm& arm) {
     std::vector<EnumPatternRef> refs;
-    const ast::Pattern* p = arm.pattern.get();
-    if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
-        if (np->name && !np->name->parts.empty())
-            refs.push_back({np->name->parts.back(), np->span.begin});
-    } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
-        for (const auto& c : cp->constants) {
-            if (!c) continue;
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(c.get()))
-                refs.push_back({ma->member, c->span.begin});
-            else if (auto* id =
-                         dynamic_cast<const ast::IdentifierExpr*>(c.get()))
-                refs.push_back({id->name, c->span.begin});
+    // §19.3 (v0.183, #1584): recurse into an AltPattern's constant/named members
+    // (its range/relational members carry no enum constant).
+    std::function<void(const ast::Pattern*)> collect =
+        [&](const ast::Pattern* p) {
+        if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
+            if (np->name && !np->name->parts.empty())
+                refs.push_back({np->name->parts.back(), np->span.begin});
+        } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+            for (const auto& c : cp->constants) {
+                if (!c) continue;
+                if (auto* ma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(c.get()))
+                    refs.push_back({ma->member, c->span.begin});
+                else if (auto* id =
+                             dynamic_cast<const ast::IdentifierExpr*>(c.get()))
+                    refs.push_back({id->name, c->span.begin});
+            }
+        } else if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+            for (const auto& m : ap->members) collect(m.get());
         }
-    }
+    };
+    collect(arm.pattern.get());
     return refs;
 }
 
@@ -2485,36 +2503,44 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
         // membership and a stride has no meaning. Reject cleanly; codegen has no
         // lowering for a stepped range pattern and otherwise emits malformed IR
         // (an unterminated case.end block, issue #738).
-        if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
-            if (auto* re =
-                    dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get())) {
-                if (re->step)
-                    ctx_.diagnostics().report(
-                        Severity::Error, p->span.begin,
-                        "`step` is not legal in a `case` range pattern — a "
-                        "pattern tests membership and a stride has no meaning "
-                        "(§16.4)");
-                // §16.6 (v0.162, fix #1340): a stepless range pattern with
-                // constant integer bounds that are reversed (lo > hi for a
-                // closed `lo..hi`, or lo >= hi for a half-open `lo..<hi`)
-                // can NEVER match — the pattern's extent is empty in the
-                // default ascending direction.  Warn at the pattern site so
-                // the author sees it immediately ("reversed bounds" mirrors
-                // the Rust / Python convention for this diagnostic).
-                if (!re->step && re->lo && re->hi) {
-                    auto loV = foldIntConstExprTC(*re->lo);
-                    auto hiV = foldIntConstExprTC(*re->hi);
-                    if (loV && hiV) {
-                        bool neverMatches =
-                            re->inclusive ? (*loV > *hiV) : (*loV >= *hiV);
-                        if (neverMatches)
-                            ctx_.diagnostics().report(
-                                Severity::Warning, p->span.begin,
-                                "this pattern never matches \xe2\x80\x94 "
-                                "bounds are reversed (§16.6)");
-                    }
+        auto checkRangePattern = [&](const ast::RangePattern* rp) {
+            auto* re = dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
+            if (!re) return;
+            if (re->step)
+                ctx_.diagnostics().report(
+                    Severity::Error, rp->span.begin,
+                    "`step` is not legal in a `case` range pattern — a "
+                    "pattern tests membership and a stride has no meaning "
+                    "(§16.4)");
+            // §16.6 (v0.162, fix #1340): a stepless range pattern with
+            // constant integer bounds that are reversed (lo > hi for a
+            // closed `lo..hi`, or lo >= hi for a half-open `lo..<hi`)
+            // can NEVER match — the pattern's extent is empty in the
+            // default ascending direction.  Warn at the pattern site so
+            // the author sees it immediately ("reversed bounds" mirrors
+            // the Rust / Python convention for this diagnostic).
+            if (!re->step && re->lo && re->hi) {
+                auto loV = foldIntConstExprTC(*re->lo);
+                auto hiV = foldIntConstExprTC(*re->hi);
+                if (loV && hiV) {
+                    bool neverMatches =
+                        re->inclusive ? (*loV > *hiV) : (*loV >= *hiV);
+                    if (neverMatches)
+                        ctx_.diagnostics().report(
+                            Severity::Warning, rp->span.begin,
+                            "this pattern never matches \xe2\x80\x94 "
+                            "bounds are reversed (§16.6)");
                 }
             }
+        };
+        if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
+            checkRangePattern(rp);
+        } else if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+            // §19.3 (v0.183, #1584): the same step/reversed-bounds checks apply
+            // to a range member inside an alternative list.
+            for (const auto& m : ap->members)
+                if (auto* rp = dynamic_cast<const ast::RangePattern*>(m.get()))
+                    checkRangePattern(rp);
         }
         // §19.3 / §19.6: an unguarded `_` is a catch-all and must be the last
         // arm; an earlier one makes every following arm unreachable. (A guarded
@@ -2539,16 +2565,33 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
 // scrutinee-less bool condition) and is not an alternatives list.
 void ExprTC::checkAltMembersConstant(const ast::Pattern* p) {
     if (!p) return;
+    auto reportTypeMember = [&](SourceLocation loc) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "a type may not appear in a `|` pattern alternative list "
+            "\xe2\x80\x94 every member must be binding-free (a constant, a range, "
+            "or a relational pattern); grouped type tests are written as "
+            "separate arms (\xc2\xa7""19.3)");
+    };
     if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
         if (cp->constants.size() < 2) return;
         for (const auto& c : cp->constants)
-            if (c && altMemberNamesType(c.get()))
-                ctx_.diagnostics().report(
-                    Severity::Error, c->span.begin,
-                    "a type may not appear in a `|` pattern alternative list "
-                    "\xe2\x80\x94 every member must be a constant (a literal, an "
-                    "enum constant, or a named `const`); grouped type tests are "
-                    "written as separate arms (\xc2\xa7""19.3)");
+            if (c && altMemberNamesType(c.get())) reportTypeMember(c->span.begin);
+        return;
+    }
+    // §19.3 (v0.183, #1584): an AltPattern is a binding-free alternative list
+    // with a range/relational member. Its ranges and relationals bind nothing
+    // and are always admissible; a constant-shaped member (the parser folds a
+    // NamedPattern / `null` into a single-constant ConstantPattern) that
+    // resolves to a TYPE is the same compile error — a type alters
+    // exhaustiveness/binding analysis, which is what the constants-only
+    // reasoning targeted (rationale §3.8).
+    if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+        for (const auto& m : ap->members)
+            if (auto* mcp = dynamic_cast<const ast::ConstantPattern*>(m.get()))
+                for (const auto& c : mcp->constants)
+                    if (c && altMemberNamesType(c.get()))
+                        reportTypeMember(c->span.begin);
         return;
     }
     if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p))
@@ -2576,7 +2619,14 @@ bool ExprTC::altMemberNamesType(const ast::Expr* c) {
     parts.push_back(id->name);
     for (std::size_t lo = 0, hi = parts.size(); lo + 1 < hi; ++lo, --hi)
         std::swap(parts[lo], parts[hi - 1]);
+    return altPartsNameType(parts);
+}
 
+// §19.3 / §A.7: the shared dotted-name resolution behind altMemberNamesType,
+// operating on an already-split QualifiedName (so a NamedPattern alternative
+// member reaches it directly, #1584).
+bool ExprTC::altPartsNameType(const std::vector<std::string_view>& parts) {
+    if (parts.empty()) return false;
     // Resolve the head. A resolved non-type symbol (local/param/const/enum
     // constant) shadows a same-named type and means "not a type".
     TypeSymbol* ts = nullptr;
@@ -2730,6 +2780,16 @@ void ExprTC::checkCasePatternConstantRanges(
                             "is a struct, not a scalar; use `_` or `var x` "
                             "to match (\xc2\xa7""19.3)");
                 }
+            } else if (dynamic_cast<const ast::AltPattern*>(p)) {
+                // §19.3 (v0.183, #1584): an alternative list always carries a
+                // range/relational member for a Range-typed scrutinee — the
+                // same struct-vs-scalar mismatch that would crash the backend.
+                ctx_.diagnostics().report(
+                    Severity::Error, p->span.begin,
+                    "range or relational pattern is not compatible with a "
+                    "Range-typed scrutinee \xe2\x80\x94 a Range value is a "
+                    "struct, not a scalar; use `_` or `var x` to match "
+                    "(\xc2\xa7""19.3)");
             }
         }
         return;
@@ -2750,9 +2810,9 @@ void ExprTC::checkCasePatternConstantRanges(
                 "scrutinee's integer range and would otherwise be silently "
                 "truncated to its width");
     };
-    for (const auto& arm : arms) {
-        const ast::Pattern* p = arm.pattern.get();
-        if (!p) continue;
+    std::function<void(const ast::Pattern*)> checkPatternConsts =
+        [&](const ast::Pattern* p) {
+        if (!p) return;
         if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
             for (const auto& c : cp->constants) checkConst(c.get());
         } else if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
@@ -2769,8 +2829,13 @@ void ExprTC::checkCasePatternConstantRanges(
             // compiles to `x > 44` (300 → i8 44), a wrong match. Gate the operand
             // with the same §5.1 narrowing diagnostic as the constant/range bounds.
             checkConst(relp->expr.get());
+        } else if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+            // §19.3 (v0.183, #1584): the same §5.1 narrowing gate applies to
+            // every member of a range/relational alternative list.
+            for (const auto& m : ap->members) checkPatternConsts(m.get());
         }
-    }
+    };
+    for (const auto& arm : arms) checkPatternConsts(arm.pattern.get());
 }
 
 std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
@@ -5332,6 +5397,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (auto* rop =
                     dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get())) {
                 if (rop->expr) visitExpr(*rop->expr);
+            }
+            // §19.3 (v0.183, #1584): a heterogeneous alternative list — type the
+            // constant and relational members' operand exprs (mirroring the
+            // top-level treatment) so codegen can lower a variable operand.
+            if (auto* ap =
+                    dynamic_cast<const ast::AltPattern*>(arm.pattern.get())) {
+                for (const auto& m : ap->members) {
+                    if (auto* mcp =
+                            dynamic_cast<const ast::ConstantPattern*>(m.get())) {
+                        if (cs->scrutinee && scrutIsEnum) continue;
+                        for (const auto& c : mcp->constants)
+                            if (c) visitExpr(*c);
+                    } else if (auto* mrop =
+                                   dynamic_cast<const ast::RelOpPattern*>(
+                                       m.get())) {
+                        if (mrop->expr) visitExpr(*mrop->expr);
+                    }
+                }
             }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).

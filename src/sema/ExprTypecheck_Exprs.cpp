@@ -4416,6 +4416,47 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     }
                 }
             }
+            // §19.3 (v0.183, #1584): a heterogeneous alternative list — type and
+            // range-check each member's operand exprs exactly as a top-level
+            // member (constant, relational, range), so codegen can lower a
+            // variable operand and an incompatible comparison class is rejected
+            // rather than aborting the backend. A ConstantPattern member over an
+            // enum scrutinee is excluded for the same reason as above.
+            if (auto* ap =
+                    dynamic_cast<const ast::AltPattern*>(arm.pattern.get())) {
+                for (const auto& m : ap->members) {
+                    if (auto* mcp =
+                            dynamic_cast<const ast::ConstantPattern*>(m.get())) {
+                        if (ce->scrutinee && scrutIsEnum) continue;
+                        for (const auto& c : mcp->constants) {
+                            if (!c) continue;
+                            visitExpr(*c);
+                            checkPatternOperand(c.get());
+                        }
+                    } else if (auto* mrop =
+                                   dynamic_cast<const ast::RelOpPattern*>(
+                                       m.get())) {
+                        if (mrop->expr) {
+                            visitExpr(*mrop->expr);
+                            checkPatternOperand(mrop->expr.get());
+                        }
+                    } else if (auto* mrng =
+                                   dynamic_cast<const ast::RangePattern*>(
+                                       m.get())) {
+                        if (auto* rng = dynamic_cast<const ast::RangeExpr*>(
+                                mrng->rangeExpr.get())) {
+                            if (rng->lo) {
+                                visitExpr(*rng->lo);
+                                checkPatternOperand(rng->lo.get());
+                            }
+                            if (rng->hi) {
+                                visitExpr(*rng->hi);
+                                checkPatternOperand(rng->hi.get());
+                            }
+                        }
+                    }
+                }
+            }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =

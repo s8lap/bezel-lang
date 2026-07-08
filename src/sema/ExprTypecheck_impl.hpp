@@ -509,10 +509,13 @@ private:
     // resolve to a CONSTANT — a type member is a compile error "in any
     // position", at arm level or inside a positional destructuring slot.
     // `checkAltMembersConstant` walks a pattern (recursing through
-    // DestructuringPattern slots) and reports a member that names a type;
-    // `altMemberNamesType` resolves whether one member expression denotes a type.
+    // DestructuringPattern slots and, per §19.3 v0.183 / #1584, AltPattern
+    // members) and reports a member that names a type; `altMemberNamesType`
+    // resolves whether one member expression denotes a type, `altPartsNameType`
+    // the shared dotted-name resolution over an already-split QualifiedName.
     void checkAltMembersConstant(const ast::Pattern* p);
     bool altMemberNamesType(const ast::Expr* c);
+    bool altPartsNameType(const std::vector<std::string_view>& parts);
 
     // §31.1 (issue #739): the operand of `throw` must be an exception — a CLASS
     // instance. A primitive/string/record/enum/function thrown value miscompiles

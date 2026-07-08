@@ -1565,6 +1565,15 @@ void Resolver::resolveTypesInPattern(const ast::Pattern& p, Scope* scope) {
             if (c) resolveTypesInExpr(*c, scope);
         return;
     }
+    // §19.3 (v0.183, #1584): a heterogeneous alternative list — resolve names
+    // in each member (a ConstantPattern member's constant exprs; a range or
+    // relational member carries no name node this pass handles, matching the
+    // top-level treatment of those kinds).
+    if (auto* ap = dynamic_cast<const ast::AltPattern*>(&p)) {
+        for (const auto& m : ap->members)
+            if (m) resolveTypesInPattern(*m, scope);
+        return;
+    }
 }
 
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {

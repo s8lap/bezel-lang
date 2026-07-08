@@ -906,17 +906,84 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
     auto first = stampSpan(parsePrimaryPattern(inPositional), start,
                            current_.location);
     if (!isPunctuator("|")) return first;
-    auto cp = std::make_unique<ast::ConstantPattern>();
-    cp->span.begin = start;
-    appendAlternativeMember(*cp, std::move(first));
+    // Collect every `|`-joined primary pattern first, then choose the
+    // representation from their kinds.
+    std::vector<std::unique_ptr<ast::Pattern>> members;
+    members.push_back(std::move(first));
     while (consumePunctuator("|")) {
         SourceLocation memStart = current_.location;
-        appendAlternativeMember(
-            *cp, stampSpan(parsePrimaryPattern(inPositional), memStart,
-                           current_.location));
+        members.push_back(stampSpan(parsePrimaryPattern(inPositional), memStart,
+                                    current_.location));
     }
-    cp->span.end = current_.location;
-    return std::unique_ptr<ast::Pattern>(cp.release());
+    // §19.3 (v0.183, #1584): ranges and relationals are now admitted as `|`
+    // alternative members. If any member is a range/relational pattern, the
+    // list is a heterogeneous OR of membership tests and is kept as an
+    // AltPattern of the individual primary patterns. Otherwise every member is
+    // constant-shaped and collapses into a single ConstantPattern — the v0.167
+    // form, reused unchanged by all downstream constant-alternative logic (enum
+    // exhaustiveness, duplicate detection, the OR-of-equals codegen lowering).
+    bool anyExtent = false;
+    for (const auto& m : members)
+        if (dynamic_cast<ast::RangePattern*>(m.get()) ||
+            dynamic_cast<ast::RelOpPattern*>(m.get())) {
+            anyExtent = true;
+            break;
+        }
+    if (!anyExtent) {
+        auto cp = std::make_unique<ast::ConstantPattern>();
+        cp->span.begin = start;
+        for (auto& m : members) appendAlternativeMember(*cp, std::move(m));
+        cp->span.end = current_.location;
+        return std::unique_ptr<ast::Pattern>(cp.release());
+    }
+    // §19.3 (v0.183, #1584): build the AltPattern. Each member is normalized to
+    // one of the three binding-free kinds the downstream passes handle
+    // uniformly: a constant-shaped member (a single-constant ConstantPattern, a
+    // NamedPattern, or `null`) becomes a single-constant ConstantPattern — the
+    // same expression form the pure-constant collapse produces, so a member that
+    // resolves to a *type* is caught in sema (checkAltMembersConstant) and a
+    // mismatched member is caught by the §19 comparison-class check. A range or
+    // relational member is kept as-is. A binding-bearing member (`var x`, a
+    // naked binding, `_`), a primitive type-test, or a destructuring member is
+    // NOT binding-free and is rejected here — the list binds nothing regardless
+    // of member kind.
+    auto ap = std::make_unique<ast::AltPattern>();
+    ap->span.begin = start;
+    for (auto& m : members) {
+        if (!m) continue;
+        if (dynamic_cast<ast::ConstantPattern*>(m.get()) ||
+            dynamic_cast<ast::RangePattern*>(m.get()) ||
+            dynamic_cast<ast::RelOpPattern*>(m.get())) {
+            ap->members.push_back(std::move(m));
+            continue;
+        }
+        if (auto* np = dynamic_cast<ast::NamedPattern*>(m.get())) {
+            auto cp = std::make_unique<ast::ConstantPattern>();
+            cp->span = m->span;
+            auto e = qualifiedNameToExpr(std::move(np->name));
+            if (e) e->span = m->span;
+            cp->constants.push_back(std::move(e));
+            ap->members.push_back(std::unique_ptr<ast::Pattern>(cp.release()));
+            continue;
+        }
+        if (dynamic_cast<ast::NullPattern*>(m.get())) {
+            auto cp = std::make_unique<ast::ConstantPattern>();
+            cp->span = m->span;
+            auto nl = std::make_unique<ast::NullLiteralExpr>();
+            nl->span = m->span;
+            cp->constants.push_back(std::unique_ptr<ast::Expr>(nl.release()));
+            ap->members.push_back(std::unique_ptr<ast::Pattern>(cp.release()));
+            continue;
+        }
+        diagnostics_.report(
+            Severity::Error, m->span.begin,
+            "a pattern alternative member must be binding-free \xe2\x80\x94 a "
+            "constant, a range pattern, or a relational pattern "
+            "(\xc2\xa7""19.3); a binding or a type may not appear in a `|` "
+            "alternative list");
+    }
+    ap->span.end = current_.location;
+    return std::unique_ptr<ast::Pattern>(ap.release());
 }
 
 // §19.3 / §A.7 (v0.167, #1371): fold one already-parsed primary pattern into an

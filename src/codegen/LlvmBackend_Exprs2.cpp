@@ -5176,6 +5176,25 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
 
+    // §19.3 (v0.183, #1584): a heterogeneous alternative list (AltPattern) —
+    // ranges/relationals mixed with constants — lowers as the OR of its
+    // members' individual tests. Each member is matched against the same
+    // scrutinee, enum/string context, and scrutTy, so a nullable scrutinee
+    // threads through per member (each member's own handler ANDs with hasValue,
+    // and OR distributes over the shared hasValue). A pure-constants list is
+    // collapsed into a ConstantPattern by the parser and never reaches here.
+    if (auto* ap = dynamic_cast<const ast::AltPattern*>(pat)) {
+        llvm::Value* any = builder_.getInt1(false);
+        for (const auto& m : ap->members) {
+            if (!m) continue;
+            llvm::Value* mm =
+                patternMatches(m.get(), scrut, enumTy, isStr, scrutTy);
+            if (!mm) return nullptr;
+            any = builder_.CreateOr(any, mm);
+        }
+        return any;
+    }
+
     // #836 / §19.3: a pattern CONSTANT or range/relop BOUND expression usually
     // has no resolved sema exprType (pattern exprs are not value-typechecked the
     // way ordinary expressions are), so its literal lowers at the DEFAULT width —
