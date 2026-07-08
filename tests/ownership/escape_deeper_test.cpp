@@ -309,17 +309,19 @@ BEZEL_TEST(own_multihop_escape, store_two_hop_reborrow_into_field_diagnosed_28_3
 
 // --- CASE 3 controls (must NOT be rejected) -------------------------------
 
-// CONTROL: a multi-hop chain rooted at a PARAMETER (not an owned local) is
-// accepted — the source outlives this method. `var b := src; var c := b;
-// return c;` where `src` is a parameter.
-BEZEL_TEST(own_multihop_escape, return_two_hop_reborrow_of_param_clean_28_3) {
+// v0.180 (§28.3 Pick-prohibition, #1547): a STATIC method returning a
+// parameter-sourced borrow (even multi-hop) is REJECTED. A static method has no
+// receiver source, and the caller-side sourceless-return owned-assumption (§28.3
+// "Factory methods") is sound only if the callee-side rule rejects EVERY borrow
+// return. Supersedes the pre-v0.180 "deliberately not flagged" behavior.
+BEZEL_TEST(own_multihop_escape, return_two_hop_reborrow_of_param_rejected_28_3_v0180) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Pass(src: R): R "
         "  var b := src; "
         "  var c := b; "
         "  return c; "
         "end Pass;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // CONTROL: a multi-hop chain that is used LOCALLY (a value projection read)
@@ -364,21 +366,23 @@ BEZEL_TEST(own_multihop_escape, multihop_rebound_to_null_clean_28_3) {
 }
 
 // =====================================================================
-// CASE 4 — parameter-source borrows are NOT flagged (deliberate; sound).
-// A borrow whose source is a plain parameter has its source in the caller's
-// frame, which outlives this method. Returning or storing it within the
-// caller is the standard "borrow in, borrow out" pattern (§28.6 "Methods
-// returning `this`"; §28.3 borrow-lifetime: the source outlives the borrow).
+// CASE 4 — a STATIC method returning a parameter-sourced borrow is REJECTED
+// (v0.180, §28.3 Pick-prohibition, #1547). A static method has no receiver, so
+// the caller treats a sourceless non-`owned` return as OWNED; that is sound only
+// because the callee-side rule rejects a static method returning a borrow of one
+// of its parameters (otherwise the borrow is misclassified as owned -> double free).
+// [Superseded: pre-v0.180 these parameter-source returns were "not flagged".]
+// A record/closure/`this` return is a DIFFERENT rule and stays accepted (below).
 // =====================================================================
 
-// CONTROL: returning a direct re-borrow of a parameter is accepted.
-BEZEL_TEST(own_param_source, return_reborrow_of_param_clean_28_3) {
+// v0.180: returning a direct re-borrow of a parameter from a static method is REJECTED.
+BEZEL_TEST(own_param_source, return_reborrow_of_param_rejected_28_3_v0180) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Pass(src: R): R "
         "  var b := src; "
         "  return b; "
         "end Pass;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // CONTROL: returning a record borrowing a parameter is accepted (parallels the
