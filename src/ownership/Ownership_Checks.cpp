@@ -4172,7 +4172,17 @@ void MethodOwnership::checkResultSitesExpr(const ast::Expr& e,
                 }
             }
         }
-        checkResultSitesExpr(*ma->target, false);
+        // per §28.3 (#1615): `ma->target` is only guaranteed non-null on the
+        // grammar's own well-formed postfix chain (A.5 `expr "." Identifier`).
+        // A parser error-recovery AST (e.g. an unparenthesized single-param
+        // lambda argument such as `v => v > 2` — invalid per Appendix A.7's
+        // `"(" LambdaParams? ")"` — swallows the intended `)`/`.` continuation
+        // and leaves a later `.member` node with no target) can still reach
+        // this pass: the driver runs ownership checking unconditionally after
+        // parsing, even when diagnostics are already queued, so a partially-
+        // recovered tree must be walked defensively rather than crash before
+        // the queued parse diagnostic is ever printed.
+        if (ma->target) checkResultSitesExpr(*ma->target, false);
         return;
     }
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
