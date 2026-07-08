@@ -82,7 +82,10 @@ if [ "$MODE" != "--quick" ]; then
   # any assertion FAIL immediately, or on a persistent no-complete (real crash).
   serial_ok=0
   for attempt in 1 2 3; do
-    "$DH" suite build/tests/bezel_tests >"$S/gate_serial.log" 2>&1 || true
+    # timeout guards against a DEADLOCKED test (#1609 contention race) hanging the
+    # serial binary forever; a hang leaves no clean summary -> treated as "did not
+    # complete" -> retried, like a flaky crash.
+    timeout -k 30 900 "$DH" suite build/tests/bezel_tests >"$S/gate_serial.log" 2>&1 || true
     if grep -qE '^\[ FAIL' "$S/gate_serial.log"; then
       echo "   serial FAILs (attempt $attempt):"; grep -E '^\[ FAIL' "$S/gate_serial.log"; fail "serial suite — assertion failure"
     fi

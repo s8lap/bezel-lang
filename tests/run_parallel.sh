@@ -42,8 +42,12 @@ pids=()
 for (( i = 0; i < shards; i++ )); do
     shard_tmp="$logdir/tmp.$i"
     mkdir -p "$shard_tmp"
+    # Per-shard timeout: a DEADLOCKED test (e.g. a cross-domain-mutex contention
+    # race, #1609) otherwise hangs `wait` below forever and wedges the whole gate.
+    # timeout kills the hung shard (exit 124/137 -> counted as a crashed shard ->
+    # the gate's flake arbitration re-runs it). A shard normally finishes in ~45s.
     TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
-        "$bin" > "$logdir/shard.$i.log" 2>&1 &
+        timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "$bin" > "$logdir/shard.$i.log" 2>&1 &
     pids+=("$!")
 done
 
