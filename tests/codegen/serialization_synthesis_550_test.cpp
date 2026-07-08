@@ -242,6 +242,37 @@ BEZEL_TEST(codegen_serialization_550, record_serialized_skip_clause_spec_9_8) {
         "end Main; end C;"), 1);
 }
 
+// §9.8: `serialized skip` on a BODY record (auto-property record, not
+// positional) — fix #1612. emitRecordSerialize's BeginObject field count for
+// a body record was computed as the FULL storage-symbol count (skip-marked
+// auto-properties included) rather than filtering skip components the way
+// the positional branch already did, so the wire header declared one more
+// field than the write loop actually wrote. Deserialize's read loop, driven
+// by the (over-)declared wire count, then ran an extra iteration past the
+// real field data — a null field-name read dereferenced before the fix
+// (SIGSEGV); after the fix the count matches the fields actually written and
+// the round-trip is lossless for the retained (non-skip) field.
+BEZEL_TEST(codegen_serialization_550, body_record_serialized_skip_clause_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Cached: ISerializable, IDeserializable "
+        "  public readonly property Id: int; "
+        "  public readonly property Cache: int serialized skip; "
+        "  public constructor(id: int, cache: int) "
+        "    Id := id; Cache := cache; end constructor; "
+        "end Cached; "
+        "class C public static method Main(): int "
+        "  var original := new Cached(7, 1); "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Cached.Deserialize(d); "
+        // Cache was excluded; Deserialize supplies default(int) = 0.
+        "  return (1 if back.Id = 7 and back.Cache = 0 else 0); "
+        "end Main; end C;"), 1);
+}
+
 // §9.8 / §2.15 field order independence: Deserialize must work regardless of
 // input field order (dispatch by name). We test by serializing normally and
 // reading back — the binary format writes declaration order, reads by name.

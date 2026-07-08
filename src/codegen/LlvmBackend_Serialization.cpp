@@ -322,8 +322,25 @@ void Emitter::emitRecordSerialize(const TypeSymbol* ts,
     llvm::Type* voidTy  = llvm::Type::getVoidTy(llvm_);
 
     // BeginObject(field_count)
-    int32_t nonSkipCount = (int32_t)components.size();
-    if (!td->hasPositionalFields) nonSkipCount = (int32_t)storage.size();  // body
+    // per §9.8: `serialized skip` components are excluded from both the wire
+    // count and the writes. For a positional record, `components` above is
+    // already filtered. For a BODY record, `storage` is the FULL storage set
+    // (skip-marked auto-properties included), so it must be filtered the same
+    // way the write loop below filters it — otherwise the wire header
+    // declares more fields than are actually written, desynchronizing the
+    // reader (fix #1612).
+    int32_t nonSkipCount;
+    if (td->hasPositionalFields) {
+        nonSkipCount = (int32_t)components.size();
+    } else {
+        nonSkipCount = 0;
+        for (const sema::Symbol* sym : storage) {
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(sym->decl)) {
+                if (pd->serialized && pd->serialized->isSkip) continue;
+            }
+            ++nonSkipCount;
+        }
+    }
     auto* beginFn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
     builder_.CreateCall(beginFn, {serPtr, builder_.getInt32(nonSkipCount)});
     // §2.15 / fix #687: bz_binser_begin_object can now set bz_exc (MaxDepth guard).
