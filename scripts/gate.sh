@@ -77,9 +77,13 @@ if [ "$MODE" = "--full" ]; then
   # via dev_heavy suite: the lock is re-entrant, so asan_sweep's inner dev_heavy
   # build does not deadlock; do NOT run asan_sweep bare + a build concurrently.
   "$DH" suite scripts/asan_sweep.sh >"$S/gate_asan.log" 2>&1 || true
-  errs=$(grep -icE 'ASan error|runtime error|LeakSanitizer' "$S/gate_asan.log")
-  echo "   ASan shards reported: $(grep -c 'ASan errors' "$S/gate_asan.log")/8, error lines: $errs"
-  [ "$errs" -ne 0 ] && { grep -iE 'ASan error|runtime error' "$S/gate_asan.log" | head; fail "asan_sweep"; }
+  # Count REAL sanitizer errors — the per-shard summary line is "shard N: X ASan
+  # errors", so grepping the substring 'ASan error' false-counts the zero lines.
+  # Sum the per-shard counts, and also catch the sanitizer's own error markers.
+  errs=$(awk 'match($0,/ASan errors/){for(i=1;i<=NF;i++)if($i=="ASan"){s+=$(i-1)}} END{print s+0}' "$S/gate_asan.log")
+  errs=$(( errs + $(grep -cE '(ERROR|SUMMARY): (Address|Leak)Sanitizer|runtime error:|detected memory leaks' "$S/gate_asan.log") ))
+  echo "   ASan shards reported: $(grep -c 'ASan errors' "$S/gate_asan.log")/8, real errors: $errs"
+  [ "$errs" -ne 0 ] && { grep -iE 'ERROR: AddressSanitizer|runtime error:|shard [0-9]+: [1-9]' "$S/gate_asan.log" | head; fail "asan_sweep"; }
 fi
 
 echo "== GATE PASS =="
