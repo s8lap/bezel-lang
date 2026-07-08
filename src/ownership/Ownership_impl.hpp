@@ -1336,6 +1336,77 @@ private:
     void checkResultSitesStmt(const ast::Stmt& s);
     void checkResultSitesExpr(const ast::Expr& e, bool bindingValue);
 
+    // -- #1526 (§28.3 "Deferred-activation callees", v0.179) --------------------
+    //
+    // A call whose return type is a §29.3/§30.7 iterator/async-iterator
+    // interface, a §29.11 lazy query, or a Task-family type (Task/Task<T>/
+    // OwningTask<T>) returns a frame that carries a BORROW of its plain
+    // (non-`owned`) reference-typed arguments until the frame itself
+    // completes or is disposed (iterator/lazy query) or the task settles
+    // (Task family). When such an argument is an UNBOUND OWNED TEMPORARY
+    // (§28.3 "Unbound owned temporaries") — a bare `new`/call producing an
+    // owned value, not bound to any name — the temporary is disposed at the
+    // end of the FULL EXPRESSION that produces it, so the frame's borrow of
+    // it dangles unless the frame is itself fully consumed within that same
+    // full expression (awaited/blocked-on, for the Task family). Where the
+    // frame instead escapes the expression — bound to a name (`var`/`using
+    // var`), returned, stored, used as a `for`/`await for` source, or passed
+    // to `Task.FireAndForget` — the program must be rejected.
+    //
+    // Implemented as a whole-body walk mirroring checkAwaitSites /
+    // checkResultSites: `escaping` plays the role `bindingValue` plays
+    // there, true at exactly the escaping positions above (LocalDecl
+    // initializer, assignment RHS, return value, yield value, and — unlike
+    // the await/.Result siblings — a ForStmt's `iterable`, since a `for`/
+    // `await for` source is itself an escape here, §29.2) and propagated
+    // through the same pass-through forms (postfix `!`, `?:` branches).
+    // Every other recursion (a unary operand — including an `await`
+    // operand, which always fully consumes its operand to settlement — a
+    // binary operand, a member-access/index target, an ordinary call
+    // argument) resets to false, exactly as the sibling checks reset
+    // `bindingValue`: being borrowed by a further operation within the same
+    // statement is the definition of "consumed within the full expression."
+    // The one argument-position exception is `Task.FireAndForget`'s sole
+    // argument, which is itself named as an escape by the spec. // per §28.3
+    void checkDeferredActivationTempSites(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkDeferredActivationTempSitesStmt(const ast::Stmt& s);
+    void checkDeferredActivationTempSitesExpr(const ast::Expr& e,
+                                               bool escaping);
+
+    // True when `callResult`'s resolved type is one of the deferred-
+    // activation frame shapes above: an iterator/async-iterator interface,
+    // the lazy-query sentinel (mirrors DefiniteAssignment's
+    // isLazyEnumerableExprType / codegen's isLazyEnumerableType — a Named
+    // TypeRef with no declaration/astNode and at least one generic arg), or
+    // Task/Task<T>/OwningTask<T>. // per §28.3, §29.3, §29.11, §30.1
+    bool isDeferredActivationCallResult(const ast::Expr& callResult) const;
+
+    // True when `arg` is a plain-argument "unbound owned temporary" per the
+    // §28.3 Producers table: a bare `new T(...)` or call already classified
+    // Owned by producerState, OR a call to a STATIC method (no receiver)
+    // returning a disposable class/interface with no `owned` annotation —
+    // the §28.3 "Factory methods and sourceless returns" rule, which treats
+    // an unannotated static factory return as owned unconditionally (the
+    // iterator-method carve-out there is a WARNING exemption only, not a
+    // classification exemption — but producerState's own
+    // staticFactoryReturnsFreshOwned helper deliberately excludes a
+    // yield-only body, since it scans `return` statements for ITS purpose,
+    // the local auto-drop obligation; that exclusion does not apply here).
+    // // per §28.3
+    bool isUnboundOwnedTempArg(const ast::Expr& arg);
+
+    // True when argument `pos` of the deferred-activation call `ce` sits at a
+    // PLAIN (non-`owned`) reference-typed parameter of a USER method/ctor — the
+    // §28.3 "plain reference-typed arguments" the frame borrows. The borrow gate
+    // that narrows the deferred-activation temp rule: an `owned`-parameter sink
+    // (§29.8/§30.14 owned transfer) and any builtin callee with no resolvable
+    // param list (Task.FromException/FromResult, Domain.Spawn, lazy queries —
+    // which OWN or copy their args) return false, so an owned temp transferred
+    // into a sink is not over-rejected. // per §28.3, §28.8, §29.8, §30.14
+    bool deferredActivationArgIsPlainRefParam(const ast::CallExpr& ce,
+                                              std::size_t pos) const;
+
     // -- Async-readiness 3c: SuspendLocal annotation + completion edges --------
     //
     // §30.5 / §30.9. Classify each owned local as suspend-local (live range

@@ -4622,6 +4622,342 @@ void MethodOwnership::checkAwaitSitesExpr(
     // its body is analysed, not here. Other leaf expressions hold no awaits.
 }
 
+// #1526 (§28.3 "Deferred-activation callees", v0.179): true when `callResult`'s
+// resolved type is one of the frame-carrying deferred-activation shapes the
+// rule covers — a §29.3/§30.7 iterator/async-iterator interface, the §29.11
+// lazy-query sentinel, or a Task-family type. Mirrors the lazy-query shape
+// DefiniteAssignment.cpp's isLazyEnumerableExprType and codegen's
+// isLazyEnumerableType already use (a Named TypeRef synthesized by the
+// deferred LINQ operators, carrying no declaration and no astNode, with at
+// least one generic argument) — the same structural sentinel, duplicated
+// here because the two existing copies are also duplicated across sema and
+// codegen rather than factored out (see those sites' own "must match" cross-
+// reference comments). The interface/Task-family names mirror
+// isAdmittedAsyncReturnType (TypeResolution_Checks.cpp) and awaitTaskKind
+// (this file) — a Named, non-nullable, single-part-name TypeRef whose head
+// is one of the listed identifiers. // per §28.3, §29.3, §29.11, §30.1
+bool MethodOwnership::isDeferredActivationCallResult(
+    const ast::Expr& callResult) const {
+    const sema::TypeRef* rt = ctx_.exprType(callResult);
+    if (!rt) return false;
+    if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        !rt->astNode && !rt->genericArgs.empty() && rt->importedName.empty()) {
+        return true;  // §29.11 lazy-query sentinel
+    }
+    if (rt->kind != sema::TypeRef::Kind::Named || rt->nullable) return false;
+    if (!rt->astNode || !rt->astNode->name ||
+        rt->astNode->name->parts.size() != 1)
+        return false;
+    std::string_view head = rt->headName();
+    return head == "IEnumerable" || head == "IEnumerator" ||
+           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
+           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
+           head == "Task" || head == "OwningTask";
+}
+
+// #1526 (§28.3): true when `arg` is a plain-argument "unbound owned
+// temporary" per the Producers table — a bare `new T(...)` or call already
+// classified Owned by producerState (an `owned`-returning call, a fresh
+// `new`, …), OR a call to a STATIC method (no receiver) returning a
+// disposable class/interface with no `owned` annotation. The latter is the
+// §28.3 "Factory methods and sourceless returns" rule: an unannotated static
+// factory return has no structural borrow source, so the caller treats it
+// as owned — UNCONDITIONALLY; "iterator methods are exempt from this
+// WARNING" is a warning-suppression carve-out, not a classification one.
+// producerState's own staticFactoryReturnsFreshOwned helper does not reach
+// this case for a yield-only iterator/async-iterator factory: it scans
+// `return` statements to decide "every path is fresh" for ITS purpose (the
+// local auto-drop obligation), and a yield-only body has none — correct
+// there, but not a reason to treat `Nums(3): IEnumerable<int>` as sourced
+// from anywhere when it is passed bare into another deferred-activation
+// callee's argument list. Resolve the callee directly here instead of
+// reusing that helper. // per §28.3
+bool MethodOwnership::isUnboundOwnedTempArg(const ast::Expr& arg) {
+    if (!isUnboundProducerExpr(arg)) return false;
+    if (producerState(arg) == OwnershipState::Owned) return true;
+    auto* ce = dynamic_cast<const ast::CallExpr*>(&arg);
+    if (!ce || !ce->callee) return false;
+    auto* ms =
+        dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee));
+    const auto* md = ms ? dynamic_cast<const ast::MethodDecl*>(ms->decl)
+                         : nullptr;
+    if (!md) return false;
+    bool isStatic = false;
+    for (std::string_view mod : md->modifiers)
+        if (mod == "static") { isStatic = true; break; }
+    if (!isStatic) return false;
+    // A builtin iterator/async-iterator interface or Task-family type
+    // (isDeferredActivationCallResult) resolves LOCALLY with a NULL
+    // `declaration` and only `astNode` set — unlike a user-declared class/
+    // interface, which carries a real TypeSymbol — so isBorrowableType
+    // (which requires a non-null declaration) alone misses exactly the
+    // shape this rule most needs (a nested factory like `Nums(n): int):
+    // IEnumerable<int>`). Accept either: the deferred-activation shape
+    // itself, or an ordinary declared class/interface (isBorrowableType,
+    // kept for a static factory returning some other disposable type).
+    // // per §28.3
+    return isDeferredActivationCallResult(arg) ||
+           isBorrowableType(ctx_.exprType(arg));
+}
+
+// #1526 (§28.3): true when argument `pos` of the deferred-activation call `ce`
+// flows into a PLAIN (non-`owned`) reference-typed parameter of a USER method
+// or constructor — the ONLY positions whose borrow the returned frame can hold
+// past the full expression. §28.3 scopes the rule to "its plain reference-typed
+// arguments"; an `owned` parameter is an owned SINK, so the argument's ownership
+// TRANSFERS into the frame (an iterator's `owned` param is disposed at iterator-
+// Dispose, §29.8; a `Domain.Spawn` arg is disposed by the spawned entry, §30.14)
+// — it is never borrowed, so its borrow can never dangle and it is exempt.
+//
+// A callee with NO resolvable user parameter list — every stdlib builtin:
+// Task.FromResult / Task.FromException / Task.FromCancelled, Domain.Spawn, the
+// §29.11 lazy-query operators — is treated conservatively as NON-borrowing
+// here: the builtins that take a reference argument OWN it (Task.FromException
+// disposes its exception at task disposal, §30.3/#962; Domain.Spawn transfers
+// its args, §30.14), and §28.3's own repros are all user-method callees, so
+// firing on an unresolved builtin would only over-reject (the pre-#1526
+// compiler already admitted every such shape and its disposal is correct). This
+// mirrors the `userOwned` half of recordMovesInArgs' owned-sink computation —
+// the same MethodSymbol/ConstructorSymbol -> decl -> `params[pos].modifier`
+// navigation, with a null/absent param list meaning "not a plain-borrow user
+// position." // per §28.3, §28.8, §29.8, §30.14
+bool MethodOwnership::deferredActivationArgIsPlainRefParam(
+    const ast::CallExpr& ce, std::size_t pos) const {
+    if (!ce.callee) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*ce.callee);
+    const std::vector<ast::Param>* params = nullptr;
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+        if (const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            params = &md->params;
+    } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
+        if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+            params = &cd->params;
+    }
+    if (!params || pos >= params->size()) return false;
+    return (*params)[pos].modifier != "owned";
+}
+
+// #1526 (§28.3 "Deferred-activation callees", v0.179): drive the whole-body
+// walk. See the header comment (Ownership_impl.hpp) for the escape-position
+// list and the rationale for reusing the checkAwaitSites/checkResultSites
+// shape. Runs unconditionally (like checkResultSites) — a synchronous body
+// can call an iterator/lazy-query factory or a Task-returning async method
+// just as an async body can. // per §28.3
+void MethodOwnership::checkDeferredActivationTempSites(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body)
+        if (s) checkDeferredActivationTempSitesStmt(*s);
+}
+
+void MethodOwnership::checkDeferredActivationTempSitesStmt(
+    const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer)
+            checkDeferredActivationTempSitesExpr(*ld->initializer, true);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) checkDeferredActivationTempSitesExpr(*es->expr, false);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) checkDeferredActivationTempSitesExpr(*ds->value, false);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value) checkDeferredActivationTempSitesExpr(*as->value, true);
+        if (as->target)
+            checkDeferredActivationTempSitesExpr(*as->target, false);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) checkDeferredActivationTempSitesExpr(*rs->value, true);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value) checkDeferredActivationTempSitesExpr(*th->value, false);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) checkDeferredActivationTempSitesExpr(*ys->value, true);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            checkDeferredActivationTempSitesExpr(*ifs->ifBranch.condition,
+                                                  false);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition)
+                checkDeferredActivationTempSitesExpr(*el.condition, false);
+            for (const auto& bs : el.body)
+                if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition)
+            checkDeferredActivationTempSitesExpr(*ws->condition, false);
+        for (const auto& bs : ws->body)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        // §29.2/§28.3 (v0.179): a `for`/`await for` source is itself an
+        // escape — the desugaring binds it to an implicit `using var`
+        // (§29.2), so it joins the escaping-position set here even though
+        // the await/.Result siblings deliberately leave `iterable` at
+        // bindingValue=false (their concern is embedded awaits/`.Result`
+        // reads elsewhere in the iterable expression, not the top-level
+        // call's own position). // per §28.3, §29.2
+        if (fs->iterable)
+            checkDeferredActivationTempSitesExpr(*fs->iterable, true);
+        for (const auto& bs : fs->body)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        for (const auto& arm : ts->catches)
+            if (arm.body) checkDeferredActivationTempSitesStmt(*arm.body);
+        for (const auto& bs : ts->finallyBody)
+            if (bs) checkDeferredActivationTempSitesStmt(*bs);
+        return;
+    }
+}
+
+void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
+                                                             bool escaping) {
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (escaping && isDeferredActivationCallResult(*ce)) {
+            std::size_t pos = 0;
+            for (const auto& a : ce->args) {
+                if (!a.value || !a.modifier.empty()) { ++pos; continue; }
+                // §28.3: the frame borrows only its PLAIN (non-`owned`)
+                // reference-typed arguments. Skip an argument owned-TRANSFERRED
+                // into the frame (an `owned` param, §29.8; a Domain.Spawn arg,
+                // §30.14) and any builtin callee whose params do not resolve —
+                // deferredActivationArgIsPlainRefParam is the borrow gate that
+                // narrows this rule to exactly the user-method plain-ref
+                // positions §28.3 targets, so an owned temp transferred into an
+                // owned sink is not over-rejected. // per §28.3
+                if (!deferredActivationArgIsPlainRefParam(*ce, pos)) {
+                    ++pos;
+                    continue;
+                }
+                if (!isUnboundOwnedTempArg(*a.value)) { ++pos; continue; }
+                report(
+                    Severity::Error, a.value->span.begin,
+                    "an unbound owned temporary passed as a plain argument "
+                    "to a deferred-activation callee (an iterator/async-"
+                    "iterator factory, a lazy query, or a Task-family "
+                    "method) may not escape the full expression that "
+                    "produces it — the returned frame holds a borrow of "
+                    "this argument until it is fully consumed, but the "
+                    "temporary is disposed at the end of the full "
+                    "expression it is produced in; here the frame is bound "
+                    "to a name, returned, stored, used as a `for`/`await "
+                    "for` source, or passed to `Task.FireAndForget`, so the "
+                    "borrow would dangle (§28.3 \"Deferred-activation "
+                    "callees\", v0.179) — name the source first: `var src "
+                    ":= Source(3); await for var line in Shout(src) do "
+                    "… end;`");
+                ++pos;
+            }
+        }
+        // `Task.FireAndForget(call)` is itself a named escape (§28.3): the
+        // sole argument is checked as if it were bound, even though an
+        // ordinary call argument is otherwise a consumed-within-expression
+        // (non-escaping) position. // per §28.3
+        bool isFireAndForget = false;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ce->callee.get())) {
+            if (ma->member == "FireAndForget") {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get()))
+                    isFireAndForget = id->name == "Task";
+            }
+        }
+        if (ce->callee)
+            checkDeferredActivationTempSitesExpr(*ce->callee, false);
+        for (const auto& a : ce->args)
+            if (a.value)
+                checkDeferredActivationTempSitesExpr(*a.value,
+                                                      isFireAndForget);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) checkDeferredActivationTempSitesExpr(*nc->callee, false);
+        for (const auto& a : nc->args)
+            if (a.value) checkDeferredActivationTempSitesExpr(*a.value, false);
+        return;
+    }
+    // `await X` (and any other unary op) always fully consumes its operand
+    // within the same full expression — an await settles the task; `move`/
+    // `not`/etc. are never binding positions for a deferred-activation
+    // callee's own frame. // per §28.3, §30.1
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->operand) checkDeferredActivationTempSitesExpr(*ue->operand, false);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) checkDeferredActivationTempSitesExpr(*be->left, false);
+        if (be->right) checkDeferredActivationTempSitesExpr(*be->right, false);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) checkDeferredActivationTempSitesExpr(*ma->target, false);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) checkDeferredActivationTempSitesExpr(*nm->target, false);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) checkDeferredActivationTempSitesExpr(*ix->target, false);
+        for (const auto& a : ix->indices)
+            if (a.value) checkDeferredActivationTempSitesExpr(*a.value, false);
+        return;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        // Postfix `!` is a pass-through — see checkAwaitSitesExpr's twin.
+        if (bg->operand)
+            checkDeferredActivationTempSitesExpr(*bg->operand, escaping);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) checkDeferredActivationTempSitesExpr(*a.value, false);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition)
+            checkDeferredActivationTempSitesExpr(*cd->condition, false);
+        // Pass-through: see checkAwaitSitesExpr's twin.
+        if (cd->thenValue)
+            checkDeferredActivationTempSitesExpr(*cd->thenValue, escaping);
+        if (cd->elseValue)
+            checkDeferredActivationTempSitesExpr(*cd->elseValue, escaping);
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (te->operand) checkDeferredActivationTempSitesExpr(*te->operand, false);
+        return;
+    }
+    // A LambdaExpr is its own scope — its calls are checked when its body is
+    // analysed, not here. Other leaf expressions hold no calls.
+}
+
 // §30.5 / §30.4 (#834): true when `e`'s static type is an `OwningTask<...>`
 // (name-head), the single-consumer owning task whose await consumes it. Used
 // to record the operand consume of an `await task` independently of the

@@ -569,6 +569,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // code (`await` is unavailable there), so this must run over every
     // method body. // per §30.3, §30.5
     checkResultSites(body);
+    // #1526 (§28.3 "Deferred-activation callees", v0.179): reject an unbound
+    // owned temporary passed as a plain argument to an iterator/async-
+    // iterator factory, a lazy query, or a Task-family callee whose returned
+    // frame escapes the full expression. NOT gated on `isAsync_` — a
+    // synchronous body can call an iterator/lazy-query factory (or store a
+    // Task returned by an async method) just as readily as an async one.
+    // // per §28.3
+    checkDeferredActivationTempSites(body);
 }
 
 void MethodOwnership::runExprBodyOwningReturnCheck(
@@ -612,6 +620,15 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // a binding position — matching the ReturnStmt driver in
     // checkResultSitesStmt (§30.5/§28.3 v0.182, #1570). // per §30.3
     checkResultSitesExpr(exprBody, true);
+    // #1526 (§28.3 "Deferred-activation callees", v0.179): the expression-body
+    // sibling of `checkDeferredActivationTempSites`. The `=>` body IS the
+    // return value (equivalent to `return <exprBody>;`), an escaping position,
+    // so a deferred-activation call whose unbound-owned-temp argument escapes
+    // via the return (`Wrap(): Task<int> => SumAsync(MakeRes(3));`) is rejected
+    // exactly as the block-body `return SumAsync(MakeRes(3));` form is —
+    // `escaping=true` matches the ReturnStmt driver in
+    // checkDeferredActivationTempSitesStmt. // per §28.3
+    checkDeferredActivationTempSitesExpr(exprBody, true);
     // §28.14 v0.177 (#1419): the expression body IS the return value — a
     // call-bounded parameter (or a closure capturing one) returned through
     // `=> f` escapes exactly as `return f;` does. // per §28.14
