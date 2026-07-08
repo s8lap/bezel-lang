@@ -1464,6 +1464,62 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
     return false;
 }
 
+// §9.7 (v0.180, #1540): see header for the null-source-form contract. Uses
+// the SAME borrow-carrying-field notion as isBorrowBearingRecordImpl's own
+// `fieldIsBorrowCarrying` closure above (a class/interface reference field,
+// an inline array of reference elements, or a transitively borrow-bearing
+// record field) — deliberately NOT fieldTypeIsBorrowCarrying, which also
+// counts builtin heap collections (Array<T>, …) by name and is scoped to
+// checkRecordFromTemporary's own (broader) construction-from-temporary rule.
+// Using a mismatched predicate here would let this recognizer demand a
+// builtin-collection field be `null` even when isBorrowBearingRecord (the
+// gate every caller applies first) never considered that field a borrow in
+// the first place. Only recognizes a direct `new Rec(...)` construction
+// (positional fields); a record value read back from a local/parameter/
+// field is never null-source here, matching the reject-not-trust posture
+// documented on the header.
+bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
+    if (!ne) return false;
+    const sema::TypeRef* rt =
+        ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    const auto* decl =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+    auto isBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
+        if (!ft) return false;
+        if (ft->kind == sema::TypeRef::Kind::Named) {
+            if (!ft->declaration) return false;  // generic param
+            if (ft->declaration->isValueBuiltin) return false;
+            if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                ft->declaration->kind == ast::TypeDeclKind::Interface)
+                return true;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record)
+                return isBorrowBearingRecord(ft);  // transitive
+            return false;  // enum
+        }
+        if (ft->kind == sema::TypeRef::Kind::InlineArray)
+            return ft->arrayElement && !ft->arrayOwned &&
+                   isBorrowableType(ft->arrayElement);
+        return false;
+    };
+    const auto& fields = decl->positionalFields;
+    for (std::size_t i = 0; i < ne->args.size() && i < fields.size(); ++i) {
+        const ast::Param& f = fields[i];
+        if (!f.type) continue;
+        if (!isBorrowCarrying(ctx_.resolvedType(*f.type))) continue;
+        const ast::Expr* arg = ne->args[i].value.get();
+        if (!arg) return false;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;
+        // Nested borrow-bearing record argument (transitivity, §9.7): the
+        // outer construction is null-source only if this one is too.
+        if (!isNullSourceRecordExpr(*arg)) return false;
+    }
+    return true;
+}
+
 void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // Direct form: `return new Rec(...);` where Rec is a borrow-bearing
     // record (§9.7). The static type of the returned expression must be a
@@ -2281,6 +2337,41 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     }
     if (dest == Dest::None && !targetLocal) return false;
 
+    // §9.7 (v0.180, #1540): a borrow-bearing record value may not be stored
+    // in an INSTANCE FIELD of a class at all — unconditionally, regardless
+    // of whether the borrow's source provably outlives the field's object.
+    // Unlike a direct class/interface-typed borrow field (the §28.3 lifetime
+    // check below, which only fires when the source is a scope-bound owned
+    // local about to be disposed), every use of a record-carried borrow
+    // passes through access paths with NO per-access disposed-flag check (a
+    // span's buffer window is the canonical case), so the checked-mode trust
+    // regime the §28.3 rule relies on is unavailable and the store is
+    // rejected statically — "one rule for record-carried borrows, not a
+    // per-record judgment of access paths." The null-source form (every
+    // borrow-carrying component provably `null`) is exempt, mirroring the
+    // static-field exception (§9.7). This check is TYPE-based, not
+    // lifetime-based, so it runs before (and independently of) the
+    // owned-field move-on-read skip and the scope-bound-local source lookup
+    // below, both of which only apply to the general borrow-lifetime rule.
+    if (dest == Dest::Field) {
+        const sema::TypeRef* rhsType = ctx_.exprType(*as.value);
+        if (isBorrowBearingRecord(rhsType) &&
+            !isNullSourceRecordExpr(*as.value)) {
+            report(
+                Severity::Error, as.span.begin,
+                "a borrow-bearing record may not be stored in an instance "
+                "field of a class — a record-carried borrow can be consumed "
+                "through access paths with no per-access disposed-flag "
+                "check, so the checked-mode trust regime that covers a "
+                "direct class-typed borrow field does not apply here (§9.7; "
+                "store the borrow's source instead — e.g. an `owned` field "
+                "of the underlying class — and re-derive the record view at "
+                "the use site, or store a value whose borrow-carrying "
+                "components are all `null`)");
+            return true;
+        }
+    }
+
     // §28.3 / §28.8 (issue #402): a BARE read of an owned LOCAL stored into an
     // OWNED field is a move-on-read into an owned slot ("Reading an owned local
     // x in a position that requires an owned value … transfers ownership out of
@@ -2530,6 +2621,44 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
 
     for (const ast::CallArgument& a : call.args) {
         if (!a.value) continue;
+
+        // §9.7 (v0.180, #1540): a borrow-bearing record copied into a
+        // collection that ESCAPES this method (the receiver is `this`/
+        // `base`, a field, a parameter, or reachable from a field) is
+        // rejected unconditionally — no trust residual for record-carried
+        // borrows, the same "regime uniformity" reasoning as the
+        // instance-field bullet above (checkBorrowStoreEscape): a record's
+        // access paths bypass the disposed-flag check the plain-borrow
+        // escape analysis below relies on, so an Escapes-classified
+        // receiver is rejected regardless of whether a specific borrow
+        // source can even be identified. This is TYPE-based, so it runs
+        // before (and independently of) the scope-bound-local source lookup
+        // below, which only decides the general (non-record) borrow rule.
+        // The null-source form is exempt, mirroring the instance-field rule.
+        if (kind == RecvKind::Escapes) {
+            const sema::TypeRef* argType = ctx_.exprType(*a.value);
+            if (isBorrowBearingRecord(argType) &&
+                !isNullSourceRecordExpr(*a.value)) {
+                const std::string recvName =
+                    recvRoot ? std::string(recvRoot->name) : std::string("it");
+                report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("a borrow-bearing record passed to `.") +
+                    std::string(m) + "(...)` on `" + recvName +
+                    "` may not be copied into a collection reachable beyond "
+                    "this method's scope (the receiver, a field, or a "
+                    "parameter) — a record-carried borrow's access paths "
+                    "bypass the disposed-flag check the escape analysis "
+                    "relies on for a direct borrow, so the store is "
+                    "rejected regardless of whether the borrow's source "
+                    "provably outlives it (§9.7 / §28.11; store into an "
+                    "owning-family collection and transfer ownership with "
+                    "`Add(owned item)` instead, or store a value whose "
+                    "borrow-carrying components are all `null`)");
+                continue;
+            }
+        }
+
         // ownedLocalBorrowSource restricts to a scope-bound owned LOCAL
         // source, excluding parameters — a plain borrow read of `src` here
         // (not a `move`d/owned transfer, which recordMovesIn has already
@@ -3796,6 +3925,36 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
     // instance-field store (`this.f := …`). Skip static fields here. // per §22.13
     for (std::string_view m : fd.modifiers)
         if (m == "static") return;
+
+    // §9.7 (v0.180, #1540): the field-initializer counterpart of
+    // checkBorrowStoreEscape's instance-field rule — a borrow-bearing
+    // record initializer is rejected unconditionally (null-source form
+    // exempt), for the same "regime uniformity" reasoning documented
+    // there. TYPE-based, so it is checked ahead of (and independently of)
+    // the owned-field / fresh-owned-value check below, which governs the
+    // unrelated §28.6 leak rule.
+    {
+        const sema::TypeRef* fieldType =
+            fd.type ? ctx_.resolvedType(*fd.type) : nullptr;
+        if (isBorrowBearingRecord(fieldType) &&
+            !isNullSourceRecordExpr(*fd.initializer)) {
+            report(
+                Severity::Error, fd.initializer->span.begin,
+                std::string("a borrow-bearing record may not be stored in "
+                            "the instance field `") +
+                std::string(fd.name) +
+                "` — a record-carried borrow can be consumed through access "
+                "paths with no per-access disposed-flag check, so the "
+                "checked-mode trust regime that covers a direct class-typed "
+                "borrow field does not apply here (§9.7; store the borrow's "
+                "source instead — e.g. an `owned` field of the underlying "
+                "class — and re-derive the record view at the use site, or "
+                "initialize with a value whose borrow-carrying components "
+                "are all `null`)");
+            return;
+        }
+    }
+
     // `owned` field → §28.5 owned-storage path: the containing object disposes
     // the value, so a fresh owned initializer is exactly what it wants. Not here.
     for (std::string_view m : fd.modifiers)

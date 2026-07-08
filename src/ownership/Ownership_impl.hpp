@@ -882,6 +882,20 @@ private:
         const sema::TypeRef* rt,
         std::unordered_set<const ast::TypeDecl*>& seen) const;
 
+    // §9.7 (v0.180, #1540): true when `e` is provably the **null-source
+    // form** of a borrow-bearing record — a direct `new Rec(...)`
+    // construction where every argument bound to a borrow-carrying
+    // positional field is a literal `null` (recursing into a nested
+    // borrow-bearing record argument). This is a conservative, purely
+    // syntactic recognizer: a record value read back from a local,
+    // parameter, or field is never treated as null-source here even if it
+    // happens to hold one at run time — matching the reject-not-trust
+    // posture the field-store and collection-store rules below apply to
+    // every OTHER case. Used to exempt the stdlib "sentinel" shape (e.g.
+    // `CancellationToken.None`) from the otherwise-unconditional storage
+    // rejection. // per §9.7
+    bool isNullSourceRecordExpr(const ast::Expr& e) const;
+
     // §30.1 / §9.7 (v0.179, #1438/#1448): true when `rt` is borrow-bearing for
     // the async-signature and across-suspension rules — a user borrow-bearing
     // record (isBorrowBearingRecord, above) OR a builtin span *view* over an
