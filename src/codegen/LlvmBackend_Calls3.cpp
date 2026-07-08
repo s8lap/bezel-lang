@@ -3459,151 +3459,311 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             sema::MethodSymbol* entryMs =
                 dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*entryExpr));
 
-            // §30.14 / fix #1228: non-capturing lambda as Domain.Spawn entry.
-            // The spec allows `() => expr` and block-body lambdas as spawn entries
-            // alongside static method refs. A non-capturing lambda lowers to a
-            // closure cell { fn_ptr, env_ptr=null, rc=1, envdtor=null }. We build a
-            // spawn adapter that loads fn+env from the cell, calls fn(env), releases
-            // the closure, and returns null. The cell is the bz_domain_spawn arg
-            // (ownership transferred — no caller-side release). per §30.14 / §27.5.
+            // §30.14 / fix #1228, #1490: non-capturing lambda as Domain.Spawn
+            // entry, with or without a value-typed spawn argument. The spec
+            // admits `Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned
+            // arg: A)` and its by-value-`A` sibling (stdlib §6.8) — a single-
+            // param non-capturing lambda entry, exactly like the zero-param
+            // `() -> R` form fix #1228 already handled. A non-capturing lambda
+            // lowers to a closure cell { fn_ptr, env_ptr=null, rc=1,
+            // envdtor=null }. We build a spawn adapter that loads fn+env from
+            // the cell, calls fn(env, arg...), releases the closure, and
+            // marshals the result. per §30.14 / §27.5.
             if (!entryMs) {
                 if (auto* lamExpr =
                         dynamic_cast<const ast::LambdaExpr*>(entryExpr)) {
-                    // Only handle zero-extra-arg form: Domain.Spawn(() => …).
-                    // Lambda-with-param-plus-extra-arg entries not yet handled.
-                    if (call.args.size() == 1) {
-                        // 1. Lower the lambda → closure cell (inline transient).
-                        llvm::Value* closureCell = lowerLambda(*lamExpr);
-                        if (!closureCell) return nullptr;
+                    // nExtra is 0 (`Domain.Spawn(() => …)`) or 1 (`Domain.Spawn(
+                    // (a: A) => …, arg)`) per stdlib §6.8's Spawn overload set
+                    // (at most one `arg: A`; multiple values are aggregated by
+                    // the caller into one sendable type before this call).
+                    std::size_t nExtra =
+                        call.args.size() > 1 ? call.args.size() - 1 : 0;
 
-                        // 2. Compute the lambda fn's LLVM return type, mirroring
-                        //    lowerLambda's retTy logic so the indirect call type-
-                        //    checks in IR. fn signature: (ptr env_ptr) -> lamRetTy.
-                        llvm::Type* lamRetTy = i32();  // default (unresolved)
-                        if (lamExpr->isAsync) {
-                            // async lambda: state machine wraps into Task → ptr.
-                            lamRetTy = ptrTy();
-                        } else if (lamExpr->exprBody) {
-                            if (sema::TypeRef* rt =
-                                    ctx_.exprType(*lamExpr->exprBody))
-                                lamRetTy = lowerTypeRef(rt);
-                            else if (isLambdaExprBodyVoidBuiltin(*lamExpr))
-                                lamRetTy = llvm::Type::getVoidTy(llvm_);
-                        } else {
-                            // Block-body: use the sema-inferred funcReturn.
-                            if (sema::TypeRef* lamTy =
-                                    ctx_.exprType(*lamExpr)) {
-                                if (lamTy->kind ==
-                                        sema::TypeRef::Kind::Function &&
-                                        lamTy->funcReturn) {
-                                    llvm::Type* inf =
-                                        lowerTypeRef(lamTy->funcReturn);
-                                    if (inf != i32()) lamRetTy = inf;
-                                }
+                    // 1. Lower the lambda → closure cell (inline transient).
+                    llvm::Value* closureCell = lowerLambda(*lamExpr);
+                    if (!closureCell) return nullptr;
+
+                    // 2. Compute the lambda fn's LLVM return type, mirroring
+                    //    lowerLambda's retTy logic so the indirect call type-
+                    //    checks in IR. fn signature: (ptr env_ptr, params...)
+                    //    -> lamRetTy.
+                    llvm::Type* lamRetTy = i32();  // default (unresolved)
+                    if (lamExpr->isAsync) {
+                        // async lambda: state machine wraps into Task → ptr.
+                        lamRetTy = ptrTy();
+                    } else if (lamExpr->exprBody) {
+                        if (sema::TypeRef* rt =
+                                ctx_.exprType(*lamExpr->exprBody))
+                            lamRetTy = lowerTypeRef(rt);
+                        else if (isLambdaExprBodyVoidBuiltin(*lamExpr))
+                            lamRetTy = llvm::Type::getVoidTy(llvm_);
+                    } else {
+                        // Block-body: use the sema-inferred funcReturn.
+                        if (sema::TypeRef* lamTy =
+                                ctx_.exprType(*lamExpr)) {
+                            if (lamTy->kind ==
+                                    sema::TypeRef::Kind::Function &&
+                                    lamTy->funcReturn) {
+                                llvm::Type* inf =
+                                    lowerTypeRef(lamTy->funcReturn);
+                                if (inf != i32()) lamRetTy = inf;
                             }
                         }
-                        // Lambda fn LLVM type: (ptr env_ptr) -> lamRetTy.
-                        auto* lamFnTy = llvm::FunctionType::get(
-                            lamRetTy, {ptrTy()}, false);
-
-                        // 3. Build spawn adapter: void* adapter(void* arg)
-                        //    where arg = closure cell. Loads fn+env from the cell,
-                        //    calls fn(env), releases the closure, returns null.
-                        static std::atomic<unsigned> spawnLamCtr{0};
-                        std::string aName = "spawn.lam$" +
-                            std::to_string(spawnLamCtr.fetch_add(1));
-                        auto* aTy = llvm::FunctionType::get(
-                            ptrTy(), {ptrTy()}, false);
-                        auto* adapter = llvm::Function::Create(
-                            aTy, llvm::Function::InternalLinkage,
-                            aName, module_.get());
-
-                        {
-                            llvm::Function*   svFn   = currentFn_;
-                            llvm::Value*      svThis = currentThis_;
-                            llvm::BasicBlock* svBB   = builder_.GetInsertBlock();
-
-                            currentFn_   = adapter;
-                            currentThis_ = nullptr;
-                            auto* aBB = llvm::BasicBlock::Create(
-                                llvm_, "entry", adapter);
-                            builder_.SetInsertPoint(aBB);
-
-                            llvm::Value* cellArg = adapter->getArg(0);
-
-                            // Load fn_ptr from closure cell slot 0.
-                            llvm::Value* fnPtr = builder_.CreateLoad(
-                                ptrTy(), cellArg, "spawn.lam.fn");
-                            // Load env_ptr from closure cell slot 1 (offset 8).
-                            llvm::Value* envSlot = builder_.CreateGEP(
-                                ptrTy(), cellArg,
-                                {builder_.getInt32(1)},
-                                "spawn.lam.env.slot");
-                            llvm::Value* envPtr = builder_.CreateLoad(
-                                ptrTy(), envSlot, "spawn.lam.env");
-
-                            // Invoke lambda: fn_ptr(env_ptr).
-                            llvm::Value* lamRet =
-                                builder_.CreateCall(lamFnTy, fnPtr, {envPtr});
-
-                            // Release closure cell in the spawned domain.
-                            // Non-capturing lambda: rc=1→0, env=null, envdtor=null
-                            // → free(cell). Caller transfers ownership on spawn;
-                            // no caller-side release → no double-free. §28.9/§27.5.
-                            auto* relFn = declareC(
-                                "bz_closure_release",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                            builder_.CreateCall(relFn, {cellArg});
-
-                            // fix #1491: marshal the lambda's result into the
-                            // adapter's void* return, mirroring the static-method
-                            // adapter below. Per §30.14 / stdlib §6.8 a value entry
-                            // (`() -> R`) joins as a Task<R> whose result the runtime
-                            // reads back from these bytes; a class entry
-                            // (`() -> owned R`) crosses as the ptr; a unit entry
-                            // (`() -> ()`) crosses as null. Before this the adapter
-                            // always returned null, so `() => 42` joined to 0.
-                            // Async entries keep the null return here — the runtime
-                            // is meant to await the returned Task in-domain rather
-                            // than treat it as the result (#1490/#1492/#1493).
-                            if (lamExpr->isAsync ||
-                                lamRetTy->isVoidTy() ||
-                                lamRet->getType()->isVoidTy()) {
-                                builder_.CreateRet(
-                                    llvm::ConstantPointerNull::get(ptrTy()));
-                            } else if (lamRet->getType()->isPointerTy()) {
-                                builder_.CreateRet(lamRet);
-                            } else if (lamRet->getType()->isIntegerTy()) {
-                                llvm::Value* wide = lamRet;
-                                if (!wide->getType()->isIntegerTy(64))
-                                    wide = builder_.CreateZExt(wide, i64());
-                                builder_.CreateRet(
-                                    builder_.CreateIntToPtr(wide, ptrTy()));
-                            } else {
-                                // Floating-point / other value result: reinterpret
-                                // the bits as i64, then inttoptr (the join reads the
-                                // low bytes back out under the result type).
-                                llvm::Value* bits =
-                                    builder_.CreateBitCast(lamRet, i64());
-                                builder_.CreateRet(
-                                    builder_.CreateIntToPtr(bits, ptrTy()));
-                            }
-
-                            currentFn_   = svFn;
-                            currentThis_ = svThis;
-                            if (svBB) builder_.SetInsertPoint(svBB);
-                        }
-
-                        // 4. bz_domain_spawn(adapter, closureCell, dfe_vtable).
-                        //    closureCell is the arg; ownership transferred to the
-                        //    spawned domain's adapter — no caller-side release.
-                        auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
-                                                 {ptrTy(), ptrTy(), ptrTy()});
-                        return builder_.CreateCall(
-                            spawnFn,
-                            {adapter, closureCell, getDFEVtable()},
-                            "domain.spawn");
                     }
+
+                    // 2b. fix #1490: compute the lambda's user-parameter LLVM
+                    // types (mirroring lowerLambda's explicit-annotation
+                    // path) so the indirect call below is built with the
+                    // exact signature lowerLambda gave the closure's fn —
+                    // without this the adapter always called fn_ptr(env_ptr)
+                    // with a single-arg function type, which is a type
+                    // mismatch (undefined behavior) against the two-plus-arg
+                    // function lowerLambda actually emitted for `(n: int) =>
+                    // …`, corrupting the stack the pthread trampoline reads.
+                    const std::vector<sema::Symbol*>* lamParamSyms =
+                        ctx_.lambdaParams(lamExpr);
+                    std::vector<llvm::Type*> lamParamTys;
+                    if (lamParamSyms) {
+                        for (sema::Symbol* ps : *lamParamSyms) {
+                            auto* par =
+                                dynamic_cast<sema::ParameterSymbol*>(ps);
+                            llvm::Type* pty = i32();
+                            if (par && par->declType) {
+                                if (sema::TypeRef* rt =
+                                        ctx_.resolvedType(*par->declType))
+                                    pty = lowerTypeRef(rt);
+                            } else if (par && par->resolvedDeclType) {
+                                pty = lowerTypeRef(par->resolvedDeclType);
+                            }
+                            lamParamTys.push_back(pty);
+                        }
+                    }
+                    // Lambda fn LLVM type: (ptr env_ptr, params...) -> lamRetTy.
+                    std::vector<llvm::Type*> lamFnParamTys;
+                    lamFnParamTys.push_back(ptrTy());
+                    for (llvm::Type* t : lamParamTys) lamFnParamTys.push_back(t);
+                    auto* lamFnTy = llvm::FunctionType::get(
+                        lamRetTy, lamFnParamTys, false);
+
+                    // 3. Build spawn adapter: void* adapter(void* arg).
+                    //    nExtra==0: arg IS the closure cell (fix #1228 shape).
+                    //    nExtra>=1: arg is a malloc'd void*[1+nExtra] array —
+                    //    slot 0 the closure cell, slots 1.. the extra Spawn
+                    //    args in call order (the cell itself is not sendable
+                    //    data, so it cannot ride in the single-arg fast path
+                    //    the static-method adapter below uses for one arg).
+                    //    The adapter loads fn+env from the cell, calls
+                    //    fn(env, arg...), releases the closure, and marshals
+                    //    the result. per §30.14 / fix #1490/#1491.
+                    static std::atomic<unsigned> spawnLamCtr{0};
+                    std::string aName = "spawn.lam$" +
+                        std::to_string(spawnLamCtr.fetch_add(1));
+                    auto* aTy = llvm::FunctionType::get(
+                        ptrTy(), {ptrTy()}, false);
+                    auto* adapter = llvm::Function::Create(
+                        aTy, llvm::Function::InternalLinkage,
+                        aName, module_.get());
+
+                    {
+                        llvm::Function*   svFn   = currentFn_;
+                        llvm::Value*      svThis = currentThis_;
+                        llvm::BasicBlock* svBB   = builder_.GetInsertBlock();
+
+                        currentFn_   = adapter;
+                        currentThis_ = nullptr;
+                        auto* aBB = llvm::BasicBlock::Create(
+                            llvm_, "entry", adapter);
+                        builder_.SetInsertPoint(aBB);
+
+                        llvm::Value* argParam = adapter->getArg(0);
+
+                        // Cast a packed void* slot value to the lambda
+                        // param's expected type — mirrors the static-method
+                        // adapter's castToParamTy below (that lambda is
+                        // scoped to the entryMs-found branch, so it is not
+                        // reachable here).
+                        auto castSlotToParamTy =
+                            [&](llvm::Value* voidPtr,
+                                llvm::Type* paramTy) -> llvm::Value* {
+                            if (paramTy->isPointerTy()) return voidPtr;
+                            if (paramTy->isIntegerTy(64))
+                                return builder_.CreatePtrToInt(voidPtr, i64());
+                            if (paramTy->isIntegerTy(32)) {
+                                llvm::Value* w =
+                                    builder_.CreatePtrToInt(voidPtr, i64());
+                                return builder_.CreateTrunc(w, i32());
+                            }
+                            return builder_.CreatePtrToInt(voidPtr, i64());
+                        };
+
+                        llvm::Value* cellArg;
+                        std::vector<llvm::Value*> extraSlotVals;
+                        if (nExtra == 0) {
+                            cellArg = argParam;
+                        } else {
+                            llvm::Value* cellSlotPtr =
+                                builder_.CreateInBoundsGEP(
+                                    ptrTy(), argParam, builder_.getInt64(0),
+                                    "spawn.lam.cellslot");
+                            cellArg = builder_.CreateLoad(
+                                ptrTy(), cellSlotPtr, "spawn.lam.cell");
+                            for (std::size_t i = 0; i < nExtra; ++i) {
+                                llvm::Value* slotPtr =
+                                    builder_.CreateInBoundsGEP(
+                                        ptrTy(), argParam,
+                                        builder_.getInt64(
+                                            static_cast<uint64_t>(i + 1)),
+                                        "spawn.lam.argslot" +
+                                            std::to_string(i));
+                                extraSlotVals.push_back(builder_.CreateLoad(
+                                    ptrTy(), slotPtr,
+                                    "spawn.lam.arg" + std::to_string(i)));
+                            }
+                            // Free the packed array now that everything is
+                            // loaded out of it (mirrors the static-method
+                            // adapter's multi-arg unpack-then-free below).
+                            auto* freeFn = declareC(
+                                "free", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy()});
+                            builder_.CreateCall(freeFn, {argParam});
+                        }
+
+                        // Load fn_ptr from closure cell slot 0.
+                        llvm::Value* fnPtr = builder_.CreateLoad(
+                            ptrTy(), cellArg, "spawn.lam.fn");
+                        // Load env_ptr from closure cell slot 1 (offset 8).
+                        llvm::Value* envSlot = builder_.CreateGEP(
+                            ptrTy(), cellArg,
+                            {builder_.getInt32(1)},
+                            "spawn.lam.env.slot");
+                        llvm::Value* envPtr = builder_.CreateLoad(
+                            ptrTy(), envSlot, "spawn.lam.env");
+
+                        // Invoke lambda: fn_ptr(env_ptr, arg0, arg1, ...).
+                        std::vector<llvm::Value*> callArgs;
+                        callArgs.push_back(envPtr);
+                        for (std::size_t i = 0; i < extraSlotVals.size();
+                             ++i) {
+                            llvm::Type* pty = i < lamParamTys.size()
+                                ? lamParamTys[i] : ptrTy();
+                            callArgs.push_back(
+                                castSlotToParamTy(extraSlotVals[i], pty));
+                        }
+                        llvm::Value* lamRet =
+                            builder_.CreateCall(lamFnTy, fnPtr, callArgs);
+
+                        // Release closure cell in the spawned domain.
+                        // Non-capturing lambda: rc=1→0, env=null, envdtor=null
+                        // → free(cell). Caller transfers ownership on spawn;
+                        // no caller-side release → no double-free. §28.9/§27.5.
+                        auto* relFn = declareC(
+                            "bz_closure_release",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(relFn, {cellArg});
+
+                        // fix #1491: marshal the lambda's result into the
+                        // adapter's void* return, mirroring the static-method
+                        // adapter below. Per §30.14 / stdlib §6.8 a value entry
+                        // (`() -> R`) joins as a Task<R> whose result the runtime
+                        // reads back from these bytes; a class entry
+                        // (`() -> owned R`) crosses as the ptr; a unit entry
+                        // (`() -> ()`) crosses as null. Before this the adapter
+                        // always returned null, so `() => 42` joined to 0.
+                        // Async entries keep the null return here — the runtime
+                        // is meant to await the returned Task in-domain rather
+                        // than treat it as the result (#1490/#1492/#1493).
+                        if (lamExpr->isAsync ||
+                            lamRetTy->isVoidTy() ||
+                            lamRet->getType()->isVoidTy()) {
+                            builder_.CreateRet(
+                                llvm::ConstantPointerNull::get(ptrTy()));
+                        } else if (lamRet->getType()->isPointerTy()) {
+                            builder_.CreateRet(lamRet);
+                        } else if (lamRet->getType()->isIntegerTy()) {
+                            llvm::Value* wide = lamRet;
+                            if (!wide->getType()->isIntegerTy(64))
+                                wide = builder_.CreateZExt(wide, i64());
+                            builder_.CreateRet(
+                                builder_.CreateIntToPtr(wide, ptrTy()));
+                        } else {
+                            // Floating-point / other value result: reinterpret
+                            // the bits as i64, then inttoptr (the join reads the
+                            // low bytes back out under the result type).
+                            llvm::Value* bits =
+                                builder_.CreateBitCast(lamRet, i64());
+                            builder_.CreateRet(
+                                builder_.CreateIntToPtr(bits, ptrTy()));
+                        }
+
+                        currentFn_   = svFn;
+                        currentThis_ = svThis;
+                        if (svBB) builder_.SetInsertPoint(svBB);
+                    }
+
+                    // 4. Lower the Spawn argument(s) and pass to
+                    //    bz_domain_spawn. nExtra==0: the closure cell is the
+                    //    arg directly (fix #1228 shape). nExtra>=1: pack the
+                    //    closure cell + extra args into a malloc'd
+                    //    void*[1+nExtra] array; the adapter frees it. Either
+                    //    way ownership of the cell (and any class-typed extra
+                    //    arg — moved per §30.14) transfers to the spawned
+                    //    domain's adapter; no caller-side release.
+                    llvm::Value* spawnArg = closureCell;
+                    if (nExtra >= 1) {
+                        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                        llvm::Value* arrSize = builder_.getInt64(
+                            static_cast<uint64_t>(1 + nExtra) * 8u);
+                        llvm::Value* arr = builder_.CreateCall(
+                            mallocFn, {arrSize}, "spawn.lam.argpack");
+                        llvm::Value* cellSlotPtr = builder_.CreateInBoundsGEP(
+                            ptrTy(), arr, builder_.getInt64(0),
+                            "spawn.lam.cellslot.store");
+                        builder_.CreateStore(closureCell, cellSlotPtr);
+                        for (std::size_t i = 0; i < nExtra; ++i) {
+                            const auto& a = call.args[i + 1];
+                            if (!a.value) continue;
+                            llvm::Value* val = lowerExpr(*a.value);
+                            if (!val) {
+                                // #1386: ICE — lowerExpr returned null for a
+                                // Domain.Spawn argument; the expression kind
+                                // is not yet handled by codegen.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, a.value->span.begin,
+                                    "internal: lowerExpr returned null for "
+                                    "Domain.Spawn argument — #1386");
+                                continue;
+                            }
+                            llvm::Value* asPtr;
+                            if (val->getType()->isPointerTy()) {
+                                asPtr = val;
+                            } else if (val->getType()->isIntegerTy(64)) {
+                                asPtr = builder_.CreateIntToPtr(val, ptrTy());
+                            } else if (val->getType()->isIntegerTy()) {
+                                asPtr = builder_.CreateIntToPtr(
+                                    builder_.CreateZExt(val, i64()), ptrTy());
+                            } else {
+                                asPtr = builder_.CreateIntToPtr(
+                                    builder_.CreateBitCast(val, i64()),
+                                    ptrTy());
+                            }
+                            llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
+                                ptrTy(), arr,
+                                builder_.getInt64(
+                                    static_cast<uint64_t>(i + 1)),
+                                "spawn.lam.argslot.store" +
+                                    std::to_string(i));
+                            builder_.CreateStore(asPtr, slotPtr);
+                        }
+                        spawnArg = arr;
+                    }
+
+                    // 5. bz_domain_spawn(adapter, spawnArg, dfe_vtable).
+                    auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
+                                             {ptrTy(), ptrTy(), ptrTy()});
+                    return builder_.CreateCall(
+                        spawnFn,
+                        {adapter, spawnArg, getDFEVtable()},
+                        "domain.spawn");
                 }
                 return nullptr;
             }
