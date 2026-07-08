@@ -2325,6 +2325,22 @@ Symbol* ExprTC::lookupExtensionMember(
     return nullptr;
 }
 
+// §26.5 step 1 (v0.183): see header. Re-runs the same extension search
+// lookupExtensionMember uses — a same-named extension member is name-blocked
+// (never consulted) whenever an instance member of that name exists, which
+// is exactly the situation callers of this helper are already in (they call
+// it only after a name-blocked instance call has failed), so the search
+// itself is unconditional: no `member == nullptr` guard is needed here.
+std::string ExprTC::extensionNameBlockedNote(const TypeRef* receiver,
+                                             std::string_view name) {
+    if (!receiver) return std::string();
+    if (!lookupExtensionMember(receiver, name, nullptr)) return std::string();
+    return "; note: an extension member named `" + std::string(name) +
+          "` also matches this receiver but was not considered — an "
+          "instance member of the same name name-blocks extension lookup "
+          "regardless of applicability or accessibility (§26.5)";
+}
+
 // §11.8 (v0.176, #807): is `name` a declared generic type parameter of the
 // enclosing method (checked first — more specific) or the enclosing type?
 bool ExprTC::isInScopeTypeParam(std::string_view name) const {

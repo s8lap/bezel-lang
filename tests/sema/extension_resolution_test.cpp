@@ -378,3 +378,182 @@ BEZEL_TEST(sema_extension, type_param_no_shadow_no_warn_1346) {
             hasWarning = true;
     BEZEL_EXPECT_FALSE(hasWarning);
 }
+
+// ---------------------------------------------------------------------------
+// §26.5 step 1 (v0.183, issue #1580 (a)) — a NAME-BLOCKED call (an instance
+// member of the same name exists, so extension lookup is never consulted,
+// §26.5 step 1) that then fails overload resolution must NOTE that a
+// same-named extension exists but was not considered — without the note the
+// caller cannot tell their extension was shadowed rather than simply absent.
+// ---------------------------------------------------------------------------
+
+// (a) — no-applicable-overload path (§22.6, via resolveMethodOverload):
+// `Foo` declares two instance overloads of `Bar` (string, bool); calling with
+// an `int` argument is applicable to neither (§5.1 has no int→string or
+// int→bool implicit conversion — ExprTC::primitiveWidens). A same-named
+// extension `Bar(x: int)` on `Foo` exists but is name-blocked (§26.5 step 1)
+// and must never be considered — the diagnostic should say so.
+BEZEL_TEST(sema_extension,
+           name_blocked_no_applicable_overload_notes_extension_1580a) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Foo "
+        "  public method Bar(x: string): int => 1; "
+        "  public method Bar(x: bool): int => 2; "
+        "end Foo; "
+        "extension Foo public method Bar(x: int): int => 99; end; "
+        "class P public method Use(f: Foo): int => f.Bar(5); end P;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool foundOverloadError = false;
+    bool foundNote = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("no overload of") != std::string::npos &&
+            d.message.find("22.6") != std::string::npos)
+            foundOverloadError = true;
+        if (d.message.find("extension") != std::string::npos &&
+            d.message.find("26.5") != std::string::npos &&
+            d.message.find("Bar") != std::string::npos)
+            foundNote = true;
+    }
+    BEZEL_EXPECT_TRUE(foundOverloadError);
+    BEZEL_EXPECT_TRUE(foundNote);
+}
+
+// (a) — regression: the SAME no-applicable-overload call, but with NO
+// same-named extension declared anywhere, must NOT fabricate a note (empty
+// extensionNameBlockedNote — no spurious "26.5"/"extension" text).
+BEZEL_TEST(sema_extension,
+           no_applicable_overload_without_extension_no_note_1580a) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Foo "
+        "  public method Bar(x: string): int => 1; "
+        "  public method Bar(x: bool): int => 2; "
+        "end Foo; "
+        "class P public method Use(f: Foo): int => f.Bar(5); end P;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool foundNote = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("no overload of") != std::string::npos &&
+            d.message.find("26.5") != std::string::npos)
+            foundNote = true;
+    BEZEL_EXPECT_FALSE(foundNote);
+}
+
+// (a) — inaccessible-member path (§13.1, via checkMemberVisibility): `Secret`
+// is `private` on `Foo`, so calling it from an unrelated class `P` is a
+// §13.1 accessibility error. A same-named PUBLIC extension `Secret()` on
+// `Foo` exists but is name-blocked (§26.5 step 1: instance members block by
+// NAME regardless of accessibility) — the diagnostic should note it.
+BEZEL_TEST(sema_extension,
+           name_blocked_inaccessible_member_notes_extension_1580a) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Foo "
+        "  private method Secret(): int => 42; "
+        "end Foo; "
+        "extension Foo public method Secret(): int => 1; end; "
+        "class P public method Use(f: Foo): int => f.Secret(); end P;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool foundPrivateError = false;
+    bool foundNote = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("private") != std::string::npos &&
+            d.message.find("13.1") != std::string::npos)
+            foundPrivateError = true;
+        if (d.message.find("extension") != std::string::npos &&
+            d.message.find("26.5") != std::string::npos &&
+            d.message.find("Secret") != std::string::npos)
+            foundNote = true;
+    }
+    BEZEL_EXPECT_TRUE(foundPrivateError);
+    BEZEL_EXPECT_TRUE(foundNote);
+}
+
+// ---------------------------------------------------------------------------
+// §26.4 (v0.183, issue #1580 (b)) — a NULLABLE-MARKED identifier in an
+// extension's target-type argument position (`extension Array<T?>`) binds no
+// type parameter and is ALWAYS a compile error naming this rule. Before the
+// fix this fell through to the generic "unresolved type name `T`" diagnostic
+// (misleading — T is not a typo, it occupies exactly a type-parameter-head
+// position) with no §26.4 citation at all.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(sema_extension, nullable_marked_head_cites_26_4_1580b) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension Array<T?> "
+        "  public method Describe(): int => 0; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool foundOldMisleadingError = false;
+    bool foundSpecCitedError = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("unresolved type name") != std::string::npos)
+            foundOldMisleadingError = true;
+        if (d.message.find("26.4") != std::string::npos &&
+            d.message.find("nullable") != std::string::npos)
+            foundSpecCitedError = true;
+    }
+    // The old bug: falls through to the generic "unresolved type name"
+    // diagnostic. Must be gone.
+    BEZEL_EXPECT_FALSE(foundOldMisleadingError);
+    // The fix: a diagnostic naming the actual §26.4 rule.
+    BEZEL_EXPECT_TRUE(foundSpecCitedError);
+}
+
+// (b) — regression: a bare, non-nullable `extension Array<T>` (the legal
+// form) must still resolve cleanly — the new nullable-only branch must not
+// disturb the existing non-nullable binding path.
+BEZEL_TEST(sema_extension, bare_non_nullable_array_head_still_accepted_1580b) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension Array<T> "
+        "  public method IsSingle(): bool => this.Count = 1; "
+        "end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (b) — regression: a genuinely concrete nullable argument, `Array<int?>`
+// used as a CALLER's variable type (not an extension head), is unaffected —
+// the new §26.4 rule only fires on an extension's OWN target-type argument
+// position, never on ordinary type resolution elsewhere.
+BEZEL_TEST(sema_extension, concrete_nullable_type_elsewhere_unaffected_1580b) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var xs: Array<int?>?; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// §26.5 step 2 (v0.183, issue #1580 (c)) — visibility filtering. §26.3: "From
+// the same module, internal members are also visible" and §13.1: `internal`
+// = same module. Every extension the compiler currently locates for a call
+// site comes from `ctx_.module()->children` — i.e. the CALLING module itself
+// (see ExprTC::lookupExtensionMember) — so an `internal` extension member is
+// always same-module-visible at any call site that can find it at all; step
+// 2's visibility filter is correctly a no-op in the only case reachable
+// today. (Cross-module extension import — the case where filtering would
+// actually need to REMOVE a candidate — is separately unimplemented; see
+// ModuleMetadataBuilder.cpp's "Type aliases, extensions, and extern blocks
+// are likewise out of this increment's scope" and SymbolCollection.cpp /
+// ExprTypecheck.cpp, which only ever populate/search ExtensionSymbols on the
+// current module. That is a larger, already-flagged prerequisite, not a
+// diagnostics defect, and is out of scope here.) This test locks in that an
+// `internal` extension member is reachable — same-module visibility must
+// never be wrongly rejected.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sema_extension,
+           internal_extension_member_visible_same_module_1580c) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Foo public _x: int := 0; end Foo; "
+        "extension Foo internal method Bar(): int => this._x; end; "
+        "class P public method Use(f: Foo): int => f.Bar(); end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

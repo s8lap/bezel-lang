@@ -488,6 +488,19 @@ private:
         std::string_view name,
         std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr);
 
+    // §26.5 step 1 (v0.183): when an instance member of `name` name-blocks
+    // extension lookup for `receiver` and the committed instance call then
+    // fails (no applicable overload, wrong arity, or inaccessible), the
+    // spec requires the diagnostic to "note a same-named extension where
+    // one exists" — a name-blocked extension was never even considered, so
+    // without this note a caller cannot tell their extension was shadowed
+    // rather than simply not found. Returns an empty string when no
+    // same-named extension matches `receiver` (append nothing), else a
+    // clause of the form "; note: ..." ready to append to a diagnostic
+    // message.
+    std::string extensionNameBlockedNote(const TypeRef* receiver,
+                                         std::string_view name);
+
     // §26.1 / §26.5: bind a resolved extension member to the member-access
     // expression — set its exprSymbol and the access's exprType. For a method
     // this is the §27.6 method-reference function type (the CallExpr handler
@@ -694,13 +707,19 @@ private:
     // provided it is better-or-equal at every supplied-argument position.
     // Emits the ambiguous / unreachable diagnostic itself when applicable.
     // `candNames` supplies a display string per candidate for the
-    // ambiguous-case citation.
+    // ambiguous-case citation. `extraNote` (default empty), when non-empty,
+    // is appended verbatim to an emitted diagnostic's message — used by
+    // member-access call sites to carry the §26.5 step 1 name-blocked-
+    // extension note (see extensionNameBlockedNote); callers outside the
+    // member-access path (e.g. `new T(...)` constructor overloads) pass the
+    // default and get no such suffix.
     OverloadResult resolveOverload(
         const std::vector<std::vector<const TypeRef*>>& paramTypes,
         const std::vector<const TypeRef*>& argTypes,
         const std::vector<bool>& fillsDefault,
         const std::vector<std::string>& candNames, SourceLocation loc,
-        const std::string& calleeDesc);
+        const std::string& calleeDesc,
+        const std::string& extraNote = std::string());
 
     // §22.6 method-overload resolution. Given the initially-resolved
     // MethodSymbol for a call and the call site, returns the MethodSymbol
@@ -837,9 +856,15 @@ private:
     // The overload-suppression heuristic (a non-private sibling with the same
     // name → suppress the error) is applied for private and protected, matching
     // the original private-only check.
+    // `receiver` (optional, default null): the dot-call's receiver TypeRef,
+    // when known. §26.5 step 1 (v0.183): when supplied and access is
+    // rejected, the diagnostic notes a same-named extension that matches
+    // `receiver` where one exists (name-blocked by the instance member,
+    // never consulted) — see extensionNameBlockedNote.
     bool checkMemberVisibility(const MemberSymbol* msym,
                                std::string_view memberName,
-                               SourceLocation loc);
+                               SourceLocation loc,
+                               const TypeRef* receiver = nullptr);
 
     // §7.5 null-conditional member access `x?.M`. Resolves the member on
     // the target's (non-nullable) type exactly like `.`, but the result

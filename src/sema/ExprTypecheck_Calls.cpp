@@ -149,7 +149,7 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<const TypeRef*>& argTypes,
     const std::vector<bool>& fillsDefault,
     const std::vector<std::string>& candNames, SourceLocation loc,
-    const std::string& calleeDesc) {
+    const std::string& calleeDesc, const std::string& extraNote) {
     OverloadResult res;
     const std::size_t nCand = paramTypes.size();
     const std::size_t nArg = argTypes.size();
@@ -212,7 +212,7 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             "no overload of " + calleeDesc +
                 " is applicable to these arguments; every candidate would "
                 "require a conversion that §5.1 does not admit as implicit "
-                "(§22.6)");
+                "(§22.6)" + extraNote);
         res.outcome = OverloadOutcome::Unreachable;
         return res;
     }
@@ -295,6 +295,7 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
         msg += "\nadd an explicit cast (§5.2) so exactly one candidate is an "
                "exact match";
     }
+    msg += extraNote;
     ctx_.diagnostics().report(Severity::Error, loc, msg);
     res.outcome = OverloadOutcome::Ambiguous;
     return res;
@@ -660,9 +661,22 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             if (argIdxRows[c][i] != argIdxRows[0][i]) return arityFallback();
     }
 
+    // §26.5 step 1 (v0.183): for a dot-call (`x.Foo(...)`) whose callee
+    // resolved to an instance member by name, note whether a same-named
+    // extension also matches the receiver — it was never considered (step 1
+    // name-blocks step 2 unconditionally), so a resulting "no applicable
+    // overload" / "ambiguous" diagnostic should say so.
+    std::string extNote;
+    if (auto* calleeMA =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if (calleeMA->target) {
+            if (const TypeRef* recvTy = ctx_.exprType(*calleeMA->target))
+                extNote = extensionNameBlockedNote(recvTy, initial->name);
+        }
+    }
     OverloadResult r = resolveOverload(
         paramTypes, argTypes, fillsDefault, candNames, ce.span.begin,
-        std::string("`") + std::string(initial->name) + "`");
+        std::string("`") + std::string(initial->name) + "`", extNote);
     switch (r.outcome) {
         case OverloadOutcome::Resolved:
             return cands[r.winnerIndex];
@@ -6686,7 +6700,8 @@ static bool isNestedWithin(const TypeSymbol* inner, const TypeSymbol* outer) {
 
 bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
                                    std::string_view memberName,
-                                   SourceLocation loc) {
+                                   SourceLocation loc,
+                                   const TypeRef* receiver) {
     if (!msym || !msym->parent) return false;
     TypeSymbol* declaring = msym->parent;
     const ast::Visibility vis = msym->visibility;
@@ -6721,7 +6736,8 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
             "` is internal to module `" +
             std::string(declaring->name) +
             "` and not accessible from outside that module"
-            " (§13.1 — `internal` is visible to the same module only)");
+            " (§13.1 — `internal` is visible to the same module only)" +
+            extensionNameBlockedNote(receiver, memberName));
         return true;
     }
 
@@ -6752,7 +6768,8 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
             std::string(currentType_ ? currentType_->name
                                      : std::string_view("(global)")) +
             "` (§13.1 — `protected` is visible to the declaring class and "
-            "derived classes only)");
+            "derived classes only)" +
+            extensionNameBlockedNote(receiver, memberName));
         return true;
     }
 
@@ -6778,7 +6795,8 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
             std::string(currentType_ ? currentType_->name
                                      : std::string_view("(global)")) +
             "` (§13.1 — `private` is visible to the declaring "
-            "class only)");
+            "class only)" +
+            extensionNameBlockedNote(receiver, memberName));
         return true;
     }
 
@@ -9924,7 +9942,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // checkMemberVisibility handles all four levels and the overload-suppression
     // heuristic (a non-private accessible sibling → suppress the error).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
-        checkMemberVisibility(msym, ma.member, ma.span.begin);
+        // §26.5 step 1 (v0.183): pass the receiver's type so a rejected
+        // access can note a same-named, name-blocked extension.
+        const TypeRef* recvTy = ma.target ? ctx_.exprType(*ma.target) : nullptr;
+        checkMemberVisibility(msym, ma.member, ma.span.begin, recvTy);
     }
     ctx_.setExprSymbol(&ma, member);
     // §2.2 / §2.5 (issue #328 inc 3): an imported field/const member has no
@@ -10134,7 +10155,10 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // §13.1 (issue #432): full visibility check — delegates to the shared
     // checkMemberVisibility helper (same four-level rule as resolveMemberAccess).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
-        checkMemberVisibility(msym, nm.member, nm.span.begin);
+        // §26.5 step 1 (v0.183): pass the receiver's type so a rejected
+        // access can note a same-named, name-blocked extension.
+        const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
+        checkMemberVisibility(msym, nm.member, nm.span.begin, recvTy);
     }
     ctx_.setExprSymbol(&nm, member);
     TypeRef* memberTy = nullptr;

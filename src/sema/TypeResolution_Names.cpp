@@ -314,6 +314,45 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                 if (!ga) continue;
                 if (ga->kind == ast::TypeKind::Named &&
                     ga->name && ga->name->parts.size() == 1 &&
+                    ga->nullable) {
+                    // §26.4 (v0.183): "A nullable-marked identifier in an
+                    // argument position (`extension Array<T?>`) binds
+                    // nothing and is a compile error naming this rule —
+                    // only the bare non-nullable identifier introduces a
+                    // parameter." Report THIS specific rule here, at the
+                    // declaration, rather than falling through to ordinary
+                    // name resolution on `T` below: (1) the generic
+                    // "unresolved type name" fallback is actively
+                    // misleading here — `T` is not a typo, it is written
+                    // in exactly the position a type-parameter head would
+                    // occupy, just illegally nullable-marked; and (2) if an
+                    // unrelated type happened to be named `T` in enclosing
+                    // scope, ordinary name resolution would silently bind
+                    // to it instead of erroring — precisely the
+                    // action-at-a-distance hazard this rule exists to rule
+                    // out (mirroring the non-nullable binding rule's
+                    // "always, shadowing any same-named type in scope").
+                    std::string_view paramName = ga->name->parts[0];
+                    ctx_.diagnostics().report(
+                        Severity::Error, ga->span.begin,
+                        "nullable-marked type-parameter head `" +
+                        std::string(paramName) +
+                        "?` is not permitted in an extension's target type "
+                        "(§26.4): only a bare, non-nullable identifier "
+                        "introduces a block-level type parameter — write `" +
+                        std::string(paramName) + "` (a bare `" +
+                        std::string(paramName) + "` already unifies with a "
+                        "nullable receiver argument, e.g. `Array<int?>`)");
+                    // Register the (unbound) name anyway so the recursive
+                    // resolution of this same argument just below does not
+                    // cascade a second, redundant "unresolved type name"
+                    // diagnostic over the identical span — the rule above
+                    // is the diagnostic of record for this declaration.
+                    extScope.names[paramName] = nullptr;
+                    continue;
+                }
+                if (ga->kind == ast::TypeKind::Named &&
+                    ga->name && ga->name->parts.size() == 1 &&
                     !ga->nullable) {
                     // Single-part bare name: treat as a type parameter.
                     std::string_view paramName = ga->name->parts[0];
