@@ -2726,6 +2726,67 @@ bool Emitter::isFreshOwnedClassProducer(const ast::Expr* e) const {
 }
 
 
+// §22.7 / §22.13 / §24.1: the entry-point (Main) static-init prologue. Runs
+// the program-wide static initialization that must complete before any user
+// code: the SerializationException runtime vtable, every non-lazy static
+// constructor, and the allocation of each static event's backing EventSource<T>
+// so a subscribe/raise on a static event reaches a real shared source.
+//
+// Requires builder_ positioned in the entry function (currentFn_ is the C
+// `main`, whose propagateBB routes an uncaught static-init fault to
+// bz_unhandled_exception — §33.3) and emitPendingCheck's unwind chain set up
+// (propagateBB_/unwindTarget_ as at method-body entry). Called from
+// emitFunctionBody for a synchronous Main, and from emitAsyncMethod's entry for
+// an async Main — the latter returns from emitFunctionBody before the inline
+// prologue site, so without this call the static event sources (and every other
+// static root) were never allocated (#1502).
+void Emitter::emitMainStaticInitPrologue() {
+    // §2.15 / §9.8: register the SerializationException vtable with the runtime
+    // so bz_ser_throw (called by JSON runtime helpers) produces a well-formed
+    // exception that emitIsA's catch dispatch can identify. Must run before any
+    // user code (incl. static ctors) can call serializer APIs. The vtable
+    // pointer is always defined here (setupBuiltinExceptions runs in emitModule
+    // before any method lowering).
+    {
+        auto vit = builtinVtable_.find("SerializationException");
+        if (vit != builtinVtable_.end()) {
+            auto* initFn = declareC("bz_ser_exc_vtable_init",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(initFn, {vit->second});
+        }
+    }
+    // #720 / #796 / §22.13: every type with static state now initializes LAZILY
+    // on first use (via bz$<T>$ensureinit at each static-access site) — non-
+    // generic since #720, generic since #796. Skip any type that has a lazy
+    // ensureinit; only a type WITHOUT one (none today) would run here.
+    // fix #529 / §22.7 (part b): after each static-ctor call, check bz_exc. If
+    // the ctor threw, its own propagate block already wrapped the original
+    // exception in TypeInitializationException; emitPendingCheck routes the
+    // wrapped exception through Main's normal unwind path.
+    for (auto& e : staticCtors_) {
+        if (e.type && ensureInitFns_.count(e.type)) continue;  // lazy
+        builder_.CreateCall(e.fn, {});
+        emitPendingCheck();
+    }
+    // §24.1 / §22.13 (#477 B6): allocate each static event's backing
+    // EventSource<T> at program start (the single static root), so a
+    // subscribe/raise on a static event reaches a real shared source. Mirrors
+    // the per-instance allocation done during construction (emitInstanceInit),
+    // but at the program-wide static-init point. bz_static_event_source_new also
+    // registers the source for program-exit disposal (§22.13) via atexit — a
+    // static owned field is disposed at program exit, not by any instance
+    // disposer.
+    if (!staticEventGlobals_.empty()) {
+        auto* newFn =
+            declareC("bz_static_event_source_new", ptrTy(), {});
+        for (auto& [es, gv] : staticEventGlobals_) {
+            llvm::Value* esrc = builder_.CreateCall(newFn, {});
+            builder_.CreateStore(esrc, gv);
+        }
+    }
+}
+
+
 void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // §2.5 / §14.1 / #783: an IMPORTED method's `methodFns_` entry is an EXTERNAL
     // declaration (the exporter holds the compiled body); never emit a body for
@@ -2963,47 +3024,13 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // enclosing try/catch (e.g. in a test), the TypeInitializationException
     // reaches the catch arm; otherwise it propagates to Main's propagateBB
     // (bz_unhandled_exception).
-    if (isMain(ms)) {
-        // §2.15 / §9.8: register the SerializationException vtable with the
-        // runtime so bz_ser_throw (called by JSON runtime helpers) produces a
-        // well-formed exception that emitIsA's catch dispatch can identify.
-        // Must run before any user code (incl. static ctors) can call serializer
-        // APIs.  The vtable pointer is always defined here (setupBuiltinExceptions
-        // runs in emitModule before any method lowering).
-        {
-            auto vit = builtinVtable_.find("SerializationException");
-            if (vit != builtinVtable_.end()) {
-                auto* initFn = declareC("bz_ser_exc_vtable_init",
-                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(initFn, {vit->second});
-            }
-        }
-        // #720 / #796 / §22.13: every type with static state now initializes
-        // LAZILY on first use (via bz$<T>$ensureinit at each static-access site)
-        // — non-generic since #720, generic since #796. Skip any type that has a
-        // lazy ensureinit; only a type WITHOUT one (none today) would run here.
-        for (auto& e : staticCtors_) {
-            if (e.type && ensureInitFns_.count(e.type)) continue;  // lazy
-            builder_.CreateCall(e.fn, {});
-            emitPendingCheck();
-        }
-        // §24.1 / §22.13 (#477 B6): allocate each static event's backing
-        // EventSource<T> at program start (the single static root), so a
-        // subscribe/raise on a static event reaches a real shared source.
-        // Mirrors the per-instance allocation done during construction
-        // (emitInstanceInit), but at the program-wide static-init point.
-        // bz_static_event_source_new also registers the source for program-exit
-        // disposal (§22.13) via atexit — a static owned field is disposed at
-        // program exit, not by any instance disposer.
-        if (!staticEventGlobals_.empty()) {
-            auto* newFn =
-                declareC("bz_static_event_source_new", ptrTy(), {});
-            for (auto& [es, gv] : staticEventGlobals_) {
-                llvm::Value* esrc = builder_.CreateCall(newFn, {});
-                builder_.CreateStore(esrc, gv);
-            }
-        }
-    }
+    // §22.7 / §22.13 / §24.1: the entry-point (Main) static-init prologue —
+    // SerializationException vtable, static ctors, and static-event backing
+    // sources. Factored into emitMainStaticInitPrologue so the async-Main entry
+    // (emitAsyncMethod, which returns from emitFunctionBody before this point)
+    // can run the same prologue before driving its state machine (#1502).
+    if (isMain(ms))
+        emitMainStaticInitPrologue();
 
     // CG30: for enum instance methods, record the enum type so that
     // `case this` arms can resolve enum constant patterns.

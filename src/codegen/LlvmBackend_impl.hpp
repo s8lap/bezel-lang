@@ -4862,6 +4862,12 @@ private:
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);
 
+    // §22.7 / §22.13 / §24.1 (#1502): the entry-point (Main) static-init
+    // prologue — SerializationException vtable, non-lazy static ctors, and
+    // static-event backing-source allocation. Shared by the synchronous-Main
+    // body path (emitFunctionBody) and the async-Main entry (emitAsyncMethod).
+    void emitMainStaticInitPrologue();
+
     // CG10: emit a constructor body. Always an instance function (leading
     // `this`); its params bind to the ConstructorSymbol's ParameterSymbols.
     // Field initializers run in `lowerNew` before the call, so the body

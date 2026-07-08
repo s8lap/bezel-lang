@@ -641,6 +641,24 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
 
+        // §22.7 / §22.13 / §24.1 (#1502): run the entry-point static-init
+        // prologue BEFORE driving the state machine. emitFunctionBody's async
+        // routing returns before its own inline prologue site, so without this
+        // an async Main never allocated the static event sources (nor ran the
+        // SerializationException vtable init / non-lazy static ctors) — a
+        // subscribe/raise on a static event inside an async method reached a
+        // null source and silently dropped every handler. currentFn_ is the C
+        // `main` here, whose propagateBB routes an uncaught static-init fault to
+        // bz_unhandled_exception (§33.3), exactly as in the synchronous path.
+        if (isMain(ms))
+            emitMainStaticInitPrologue();
+        // §22.13: a static async method's declaring type initializes before its
+        // body runs; the body lowers in Resume, so trigger the lazy ensureinit
+        // here in the entry (the synchronous path does this at method-body entry
+        // for every static method — emitFunctionBody, `emitEnsureStaticInit`).
+        if (isStaticMethod(ms) && ms->parent)
+            emitEnsureStaticInit(ms->parent);
+
         // §30.13 (#439): start the runtime thread pool before driving an async
         // Main. The pool's worker threads run the continuations of genuinely-
         // incomplete tasks (Task.Delay, and any task whose producer suspends),
