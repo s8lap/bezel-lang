@@ -772,6 +772,17 @@ bool  bz_task_is_spent(void* task);
 // through the source, so the source must outlive the outer task.
 void  bz_task_set_chained(void* outer, void* source);
 
+// §30.5 / #1503: attach a per-T disposer for `task`'s produced class-typed
+// result. bz_task_free runs `disposer` on the result's pointee (once, before
+// reclaiming the result buffer) iff the task is not faulted and its result
+// was never consumed (a consuming await/`.Result` nulls the slot first via
+// bz_task_take_result). Safe to call before the task has completed — the
+// disposer fires whenever bz_task_free eventually runs, whether that is
+// immediately (already-done) or later via bz_task_fire_and_forget's
+// completion continuation (§30.5 "the Dispose() call attaches a continuation
+// that disposes the produced result whenever it appears").
+void  bz_task_set_result_disposer(void* task, void (*disposer)(void*));
+
 // Block the calling thread until the task completes. Returns a pointer to the
 // result buffer (owned by the task; valid until bz_task_free). Returns null on error.
 void* bz_task_await_sync(void* task);

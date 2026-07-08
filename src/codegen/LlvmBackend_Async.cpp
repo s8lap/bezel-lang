@@ -501,6 +501,50 @@ bool Emitter::suspendInTryPosition(
 }
 
 
+// §30.5 / #1503: classify `taskTypeRef` (the FULL declared/annotated async
+// return type, e.g. `Task<Config>` or `OwningTask<Token>` — NOT just the
+// generic argument T) and return the per-T disposer thunk iff it names
+// Pattern A `Task<T:class>`. Task<T> always owns its produced class-typed
+// result directly: every await and every `.Result` read only ever produces a
+// BORROW (§30.5 "Consumer-side rules" / §30.3), never a consuming move, so
+// the task itself — not any particular consumer — is the one place that can
+// discharge the result's disposal. Returns null for:
+//   - `Task` (no generic arg — no result to dispose);
+//   - `Task<T>` where T is not class/interface (§30.5: "no ownership
+//     obligation crosses the await boundary" for value/string/runtime-managed
+//     T);
+//   - `OwningTask<T>` (Pattern B) — an unconsumed OwningTask<T> result is the
+//     CONSUMER's disposal responsibility at its `using var` scope end (§30.5
+//     "Disposing an unconsumed OwningTask<T>"), wired separately via
+//     bz_task_set_result_disposer in LlvmBackend_Disposal.cpp's `using var`
+//     Task-disposal block — attaching it here too would be redundant, not
+//     unsound (bz_task_free's guard already tolerates a second identical
+//     set), but the two call sites would then disagree about WHO owns the
+//     decision, so this function deliberately excludes it.
+// Shared by emitAsyncMethod and emitAsyncLambda.
+llvm::Function* Emitter::patternAResultDisposerFor(
+    const sema::TypeRef* taskTypeRef) {
+    // isTaskTypeName is the established Task/OwningTask recognizer (used by
+    // taskTypeOfLocal for `using var` locals) — it handles both shapes a
+    // builtin task TypeRef can take: no declaration at all (name read from
+    // astNode), or a declaration with no user TypeDecl (name read from
+    // declaration->name). Reuse it rather than re-deriving the check.
+    if (!taskTypeRef || !isTaskTypeName(taskTypeRef)) return nullptr;
+    std::string_view name;
+    if (!taskTypeRef->declaration)
+        name = taskTypeRef->headName();
+    else if (!taskTypeRef->declaration->decl)
+        name = taskTypeRef->declaration->name;
+    if (name != "Task") return nullptr;  // excludes OwningTask (Pattern B)
+    if (taskTypeRef->genericArgs.empty() || !taskTypeRef->genericArgs[0])
+        return nullptr;
+    ElementPolicy pol =
+        elementPolicyFor(taskTypeRef->genericArgs[0], /*owningFamily=*/true);
+    return pol.cat == ElementPolicy::Category::ClassOwned ? pol.disposerThunk
+                                                           : nullptr;
+}
+
+
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                               const CallableInfo& ci) {
     if (!ci.stmts) return;
@@ -536,8 +580,10 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     //   OwningTask<T>   → T (Pattern B; ownership transfer is the awaiter's job)
     llvm::Type* resultTy = nullptr;
     const sema::TypeRef* resultSemaTy = nullptr;
+    const sema::TypeRef* declaredTaskTy = nullptr;
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
+        declaredTaskTy = retRef;
         if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
             resultSemaTy = retRef->genericArgs[0];
             resultTy = lowerTypeRef(resultSemaTy);
@@ -547,6 +593,12 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // §30.1 / §7.2 (#493): keep the sema TypeRef for T so emitAsyncComplete
     // can detect a nullable value type and wrap the returned plain value.
     asyncResultSemaType_ = resultSemaTy;
+    // §30.5 / #1503: Pattern A (Task<T:class>) always owns its produced
+    // result directly; compute the per-T disposer once here from the
+    // declared return type. lowerStmt(ReturnStmt) attaches it to the outer
+    // task at each non-chained `return <owned>` site. Null for `Task`,
+    // `Task<non-class T>`, and `OwningTask<T>` (Pattern B).
+    asyncPatternAResultDisposer_ = patternAResultDisposerFor(declaredTaskTy);
 
     // Build the kind-agnostic frame with three trailing async fields:
     //   [.. ] outerTask (ptr), [.. ] pendingTask (ptr), [.. ] spillArea (ptr).
@@ -939,6 +991,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         asyncResumeFn_ = nullptr;
         asyncResultTy_ = nullptr;
         asyncResultSemaType_ = nullptr;
+        asyncPatternAResultDisposer_ = nullptr;
     }
 }
 
@@ -959,7 +1012,8 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 // sm*_/async*Field_ state, identical to the method path.
 void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
                               const std::vector<sema::Symbol*>* paramSyms,
-                              const sema::TypeRef* resultElemSemaTy) {
+                              const sema::TypeRef* resultElemSemaTy,
+                              const sema::TypeRef* declaredTaskTy) {
     // `fn` is the closure entry; the builder is already positioned at its entry
     // block (lowerLambda's prologue), and currentFn_ == fn. We drive the entry
     // through builder_ / currentFn_, so `fn` itself is referenced only for the
@@ -974,6 +1028,11 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         resultElemSemaTy ? lowerTypeRef(resultElemSemaTy) : nullptr;
     asyncResultTy_ = resultTy;
     asyncResultSemaType_ = resultElemSemaTy;
+    // §30.5 / #1503: Pattern A (Task<T:class>) result disposer, mirroring
+    // emitAsyncMethod. `declaredTaskTy` is null when the caller had no
+    // call-site annotation to derive it from (e.g. an IIFE-invoked async
+    // lambda); in that case no disposer is attached here.
+    asyncPatternAResultDisposer_ = patternAResultDisposerFor(declaredTaskTy);
 
     // ---- Snapshot the capture set bound by lowerLambda's prologue ----
     // A FrameCapture records how to spill (in the entry, from the current slot)
@@ -1318,6 +1377,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         asyncResumeFn_ = nullptr;
         asyncResultTy_ = nullptr;
         asyncResultSemaType_ = nullptr;
+        asyncPatternAResultDisposer_ = nullptr;
     }
 }
 

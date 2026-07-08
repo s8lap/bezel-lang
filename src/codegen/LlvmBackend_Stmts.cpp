@@ -1223,6 +1223,35 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     "bz_task_set_chained", llvm::Type::getVoidTy(llvm_),
                     {ptrTy(), ptrTy()});
                 builder_.CreateCall(setChainedFn, {outerTask, sourceTask});
+            } else if (v && asyncPatternAResultDisposer_) {
+                // §30.5 / #1503: Pattern A (Task<T:class>) NON-chained return —
+                // the async body produced a FRESH owned value, so the task owns
+                // the result directly (§30.5: "the task owns the result and its
+                // destructor disposes it directly"). Attach the per-T disposer
+                // to the outer task BEFORE bz_task_complete, same race-safety
+                // ordering as the chained-slot branch above (a continuation may
+                // free the task the instant it completes). bz_task_free
+                // consults this field whenever it eventually runs — whether the
+                // task is already settled at that point (an already-done `using
+                // var` scope-end / anonymous-await reclaim) or still running
+                // (the fire-and-forget completion continuation) — so both the
+                // "already done" and "still running at disposal time" cases in
+                // §30.5's "Disposing an unconsumed OwningTask<T>" text (which
+                // applies here by the same logic, even though that subsection
+                // is written for Pattern B) are covered by one mechanism. A
+                // borrow taken via a later `await`/`.Result` read does NOT
+                // consume/null the slot for Pattern A (only Pattern B's
+                // bz_task_take_result does that), so the result is disposed
+                // exactly once whether or not it was ever borrowed.
+                llvm::Value* otField = builder_.CreateStructGEP(
+                    smStateStruct_, smSelf_, asyncOuterTaskField_);
+                llvm::Value* outerTask =
+                    builder_.CreateLoad(ptrTy(), otField, "patterna.outer");
+                auto* setDisposerFn = declareC(
+                    "bz_task_set_result_disposer", llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(setDisposerFn,
+                                    {outerTask, asyncPatternAResultDisposer_});
             }
             emitAsyncComplete(v);
             builder_.CreateRetVoid();

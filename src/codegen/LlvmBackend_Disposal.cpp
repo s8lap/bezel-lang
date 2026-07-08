@@ -2112,16 +2112,34 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);
             }
-            // §30.5 / #1258: dispose the produced-but-unconsumed owned class
-            // result of an OwningTask<T:class> before the task is freed. The
-            // runtime guard (result null after a consuming await, or is_error)
-            // makes this a no-op when there is nothing to dispose, so it never
-            // double-frees a result an awaiter already took.
+            // §30.5 / #1258, #1503: attach the per-T disposer for the
+            // produced-but-unconsumed owned class result of an OwningTask
+            // <T:class> BEFORE the task is reclaimed below. bz_task_free
+            // (called either synchronously by the fast path just below, when
+            // the task is already done, or later by bz_task_fire_and_forget's
+            // completion continuation when it is not) is what actually runs
+            // the disposer, guarded so it never double-frees a result an
+            // awaiter already took (a consuming await/`.Result` nulls the
+            // result slot first via bz_task_take_result) and never fires on a
+            // faulted task (no result was produced).
+            //
+            // #1503: this used to call bz_task_dispose_owned_result directly
+            // here, which only ever disposed a result already sitting in the
+            // task's buffer AT THIS EXACT SYNCHRONOUS POINT — a task still
+            // running at this scope-end drop (task->result not yet set) saw a
+            // no-op, and the per-T disposer was never retained anywhere, so
+            // its eventual result leaked once bz_task_fire_and_forget's
+            // continuation later called plain bz_task_free. Persisting the
+            // disposer ON THE TASK via bz_task_set_result_disposer instead
+            // means it survives to whichever bz_task_free call actually
+            // reclaims the task, matching §30.5's "the Dispose() call
+            // attaches a continuation that disposes the produced result
+            // whenever it appears" for a not-yet-settled task.
             if (it->taskOwnedResultDisposer) {
-                auto* dispFn = declareC("bz_task_dispose_owned_result",
-                                        llvm::Type::getVoidTy(llvm_),
-                                        {ptrTy(), ptrTy()});
-                builder_.CreateCall(dispFn, {t, it->taskOwnedResultDisposer});
+                auto* setDispFn = declareC("bz_task_set_result_disposer",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), ptrTy()});
+                builder_.CreateCall(setDispFn, {t, it->taskOwnedResultDisposer});
             }
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});

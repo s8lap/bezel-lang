@@ -189,6 +189,30 @@ struct bz_task_t {
     // for as long as the outer task exists. bz_task_free disposes the chain
     // transitively. Null for tasks that own their result directly (most tasks).
     void* chained_source = nullptr;
+    // §30.5 / #1503: per-T disposer for an UNCONSUMED owned class-typed result.
+    // Set via bz_task_set_result_disposer, from two producers:
+    //   - Pattern A (Task<T:class>, non-chained): the task always owns its
+    //     result directly -- every await/`.Result` only ever borrows it, never
+    //     consumes it (§30.5) -- so codegen sets this unconditionally at the
+    //     async body's non-chained `return <owned>` site.
+    //   - Pattern B (OwningTask<T:class>): codegen sets this at the consumer's
+    //     `using var` scope-end drop (§30.5 "Disposing an unconsumed
+    //     OwningTask<T>"); a successful consuming await/`.Result` nulls
+    //     `result` first (bz_task_take_result), so a CONSUMED Pattern B result
+    //     naturally makes this a no-op.
+    // bz_task_free consults this field (guarded by !is_error and a non-null
+    // `result`) and disposes the result's pointee before freeing the result
+    // buffer. Because the field lives on the task struct rather than being
+    // used only at the moment of the call, this covers BOTH the
+    // already-completed case (dispose runs immediately when bz_task_free is
+    // called synchronously) and the still-running case (the disposer fires
+    // whenever bz_task_free eventually runs -- via bz_task_fire_and_forget's
+    // completion continuation -- satisfying §30.5's "the Dispose() call
+    // attaches a continuation that disposes the produced result whenever it
+    // appears"). Null for tasks with no ownership obligation on their result
+    // (`Task`, `Task<non-class T>`) and for a Pattern B task never dropped
+    // unconsumed.
+    void (*result_disposer)(void*) = nullptr;
     // §30.13 (#618): owning execution domain (set at allocation; always
     // g_main_domain for current single-domain programs).
     bz_domain_t* domain = nullptr;

@@ -5942,6 +5942,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
     llvm::Type* savedAsyncResultTy = asyncResultTy_;
     const sema::TypeRef* savedAsyncResultSemaTy = asyncResultSemaType_;
+    // §30.5 / #1503: save/restore alongside its asyncResultTy_/
+    // asyncResultSemaType_ siblings — emitAsyncMethod (called below for a
+    // specialized async method) both sets and resets this field itself, but
+    // this wrapper may run mid-emission of an OUTER async state machine, so
+    // the outer's value must survive the nested specialization untouched.
+    llvm::Function* savedAsyncPatternAResultDisposer =
+        asyncPatternAResultDisposer_;
     auto savedSmStateBBs = std::move(smStateBBs_);
     auto savedSmLocalFields = std::move(smLocalFields_);
     auto savedSmForInSrcFields = std::move(smForInSrcFields_);
@@ -5979,6 +5986,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncResumeFn_ = nullptr;
     asyncResultTy_ = nullptr;
     asyncResultSemaType_ = nullptr;
+    asyncPatternAResultDisposer_ = nullptr;
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -6135,6 +6143,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncResumeFn_ = savedAsyncResumeFn;
     asyncResultTy_ = savedAsyncResultTy;
     asyncResultSemaType_ = savedAsyncResultSemaTy;
+    asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
     smStateBBs_ = std::move(savedSmStateBBs);
     smLocalFields_ = std::move(savedSmLocalFields);
     smForInSrcFields_ = std::move(savedSmForInSrcFields);

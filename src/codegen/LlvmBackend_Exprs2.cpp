@@ -1207,6 +1207,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // (for completing the task with a value) comes from the call-site expected
     // function type's `Task<T>` return annotation; null means a no-value `Task`.
     const sema::TypeRef* asyncResultElemSemaTy = nullptr;
+    // §30.5 / #1503: the FULL declared `Task<T>`/`OwningTask<T>` annotation
+    // (not just T), passed through to emitAsyncLambda so it can compute the
+    // Pattern A result disposer. Null when no call-site annotation is visible
+    // (the IIFE-invoked fallback below) — that shape gets no disposer, same
+    // as any other unannotated async lambda before this fix.
+    const sema::TypeRef* asyncDeclaredTaskTy = nullptr;
     if (lam.isAsync) {
         bool haveAnnotation =
             expectedFunctionType_ && expectedFunctionType_->funcReturn &&
@@ -1217,6 +1223,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // (§30.6): a bare `Task` (no generic arg) is a no-value task — leave
             // T null; `Task<T>` / `OwningTask<T>` carries the element type T.
             const sema::TypeRef* taskTy = expectedFunctionType_->funcReturn;
+            asyncDeclaredTaskTy = taskTy;
             if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0])
                 asyncResultElemSemaTy = taskTy->genericArgs[0];
         } else if (retSemaTy && retSemaTy->kind != sema::TypeRef::Kind::Unit &&
@@ -1376,6 +1383,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
         llvm::Type* savedAsyncResultTy = asyncResultTy_;
         const sema::TypeRef* savedAsyncResultSemaType = asyncResultSemaType_;
+        // §30.5 / #1503: save/restore the Pattern A result-disposer field
+        // alongside its asyncResultTy_/asyncResultSemaType_ siblings — same
+        // nested-async-lambda-inside-an-enclosing-machine hazard.
+        llvm::Function* savedAsyncPatternAResultDisposer =
+            asyncPatternAResultDisposer_;
         // emitAsyncLambda recomputes closure-release AND capture-cell-free
         // eligibility for the LAMBDA's own body and keys them to the lambda resume
         // fn. The ENCLOSING function's eligibility (which governs whether THIS
@@ -1394,7 +1406,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
         auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
 
-        emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy);
+        emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy,
+                       asyncDeclaredTaskTy);
 
         closureReleaseEligible_ = std::move(savedClosureRelElig);
         closureReleaseEligibleFn_ = savedClosureRelEligFn;
@@ -1422,6 +1435,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         asyncResumeFn_ = savedAsyncResumeFn;
         asyncResultTy_ = savedAsyncResultTy;
         asyncResultSemaType_ = savedAsyncResultSemaType;
+        asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
     } else
     // Emit body.
     if (lam.exprBody) {

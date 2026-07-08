@@ -788,6 +788,29 @@ void bz_task_set_chained(void* outer_p, void* source_p) {
     outer->chained_source = source_p;
 }
 
+// §30.5 / #1503: attach a per-T disposer for `task`'s produced class-typed
+// result, to be run by bz_task_free once the task settles (see bz_task_t::
+// result_disposer's doc comment for the full contract). Guarded by the task's
+// mutex so the write is visible to whichever thread eventually completes and
+// frees the task (mirrors bz_task_set_chained above: the write may race an
+// in-flight bz_task_complete on a pool thread, and the SAME mutex is what
+// establishes the happens-before edge bz_task_free's later, lock-free read
+// relies on -- bz_task_free only ever runs after the task has settled, by
+// which point no other thread still touches the struct).
+//
+// Used from two codegen sites:
+//   - the async body's non-chained `return <owned>` completion, for a Pattern
+//     A `Task<T:class>` method (the task always owns a fresh result);
+//   - the consumer's `using var` scope-end drop of an unconsumed `OwningTask
+//     <T:class>` local (Pattern B), replacing an eager-only dispose attempt
+//     that missed a task still running at drop time (#1503).
+void bz_task_set_result_disposer(void* tp, void (*disposer)(void*)) {
+    if (!tp) return;
+    auto* task = (bz_task_t*)tp;
+    std::lock_guard<std::mutex> lk(task->mtx);
+    task->result_disposer = disposer;
+}
+
 // §30.13 / bz_task_await_sync: the main OS thread (emitted by the async-Main
 // wrapper in LlvmBackend_Async.cpp) blocks here until the top-level Task
 // completes.  This function is NOT a domain continuation: the main thread is
@@ -866,6 +889,27 @@ void bz_task_then(void* tp, void (*cont)(void* task, void* state), void* state) 
 
 void bz_task_free(void* tp) {
     auto* task = (bz_task_t*)tp;
+    // §30.5 / #1503: dispose an UNCONSUMED owned class-typed result before
+    // reclaiming the result buffer. Guards mirror bz_task_dispose_owned_result:
+    //   • result_disposer == null → no ownership obligation on the result
+    //     (Task, Task<non-class T>, or a Pattern B task never dropped
+    //     unconsumed) — skip.
+    //   • task->is_error          → the body faulted; no result was produced
+    //     (§30.5: "has no owned result to dispose; disposal is a no-op") — skip.
+    //   • task->result == null    → already consumed: a Pattern B consuming
+    //     await/`.Result` runs bz_task_take_result, which nulls the slot —
+    //     skip (no double-free of the now-caller-owned object). A Pattern A
+    //     borrow-only await never nulls this, so a Pattern A result is
+    //     disposed here exactly once regardless of how many borrows it saw.
+    // No locking: by the time bz_task_free runs the task has settled (either
+    // called synchronously on an already-done task, or via the fire-and-forget
+    // completion continuation) and no other thread still touches the struct —
+    // the same invariant the pre-existing lock-free reads below already rely on.
+    if (task->result_disposer && !task->is_error && task->result &&
+        task->result_size >= (int64_t)sizeof(void*)) {
+        void* obj = *(void**)task->result;
+        if (obj) task->result_disposer(obj);
+    }
     free(task->result);
     free(task->error_msg);
     // §30.5 / #1332 (v0.162): dispose the chained Pattern A source task (if any)
@@ -3181,36 +3225,14 @@ void bz_task_take_result(void* tp) {
     free(buf);
 }
 
-// §30.5 / #1258: dispose an UNCONSUMED owned class result of an OwningTask<T:class>
-// at the task's using-var scope-end disposal, BEFORE bz_task_fire_and_forget /
-// bz_task_free frees the task struct. Mirrors bz_tcs_dispose_owned_result, but the
-// per-type disposer is passed in by codegen (bz_task_t carries no disposer field).
-// Guards:
-//   • disposer == null   → not an OwningTask<T:class> (Task<T> / no-value task); skip.
-//   • task->is_error     → the async body faulted; no result was produced; skip.
-//   • task->result == null → the result was already consumed (bz_task_take_result
-//                            zeroed the buffer at the await consume site); skip → no
-//                            double-free of the now-caller-owned object.
-// On dispose: extract the class pointer from the result buffer, free the buffer, null
-// the slot (so the subsequent bz_task_free's free(task->result) is free(nullptr)), then
-// run the disposer (the class destructor + object free).
-void bz_task_dispose_owned_result(void* tp, void (*disposer)(void*)) {
-    if (!tp || !disposer) return;
-    auto* task = static_cast<bz_task_t*>(tp);
-    void* result_to_dispose = nullptr;
-    void* buf_to_free = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(task->mtx);
-        if (!task->is_error && task->result &&
-            task->result_size >= static_cast<int64_t>(sizeof(void*))) {
-            result_to_dispose = *static_cast<void**>(task->result);
-            buf_to_free = task->result;
-            task->result = nullptr;
-            task->result_size = 0;
-        }
-    }
-    free(buf_to_free);
-    if (result_to_dispose) disposer(result_to_dispose);
-}
+// §30.5 / #1258, #1503: an unconsumed OwningTask<T:class>'s produced result is
+// now disposed via bz_task_set_result_disposer + bz_task_free (see those
+// functions' doc comments) rather than an eager, call-time-only dispose —
+// the eager version (formerly bz_task_dispose_owned_result, removed here) was
+// a no-op for a task still running at its `using var` scope-end drop, since
+// it only ever inspected the task's result buffer at that exact synchronous
+// point; the disposer is now persisted on the task struct so it also fires
+// for a task that settles later, via bz_task_fire_and_forget's completion
+// continuation (#1503).
 
 } // extern "C" (bz_task_take_result)

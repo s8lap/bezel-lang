@@ -4818,6 +4818,20 @@ private:
     void emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci);
 
+    // §30.5 / #1503: classify a declared/annotated async return type (the
+    // FULL `Task<T>`/`OwningTask<T>` type, not just T) and return the per-T
+    // disposer thunk iff it is Pattern A `Task<T:class>` — the shape whose
+    // task always owns its produced result directly and so must dispose it
+    // at task-free time regardless of whether any await ever borrowed it
+    // (§30.5: "the task owns the result and its destructor disposes it
+    // directly"). Returns null for `Task` (no generic arg), `Task<T>` where T
+    // is not class/interface (no ownership obligation crosses the await
+    // boundary), and `OwningTask<T>` (Pattern B — its unconsumed-result
+    // disposal is the CONSUMER's using-var scope-end responsibility, wired
+    // separately in LlvmBackend_Disposal.cpp). Shared by emitAsyncMethod and
+    // emitAsyncLambda.
+    llvm::Function* patternAResultDisposerFor(const sema::TypeRef* taskTypeRef);
+
     // §30.6 (#488): emit the async state machine for an `async` LAMBDA. Called
     // from lowerLambda after the closure entry function `fn(env, params...)` is
     // created and its prologue has bound the lambda params (from args) and the
@@ -4830,14 +4844,20 @@ private:
     // suspend, ReturnStmt completion, fault boundary) exactly as emitAsyncMethod
     // does. `resultElemSemaTy` is T in the lambda's `Task<T>`/`OwningTask<T>`
     // return type (null for a no-value `Task`), taken from the call-site
-    // expected function type. `paramSyms` are the lambda's user parameter
-    // symbols (already bound from the entry fn's args 1..N). On return `fn` is
-    // fully terminated; the builder is left at the resume function's end and
-    // lowerLambda restores its saved insert point. Leaves the sm*_ async state
-    // cleared.
+    // expected function type. `declaredTaskTy` is the FULL `Task<T>`/
+    // `OwningTask<T>` type carrying that same annotation (null when no
+    // call-site annotation was visible, e.g. an IIFE-invoked async lambda) —
+    // used only to compute the Pattern A result disposer (#1503); passing
+    // null there simply means no disposer is attached, matching the
+    // pre-existing conservative behavior for that unannotated shape.
+    // `paramSyms` are the lambda's user parameter symbols (already bound from
+    // the entry fn's args 1..N). On return `fn` is fully terminated; the
+    // builder is left at the resume function's end and lowerLambda restores
+    // its saved insert point. Leaves the sm*_ async state cleared.
     void emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
                          const std::vector<sema::Symbol*>* paramSyms,
-                         const sema::TypeRef* resultElemSemaTy);
+                         const sema::TypeRef* resultElemSemaTy,
+                         const sema::TypeRef* declaredTaskTy = nullptr);
 
     // §30.1 / §30.9: complete the in-flight async method's outer task with the
     // given lowered return value (null for `Task` / fall-off / `return;`). Reads
@@ -5038,6 +5058,18 @@ private:
     // double?, enum?) and wrap a plain returned value into the {hasValue=1,
     // value} struct before storing — per §30.1 / §7.2 (#493).
     const sema::TypeRef* asyncResultSemaType_ = nullptr;
+    // §30.5 / #1503: the per-T disposer thunk for the CURRENT async body's
+    // declared return type, iff that type is Pattern A `Task<T:class>` (the
+    // one shape whose task always owns its produced result directly — every
+    // await/`.Result` on a Task<T> only ever borrows it, §30.5). Computed
+    // once (patternAResultDisposerFor) by emitAsyncMethod / emitAsyncLambda
+    // from the declared/annotated return type; lowerStmt(ReturnStmt) attaches
+    // it to the outer task (bz_task_set_result_disposer) at each NON-chained
+    // `return <owned>` site, right before bz_task_complete. Null for `Task`,
+    // `Task<non-class T>`, and `OwningTask<T>` (Pattern B has its own
+    // consumer-side disposal path in LlvmBackend_Disposal.cpp). Reset to null
+    // when the owning async body's emission finishes.
+    llvm::Function* asyncPatternAResultDisposer_ = nullptr;
     // §30.5 / #1332 (v0.162): set to true in lowerStmt(ReturnStmt) when the
     // pattern `return await <call>` with a pointer-typed (Pattern A class)
     // result is detected inside an async method — signals lowerAwait to NOT
