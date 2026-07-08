@@ -1430,6 +1430,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (item.kind == "type" && item.typeArg) {
                                     TypeRef* bound =
                                         ctx_.resolvedType(*item.typeArg);
+                                    // §14.2 type-parameter bound (`where T: U`):
+                                    // the bound is another type parameter of this
+                                    // method, so it carries no declaration of its
+                                    // own. Its concrete bound is U's substitution
+                                    // (looked up in `subst`); T's substitution
+                                    // must be non-nullable and assignable to it —
+                                    // identical, a subclass, or an interface
+                                    // conformance — else the instantiation is
+                                    // rejected (closes the soundness hole where
+                                    // an unrelated type was silently accepted).
+                                    if ((!bound || !bound->declaration) &&
+                                        item.typeArg->name &&
+                                        item.typeArg->name->parts.size() == 1) {
+                                        auto ui = subst.find(
+                                            item.typeArg->name->parts.back());
+                                        if (ui != subst.end() && ui->second) {
+                                            TypeRef* uSubst = ui->second;
+                                            std::string uName =
+                                                uSubst->declaration
+                                                    ? std::string(
+                                                          uSubst->declaration->name)
+                                                    : std::string(
+                                                          item.typeArg->name
+                                                              ->parts.back());
+                                            if (argRef->nullable) {
+                                                report(uName);
+                                            } else if (uSubst->declaration &&
+                                                       argDecl &&
+                                                       !isSubtype(
+                                                           argDecl,
+                                                           uSubst->declaration)) {
+                                                report(uName);
+                                            }
+                                            // else: U's or T's substitution is not
+                                            // a user declaration → defer (no
+                                            // diagnostic), mirroring the concrete-
+                                            // bound defer below.
+                                        }
+                                        continue;
+                                    }
                                     if (!bound || !bound->declaration) continue;
                                     if (!argDecl) {
                                         // stdlib §2.19 / §11.8 (v0.176, #807):
@@ -8126,63 +8166,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             if (!targetType && tt->astNode && tt->astNode->name &&
                     tt->astNode->name->parts.size() == 1) {
                 std::string_view paramName = tt->headName();
-                // Collect applicable constraints from the method and the class.
-                // Method constraints come first so a method-level `where T: X`
-                // shadows a class-level `where T: Y` if both exist (unusual but
-                // per §14.2 method constraints are more specific).
-                auto tryConstraints =
-                    [&](const std::vector<ast::GenericParam>& gps,
-                        const std::vector<ast::GenericConstraint>& gcs) {
-                    // Only act if paramName is actually a declared generic param.
-                    bool isParam = false;
-                    for (const auto& gp : gps)
-                        if (gp.name == paramName) { isParam = true; break; }
-                    if (!isParam) return;
-                    // Walk each where-clause for this param.
-                    for (const auto& gc : gcs) {
-                        if (gc.typeParam != paramName) continue;
-                        for (const auto& item : gc.items) {
-                            // Only "type" items carry a TypeArg that may name a
-                            // class or interface; skip "class"/"value"/"new"/etc.
-                            if (item.kind != "type") continue;
-                            if (!item.typeArg) continue;
-                            TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
-                            if (!ctr || ctr->kind != TypeRef::Kind::Named ||
-                                    !ctr->declaration) continue;
-                            // Try to find the member on this constraint type.
-                            Symbol* cm =
-                                lookupMember(ctr->declaration, ma.member);
-                            if (!cm) continue;
-                            // Found it: resolve via the constraint type, just
-                            // as the normal branch below does for a concrete
-                            // receiver.  Set the exprSymbol on the MemberAccess
-                            // and attach its type.  Use the constraint's
-                            // TypeSymbol as targetType so the visibility check
-                            // and the per-member-kind type-attachment logic
-                            // later in this function fire correctly.
-                            // We set targetType here so the `if (!targetType)`
-                            // block (intrinsic handling) is bypassed entirely.
-                            targetType = ctr->declaration;
-                            return;
-                        }
-                    }
-                };
-                // Try method constraints first (most specific), then class.
-                if (currentMethodDecl_ &&
-                        !currentMethodDecl_->genericParams.empty()) {
-                    tryConstraints(currentMethodDecl_->genericParams,
-                                   currentMethodDecl_->genericConstraints);
-                }
-                // Class-level generic params if the method search didn't resolve.
-                if (!targetType && currentType_ && currentType_->decl) {
-                    if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                            currentType_->decl)) {
-                        if (!td->genericParams.empty()) {
-                            tryConstraints(td->genericParams,
-                                           td->genericConstraints);
-                        }
-                    }
-                }
+                // Resolve the member through the parameter's where-constraints.
+                // forEachConstraintBound walks the method's constraints first
+                // (most specific) then the enclosing type's, AND follows
+                // `where T: U` type-parameter-bound chains (per §14.2): a bound
+                // that is itself a type parameter contributes its own constraint-
+                // derived member surface, so `where T: U where U: Animal` lets a
+                // `T`-typed value see `Animal`'s members. The constraint's
+                // TypeSymbol becomes `targetType`, bypassing the intrinsic-
+                // handling `if (!targetType)` block below exactly as a concrete
+                // receiver would.
+                forEachConstraintBound(
+                    paramName, [&](TypeRef* ctr) -> bool {
+                        Symbol* cm = lookupMember(ctr->declaration, ma.member);
+                        if (!cm) return false;
+                        targetType = ctr->declaration;
+                        return true;
+                    });
             }
         } else if (!tt) {
             // Target had no resolvable type — fall back to the

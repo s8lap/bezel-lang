@@ -2540,36 +2540,71 @@ GenericParamSymbol* ExprTC::typeParamMarker(std::string_view name) {
 // enclosing type's — calling `fn` with each resolved bound until it accepts.
 bool ExprTC::forEachConstraintBound(
     std::string_view paramName, const std::function<bool(TypeRef*)>& fn) {
-    auto tryList = [&](const std::vector<ast::GenericParam>& gps,
-                       const std::vector<ast::GenericConstraint>& gcs) -> bool {
-        bool isParam = false;
-        for (const auto& gp : gps)
-            if (gp.name == paramName) { isParam = true; break; }
-        if (!isParam) return false;
-        for (const auto& gc : gcs) {
-            if (gc.typeParam != paramName) continue;
-            for (const auto& item : gc.items) {
-                if (item.kind != "type" || !item.typeArg) continue;
-                TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
-                if (!ctr || ctr->kind != TypeRef::Kind::Named ||
-                    !ctr->declaration)
-                    continue;
-                if (fn(ctr)) return true;
-            }
-        }
+    // §14.2 type-parameter bounds: a constraint bound may itself be another type
+    // parameter (`where T: U`). In that case `T` inherits `U`'s constraint-
+    // derived member surface ("T conforms to every interface that U's own
+    // constraints guarantee"), so the `where T: U` chain is followed
+    // transitively. A self-bound (`where T: T`) or a cycle (`where T: U`,
+    // `where U: T`) is a declaration error checked elsewhere; the `visited` set
+    // still guards this walk against looping defensively.
+    const ast::TypeDecl* typeDecl =
+        (currentType_ && currentType_->decl)
+            ? dynamic_cast<const ast::TypeDecl*>(currentType_->decl)
+            : nullptr;
+    auto isDeclaredParam = [&](std::string_view nm) -> bool {
+        if (currentMethodDecl_)
+            for (const auto& gp : currentMethodDecl_->genericParams)
+                if (gp.name == nm) return true;
+        if (typeDecl)
+            for (const auto& gp : typeDecl->genericParams)
+                if (gp.name == nm) return true;
         return false;
     };
-    if (currentMethodDecl_ && !currentMethodDecl_->genericParams.empty()) {
-        if (tryList(currentMethodDecl_->genericParams,
-                    currentMethodDecl_->genericConstraints))
+    // Visit every constraint item declared for `nm` — the method's clause first
+    // (most specific), then the enclosing type's — applying `g`; stop when it
+    // returns true. (A constraint clause only references params declared in the
+    // same clause, so scanning both lists never cross-attributes a bound.)
+    auto forItems =
+        [&](std::string_view nm,
+            const std::function<bool(const ast::ConstraintItem&)>& g) -> bool {
+        auto scan =
+            [&](const std::vector<ast::GenericConstraint>& gcs) -> bool {
+            for (const auto& gc : gcs) {
+                if (gc.typeParam != nm) continue;
+                for (const auto& item : gc.items)
+                    if (g(item)) return true;
+            }
+            return false;
+        };
+        if (currentMethodDecl_ && scan(currentMethodDecl_->genericConstraints))
             return true;
-    }
-    if (currentType_ && currentType_->decl) {
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl)) {
-            if (!td->genericParams.empty() &&
-                tryList(td->genericParams, td->genericConstraints))
-                return true;
-        }
+        if (typeDecl && scan(typeDecl->genericConstraints)) return true;
+        return false;
+    };
+    std::unordered_set<std::string_view> visited;
+    std::vector<std::string_view> worklist{paramName};
+    while (!worklist.empty()) {
+        std::string_view nm = worklist.back();
+        worklist.pop_back();
+        if (!visited.insert(nm).second) continue;
+        if (!isDeclaredParam(nm)) continue;
+        bool stop = forItems(nm, [&](const ast::ConstraintItem& item) -> bool {
+            if (item.kind != "type" || !item.typeArg) return false;
+            TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
+            if (!ctr || ctr->kind != TypeRef::Kind::Named) return false;
+            if (ctr->declaration) return fn(ctr);  // concrete class/iface bound
+            // A bound with no declaration whose single-part name is another
+            // in-scope type parameter is a `where nm: <param>` bound — enqueue
+            // that parameter so its own constraint surface is searched too.
+            if (ctr->astNode && ctr->astNode->name &&
+                ctr->astNode->name->parts.size() == 1) {
+                std::string_view boundParam = ctr->headName();
+                if (isDeclaredParam(boundParam))
+                    worklist.push_back(boundParam);
+            }
+            return false;
+        });
+        if (stop) return true;
     }
     return false;
 }

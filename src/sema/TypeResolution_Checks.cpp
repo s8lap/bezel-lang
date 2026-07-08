@@ -2882,6 +2882,53 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
             // instantiation-time obligation here; skip it.
             if (!gc.modifierConstraint.empty()) continue;
             for (const auto& item : gc.items) {
+                // §14.2 type-parameter bound (`where T: U`): the bound names
+                // another generic parameter of `tsym`, so checkOneConstraint
+                // defers on it (the bound's TypeRef has no declaration). Verify
+                // it here where the sibling parameter's substitution is in hand:
+                // T's substitution must be non-nullable and assignable to U's.
+                if (item.kind == "type" && item.typeArg && item.typeArg->name &&
+                    item.typeArg->name->parts.size() == 1) {
+                    std::string_view boundParam =
+                        item.typeArg->name->parts.back();
+                    std::size_t ui = tsym->genericParams.size();
+                    for (std::size_t k = 0; k < tsym->genericParams.size(); ++k)
+                        if (tsym->genericParams[k] &&
+                            tsym->genericParams[k]->name == boundParam) {
+                            ui = k;
+                            break;
+                        }
+                    if (ui < argRefs.size() && argRefs[ui]) {
+                        TypeRef* uSubst = argRefs[ui];
+                        if (arg->nullable) {
+                            // §14.2: `where T: U` implies non-null T.
+                            ctx_.diagnostics().report(
+                                Severity::Error, t.span.begin,
+                                std::string("type argument `") +
+                                argSpelling(argAst) +
+                                "` does not satisfy the constraint `where " +
+                                std::string(gp->name) + ": " +
+                                std::string(boundParam) + "` (§14.2)");
+                        } else if (uSubst->kind == TypeRef::Kind::Named &&
+                                   uSubst->declaration &&
+                                   arg->kind == TypeRef::Kind::Named &&
+                                   arg->declaration) {
+                            // Both substitutions are user types: route through
+                            // the ordering-safe recheck (a base set may still be
+                            // mid-population at this instantiation site).
+                            if (!argSatisfiesTypeBound(arg, uSubst))
+                                deferredTypeBoundFailures_.push_back(
+                                    DeferredTypeBoundFailure{
+                                        t.span.begin, std::string(gp->name),
+                                        std::string(uSubst->declaration->name),
+                                        argSpelling(argAst), arg, uSubst});
+                        }
+                        // else: a substitution that is not a user declaration
+                        // (primitive/builtin/param) → defer (no diagnostic),
+                        // matching checkOneConstraint's conservatism.
+                        continue;
+                    }
+                }
                 checkOneConstraint(t, gp->name, item, argAst, arg,
                                    &boundScope);
             }
