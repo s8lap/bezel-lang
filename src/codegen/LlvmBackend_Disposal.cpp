@@ -754,6 +754,17 @@ void Emitter::emitPendingCheck() {
     bool throwLeavesArm =
         caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
     if (currentCaughtExc_ && throwLeavesArm) {
+        // §30.9 (v0.179): if E1 is a task-owned fault whose disposal was deferred
+        // (its owning task was disposed while E1 was in flight, #1288), its
+        // handling ends HERE via the supersede — the catch-arm's handling-
+        // completion drain will not fire on this unwind edge — so clear the
+        // deferred record before disposing to keep the single dispose here and
+        // leave no stale pointer in the deferred set. A no-op for a handler-owned
+        // E1 (the common #1216 case).
+        builder_.CreateCall(
+            declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {currentCaughtExc_});
         emitDisposeAndReclaim(currentCaughtExc_);
     }
     emitUnwindDisposals();
@@ -785,6 +796,12 @@ void Emitter::emitNewPendingCheck(llvm::Value* obj) {
     bool throwLeavesArm =
         caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
     if (currentCaughtExc_ && throwLeavesArm) {
+        // §30.9 (v0.179): see emitPendingCheck — clear any deferred-dispose
+        // record for a superseded task-owned fault before its single dispose.
+        builder_.CreateCall(
+            declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {currentCaughtExc_});
         emitDisposeAndReclaim(currentCaughtExc_);
     }
     emitUnwindDisposals();
@@ -1534,13 +1551,34 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* borrowBB = llvm::BasicBlock::Create(llvm_, "exc.borrow", fn);
             auto* ownedBB  = llvm::BasicBlock::Create(llvm_, "exc.owned", fn);
             auto* contBB   = llvm::BasicBlock::Create(llvm_, "exc.dispcont", fn);
+            auto* drainBB = llvm::BasicBlock::Create(llvm_, "exc.eo.drain", fn);
             builder_.CreateCondBr(isB, borrowBB, ownedBB);
-            // Borrowed: unmark, do NOT reclaim (the task local's scope-end / the
-            // owning awaiter frees error_obj exactly once).
+            // Borrowed: the fault is owned by the task, not this awaiter — the
+            // awaiter must NOT reclaim it (a SECOND `await t` re-raises the same
+            // live instance, §30.4). Unmark it; handling has now completed.
+            // §30.9 in-flight-deferral (v0.179) terminal act: if the owning task
+            // was disposed WHILE this fault was in flight (a faulted task bound
+            // inside this `try`, unwound by its own fault — #1288 / #1197), its
+            // scope-end recorded the exception for deferred disposal instead of
+            // freeing it mid-dispatch. Perform that deferred dispose now, as the
+            // terminal act of handling; otherwise leave the live instance to its
+            // still-owning task's own scope-end.
             builder_.SetInsertPoint(borrowBB);
             auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(unmarkFn, {obj});
+            auto* isDeferredFn = declareC("bz_is_exc_deferred",
+                                          llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+            llvm::Value* dv = builder_.CreateCall(isDeferredFn, {obj},
+                                                  "exc.deferred");
+            llvm::Value* isD = builder_.CreateICmpNE(
+                dv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+            builder_.CreateCondBr(isD, drainBB, contBB);
+            builder_.SetInsertPoint(drainBB);
+            auto* clearFn = declareC("bz_clear_exc_deferred",
+                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(clearFn, {obj});
+            emitDisposeAndReclaim(obj);
             builder_.CreateBr(contBB);
             // Owned: normal reclaim.
             builder_.SetInsertPoint(ownedBB);
@@ -1907,17 +1945,25 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB = llvm::BasicBlock::Create(llvm_, "task.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, fafBB);
             builder_.SetInsertPoint(fafBB);
-            // §30.4 / §30.9 (#854): a BOUND faulted task's error_obj is BORROWED by
-            // any awaiter (the catch arm skips its reclaim, #854 sites 2-3) — or is
-            // unobserved (never awaited) — so the task LOCAL's scope-end is the
-            // single Bezel-level free of error_obj. bz_task_free / fire-and-forget
-            // frees the task struct + its buffers but NOT the Bezel exception object
-            // (only Bezel codegen can run its destructor). Dispose it here when the
-            // task has faulted; unmark first so the borrowed-set never holds a freed
-            // pointer. (A still-running async task is not yet errored here → skipped;
-            // its unobserved-fault error_obj is a separate residual.) A non-faulted
-            // task has a null error_obj → skipped. bz_task_free below ignores
-            // error_obj, so the now-dangling task->error_obj is never re-read.
+            // §30.9 fault ownership (v0.179): a faulted task OWNS its fault
+            // exception and disposes it exactly once at task disposal — the task
+            // LOCAL's scope-end here (bz_task_free / fire-and-forget frees the task
+            // struct + its buffers but NOT the Bezel exception object; only Bezel
+            // codegen can run its destructor). Two paths:
+            //   • NOT in flight (not borrowed): the fault was already fully handled
+            //     (or never awaited) — dispose the exception now.
+            //   • IN FLIGHT (borrowed by an awaiter mid-dispatch): a faulted task
+            //     bound INSIDE a `try` is unwound by its OWN re-raised fault while
+            //     the exception is still routing to the enclosing catch (#1288 /
+            //     #1197). Disposing it here would free an object the catch arm's
+            //     type-test / binding still reads (UAF / double-free). Instead
+            //     record it for deferred disposal (bz_defer_exc_dispose); the catch
+            //     arm's normal exit performs the dispose as its terminal act (the
+            //     borrowed branch above drains bz_is_exc_deferred). Refinement (a).
+            // (A still-running async task is not yet errored here → skipped; its
+            // unobserved-fault error_obj is a separate residual, #1021.) A
+            // non-faulted task has a null error_obj → skipped. bz_task_free below
+            // ignores error_obj, so the now-dangling task->error_obj is never read.
             {
                 auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
                 llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "task.err");
@@ -1935,9 +1981,24 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                       currentFn_);
                 builder_.CreateCondBr(eoNull, eaBB, doBB);
                 builder_.SetInsertPoint(doBB);
-                auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
-                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(unmarkFn, {eo});
+                // In flight (borrowed) → defer; else dispose now.
+                auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
+                                              llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+                llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
+                                                      "task.eo.borrowed");
+                llvm::Value* isB = builder_.CreateICmpNE(
+                    bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+                auto* deferBB = llvm::BasicBlock::Create(llvm_, "task.eo.defer",
+                                                         currentFn_);
+                auto* dispBB  = llvm::BasicBlock::Create(llvm_, "task.eo.dispnow",
+                                                         currentFn_);
+                builder_.CreateCondBr(isB, deferBB, dispBB);
+                builder_.SetInsertPoint(deferBB);
+                auto* deferFn = declareC("bz_defer_exc_dispose",
+                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(deferFn, {eo});
+                builder_.CreateBr(eaBB);
+                builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(eo);
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);
@@ -2011,9 +2072,28 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                        currentFn_);
                 builder_.CreateCondBr(eoNull, eaBB, doBB);
                 builder_.SetInsertPoint(doBB);
-                auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
-                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(unmarkFn, {eo});
+                // §30.9 in-flight-deferral (v0.179): if the fault is still in
+                // flight (borrowed by an awaiter mid-dispatch — a TCS-backed task
+                // bound inside a `try`, unwound by its own re-raised fault),
+                // defer its disposal to the catch arm's terminal act rather than
+                // freeing the object mid-dispatch (UAF). Otherwise dispose now.
+                auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
+                                              llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+                llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
+                                                      "tcs.eo.borrowed");
+                llvm::Value* isB = builder_.CreateICmpNE(
+                    bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+                auto* deferBB = llvm::BasicBlock::Create(llvm_, "tcs.eo.defer",
+                                                         currentFn_);
+                auto* dispBB  = llvm::BasicBlock::Create(llvm_, "tcs.eo.dispnow",
+                                                         currentFn_);
+                builder_.CreateCondBr(isB, deferBB, dispBB);
+                builder_.SetInsertPoint(deferBB);
+                auto* deferFn = declareC("bz_defer_exc_dispose",
+                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(deferFn, {eo});
+                builder_.CreateBr(eaBB);
+                builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(eo);
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);

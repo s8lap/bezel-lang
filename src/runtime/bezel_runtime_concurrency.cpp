@@ -685,6 +685,34 @@ extern "C" void bz_unmark_exc_borrowed(void* obj) {
     if (obj) g_borrowed_exc.erase(obj);
 }
 
+// §30.9 fault ownership (v0.179), in-flight-deferral refinement (a). A faulted
+// task OWNS its fault exception and disposes it exactly once when the task is
+// disposed — for a `using var`/`var`-bound Task/Task<T> that is at the task
+// local's scope-end, for a TCS at the inner-task disposal. But a task disposed
+// WHILE its own fault exception is still in flight — being routed to / handled
+// by an enclosing catch, as happens when a faulted task bound INSIDE a `try` is
+// unwound by its own re-raised fault (#1288 / #1197) — must NOT destroy the
+// exception mid-dispatch: the catch arm's type-test and binding would then read
+// a freed object (SIGSEGV / double-free). Codegen detects the in-flight case at
+// the task's scope-end disposal (the exception is marked BORROWED —
+// bz_is_exc_borrowed — because an `await`/`.Result` re-raise put it in flight)
+// and, instead of disposing it there, records it here; the disposal is then
+// performed as the TERMINAL ACT of exception handling, at the catch arm's normal
+// exit (bz_is_exc_deferred → codegen emits the real Dispose + reclaim, then
+// bz_clear_exc_deferred). Thread-local like g_borrowed_exc because the in-flight
+// exception slot (bz$exc) is thread-local (§30.14).
+static thread_local std::unordered_set<void*> g_deferred_exc_dispose;
+
+extern "C" void bz_defer_exc_dispose(void* obj) {
+    if (obj) g_deferred_exc_dispose.insert(obj);
+}
+extern "C" int8_t bz_is_exc_deferred(void* obj) {
+    return (obj && g_deferred_exc_dispose.count(obj)) ? 1 : 0;
+}
+extern "C" void bz_clear_exc_deferred(void* obj) {
+    if (obj) g_deferred_exc_dispose.erase(obj);
+}
+
 bool bz_task_is_done(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::lock_guard<std::mutex> lk(task->mtx);
