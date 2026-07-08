@@ -3298,6 +3298,133 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 {other, llvm::ConstantPointerNull::get(ptrTy())});
             return llvm::ConstantInt::get(i32(), 0);  // unit
         }
+        // fix #1478 / stdlib §4.10: OwningSet<T>.ExceptWith(other: IEnumerable<T>)
+        // for class-typed T (array-backed path — class elements are ineligible
+        // for the dict-backed set path since genericBackingType returns null for
+        // class types, so the isSetName block near the top of this method is
+        // dead for every valid OwningSet instantiation; see the #1474 UnionWith
+        // comment above). Unlike UnionWith, `other` here is a BORROW
+        // (`other: IEnumerable<T>`, not `owned`): its elements stay owned by
+        // `other`, and per §4.10 only self's matching elements are removed AND
+        // DISPOSED ("disposes elements in other"). `other` may be any
+        // IEnumerable<T> (Array<T>, another Set, a LINQ pipeline, …), so it is
+        // materialized once via the same lowerToLazyEnumerator + bz_lazy_to_array
+        // path the ToArray() terminal uses (§5) into a throwaway snapshot array
+        // of the SAME borrowed element pointers `other` holds — the snapshot
+        // never takes ownership, so it is freed afterward with a NULL disposer.
+        // Self is then scanned once: for each element that equals some snapshot
+        // entry (§8.3 equality, honouring a user Equals override via
+        // emitRemoveElementEquality), it is removed and disposed via
+        // bz_array_remove_at_disposing, mirroring the .Remove(item) loop above.
+        // The scan index is NOT advanced on a removal — bz_array_remove_at shifts
+        // later elements down into the freed slot, so the next element to test is
+        // already at the same index.
+        if (m == "ExceptWith" && call.args.size() == 1 && call.args[0].value &&
+            isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
+            sema::TypeRef* otherElemRef = nullptr;
+            llvm::Value* lazy =
+                lowerToLazyEnumerator(*call.args[0].value, otherElemRef);
+            if (!lazy) return nullptr;
+            // Element LLVM-type mismatch (an ill-typed `other`) → defer rather
+            // than read snapshot bytes at the wrong stride (mirrors
+            // tryLowerSetAlgebra's same guard for the dict-backed path).
+            if (!otherElemRef ||
+                lowerTypeRef(otherElemRef) != lowerTypeRef(arrElemRef))
+                return nullptr;
+            auto* toArrFn = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* snap = builder_.CreateCall(
+                toArrFn, {lazy, builder_.getInt64(esz)}, "ew.snap");
+
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            llvm::Value* snapLen =
+                builder_.CreateCall(lenFn, {snap}, "ew.slen");
+            llvm::Function* rmDisp = arrElemPol.disposerThunk;
+
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "ew.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ew.b", currentFn_);
+            auto* rmBB   = llvm::BasicBlock::Create(llvm_, "ew.rm", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "ew.n", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ew.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* curLen =
+                builder_.CreateCall(lenFn, {recv}, "ew.len");
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "ew.i");
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx, curLen), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            {
+                llvm::Value* ep = builder_.CreateCall(
+                    ptrFn, {recv, idx, builder_.getInt64(esz)}, "ew.ep");
+                llvm::Value* el = builder_.CreateLoad(ptrTy(), ep, "ew.el");
+
+                // Inner scan: does `el` match any snapshot entry?
+                auto* jSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), jSlot);
+                auto* jcondBB  = llvm::BasicBlock::Create(llvm_, "ew.jc", currentFn_);
+                auto* jbodyBB  = llvm::BasicBlock::Create(llvm_, "ew.jb", currentFn_);
+                auto* jfoundBB = llvm::BasicBlock::Create(llvm_, "ew.jf", currentFn_);
+                auto* jnextBB  = llvm::BasicBlock::Create(llvm_, "ew.jn", currentFn_);
+                auto* jendBB   = llvm::BasicBlock::Create(llvm_, "ew.je", currentFn_);
+                builder_.CreateBr(jcondBB);
+                builder_.SetInsertPoint(jcondBB);
+                llvm::Value* jIdx = builder_.CreateLoad(i64(), jSlot, "ew.j");
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(jIdx, snapLen), jbodyBB, jendBB);
+                builder_.SetInsertPoint(jbodyBB);
+                llvm::Value* jep = builder_.CreateCall(
+                    ptrFn, {snap, jIdx, builder_.getInt64(esz)}, "ew.jep");
+                llvm::Value* sel = builder_.CreateLoad(ptrTy(), jep, "ew.sel");
+                llvm::Value* same = emitRemoveElementEquality(
+                    el, sel, arrElemRef, /*elemIsClass=*/true);
+                if (!same) return nullptr;
+                builder_.CreateCondBr(same, jfoundBB, jnextBB);
+                builder_.SetInsertPoint(jnextBB);
+                builder_.CreateStore(
+                    builder_.CreateAdd(jIdx, builder_.getInt64(1)), jSlot);
+                builder_.CreateBr(jcondBB);
+                builder_.SetInsertPoint(jfoundBB);
+                builder_.CreateBr(jendBB);
+                builder_.SetInsertPoint(jendBB);
+                auto* matched = builder_.CreatePHI(i1(), 2, "ew.matched");
+                matched->addIncoming(builder_.getTrue(), jfoundBB);
+                matched->addIncoming(builder_.getFalse(), jcondBB);
+                builder_.CreateCondBr(matched, rmBB, nextBB);
+            }
+            // Found in `other`: remove (and dispose, per §4.10) self's element.
+            // Do NOT advance idx — the shift-down leaves the next element here.
+            builder_.SetInsertPoint(rmBB);
+            if (rmDisp) {
+                auto* rmFn = declareC("bz_array_remove_at_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), i64(), ptrTy()});
+                builder_.CreateCall(rmFn,
+                    {recv, idx, builder_.getInt64(esz), rmDisp});
+            } else {
+                auto* rmFn = declareC("bz_array_remove_at",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
+                builder_.CreateCall(rmFn, {recv, idx, builder_.getInt64(esz)});
+            }
+            builder_.CreateBr(condBB);
+            // Not found: keep self's element, advance to the next index.
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            // `snap` never took ownership of the (borrowed) elements it copied
+            // from `other` — free its shell only, per the "consumed snapshot"
+            // idiom UnionWith's `other` free uses above.
+            auto* freeSnapFn = declareC("bz_array_free",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(freeSnapFn,
+                {snap, llvm::ConstantPointerNull::get(ptrTy())});
+            return llvm::ConstantInt::get(i32(), 0);  // unit
+        }
         if ((m == "Add" || m == "Push" || m == "Enqueue") &&
             call.args.size() == 1 && call.args[0].value) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
