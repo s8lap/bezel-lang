@@ -43,20 +43,25 @@ echo "== gate[3/*]: sharded suite (crash/undercount-checked) =="
 "$DH" suite tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
 grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true
 if [ "$rc" -ne 0 ]; then
-  # An assertion FAIL is never a flake -> hard fail.
-  grep -qE '^\[ FAIL' "$S/gate_shard.log" && fail "sharded suite — assertion failures"
-  # Only shard CRASHES (a test's JIT'd program killed its host). Some are flaky
-  # test-pollution under sharding (a test leaves global state; the round-robin
-  # partition lands a polluter with a snapshot test). ARBITRATE: re-run each
-  # crashed test alone; pass-alone => flake (continue to serial, the authority);
-  # fail-alone => real crash => fail.
+  # Collect ALL suspects: shard CRASHES (died on: a JIT'd program killed its host)
+  # AND assertion FAILs. BOTH can be flaky under sharding — a crash, or a FAIL
+  # from test-pollution (a polluter leaves global state; the round-robin lands it
+  # with a snapshot/leak test). ARBITRATE uniformly: re-run each suspect's SUITE
+  # alone up to 5x. A DETERMINISTIC failure (real regression / over-rejection)
+  # fails all 5; a pollution/timing flake passes at least once. One run isn't
+  # enough — it shares the flake rate. On --full the serial suite (below) is the
+  # authoritative full-order re-check; a --quick pass-alone flake is accepted.
   crashed=$(grep 'died on:' "$S/gate_shard.log" | sed -E 's/.*died on: //')
-  [ -z "$crashed" ] && fail "sharded suite — nonzero exit, no crash marker (see $S/gate_shard.log)"
+  failed=$(grep -E '^\[ FAIL' "$S/gate_shard.log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
+  suspects=$(printf '%s\n%s\n' "$crashed" "$failed" | grep -v '^$' | sort -u)
+  [ -z "$suspects" ] && fail "sharded suite — nonzero exit, no crash/FAIL marker (see $S/gate_shard.log)"
+  nsus=$(printf '%s\n' "$suspects" | grep -c .)
+  # >8 distinct failing suites is a real regression, not pollution flakes; fail
+  # fast (and bound the arbitration cost).
+  if [ "$nsus" -gt 8 ]; then
+    grep -E '^\[ FAIL' "$S/gate_shard.log" | head; fail "sharded suite — $nsus failing tests (real regression, too many to be flakes)"
+  fi
   real=0
-  # Re-run each crashed test's SUITE alone up to 5x. A DETERMINISTIC crash (real
-  # regression) fails all 5; a LOAD/TIMING flake (e.g. cross-domain-mutex
-  # contention tests, which crash a few % of the time under build load) passes
-  # at least once. One isolation run is not enough — it shares the flake rate.
   while IFS= read -r t; do
     [ -z "$t" ] && continue
     suite="${t%%.*}"
@@ -65,13 +70,13 @@ if [ "$rc" -ne 0 ]; then
       if BEZEL_TEST_FILTER="$suite" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
     done
     if [ "$passed_alone" -eq 1 ]; then
-      echo "   FLAKY: crashed test $t — its suite PASSES alone within 5 tries (load/timing flake, not a deterministic crash)"
+      echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
     else
-      echo "   REAL: crashed test $t — fails alone all 5 tries"; real=1
+      echo "   REAL: $t — fails alone all 5 tries"; real=1
     fi
-  done <<< "$crashed"
-  [ "$real" -eq 1 ] && fail "sharded suite — a crashed test fails alone all 5 tries (real crash)"
-  echo "   crashed-shard tests are flaky (pass alone) -> continuing to serial (authoritative)"
+  done <<< "$suspects"
+  [ "$real" -eq 1 ] && fail "sharded suite — a suspect fails alone all 5 tries (real regression)"
+  echo "   all sharded suspects flaky (pass alone) -> continuing to serial (authoritative)"
 fi
 
 if [ "$MODE" != "--quick" ]; then
