@@ -1581,6 +1581,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         smIterFinallyAtState_.clear();
         smIterDisposalsAtState_.clear();  // #821 (async)
         smIterEnumFramesAtState_.clear();  // §29.7 (#944): no stale entries
+        smIterCleanupAtState_.clear();     // fix #1567: no stale unified entries
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
@@ -1837,6 +1838,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         smIterFinallyAtState_.clear();
         smIterDisposalsAtState_.clear();  // #821
         smIterEnumFramesAtState_.clear();  // §29.7 (#944)
+        smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         finallyBodyStack_.clear();
     }

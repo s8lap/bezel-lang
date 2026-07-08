@@ -928,6 +928,17 @@ private:
         // later, when the try itself exits). Only a break/continue that EXITS
         // the try (target loop at/below this depth) routes through the finally.
         std::size_t loopDepthAtEntry = 0;
+        // fix #1567 / §29.7/§28.10 (v0.182): disposeStack_ depth at this try's
+        // entry (== the `unwindScopeDepth_`/`thisTryDepth` captured in lowerTry).
+        // A `return`/`break`/`continue` routing through this finally disposes only
+        // the try-BODY scopes (indices >= this depth) BEFORE the finally runs; the
+        // ENCLOSING scopes (indices < this depth) are disposed AFTER the finally,
+        // as the exit edge unwinds further outward — the same reverse-establishment
+        // interleave the exception edge realizes via finUnwindBB +
+        // emitUnwindDisposalsInRange. Without this, an enclosing `using var`
+        // established before the try was disposed BEFORE the finally, a
+        // use-after-dispose if the finally touches it.
+        std::size_t disposeDepthAtEntry = 0;
         // #721 C1: an async method's `return` exits via emitAsyncComplete, not a
         // function `ret`, so its unwrapped result value can't ride retValSlot
         // (typed as the void Resume return). This slot (typed asyncResultTy_)
@@ -983,6 +994,36 @@ private:
     // body. The yield snapshot consults this to record live frames in
     // smIterEnumFramesAtState_. Reset per iterator body.
     std::unordered_map<llvm::AllocaInst*, unsigned> smIterEnumFrameSlot_;
+
+    // fix #1567 / §29.7/§28.10 (v0.182): per-yield-state → the ONE
+    // establishment-ordered cleanup stack active at that yield. `using var`
+    // disposals, for-in enumerator-frame disposals, and `finally` bodies form a
+    // SINGLE establishment-ordered stack (§28.10: "one establishment-ordered
+    // stack ... no edge runs the two kinds in separate category-ordered phases").
+    // On early Dispose (§29.7) they run in exact REVERSE of this vector — a
+    // `finally` established when the dispose-stack had depth d sits, in
+    // establishment order, immediately before scope d (after every scope < d,
+    // before every scope >= d), so it runs before the enclosing scopes' disposals
+    // and after its own try-body's. The pre-v0.182 code ran all using-var
+    // disposals, then all finally bodies (category phases), inverting the order
+    // for a finally that touched an enclosing `using var` — a use-after-dispose.
+    // This replaces the three category-split maps above for the SYNC iterator
+    // Dispose; those maps remain for the async-iterator Dispose (its ordering is
+    // tracked as a separate follow-up).
+    struct IterCleanup {
+        enum class Kind { Disposal, EnumFrame, Finally };
+        Kind kind;
+        // Kind::Disposal — the decl node (to rebind the restored alloca slot in
+        // Dispose) and the Disposal action recorded at snapshot time.
+        const ast::Node* node = nullptr;
+        Disposal disposal{};
+        // Kind::EnumFrame — the frame field index holding the live for-in
+        // enumerator/source frame (disposed via iterator-vtable slot 1).
+        unsigned frameField = 0;
+        // Kind::Finally — the finally-body AST to re-run under Dispose.
+        const std::vector<std::unique_ptr<ast::Stmt>>* finallyBody = nullptr;
+    };
+    std::unordered_map<unsigned, std::vector<IterCleanup>> smIterCleanupAtState_;
 
     // CG20: exception handling (explicit-unwinding model). A module-level
     // global holds the in-flight exception (null when none). A `throw` and
@@ -3740,6 +3781,16 @@ private:
     // the explicit finally body has run. See the definition for the full
     // rationale.
     void emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi);
+
+    // fix #1567 / §29.7/§28.10 (v0.182): the NORMAL-exit analogue of
+    // emitUnwindDisposalsInRange — dispose disposeStack_ scopes in the half-open
+    // index range [lo, hi), innermost (higher index) first, on a non-unwind exit
+    // edge (isUnwind=false: caughtException entries are NOT skipped). Used by a
+    // `return` (and the finally normal-exit dispatch it routes through) to
+    // dispose the scopes between two successive finally bodies in reverse
+    // establishment order, so an enclosing `using var` is disposed AFTER an inner
+    // finally rather than before it.
+    void emitDisposalsInRange(std::size_t lo, std::size_t hi);
 
     // CG20/CG21: after a call that may throw, branch to the unwind target
     // when the exception global is non-null (disposing unwound using-vars

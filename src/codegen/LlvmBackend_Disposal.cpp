@@ -2470,4 +2470,17 @@ void Emitter::emitLoopDisposals(std::size_t loopScopeDepth) {
 }
 
 
+void Emitter::emitDisposalsInRange(std::size_t lo, std::size_t hi) {
+    // fix #1567 / §29.7/§28.10 (v0.182): the normal-exit twin of
+    // emitUnwindDisposalsInRange — dispose scopes [lo, hi) innermost-first, but
+    // on the NON-unwind (isUnwind=false) path so caughtException entries are not
+    // skipped. A `return` routing through a `finally` uses this to dispose only
+    // the try-body scopes before the finally and, in the finally's normal-exit
+    // dispatch, the enclosing scopes after it — reverse establishment order.
+    if (hi > disposeStack_.size()) hi = disposeStack_.size();
+    for (std::size_t i = hi; i-- > lo;)
+        emitDisposals(disposeStack_[i]);
+}
+
+
 }  // namespace bezel::codegen

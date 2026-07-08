@@ -1156,20 +1156,29 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 }
             }
-            emitAllDisposals();
             // #721 C1 / §30.9: a `return` exiting a try-with-finally must run the
             // finally first. Stash the unwrapped result and route through the
             // active finally (exit mode 5); the post-finally dispatch (lowerTry)
             // performs emitAsyncComplete + RetVoid. Without this the finally is
             // silently skipped on the async-return edge.
+            // fix #1567 / §29.7/§28.10 (v0.182): the async-method return edge
+            // obeys the same reverse-establishment rule as the sync return edge
+            // above — dispose ONLY the try-body scopes (>= the finally's entry
+            // depth) here; the mode-5 dispatch (lowerTry) disposes the enclosing
+            // scopes AFTER the finally runs. The pre-v0.182 emitAllDisposals()
+            // before the finally freed an enclosing `using var` before a finally
+            // that touched it, a use-after-dispose.
             if (!finallyStack_.empty()) {
                 auto& fr = finallyStack_.back();
+                emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
                 if (v && fr.asyncRetSlot)
                     builder_.CreateStore(v, fr.asyncRetSlot);
                 builder_.CreateStore(builder_.getInt32(5), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
                 return true;
             }
+            // No enclosing finally: dispose all live scopes, then complete.
+            emitAllDisposals();
             // §30.5 / #1332 (v0.162): Pattern A chained return — chain the source
             // task (set by emitAwaitSuspend into asyncPendingTaskField_ and NOT freed
             // because asyncChainedReturn_ suppressed bz_task_free) to the outer task
@@ -1331,17 +1340,27 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     scope.end());
             }
         }
-        emitAllDisposals();
-        // CG21c (§31.2): if inside a try-with-finally, stash the return
-        // value and route through the finally block instead of ret-ing now.
+        // CG21c (§31.2): if inside a try-with-finally, stash the return value
+        // and route through the finally block instead of ret-ing now.
+        // fix #1567 / §29.7/§28.10 (v0.182): cleanup runs in REVERSE
+        // establishment order on the return edge, uniformly with the exception
+        // edge. Dispose ONLY the try-body scopes (indices >= the innermost
+        // finally's entry depth) here — the enclosing scopes established before
+        // the try are disposed by the finally's normal-exit dispatch AFTER the
+        // finally body runs (see mode=1 in lowerTry). The pre-v0.182 code ran
+        // emitAllDisposals() before the finally, disposing an enclosing
+        // `using var` BEFORE a finally that may touch it — a use-after-dispose.
         if (!finallyStack_.empty()) {
             auto& fr = finallyStack_.back();
+            emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
             if (fr.retValSlot && v)
                 builder_.CreateStore(v, fr.retValSlot);
             builder_.CreateStore(builder_.getInt32(1), fr.exitModSlot);
             builder_.CreateBr(fr.finNormalBB);
             return true;
         }
+        // No enclosing finally: dispose all live scopes, then ret.
+        emitAllDisposals();
         emitReturn(currentFn_, v);
         return true;
     }
@@ -1771,6 +1790,70 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!activeFrames.empty())
                     smIterEnumFramesAtState_[nextState] = std::move(activeFrames);
             }
+            // fix #1567 / §29.7/§28.10 (v0.182): build the ONE establishment-
+            // ordered cleanup stack for this suspend state — using-var disposals,
+            // for-in enumerator-frame disposals, and finally bodies in the single
+            // order they were established. The SYNC iterator Dispose consumes this
+            // and runs it in exact reverse (§28.10: one establishment-ordered
+            // stack, no category-ordered phases); the category-split maps above
+            // remain for the async iterator Dispose (a separate follow-up). A
+            // finally established when the dispose-stack had depth d sits, in
+            // establishment order, immediately before scope d (after every scope
+            // < d, before every scope >= d), so early Dispose runs it AFTER its
+            // own try body's using-var disposals and BEFORE the enclosing scopes'
+            // — reverse establishment, matching the exception edge. finallyStack_
+            // is outermost-first (increasing disposeDepthAtEntry) and parallel to
+            // finallyBodyStack_.
+            {
+                std::vector<IterCleanup> actions;
+                std::size_t finIdx = 0;
+                auto flushFinallysBefore = [&](std::size_t depth) {
+                    while (finIdx < finallyStack_.size() &&
+                           finIdx < finallyBodyStack_.size() &&
+                           finallyStack_[finIdx].disposeDepthAtEntry == depth) {
+                        IterCleanup act;
+                        act.kind = IterCleanup::Kind::Finally;
+                        act.finallyBody = finallyBodyStack_[finIdx];
+                        actions.push_back(act);
+                        ++finIdx;
+                    }
+                };
+                for (std::size_t i = 0; i < disposeStack_.size(); ++i) {
+                    flushFinallysBefore(i);  // finally@depth i precedes scope i
+                    for (const Disposal& d : disposeStack_[i]) {
+                        if (d.caughtException || d.unwindOnly) continue;
+                        if (d.iterEnumDispose) {
+                            auto* alloca =
+                                llvm::dyn_cast_or_null<llvm::AllocaInst>(d.slot);
+                            auto fit = alloca ? smIterEnumFrameSlot_.find(alloca)
+                                              : smIterEnumFrameSlot_.end();
+                            if (alloca && fit != smIterEnumFrameSlot_.end()) {
+                                IterCleanup act;
+                                act.kind = IterCleanup::Kind::EnumFrame;
+                                act.frameField = fit->second;
+                                actions.push_back(act);
+                            }
+                            continue;
+                        }
+                        const ast::Node* node = nullptr;
+                        for (const auto& [n, s] : locals_)
+                            if (s == d.slot) { node = n; break; }
+                        if (node) {
+                            IterCleanup act;
+                            act.kind = IterCleanup::Kind::Disposal;
+                            act.node = node;
+                            act.disposal = d;
+                            actions.push_back(act);
+                        }
+                    }
+                }
+                // Defensive: a finally at depth == disposeStack_.size() sorts
+                // after all scopes; in practice the yield is inside the try body,
+                // so a body scope exists and no such finally remains.
+                flushFinallysBefore(disposeStack_.size());
+                if (!actions.empty())
+                    smIterCleanupAtState_[nextState] = std::move(actions);
+            }
             builder_.CreateStore(builder_.getInt32((int)nextState), smStateGEP_);
             if (isAsyncYield) {
                 emitAsyncIterComplete(/*hasValue=*/true);
@@ -1866,6 +1949,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // break/continue of a loop opened INSIDE the try body must not route
         // through this finally (see the break/continue handlers).
         frame.loopDepthAtEntry = loopStack_.size();
+        // fix #1567 / §29.7/§28.10 (v0.182): the dispose-stack depth at this
+        // try's entry. disposeStack_ is not touched between here and the
+        // `unwindScopeDepth_ = disposeStack_.size()` below, so this equals the
+        // `thisTryDepth` the unwind path uses. A return/break/continue routing
+        // through this finally disposes scopes >= this depth (the try body)
+        // before the finally and the enclosing scopes < this depth after it.
+        frame.disposeDepthAtEntry = disposeStack_.size();
         finallyStack_.push_back(frame);
         // §29.7 (#623): track the AST finally-body alongside the frame so
         // a yield inside this try can snapshot the chain for Dispose.
@@ -2112,6 +2202,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         sw->addCase(builder_.getInt32(1), retDispBB);
         builder_.SetInsertPoint(retDispBB);
         if (outerFr) {
+            // fix #1567 / §29.7/§28.10 (v0.182): the finally body has now run;
+            // dispose the scopes established between THIS finally and the next-
+            // outer finally (reverse establishment) BEFORE routing the return
+            // onward, then let the outer finally run and dispose its own outer
+            // range. This is the normal-exit twin of the exception path's
+            // emitUnwindDisposalsInRange(savedDepth, thisTryDepth) below.
+            emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
             // Route through outer finally (nested try-with-finally).
             builder_.CreateStore(builder_.getInt32(1), outerFr->exitModSlot);
             if (retValSlot && outerFr->retValSlot) {
@@ -2120,6 +2217,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             }
             builder_.CreateBr(outerFr->finNormalBB);
         } else {
+            // fix #1567 / §29.7/§28.10 (v0.182): no enclosing finally — dispose
+            // every remaining scope established before this try (indices
+            // [0, thisTryDepth)), AFTER the finally body, then ret. Together with
+            // the return site's disposal of the try-body scopes (>= thisTryDepth)
+            // this disposes all live scopes in reverse establishment order with
+            // the finally interleaved at its establishment point.
+            emitDisposalsInRange(0, thisTryDepth);
             llvm::Value* rv = (retValSlot && retTy && !retTy->isVoidTy())
                 ? builder_.CreateLoad(retTy, retValSlot) : nullptr;
             emitReturn(currentFn_, rv);
@@ -2188,6 +2292,11 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             sw->addCase(builder_.getInt32(5), arDispBB);
             builder_.SetInsertPoint(arDispBB);
             if (outerFr) {
+                // fix #1567 / §29.7/§28.10 (v0.182): dispose the scopes between
+                // this finally and the next-outer finally (reverse establishment)
+                // after this finally body, before routing the async return onward
+                // — the mode-5 twin of mode 1.
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
                 builder_.CreateStore(builder_.getInt32(5), outerFr->exitModSlot);
                 if (asyncRetSlot && outerFr->asyncRetSlot && asyncResultTy_) {
                     llvm::Value* rv =
@@ -2196,6 +2305,10 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 }
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
+                // fix #1567 / §29.7/§28.10 (v0.182): no enclosing finally —
+                // dispose every remaining scope established before this try
+                // AFTER the finally body, then complete the outer task.
+                emitDisposalsInRange(0, thisTryDepth);
                 llvm::Value* rv = (asyncRetSlot && asyncResultTy_)
                     ? builder_.CreateLoad(asyncResultTy_, asyncRetSlot)
                     : nullptr;

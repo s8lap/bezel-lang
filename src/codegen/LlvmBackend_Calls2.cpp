@@ -5798,6 +5798,10 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     auto savedSmForInSrcFields = std::move(smForInSrcFields_);
     auto savedSmAllocaToField = std::move(smAllocaToField_);
     auto savedSmIterEnumFrames = std::move(smIterEnumFramesAtState_);
+    // fix #1567: preserve the outer iterator's unified establishment-ordered
+    // cleanup snapshot across a nested SM emission (parallel to the enum-frame
+    // save above).
+    auto savedSmIterCleanup = std::move(smIterCleanupAtState_);
     auto savedAsyncHandlerSpill = std::move(asyncHandlerSpillSlots_);
     // #1062: RESET the SM scalars to their fresh top-level values before the
     // helper runs — saving alone is not enough. emitResumeDispatch
@@ -5977,6 +5981,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     smForInSrcFields_ = std::move(savedSmForInSrcFields);
     smAllocaToField_ = std::move(savedSmAllocaToField);
     smIterEnumFramesAtState_ = std::move(savedSmIterEnumFrames);
+    smIterCleanupAtState_ = std::move(savedSmIterCleanup);  // fix #1567
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpill);
 
     return specFn;

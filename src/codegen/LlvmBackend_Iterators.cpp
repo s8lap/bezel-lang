@@ -785,6 +785,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smIterFinallyAtState_.clear();
         smIterDisposalsAtState_.clear();  // #821
         smIterEnumFramesAtState_.clear();  // §29.7 (#944)
+        smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
@@ -1092,9 +1093,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // If no yield was ever inside a try/finally AND no `using var` was active
         // at any yield (#821) AND no for-in enumerator/source frame was live at a
-        // yield (#944), emit a simple free + return.
-        if (smIterFinallyAtState_.empty() && smIterDisposalsAtState_.empty() &&
-            smIterEnumFramesAtState_.empty()) {
+        // yield (#944), emit a simple free + return. fix #1567: the unified
+        // establishment-ordered stack (smIterCleanupAtState_) is the superset of
+        // all three; empty iff there is nothing to run.
+        if (smIterCleanupAtState_.empty()) {
             // Mark done so a second Dispose is a no-op (not strictly necessary
             // when there are no finally chains, but keeps the contract clean).
             llvm::Value* stateGEP2 =
@@ -1115,12 +1117,12 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
             // Mark done immediately so re-entrant Dispose is a no-op.
             builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
-            // The union of states that have a finally chain, active using-var
-            // disposals (#821), and/or live for-in enumerator/source frames (#944).
+            // fix #1567 / §29.7/§28.10 (v0.182): the states that have any pending
+            // cleanup — one unified establishment-ordered stack per state (a
+            // finally chain, active using-var disposals #821, and/or live for-in
+            // enumerator/source frames #944, in one list).
             std::set<unsigned> states;
-            for (auto& kv : smIterFinallyAtState_) states.insert(kv.first);
-            for (auto& kv : smIterDisposalsAtState_) states.insert(kv.first);
-            for (auto& kv : smIterEnumFramesAtState_) states.insert(kv.first);
+            for (auto& kv : smIterCleanupAtState_) states.insert(kv.first);
             auto* sw = builder_.CreateSwitch(curState, doneBB,
                                              (unsigned)states.size());
 
@@ -1129,74 +1131,74 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     llvm_, "dsp.s" + std::to_string(stateIdx), targetFn);
                 sw->addCase(builder_.getInt32((int)stateIdx), chainBB);
                 builder_.SetInsertPoint(chainBB);
-                // #821 / §29.7: dispose the `using var` resources active at this
-                // yield, innermost-first (recorded outermost-first). Rebind each
-                // Disposal's slot to the Dispose-restored local (the frame field
-                // was restored into locals_ above) and run the normal disposal.
-                auto dit = smIterDisposalsAtState_.find(stateIdx);
-                if (dit != smIterDisposalsAtState_.end()) {
-                    for (auto rit = dit->second.rbegin();
-                         rit != dit->second.rend(); ++rit) {
-                        auto lit = locals_.find(rit->first);
-                        if (lit == locals_.end()) continue;  // not restored
-                        Disposal d = rit->second;
-                        d.slot = lit->second;
-                        std::vector<Disposal> one{d};
-                        emitDisposals(one);
-                    }
-                }
-                // §29.7 (#944): dispose the for-in implicit enumerator/source
-                // frames live at this yield, innermost-first (recorded
-                // outermost-first). Each is a frame ptr in a dedicated frame
-                // field; GEP it, load, null-guard, dispatch the iterator-vtable
-                // slot-1 Dispose (which recursively disposes the inner iterator's
-                // own active using-vars + frees its frame), then null the field so
-                // a re-entrant Dispose is a no-op. This is the SOLE disposal of
-                // these frames on the abandon-mid-loop path (the loop's own
-                // scope-exit/break disposal never ran — we suspended out of the
-                // body), so exactly once.
-                auto eit = smIterEnumFramesAtState_.find(stateIdx);
-                if (eit != smIterEnumFramesAtState_.end()) {
-                    for (auto rfit = eit->second.rbegin();
-                         rfit != eit->second.rend(); ++rfit) {
-                        unsigned fieldIdx = *rfit;
-                        llvm::Value* fptr = builder_.CreateStructGEP(
-                            stateStructTy, self, fieldIdx);
-                        llvm::Value* obj =
-                            builder_.CreateLoad(ptrTy(), fptr, "fie.obj");
-                        llvm::Value* isNull = builder_.CreateICmpEQ(
-                            obj, llvm::ConstantPointerNull::get(ptrTy()),
-                            "fie.isnull");
-                        auto* dispBB = llvm::BasicBlock::Create(
-                            llvm_, "fie.dispose", targetFn);
-                        auto* contBB = llvm::BasicBlock::Create(
-                            llvm_, "fie.cont", targetFn);
-                        builder_.CreateCondBr(isNull, contBB, dispBB);
-                        builder_.SetInsertPoint(dispBB);
-                        // Iterator-vtable slot 1 = Dispose.
-                        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
-                        llvm::Value* dispSlot = builder_.CreateGEP(
-                            ptrTy(), vt, {builder_.getInt32(1)});
-                        llvm::Value* dispFnPtr =
-                            builder_.CreateLoad(ptrTy(), dispSlot);
-                        auto* dispTy = llvm::FunctionType::get(
-                            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
-                        builder_.CreateCall(dispTy, dispFnPtr, {obj});
-                        builder_.CreateStore(
-                            llvm::ConstantPointerNull::get(ptrTy()), fptr);
-                        builder_.CreateBr(contBB);
-                        builder_.SetInsertPoint(contBB);
-                    }
-                }
-                // Run finally bodies innermost-first (chain is outermost-first,
-                // so iterate in reverse per §29.7 / §28.11).
-                auto fit = smIterFinallyAtState_.find(stateIdx);
-                if (fit != smIterFinallyAtState_.end()) {
-                    for (auto it = fit->second.rbegin();
-                         it != fit->second.rend(); ++it) {
-                        disposeStack_.emplace_back();
-                        lowerBody(**it);
-                        disposeStack_.pop_back();
+                // fix #1567 / §29.7/§28.10 (v0.182): run the ONE establishment-
+                // ordered cleanup stack active at this yield in exact REVERSE —
+                // using-var disposals, for-in enumerator-frame disposals, and
+                // finally bodies interleaved by establishment position (a finally
+                // established before an enclosing `using var` runs before that
+                // using var's disposal, and vice versa; §28.10). The pre-v0.182
+                // code ran all using-var disposals, then all finally bodies
+                // (category phases), disposing an enclosing `using var` BEFORE a
+                // finally that touched it — a use-after-dispose.
+                auto cit = smIterCleanupAtState_.find(stateIdx);
+                if (cit != smIterCleanupAtState_.end()) {
+                    for (auto rit = cit->second.rbegin();
+                         rit != cit->second.rend(); ++rit) {
+                        const IterCleanup& ac = *rit;
+                        if (ac.kind == IterCleanup::Kind::Disposal) {
+                            // #821 / §29.7: rebind the Disposal's slot to the
+                            // Dispose-restored local (the frame field was restored
+                            // into locals_ above) and run the normal disposal.
+                            auto lit = locals_.find(ac.node);
+                            if (lit == locals_.end()) continue;  // not restored
+                            Disposal d = ac.disposal;
+                            d.slot = lit->second;
+                            std::vector<Disposal> one{d};
+                            emitDisposals(one);
+                        } else if (ac.kind == IterCleanup::Kind::EnumFrame) {
+                            // §29.7 (#944): dispose a for-in implicit enumerator/
+                            // source frame — a frame ptr in a dedicated field. GEP
+                            // it, load, null-guard, dispatch the iterator-vtable
+                            // slot-1 Dispose (which recursively disposes the inner
+                            // iterator's own active using-vars + frees its frame),
+                            // then null the field so a re-entrant Dispose is a
+                            // no-op. This is the SOLE disposal of these frames on
+                            // the abandon-mid-loop path (the loop's own
+                            // scope-exit/break disposal never ran — we suspended
+                            // out of the body), so exactly once.
+                            unsigned fieldIdx = ac.frameField;
+                            llvm::Value* fptr = builder_.CreateStructGEP(
+                                stateStructTy, self, fieldIdx);
+                            llvm::Value* obj =
+                                builder_.CreateLoad(ptrTy(), fptr, "fie.obj");
+                            llvm::Value* isNull = builder_.CreateICmpEQ(
+                                obj, llvm::ConstantPointerNull::get(ptrTy()),
+                                "fie.isnull");
+                            auto* dispBB = llvm::BasicBlock::Create(
+                                llvm_, "fie.dispose", targetFn);
+                            auto* contBB = llvm::BasicBlock::Create(
+                                llvm_, "fie.cont", targetFn);
+                            builder_.CreateCondBr(isNull, contBB, dispBB);
+                            builder_.SetInsertPoint(dispBB);
+                            // Iterator-vtable slot 1 = Dispose.
+                            llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+                            llvm::Value* dispSlot = builder_.CreateGEP(
+                                ptrTy(), vt, {builder_.getInt32(1)});
+                            llvm::Value* dispFnPtr =
+                                builder_.CreateLoad(ptrTy(), dispSlot);
+                            auto* dispTy = llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+                            builder_.CreateCall(dispTy, dispFnPtr, {obj});
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                            builder_.CreateBr(contBB);
+                            builder_.SetInsertPoint(contBB);
+                        } else {  // IterCleanup::Kind::Finally
+                            // Run one finally body (§29.7 / §28.11).
+                            disposeStack_.emplace_back();
+                            lowerBody(*ac.finallyBody);
+                            disposeStack_.pop_back();
+                        }
                     }
                 }
                 builder_.CreateBr(doneBB);
@@ -1222,6 +1224,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     smIterFinallyAtState_.clear();
     smIterDisposalsAtState_.clear();  // #821
     smIterEnumFramesAtState_.clear();  // §29.7 (#944)
+    smIterCleanupAtState_.clear();     // fix #1567 §29.7/§28.10 (v0.182)
     smIterEnumFrameSlot_.clear();      // §29.7 (#944)
     finallyBodyStack_.clear();
 }
