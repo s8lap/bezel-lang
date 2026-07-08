@@ -425,6 +425,27 @@ BEZEL_TEST(static_iface_dispatch_807, tryparse_bridge_byte_range) {
         "end Main; end C;"), 253);
 }
 
+// §11.8/§22.4/§1585 (guards the #1597-regression fix): the `when true`
+// out-nullability postcondition on `IParsable<T>.TryParse` narrows `v: T?`
+// non-null ONLY inside the controlled `then` branch (stdlib §1's Try
+// convention, normative for the §11.8 `TryParse` companions). It must NOT
+// leak past the `if`: a path exists on which the call was `false` (or, under
+// §11.6 short-circuit DA, did not run at all), so `v` is still `T?` there and
+// returning it as non-nullable `T` is a §7 error. This pins the narrowing
+// scope so the checkAssignable generic-type-parameter unwrap can never
+// over-narrow an un-narrowed `T?`.
+BEZEL_TEST(static_iface_dispatch_807, tryparse_bridge_narrowing_scoped_to_then) {
+    BEZEL_EXPECT_TRUE(rejects(
+        "module M; static class F "
+        "  public static method Try<T>(s: string): T "
+        "      where T: IParsable<T> "
+        "    if T.TryParse(s, out var v) then end; "
+        "    return v; "
+        "  end Try; "
+        "end F; "
+        "class C public static method Main(): int => 0; end C;"));
+}
+
 // ── §11.8: user-type Parse/TryParse (direct static calls, no bridge) ────────
 
 BEZEL_TEST(static_iface_dispatch_807, user_parse_meters) {

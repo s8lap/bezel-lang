@@ -1048,9 +1048,19 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     // narrowed (non-null) pointer assigns directly to a non-nullable reference
     // slot. (For a class reference the assignment still needs `move` — that
     // ownership rule is orthogonal and enforced separately.)
+    // §11.8/§22.4/§1585 (fixes #1597 regression): a null-declaration Named
+    // `from` — a generic type parameter (`T?`, declaration == nullptr) — is
+    // also unwrapped when narrowed. The `if T.TryParse(s, out var v) then
+    // return v; end` bridge narrows `v: T?` non-null via the `when true`
+    // out-postcondition (narrowFromOutPostcond); `return v` must then satisfy
+    // the non-nullable `T` return exactly as the concrete-type case does. The
+    // clone-and-clear `else` branch below handles any Named `from` uniformly;
+    // codegen's return coercion (unwrapNarrowedNullable / coerceReturnToNullable
+    // Value) extracts the value when the monomorphized `T?` is a tagged optional
+    // and is a no-op when it is a bare reference pointer.
     if (fromExpr && from->nullable && !to->nullable &&
         (from->kind == TypeRef::Kind::Primitive ||
-         (from->kind == TypeRef::Kind::Named && from->declaration))) {
+         from->kind == TypeRef::Kind::Named)) {
         // Peel a `move x` wrapper (#1056): a class/interface reference assignment
         // transfers ownership via `move`, so `fromExpr` is a UnaryExpr whose
         // operand is the narrowed identifier (value-type copies have the bare

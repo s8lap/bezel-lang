@@ -507,7 +507,14 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         // One member spec: a static method (isOp=false, name) or a static
         // operator (isOp=true, token). Type spellings admitted: "T", "T?",
         // "bool", "long", "string" — the §2.19 surface.
-        struct SParam { const char* pname; const char* type; const char* mod; };
+        struct SParam {
+            const char* pname;
+            const char* type;
+            const char* mod;
+            // §22.4/§1585 (stdlib §1): a shape-(a) Try out-parameter's
+            // `when true` nullability postcondition, or None when absent.
+            ast::OutNullWhen postcond = ast::OutNullWhen::None;
+        };
         struct SMember {
             bool isOp;
             const char* nameOrToken;
@@ -531,10 +538,20 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                 {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool"},
             };
         } else {  // IParsable
+            // stdlib §1 / §2.19: `TryParse` is a shape-(a) Try — its `out`
+            // parameter is `T?` and carries the `when true` nullability
+            // postcondition (elided from the stdlib listing for brevity but
+            // normative for "the §11.8 `TryParse` companions"). Without it the
+            // §22.4 caller narrowing never fires for the generic `T.TryParse`
+            // bridge, so `if T.TryParse(s, out var v) then … return v; end`
+            // wrongly sees `v` as still-nullable `T?` (regression from #1597,
+            // which correctly stopped stripping the `?` off the recipient).
             smembers = {
                 {false, "Parse", {{"s", "string", ""}}, "T"},
                 {false, "TryParse",
-                 {{"s", "string", ""}, {"value", "T?", "out"}}, "bool"},
+                 {{"s", "string", ""},
+                  {"value", "T?", "out", ast::OutNullWhen::WhenTrue}},
+                 "bool"},
             };
         }
 
@@ -613,6 +630,7 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                     ast::Param p;
                     p.name = sp.pname;
                     p.modifier = sp.mod;
+                    p.outNullPostcond = sp.postcond;  // §22.4/§1585
                     p.type = makeTypeNode(sp.type);
                     preResolve(p.type.get());
                     rm.paramTypes.push_back(p.type.get());
@@ -654,6 +672,10 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                 auto* ps = makeSymbol<ParameterSymbol>();
                 ps->name = sm.params[p].pname;
                 ps->modifier = sm.params[p].mod;
+                // §22.4/§1585 (stdlib §1): carry the out-nullability
+                // postcondition onto the symbol the caller-side narrowing
+                // (narrowFromOutPostcond) reads for the `T.TryParse` bridge.
+                ps->outNullPostcond = sm.params[p].postcond;
                 ps->declType = rm.paramTypes[p];
                 ms->params.push_back(ps);
             }
