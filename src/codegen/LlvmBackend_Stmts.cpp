@@ -1380,6 +1380,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         }
         // No enclosing finally: dispose all live scopes, then ret.
         emitAllDisposals();
+        // fix #1607 / §28.3/§28.4 (§3459: `return;` exits a destructor early):
+        // an early `return;` inside a user destructor body is a second
+        // reachable exit from emitDisposerCore's bz_exc park (see
+        // LlvmBackend_Disposal.cpp). Without restoring here, the still
+        // in-flight propagating exception parked at disposer entry would stay
+        // cleared forever on this path — turning the pre-existing "early
+        // return skips owned-field disposal" deferred corner into a strictly
+        // worse one (the exception itself silently vanishes, rather than just
+        // skipping extra cleanup). Combine via select with any genuinely NEW
+        // exception the body itself raised before this point, mirroring the
+        // normal-completion restore.
+        if (emittingDisposerBody_ && disposerEntryExc_) {
+            llvm::Value* excNow = builder_.CreateLoad(ptrTy(), emitExcSlot());
+            llvm::Value* isNew = builder_.CreateICmpNE(
+                excNow, llvm::ConstantPointerNull::get(ptrTy()));
+            llvm::Value* restored = builder_.CreateSelect(
+                isNew, excNow, disposerEntryExc_);
+            builder_.CreateStore(restored, emitExcSlot());
+        }
         emitReturn(currentFn_, v);
         return true;
     }

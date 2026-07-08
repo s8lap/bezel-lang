@@ -2119,4 +2119,168 @@ BEZEL_TEST(codegen_1468, dtor_static_call_without_callee_static_touch_disposed) 
     BEZEL_EXPECT_EQ(run(kDtorStaticCallNoStaticTouch_1468), 1);
 }
 
+// #1607 §28.3 "Exception-path discharge" / §28.4 — residual of #1468: a
+// destructor that calls a user static METHOD whose body ITSELF touches a user
+// static was still silently skipped during exception unwinding, even after the
+// #1468 fix.
+//
+// Root cause: the #1468 fix's AND-trick (emitPendingCheck comparing bz_exc
+// against the value captured at disposer entry) only covers pending-checks
+// emitted DIRECTLY inside the destructor body (gated on
+// emittingDisposerBody_). It does not cover a CALLEE compiled as an ordinary
+// function — here, `Bump`, a plain static method whose own body touches
+// S.x. Bump is compiled once with emittingDisposerBody_ == false, so its own
+// §22.13 static-init guard reads the raw bz_exc slot with no adjustment: on
+// the unwind path bz_exc already holds the propagating exception, so Bump's
+// guard misread it as "Bump itself just threw" and returned before running
+// the rest of Bump's body — S.x never incremented.
+//
+// Fix: emitDisposerCore now PARKS bz_exc (save + clear) for the run of the
+// destructor body, so every callee — Bump, and anything it transitively
+// calls — runs in a clean exception context; the parked value (combined via
+// select with any genuinely NEW exception the body raised) is restored at
+// every reachable exit from the body: the normal fallthrough
+// (LlvmBackend_Disposal.cpp emitDisposerCore) and an early `return;` inside
+// the body (LlvmBackend_Stmts.cpp's plain ReturnStmt path, §3459).
+// --------------------------------------------------------------------------
+
+// Direct repro from issue #1607: `using var r`'s destructor calls a PUBLIC
+// static method `S.Bump()` whose own body increments a PUBLIC static field.
+// The `throw` inside the `try` unwinds through r's scope before being caught;
+// per §28.3 r is disposed on that unwind, so S.x must read 1 afterward. The
+// bug left it at 0 (Bump's own static-touching body never completed).
+const char* kDtorCallsStaticMethodThatTouchesStaticUnwind_1607 =
+    "module M; "
+    "public static class S "
+    "  public static x: int := 0; "
+    "  public static method Bump() S.x := S.x + 1; end Bump; "
+    "end S; "
+    "public class R "
+    "  public constructor() end constructor; "
+    "  destructor S.Bump(); end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => var dummy := 0; end; "
+    "    return S.x; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1607, dtor_calls_static_method_that_touches_static_disposed_on_unwind) {
+    BEZEL_EXPECT_EQ(run(kDtorCallsStaticMethodThatTouchesStaticUnwind_1607), 1);
+}
+
+// Dispose-once companion: counts BOTH R's own destructor body running (its
+// direct statement, R.dtorCount) AND Bump's internal body completing
+// (S.bumpCount, S.x) to prove each runs EXACTLY once on the unwind path — not
+// skipped (pre-fix: dtorCount=1 but bumpCount=0/x=0, since the destructor's
+// OWN statement ran but Bump's internal misfire returned before touching
+// S.bumpCount/S.x) and not double-run (the disposed-flag run-once guard,
+// §28.2). Encodes dtorCount*100 + bumpCount*10 + x; 111 iff all three ran
+// exactly once.
+const char* kDtorCallsStaticMethodDisposeOnceCounts_1607 =
+    "module M; "
+    "public static class S "
+    "  public static x: int := 0; "
+    "  public static bumpCount: int := 0; "
+    "  public static method Bump() "
+    "    S.bumpCount := S.bumpCount + 1; "
+    "    S.x := S.x + 1; "
+    "  end Bump; "
+    "end S; "
+    "public class R "
+    "  public static dtorCount: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor "
+    "    R.dtorCount := R.dtorCount + 1; "
+    "    S.Bump(); "
+    "  end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => var dummy := 0; end; "
+    "    return R.dtorCount * 100 + S.bumpCount * 10 + S.x; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1607, dtor_calls_static_method_that_touches_static_disposed_exactly_once) {
+    BEZEL_EXPECT_EQ(run(kDtorCallsStaticMethodDisposeOnceCounts_1607), 111);
+}
+
+// Transitive-owned-field compounding (mirrors #1468's compounding case): R
+// owns field `_f: F`; F's destructor (not R's) calls the static-touching
+// method. On unwind, R's own destructor (empty) completes, its §28.4 step-2
+// owned-field cascade dispatches to F's Dispose(), and F's disposer-core must
+// independently park/restore bz_exc around ITS OWN body so BumpY's internal
+// touch of S.y is not skipped. Exercises the restore inserted before
+// emitOwnedFieldDisposals in emitDisposerCore (the nested disposer-core call
+// must see the correctly-restored propagating exception at its own entry).
+const char* kDtorCallsStaticMethodTransitiveOwnedField_1607 =
+    "module M; "
+    "public static class S "
+    "  public static y: int := 0; "
+    "  public static method BumpY() S.y := S.y + 1; end BumpY; "
+    "end S; "
+    "public class F "
+    "  public constructor() end constructor; "
+    "  destructor S.BumpY(); end destructor; "
+    "end F; "
+    "public class R "
+    "  private owned _f: F; "
+    "  public constructor() _f := new F(); end constructor; "
+    "  destructor end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => var dummy := 0; end; "
+    "    return S.y; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1607, dtor_calls_static_method_touching_static_transitive_owned_field) {
+    BEZEL_EXPECT_EQ(run(kDtorCallsStaticMethodTransitiveOwnedField_1607), 1);
+}
+
+// Safety-net regression: a destructor whose body takes an early `return;`
+// (legal per §3459: "Constructors and destructors use `return;` to exit
+// early") during an exception unwind must not lose the propagating exception.
+// Parking bz_exc for the destructor body's run (the #1607 fix above) clears
+// it at entry; without ALSO restoring on this early-return exit — a second
+// reachable exit from the park, alongside the normal fallthrough — bz_exc
+// would stay cleared forever on this path, silently discarding the in-flight
+// exception (a strictly worse regression than the pre-existing "early return
+// skips owned-field disposal" deferred corner, §28.4). `caught` proves the
+// `catch` still runs after R's destructor returns early.
+const char* kDtorEarlyReturnPreservesUnwindingException_1607 =
+    "module M; "
+    "public class R "
+    "  public constructor() end constructor; "
+    "  destructor "
+    "    return; "
+    "  end destructor; "
+    "end R; "
+    "public static class Program "
+    "  public static method Main(): int "
+    "    var caught: int := 0; "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new InvalidOperationException(\"boom\"); "
+    "    catch InvalidOperationException => caught := 1; end; "
+    "    return caught; "
+    "  end Main; "
+    "end Program;";
+
+BEZEL_TEST(codegen_1607, dtor_early_return_preserves_unwinding_exception) {
+    BEZEL_EXPECT_EQ(run(kDtorEarlyReturnPreservesUnwindingException_1607), 1);
+}
+
 }  // namespace

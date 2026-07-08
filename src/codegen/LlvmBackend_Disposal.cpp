@@ -97,6 +97,11 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
     bool terminated = false;
+    // fix #1607: the exception parked across the destructor body (see below),
+    // kept in a local (disposerEntryExc_ itself is reset to null once the body
+    // finishes) so the normal-completion restore after the `if` below can still
+    // reach it.
+    llvm::Value* parkedDtorExc = nullptr;
     if (const ast::DestructorDecl* dd = findDestructor(ts)) {
         // #383 / §28.8.1: suppress dynamic disposal of `using var u := move
         // this._f;` inside the destructor — the auto field-dispose below would
@@ -115,6 +120,30 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // the comparison in emitPendingCheck reduces to the plain `exc != null`.
         disposerEntryExc_ =
             builder_.CreateLoad(ptrTy(), emitExcSlot(), "disposer.entry.exc");
+        // fix #1607 / §28.3 "Exception-path discharge" / §28.4: the AND-trick
+        // above (emitPendingCheck comparing against disposerEntryExc_) only
+        // covers pending-checks emitted DIRECTLY inside this destructor body
+        // (gated on emittingDisposerBody_). It does NOT cover a callee compiled
+        // as an ORDINARY function — e.g. `destructor S.Bump(); end destructor;`
+        // where Bump is a plain static method whose own body touches a user
+        // static. Bump is compiled once with emittingDisposerBody_ == false, so
+        // its own §22.13 static-init guard's emitPendingCheck reads the raw
+        // bz_exc slot with no adjustment: seeing the propagating exception
+        // still parked there, it misreads it as "Bump itself just threw" and
+        // returns before running the rest of Bump's body (S.x never
+        // increments) — the residual #1468 leak this fixes.
+        //
+        // PARK bz_exc for the run of the destructor body: clear it here so
+        // every callee (Bump, and anything it transitively calls) sees a
+        // clean exception context, and restore it — combined via select with
+        // any genuinely NEW exception the body raised — at every reachable
+        // exit from the body (the normal fallthrough below, and an early
+        // `return;` inside the body, per §3459: LlvmBackend_Stmts.cpp's plain
+        // ReturnStmt path). On the normal, non-unwind disposal path this
+        // value is null at runtime, so clear/restore is a no-op there.
+        parkedDtorExc = disposerEntryExc_;
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                             emitExcSlot());
         emittingDisposerBody_ = true;
         terminated = lowerScopedBlock(dd->body);
         emittingDisposerBody_ = false;
@@ -125,6 +154,20 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
     // (A destructor that returns early skips this — destructors with
     // both an early return and owned fields are a deferred corner.)
     if (!terminated) {
+        // fix #1607: restore the parked exception (see above) before running
+        // the owned-field cascade / base chain, which may themselves recurse
+        // into another type's emitDisposerCore (the "transitive owned-field
+        // compounding" case #1468's tests already cover) — that nested call
+        // must see the correctly-restored propagating value at ITS OWN entry.
+        if (parkedDtorExc) {
+            llvm::Value* excNow =
+                builder_.CreateLoad(ptrTy(), emitExcSlot(), "postdtor.exc");
+            llvm::Value* isNew = builder_.CreateICmpNE(
+                excNow, llvm::ConstantPointerNull::get(ptrTy()));
+            llvm::Value* restored =
+                builder_.CreateSelect(isNew, excNow, parkedDtorExc);
+            builder_.CreateStore(restored, emitExcSlot());
+        }
         emitOwnedFieldDisposals(ts);
         emitBaseDisposeChain(ts);
         builder_.CreateRetVoid();
