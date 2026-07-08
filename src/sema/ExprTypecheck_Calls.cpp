@@ -5142,9 +5142,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             return tr;
                         };
                         if (m == "Acquire" && ce.args.empty()) {
+                            // §30.12 (v0.179 / #1522): `Acquire()` is a blocking
+                            // form and is rejected lexically inside `async`
+                            // methods/lambdas — `await m.AcquireAsync()` is
+                            // strictly superior there and always available
+                            // (mirrors the §30.3/#1362 Wait()/Result reject).
+                            // Report but still type the expression so downstream
+                            // checks don't cascade unrelated diagnostics.
+                            if (inAsyncContext_) {
+                                ctx_.diagnostics().report(Severity::Error,
+                                    ce.span.begin,
+                                    "use `await m.AcquireAsync()` — blocking "
+                                    "Mutex acquisition is not available in "
+                                    "async code (\xC2\xA7""30.12)");
+                            }
                             // Acquire(): owned Lock.
                             ctx_.setExprType(&ce, makeLockTypeRef());
                         } else if (m == "TryAcquire" && ce.args.size() == 1) {
+                            // §30.12 (v0.179 / #1522): `TryAcquire(timeout)` is
+                            // also a blocking form (it blocks up to `timeout`)
+                            // and is rejected lexically in async bodies for the
+                            // same reason as `Acquire()`.
+                            if (inAsyncContext_) {
+                                ctx_.diagnostics().report(Severity::Error,
+                                    ce.span.begin,
+                                    "use `await m.TryAcquireAsync(timeout)` — "
+                                    "blocking Mutex acquisition is not "
+                                    "available in async code (\xC2\xA7""30.12)");
+                            }
                             // TryAcquire(timeout: TimeSpan): owned Lock?
                             // Build a nullable Lock TypeRef.
                             auto* tr = makeLockTypeRef();
@@ -5221,9 +5246,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             return tr;
                         };
                         if (m == "Acquire" && ce.args.empty()) {
+                            // §30.12 (v0.179 / #1522): blocking form — rejected
+                            // lexically inside `async` methods/lambdas, same as
+                            // Mutex.Acquire() above.
+                            if (inAsyncContext_) {
+                                ctx_.diagnostics().report(Severity::Error,
+                                    ce.span.begin,
+                                    "use `await s.AcquireAsync()` — blocking "
+                                    "Semaphore acquisition is not available in "
+                                    "async code (\xC2\xA7""30.12)");
+                            }
                             // Acquire(): owned SemaphoreToken.
                             ctx_.setExprType(&ce, makeSemTokenTypeRef());
                         } else if (m == "TryAcquire" && ce.args.size() == 1) {
+                            // §30.12 (v0.179 / #1522): blocking form — rejected
+                            // lexically inside `async` methods/lambdas, same as
+                            // Mutex.TryAcquire() above.
+                            if (inAsyncContext_) {
+                                ctx_.diagnostics().report(Severity::Error,
+                                    ce.span.begin,
+                                    "use `await s.TryAcquireAsync(timeout)` — "
+                                    "blocking Semaphore acquisition is not "
+                                    "available in async code (\xC2\xA7""30.12)");
+                            }
                             // TryAcquire(timeout: TimeSpan): owned SemaphoreToken?
                             auto* tr = makeSemTokenTypeRef();
                             tr->nullable = true;

@@ -564,7 +564,10 @@ BEZEL_TEST(codegen_semaphore_acquire_async_aot_6_3, try_acquire_async_zero_timeo
         "class C "
         "  public static async method Main(): Task<int> "
         "    using var sem := new Semaphore(1); "
-        "    using var outer := sem.Acquire(); "
+        // §30.12 (v0.179 / #1522): the blocking Acquire() form is rejected
+        // lexically inside async methods — use AcquireAsync() (immediately
+        // available on a fresh semaphore, so this still completes synchronously).
+        "    using var outer := await sem.AcquireAsync(); "
         // Permit exhausted; TryAcquireAsync with 0-ms → null.
         "    using var tok := await sem.TryAcquireAsync(TimeSpan.FromMilliseconds(0)); "
         "    if tok = null then "

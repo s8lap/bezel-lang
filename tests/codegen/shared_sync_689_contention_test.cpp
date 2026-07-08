@@ -253,9 +253,13 @@ BEZEL_TEST(shared_sync_689_contention,
         // Clone one handle to pass to the spawned domain.
         "    using var t := Domain.Spawn(Worker.AcquireN, shared.Clone()); "
         // Main domain: also do 5 acquire/release cycles on its own handle.
+        // §30.12 (v0.179 / #1522): Program.Main is `async` — the blocking
+        // Acquire() form is rejected lexically there; AcquireAsync() is the
+        // required substitute (Worker.AcquireN is a plain, non-async method,
+        // so its Acquire() calls above are unaffected).
         "    var mainCount := 0; "
         "    while mainCount < 5 do "
-        "      using var guard := shared.Get().Acquire(); "
+        "      using var guard := await shared.Get().AcquireAsync(); "
         "      mainCount := mainCount + 1; "
         "    end; "
         // Join the spawned task; spawnedCount should be 5.

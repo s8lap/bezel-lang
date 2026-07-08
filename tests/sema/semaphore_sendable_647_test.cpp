@@ -90,7 +90,10 @@ BEZEL_TEST(semaphore_sendable_6_3,
         "class Main "
         "  public static async method Go(): Task "
         "    using var sem := new Semaphore(1); "
-        "    var tok := sem.Acquire(); "
+        // §30.12 (v0.179 / #1522): blocking Acquire() is rejected lexically
+        // inside async methods — AcquireAsync() keeps this test isolated to
+        // the sendability diagnostic under test.
+        "    var tok := await sem.AcquireAsync(); "
         "    using var t := Domain.Spawn(Worker.Run, move tok); "
         "    await t; "
         "  end Go; "

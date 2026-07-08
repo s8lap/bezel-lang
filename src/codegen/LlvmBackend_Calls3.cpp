@@ -3976,6 +3976,79 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
 }
 
 // ---------------------------------------------------------------------------
+// §30.12 (v0.179 / #1522): would-park guard shared by Mutex.Acquire()/
+// TryAcquire(timeout) and Semaphore.Acquire()/TryAcquire(timeout).
+//
+// Both types' blocking forms are rejected LEXICALLY inside `async` methods/
+// lambdas by sema (ExprTypecheck_Calls.cpp, next to the Task.Wait()/.Result
+// reject of §30.3/#1362). This is the runtime layer for the case static
+// rejection can't see: a non-`async` helper invoked from a domain
+// continuation. Mirrors the Task guard's shape (LlvmBackend_Exprs.cpp
+// `.Result`, LlvmBackend_Calls2.cpp `t.Wait()`) but a Mutex/Semaphore core has
+// no side-effect-free "is available" peek the way `bz_task_is_done` is for a
+// task, so availability is tested by actually attempting a non-blocking
+// acquire (`tryAcquireFnName(handle, 0)`) — the probe result IS the
+// acquisition on success, avoiding a separate blocking call and a TOCTOU race
+// between "check" and "acquire".
+//
+// - Outside a domain (startup thread / FFI, stdlib §6.2/§6.3 "outside any
+//   domain"): behavior is unchanged — `timeoutMs == nullptr` calls the plain
+//   blocking Acquire(); a non-null `timeoutMs` calls TryAcquire with the
+//   REQUESTED timeout (a timeout -> null is a legitimate outcome, not a
+//   guard fire).
+// - Inside a domain continuation: probe with timeout=0 regardless of the
+//   caller's requested timeout — even a bounded wait still parks a pool
+//   worker (§30.12: "never parks a thread inside a domain continuation").
+//   An immediately-available acquisition succeeds exactly as it would
+//   outside a domain (spec: "proceeds as before"); an unavailable one raises
+//   InvalidOperationException instead of blocking.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::emitGuardedBlockingAcquire(
+        llvm::Value* handle, const char* tryAcquireFnName,
+        const char* acquireFnName, llvm::Value* timeoutMs) {
+    auto* tryFn = declareC(tryAcquireFnName, ptrTy(), {ptrTy(), i64()});
+    auto* curDomFn = declareC("bz_current_domain_ptr", ptrTy(), {});
+    llvm::Value* dom = builder_.CreateCall(curDomFn, {}, "acq.dom");
+    llvm::Value* inDomain = builder_.CreateICmpNE(
+        dom, llvm::Constant::getNullValue(ptrTy()), "acq.indomain");
+
+    auto* curFn = currentFn_;
+    auto* domBB = llvm::BasicBlock::Create(llvm_, "acq.dom.probe", curFn);
+    auto* outBB = llvm::BasicBlock::Create(llvm_, "acq.outdom", curFn);
+    auto* joinBB = llvm::BasicBlock::Create(llvm_, "acq.join", curFn);
+    builder_.CreateCondBr(inDomain, domBB, outBB);
+
+    // Inside a domain: non-blocking probe (timeout=0). Unavailable -> would
+    // park a worker -> InvalidOperationException (§30.12) instead of blocking.
+    builder_.SetInsertPoint(domBB);
+    llvm::Value* probeResult = builder_.CreateCall(
+        tryFn, {handle, llvm::ConstantInt::get(i64(), 0)}, "acq.probe");
+    llvm::Value* probeFailed = builder_.CreateICmpEQ(
+        probeResult, llvm::Constant::getNullValue(ptrTy()), "acq.probe.fail");
+    emitGuardThrow(probeFailed, "InvalidOperationException");
+    llvm::BasicBlock* domEndBB = builder_.GetInsertBlock();
+    builder_.CreateBr(joinBB);
+
+    // Outside a domain: unchanged behavior — full blocking Acquire(), or
+    // TryAcquire's real requested timeout.
+    builder_.SetInsertPoint(outBB);
+    llvm::Value* outResult;
+    if (timeoutMs) {
+        outResult = builder_.CreateCall(tryFn, {handle, timeoutMs}, "acq.tryacq");
+    } else {
+        auto* blockFn = declareC(acquireFnName, ptrTy(), {ptrTy()});
+        outResult = builder_.CreateCall(blockFn, {handle}, "acq.block");
+    }
+    builder_.CreateBr(joinBB);
+
+    builder_.SetInsertPoint(joinBB);
+    auto* phi = builder_.CreatePHI(ptrTy(), 2, "acq.result");
+    phi->addIncoming(probeResult, domEndBB);
+    phi->addIncoming(outResult, outBB);
+    return phi;
+}
+
+// ---------------------------------------------------------------------------
 // §6.2 / issue #647: Mutex instance methods.
 //
 //   Acquire()                 → bz_mutex_acquire(mx)             → ptr (owned Lock)
@@ -3987,6 +4060,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
 // TryAcquire lowers the TimeSpan argument to milliseconds (i64) using
 // bz_timespan_total_milliseconds, truncated to int64_t. A null return from the
 // runtime (timeout) is returned as a null ptr to the Bezel nullable owned Lock?.
+// Acquire() and TryAcquire() are additionally guarded by
+// emitGuardedBlockingAcquire (§30.12 / #1522, above).
 // ---------------------------------------------------------------------------
 llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
@@ -4003,8 +4078,13 @@ llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
     if (mname == "Acquire" && call.args.empty()) {
         // Acquire(): blocks until the mutex is available, returns owned Lock.
         // per §6.2: the non-null return makes the guard idiom straightforward.
-        auto* fn = declareC("bz_mutex_acquire", ptrTy(), {ptrTy()});
-        return builder_.CreateCall(fn, {mx}, "mx.acquire");
+        // §30.12 (v0.179 / #1522): guarded by emitGuardedBlockingAcquire — a
+        // non-async helper reached from a domain continuation raises
+        // InvalidOperationException instead of parking when the mutex is not
+        // immediately available; outside a domain the blocking call is
+        // unchanged (stdlib §6.2 "Blocking discipline").
+        return emitGuardedBlockingAcquire(
+            mx, "bz_mutex_try_acquire", "bz_mutex_acquire", nullptr);
     }
 
     if (mname == "TryAcquire" && call.args.size() == 1 && call.args[0].value) {
@@ -4026,8 +4106,13 @@ llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
         // Truncate double to i64 (floor towards zero per standard C conv).
         llvm::Value* msI64 = builder_.CreateFPToSI(
             msDouble, i64(), "ts.ms.i64");
-        auto* fn = declareC("bz_mutex_try_acquire", ptrTy(), {ptrTy(), i64()});
-        return builder_.CreateCall(fn, {mx, msI64}, "mx.tryacq");
+        // §30.12 (v0.179 / #1522): guarded — inside a domain continuation, a
+        // busy mutex is probed non-blocking (timeout=0) instead of waiting out
+        // `msI64`, since a bounded park still pins a worker; unavailable ->
+        // InvalidOperationException. Outside a domain, `msI64` is honored as
+        // before (a legitimate timeout -> null is unaffected).
+        return emitGuardedBlockingAcquire(
+            mx, "bz_mutex_try_acquire", "bz_mutex_acquire", msI64);
     }
 
     // §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync.
@@ -4126,8 +4211,10 @@ llvm::Value* Emitter::tryLowerSemaphoreTokenCall(const ast::CallExpr& call) {
 
     if (mname == "Acquire" && call.args.empty()) {
         // Acquire(): blocks until a permit is available, returns owned SemaphoreToken.
-        auto* fn = declareC("bz_semaphore_acquire", ptrTy(), {ptrTy()});
-        return builder_.CreateCall(fn, {sem}, "sem.acquire");
+        // §30.12 (v0.179 / #1522): guarded — see tryLowerMutexLockCall's
+        // Acquire() case; identical discipline for Semaphore (stdlib §6.3).
+        return emitGuardedBlockingAcquire(
+            sem, "bz_semaphore_try_acquire", "bz_semaphore_acquire", nullptr);
     }
 
     if (mname == "TryAcquire" && call.args.size() == 1 && call.args[0].value) {
@@ -4141,8 +4228,10 @@ llvm::Value* Emitter::tryLowerSemaphoreTokenCall(const ast::CallExpr& call) {
                                llvm::Type::getDoubleTy(llvm_), {i64()});
         llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
         llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
-        auto* fn = declareC("bz_semaphore_try_acquire", ptrTy(), {ptrTy(), i64()});
-        return builder_.CreateCall(fn, {sem, msI64}, "sem.tryacq");
+        // §30.12 (v0.179 / #1522): guarded — see tryLowerMutexLockCall's
+        // TryAcquire() case.
+        return emitGuardedBlockingAcquire(
+            sem, "bz_semaphore_try_acquire", "bz_semaphore_acquire", msI64);
     }
 
     // §6.3 / #647 / v0.140: AcquireAsync / TryAcquireAsync.

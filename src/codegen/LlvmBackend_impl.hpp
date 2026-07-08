@@ -6799,6 +6799,16 @@ private:
     llvm::Value* tryLowerMutexLockCall(const ast::CallExpr& call);
     // §6.3 / issue #647: Semaphore.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
     llvm::Value* tryLowerSemaphoreTokenCall(const ast::CallExpr& call);
+    // §30.12 (v0.179 / #1522): shared would-park guard for Mutex.Acquire()/
+    // TryAcquire(timeout) and Semaphore.Acquire()/TryAcquire(timeout). Probes
+    // non-blocking (timeout=0) when inside a domain continuation and raises
+    // InvalidOperationException instead of parking a thread; unchanged
+    // blocking behavior outside a domain. See tryLowerMutexLockCall /
+    // tryLowerSemaphoreTokenCall for callers.
+    llvm::Value* emitGuardedBlockingAcquire(llvm::Value* handle,
+                                             const char* tryAcquireFnName,
+                                             const char* acquireFnName,
+                                             llvm::Value* timeoutMs);
     // §6.6 / issue #974: TaskCompletionSource<T>/OwningTaskCompletionSource<T>/
     //   TaskCompletionSource instance methods: TrySetResult, SetResult,
     //   TrySetException, SetException, TrySetCancelled, SetCancelled, Dispose.

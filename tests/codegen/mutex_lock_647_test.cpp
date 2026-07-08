@@ -603,7 +603,10 @@ BEZEL_TEST(codegen_mutex_acquire_async_aot_6_2_v0139, try_acquire_async_zero_tim
         "class C "
         "  public static async method Main(): Task<int> "
         "    using var mutex := new Mutex(); "
-        "    using var outer := mutex.Acquire(); "
+        // §30.12 (v0.179 / #1522): the blocking Acquire() form is rejected
+        // lexically inside async methods — use AcquireAsync() (immediately
+        // available on a fresh mutex, so this still completes synchronously).
+        "    using var outer := await mutex.AcquireAsync(); "
         // Mutex is held (non-recursive); TryAcquireAsync with 0-ms → null.
         "    using var maybe := await mutex.TryAcquireAsync(TimeSpan.FromMilliseconds(0)); "
         "    if maybe = null then "
