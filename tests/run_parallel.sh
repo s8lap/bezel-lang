@@ -49,23 +49,32 @@ done
 
 # Collect exit codes; a crashed shard (nonzero) is a hard failure.
 shard_rc=0
+crashed_shards=()
 for i in "${!pids[@]}"; do
     if ! wait "${pids[$i]}"; then
         echo "shard $i exited nonzero (crash or test failure)" >&2
         shard_rc=1
+        crashed_shards+=("$i")
     fi
 done
 
-# Aggregate the per-shard "N passed, M failed" lines.
+# Aggregate the per-shard "N passed, M failed" lines. Each shard also prints the
+# full registry size as "... T total" (identical across shards) — capture it as
+# the EXPECTED count so a shard that dies mid-run (its passed count missing) is
+# detected as an undercount rather than passing silently.
 total_pass=0
 total_fail=0
+expected_total=0
 for (( i = 0; i < shards; i++ )); do
     line="$(grep -E '^[0-9]+ passed, [0-9]+ failed' "$logdir/shard.$i.log" | tail -1)"
     p="$(sed -E 's/^([0-9]+) passed.*/\1/' <<<"$line")"
     f="$(sed -E 's/^[0-9]+ passed, ([0-9]+) failed.*/\1/' <<<"$line")"
+    t="$(sed -E 's/.*, ([0-9]+) total.*/\1/' <<<"$line")"
     total_pass=$(( total_pass + ${p:-0} ))
     total_fail=$(( total_fail + ${f:-0} ))
+    [[ "${t:-0}" -gt "$expected_total" ]] && expected_total="$t"
 done
+ran=$(( total_pass + total_fail ))
 
 end=$(date +%s)
 
@@ -76,11 +85,31 @@ if [[ -n "$fail_lines" ]]; then
     echo "$fail_lines"
 fi
 
+# GATE INTEGRITY: a crashed shard (uncaught exception -> runtime exit(70), or a
+# segfault) kills the host process and silently drops its remaining tests. Detect
+# it two ways — a nonzero shard exit AND a count that falls short of the registry
+# total — and fail LOUDLY, naming the crashed shard and the last test it ran
+# (the crash culprit). Without this the summary reads "0 failed" on an undercount.
+count_ok=1
+if [[ "$expected_total" -gt 0 && "$ran" -ne "$expected_total" ]]; then
+    count_ok=0
+fi
+if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 ]]; then
+    echo "############################################################"
+    echo "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy"
+    echo "##   ran $ran of $expected_total registered tests ($(( expected_total - ran )) unaccounted)"
+    for i in "${crashed_shards[@]}"; do
+        last="$(grep -E '^\[ RUN' "$logdir/shard.$i.log" | tail -1 | sed -E 's/^\[ RUN  \] //')"
+        echo "##   shard $i exited nonzero — died on: ${last:-<none>}"
+    done
+    echo "############################################################"
+fi
+
 echo "============================================================"
 echo "TOTAL: $total_pass passed, $total_fail failed  (across $shards shards, $((end - start))s)"
 echo "============================================================"
 
-if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 ]]; then
+if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 ]]; then
     exit 1
 fi
 exit 0
