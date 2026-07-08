@@ -492,6 +492,15 @@ private:
     // (§22.7). Static-access lowering sites call emitEnsureStaticInit(owner) before
     // the access so the (possible) TIE routes through the current unwind target.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> ensureInitFns_;
+    // #1553 / §22.13 (v0.181): per-type static-init state globals, created in
+    // emitEnsureInitFns and shared with the sfinit body (progress bumps) and the
+    // partial-state read guard. initState: 0 uninit / 1 in-progress / 2 done /
+    // 3 failed. initOwner: id of the thread that moved the state to in-progress
+    // (owner-thread tracking). initProgress: count of non-constant static-field
+    // initializers completed (textual order).
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initStateGV_;
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initOwnerGV_;
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> initProgressGV_;
     // Per-type sfinit / cctor functions, indexed for ensureinit emission. Built
     // from staticCtors_ in declareStaticInitializers.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;
@@ -4993,6 +5002,30 @@ private:
     // TypeInitializationException through the current unwind target. No-op for a
     // type without lazy static state (generic types, types with no static init).
     void emitEnsureStaticInit(const sema::TypeSymbol* owner);
+
+    // #1553 / §22.13 (v0.181): the ordinal of `fs` among its type's non-constant
+    // static-field initializers in textual declaration order (the sequence sfinit
+    // stores, and initProgress counts). Returns -1 for a field sfinit does not
+    // store at runtime — a compile-time-constant initializer (already in the
+    // global) or one without a backing global — i.e. always-assigned, no guard.
+    int staticFieldInitIndex(const sema::FieldSymbol* fs);
+
+    // #1553 / §22.13 (v0.181): the static-initialization-cycle runtime backstop.
+    // Emitted after emitEnsureStaticInit at a static-FIELD READ site: if `owner`'s
+    // static init is in progress on THIS thread and `fs` has not been assigned yet
+    // (its declaration index >= owner's init progress), the read would observe a
+    // partially-initialized static — synthesize a TypeInitializationException
+    // (naming `owner`, InnerException null) into bz_exc and route it through the
+    // current unwind target instead. A no-op when `owner` has no static state, or
+    // `fs` is always-assigned (staticFieldInitIndex < 0), or the state is not
+    // in-progress (the normal post-init read).
+    void emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
+                                    const sema::FieldSymbol* fs);
+
+    // #1553 / §22.13 (v0.181): store a freshly-synthesized cycle-backstop
+    // TypeInitializationException — vtable + a message naming `typeName`,
+    // InnerException null — into bz_exc (does not itself route/unwind).
+    void emitSynthesizeCycleTIE(const std::string& typeName);
 
     void emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn);
 

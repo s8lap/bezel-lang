@@ -96,6 +96,23 @@ bz_domain_t* g_main_domain = nullptr;
 // get g_main_domain — zero behavior change for the common path.
 thread_local bz_domain_t* g_current_domain = nullptr;
 
+// #1553 / §22.13 (v0.181): a stable, non-zero per-OS-thread identifier used by
+// the static-initialization re-entrancy backstop (emitEnsureInitFns) to
+// distinguish a SAME-thread re-entrant touch of an in-progress initializer —
+// which must raise a runtime-synthesized TypeInitializationException — from a
+// cross-domain touch on a different pool thread, which is the §22.12 rule-1
+// blocking case and is NOT synthesized here (that cross-domain waits-for /
+// blocking half is deliberately out of scope; tracked at #1391). The id is
+// drawn from a process-global atomic counter on first use per thread, so it is
+// unique per live thread and never 0 (0 marks "no owner recorded" in the
+// per-type owner-thread global).
+extern "C" uint64_t bz_current_thread_id() {
+    static std::atomic<uint64_t> next{1};
+    static thread_local uint64_t id =
+        next.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+
 // ---------------------------------------------------------------------------
 // domain_ref / domain_release — refcount helpers (fix #632)
 // ---------------------------------------------------------------------------

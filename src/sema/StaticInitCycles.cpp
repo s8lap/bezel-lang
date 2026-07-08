@@ -1,5 +1,18 @@
 // §2.5 / §22.13 (#797): compile-time detection of circular static-initialization
 // dependencies. See StaticInitCycles.hpp for the contract.
+//
+// #1553 / §22.13 rule 1 (v0.181): this pass IS the normative compile-time
+// approximation — an edge T→U exists when T's static field initializers or
+// static-constructor body reference a static member of U, directly or
+// transitively through *statically-resolvable calls* (static methods and static
+// property getters reached by direct name within the compilation unit, followed
+// by followMethod/followProperty below). Calls through function values (lambda
+// bodies are deliberately NOT walked — see expr()), virtual dispatch
+// (followCalledStaticMethod resolves only static callees), and code outside the
+// compilation unit (imported targets skipped) contribute NO edges. It rejects
+// every cycle it can see and is not a completeness guarantee; a cycle routed
+// through those uncovered edges compiles and is caught at runtime by the
+// same-thread re-entrancy backstop (§22.13 rule 2, LlvmBackend_Setup.cpp).
 
 #include "sema/StaticInitCycles.hpp"
 

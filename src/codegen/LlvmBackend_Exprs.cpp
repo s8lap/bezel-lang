@@ -4229,7 +4229,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // backing global directly.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
             // #720 / §22.13: lazily initialize the owning type on first use.
-            if (auto* sym = ctx_.exprSymbol(e)) emitEnsureStaticInit(memberOwner(sym));
+            if (auto* sym = ctx_.exprSymbol(e)) {
+                emitEnsureStaticInit(memberOwner(sym));
+                // #1553 / §22.13 (v0.181): a re-entrant read, on the owner thread,
+                // of a static this type's in-progress initializer has not assigned
+                // yet raises the cycle backstop rather than observing partial state.
+                if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
+                    emitStaticPartialReadGuard(memberOwner(sym), fsym);
+            }
             return builder_.CreateLoad(gv->getValueType(), gv);
         }
     }
@@ -4275,7 +4282,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // its backing global.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
             // #720 / §22.13: lazily initialize the owning type on first use.
-            if (auto* sym = ctx_.exprSymbol(e)) emitEnsureStaticInit(memberOwner(sym));
+            if (auto* sym = ctx_.exprSymbol(e)) {
+                emitEnsureStaticInit(memberOwner(sym));
+                // #1553 / §22.13 (v0.181): a re-entrant read, on the owner thread,
+                // of a static this type's in-progress initializer has not assigned
+                // yet raises the cycle backstop rather than observing partial state.
+                if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
+                    emitStaticPartialReadGuard(memberOwner(sym), fsym);
+            }
             return builder_.CreateLoad(gv->getValueType(), gv);
         }
         // CG9: a bare identifier resolving to an instance field is an

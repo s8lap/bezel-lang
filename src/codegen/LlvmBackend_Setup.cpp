@@ -3214,6 +3214,27 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
         llvm::Value* origExc = builder_.CreateLoad(ptrTy(), emitExcSlot());
         auto vit = builtinVtable_.find("TypeInitializationException");
         if (vit != builtinVtable_.end()) {
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            // #1553 / §22.7 (v0.181): if the escaping exception is ITSELF a
+            // TypeInitializationException — the §22.13 cycle backstop synthesizes
+            // one, and a nested static init may have already wrapped — it is
+            // cached DIRECTLY, not wrapped again. Compare its vtable (offset 0)
+            // with the TIE vtable; on a match, leave bz_exc unchanged. A null
+            // exc (defensive; propagate is only reached with a pending exc) also
+            // needs no wrapping.
+            auto* retBB     = llvm::BasicBlock::Create(llvm_, "sinit.prop.ret",  fn);
+            auto* notNullBB = llvm::BasicBlock::Create(llvm_, "sinit.prop.nn",   fn);
+            auto* wrapBB    = llvm::BasicBlock::Create(llvm_, "sinit.prop.wrap", fn);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                origExc, llvm::ConstantPointerNull::get(ptrTy()));
+            builder_.CreateCondBr(isNull, retBB, notNullBB);
+
+            builder_.SetInsertPoint(notNullBB);
+            llvm::Value* vt = builder_.CreateLoad(ptrTy(), origExc);  // vtable@0
+            llvm::Value* isTie = builder_.CreateICmpEQ(vt, vit->second);
+            builder_.CreateCondBr(isTie, retBB, wrapBB);
+
+            builder_.SetInsertPoint(wrapBB);
             llvm::Value* tie = builder_.CreateCall(
                 callocFn(),
                 {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
@@ -3221,13 +3242,17 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             builder_.CreateStore(vit->second, tie);
             // message at offset 8: null (calloc zeroed it)
             // InnerException at offset 16 (kExcInnerOffset)
-            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
             llvm::Value* innerSlot =
                 builder_.CreateGEP(i8Ty, tie, builder_.getInt64(kExcInnerOffset));
             builder_.CreateStore(origExc, innerSlot);
             builder_.CreateStore(tie, emitExcSlot());
+            builder_.CreateBr(retBB);
+
+            builder_.SetInsertPoint(retBB);
+            builder_.CreateRetVoid();
+        } else {
+            builder_.CreateRetVoid();
         }
-        builder_.CreateRetVoid();
         builder_.SetInsertPoint(savedInsert);
     }
 
@@ -3269,6 +3294,20 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             // Non-constant initializer: evaluate it and store into the global.
             auto gvIt = staticGlobals_.find(fs);
             if (gvIt == staticGlobals_.end()) continue;  // no backing global
+            // #1553 / §22.13 (v0.181): after this field's initializer store lands,
+            // advance the owning type's init-progress to (this field's index + 1),
+            // so a re-entrant read of a later (not-yet-stored) static observes it
+            // as unassigned and the partial-state guard raises. `bumpProgress` is
+            // emitted on every store path (inline-array early-continue included).
+            auto pgIt = initProgressGV_.find(type);
+            int fieldIdx = staticFieldInitIndex(fs);
+            auto bumpProgress = [&]() {
+                if (pgIt != initProgressGV_.end() && fieldIdx >= 0)
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(i32(),
+                            static_cast<uint64_t>(fieldIdx) + 1),
+                        pgIt->second);
+            };
             llvm::Value* val = nullptr;
             // R40 / #743 / §15.4: a COLLECTION-LITERAL static initializer
             // (`static All: Array<T> := [a, b, c]`, or a dict literal) — lowerExpr
@@ -3344,6 +3383,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                         if (regFn && ev->getType()->isPointerTy())
                             builder_.CreateCall(regFn, {ev});
                     }
+                    bumpProgress();  // #1553: inline-array field now assigned
                     continue;  // inline-array literal stored element-wise
                 }
             }
@@ -3358,6 +3398,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                 continue;
             }
             builder_.CreateStore(val, gvIt->second);
+            bumpProgress();  // #1553 / §22.13: this field is now assigned
             // §22.13 (#1212): a static OWNED class/interface field is disposed
             // at program exit in reverse init order (bz_dispose_static_owned,
             // installed via atexit on first registration).  Register the value
@@ -3475,6 +3516,12 @@ void Emitter::emitEnsureInitFns() {
     auto* voidFnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    // #1553 / §22.13 (v0.181): the same-thread re-entrancy backstop needs the
+    // id of the thread currently touching a type, to tell a SAME-thread re-entrant
+    // touch of an in-progress initializer (→ synthesize TypeInitializationException)
+    // apart from a cross-domain touch on another pool thread (→ §22.12 rule-1
+    // blocking; not synthesized here, #1391).
+    llvm::Function* tidFn = declareC("bz_current_thread_id", i64(), {});
 
     // Save the per-function builder state (emitEnsureInitFns runs during setup,
     // before/around other function emission).
@@ -3492,6 +3539,26 @@ void Emitter::emitEnsureInitFns() {
             *module_, ptrTy(), /*isConstant=*/false,
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantPointerNull::get(ptrTy()), "bz$" + cls + "$initexc");
+        // #1553 / §22.13 (v0.181): owner-thread tracking. Set to the id of the
+        // thread that moved the state to in-progress (1); read back when a touch
+        // finds the state still in-progress, to classify it as SAME-thread
+        // re-entrancy (the cycle backstop) vs. a cross-domain touch. 0 = no owner.
+        auto* ownerTidGV = new llvm::GlobalVariable(
+            *module_, i64(), /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i64(), 0), "bz$" + cls + "$initowner");
+        // #1553 / §22.13 (v0.181): initialization progress — the count of this
+        // type's non-constant static-field initializers (sfinit-stored, textual
+        // order) that have completed. sfinit bumps it after each store; the
+        // partial-state read guard compares a field's declaration index against
+        // it to tell an already-assigned static from a not-yet-assigned one.
+        auto* progressGV = new llvm::GlobalVariable(
+            *module_, i32(), /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i32(), 0), "bz$" + cls + "$initprogress");
+        initStateGV_[t]    = stateGV;
+        initOwnerGV_[t]    = ownerTidGV;
+        initProgressGV_[t] = progressGV;
 
         // #798: a public non-generic type's ensureinit is EXPORTED so an importer
         // can trigger its static init on first cross-module use (§22.13). The
@@ -3528,14 +3595,27 @@ void Emitter::emitEnsureInitFns() {
         auto* chkProg = llvm::BasicBlock::Create(llvm_, "chkprog", fn);
         builder_.CreateCondBr(isFailed, failedB, chkProg);
 
+        // #1553 / §22.13 (v0.181): in-progress → return (proceed), NOT raise. A
+        // re-entrant touch here is the ordinary self-reference case — a same-type
+        // static METHOD call during the type's own init (e.g. `_v := Seed()`)
+        // legitimately re-enters and must run. Partial-state OBSERVATION is caught
+        // precisely at static-field READ sites (emitStaticPartialReadGuard): a
+        // re-entrant read, on the OWNER thread, of a static that the in-progress
+        // initializer has not assigned yet raises the backstop TIE. This keeps the
+        // backstop strictly same-thread-only (owner-thread tracking below) while
+        // not falsely raising for same-type helper calls or reads of already-
+        // assigned fields; a cross-domain in-progress touch proceeds here (the
+        // §22.12 rule-1 blocking case is unimplemented — #1391).
         builder_.SetInsertPoint(chkProg);
         llvm::Value* isProg =
             builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 1));
         builder_.CreateCondBr(isProg, retB, initB);
 
-        // doinit: mark in-progress, run sfinit then cctor with pending-exc checks.
+        // doinit: mark in-progress, record the owner thread (§22.13 owner-thread
+        // tracking), run sfinit then cctor with pending-exc checks.
         builder_.SetInsertPoint(initB);
         builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), stateGV);
+        builder_.CreateStore(builder_.CreateCall(tidFn, {}, "owntid"), ownerTidGV);
         auto sfIt = sfinitFnOf_.find(t);
         auto ccIt = cctorFnOf_.find(t);
         auto* afterSf = llvm::BasicBlock::Create(llvm_, "after_sf", fn);
@@ -3637,6 +3717,113 @@ void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
         builder_.CreateCall(fn, {});
         emitPendingCheck();
     }
+}
+
+
+// #1553 / §22.13 (v0.181): true iff sfinit stores `f` at RUNTIME in textual
+// order — a non-constant static-field initializer with a backing global. A
+// compile-time-constant literal is already in the global (constInitFor), so it
+// is always assigned and contributes no init-progress step (mirrors the skip
+// list in emitStaticConstructorBody's field loop).
+static bool isSfinitStoredStaticField(const sema::FieldSymbol* f,
+    const std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>& globals) {
+    if (!f) return false;
+    bool isStatic = false;
+    for (auto mod : f->modifiers) if (mod == "static") { isStatic = true; break; }
+    if (!isStatic) return false;
+    auto* fd = dynamic_cast<const ast::FieldDecl*>(f->decl);
+    if (!fd || !fd->initializer) return false;
+    const ast::Expr* e = fd->initializer.get();
+    if (dynamic_cast<const ast::IntLiteralExpr*>(e))     return false;
+    if (dynamic_cast<const ast::BoolLiteralExpr*>(e))    return false;
+    if (dynamic_cast<const ast::FloatLiteralExpr*>(e))   return false;
+    if (dynamic_cast<const ast::StringLiteralExpr*>(e))  return false;
+    if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) return false;
+    return globals.count(f) != 0;
+}
+
+int Emitter::staticFieldInitIndex(const sema::FieldSymbol* fs) {
+    if (!fs || !fs->parent) return -1;
+    if (!isSfinitStoredStaticField(fs, staticGlobals_)) return -1;
+    int idx = 0;
+    for (const sema::Symbol* m : fs->parent->members) {
+        auto* f = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (!f || !isSfinitStoredStaticField(f, staticGlobals_)) continue;
+        if (f == fs) return idx;
+        ++idx;
+    }
+    return -1;
+}
+
+void Emitter::emitSynthesizeCycleTIE(const std::string& typeName) {
+    auto vit = builtinVtable_.find("TypeInitializationException");
+    if (vit == builtinVtable_.end()) return;
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    llvm::Value* tie = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
+    builder_.CreateStore(vit->second, tie);  // vtable at offset 0
+    // ASCII-only message (width-1 bz_string): names the re-entrant type per
+    // §22.13 and prints cleanly on the uncaught-exception path.
+    llvm::Value* msg = lowerStringLiteral(
+        "\"The static initializer for type '" + typeName +
+            "' was re-entered during its own initialization on the same "
+            "thread (static-initialization cycle)\"",
+        /*verbatim=*/false);
+    builder_.CreateStore(
+        msg, builder_.CreateGEP(i8Ty, tie, builder_.getInt64(kExcMsgOffset)));
+    // InnerException at offset 16 stays null (calloc): no original exception.
+    builder_.CreateStore(tie, emitExcSlot());
+}
+
+void Emitter::emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
+                                         const sema::FieldSymbol* fs) {
+    if (!owner || !fs) return;
+    auto stIt = initStateGV_.find(owner);
+    if (stIt == initStateGV_.end()) return;   // no static state → no guard
+    int idx = staticFieldInitIndex(fs);
+    if (idx < 0) return;                        // always-assigned field → no guard
+    auto ownIt = initOwnerGV_.find(owner);
+    auto prIt  = initProgressGV_.find(owner);
+    if (ownIt == initOwnerGV_.end() || prIt == initProgressGV_.end()) return;
+    if (!currentFn_) return;
+
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    // Fast path: only an IN-PROGRESS type can expose a partially-initialized
+    // static; a completed / failed / uninitialized state cannot, so the common
+    // post-init read falls straight through.
+    llvm::Value* st = builder_.CreateLoad(i8Ty, stIt->second, "pg.state");
+    llvm::Value* isProg =
+        builder_.CreateICmpEQ(st, llvm::ConstantInt::get(i8Ty, 1));
+    auto* chkBB  = llvm::BasicBlock::Create(llvm_, "pg.chk",   currentFn_);
+    auto* raiseBB = llvm::BasicBlock::Create(llvm_, "pg.raise", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "pg.cont",  currentFn_);
+    builder_.CreateCondBr(isProg, chkBB, contBB);
+
+    // chk: raise only if this is the OWNER thread (same-thread re-entrancy; a
+    // cross-domain in-progress touch is the §22.12 rule-1 blocking case, #1391 —
+    // it proceeds here) AND the field has not been assigned yet (its index is at
+    // or beyond how far sfinit has progressed).
+    builder_.SetInsertPoint(chkBB);
+    llvm::Value* ownerTid = builder_.CreateLoad(i64(), ownIt->second, "pg.owner");
+    llvm::Value* self =
+        builder_.CreateCall(declareC("bz_current_thread_id", i64(), {}), {},
+                            "pg.self");
+    llvm::Value* sameThread = builder_.CreateICmpEQ(ownerTid, self);
+    llvm::Value* progress = builder_.CreateLoad(i32(), prIt->second, "pg.progress");
+    llvm::Value* notAssigned = builder_.CreateICmpUGE(
+        llvm::ConstantInt::get(i32(), static_cast<uint64_t>(idx)), progress);
+    llvm::Value* shouldRaise = builder_.CreateAnd(sameThread, notAssigned);
+    builder_.CreateCondBr(shouldRaise, raiseBB, contBB);
+
+    // raise: synthesize the backstop TIE (naming the owner). It escapes via the
+    // emitPendingCheck below, unwinds out of the in-progress initializer, and the
+    // ordinary §22.7 failed-state machinery caches it — partial state never read.
+    builder_.SetInsertPoint(raiseBB);
+    emitSynthesizeCycleTIE(std::string(owner->name));
+    builder_.CreateBr(contBB);
+
+    builder_.SetInsertPoint(contBB);
+    emitPendingCheck();  // route a raised TIE through the current unwind target
 }
 
 
