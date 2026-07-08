@@ -108,6 +108,18 @@ struct TypeRef {
 // Returns PrimitiveType::None for unknown lexemes.
 PrimitiveType primitiveFromName(std::string_view name);
 
+// §7.9 / §22.4 (v0.181): true when `t` is a non-nullable reference type — a
+// type with *no* default value, for which a read before assignment is a
+// definite-assignment error. These are class/interface types (including the
+// builtin collection wrappers `Array<T>` / `OwningArray<T>` and other imported
+// builtins), `string`, `Object`, and function types. Value types (primitives
+// other than string/Object, records, enums, inline arrays, the unit type) and
+// every nullable type carry a default (`0`/`false`/all-default/`null`) and are
+// *not* reported. An unclassifiable / error TypeRef returns false (lenient — the
+// analysis never invents a false positive). Defined in TypeResolution.cpp
+// (needs the complete TypeSymbol to read a Named type's declaration kind).
+bool isNonNullableReferenceType(const TypeRef* t);
+
 // stdlib §2.19 (v0.176, #807): the compiler-provided primitive conformance
 // table for the static-abstraction interfaces. The numeric tower (byte…ulong,
 // float, double, decimal) conforms to INumber<T>/ISteppable<T>/IParsable<T>;

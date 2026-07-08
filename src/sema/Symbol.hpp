@@ -222,6 +222,18 @@ struct LocalSymbol : Symbol {
     // LocalDecl::autoDropAtScopeEnd flag but lives on the LocalSymbol because the
     // inline local has no LocalDecl node to annotate.
     bool autoDropAtScopeEnd = false;
+    // §22.4 / §7.9 (v0.181, #1552): set on an inline `out var x` local whose
+    // DECLARED out-parameter type is a NON-nullable reference type (has no
+    // default value). Such a variable is definitely assigned only on paths
+    // where the introducing call actually ran; a read on a path where a
+    // short-circuit operator skipped the call is a definite-assignment error.
+    // Recorded here because `declType` below is stripped of its declared
+    // nullability at registration (a reference `T?` out var is represented as
+    // the non-nullable `T`), so the definite-assignment pass could not recover
+    // the declared nullability from `declType` alone. Left false for value-typed
+    // and nullable out vars (default-initialized, §7.9 — readable on every path)
+    // and for every non-`out var` local.
+    bool outVarNeedsDefiniteAssignment = false;
     // Slice 3g: resolved type for the local. Set either from an
     // explicit `: Type` ascription (via TypeResolution) or inferred
     // from the initializer's exprType. Null when neither is available

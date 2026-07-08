@@ -54,6 +54,29 @@ PrimitiveType primitiveFromName(std::string_view name) {
     return PrimitiveType::None;
 }
 
+// §7.9 / §22.4 (v0.181): see the declaration in TypeRef.hpp.
+bool isNonNullableReferenceType(const TypeRef* t) {
+    if (!t || t->nullable) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            return t->primitive == PrimitiveType::String ||
+                   t->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Named:
+            // A resolved class/interface has no default; a resolved record/enum
+            // is a value type. A Named TypeRef with no declaration is an
+            // imported/builtin reference type (a collection wrapper, `Task`, …)
+            // or a bare generic parameter, both of which follow the
+            // non-nullable-reference rule (§7.10).
+            if (!t->declaration) return true;
+            return t->declaration->kind == ast::TypeDeclKind::Class ||
+                   t->declaration->kind == ast::TypeDeclKind::Interface;
+        default:  // Unit, InlineArray, Error
+            return false;
+    }
+}
+
 void Resolver::run(const ast::SourceFile& src) {
     // §2.15 / issue #631: build the set of imported namespace names so that
     // import-gated builtin types (BinarySerializer / BinaryDeserializer) can be

@@ -3397,6 +3397,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         calleeParent2);
                             }
                         }
+                        // §22.4 / §7.9 (v0.181, #1552): record whether a read
+                        // of this inline out var on a path where the call did
+                        // not run is a definite-assignment error — true only for
+                        // a NON-nullable reference-typed out param (no default).
+                        // Captured from the DECLARED type here, before the
+                        // nullable-strip below erases the `?` (which would make a
+                        // declared `string?` out var indistinguishable from a
+                        // non-nullable `string` one downstream).
+                        lsym->outVarNeedsDefiniteAssignment =
+                            isNonNullableReferenceType(lsym->declType);
                         // out params are nullable refs — strip nullable
                         // (the variable holds the non-nullable value).
                         if (lsym->declType && lsym->declType->nullable) {

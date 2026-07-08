@@ -94,6 +94,107 @@ private:
     // the fall-off check runs on the live path).
     bool terminated_ = false;
 
+    // §22.4 (v0.181): short-circuit-sensitive definite-assignment state for a
+    // boolean sub-expression. `afterTrue` / `afterFalse` are the sets of
+    // definitely-assigned names on the paths where the expression evaluated to
+    // `true` and to `false` respectively. They differ exactly where a
+    // short-circuit operator skips a call: `A and Call(out var x)` assigns `x`
+    // only on the true continuation; `A or Call(out var x)` only on the false
+    // continuation.
+    struct CondState {
+        std::unordered_set<std::string_view> afterTrue;
+        std::unordered_set<std::string_view> afterFalse;
+    };
+
+    // Set intersection helper (a local is definitely assigned only where it is
+    // assigned on *every* incoming path).
+    static std::unordered_set<std::string_view> intersectSets(
+        const std::unordered_set<std::string_view>& a,
+        const std::unordered_set<std::string_view>& b) {
+        std::unordered_set<std::string_view> r;
+        for (auto n : a)
+            if (b.count(n)) r.insert(n);
+        return r;
+    }
+
+    // §22.4 (v0.181): whether an inline `out var` recipient must be tracked
+    // path-sensitively for definite assignment. Only a non-nullable
+    // reference-typed inline out var is unsafe to read on a path where the
+    // introducing call never ran; value-typed and nullable inline out vars are
+    // default-initialized (§7.9) and readable everywhere they are in scope, so
+    // they are left untracked. The decision is recorded on the LocalSymbol at
+    // type-check time (from the DECLARED out-param type, before its nullability
+    // was stripped), because `declType` alone can no longer distinguish a
+    // declared `T?` reference out var from a `T` one.
+    bool inlineOutVarNeedsDA(const ast::IdentifierExpr& id) const {
+        auto* loc = dynamic_cast<const LocalSymbol*>(ctx_.exprSymbol(id));
+        return loc && loc->outVarNeedsDefiniteAssignment;
+    }
+
+    // §22.4 (v0.181): evaluate `e` for its effect on `assigned_` with
+    // short-circuit precision, returning the definitely-assigned sets on its
+    // true and false continuations. Reads inside `e` are diagnosed in place; an
+    // inline `out var` assignment inside a short-circuited operand lands only on
+    // the branch where the introducing call actually ran. On return `assigned_`
+    // is left at the intersection of the two branch sets — the state that holds
+    // regardless of `e`'s value, correct for using `e` as a plain
+    // sub-expression or statement.
+    CondState evalCond(const ast::Expr& e) {
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            if (be->op == "and") {
+                CondState a = be->left ? evalCond(*be->left)
+                                       : CondState{assigned_, assigned_};
+                // The right operand is evaluated only when the left is true.
+                assigned_ = a.afterTrue;
+                CondState b = be->right ? evalCond(*be->right)
+                                        : CondState{assigned_, assigned_};
+                CondState r;
+                r.afterTrue = b.afterTrue;  // whole is true ⇒ both ran and true
+                r.afterFalse =
+                    intersectSets(a.afterFalse, b.afterFalse);  // either false
+                assigned_ = intersectSets(r.afterTrue, r.afterFalse);
+                return r;
+            }
+            if (be->op == "or") {
+                CondState a = be->left ? evalCond(*be->left)
+                                       : CondState{assigned_, assigned_};
+                // The right operand is evaluated only when the left is false.
+                assigned_ = a.afterFalse;
+                CondState b = be->right ? evalCond(*be->right)
+                                        : CondState{assigned_, assigned_};
+                CondState r;
+                r.afterTrue =
+                    intersectSets(a.afterTrue, b.afterTrue);  // either true
+                r.afterFalse = b.afterFalse;  // whole is false ⇒ both ran, false
+                assigned_ = intersectSets(r.afterTrue, r.afterFalse);
+                return r;
+            }
+        }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            if (ue->op == "not") {
+                CondState a = ue->operand ? evalCond(*ue->operand)
+                                          : CondState{assigned_, assigned_};
+                // `not` swaps the two continuations; their intersection
+                // (`assigned_`) is unchanged.
+                return CondState{a.afterFalse, a.afterTrue};
+            }
+        }
+        // Leaf / non-short-circuit expression: it evaluates unconditionally, so
+        // its assignments and reads apply on both continuations.
+        visitExpr(e);
+        return CondState{assigned_, assigned_};
+    }
+
+    // True when `e` is a short-circuit boolean operator whose operands must be
+    // evaluated path-sensitively (§22.4).
+    static bool isShortCircuitExpr(const ast::Expr& e) {
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e))
+            return be->op == "and" || be->op == "or";
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e))
+            return ue->op == "not";
+        return false;
+    }
+
     // §29.11 / #1226: true when `e`'s resolved type is the lazy LINQ
     // sentinel (Named TypeRef, no declaration, no astNode, no importedName,
     // at least one genericArg).  Must match isLazyEnumerableType() in codegen.
@@ -194,11 +295,24 @@ private:
             // the intersection becomes the new assigned set.
             // consumedLazy_ uses the same intersection semantics (#1226/§29.11):
             // a var is "definitely consumed" only when consumed on every path.
-            if (ifs->ifBranch.condition) visitExpr(*ifs->ifBranch.condition);
-            auto entry = assigned_;
-            auto consumedLazyEntry = consumedLazy_;
+            //
+            // §22.4 (v0.181): the guard is evaluated short-circuit-sensitively.
+            // The `then` branch is reached only when the guard is TRUE, so it
+            // starts from the guard's after-true set (an inline `out var` in an
+            // `and`-conjunct is assigned there); each `elif` guard, the `else`
+            // body, and the no-else fall-through are reached only when the
+            // preceding guards were FALSE, so they thread the guard's after-false
+            // set — the path on which a short-circuited call never ran.
             bool entryTerminated = terminated_;
             terminated_ = false;
+            CondState c0 = ifs->ifBranch.condition
+                               ? evalCond(*ifs->ifBranch.condition)
+                               : CondState{assigned_, assigned_};
+            auto consumedLazyEntry = consumedLazy_;
+            // `falseState` threads the assigned set on the path where every
+            // guard checked so far was false.
+            auto falseState = std::move(c0.afterFalse);
+            assigned_ = std::move(c0.afterTrue);
             for (const auto& bs : ifs->ifBranch.body) {
                 if (bs) visitStmt(*bs);
             }
@@ -209,10 +323,14 @@ private:
             std::vector<bool> branchTerminated;
             branchTerminated.push_back(terminated_);
             for (const auto& el : ifs->elifBranches) {
-                assigned_ = entry;
+                assigned_ = falseState;
                 consumedLazy_ = consumedLazyEntry;
                 terminated_ = false;
-                if (el.condition) visitExpr(*el.condition);
+                CondState ci = el.condition
+                                   ? evalCond(*el.condition)
+                                   : CondState{assigned_, assigned_};
+                falseState = std::move(ci.afterFalse);
+                assigned_ = std::move(ci.afterTrue);
                 for (const auto& bs : el.body) {
                     if (bs) visitStmt(*bs);
                 }
@@ -221,7 +339,7 @@ private:
                 branchTerminated.push_back(terminated_);
             }
             if (ifs->hasElse) {
-                assigned_ = entry;
+                assigned_ = falseState;
                 consumedLazy_ = consumedLazyEntry;
                 terminated_ = false;
                 for (const auto& bs : ifs->elseBody) {
@@ -231,7 +349,7 @@ private:
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
                 branchTerminated.push_back(terminated_);
             } else {
-                branchOuts.push_back(entry);           // no-else fall-through
+                branchOuts.push_back(std::move(falseState)); // no-else: guard-false path
                 consumedLazyOuts.push_back(consumedLazyEntry); // no-else: no new consumption
                 branchTerminated.push_back(false);     // no-else = path live
             }
@@ -264,21 +382,25 @@ private:
             return;
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-            if (ws->condition) visitExpr(*ws->condition);
-            // Conservative: body may not execute (zero-trip), so any
-            // assignments inside don't propagate to post-loop. Walk to
-            // diagnose reads but restore the entry set afterwards.
-            // consumedLazy_ (#1226) is also restored: the loop may run 0
-            // times, so we cannot claim a lazy var inside the body is
-            // definitely consumed after the loop.
-            auto entry = assigned_;
-            auto consumedLazyEntry = consumedLazy_;
+            // §22.4 (v0.181): the guard is evaluated short-circuit-sensitively
+            // and at least once. The body runs only when the guard is TRUE, so
+            // it starts from the guard's after-true set (an inline `out var` in
+            // an `and`-conjunct is assigned there). A `while` exits with its
+            // guard FALSE (or ran zero times), so the post-loop state is the
+            // guard's after-false set. Body-internal assignments do not survive
+            // (the loop may run zero times), so they are not propagated past.
+            // consumedLazy_ (#1226) is likewise restored to its post-guard
+            // state: a zero-trip loop consumes nothing inside the body.
             bool entryTerminated = terminated_;
             terminated_ = false;
+            CondState c = ws->condition ? evalCond(*ws->condition)
+                                        : CondState{assigned_, assigned_};
+            auto consumedLazyEntry = consumedLazy_;
+            assigned_ = std::move(c.afterTrue);
             for (const auto& bs : ws->body) {
                 if (bs) visitStmt(*bs);
             }
-            assigned_ = std::move(entry);
+            assigned_ = std::move(c.afterFalse);
             consumedLazy_ = std::move(consumedLazyEntry);
             terminated_ = entryTerminated; // loop may not execute
             return;
@@ -394,6 +516,16 @@ private:
     }
 
     void visitExpr(const ast::Expr& e) {
+        // §22.4 (v0.181): a short-circuit boolean operator evaluates its
+        // operands path-sensitively. Route it through evalCond, which leaves
+        // `assigned_` at the state that holds regardless of the operator's
+        // value (the intersection of its true/false continuations) — so a
+        // conditionally-assigned inline `out var` does not leak past the
+        // operator as definitely assigned.
+        if (isShortCircuitExpr(e)) {
+            (void)evalCond(e);
+            return;
+        }
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
             checkRead(*id);
             return;
@@ -535,6 +667,24 @@ private:
         if (a.modifier.rfind("out", 0) == 0) {
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                // §22.4 (v0.181): an inline `out var x` declares a fresh local
+                // that is definitely assigned *only on paths where this call
+                // actually evaluated*. Marking it in `assigned_` here records
+                // the assignment on the current (call-ran) path; the
+                // short-circuit machinery (evalCond) drops it again on any
+                // branch where the call was skipped. To make a later read on
+                // such a skipped path an error, the name must also be tracked in
+                // `declared_` — but only when it is a non-nullable reference
+                // type (§7.9); value-typed and nullable inline out vars are
+                // default-initialized and readable on every path, so they stay
+                // untracked (as before). The owning inline forms (`out owned
+                // var` / `out using var`) carry a per-path disposal obligation
+                // handled by the ownership pass and are not DA-tracked here.
+                // A plain `out x` / `out owned x` targets a pre-declared local
+                // (already in `declared_`) and is just marked assigned
+                // (§22.3 / #747).
+                if (a.modifier == "out var" && inlineOutVarNeedsDA(*id))
+                    declared_.insert(id->name);
                 assigned_.insert(id->name);
                 return;  // pure write — not a read
             }

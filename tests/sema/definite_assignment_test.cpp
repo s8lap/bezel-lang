@@ -250,3 +250,139 @@ BEZEL_TEST(sema_da, callee_ref_param_not_reassigned_is_clean_spec_22_3_925) {
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// -----------------------------------------------------------------------------
+// §22.4 / §7.9 (v0.181, #1552): inline `out var` definite assignment is
+// short-circuit path-sensitive. An inline out variable is definitely assigned
+// only on control-flow paths where the introducing call actually ran; under
+// `and`/`or` the distinction is live. A read of a non-nullable-reference-typed
+// out var on a path where the call was skipped is a compile error; guarded reads
+// stay accepted; value-typed and nullable out vars follow §7.9 default-init and
+// remain readable on every path.
+// -----------------------------------------------------------------------------
+
+namespace {
+bool mentionsUnassignedRead(const bezel::test::DAResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("read of unassigned local") != std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// (a) REJECT: `if flag and TryGet(out var s) then ... end; _ := s;` — on the
+// `flag == false` path the call never ran, so a read of the non-nullable
+// reference (`string`) out var `s` after the `if` is a definite-assignment
+// error. This is the accept+segfault the issue reported.
+BEZEL_TEST(sema_da,
+           inline_out_var_short_circuit_read_after_if_rejected_spec_22_4_1552) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  static method TryGet(out v: string): bool "
+        "    v := \"hi\"; return true; "
+        "  end TryGet; "
+        "  public static method Run(flag: bool) "
+        "    if flag and TryGet(out var s) then _ := s; end; "
+        "    _ := s; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
+}
+
+// (b) ACCEPT: the idiomatic guarded read — `s` is read only inside the `then`
+// branch, reached only when the `and`-conjunct call ran and returned `true`, so
+// `s` is definitely assigned there (§22.4 after-true fact).
+BEZEL_TEST(sema_da,
+           inline_out_var_short_circuit_guarded_read_accepted_spec_22_4_1552) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  static method TryGet(out v: string): bool "
+        "    v := \"hi\"; return true; "
+        "  end TryGet; "
+        "  public static method Run(flag: bool) "
+        "    if flag and TryGet(out var s) then _ := s; end; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c) ACCEPT: a value-typed inline out var (`int`) is default-initialized
+// (§7.9); reading it after a short-circuited call observes the default, not
+// garbage, so the read stays accepted.
+BEZEL_TEST(sema_da,
+           inline_out_var_value_type_read_after_short_circuit_accepted_spec_7_9_1552) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  static method TryGetInt(out n: int): bool "
+        "    n := 42; return true; "
+        "  end TryGetInt; "
+        "  public static method Run(flag: bool) "
+        "    if flag and TryGetInt(out var n) then end; "
+        "    _ := n; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c') ACCEPT: a nullable-reference inline out var (`string?`) is
+// default-initialized to `null` (§7.9); the read after a short-circuited call
+// observes `null`, so it stays accepted (the declared nullability must survive
+// the type checker's reference-`?`-strip — #1552).
+BEZEL_TEST(sema_da,
+           inline_out_var_nullable_read_after_short_circuit_accepted_spec_7_9_1552) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  static method TryGetN(out v: string?): bool "
+        "    v := \"hi\"; return true; "
+        "  end TryGetN; "
+        "  public static method Run(flag: bool) "
+        "    if flag and TryGetN(out var s) then end; "
+        "    _ := s; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (d) ACCEPT: when the whole guard IS the call (no short-circuit above it), the
+// call ran on every path reaching past the `if`, so the non-nullable out var is
+// definitely assigned afterward.
+BEZEL_TEST(sema_da,
+           inline_out_var_unconditional_call_read_after_if_accepted_spec_22_4_1552) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  static method TryGet(out v: string): bool "
+        "    v := \"hi\"; return true; "
+        "  end TryGet; "
+        "  public static method Run() "
+        "    if TryGet(out var s) then end; "
+        "    _ := s; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (e) REJECT: `or` is the mirror image of `and` — `A or Call(out var x)` assigns
+// `x` only when the whole guard is FALSE, i.e. on the `else`/false path. A read
+// of `x` in the `then` branch (guard true, which includes the `A == true` path
+// on which the call was skipped) is a definite-assignment error.
+BEZEL_TEST(sema_da,
+           inline_out_var_or_short_circuit_then_read_rejected_spec_22_4_1552) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  static method TryGet(out v: string): bool "
+        "    v := \"hi\"; return true; "
+        "  end TryGet; "
+        "  public static method Run(flag: bool) "
+        "    if flag or TryGet(out var s) then _ := s; end; "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
+}
