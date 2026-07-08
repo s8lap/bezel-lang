@@ -3629,19 +3629,31 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // of this inline out var on a path where the call did
                         // not run is a definite-assignment error — true only for
                         // a NON-nullable reference-typed out param (no default).
-                        // Captured from the DECLARED type here, before the
-                        // nullable-strip below erases the `?` (which would make a
-                        // declared `string?` out var indistinguishable from a
-                        // non-nullable `string` one downstream).
                         lsym->outVarNeedsDefiniteAssignment =
                             isNonNullableReferenceType(lsym->declType);
-                        // out params are nullable refs — strip nullable
-                        // (the variable holds the non-nullable value).
-                        if (lsym->declType && lsym->declType->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
-                            nn->nullable = false;
-                            lsym->declType = nn;
-                        }
+                        // §22.4 / §7.9 (#1597): do NOT strip the out-param's
+                        // declared nullability. A nullable out param (`T?`)
+                        // means the callee may leave the slot null on some
+                        // exit path (§22.3's every-exit-path-assigned rule
+                        // permits assigning `null` there); the inline
+                        // `out var x` recipient must keep that same `T?` type
+                        // so a bare `x.Member` after the call is still subject
+                        // to §7.4's nullable-member-access rule and so
+                        // `when true`/`when false` (§22.4) caller narrowing has
+                        // a nullable type to narrow FROM. This block used to
+                        // unconditionally clear `nullable` here, reasoning it
+                        // was "representationally harmless for a reference
+                        // type" — true for CODEGEN's pointer lowering
+                        // (LlvmBackend_Calls2.cpp's ensureOutVarSlots resolves
+                        // the out-var slot's LLVM type fresh from the callee's
+                        // AST parameter, independent of this sema TypeRef) —
+                        // but wrong for the type checker, which then treated
+                        // `x` as provably non-null forever after, silently
+                        // widening past what the callee's signature promised.
+                        // A non-nullable out param's declType already has
+                        // `nullable == false`, so removing the strip is a
+                        // no-op for that case (verified by the control test
+                        // below and #1552's DA tests, which stay green).
                     }
                     // v0.171 (#1336): BUILTIN borrowing extraction Trys have no
                     // MethodDecl (calleeMd2 == null), so the block above leaves
@@ -3717,13 +3729,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         calleeMd2->params[pos2].type) {
                         lsym->declType = ctx_.resolvedType(
                             *calleeMd2->params[pos2].type);
-                        // `out owned T?` parameter: strip nullable so the
-                        // local holds the non-nullable owned value.
-                        if (lsym->declType && lsym->declType->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
-                            nn->nullable = false;
-                            lsym->declType = nn;
-                        }
+                        // §22.4 / §7.9 (#1597): keep the `out owned T?`
+                        // parameter's declared nullability — mirrors the
+                        // plain `out var` fix just above (same reasoning: the
+                        // strip was cosmetically harmless for codegen's
+                        // pointer lowering but wrong for the type checker).
+                        // An `out owned conn: Connection? when true` recipient
+                        // must stay `Connection?` so §22.4's postcondition
+                        // narrowing and ordinary null checks on it apply; a
+                        // non-nullable `out owned T` parameter is unaffected
+                        // (declType->nullable is already false).
                     }
                     // §28.11 / v0.160 (#1305): for BUILTIN owning-collection Try*
                     // methods (TryPop/TryDequeue/TryPopFirst/TryPopLast/TryTake/
