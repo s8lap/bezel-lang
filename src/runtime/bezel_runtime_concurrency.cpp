@@ -930,10 +930,21 @@ struct BzWhenAllCtx {
     bz_task_t* aggregate;
     std::atomic<int64_t> remaining;  // pending completion count
     std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
-    void* task_arr;                  // original input array (BORROWED, not
-                                      // freed here) — read only by the
-                                      // terminal continuation, after every
-                                      // input is done.
+    std::vector<void*> tasks;        // SNAPSHOT of the input task pointers
+                                      // (borrowed), taken at call time — the
+                                      // terminal input-order scan reads THIS,
+                                      // never the input `Array<Task>`. The
+                                      // input array is a BORROWED `using var`
+                                      // the caller may dispose at scope end
+                                      // before a queued continuation runs; a
+                                      // read-back of it there is a
+                                      // use-after-free (the not-awaited
+                                      // WhenAll aggregate regression, #1529).
+                                      // Fully populated before any continuation
+                                      // is registered, so the terminal
+                                      // continuation (fires only once all n
+                                      // have decremented `remaining`) sees an
+                                      // immutable snapshot — no data race.
 };
 
 void* bz_task_when_all(void* task_arr) {
@@ -948,11 +959,19 @@ void* bz_task_when_all(void* task_arr) {
         aggregate->done = true;
         return aggregate;
     }
-    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}, task_arr};
+    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}, {}};
+    // Snapshot the input task pointers BEFORE registering any continuation, so
+    // the terminal input-order scan never reads back the borrowed input array
+    // (which the caller may free at scope end while a continuation is still
+    // queued — the not-awaited-aggregate use-after-free). §30.10 / #1529.
+    ctx->tasks.reserve((size_t)n);
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
-        bz_task_then(t,
+        ctx->tasks.push_back(t);
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        bz_task_then(ctx->tasks[i],
             [](void* /*completedTask*/, void* state) {
                 auto* c = (BzWhenAllCtx*)state;
                 // When ALL inputs are done (remaining → 0), scan in INPUT
@@ -960,12 +979,10 @@ void* bz_task_when_all(void* task_arr) {
                 // input is done at this point, so each one's is_error /
                 // error_obj / error_msg is stable — no race.
                 if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    auto* a = (bz_array_t*)c->task_arr;
-                    int64_t n2 = bz_array_len(a);
+                    int64_t n2 = (int64_t)c->tasks.size();
                     bool faulted = false;
                     for (int64_t j = 0; j < n2 && !faulted; ++j) {
-                        void* tj = nullptr;
-                        bz_array_get(a, j, &tj, sizeof(void*));
+                        void* tj = c->tasks[j];
                         if (bz_task_is_error(tj)) {
                             faulted = true;
                             void* errObj = bz_task_error_obj(tj);
@@ -1013,9 +1030,16 @@ struct BzWhenAllResultsCtx {
     int64_t n;                           // total task count
     int64_t elem_size;                   // sizeof(T) — bytes per result element
     void** result_bufs;                  // result_bufs[i]: malloc'd copy of task i's result
-    void* task_arr;                      // original input array (BORROWED) —
-                                          // read only by the terminal
-                                          // continuation's input-order scan.
+    std::vector<void*> tasks;            // SNAPSHOT of input task pointers
+                                          // (borrowed), taken at call time —
+                                          // the terminal input-order scan reads
+                                          // THIS, never the borrowed input
+                                          // array (which the caller may free at
+                                          // scope end while a continuation is
+                                          // still queued: a use-after-free).
+                                          // Fully populated before any
+                                          // continuation registers. §30.10 /
+                                          // #1529.
 };
 
 struct BzWhenAllResultsSlot {
@@ -1044,14 +1068,22 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     // copy of the task's raw result bytes (elem_size bytes).
     void** result_bufs = (void**)calloc((size_t)n, sizeof(void*));
     auto* ctx = new BzWhenAllResultsCtx{
-        aggregate, {n}, {n}, n, elem_size, result_bufs, task_arr};
+        aggregate, {n}, {n}, n, elem_size, result_bufs, {}};
+    // Snapshot the input task pointers BEFORE registering any continuation, so
+    // the terminal input-order scan never reads back the borrowed input array
+    // (freed at the caller's scope end while a continuation is still queued —
+    // the not-awaited-aggregate use-after-free). §30.10 / #1529.
+    ctx->tasks.reserve((size_t)n);
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
+        ctx->tasks.push_back(t);
+    }
+    for (int64_t i = 0; i < n; ++i) {
         // Per-slot: allocate a BzWhenAllResultsSlot to carry (ctx, idx) into
         // the continuation. The slot is freed by the continuation itself.
         auto* slot = new BzWhenAllResultsSlot{ctx, i};
-        bz_task_then(t,
+        bz_task_then(ctx->tasks[i],
             [](void* completedTask, void* state) {
                 auto* slot = (BzWhenAllResultsSlot*)state;
                 auto* c  = slot->ctx;
@@ -1073,12 +1105,10 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
                 // When ALL inputs done (remaining → 0): scan in INPUT ORDER
                 // (§30.10 / #1529) for the first non-successful task.
                 if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    auto* a = (bz_array_t*)c->task_arr;
-                    int64_t n2 = bz_array_len(a);
+                    int64_t n2 = (int64_t)c->tasks.size();
                     bool faulted = false;
                     for (int64_t j = 0; j < n2 && !faulted; ++j) {
-                        void* tj = nullptr;
-                        bz_array_get(a, j, &tj, sizeof(void*));
+                        void* tj = c->tasks[j];
                         if (bz_task_is_error(tj)) {
                             faulted = true;
                             // Free any collected result bufs (discarded).
