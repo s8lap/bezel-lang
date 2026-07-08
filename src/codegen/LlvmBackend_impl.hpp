@@ -1457,6 +1457,22 @@ private:
     std::map<std::pair<const sema::MethodSymbol*, const sema::MethodSymbol*>,
              llvm::Function*>
         nullableWideningThunks_;
+    // #1592 / §12.1: per virtual-slot FAMILY (keyed by the introducing,
+    // non-override virtual declaration — see introducingVirtualMethod), which
+    // 0-based parameter positions are widened (base `T` → some override's
+    // `T?`, VALUE type) by ANY contributor anywhere in the whole class
+    // hierarchy reachable from the family's root. Memoized: computed once per
+    // root MethodSymbol by scanning ctx_.symbols() (mirrors the existing
+    // whole-program subclass scan in emitVirtualGenericDispatch).
+    std::unordered_map<const sema::MethodSymbol*, std::vector<bool>>
+        vtableFamilyWidenedParams_;
+    // #1592: adapter thunks presenting a widened family's uniform (boxed)
+    // ABI for a contributor whose OWN declared parameter is still the narrow
+    // (un-widened) form — the base's own un-overridden body, or a sibling
+    // override that never widened. Keyed by the contributor's own
+    // MethodSymbol (its narrow body); generated once per contributor.
+    std::unordered_map<const sema::MethodSymbol*, llvm::Function*>
+        vtableWideningThunks_;
     // Per class: the itmap$C global ([td$I1, itab$C$I1, …, null]).
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         itmaps_;
@@ -3286,6 +3302,44 @@ private:
                                                 const sema::MethodSymbol* implMs);
     llvm::Function* emitEventAccessor(const sema::TypeSymbol* cls,
                                       const sema::EventSymbol* es);
+
+    // #1592: the resolved declared TypeRef for a ParameterSymbol (prefers
+    // resolvedDeclType, falls back to resolving declType) — the same
+    // resolution order used throughout the widening machinery below and in
+    // ensureNullableWideningThunk.
+    sema::TypeRef* paramTypeOf(sema::Symbol* p) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
+        if (!ps) return nullptr;
+        if (ps->resolvedDeclType) return ps->resolvedDeclType;
+        return ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
+    }
+
+    // #1592 / §12.1: find the INTRODUCING (non-override) virtual declaration
+    // for `ms` by walking the base-class chain while the same vtable slot
+    // continues to be present on the ancestor. Returns `ms` itself if it has
+    // no vtable slot info, or if it already is the introducing declaration.
+    const sema::MethodSymbol* introducingVirtualMethod(
+        const sema::MethodSymbol* ms);
+    // #1592: the widened parameter-position bitmap for `rootMs`'s whole
+    // virtual-slot family (memoized in vtableFamilyWidenedParams_). Empty
+    // vector or all-false ⇒ no widening anywhere ⇒ existing (pre-#1592)
+    // direct-install / direct-call behavior applies unchanged.
+    const std::vector<bool>& widenedParamPositions(
+        const sema::MethodSymbol* rootMs);
+    // #1592: the family's uniform ABI function type — `rootMs`'s own declared
+    // signature with each widened position's type replaced by the tagged
+    // `{i8 hasValue, T}` struct. Returns methodFnType(rootMs) unchanged (no
+    // widened positions) when `widened` is all-false.
+    llvm::FunctionType* uniformVtableFnType(const sema::MethodSymbol* rootMs,
+                                            const std::vector<bool>& widened);
+    // #1592: adapter thunk presenting the family's uniform (possibly wide)
+    // ABI for a contributor (`leafMs`) whose own compiled body is still the
+    // narrow form — unboxes each widened argument before forwarding. Returns
+    // nullptr when leafMs's own ABI already matches the uniform type (no
+    // thunk needed — direct install/call suffices).
+    llvm::Function* ensureVtableWideningThunk(const sema::MethodSymbol* rootMs,
+                                              const sema::MethodSymbol* leafMs,
+                                              const std::vector<bool>& widened);
 
     void declareVtables();
 

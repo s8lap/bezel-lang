@@ -5444,6 +5444,49 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             }
         }
         llvm::FunctionType* fnTy = methodFnType(ms);
+        // #1592 / §12.1: if this class-virtual slot is widened (a VALUE-typed
+        // parameter, e.g. `int` → `int?`) by ANY contributor anywhere in the
+        // whole hierarchy, every call to the slot — regardless of which
+        // ancestor's static type resolved `ms` — must use the family's
+        // uniform (wide) ABI, matching what declareVtables installed at
+        // every contributing class's vtable slot (a direct wide-ABI fn, or
+        // an unboxing thunk for a still-narrow contributor —
+        // LlvmBackend_Setup.cpp). A call resolved through a narrow
+        // (`T`-declaring) static type always has a definite (non-null) value
+        // in hand, so it is boxed here; a call already resolved through a
+        // wide (`T?`-declaring) static type finds its argument already
+        // boxed by the ordinary per-parameter coercion the caller performed
+        // against `ms`'s own (already wide) declared type. Reference-typed
+        // widening (#1560) is unaffected: isNullableValueTy is false for
+        // those, so `widened` stays all-false and this block is a no-op.
+        // Interface dispatch and any active generic substitution don't use
+        // this mechanism (out of scope — gated out below).
+        if (!isIfaceMethod && genericSubst_.empty()) {
+            const sema::MethodSymbol* rootMs = introducingVirtualMethod(ms);
+            const std::vector<bool>& widened = widenedParamPositions(rootMs);
+            bool anyWiden = false;
+            for (bool w : widened) if (w) { anyWiden = true; break; }
+            if (anyWiden) {
+                if (llvm::FunctionType* uniformTy =
+                        uniformVtableFnType(rootMs, widened)) {
+                    for (std::size_t pi = 0; pi < widened.size(); ++pi) {
+                        if (!widened[pi]) continue;
+                        std::size_t ai = pi + 1;  // skip the receiver
+                        if (ai >= args.size() || !fnTy ||
+                            ai >= fnTy->getNumParams())
+                            continue;
+                        if (fnTy->getParamType(ai) == uniformTy->getParamType(ai))
+                            continue;  // ms's own declared param is already wide.
+                        sema::TypeRef* pt = paramTypeOf(rootMs->params[pi]);
+                        if (!pt) continue;
+                        sema::TypeRef nn = *pt;
+                        nn.nullable = true;
+                        args[ai] = wrapNullableValue(&nn, args[ai]);
+                    }
+                    fnTy = uniformTy;
+                }
+            }
+        }
         if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
         // §5.1 / §22.6: widen each argument to its declared parameter type
         // when sema admitted an implicit numeric conversion (e.g. an int

@@ -63,8 +63,9 @@ bool typeRefEqual(const TypeRef* a, const TypeRef* b) {
 // widening match predicate for reuse by other passes (§22.6 overload-set
 // dedup, #1560). Single source of truth: delegates to
 // Resolver::overrideParamTypeMatches.
-bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy) {
-    return Resolver::overrideParamTypeMatches(derivedTy, baseTy);
+bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
+                              bool isByRefParam) {
+    return Resolver::overrideParamTypeMatches(derivedTy, baseTy, isByRefParam);
 }
 
 int Resolver::effVisRank(ast::Visibility v) {
@@ -1635,10 +1636,21 @@ void Resolver::buildBaseGenericSubst(
     }
 }
 
-// §12.1 (v0.181, #1560) implementation note / #1592 follow-up: is `t` a
-// widening candidate whose nullable form is ABI-IDENTICAL to its non-null
-// form, so a vtable call built from an ancestor's narrower static type can
-// safely reach an override that widened this parameter?
+// #1592: is `mod` a parameter modifier that passes the argument BY
+// REFERENCE — aliasing the caller's own storage — rather than by value?
+// Mirrors codegen's Emitter::isByRefMod (LlvmBackend_impl.hpp); kept as an
+// independent copy since sema and codegen are separate layers, but the
+// modifier vocabulary (§22.3/§22.4) is shared.
+static bool isByRefParamModifier(std::string_view mod) {
+    return mod == "ref" || mod == "out" || mod == "out var" ||
+           mod == "out owned" || mod == "out owned var" ||
+           mod == "out using var";
+}
+
+// §12.1 (v0.181, #1560) implementation note / #1592: is `t` a widening
+// candidate the codegen side can marshal safely, so a vtable call built from
+// an ancestor's narrower static type can safely reach an override that
+// widened this parameter?
 //
 // Reference types (class, interface, `string`, `Object`) always are: `T`
 // and `T?` both lower to a plain (possibly-null) pointer, so no thunk is
@@ -1646,32 +1658,48 @@ void Resolver::buildBaseGenericSubst(
 // given call site used to build its call.
 //
 // VALUE types (numeric/bool primitives, enums, records — codegen's
-// isNullableValueTy) are NOT: `T?` lowers to a tagged `{i8 hasValue; T
-// value}` struct, a different runtime representation than the bare `T` the
-// original (un-widened) virtual declaration's ABI uses. §11.2's analogous
-// interface-implementation widening handles this with an adapter thunk
-// (ensureNullableWideningThunk, #1139/#1183) rewritten into every itable
-// slot; no equivalent thunk exists yet for virtual/override dispatch
-// (declareVtables installs the override's function pointer directly — CG35
-// Setup.cpp — so a slot reached through an ancestor's non-widened static
-// type would bitcast to the unboxed signature and pass a raw value where
-// the installed function expects the boxed struct, corrupting the call).
-// Until that vtable-thunk machinery exists, decline the widening for
-// value-typed parameters — see issue #1592.
-static bool overrideWideningIsAbiSafe(const TypeRef* t) {
+// isNullableValueTy) are NOT ABI-identical: `T?` lowers to a tagged
+// `{i8 hasValue; T value}` struct, a different runtime representation than
+// the bare `T` the original (un-widened) virtual declaration's ABI uses.
+// #1592 closes this: `declareVtables` (LlvmBackend_Setup.cpp) now installs a
+// per-slot ADAPTER THUNK whenever any override anywhere in the virtual
+// slot's hierarchy widens a value-typed parameter — every contributing
+// class's slot (including the un-overridden base's own, and any sibling
+// that never widened) presents one uniform, family-wide ABI, and
+// `emitMethodCall` (LlvmBackend_Calls2.cpp) builds every call to that slot
+// against the SAME uniform ABI regardless of which ancestor's static type
+// resolved the call, boxing a definite narrow value up when necessary. So a
+// plain (by-value) VALUE-typed parameter is now ABI-safe to widen too.
+//
+// A `ref`/`out` parameter is the one case that stays unsafe even for a
+// value type: it aliases the CALLER's own storage directly (no thunk-owned
+// copy to marshal), and that storage is sized for the narrow, un-boxed `T` —
+// there is no safe place to grow an extra hasValue byte. `isByRefParam`
+// (threaded from the parameter's modifier, per the call sites below) keeps
+// that case declined. Reference-typed by-ref parameters are unaffected: `T`
+// and `T?` are both plain pointer-sized slots there regardless of the
+// modifier, so no aliasing hazard exists for them.
+static bool overrideWideningIsAbiSafe(const TypeRef* t, bool isByRefParam) {
     if (!t) return false;
     if (t->kind == TypeRef::Kind::Primitive) {
-        return t->primitive == PrimitiveType::Object ||
-               t->primitive == PrimitiveType::String;
+        if (t->primitive == PrimitiveType::Object ||
+            t->primitive == PrimitiveType::String)
+            return true;
+        return !isByRefParam;  // #1592: numeric/bool value primitives.
     }
     if (t->kind == TypeRef::Kind::Named && t->declaration) {
-        return t->declaration->kind == ast::TypeDeclKind::Class ||
-               t->declaration->kind == ast::TypeDeclKind::Interface;
+        if (t->declaration->kind == ast::TypeDeclKind::Class ||
+            t->declaration->kind == ast::TypeDeclKind::Interface)
+            return true;
+        if (t->declaration->kind == ast::TypeDeclKind::Enum ||
+            t->declaration->kind == ast::TypeDeclKind::Record)
+            return !isByRefParam;  // #1592: enum/record value types.
+        return false;
     }
     // Unresolved / declaration-less Named type (a generic type parameter, or
     // a builtin whose concrete shape isn't visible here): the concrete
-    // instantiation could be a value type, so conservatively decline rather
-    // than risk the ABI corruption above.
+    // instantiation could be a value type behind a ref/out parameter, so
+    // conservatively decline rather than risk the ABI corruption above.
     return false;
 }
 
@@ -1688,17 +1716,19 @@ static bool overrideWideningIsAbiSafe(const TypeRef* t) {
 // parameter is `T?`, the next override's base type IS `T?`, so this
 // predicate demands the next override also declare `T?` (or narrower is
 // rejected, matching exactly is fine, but there is no "T?→T" widening case).
-// The widening is further restricted to ABI-safe (reference) types per
-// overrideWideningIsAbiSafe above — see issue #1592 for the value-type
-// follow-up (needs a vtable adapter thunk mirroring the itable one).
+// The widening is further restricted to ABI-safe types per
+// overrideWideningIsAbiSafe above — reference types always qualify; a
+// by-value VALUE type qualifies too as of #1592 (vtable adapter-thunk
+// machinery); a by-ref (`ref`/`out`) VALUE-typed parameter still does not.
 bool Resolver::overrideParamTypeMatches(const TypeRef* derivedTy,
-                                        const TypeRef* baseTy) {
+                                        const TypeRef* baseTy,
+                                        bool isByRefParam) {
     if (!derivedTy || !baseTy) return false;
     if (typeRefEqual(derivedTy, baseTy)) return true;
     // Only a base-non-nullable / derived-nullable pair can be a widening
     // match; the reverse, or any other kind of mismatch, is rejected.
     if (!derivedTy->nullable || baseTy->nullable) return false;
-    if (!overrideWideningIsAbiSafe(baseTy)) return false;
+    if (!overrideWideningIsAbiSafe(baseTy, isByRefParam)) return false;
     // Compare structurally with the derived type's `?` stripped — a plain
     // stack copy is fine here, typeRefEqual only reads through the pointer
     // for the duration of this call (no arena allocation needed).
@@ -1723,7 +1753,11 @@ bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
         TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType) : nullptr;
         TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType) : nullptr;
         TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
-        if (!overrideParamTypeMatches(dt, btSubst)) return false;
+        // #1592: dp->modifier == bp->modifier already (checked above), so
+        // either symbol's modifier tells us whether this is a by-ref param.
+        if (!overrideParamTypeMatches(dt, btSubst,
+                                      isByRefParamModifier(dp->modifier)))
+            return false;
     }
     return true;
 }
@@ -1795,7 +1829,10 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         // chain — see overrideParamTypeMatches); every other mismatch,
         // including the reverse `T?`→`T` narrowing, is rejected.
         TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
-        if (dt && btSubst && !overrideParamTypeMatches(dt, btSubst)) {
+        // #1592: dp->modifier == bp->modifier already (checked above).
+        if (dt && btSubst &&
+            !overrideParamTypeMatches(dt, btSubst,
+                                      isByRefParamModifier(dp->modifier))) {
             err("parameter types");
             return;
         }

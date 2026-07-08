@@ -49,6 +49,10 @@ bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 // a match. Exposes the resolver's override-match predicate for reuse by
 // other passes (e.g. §22.6's collectHierarchyOverloads, which must
 // recognize a widened override as shadowing — not overloading — its base).
-bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy);
+// `isByRefParam` (#1592): pass true for a `ref`/`out` parameter — a
+// VALUE-typed widening is declined in that position even though it is now
+// admitted for a plain by-value parameter (see TypeResolution_Checks.cpp).
+bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
+                              bool isByRefParam = false);
 
 } // namespace bezel::sema

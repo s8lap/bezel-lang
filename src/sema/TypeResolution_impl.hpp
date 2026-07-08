@@ -53,8 +53,16 @@ public:
     // shadowing its base declaration, not as a second, separately-callable
     // overload) can reuse it via the free-function wrapper
     // `bezel::sema::overrideParamTypeMatches` in TypeResolution.hpp.
+    // `isByRefParam` (#1592): true when the parameter's modifier is `ref`/
+    // `out` (any out-variant) — a VALUE-typed widening under such a modifier
+    // is still declined (see overrideWideningIsAbiSafe in
+    // TypeResolution_Checks.cpp): the caller's storage is sized for the
+    // narrow, un-boxed form, and a by-reference parameter aliases that
+    // storage directly rather than passing a copy a vtable thunk could
+    // marshal.
     static bool overrideParamTypeMatches(const TypeRef* derivedTy,
-                                         const TypeRef* baseTy);
+                                         const TypeRef* baseTy,
+                                         bool isByRefParam = false);
 
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type

@@ -424,7 +424,15 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                        : dp->resolvedDeclType;
             TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
                                        : bp->resolvedDeclType;
-            if (!overrideParamTypeMatches(dt, bt)) return false;
+            // #1592: a by-ref (`ref`/`out`) VALUE-typed parameter still isn't
+            // an ABI-safe widening (dp->modifier == bp->modifier already, so
+            // either symbol's modifier tells us whether this is by-ref).
+            bool isByRef = dp->modifier == "ref" || dp->modifier == "out" ||
+                           dp->modifier == "out var" ||
+                           dp->modifier == "out owned" ||
+                           dp->modifier == "out owned var" ||
+                           dp->modifier == "out using var";
+            if (!overrideParamTypeMatches(dt, bt, isByRef)) return false;
         }
         return true;
     };

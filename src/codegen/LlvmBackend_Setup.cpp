@@ -1508,6 +1508,204 @@ llvm::Function* Emitter::ensureNullableWideningThunk(
 }
 
 
+// #1592 / §12.1: find the INTRODUCING (non-override) virtual declaration for
+// `ms` by walking the base-class chain while the same vtable slot continues
+// to be present on the ancestor. buildVtable copies + overwrites the base's
+// slot array for every subclass, so a slot is present at index i in every
+// class from its introducing declarer downward — walking up stops at the
+// first ancestor missing it. Returns `ms` itself when no slot info is
+// available (e.g. a non-virtual/static method, which emitMethodCall never
+// reaches this from anyway) or `ms` already is the introducing declaration.
+const sema::MethodSymbol* Emitter::introducingVirtualMethod(
+        const sema::MethodSymbol* ms) {
+    if (!ms || !ms->parent) return ms;
+    auto slotIt = vtableSlot_.find(ms);
+    if (slotIt == vtableSlot_.end() || slotIt->second < kVirtualMethodsBase)
+        return ms;
+    unsigned idx = slotIt->second - kVirtualMethodsBase;
+    const sema::TypeSymbol* introClass = ms->parent;
+    for (const sema::TypeSymbol* cur = ms->parent; cur; ) {
+        const sema::TypeSymbol* base = baseClassOf(cur);
+        if (!base) break;
+        auto vmIt = vtableMethods_.find(base);
+        if (vmIt == vtableMethods_.end() || idx >= vmIt->second.size() ||
+            !vmIt->second[idx].method)
+            break;
+        introClass = base;
+        cur = base;
+    }
+    auto vmIt = vtableMethods_.find(introClass);
+    if (vmIt == vtableMethods_.end() || idx >= vmIt->second.size() ||
+        !vmIt->second[idx].method)
+        return ms;
+    return vmIt->second[idx].method;
+}
+
+// #1592: which 0-based parameter positions does ANY contributor anywhere in
+// rootMs's whole virtual-slot family widen (base `T` → some override's `T?`,
+// a VALUE type)? Scans every class in the program that is rootMs->parent or
+// a (transitive) subclass of it — the same whole-program subclass scan
+// emitVirtualGenericDispatch already performs (LlvmBackend_Calls2.cpp) — and
+// for each finds that class's own installed contributor for this slot (by
+// name+arity, via vtableNameSlot_/vtableMethods_), comparing its declared
+// parameter types against rootMs's own. Memoized per rootMs: a hierarchy scan
+// runs at most once per distinct virtual-slot family.
+const std::vector<bool>& Emitter::widenedParamPositions(
+        const sema::MethodSymbol* rootMs) {
+    static const std::vector<bool> kEmpty;
+    if (!rootMs || !rootMs->parent) return kEmpty;
+    auto cached = vtableFamilyWidenedParams_.find(rootMs);
+    if (cached != vtableFamilyWidenedParams_.end()) return cached->second;
+    std::vector<bool>& result = vtableFamilyWidenedParams_[rootMs];
+    result.assign(rootMs->params.size(), false);
+
+    auto isSubclassOf = [&](const sema::TypeSymbol* c,
+                            const sema::TypeSymbol* anc) {
+        for (const sema::TypeSymbol* t = c; t; t = baseClassOf(t))
+            if (t == anc) return true;
+        return false;
+    };
+    std::string key = std::string(rootMs->name) + "#" +
+                      std::to_string(rootMs->params.size());
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (!isSubclassOf(ts, rootMs->parent)) continue;
+        auto nsIt = vtableNameSlot_.find(ts);
+        if (nsIt == vtableNameSlot_.end()) continue;
+        auto slotIt = nsIt->second.find(key);
+        if (slotIt == nsIt->second.end() ||
+            slotIt->second < kVirtualMethodsBase)
+            continue;
+        unsigned idx = slotIt->second - kVirtualMethodsBase;
+        auto vmIt = vtableMethods_.find(ts);
+        if (vmIt == vtableMethods_.end() || idx >= vmIt->second.size())
+            continue;
+        const sema::MethodSymbol* leaf = vmIt->second[idx].method;
+        if (!leaf) continue;
+        for (std::size_t pi = 0; pi < leaf->params.size() &&
+                                  pi < result.size(); ++pi) {
+            sema::TypeRef* lpt = paramTypeOf(leaf->params[pi]);
+            sema::TypeRef* rpt = paramTypeOf(rootMs->params[pi]);
+            if (lpt && isNullableValueTy(lpt) &&
+                !(rpt && isNullableValueTy(rpt)))
+                result[pi] = true;
+        }
+    }
+    return result;
+}
+
+// #1592: rootMs's own declared function type with each widened position's
+// parameter type replaced by the tagged nullable-value struct. Identical to
+// methodFnType(rootMs) when `widened` is all-false (or empty).
+llvm::FunctionType* Emitter::uniformVtableFnType(
+        const sema::MethodSymbol* rootMs, const std::vector<bool>& widened) {
+    llvm::FunctionType* base = methodFnType(rootMs);
+    if (!base) return nullptr;
+    std::vector<llvm::Type*> paramTys(base->param_begin(), base->param_end());
+    for (std::size_t pi = 0; pi < widened.size(); ++pi) {
+        if (!widened[pi]) continue;
+        std::size_t ai = pi + 1;  // skip the receiver slot
+        if (ai >= paramTys.size()) continue;
+        sema::TypeRef* pt = paramTypeOf(rootMs->params[pi]);
+        if (!pt) continue;
+        sema::TypeRef nn = *pt;
+        nn.nullable = true;
+        paramTys[ai] = nullableValueStructTy(&nn);
+    }
+    return llvm::FunctionType::get(base->getReturnType(), paramTys,
+                                   /*isVarArg=*/false);
+}
+
+// #1592 / §12.1: adapter thunk that presents rootMs's whole family's uniform
+// (possibly-widened) ABI for a contributor (`leafMs`) whose OWN compiled body
+// is still the narrow, un-widened form — the un-overridden base body, or a
+// sibling override that never widened. Mirrors ensureNullableWideningThunk
+// above (adapts an ABI mismatch by boxing/unboxing at a thunk boundary) but
+// for the vtable side and in the OPPOSITE direction: here the thunk's OWN
+// signature is the WIDE uniform ABI, and it UNBOXES each widened argument
+// before forwarding to the leaf's real narrow-ABI body.
+//
+// Unboxing needs no runtime null check because of WHERE this thunk is
+// reachable from. This thunk is only ever installed for a contributor whose
+// OWN declared parameter is still narrow at the widened position — i.e. a
+// class that is NOT at or below the point in the hierarchy where widening
+// was introduced. By Liskov substitution, no variable whose STATIC type
+// already sees the widened `T?` parameter can ever hold a runtime object
+// that dispatches to this contributor (such a static type's own class is
+// necessarily at or below the widening point, hence so is any object it can
+// reference, and that object's OWN contributor — installed directly, not via
+// this thunk — is the one reached instead). So every call that reaches this
+// thunk resolved through a narrow (`T`-declaring) static type, which
+// `emitMethodCall`'s uniform-ABI dispatch (LlvmBackend_Calls2.cpp) can only
+// ever have populated with a definite (non-null) boxed value — the boxed
+// struct this thunk unboxes always has hasValue=true.
+llvm::Function* Emitter::ensureVtableWideningThunk(
+        const sema::MethodSymbol* rootMs, const sema::MethodSymbol* leafMs,
+        const std::vector<bool>& widened) {
+    if (!rootMs || !leafMs) return nullptr;
+    auto cacheIt = vtableWideningThunks_.find(leafMs);
+    if (cacheIt != vtableWideningThunks_.end()) return cacheIt->second;
+
+    auto fIt = methodFns_.find(const_cast<sema::MethodSymbol*>(leafMs));
+    if (fIt == methodFns_.end() || !fIt->second) return nullptr;
+    llvm::Function* implFn = fIt->second;
+    llvm::FunctionType* implTy = implFn->getFunctionType();
+    llvm::FunctionType* uniformTy = uniformVtableFnType(rootMs, widened);
+    if (!uniformTy || uniformTy == implTy) return nullptr;  // no thunk needed
+    if (uniformTy->getNumParams() != implTy->getNumParams()) return nullptr;
+
+    std::string name = "bz$vw$" +
+                       std::string(leafMs->parent ? leafMs->parent->name : "") +
+                       "$" + std::string(leafMs->name);
+    auto* thunk = llvm::Function::Create(
+        uniformTy, llvm::GlobalValue::InternalLinkage, name, module_.get());
+    vtableWideningThunks_[leafMs] = thunk;
+
+    // Save/restore builder state (same pattern as ensureNullableWideningThunk
+    // / emitEventAccessor — this may run during declareVtables, before method
+    // bodies are emitted).
+    llvm::Function* savedFn = currentFn_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    currentFn_ = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    builder_.SetInsertPoint(entry);
+
+    std::vector<llvm::Value*> implArgs;
+    unsigned paramIdx = 0;
+    for (llvm::Argument& arg : thunk->args()) {
+        llvm::Type* uniformArgTy = uniformTy->getParamType(paramIdx);
+        llvm::Type* implArgTy = implTy->getParamType(paramIdx);
+        if (uniformArgTy == implArgTy || paramIdx == 0) {
+            // Receiver (ptr), or a position not widened for this leaf: pass
+            // through unchanged.
+            implArgs.push_back(&arg);
+        } else {
+            // Unbox: the uniform (family-wide) ABI passes the tagged
+            // {i8 hasValue, T} struct here; leafMs's own narrow body wants
+            // the bare T. Always safe — see the function comment above.
+            implArgs.push_back(
+                builder_.CreateExtractValue(&arg, {1u}, "vw.val"));
+        }
+        ++paramIdx;
+    }
+    // A void-returning call must not be given a name (the IR verifier
+    // rejects a named void value), so only name it when there's a real
+    // return value to forward.
+    bool isVoidRet = implTy->getReturnType()->isVoidTy();
+    llvm::Value* result = builder_.CreateCall(
+        implTy, implFn, implArgs, isVoidRet ? llvm::Twine() : "vw.ret");
+    if (isVoidRet)
+        builder_.CreateRetVoid();
+    else
+        builder_.CreateRet(result);
+
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+    return thunk;
+}
+
+
 // §24.7 (#477 B7): emit a per-class event accessor `ptr get(ptr this)` that
 // returns the object's backing EventSource<T> (the event's instance field).
 // Cached per EventSymbol. Self-contained: saves/restores the builder so it may
@@ -1950,9 +2148,28 @@ void Emitter::declareVtables() {
             const VSlot& vs = slots[i];
             if (vs.method) {
                 auto mit = methodFns_.find(vs.method);
-                if (mit != methodFns_.end())
-                    elems[kVirtualMethodsBase + i] =
-                        llvm::cast<llvm::Constant>(mit->second);
+                if (mit != methodFns_.end()) {
+                    llvm::Constant* fp = llvm::cast<llvm::Constant>(mit->second);
+                    // #1592 / §12.1: if ANY contributor anywhere in this
+                    // slot's whole virtual hierarchy widened a value-typed
+                    // parameter, the slot's ABI must be uniformly the WIDE
+                    // (boxed) form so a narrow-static-typed caller and a
+                    // wide-static-typed caller (emitMethodCall's uniform-ABI
+                    // dispatch, LlvmBackend_Calls2.cpp) agree on one calling
+                    // convention. Install an unboxing adapter thunk when
+                    // `ts`'s own contribution (`vs.method`) is still narrow;
+                    // returns nullptr (direct fn ptr, unchanged) when there is
+                    // no widening anywhere, or `vs.method` already is the
+                    // wide-ABI contributor.
+                    const sema::MethodSymbol* rootMs =
+                        introducingVirtualMethod(vs.method);
+                    const std::vector<bool>& widened =
+                        widenedParamPositions(rootMs);
+                    if (llvm::Function* thunk =
+                            ensureVtableWideningThunk(rootMs, vs.method, widened))
+                        fp = llvm::cast<llvm::Constant>(thunk);
+                    elems[kVirtualMethodsBase + i] = fp;
+                }
             } else if (vs.prop) {
                 // #481 / §12.5: resolve the most-derived accessor on `ts`'s
                 // chain. classPropertyByName returns the override if present,
