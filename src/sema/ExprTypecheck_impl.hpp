@@ -196,6 +196,10 @@ private:
     // per §31.2: `return` inside a `finally` block is a compile error.
     // Appendix A grammar: "`return` does not appear in `finally` blocks."
     // Tracks finally-block nesting so visitStmt can reject ReturnStmt there.
+    // per §21.7 (#1589): also reset (to 0) across a lambda boundary — a
+    // lambda is its own callable, so a `return` inside it exits the lambda,
+    // not the enclosing method, and is unaffected by that method's `finally`
+    // (mirrors the `loopDepth_`/`catchDepth_`/`finallyLoopBoundary_` reset).
     int finallyDepth_ = 0;
     // per §21.5/§31.2 (v0.182, #1578): `loopDepth_` measured at the point
     // the nearest enclosing `finally` body was entered. A `break`/`continue`
