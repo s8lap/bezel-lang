@@ -3990,6 +3990,21 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
     return false;
 }
 
+// §30.5/§28.3 (v0.182, #1570): true when `e` is a fresh, UNNAMED producer
+// expression — a call or `new` expression — as opposed to a reference to
+// existing named storage. This is exactly the "unbound owned temporary" shape
+// §28.3 defines (not bound to any name, so its lifetime is the full
+// expression that produces it), and is deliberately narrower than "anything
+// `awaitOperandIsOwningLocation` rejects": a reference to a plain (non-`using`)
+// owned local — `var t := Producer(); Process(await t);` — is NAMED and
+// governed by that local's own scope, not by the statement reading it, so it
+// must NOT be admitted here even though `awaitOperandIsOwningLocation` also
+// rejects it. // per §28.3, §30.5
+bool MethodOwnership::isUnboundProducerExpr(const ast::Expr& e) {
+    return dynamic_cast<const ast::CallExpr*>(&e) != nullptr ||
+           dynamic_cast<const ast::NewExpr*>(&e) != nullptr;
+}
+
 // #1530 (§30.3 / §30.5, v0.179): `Task<T>.Result` (Pattern A, class T)
 // owning-location check. The v0.162 `OwningTask<T>.Result` amendment left
 // this Pattern A sibling gap: reading `.Result` on a completed `Task<T>`
@@ -4006,42 +4021,53 @@ void MethodOwnership::checkResultSites(
 }
 
 void MethodOwnership::checkResultSitesStmt(const ast::Stmt& s) {
+    // §30.5/§28.3 (v0.182, #1570): `bindingValue = true` at exactly the two
+    // positions whose value flows directly into a `var`/`using var` binding
+    // or a store — a LocalDecl initializer and an assignment RHS — so a
+    // `.Result` read whose operand is an unbound producer is rejected there
+    // (the borrow would escape the full expression) and admitted everywhere
+    // else (condition, iterable, discard, bare statement, throw/yield value,
+    // assignment target), where the borrowed result is merely consumed within
+    // the statement. // per §28.3, §30.5
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer) checkResultSitesExpr(*ld->initializer);
+        if (ld->initializer) checkResultSitesExpr(*ld->initializer, true);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr) checkResultSitesExpr(*es->expr);
+        if (es->expr) checkResultSitesExpr(*es->expr, false);
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) checkResultSitesExpr(*ds->value);
+        if (ds->value) checkResultSitesExpr(*ds->value, false);
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->value) checkResultSitesExpr(*as->value);
-        if (as->target) checkResultSitesExpr(*as->target);
+        if (as->value) checkResultSitesExpr(*as->value, true);
+        if (as->target) checkResultSitesExpr(*as->target, false);
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value) checkResultSitesExpr(*rs->value);
+        // Unlike `await`, `.Result` has no chained-return admission (see the
+        // header comment) — a `return` is a store into the caller, so it is a
+        // binding position here.
+        if (rs->value) checkResultSitesExpr(*rs->value, true);
         return;
     }
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (th->value) checkResultSitesExpr(*th->value);
+        if (th->value) checkResultSitesExpr(*th->value, false);
         return;
     }
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) checkResultSitesExpr(*ys->value);
+        if (ys->value) checkResultSitesExpr(*ys->value, true);
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         if (ifs->ifBranch.condition)
-            checkResultSitesExpr(*ifs->ifBranch.condition);
+            checkResultSitesExpr(*ifs->ifBranch.condition, false);
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) checkResultSitesStmt(*bs);
         for (const auto& el : ifs->elifBranches) {
-            if (el.condition) checkResultSitesExpr(*el.condition);
+            if (el.condition) checkResultSitesExpr(*el.condition, false);
             for (const auto& bs : el.body)
                 if (bs) checkResultSitesStmt(*bs);
         }
@@ -4050,13 +4076,13 @@ void MethodOwnership::checkResultSitesStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        if (ws->condition) checkResultSitesExpr(*ws->condition);
+        if (ws->condition) checkResultSitesExpr(*ws->condition, false);
         for (const auto& bs : ws->body)
             if (bs) checkResultSitesStmt(*bs);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        if (fs->iterable) checkResultSitesExpr(*fs->iterable);
+        if (fs->iterable) checkResultSitesExpr(*fs->iterable, false);
         for (const auto& bs : fs->body)
             if (bs) checkResultSitesStmt(*bs);
         return;
@@ -4077,7 +4103,8 @@ void MethodOwnership::checkResultSitesStmt(const ast::Stmt& s) {
     }
 }
 
-void MethodOwnership::checkResultSitesExpr(const ast::Expr& e) {
+void MethodOwnership::checkResultSitesExpr(const ast::Expr& e,
+                                            bool bindingValue) {
     // Diagnose a `.Result` member access here (if this expr is one), then
     // recurse into sub-expressions so a nested read (`Process(t.Result)`,
     // `a + t.Result`) is examined too.
@@ -4093,71 +4120,87 @@ void MethodOwnership::checkResultSitesExpr(const ast::Expr& e) {
                 tt->astNode->name->parts.size() == 1 &&
                 tt->headName() == "Task" && !tt->genericArgs.empty() &&
                 taskResultArgIsClass(tt->genericArgs.front())) {
-                if (!awaitOperandIsOwningLocation(*ma->target)) {
+                // §30.5/§28.3 (v0.182, #1570): admitted when the receiver is a
+                // named owning location (unchanged), OR when it is an unbound
+                // producer expression (`Producer().Result`) whose borrowed
+                // result is confined to the same full expression (bindingValue
+                // is false) — the new expression-confinement admission.
+                bool admitted =
+                    awaitOperandIsOwningLocation(*ma->target) ||
+                    (!bindingValue && isUnboundProducerExpr(*ma->target));
+                if (!admitted) {
                     report(
                         Severity::Error, ma->span.begin,
                         "reading `.Result` on a class-typed `Task<T>` "
                         "(Pattern A) requires the task expression to occupy "
                         "a syntactically-visible owning location — a `using "
                         "var`-bound task local, an `owned` parameter, an "
-                        "`owned` field, or an owning-collection slot — so "
-                        "the borrowed result has a source (§30.3 / §30.5; "
-                        "bind the producer first: `using var t := "
-                        "Producer(); var r := t.Result;`)");
+                        "`owned` field, or an owning-collection slot — or be "
+                        "an unbound producer call whose borrowed result is "
+                        "confined to the same full expression (`Producer()."
+                        "Result` consumed immediately) — so the borrowed "
+                        "result has a source (§30.3 / §30.5 / §28.3; bind "
+                        "the producer first: `using var t := Producer(); "
+                        "var r := t.Result;`)");
                 }
             }
         }
-        checkResultSitesExpr(*ma->target);
+        checkResultSitesExpr(*ma->target, false);
         return;
     }
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-        if (ue->operand) checkResultSitesExpr(*ue->operand);
+        if (ue->operand) checkResultSitesExpr(*ue->operand, false);
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        if (be->left) checkResultSitesExpr(*be->left);
-        if (be->right) checkResultSitesExpr(*be->right);
+        if (be->left) checkResultSitesExpr(*be->left, false);
+        if (be->right) checkResultSitesExpr(*be->right, false);
         return;
     }
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
-        if (nm->target) checkResultSitesExpr(*nm->target);
+        if (nm->target) checkResultSitesExpr(*nm->target, false);
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-        if (call->callee) checkResultSitesExpr(*call->callee);
+        if (call->callee) checkResultSitesExpr(*call->callee, false);
         for (const auto& a : call->args)
-            if (a.value) checkResultSitesExpr(*a.value);
+            if (a.value) checkResultSitesExpr(*a.value, false);
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        if (nc->callee) checkResultSitesExpr(*nc->callee);
+        if (nc->callee) checkResultSitesExpr(*nc->callee, false);
         for (const auto& a : nc->args)
-            if (a.value) checkResultSitesExpr(*a.value);
+            if (a.value) checkResultSitesExpr(*a.value, false);
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-        if (ix->target) checkResultSitesExpr(*ix->target);
+        if (ix->target) checkResultSitesExpr(*ix->target, false);
         for (const auto& a : ix->indices)
-            if (a.value) checkResultSitesExpr(*a.value);
+            if (a.value) checkResultSitesExpr(*a.value, false);
         return;
     }
     if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
-        if (bg->operand) checkResultSitesExpr(*bg->operand);
+        // Postfix `!` is a pass-through — it asserts non-null and yields the
+        // SAME borrow, so it does not create a new full-expression boundary;
+        // propagate `bindingValue` unchanged.
+        if (bg->operand) checkResultSitesExpr(*bg->operand, bindingValue);
         return;
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         for (const auto& a : ne->args)
-            if (a.value) checkResultSitesExpr(*a.value);
+            if (a.value) checkResultSitesExpr(*a.value, false);
         return;
     }
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-        if (cd->condition) checkResultSitesExpr(*cd->condition);
-        if (cd->thenValue) checkResultSitesExpr(*cd->thenValue);
-        if (cd->elseValue) checkResultSitesExpr(*cd->elseValue);
+        if (cd->condition) checkResultSitesExpr(*cd->condition, false);
+        // Pass-through: the conditional's VALUE is exactly whichever branch is
+        // selected, so a bound conditional's branches are themselves bound.
+        if (cd->thenValue) checkResultSitesExpr(*cd->thenValue, bindingValue);
+        if (cd->elseValue) checkResultSitesExpr(*cd->elseValue, bindingValue);
         return;
     }
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
-        if (te->operand) checkResultSitesExpr(*te->operand);
+        if (te->operand) checkResultSitesExpr(*te->operand, false);
         return;
     }
     // A LambdaExpr is its own scope — its `.Result` reads are checked when
@@ -4351,42 +4394,55 @@ void MethodOwnership::checkAwaitSitesStmt(
     const std::unordered_set<const ast::UnaryExpr*>& consuming) {
     // Walk every statement's expressions for awaits, and recurse into nested
     // blocks. Mirrors the structural recursion the other whole-body walks use.
+    //
+    // §30.5/§28.3 (v0.182, #1570): `bindingValue = true` at exactly the two
+    // positions whose value flows directly into a `var`/`using var` binding
+    // or a store — a LocalDecl initializer and an assignment RHS — so a
+    // Pattern A await whose operand is an unbound producer is rejected there
+    // (the borrow would escape the full expression) and admitted everywhere
+    // else, where the awaited borrow is merely consumed within the statement.
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer) checkAwaitSitesExpr(*ld->initializer, consuming);
+        if (ld->initializer)
+            checkAwaitSitesExpr(*ld->initializer, consuming, true);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr) checkAwaitSitesExpr(*es->expr, consuming);
+        if (es->expr) checkAwaitSitesExpr(*es->expr, consuming, false);
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) checkAwaitSitesExpr(*ds->value, consuming);
+        if (ds->value) checkAwaitSitesExpr(*ds->value, consuming, false);
         return;
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->value) checkAwaitSitesExpr(*as->value, consuming);
-        if (as->target) checkAwaitSitesExpr(*as->target, consuming);
+        if (as->value) checkAwaitSitesExpr(*as->value, consuming, true);
+        if (as->target) checkAwaitSitesExpr(*as->target, consuming, false);
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value) checkAwaitSitesExpr(*rs->value, consuming);
+        // `returnPositionAwaits_` already admits `return await Producer()`
+        // unconditionally (the chained-slot case, §30.5); bindingValue is
+        // irrelevant there but passed as true (a return is a store) for
+        // consistency with every other binding position.
+        if (rs->value) checkAwaitSitesExpr(*rs->value, consuming, true);
         return;
     }
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (th->value) checkAwaitSitesExpr(*th->value, consuming);
+        if (th->value) checkAwaitSitesExpr(*th->value, consuming, false);
         return;
     }
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) checkAwaitSitesExpr(*ys->value, consuming);
+        if (ys->value) checkAwaitSitesExpr(*ys->value, consuming, true);
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         if (ifs->ifBranch.condition)
-            checkAwaitSitesExpr(*ifs->ifBranch.condition, consuming);
+            checkAwaitSitesExpr(*ifs->ifBranch.condition, consuming, false);
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) checkAwaitSitesStmt(*bs, consuming);
         for (const auto& el : ifs->elifBranches) {
-            if (el.condition) checkAwaitSitesExpr(*el.condition, consuming);
+            if (el.condition)
+                checkAwaitSitesExpr(*el.condition, consuming, false);
             for (const auto& bs : el.body)
                 if (bs) checkAwaitSitesStmt(*bs, consuming);
         }
@@ -4395,13 +4451,13 @@ void MethodOwnership::checkAwaitSitesStmt(
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        if (ws->condition) checkAwaitSitesExpr(*ws->condition, consuming);
+        if (ws->condition) checkAwaitSitesExpr(*ws->condition, consuming, false);
         for (const auto& bs : ws->body)
             if (bs) checkAwaitSitesStmt(*bs, consuming);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        if (fs->iterable) checkAwaitSitesExpr(*fs->iterable, consuming);
+        if (fs->iterable) checkAwaitSitesExpr(*fs->iterable, consuming, false);
         for (const auto& bs : fs->body)
             if (bs) checkAwaitSitesStmt(*bs, consuming);
         return;
@@ -4424,7 +4480,8 @@ void MethodOwnership::checkAwaitSitesStmt(
 
 void MethodOwnership::checkAwaitSitesExpr(
     const ast::Expr& e,
-    const std::unordered_set<const ast::UnaryExpr*>& consuming) {
+    const std::unordered_set<const ast::UnaryExpr*>& consuming,
+    bool bindingValue) {
     // Diagnose this await (if it is one), then recurse into sub-expressions so
     // a nested await (`Process(await t)`, `a + await t`) is examined too.
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -4432,21 +4489,31 @@ void MethodOwnership::checkAwaitSitesExpr(
             AwaitTaskKind k = awaitTaskKind(*ue);
             if (k == AwaitTaskKind::PatternA) {
                 // §30.5: the awaited `Task<T>` (class T) must be in an owning
-                // location — OR the await is a `return await Producer()`, the
-                // one admitted bare-producer Pattern A position (§30.5 line
-                // ~6068, recorded in returnPositionAwaits_). // per §30.5
-                if (returnPositionAwaits_.count(ue) == 0 &&
-                    (!ue->operand ||
-                     !awaitOperandIsOwningLocation(*ue->operand))) {
+                // location, OR the await is a `return await Producer()` (the
+                // chained-slot case, recorded in returnPositionAwaits_), OR
+                // (v0.182, #1570) its operand is an unbound producer whose
+                // borrowed result is confined to the same full expression —
+                // `bindingValue` is false, meaning this await's value is
+                // merely consumed within the statement rather than bound to a
+                // name or stored (`Process(await Producer())`). // per §30.5
+                bool admitted =
+                    (ue->operand && awaitOperandIsOwningLocation(*ue->operand)) ||
+                    returnPositionAwaits_.count(ue) != 0 ||
+                    (!bindingValue && ue->operand &&
+                     isUnboundProducerExpr(*ue->operand));
+                if (!admitted) {
                     report(
                         Severity::Error, ue->span.begin,
                         "awaiting a class-typed `Task<T>` (Pattern A) requires "
                         "the awaited task to occupy a syntactically-visible "
                         "owning location — a `using var`-bound task local, an "
                         "`owned` parameter, an `owned` field, or an owning-"
-                        "collection slot — so the borrowed result has a source "
-                        "(§30.5; bind the producer first: `using var t := "
-                        "Producer(); var r := await t;`)");
+                        "collection slot — or be an unbound producer call "
+                        "whose borrowed result is confined to the same full "
+                        "expression (`Process(await Producer())`) — so the "
+                        "borrowed result has a source (§30.5 / §28.3; bind "
+                        "the producer first: `using var t := Producer(); "
+                        "var r := await t;`)");
                 }
             } else if (k == AwaitTaskKind::PatternB) {
                 // §30.5: the awaited `OwningTask<T>` must be in an owned-
@@ -4466,57 +4533,62 @@ void MethodOwnership::checkAwaitSitesExpr(
             }
             // UnitTask / ValueResult / NotTask carry no obligation at the site.
         }
-        if (ue->operand) checkAwaitSitesExpr(*ue->operand, consuming);
+        if (ue->operand) checkAwaitSitesExpr(*ue->operand, consuming, false);
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        if (be->left) checkAwaitSitesExpr(*be->left, consuming);
-        if (be->right) checkAwaitSitesExpr(*be->right, consuming);
+        if (be->left) checkAwaitSitesExpr(*be->left, consuming, false);
+        if (be->right) checkAwaitSitesExpr(*be->right, consuming, false);
         return;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-        if (ma->target) checkAwaitSitesExpr(*ma->target, consuming);
+        if (ma->target) checkAwaitSitesExpr(*ma->target, consuming, false);
         return;
     }
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
-        if (nm->target) checkAwaitSitesExpr(*nm->target, consuming);
+        if (nm->target) checkAwaitSitesExpr(*nm->target, consuming, false);
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-        if (call->callee) checkAwaitSitesExpr(*call->callee, consuming);
+        if (call->callee) checkAwaitSitesExpr(*call->callee, consuming, false);
         for (const auto& a : call->args)
-            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming, false);
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        if (nc->callee) checkAwaitSitesExpr(*nc->callee, consuming);
+        if (nc->callee) checkAwaitSitesExpr(*nc->callee, consuming, false);
         for (const auto& a : nc->args)
-            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming, false);
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-        if (ix->target) checkAwaitSitesExpr(*ix->target, consuming);
+        if (ix->target) checkAwaitSitesExpr(*ix->target, consuming, false);
         for (const auto& a : ix->indices)
-            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming, false);
         return;
     }
     if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
-        if (bg->operand) checkAwaitSitesExpr(*bg->operand, consuming);
+        // Postfix `!` is a pass-through — see checkResultSitesExpr's twin.
+        if (bg->operand)
+            checkAwaitSitesExpr(*bg->operand, consuming, bindingValue);
         return;
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         for (const auto& a : ne->args)
-            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming, false);
         return;
     }
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-        if (cd->condition) checkAwaitSitesExpr(*cd->condition, consuming);
-        if (cd->thenValue) checkAwaitSitesExpr(*cd->thenValue, consuming);
-        if (cd->elseValue) checkAwaitSitesExpr(*cd->elseValue, consuming);
+        if (cd->condition) checkAwaitSitesExpr(*cd->condition, consuming, false);
+        // Pass-through: see checkResultSitesExpr's twin.
+        if (cd->thenValue)
+            checkAwaitSitesExpr(*cd->thenValue, consuming, bindingValue);
+        if (cd->elseValue)
+            checkAwaitSitesExpr(*cd->elseValue, consuming, bindingValue);
         return;
     }
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
-        if (te->operand) checkAwaitSitesExpr(*te->operand, consuming);
+        if (te->operand) checkAwaitSitesExpr(*te->operand, consuming, false);
         return;
     }
     // A LambdaExpr is its own async scope (§30.6) — its awaits are checked when

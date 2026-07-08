@@ -19,6 +19,14 @@
 // SYNCHRONOUS escape hatch (§30.3) and is rejected lexically inside an async
 // method/lambda by a separate, pre-existing check (ExprTypecheck_Calls.cpp,
 // §30.3 v0.162/#1362), so these bodies are ordinary (non-async) methods.
+//
+// v0.182 (§30.3/§28.3, #1570) amended the rule: "an unbound owned temporary
+// (`SomeProducer().Result`) is admitted when the borrow is confined to the
+// same full expression, the temporary being disposed at the expression's end
+// exactly as for the corresponding `await`." Only a borrow that ESCAPES the
+// full expression — bound to a `var`, stored, or returned — remains rejected.
+// The tests below were updated (one flipped, several added) to reflect this;
+// see the inline notes.
 
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -66,23 +74,57 @@ BEZEL_TEST(result_own_patternA, result_bare_producer_into_var_diagnosed) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// A bare producer call read via `.Result` in an argument position is
-// likewise not an admitted owning location — diagnosed. Mirrors
-// await_bare_producer_in_arg_diagnosed. // per §30.3, §30.5
-BEZEL_TEST(result_own_patternA, result_bare_producer_in_arg_diagnosed) {
+// v0.182 (§30.3/§28.3, #1570): a bare producer call read via `.Result` in an
+// argument position IS now admitted — `p.MakeShared()` is an unbound owned
+// temporary, and the `.Result` borrow it sources is consumed by `Use` within
+// the same full expression (the statement), so the temporary's disposal
+// defers to the end of that expression, after the borrowing use — exactly
+// the `Producer().Result` shape §30.3 names as admitted. Through v0.181 this
+// was rejected outright; this test previously asserted the pre-v0.182
+// rejection and is updated to the new admission. Mirrors
+// await_bare_producer_in_arg_confined_clean. Clean. // per §30.3, §30.5, §28.3
+BEZEL_TEST(result_own_patternA, result_bare_producer_in_arg_confined_clean) {
     auto r = parseAndCheckOwnership(wrap(
         "Use(p.MakeShared().Result); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// A plain (non-`using`) `var t := producer()` local read via `.Result` is
-// STILL not an owning location — the bare-producer form the rule rejects,
-// just expressed through one intervening binding. // per §30.3, §30.5
+// v0.182: a bare producer call read via `.Result` as a standalone statement
+// (the borrow used nowhere) is trivially confined to the full expression —
+// zero uses is confined by definition — so it is admitted.
+// // per §30.3, §30.5, §28.3
+BEZEL_TEST(result_own_patternA, result_bare_producer_bare_statement_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "p.MakeShared().Result; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A plain (non-`using`) `var task := producer()` local read via `.Result` and
+// bound to `var r` is STILL not an owning location — this is the classic
+// ESCAPE case (the borrow is bound to `r`, which survives the statement),
+// unchanged by v0.182. // per §30.3, §30.5
 BEZEL_TEST(result_own_patternA, result_plain_var_bound_producer_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
         "var task := p.MakeShared(); "
         "var r := task.Result; "
         "Use(r); "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// v0.182 (§30.3/§28.3, #1570): the confinement admission is scoped to an
+// UNBOUND producer expression (a bare call), not to "any operand
+// `awaitOperandIsOwningLocation` rejects." A reference to a plain
+// (non-`using`) owned local — `var task := p.MakeShared();` — is a NAMED
+// value whose lifetime is its declaring scope, not the statement that reads
+// it; reading `task.Result` directly in a later argument-position statement
+// must NOT be admitted by the new rule even though the borrow stays confined
+// to that statement — the temporary was produced (and would need disposal)
+// in the FIRST statement, not the one being read. Diagnosed.
+// // per §30.3, §30.5, §28.3
+BEZEL_TEST(result_own_patternA, result_plain_var_task_in_arg_still_diagnosed) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var task := p.MakeShared(); "
+        "Use(task.Result); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 

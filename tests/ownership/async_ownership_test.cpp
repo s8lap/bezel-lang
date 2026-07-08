@@ -25,9 +25,14 @@
 //      task is `Task<T>` with class T (Pattern A), the awaited task
 //      expression must occupy a syntactically-visible owning location
 //      (§30.5: a `using var`-bound local, an `owned` parameter, an `owned`
-//      field, an owning-collection slot, a borrowing-iteration variable, or a
-//      Pattern-A `return await Producer()`). Otherwise the borrowed result
-//      would have no source and the await is rejected. For `OwningTask<T>`
+//      field, an owning-collection slot, a borrowing-iteration variable, a
+//      Pattern-A `return await Producer()`), OR (v0.182, §30.5/§28.3, #1570)
+//      be an UNBOUND producer call whose borrowed result is confined to the
+//      same full expression (`Use(await Producer())`) — admitted because the
+//      disposal of the unbound temporary task defers to the end of the full
+//      expression, after the borrowing use. Only a borrow that ESCAPES the
+//      full expression — bound to a `var`, stored, or a non-chained return —
+//      remains rejected (`var x := await Producer();`). For `OwningTask<T>`
 //      (Pattern B), the await must appear in an owned-consuming context
 //      (§30.5: `using var`/`await using var` RHS, `var` RHS, owned-field /
 //      owned-slot assignment RHS, `owned` parameter argument, `owned` return,
@@ -176,11 +181,54 @@ BEZEL_TEST(async_own_patternA, await_bare_producer_into_var_diagnosed) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// Pattern A: a bare producer call awaited in an argument position is likewise
-// not an admitted owning location — diagnosed. // per §30.5, Appendix C.6
-BEZEL_TEST(async_own_patternA, await_bare_producer_in_arg_diagnosed) {
+// Pattern A (v0.182, §30.5/§28.3, #1570): a bare producer call awaited in an
+// argument position IS now admitted — `p.MakeShared()` is an unbound owned
+// temporary, and its borrowed result is consumed by `Use` within the same
+// full expression (the statement), so the temporary's disposal defers to the
+// end of that expression, after the borrowing use — exactly the
+// `Process(await Producer())` shape §30.5 names as the admitted form. Through
+// v0.181 this was rejected outright; this test previously asserted the
+// pre-v0.182 rejection and is updated to the new admission. Clean.
+// // per §30.5, §28.3
+BEZEL_TEST(async_own_patternA, await_bare_producer_in_arg_confined_clean) {
     auto r = parseAndCheckOwnership(wrap(
         "Use(await p.MakeShared()); "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Pattern A (v0.182): a bare producer call awaited as a standalone statement
+// (its borrow used nowhere) is trivially confined to the full expression —
+// zero uses is confined by definition — so it is admitted. // per §30.5, §28.3
+BEZEL_TEST(async_own_patternA, await_bare_producer_bare_statement_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "await p.MakeShared(); "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Pattern A (v0.182): the confinement admission is scoped to an UNBOUND
+// producer expression (a bare call), not to "any operand
+// `awaitOperandIsOwningLocation` rejects." A reference to a plain
+// (non-`using`) owned local — `var t := p.MakeShared();` — is a NAMED value
+// whose lifetime is its declaring scope, not the statement that reads it;
+// reading it in a later, argument-position statement must NOT be admitted by
+// the new rule (it is a different case from a fresh, unnamed producer call).
+// Diagnosed. // per §30.5, §28.3
+BEZEL_TEST(async_own_patternA, await_plain_var_task_in_arg_still_diagnosed) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var t := p.MakeShared(); "
+        "Use(await t); "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Pattern A (v0.182): the confinement admission does NOT extend to a borrow
+// that escapes the full expression — binding the awaited bare producer's
+// result to a `var` is still the classic rejection (this is the sibling of
+// `await_bare_producer_into_var_diagnosed` above, confirming the escape rule
+// is unchanged by the new admission). // per §30.5, §28.3
+BEZEL_TEST(async_own_patternA, await_bare_producer_into_var_still_diagnosed) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var r := await p.MakeShared(); "
+        "Use(r); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 

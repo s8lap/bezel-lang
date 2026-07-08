@@ -1171,19 +1171,44 @@ private:
     // call, an arbitrary expression) is NOT an owning location. // per §30.5
     bool awaitOperandIsOwningLocation(const ast::Expr& taskExpr);
 
+    // §30.5/§28.3 (v0.182, #1570): true when `e` is a syntactically fresh,
+    // UNNAMED producer expression — a bare call (`Producer()`) or `new`
+    // expression — as opposed to a reference to existing named storage (an
+    // identifier, a member-access field read, or an indexer read). This is
+    // the "unbound owned temporary" shape §28.3 defines: not bound to any
+    // name, so its lifetime is the full expression that produces it. Used to
+    // admit `Process(await Producer())` / `Producer().Result` WITHOUT
+    // admitting a reference to a plain (non-`using`) owned local — `var t :=
+    // Producer(); Process(await t);` — which is a NAMED value whose lifetime
+    // is its declaring scope, not the statement that reads it, and stays
+    // governed by `awaitOperandIsOwningLocation` alone. // per §28.3, §30.5
+    static bool isUnboundProducerExpr(const ast::Expr& e);
+
     // Drive the at-await-site checks over the body. For each statement, decide
     // which awaits sit in an owned-consuming context (Pattern B) — passed via
     // `consumingAwaits` collected by `collectOwnedConsumingAwaits` — then walk
     // every await in the statement and diagnose: a Pattern A await whose
     // operand is not an owning location, and a Pattern B await not in an
-    // owned-consuming context. // per §30.5
+    // owned-consuming context. Each expression walk also threads
+    // `bindingValue` — true exactly when the walked expression's value would
+    // flow directly into a `var`/`using var` binding or a store (a LocalDecl
+    // initializer or an assignment RHS), propagated through pass-through
+    // forms (`?:` branches, postfix `!`) and false everywhere the value is
+    // merely consumed within the statement (a call argument, operator
+    // operand, receiver, …). A Pattern A await whose operand is an unbound
+    // producer expression (`isUnboundProducerExpr`) is admitted when
+    // `bindingValue` is false — the v0.182 expression-confinement admission
+    // (§30.5, #1570) — and rejected when true, since the borrow would then
+    // escape the full expression that sources it (the classic `var x := await
+    // Producer();` rejection). // per §30.5, §28.3
     void checkAwaitSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void checkAwaitSitesStmt(
         const ast::Stmt& s,
         const std::unordered_set<const ast::UnaryExpr*>& consumingAwaits);
     void checkAwaitSitesExpr(
         const ast::Expr& e,
-        const std::unordered_set<const ast::UnaryExpr*>& consumingAwaits);
+        const std::unordered_set<const ast::UnaryExpr*>& consumingAwaits,
+        bool bindingValue);
 
     // §30.5 owned-consuming contexts: collect into `out` every `await`
     // UnaryExpr that appears as the IMMEDIATE value of an owned-consuming
@@ -1218,17 +1243,20 @@ private:
     // (`awaitOperandIsOwningLocation`, reused verbatim — a `.Result` receiver
     // and an `await` operand are the same "task expression" shape). Unlike
     // `await`, there is no chained-slot admission for a bare producer call
-    // (`return await Producer()`'s exception): `.Result` is a synchronous
-    // read, not part of an async state machine's return-await chain, so a
-    // bare-producer receiver (`SomeProducer().Result`) is unconditionally
-    // rejected. Runs UNCONDITIONALLY over every method body (sync and async)
-    // — unlike the at-await-site checks above, which are gated on `isAsync_`
-    // because `await` only appears in async bodies, `.Result` is the
-    // synchronous escape hatch and is typically read from ordinary
-    // (non-async) code. // per §30.3, §30.5
+    // (`return await Producer()`'s exception) — `.Result` is a synchronous
+    // read, not part of an async state machine's return-await chain — but as
+    // of v0.182 (§30.3/§28.3, #1570) a bare-producer receiver IS admitted when
+    // its borrowed result is confined to the same full expression
+    // (`SomeProducer().Result`, consumed immediately), exactly like the
+    // `await` sibling rule; only an escaping borrow (bound to a `var`, stored,
+    // returned) remains rejected. Runs UNCONDITIONALLY over every method body
+    // (sync and async) — unlike the at-await-site checks above, which are
+    // gated on `isAsync_` because `await` only appears in async bodies,
+    // `.Result` is the synchronous escape hatch and is typically read from
+    // ordinary (non-async) code. // per §30.3, §30.5, §28.3
     void checkResultSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void checkResultSitesStmt(const ast::Stmt& s);
-    void checkResultSitesExpr(const ast::Expr& e);
+    void checkResultSitesExpr(const ast::Expr& e, bool bindingValue);
 
     // -- Async-readiness 3c: SuspendLocal annotation + completion edges --------
     //

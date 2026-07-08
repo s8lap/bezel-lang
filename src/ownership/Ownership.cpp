@@ -599,8 +599,11 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
     // — an expression-bodied method's `=>` body can read `.Result` on a
     // class-typed `Task<T>` (`M(): Conn => t.Result;`) just as a block body
-    // can, so it is subject to the same owning-location rule. // per §30.3
-    checkResultSitesExpr(exprBody);
+    // can, so it is subject to the same owning-location rule. The expression
+    // body IS the return value (equivalent to `return <exprBody>;`), so it is
+    // a binding position — matching the ReturnStmt driver in
+    // checkResultSitesStmt (§30.5/§28.3 v0.182, #1570). // per §30.3
+    checkResultSitesExpr(exprBody, true);
     // §28.14 v0.177 (#1419): the expression body IS the return value — a
     // call-bounded parameter (or a closure capturing one) returned through
     // `=> f` escapes exactly as `return f;` does. // per §28.14
