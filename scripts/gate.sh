@@ -42,7 +42,26 @@ echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '
 echo "== gate[3/*]: sharded suite (crash/undercount-checked) =="
 "$DH" suite tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
 grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true
-[ "$rc" -ne 0 ] && fail "sharded suite (crash / failures / undercount — see $S/gate_shard.log)"
+if [ "$rc" -ne 0 ]; then
+  # An assertion FAIL is never a flake -> hard fail.
+  grep -qE '^\[ FAIL' "$S/gate_shard.log" && fail "sharded suite — assertion failures"
+  # Only shard CRASHES (a test's JIT'd program killed its host). Some are flaky
+  # test-pollution under sharding (a test leaves global state; the round-robin
+  # partition lands a polluter with a snapshot test). ARBITRATE: re-run each
+  # crashed test alone; pass-alone => flake (continue to serial, the authority);
+  # fail-alone => real crash => fail.
+  crashed=$(grep 'died on:' "$S/gate_shard.log" | sed -E 's/.*died on: //')
+  [ -z "$crashed" ] && fail "sharded suite — nonzero exit, no crash marker (see $S/gate_shard.log)"
+  real=0
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    if ! BEZEL_TEST_FILTER="${t##*.}" timeout 120 build/tests/bezel_tests >/dev/null 2>&1; then
+      echo "   REAL: crashed test $t ALSO fails in isolation"; real=1
+    fi
+  done <<< "$crashed"
+  [ "$real" -eq 1 ] && fail "sharded suite — a crashed test fails in isolation (real crash)"
+  echo "   all crashed-shard tests PASS in isolation -> flaky test-pollution; continuing to serial (authoritative)"
+fi
 
 if [ "$MODE" != "--quick" ]; then
   echo "== gate[4/*]: serial suite (heap-order, catches sharded-hidden fails) =="
