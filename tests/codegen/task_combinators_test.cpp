@@ -708,3 +708,195 @@ BEZEL_TEST(task_state_942, from_exception_user_type_unawaited_leak_free_962) {
         "end Main; end C;",
         1);
 }
+
+// ===========================================================================
+// #1529 / §30.10 "Aggregation contracts" (v0.179): WhenAll / WhenAny /
+// WhenAllOwned contract conformance.
+//
+// §30.10: "Task.WhenAll ... otherwise awaiting it re-raises the exception of
+// the FIRST NON-SUCCESSFUL INPUT IN INPUT ORDER" — before this fix, the
+// runtime instead raced a CAS on whichever input's continuation fired first
+// (the first task to COMPLETE, not the first in the array): non-deterministic
+// and a spec violation whenever an EARLIER input faults later than a LATER
+// one. §30.10 also states an aggregate "owns no fault of its own" — the
+// re-raise BORROWS the winning input task's owned exception; before this fix
+// the aggregate instead behaved as if it owned a copy of the same object,
+// which double-freed it once both the aggregate and the (still-owning) input
+// task were independently disposed (a crash, reproduced below).
+// ===========================================================================
+
+// §30.10: `Task.WhenAll` selects the fault of the first non-successful INPUT
+// (index 0, `SlowBoomA`), not the first to COMPLETE (index 1, `FastBoomB`,
+// which faults synchronously while `SlowBoomA` faults only after a delay).
+// Regression guard: before the fix this raced and could non-deterministically
+// (or, timed as below, ALWAYS) re-raise ErrB instead.
+BEZEL_TEST(task_combinators_1529, when_all_first_non_successful_input_order_wins) {
+    expectValueLeakFree(
+        "module M; "
+        "class ErrA: Exception public constructor() base(\"A\"); end constructor; end ErrA; "
+        "class ErrB: Exception public constructor() base(\"B\"); end constructor; end ErrB; "
+        "class C "
+        "  public static async method SlowBoomA(): Task "
+        "    await Task.Delay(20); throw new ErrA(); "
+        "  end SlowBoomA; "
+        "  public static async method FastBoomB(): Task "
+        "    throw new ErrB(); "
+        "  end FastBoomB; "
+        "  public static async method Run(): Task "
+        "    using var a := SlowBoomA(); "
+        "    using var b := FastBoomB(); "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(a); tasks.Add(b); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    await wa; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    try await Run(); return 0; "
+        "    catch ErrA => return 1; "
+        "    catch ErrB => return 2; "
+        "    end; "
+        "  end Main; end C;",
+        1);
+}
+
+// §30.10: same input-order contract for the typed `Task.WhenAll<T>(Array<Task<T>>)`
+// form (a separate runtime aggregator, `bz_task_when_all_results`).
+BEZEL_TEST(task_combinators_1529, when_all_typed_first_non_successful_input_order_wins) {
+    expectValueLeakFree(
+        "module M; "
+        "class ErrA: Exception public constructor() base(\"A\"); end constructor; end ErrA; "
+        "class ErrB: Exception public constructor() base(\"B\"); end constructor; end ErrB; "
+        "class C "
+        "  public static async method GoodSlow(): Task<int> "
+        "    await Task.Delay(20); return 7; "
+        "  end GoodSlow; "
+        "  public static async method SlowBoomA(): Task<int> "
+        "    await Task.Delay(20); throw new ErrA(); "
+        "  end SlowBoomA; "
+        "  public static async method FastBoomB(): Task<int> "
+        "    throw new ErrB(); "
+        "  end FastBoomB; "
+        "  public static async method Run(): Task "
+        "    using var g := GoodSlow(); "
+        "    using var a := SlowBoomA(); "
+        "    using var b := FastBoomB(); "
+        "    using var tasks := new Array<Task<int>>(); "
+        "    tasks.Add(g); tasks.Add(a); tasks.Add(b); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    await wa; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    try await Run(); return 0; "
+        "    catch ErrA => return 1; "
+        "    catch ErrB => return 2; "
+        "    end; "
+        "  end Main; end C;",
+        1);
+}
+
+// §30.10 / §30.9: an aggregate "owns no fault of its own" — its re-raise
+// BORROWS the winning input task's owned exception. Before the fix, the
+// aggregate ALSO treated error_obj as its own: once `wa` was awaited (marking
+// then unmarking the exception borrowed) and its own `using var` scope ended,
+// `wa`'s disposal freed the SAME exception object `t2` (the true, still-live
+// owner) goes on to free at its own scope end — a double-free (SIGSEGV under
+// plain execution; a heap-corruption abort under ASan). Verifies BOTH: no
+// crash, and (via the destructor-counting `CountedErr`) that the exception is
+// disposed EXACTLY once — not zero (a leak) and not more than once.
+BEZEL_TEST(task_combinators_1529, when_all_fault_disposed_exactly_once_by_owning_input_task) {
+    expectValueLeakFree(
+        "module M; "
+        "class CountedErr: Exception "
+        "  public static disposeCount: int := 0; "
+        "  public constructor() base(\"boom\"); end constructor; "
+        "  destructor CountedErr.disposeCount := CountedErr.disposeCount + 1; end destructor; "
+        "end CountedErr; "
+        "class C "
+        "  public static async method Boom(): Task throw new CountedErr(); end Boom; "
+        "  public static async method Run(): Task "
+        "    using var t1 := Task.FromResult(1); "
+        "    using var t2 := Boom(); "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(t1); tasks.Add(t2); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    try await wa; catch CountedErr => var ignored := 1; end; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    await Run(); "
+        "    return CountedErr.disposeCount; "
+        "  end Main; end C;",
+        1);
+}
+
+// §30.10: "WhenAny of an empty array raises ArgumentException synchronously
+// at the call site, not as a faulted task (it could never complete, and the
+// misuse is local)." Before the fix, the runtime instead returned an
+// already-completed `Task<int>` whose result was the sentinel index -1 —
+// silently "succeeding" with a nonsensical winner index rather than throwing.
+BEZEL_TEST(task_combinators_1529, when_any_empty_array_raises_argument_exception_synchronously) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task>(); "
+        "    try "
+        "      using var w := Task.WhenAny(tasks); "
+        "      return 1; "
+        "    catch ArgumentException => return 2; "
+        "    end; "
+        "  end Main; end C;",
+        2);
+}
+
+// §30.10: `Task.WhenAllOwned<T>` — same input-order fault-selection contract
+// (index 1's `BoomA` wins over index 2's `BoomB`, which faults first in wall-
+// clock time), PLUS the ownership-of-results contract: "results already
+// produced are disposed with their tasks" on the fault path. Two successful
+// results (`Cell(1)` at index 0, `Cell(2)` at index 3, produced before and
+// after the winning fault settles) are captured before the fault wins; since
+// the whole input array was OWNED (transferred in), nobody else can ever see
+// them, so WhenAllOwned itself must dispose them — verified via the
+// destructor-counting `Cell`: `Cell.n` (live count) returns to 0 and
+// `Cell.disposeCount` is exactly 2 (dispose-once, no leak, no double-free).
+BEZEL_TEST(task_combinators_1529,
+           when_all_owned_first_non_successful_input_order_wins_and_disposes_produced_results) {
+    expectValueLeakFree(
+        "module M; "
+        "class Cell "
+        "  public static n: int := 0; "
+        "  public static disposeCount: int := 0; "
+        "  public X: int; "
+        "  public constructor(x: int) X := x; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor "
+        "    Cell.n := Cell.n - 1; Cell.disposeCount := Cell.disposeCount + 1; "
+        "  end destructor; "
+        "end Cell; "
+        "class ErrA: Exception public constructor() base(\"A\"); end constructor; end ErrA; "
+        "class ErrB: Exception public constructor() base(\"B\"); end constructor; end ErrB; "
+        "class C "
+        "  public static async method MakeCellSlow(x: int): OwningTask<Cell> "
+        "    await Task.Delay(20); return new Cell(x); "
+        "  end MakeCellSlow; "
+        "  public static async method MakeCellFast(x: int): OwningTask<Cell> "
+        "    return new Cell(x); "
+        "  end MakeCellFast; "
+        "  public static async method BoomA(): OwningTask<Cell> "
+        "    await Task.Delay(20); throw new ErrA(); "
+        "  end BoomA; "
+        "  public static async method BoomB(): OwningTask<Cell> "
+        "    throw new ErrB(); "
+        "  end BoomB; "
+        "  public static async method Run(): Task "
+        "    var tasks := new OwningArray<OwningTask<Cell>>(); "
+        "    tasks.Add(MakeCellFast(1)); tasks.Add(BoomA()); "
+        "    tasks.Add(BoomB()); tasks.Add(MakeCellSlow(2)); "
+        "    try using var results := await Task.WhenAllOwned(owned tasks); "
+        "    catch ErrA => var ignored := 1; "
+        "    catch ErrB => var ignored := 2; "
+        "    end; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    await Run(); "
+        "    return Cell.n * 100 + Cell.disposeCount; "
+        "  end Main; end C;",
+        2);
+}

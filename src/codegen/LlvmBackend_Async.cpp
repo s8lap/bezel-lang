@@ -2066,12 +2066,41 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // NOT reclaim it, or a SECOND `await t` re-reads a freed pointer (SIGSEGV).
         // Mark it so the caught-exception disposal skips a borrowed object. For an
         // ANONYMOUS producer (`await Producer()`, freeTaskAfter == true) the task is
-        // single-use and freed just below — keep the current handler-owns behavior
-        // (no mark), so the lone awaiter reclaims error_obj exactly once.
-        if (!freeTaskAfter) {
+        // single-use and freed just below — normally the handler-owns behavior (no
+        // mark) applies, so the lone awaiter reclaims error_obj exactly once.
+        //
+        // §30.10 / #1529 EXCEPTION: an anonymous-producer WhenAll/WhenAll<T>
+        // AGGREGATE never owns its fault at all — it only borrows a reference
+        // from whichever input task produced it (spec §30.10: "an aggregate
+        // task owns no fault of its own"). That input task is still alive and
+        // will dispose the SAME exception object at its own, independent scope
+        // end, so the catch arm here must NOT reclaim it either — mark it
+        // borrowed regardless of freeTaskAfter. bz_task_fault_borrowed is false
+        // for every ordinarily-faulted task (the common case), so this adds one
+        // runtime check without changing behavior there.
+        {
+            llvm::Value* shouldMark;
+            if (!freeTaskAfter) {
+                shouldMark = builder_.getTrue();
+            } else {
+                auto* fbFn = declareC("bz_task_fault_borrowed",
+                                      llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+                llvm::Value* fb = builder_.CreateCall(
+                    fbFn, {awaitedTask}, "await.faultborrowed");
+                shouldMark = builder_.CreateICmpNE(
+                    fb, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+            }
+            auto* markBB = llvm::BasicBlock::Create(llvm_, "await.eo.mark",
+                                                     currentFn_);
+            auto* noMarkBB = llvm::BasicBlock::Create(llvm_, "await.eo.nomark",
+                                                       currentFn_);
+            builder_.CreateCondBr(shouldMark, markBB, noMarkBB);
+            builder_.SetInsertPoint(markBB);
             auto* markFn = declareC("bz_mark_exc_borrowed",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(markFn, {excObj});
+            builder_.CreateBr(noMarkBB);
+            builder_.SetInsertPoint(noMarkBB);
         }
         // §30.5: reclaim the awaited task here when it is an anonymous producer
         // result (`await Producer()`) — a single-use task with no other owner.

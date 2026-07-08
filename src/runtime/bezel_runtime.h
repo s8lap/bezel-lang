@@ -783,6 +783,13 @@ const char* bz_task_error(void* task);
 // Null when the fault carried only a message.
 void* bz_task_error_obj(void* task);
 
+// §30.10 / #1529: true if `task`'s error_obj is a BORROWED reference from an
+// input task's owned fault (a WhenAll/WhenAll<T> aggregate that propagated an
+// input's fault), not owned by `task` itself. Consulted before any fault-
+// disposal decision (scope-end, await/`.Result` hand-off) so a borrowing
+// aggregate never double-frees an exception its input task still owns.
+int8_t bz_task_fault_borrowed(void* task);
+
 // Register a continuation to run when the task completes (on the thread pool).
 void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* state);
 

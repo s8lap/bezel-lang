@@ -161,6 +161,16 @@ struct bz_task_t {
     // and raises InvalidOperationException if it is already set. Plain Task<T> (not
     // OwningTask<T>) never sets this flag — it can be awaited multiple times.
     bool is_spent = false;
+    // §30.10 / #1529: true for a WhenAll/WhenAll<T> AGGREGATE task whose fault
+    // was propagated from an input task's OWNED exception — a BORROWED
+    // reference, per spec §30.10 "an aggregate task owns no fault of its own".
+    // When set, this task's own disposal (scope-end, await/`.Result` fault
+    // hand-off) must never reclaim error_obj: the input task remains its sole
+    // owner and disposes it at its own, independent scope end (the input
+    // tasks are required to outlive the aggregate's settlement and
+    // consumption, per the same section). Always false for an ordinarily-
+    // faulted task, which does own its exception (§30.9).
+    bool fault_borrowed = false;
     char* error_msg = nullptr;
     // §30.9: the ORIGINAL exception object that faulted this task (a Bezel heap
     // object with a leading vtable word). Preserved across the task boundary so

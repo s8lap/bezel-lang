@@ -2030,7 +2030,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // exception and disposes it exactly once at task disposal — the task
             // LOCAL's scope-end here (bz_task_free / fire-and-forget frees the task
             // struct + its buffers but NOT the Bezel exception object; only Bezel
-            // codegen can run its destructor). Two paths:
+            // codegen can run its destructor). Three paths:
+            //   • BORROWED aggregate (§30.10 / #1529): a WhenAll/WhenAll<T>
+            //     aggregate never owns its error_obj (only borrows a reference
+            //     from the input task that does) — skip unconditionally; see
+            //     bz_task_fault_borrowed below.
             //   • NOT in flight (not borrowed): the fault was already fully handled
             //     (or never awaited) — dispose the exception now.
             //   • IN FLIGHT (borrowed by an awaiter mid-dispatch): a faulted task
@@ -2054,6 +2058,30 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                       currentFn_);
                 builder_.CreateCondBr(err, edBB, eaBB);
                 builder_.SetInsertPoint(edBB);
+                // §30.10 / #1529: a WhenAll/WhenAll<T> AGGREGATE task whose
+                // error_obj was propagated from an input task's OWNED fault is
+                // only BORROWING that reference (spec §30.10: "an aggregate
+                // task owns no fault of its own"). Its own scope-end must never
+                // reclaim it — the input task remains the sole owner and
+                // disposes it at ITS OWN, independent scope end. Skip entirely,
+                // unconditionally: without this check, a bound aggregate whose
+                // fault was already unmarked-not-deferred by a catch arm (the
+                // "owned" branch below) would free the exception out from under
+                // the still-live input task, which then double-frees it at its
+                // own disposal (the crash this fix closes).
+                auto* fbFn = declareC("bz_task_fault_borrowed",
+                                      llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+                llvm::Value* fb = builder_.CreateCall(fbFn, {t}, "task.faultborrowed");
+                llvm::Value* isFB = builder_.CreateICmpNE(
+                    fb, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+                auto* borrowedAggBB = llvm::BasicBlock::Create(
+                    llvm_, "task.eo.aggborrowed", currentFn_);
+                auto* checkBB = llvm::BasicBlock::Create(llvm_, "task.eo.check",
+                                                         currentFn_);
+                builder_.CreateCondBr(isFB, borrowedAggBB, checkBB);
+                builder_.SetInsertPoint(borrowedAggBB);
+                builder_.CreateBr(eaBB);
+                builder_.SetInsertPoint(checkBB);
                 auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
                 llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "task.errobj");
                 llvm::Value* eoNull = builder_.CreateICmpEQ(

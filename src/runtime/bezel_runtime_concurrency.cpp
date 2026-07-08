@@ -678,6 +678,18 @@ void* bz_task_error_obj(void* tp) {
     return ((bz_task_t*)tp)->error_obj;
 }
 
+// §30.10 / #1529: true if `tp`'s error_obj (if any) is a BORROWED reference
+// from an input task's owned fault (set on a WhenAll/WhenAll<T> aggregate that
+// propagated an input's fault) rather than owned by `tp` itself. Codegen's
+// fault-disposal decisions (scope-end disposal, await/`.Result` fault
+// hand-off — see LlvmBackend_Disposal.cpp / LlvmBackend_Async.cpp /
+// LlvmBackend_Exprs.cpp) consult this before ever reclaiming error_obj, so a
+// borrowing aggregate never double-frees the exception its (still-owning,
+// independently-disposed) input task will dispose at its own scope end.
+int8_t bz_task_fault_borrowed(void* tp) {
+    return ((bz_task_t*)tp)->fault_borrowed ? 1 : 0;
+}
+
 // §30.4 / §30.9 (#854): borrowed-exception set. When an `await` of a BOUND
 // (multi-awaitable) faulted task re-raises the task's stored error_obj into the
 // in-flight exception slot, the catch arm that handles it must NOT reclaim the
@@ -889,28 +901,39 @@ void* bz_task_from_result(const void* result, int64_t result_size) {
 
 // stdlib §6.7 / §30.10: Task.WhenAll(tasks: Array<Task>): Task.
 // Returns a new task that completes (with no value) once ALL input tasks are
-// done. Uses a shared context with a refcount (number of registered
-// continuations) and a completion counter. Every continuation decrements
-// the refcount on exit (freeing the context when it reaches 0) and decrements
-// the completion counter; the last completion (counter → 0) fires the aggregate.
-// The context is heap-allocated once and shared across all continuations via a
-// raw pointer (no C++ shared_ptr to stay extern "C" compatible).
+// done — WhenAll never abandons laggards (§30.10 "Aggregation contracts").
+// Uses a shared context with a refcount (number of registered continuations)
+// and a completion counter. Every continuation decrements the refcount on
+// exit (freeing the context when it reaches 0) and decrements the completion
+// counter; the last completion (counter → 0) fires the aggregate. The context
+// is heap-allocated once and shared across all continuations via a raw
+// pointer (no C++ shared_ptr to stay extern "C" compatible).
 //
-// §30.9 / #443: fault propagation. If ANY input task is faulted (is_error),
-// the aggregate completes with the FIRST observed fault (error_obj), so the
-// awaiter's await.fault path re-raises the original exception. A separate
-// atomic bool `any_fault` tracks whether a fault was seen; a second atomic
-// `first_error_obj` (void*) records the error object of the first faulted
-// task. The first faulted continuation wins via a CAS on `any_fault`
-// (false → true); subsequent faults are discarded (the aggregate carries one
-// representative error, per §30.9). When remaining hits 0, if any_fault is
-// set the aggregate completes with error; otherwise it completes with success.
+// §30.9 / §30.10 / #443 / #1529: fault propagation is by INPUT ORDER, not by
+// completion order. The terminal continuation (the one that observes
+// `remaining` hit 0 — every input is done at that point, so no race) scans
+// `task_arr` in ARRAY ORDER for the first non-successful input and re-derives
+// the aggregate's outcome from THAT task alone; an earlier revision instead
+// raced a CAS on whichever continuation observed a fault first, which is the
+// first task to COMPLETE, not the first in the array — nondeterministic and a
+// spec violation ("the first non-successful input in input order", §30.10).
+// A faulted input's error_obj is a Bezel heap object the INPUT TASK OWNS
+// (§30.9); the aggregate only BORROWS it for re-raise (an aggregate "owns no
+// fault of its own", §30.10), so `fault_borrowed` is set on the aggregate —
+// codegen's fault-disposal paths consult it to avoid double-freeing an
+// exception the (still-owning, independently-disposed) input task will
+// dispose at its own scope end. A cancelled input may instead carry only a
+// message (no error_obj, e.g. a cancelable Task.Delay) — propagated via
+// error_msg so the aggregate re-raises a fresh OperationCanceledException,
+// exactly as awaiting that input directly would (§30.10).
 struct BzWhenAllCtx {
     bz_task_t* aggregate;
-    std::atomic<int64_t> remaining;      // pending completion count
-    std::atomic<int64_t> refcount;       // continuation refcount (= n at init)
-    std::atomic<bool> any_fault;         // true once a faulted input is seen
-    std::atomic<void*> first_error_obj;  // error_obj of the first faulted task
+    std::atomic<int64_t> remaining;  // pending completion count
+    std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
+    void* task_arr;                  // original input array (BORROWED, not
+                                      // freed here) — read only by the
+                                      // terminal continuation, after every
+                                      // input is done.
 };
 
 void* bz_task_when_all(void* task_arr) {
@@ -925,39 +948,40 @@ void* bz_task_when_all(void* task_arr) {
         aggregate->done = true;
         return aggregate;
     }
-    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}, {false}, {nullptr}};
+    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}, task_arr};
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
         bz_task_then(t,
-            [](void* completedTask, void* state) {
+            [](void* /*completedTask*/, void* state) {
                 auto* c = (BzWhenAllCtx*)state;
-                // §30.9 / #443: if this input faulted, attempt a CAS on
-                // any_fault (false → true). Only the first faulted continuation
-                // wins and records the error object; subsequent faults are
-                // discarded. The error object is read here while the task is
-                // complete and its fields are stable (no race).
-                if (bz_task_is_error(completedTask)) {
-                    bool expected = false;
-                    if (c->any_fault.compare_exchange_strong(
-                            expected, true,
-                            std::memory_order_acq_rel,
-                            std::memory_order_relaxed)) {
-                        // We won the CAS: record the error object.
-                        void* errObj = bz_task_error_obj(completedTask);
-                        c->first_error_obj.store(errObj, std::memory_order_release);
-                    }
-                }
-                // When ALL inputs are done (remaining → 0), complete the
-                // aggregate: success if no fault was recorded, error otherwise.
+                // When ALL inputs are done (remaining → 0), scan in INPUT
+                // ORDER (§30.10) for the first non-successful task. Every
+                // input is done at this point, so each one's is_error /
+                // error_obj / error_msg is stable — no race.
                 if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    if (c->any_fault.load(std::memory_order_acquire)) {
-                        void* errObj = c->first_error_obj.load(
-                            std::memory_order_acquire);
-                        bz_task_complete_error_obj(c->aggregate, errObj);
-                    } else {
-                        bz_task_complete(c->aggregate, nullptr, 0);
+                    auto* a = (bz_array_t*)c->task_arr;
+                    int64_t n2 = bz_array_len(a);
+                    bool faulted = false;
+                    for (int64_t j = 0; j < n2 && !faulted; ++j) {
+                        void* tj = nullptr;
+                        bz_array_get(a, j, &tj, sizeof(void*));
+                        if (bz_task_is_error(tj)) {
+                            faulted = true;
+                            void* errObj = bz_task_error_obj(tj);
+                            if (errObj) {
+                                bz_task_complete_error_obj(c->aggregate, errObj);
+                                c->aggregate->fault_borrowed = true;
+                            } else {
+                                auto* tjt = (bz_task_t*)tj;
+                                bz_task_complete_error(
+                                    c->aggregate,
+                                    tjt->error_msg ? tjt->error_msg
+                                                   : "OperationCanceledException");
+                            }
+                        }
                     }
+                    if (!faulted) bz_task_complete(c->aggregate, nullptr, 0);
                 }
                 if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
                     delete c;
@@ -970,23 +994,28 @@ void* bz_task_when_all(void* task_arr) {
 // stdlib §6.7 / §30.10: Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
 // Variant of bz_task_when_all that collects each input task's result (elem_size
 // bytes) into a new bz_array_t and completes the aggregate with a ptr-sized
-// result (the Array<T> pointer). Fault propagation matches bz_task_when_all:
-// the first faulted input's exception propagates; the result array is freed.
+// result (the Array<T> pointer). Fault propagation matches bz_task_when_all
+// (§1529): the terminal continuation scans the ORIGINAL input array in INPUT
+// ORDER for the first non-successful task, rather than racing on completion
+// order; `fault_borrowed` marks the aggregate so codegen never double-frees
+// the fault object the winning input task still owns.
 //
 // Thread safety: each continuation writes to a distinct results[] slot (no
 // aliasing), so no mutex is needed for slot stores. The acq_rel fetch_sub on
 // `remaining` provides the ordering: the last decrement acquires all prior
 // result stores (via the release from each preceding thread's fetch_sub), so
-// the final continuation sees the complete results[] before building the array.
+// the final continuation sees the complete results[] AND every input task's
+// stable is_error/error_obj/error_msg before deciding the outcome.
 struct BzWhenAllResultsCtx {
     bz_task_t* aggregate;
     std::atomic<int64_t> remaining;      // pending completion count
     std::atomic<int64_t> refcount;       // continuation refcount (= n at init)
-    std::atomic<bool> any_fault;         // true once a faulted input is seen
-    std::atomic<void*> first_error_obj;  // error_obj of the first faulted task
     int64_t n;                           // total task count
     int64_t elem_size;                   // sizeof(T) — bytes per result element
     void** result_bufs;                  // result_bufs[i]: malloc'd copy of task i's result
+    void* task_arr;                      // original input array (BORROWED) —
+                                          // read only by the terminal
+                                          // continuation's input-order scan.
 };
 
 struct BzWhenAllResultsSlot {
@@ -1015,7 +1044,7 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     // copy of the task's raw result bytes (elem_size bytes).
     void** result_bufs = (void**)calloc((size_t)n, sizeof(void*));
     auto* ctx = new BzWhenAllResultsCtx{
-        aggregate, {n}, {n}, {false}, {nullptr}, n, elem_size, result_bufs};
+        aggregate, {n}, {n}, n, elem_size, result_bufs, task_arr};
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
@@ -1029,18 +1058,10 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
                 int64_t i = slot->idx;
                 delete slot;
 
-                // §30.9 / #443: fault propagation — first faulted task wins.
-                if (bz_task_is_error(completedTask)) {
-                    bool expected = false;
-                    if (c->any_fault.compare_exchange_strong(
-                            expected, true,
-                            std::memory_order_acq_rel,
-                            std::memory_order_relaxed)) {
-                        void* errObj = bz_task_error_obj(completedTask);
-                        c->first_error_obj.store(errObj, std::memory_order_release);
-                    }
-                } else {
-                    // Copy this task's result bytes into results[i].
+                if (!bz_task_is_error(completedTask)) {
+                    // Copy this task's result bytes into results[i]. A
+                    // faulted task has no result to capture; its outcome is
+                    // decided by the input-order scan below instead.
                     void* resPtr = bz_task_await_sync(completedTask);
                     if (resPtr && c->elem_size > 0) {
                         void* buf = malloc((size_t)c->elem_size);
@@ -1049,15 +1070,34 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
                     }
                 }
 
-                // When ALL inputs done (remaining → 0): build the result array.
+                // When ALL inputs done (remaining → 0): scan in INPUT ORDER
+                // (§30.10 / #1529) for the first non-successful task.
                 if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    if (c->any_fault.load(std::memory_order_acquire)) {
-                        // Free any collected result bufs (we won't use them).
-                        for (int64_t j = 0; j < c->n; ++j) free(c->result_bufs[j]);
-                        free(c->result_bufs);
-                        void* errObj = c->first_error_obj.load(std::memory_order_acquire);
-                        bz_task_complete_error_obj(c->aggregate, errObj);
-                    } else {
+                    auto* a = (bz_array_t*)c->task_arr;
+                    int64_t n2 = bz_array_len(a);
+                    bool faulted = false;
+                    for (int64_t j = 0; j < n2 && !faulted; ++j) {
+                        void* tj = nullptr;
+                        bz_array_get(a, j, &tj, sizeof(void*));
+                        if (bz_task_is_error(tj)) {
+                            faulted = true;
+                            // Free any collected result bufs (discarded).
+                            for (int64_t k = 0; k < c->n; ++k) free(c->result_bufs[k]);
+                            free(c->result_bufs);
+                            void* errObj = bz_task_error_obj(tj);
+                            if (errObj) {
+                                bz_task_complete_error_obj(c->aggregate, errObj);
+                                c->aggregate->fault_borrowed = true;
+                            } else {
+                                auto* tjt = (bz_task_t*)tj;
+                                bz_task_complete_error(
+                                    c->aggregate,
+                                    tjt->error_msg ? tjt->error_msg
+                                                   : "OperationCanceledException");
+                            }
+                        }
+                    }
+                    if (!faulted) {
                         // Build Array<T> from collected result bufs.
                         void* resultArr = bz_array_alloc(c->elem_size, c->n);
                         for (int64_t j = 0; j < c->n; ++j) {
@@ -1085,20 +1125,68 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     return aggregate;
 }
 
+// §30.10 / #1529: dispose a Bezel class instance generically — Dispose() via
+// its own vtable slot 2, then free the block. Every Bezel class object has a
+// leading vtable word (§8.5) with Dispose at the fixed slot 2 (the same
+// layout emitDisposeAndReclaim's codegen dispatches through), so this needs
+// no type-specific support: it works for a WhenAllOwned<T> result (an
+// arbitrary class T) or a fault Exception alike. Mirrors the existing
+// bz_domain_spawn fault-wrap pattern (this file, DomainFaultedException path).
+static void bz_dispose_class_obj(void* obj) {
+    if (!obj) return;
+    void** vtbl = nullptr;
+    memcpy(&vtbl, obj, sizeof(void*));
+    if (vtbl && vtbl[2]) {
+        typedef void (*DispFn)(void*);
+        ((DispFn)vtbl[2])(obj);
+    }
+    free(obj);
+}
+
 // stdlib §6.7 / §30.10: Task.WhenAllOwned<T>(owned tasks: OwningArray<OwningTask<T>>):
 //   OwningTask<OwningArray<T>> where T: class
 //
 // Pattern B aggregator: caller transfers ownership of the array (and its tasks).
 // Each OwningTask<T> result is a void* (class pointer, sizeof(void*) bytes); we
 // collect them into a new OwningArray<T> (a bz_array_t* of pointers). Each input
-// task is freed after its result is captured (it is single-consumer, Pattern B).
-// The input array container is freed once all callbacks are registered (after the
-// loop, before returning).
+// task's STRUCT is freed after its outcome is captured (it is single-consumer,
+// Pattern B) — but unlike bz_task_when_all's inputs, nothing else can observe
+// these tasks again (ownership was transferred wholesale), so per-index outcome
+// (success + result, or fault + error_obj) must be captured into the context
+// BEFORE each task struct is freed. The input array container is freed once all
+// callbacks are registered (after the loop, before returning).
+//
+// §30.10 / #1529: fault selection is by INPUT ORDER (the first non-successful
+// task in array order), not completion order — an earlier revision raced a CAS
+// on whichever continuation observed a fault first. On the winning fault:
+// every ALREADY-PRODUCED successful result is disposed with its task (nobody
+// else can ever see it — Pattern B consumed the whole array), every OTHER
+// faulted input's exception is disposed likewise (only the winner's is
+// re-raised), and the winner's error_obj becomes the aggregate's own (Pattern
+// B genuinely transfers sole ownership here — unlike the BORROWING WhenAll/
+// WhenAll<T>, no caller-side reference to the input survives this call, so
+// `fault_borrowed` is NOT set: the aggregate legitimately owns and disposes
+// this exception at its own scope end, per §30.9).
 //
 // Thread safety: same acq_rel protocol as bz_task_when_all_results (each slot
-// writes a distinct result_bufs entry; the last fetch_sub acquires all prior
-// stores). The element size is always sizeof(void*) since T: class.
-// Reuses BzWhenAllResultsSlot (same {ctx, idx} layout).
+// writes distinct results[]/is_fault[]/fault_objs[] entries; the last
+// fetch_sub acquires all prior stores). The element size is always
+// sizeof(void*) since T: class.
+struct BzWhenAllOwnedCtx {
+    bz_task_t* aggregate;
+    std::atomic<int64_t> remaining;  // pending completion count
+    std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
+    int64_t n;                       // total task count
+    void** results;                  // results[i]: captured T* on success, else null
+    int8_t* is_fault;                // is_fault[i]: 1 if task i completed faulted
+    void** fault_objs;               // fault_objs[i]: error_obj if faulted (may be null)
+};
+
+struct BzWhenAllOwnedSlot {
+    BzWhenAllOwnedCtx* ctx;
+    int64_t idx;
+};
+
 void* bz_task_when_all_owned(void* task_arr) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* arr = (bz_array_t*)task_arr;
@@ -1118,71 +1206,94 @@ void* bz_task_when_all_owned(void* task_arr) {
         bz_array_free(task_arr, nullptr);
         return aggregate;
     }
-    // Allocate result buffer slots (one per task, pointer-sized).
-    void** result_bufs = (void**)calloc((size_t)n, sizeof(void*));
-    auto* ctx = new BzWhenAllResultsCtx{
-        aggregate, {n}, {n}, {false}, {nullptr},
-        n, (int64_t)sizeof(void*), result_bufs};
+    // Allocate per-index outcome slots (one per task, pointer-sized).
+    void** results = (void**)calloc((size_t)n, sizeof(void*));
+    int8_t* is_fault = (int8_t*)calloc((size_t)n, sizeof(int8_t));
+    void** fault_objs = (void**)calloc((size_t)n, sizeof(void*));
+    auto* ctx = new BzWhenAllOwnedCtx{aggregate, {n}, {n}, n, results, is_fault, fault_objs};
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
-        // Per-slot: allocate a slot carrying (ctx, idx) into the callback.
-        // Re-use the BzWhenAllResultsSlot type (same layout).
-        auto* slot = new BzWhenAllResultsSlot{ctx, i};
+        auto* slot = new BzWhenAllOwnedSlot{ctx, i};
         bz_task_then(t,
             [](void* completedTask, void* state) {
-                auto* slot = (BzWhenAllResultsSlot*)state;
+                auto* slot = (BzWhenAllOwnedSlot*)state;
                 auto* c  = slot->ctx;
                 int64_t i = slot->idx;
                 delete slot;
 
-                // §30.9 / #443: fault propagation — first faulted task wins.
                 if (bz_task_is_error(completedTask)) {
-                    bool expected = false;
-                    if (c->any_fault.compare_exchange_strong(
-                            expected, true,
-                            std::memory_order_acq_rel,
-                            std::memory_order_relaxed)) {
-                        void* errObj = bz_task_error_obj(completedTask);
-                        c->first_error_obj.store(errObj, std::memory_order_release);
-                    }
+                    c->is_fault[i] = 1;
+                    c->fault_objs[i] = bz_task_error_obj(completedTask);
                 } else {
                     // Capture the result pointer (T*) from the OwningTask<T>.
                     // The result is a pointer-sized value stored as void*.
                     void* resPtr = bz_task_await_sync(completedTask);
                     if (resPtr) {
-                        // resPtr points to the void* result slot inside the task.
                         void* objPtr = nullptr;
                         memcpy(&objPtr, resPtr, sizeof(void*));
-                        c->result_bufs[i] = objPtr;
+                        c->results[i] = objPtr;
                     }
                 }
-                // Free the OwningTask<T> — ownership was transferred to us (#451
-                // Pattern B: single-consumer, the task is spent after this await).
+                // Free the OwningTask<T> STRUCT — ownership was transferred to
+                // us (#451 Pattern B: single-consumer, the task is spent after
+                // this await). This does not touch error_obj/the captured
+                // result object (separate Bezel heap allocations, see
+                // bz_task_t::error_obj) — those outcomes were captured above.
                 bz_task_free(completedTask);
 
-                // When ALL inputs done (remaining → 0): build the result array.
+                // When ALL inputs done (remaining → 0): scan in INPUT ORDER
+                // (§30.10 / #1529) for the first non-successful task.
                 if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    if (c->any_fault.load(std::memory_order_acquire)) {
-                        // Fault path: at least one task faulted. Any result
-                        // objects already captured are leaked here — we have no
-                        // vtable pointer to call Dispose on them. In practice
-                        // the caller sees the exception (no WhenAllOwned result
-                        // is consumed) and the program terminates or propagates
-                        // the error, making the leak inconsequential.
-                        // (#451 / §30.9 fault semantics — a full Dispose path
-                        // would require passing the vtable through the context.)
-                        free(c->result_bufs);
-                        void* errObj = c->first_error_obj.load(std::memory_order_acquire);
-                        bz_task_complete_error_obj(c->aggregate, errObj);
+                    int64_t firstFault = -1;
+                    for (int64_t j = 0; j < c->n; ++j) {
+                        if (c->is_fault[j]) { firstFault = j; break; }
+                    }
+                    if (firstFault >= 0) {
+                        // Dispose every already-produced successful result —
+                        // no one else will ever see it (Pattern B consumed
+                        // the whole input array; the aggregate faults
+                        // instead of returning a result).
+                        for (int64_t j = 0; j < c->n; ++j) {
+                            if (!c->is_fault[j] && c->results[j])
+                                bz_dispose_class_obj(c->results[j]);
+                        }
+                        // Dispose every OTHER faulted input's exception —
+                        // same reasoning; only firstFault's is re-raised.
+                        for (int64_t j = 0; j < c->n; ++j) {
+                            if (c->is_fault[j] && j != firstFault && c->fault_objs[j])
+                                bz_dispose_class_obj(c->fault_objs[j]);
+                        }
+                        void* errObj = c->fault_objs[firstFault];
+                        free(c->results);
+                        free(c->is_fault);
+                        free(c->fault_objs);
+                        if (errObj) {
+                            // Pattern B: ownership was fully transferred in,
+                            // so (unlike the borrowing WhenAll/WhenAll<T>) no
+                            // other reference survives — the aggregate is the
+                            // sole owner and disposes this exception itself
+                            // (fault_borrowed stays false, its default).
+                            bz_task_complete_error_obj(c->aggregate, errObj);
+                        } else {
+                            // Defensive fallback: a message-only fault (no
+                            // captured object). Not expected in practice for a
+                            // class-typed OwningTask<T> (every user throw path
+                            // carries a real exception object), but propagate
+                            // the failure rather than silently succeeding.
+                            bz_task_complete_error(c->aggregate,
+                                                    "OperationCanceledException");
+                        }
                     } else {
                         // Build OwningArray<T> from collected result pointers.
                         int64_t esz = (int64_t)sizeof(void*);
                         void* resultArr = bz_array_alloc(esz, c->n);
                         for (int64_t j = 0; j < c->n; ++j) {
-                            bz_array_add(resultArr, &c->result_bufs[j], esz);
+                            bz_array_add(resultArr, &c->results[j], esz);
                         }
-                        free(c->result_bufs);
+                        free(c->results);
+                        free(c->is_fault);
+                        free(c->fault_objs);
                         // Complete the aggregate with the OwningArray<T> pointer.
                         bz_task_complete(c->aggregate, &resultArr, sizeof(void*));
                     }

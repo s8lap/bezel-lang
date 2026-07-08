@@ -7349,6 +7349,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "WhenAny" && !call.args.empty() && call.args[0].value) {
             auto [arr, isLiteralTemp] = lowerTaskArrayArg(*call.args[0].value);
             if (!arr) return nullptr;
+            // §30.10 / #1529: "WhenAny of an empty array raises ArgumentException
+            // synchronously at the call site, not as a faulted task (it could
+            // never complete, and the misuse is local)." Guard before calling
+            // into the runtime, which otherwise has no input to wait on.
+            {
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len =
+                    builder_.CreateCall(lenFn, {arr}, "whenany.len");
+                llvm::Value* isEmpty =
+                    builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                emitGuardThrow(isEmpty, "ArgumentException");
+            }
             auto* whenAnyFn = declareC("bz_task_when_any", ptrTy(), {ptrTy()});
             llvm::Value* result =
                 builder_.CreateCall(whenAnyFn, {arr}, "task.when_any");

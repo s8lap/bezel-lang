@@ -2850,14 +2850,45 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     // (LlvmBackend_Async.cpp ~L1889). An anonymous producer
                     // (`C.Boom().Result`) has no binder that will free error_obj, so
                     // do NOT mark it — the lone catch arm must reclaim it exactly once.
+                    // §30.10 / #1529: an anonymous-producer WhenAll/WhenAll<T>
+                    // AGGREGATE (`Task.WhenAll(tasks).Result`, isBoundTask ==
+                    // false) never owns its error_obj either — it only borrows
+                    // a reference from whichever input task produced it (spec
+                    // §30.10: "an aggregate task owns no fault of its own").
+                    // That input task is still alive and will dispose the SAME
+                    // exception at its own, independent scope end, so mark it
+                    // borrowed here too (bz_task_fault_borrowed is false for
+                    // every ordinarily-faulted task, so this is a no-op there).
                     bool isBoundTask =
                         dynamic_cast<const ast::CallExpr*>(ma->target.get()) ==
                         nullptr;
+                    llvm::Value* shouldMarkBorrowed;
                     if (isBoundTask) {
+                        shouldMarkBorrowed = builder_.getTrue();
+                    } else {
+                        auto* fbFn = declareC("bz_task_fault_borrowed",
+                                              llvm::Type::getInt8Ty(llvm_),
+                                              {ptrTy()});
+                        llvm::Value* fb = builder_.CreateCall(
+                            fbFn, {task}, "result.faultborrowed");
+                        shouldMarkBorrowed = builder_.CreateICmpNE(
+                            fb, llvm::ConstantInt::get(
+                                    llvm::Type::getInt8Ty(llvm_), 0));
+                    }
+                    {
+                        auto* markBB = llvm::BasicBlock::Create(
+                            llvm_, "result.eo.mark", currentFn_);
+                        auto* noMarkBB = llvm::BasicBlock::Create(
+                            llvm_, "result.eo.nomark", currentFn_);
+                        builder_.CreateCondBr(shouldMarkBorrowed, markBB,
+                                              noMarkBB);
+                        builder_.SetInsertPoint(markBB);
                         auto* markFn = declareC("bz_mark_exc_borrowed",
                                                 llvm::Type::getVoidTy(llvm_),
                                                 {ptrTy()});
                         builder_.CreateCall(markFn, {excObj});
+                        builder_.CreateBr(noMarkBB);
+                        builder_.SetInsertPoint(noMarkBB);
                     }
                     // §30.5 (#1127): anonymous producer (`C.Method().Result`)
                     // has no binder that will dispose the task struct; reclaim
